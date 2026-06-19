@@ -31,6 +31,21 @@ def main(argv: list[str] | None = None) -> int:
             input_data = json.loads(args.input)
         except json.JSONDecodeError as exc:
             parser.error(f"--input must be valid JSON: {exc.msg}")
+        if args.profile:
+            if not isinstance(input_data, dict):
+                parser.error("--profile requires --input to be a JSON object")
+            validation = input_data.get("validation", {})
+            if validation is None:
+                validation = {}
+            if not isinstance(validation, dict):
+                parser.error("--profile requires input.validation to be a JSON object when present")
+            input_data = {
+                **input_data,
+                "validation": {
+                    **validation,
+                    "profile": args.profile,
+                },
+            }
 
         project_contract = None
         if args.project:
@@ -70,6 +85,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_step_parser = subcommands.add_parser("run-step", help="Run one pipeline step")
     run_step_parser.add_argument("step")
     run_step_parser.add_argument("--input", required=True, help="JSON input payload")
+    run_step_parser.add_argument("--profile", help="Validation profile for profile-aware steps")
     run_step_parser.add_argument("--ledger", required=True, help="Ledger output directory")
     run_step_parser.add_argument("--project", help="Project slug for contract resolution")
     run_step_parser.add_argument(
@@ -110,6 +126,7 @@ def run_step(
         StepContext(
             input_data=input_data,
             run_id=run_id,
+            run_dir=ledger.run_dir,
             project_contract=project_contract,
         ),
     )
@@ -252,6 +269,18 @@ def result_artifact_paths(step: str, output: Any) -> dict[str, str]:
             paths["job_capsule"] = "job-capsule.json"
         if artifacts.get("agent_result") == "agent-result.json":
             paths["agent_result"] = "agent-result.json"
+        return paths
+    if step == "validate":
+        if not isinstance(output, dict):
+            return {}
+        artifacts = output.get("artifacts")
+        if not isinstance(artifacts, dict):
+            return {}
+        paths = {}
+        if artifacts.get("worker_request") == "worker-request.json":
+            paths["worker_request"] = "worker-request.json"
+        if artifacts.get("worker_result") == "worker-result.json":
+            paths["worker_result"] = "worker-result.json"
         return paths
     if step != "prepare-checkout":
         return {}

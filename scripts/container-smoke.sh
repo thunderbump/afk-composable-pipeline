@@ -155,6 +155,98 @@ assert str(submodule_gitdir).startswith(str((checkout / ".git/modules").resolve(
 print(f"container-smoke prepare-checkout: PASS {summary['run_id']}")
 PY
 
+python3 - "$tmpdir/validate-input.json" "$start_commit" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+worker_code = """
+import json
+import os
+from pathlib import Path
+
+request = json.loads(Path(os.environ["AFK_WORKER_REQUEST"]).read_text(encoding="utf-8"))
+Path(os.environ["AFK_WORKER_RESULT"]).write_text(
+    json.dumps(
+        {
+            "profile": request["profile"],
+            "status": "pass",
+            "failureCount": 0,
+            "repo": request["repo"]["path"],
+            "steps": [
+                {
+                    "name": "smoke_validate",
+                    "status": "pass",
+                    "category": "ok",
+                    "reason": "container smoke validation passed",
+                }
+            ],
+        }
+    ),
+    encoding="utf-8",
+)
+print("validate smoke complete")
+""".strip()
+
+payload = {
+    "checkout": {
+        "status": "prepared",
+        "repo_url": "/work/repo-src",
+        "checkout_path": "/work/checkout",
+        "review_branch": "afk/smoke-review",
+        "requested_ref": "main",
+        "start_commit": sys.argv[2],
+    },
+    "validation": {"dry_run": True, "timeout_seconds": 30},
+    "worker": {
+        "type": "local-command",
+        "command": ["python3", "-c", worker_code],
+        "timeout_seconds": 30,
+    },
+}
+Path(sys.argv[1]).write_text(json.dumps(payload), encoding="utf-8")
+PY
+
+"$runtime" run --rm \
+  -v "$ledger:/ledger" \
+  -v "$tmpdir:/work" \
+  "$tag" \
+  run-step validate \
+  --profile tier3-harness \
+  --input "$(cat "$tmpdir/validate-input.json")" \
+  --ledger /ledger > "$tmpdir/validate-out.json"
+
+python3 - "$tmpdir/validate-out.json" "$ledger" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+summary = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+ledger = Path(sys.argv[2])
+run_dir = ledger / "runs" / summary["run_id"]
+
+result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+worker_request = json.loads((run_dir / "worker-request.json").read_text(encoding="utf-8"))
+worker_result = json.loads((run_dir / "worker-result.json").read_text(encoding="utf-8"))
+stdout_log = (run_dir / "stdout.log").read_text(encoding="utf-8")
+
+validated = result["output"]
+assert summary["step"] == "validate", summary
+assert summary["status"] == "succeeded", summary
+assert validated["status"] == "validated", validated
+assert validated["classification"] == "success", validated
+assert validated["artifacts"] == {
+    "worker_request": "worker-request.json",
+    "worker_result": "worker-result.json",
+}, validated
+assert worker_request["profile"] == "tier3-harness", worker_request
+assert worker_request["repo"]["path"] == "/work/checkout", worker_request
+assert worker_result["artifact_type"] == "worker-result", worker_result
+assert worker_result["result"]["raw"]["status"] == "pass", worker_result
+assert "validate smoke complete" in stdout_log, stdout_log
+print(f"container-smoke validate: PASS {summary['run_id']}")
+PY
+
 python3 - "$tmpdir/implement-input.json" "$start_commit" <<'PY'
 import json
 import sys

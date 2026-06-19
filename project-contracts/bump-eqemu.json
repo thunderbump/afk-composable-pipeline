@@ -11,6 +11,23 @@
     "tier3-harness",
     "tier1-tier3-harness"
   ],
+  "validation_profile_requests": {
+    "preflight": {
+      "profile": "preflight"
+    },
+    "tier1": {
+      "profile": "safe"
+    },
+    "tier2-readonly": {
+      "profile": "safe"
+    },
+    "tier3-harness": {
+      "profile": "tier3-harness"
+    },
+    "tier1-tier3-harness": {
+      "profile": "tier1-tier3-harness"
+    }
+  },
   "artifact_retention": {
     "ledger_days": 30,
     "log_days": 30

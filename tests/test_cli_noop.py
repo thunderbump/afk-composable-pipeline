@@ -48,6 +48,12 @@ class NoopCliTest(unittest.TestCase):
                 "tier1-tier3-harness",
             ),
         )
+        self.assertEqual(contract.validation_profile_requests["tier1"]["profile"], "safe")
+        self.assertEqual(contract.validation_profile_requests["tier2-readonly"]["profile"], "safe")
+        self.assertEqual(
+            contract.validation_profile_requests["tier1-tier3-harness"]["profile"],
+            "tier1-tier3-harness",
+        )
 
     def test_unknown_step_is_rejected_with_registry_error(self):
         input_json = (FIXTURES / "noop-input.json").read_text(encoding="utf-8")
@@ -65,7 +71,10 @@ class NoopCliTest(unittest.TestCase):
 
             self.assertNotEqual(completed.returncode, 0)
             self.assertIn("unknown step 'missing-step'", completed.stderr)
-            self.assertIn("known steps: implement, noop, prepare-checkout, select-work", completed.stderr)
+            self.assertIn(
+                "known steps: implement, noop, prepare-checkout, select-work, validate",
+                completed.stderr,
+            )
             self.assertFalse(ledger.exists())
 
     def test_project_contract_validation_errors_are_reported(self):
