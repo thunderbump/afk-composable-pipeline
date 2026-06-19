@@ -129,7 +129,17 @@ class ImplementCliTest(unittest.TestCase):
                         },
                         "agent": {
                             "type": "fake-pi-command",
-                            "command": [sys.executable, "-c", agent_code],
+                            "command": [
+                                sys.executable,
+                                "-c",
+                                agent_code,
+                                "--author",
+                                "pipeline-bot",
+                                "--tokenize",
+                                "work-item",
+                                "--secretary",
+                                "notes",
+                            ],
                             "result_path": "agent-result.json",
                         },
                     }

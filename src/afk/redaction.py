@@ -6,11 +6,11 @@ from urllib.parse import urlsplit, urlunsplit
 
 URL_PATTERN = re.compile(r"(?P<url>[A-Za-z][A-Za-z0-9+.-]*://[^\s\"'<>]+)")
 TRAILING_URL_PUNCTUATION = ".,;:)]}"
-SECRET_KEY_PATTERN = re.compile(r"(auth|credential|password|secret|token|api[._-]?key|env)", re.IGNORECASE)
-SECRET_FLAG_NAME_PATTERN = re.compile(
-    r"(auth|credential|password|secret|token|api[._-]?key)",
+SECRET_KEY_PATTERN = re.compile(
+    r"(^|[._-])(auth|credentials?|password|secret|token|api[._-]?key|env)($|[._-])",
     re.IGNORECASE,
 )
+SECRET_FLAG_COMPONENTS = {"auth", "credential", "credentials", "password", "secret", "token"}
 SECRET_ASSIGNMENT_PATTERN = re.compile(
     r"(?P<key>[A-Za-z_][A-Za-z0-9_]*(?:TOKEN|SECRET|PASSWORD|AUTH|API_KEY|CREDENTIAL)[A-Za-z0-9_]*)"
     r"(?P<separator>\s*[:=]\s*)"
@@ -69,7 +69,12 @@ def is_secret_command_flag(value: str) -> bool:
         return False
     flag = normalized.split("=", 1)[0]
     flag_name = flag.lstrip("-")
-    return bool(SECRET_FLAG_NAME_PATTERN.search(flag_name))
+    components = [part for part in re.split(r"[._-]+", flag_name) if part]
+    if any(part in SECRET_FLAG_COMPONENTS for part in components):
+        return True
+    if "apikey" in components:
+        return True
+    return any(left == "api" and right == "key" for left, right in zip(components, components[1:]))
 
 
 def redact_text(value: str) -> str:

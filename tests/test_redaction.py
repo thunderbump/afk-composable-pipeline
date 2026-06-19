@@ -85,6 +85,25 @@ class RedactionTest(unittest.TestCase):
             ],
         )
 
+    def test_does_not_redact_safe_command_flags_that_contain_secret_words(self):
+        payload = {
+            "agent": {
+                "command": [
+                    "pi",
+                    "--author",
+                    "pipeline-bot",
+                    "--authority",
+                    "local",
+                    "--tokenize",
+                    "words",
+                    "--secretary",
+                    "notes",
+                ]
+            }
+        }
+
+        self.assertEqual(redact_artifact_value(payload), payload)
+
 
 if __name__ == "__main__":
     unittest.main()
