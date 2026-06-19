@@ -649,6 +649,9 @@ def default_required_labels(project_contract: Any) -> list[str]:
 def candidate_payload_error(raw_item: Any) -> str | None:
     if not isinstance(raw_item, dict):
         return "invalid_candidate_payload"
+    for identity_key in ("external_id", "id", "url"):
+        if identity_key in raw_item and raw_item[identity_key] is not None and not isinstance(raw_item[identity_key], str):
+            return "invalid_candidate_payload"
     if "labels" in raw_item and not isinstance(raw_item["labels"], list):
         return "invalid_candidate_payload"
     if "labels" in raw_item and any(not isinstance(label, str) for label in raw_item["labels"]):
@@ -674,8 +677,8 @@ def invalid_candidate(source_id: str, source_type: str, raw_item: Any) -> dict[s
     return {
         "source_id": source_id,
         "source_type": source_type,
-        "external_id": str(item.get("external_id") or item.get("id") or ""),
-        "url": str(item.get("url") or ""),
+        "external_id": identity_value(item, "external_id") or identity_value(item, "id") or "",
+        "url": identity_value(item, "url") or "",
         "title": str(item.get("title") or ""),
         "status": str(item.get("status") or "").lower(),
         "labels": [],
@@ -697,8 +700,8 @@ def normalize_candidate(source_id: str, source_type: str, raw_item: Any) -> dict
     return {
         "source_id": source_id,
         "source_type": source_type,
-        "external_id": str(item.get("external_id") or item.get("id") or ""),
-        "url": str(item.get("url") or ""),
+        "external_id": identity_value(item, "external_id") or identity_value(item, "id") or "",
+        "url": identity_value(item, "url") or "",
         "title": str(item.get("title") or ""),
         "status": str(item.get("status") or "").lower(),
         "labels": list(item.get("labels") or []),
@@ -711,6 +714,17 @@ def normalize_candidate(source_id: str, source_type: str, raw_item: Any) -> dict
         "afk": dict(item.get("afk") or {}),
         "raw": dict(item.get("raw") or {}),
     }
+
+
+def identity_value(item: dict[str, Any], key: str) -> str | None:
+    value = item.get(key)
+    if not is_non_blank_string(value):
+        return None
+    return value.strip()
+
+
+def is_non_blank_string(value: Any) -> bool:
+    return isinstance(value, str) and bool(value.strip())
 
 
 def dependency_status(dependencies: list[Any], blockers: list[Any]) -> str:

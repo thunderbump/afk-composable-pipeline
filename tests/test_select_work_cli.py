@@ -625,6 +625,80 @@ sys.exit(9)
             self.assertEqual(result["output"]["selected_work"], [])
             self.assertEqual(result["output"]["skipped_candidates"][0]["reason"], "missing_identity")
 
+    def test_fixture_candidate_with_blank_identity_is_skipped(self):
+        request = {
+            "sources": [
+                {
+                    "type": "fixture",
+                    "id": "fixture",
+                    "items": [
+                        {
+                            "external_id": "   ",
+                            "title": "Blank identity",
+                            "status": "open",
+                            "labels": [],
+                            "afk": {"ready": True},
+                        }
+                    ],
+                }
+            ],
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ledger = Path(temp_dir) / "ledger"
+            completed = run_afk(
+                "run-step",
+                "select-work",
+                "--input",
+                json.dumps(request),
+                "--ledger",
+                str(ledger),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+            self.assertEqual(result["output"]["selected_work"], [])
+            self.assertEqual(result["output"]["skipped_candidates"][0]["reason"], "missing_identity")
+
+    def test_fixture_candidate_with_non_scalar_identity_is_invalid(self):
+        request = {
+            "sources": [
+                {
+                    "type": "fixture",
+                    "id": "fixture",
+                    "items": [
+                        {
+                            "external_id": ["not-stable"],
+                            "title": "Non-scalar identity",
+                            "status": "open",
+                            "labels": [],
+                            "afk": {"ready": True},
+                        }
+                    ],
+                }
+            ],
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ledger = Path(temp_dir) / "ledger"
+            completed = run_afk(
+                "run-step",
+                "select-work",
+                "--input",
+                json.dumps(request),
+                "--ledger",
+                str(ledger),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+            self.assertEqual(result["output"]["selected_work"], [])
+            self.assertEqual(result["output"]["skipped_candidates"][0]["reason"], "invalid_candidate_payload")
+
     def test_duplicate_candidates_are_selected_once(self):
         request = {
             "required_labels": ["afk:ready"],
