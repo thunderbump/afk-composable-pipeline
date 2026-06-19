@@ -2,15 +2,21 @@
   "schema_version": 1,
   "project_slug": "bump-eqemu",
   "repo_url": "git@github.com:thunderbump/bump-EQEmu.git",
-  "base_branch": "main",
+  "base_branch": "master",
   "beads_labels": ["project:bump-eqemu"],
-  "validation_profiles": ["unit", "container-smoke", "diff-check"],
+  "validation_profiles": [
+    "preflight",
+    "tier1",
+    "tier2-readonly",
+    "tier3-harness",
+    "tier1-tier3-harness"
+  ],
   "artifact_retention": {
     "ledger_days": 30,
     "log_days": 30
   },
   "pr_target": {
     "remote": "origin",
-    "branch": "main"
+    "branch": "master"
   }
 }

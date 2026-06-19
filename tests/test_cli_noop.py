@@ -9,6 +9,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = ROOT / "tests" / "fixtures"
+sys.path.insert(0, str(ROOT / "src"))
+
+from afk.contracts import load_project_contract  # noqa: E402
 
 
 def run_afk(*args):
@@ -25,6 +28,27 @@ def run_afk(*args):
 
 
 class NoopCliTest(unittest.TestCase):
+    def test_bump_eqemu_contract_matches_current_project_defaults(self):
+        contract = load_project_contract(
+            "bump-eqemu",
+            ROOT / "project-contracts",
+            cwd=ROOT,
+        )
+
+        self.assertEqual(contract.repo_url, "git@github.com:thunderbump/bump-EQEmu.git")
+        self.assertEqual(contract.base_branch, "master")
+        self.assertEqual(contract.pr_target["branch"], "master")
+        self.assertEqual(
+            contract.validation_profiles,
+            (
+                "preflight",
+                "tier1",
+                "tier2-readonly",
+                "tier3-harness",
+                "tier1-tier3-harness",
+            ),
+        )
+
     def test_unknown_step_is_rejected_with_registry_error(self):
         input_json = (FIXTURES / "noop-input.json").read_text(encoding="utf-8")
 
