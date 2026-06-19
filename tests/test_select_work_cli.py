@@ -262,6 +262,37 @@ sys.exit(9)
                 ],
             )
 
+    def test_non_object_top_level_request_payload_records_failure(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ledger = Path(temp_dir) / "ledger"
+            completed = run_afk(
+                "run-step",
+                "select-work",
+                "--input",
+                json.dumps(["not", "an", "object"]),
+                "--ledger",
+                str(ledger),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+            self.assertEqual(result["output"]["selected_work"], [])
+            self.assertEqual(
+                result["output"]["source_statuses"],
+                [
+                    {
+                        "source_id": "request",
+                        "source_type": "request",
+                        "status": "failed_invalid_payload",
+                        "candidate_count": 0,
+                        "selected_count": 0,
+                        "message": "request must be an object",
+                    }
+                ],
+            )
+
     def test_malformed_fixture_candidate_is_reported_without_crashing(self):
         request = {
             "sources": [
@@ -512,6 +543,87 @@ sys.exit(9)
                 ["uppercase-open"],
             )
             self.assertEqual(result["output"]["selected_work"][0]["status"], "open")
+
+    def test_dependency_status_is_normalized_before_filtering(self):
+        request = {
+            "sources": [
+                {
+                    "type": "fixture",
+                    "id": "fixture",
+                    "items": [
+                        {
+                            "external_id": "uppercase-closed-dependency",
+                            "title": "Uppercase closed dependency",
+                            "status": "open",
+                            "labels": [],
+                            "dependencies": [{"id": "central-lve.2", "status": "CLOSED"}],
+                            "afk": {"ready": True},
+                        }
+                    ],
+                }
+            ],
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ledger = Path(temp_dir) / "ledger"
+            completed = run_afk(
+                "run-step",
+                "select-work",
+                "--input",
+                json.dumps(request),
+                "--ledger",
+                str(ledger),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+            self.assertEqual(
+                [candidate["external_id"] for candidate in result["output"]["selected_work"]],
+                ["uppercase-closed-dependency"],
+            )
+            self.assertEqual(
+                result["output"]["selected_work"][0]["dependencies"],
+                [{"id": "central-lve.2", "status": "closed"}],
+            )
+            self.assertEqual(result["output"]["selected_work"][0]["dependency_status"], "clear")
+
+    def test_fixture_candidate_without_stable_identity_is_skipped(self):
+        request = {
+            "sources": [
+                {
+                    "type": "fixture",
+                    "id": "fixture",
+                    "items": [
+                        {
+                            "title": "No stable identity",
+                            "status": "open",
+                            "labels": [],
+                            "afk": {"ready": True},
+                        }
+                    ],
+                }
+            ],
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ledger = Path(temp_dir) / "ledger"
+            completed = run_afk(
+                "run-step",
+                "select-work",
+                "--input",
+                json.dumps(request),
+                "--ledger",
+                str(ledger),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+            self.assertEqual(result["output"]["selected_work"], [])
+            self.assertEqual(result["output"]["skipped_candidates"][0]["reason"], "missing_identity")
 
     def test_duplicate_candidates_are_selected_once(self):
         request = {
@@ -816,6 +928,71 @@ else:
                 ]
             )
             self.assertNotIn(secret, artifact_text)
+
+    def test_malformed_beads_show_payload_records_source_failure_without_crashing(self):
+        secret = "beads-secret-value"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            fake_bin = temp_path / "bin"
+            workspace = temp_path / "beads"
+            (workspace / "secrets").mkdir(parents=True)
+            (workspace / "secrets" / "dolt_beads_password.txt").write_text(secret, encoding="utf-8")
+            fake_bin.mkdir()
+            write_executable(
+                fake_bin / "bd",
+                f"""#!{sys.executable}
+import json
+import sys
+
+if len(sys.argv) > 1 and sys.argv[1] == "list":
+    print(json.dumps([{{"id": "central-lve.badlabels"}}]))
+elif len(sys.argv) > 2 and sys.argv[1] == "show":
+    print(json.dumps({{
+        "id": "central-lve.badlabels",
+        "title": "Malformed labels",
+        "status": "open",
+        "labels": 3,
+        "metadata": {{}},
+        "dependencies": [],
+    }}))
+else:
+    sys.exit(9)
+""",
+            )
+
+            request = {
+                "sources": [
+                    {
+                        "type": "beads",
+                        "id": "central-beads",
+                        "workspace": str(workspace),
+                        "workspace_kind": "mounted",
+                        "labels": ["project:afk-composable-pipeline"],
+                    }
+                ],
+            }
+            ledger = temp_path / "ledger"
+            completed = run_afk(
+                "run-step",
+                "select-work",
+                "--input",
+                json.dumps(request),
+                "--ledger",
+                str(ledger),
+                env={"PATH": str(fake_bin)},
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+            self.assertEqual(result["output"]["selected_work"], [])
+            self.assertEqual(result["output"]["skipped_candidates"], [])
+            self.assertEqual(result["output"]["source_statuses"][0]["status"], "failed_invalid_payload")
+            self.assertIn(
+                "beads payload could not be normalized",
+                result["output"]["source_statuses"][0]["message"],
+            )
 
     def test_beads_source_rejects_project_local_beads_workspace(self):
         with tempfile.TemporaryDirectory() as temp_dir:

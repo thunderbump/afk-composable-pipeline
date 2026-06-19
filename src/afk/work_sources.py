@@ -23,24 +23,13 @@ def select_work_step(context: Any) -> dict[str, Any]:
 
 
 def select_work(input_data: Any, *, project_contract: Any = None) -> dict[str, Any]:
-    request = input_data if isinstance(input_data, dict) else {}
+    if not isinstance(input_data, dict):
+        return invalid_request_result("request must be an object")
+
+    request = input_data
     request_error = request_payload_error(request)
     if request_error is not None:
-        return {
-            "schema_version": SCHEMA_VERSION,
-            "source_statuses": [
-                source_status(
-                    "request",
-                    "request",
-                    "failed_invalid_payload",
-                    0,
-                    0,
-                    request_error,
-                )
-            ],
-            "selected_work": [],
-            "skipped_candidates": [],
-        }
+        return invalid_request_result(request_error)
 
     required_labels = (
         list(request["required_labels"])
@@ -81,6 +70,18 @@ def select_work(input_data: Any, *, project_contract: Any = None) -> dict[str, A
         except SourceLoadError as exc:
             source_statuses.append(
                 source_status(source_id, source_type, exc.status, 0, 0, exc.message)
+            )
+            continue
+        except (TypeError, ValueError, AttributeError) as exc:
+            source_statuses.append(
+                source_status(
+                    source_id,
+                    source_type,
+                    "failed_invalid_payload",
+                    0,
+                    0,
+                    f"{source_type} payload could not be normalized: {exc.__class__.__name__}",
+                )
             )
             continue
         if not isinstance(raw_items, list):
@@ -134,6 +135,24 @@ def select_work(input_data: Any, *, project_contract: Any = None) -> dict[str, A
         "source_statuses": source_statuses,
         "selected_work": selected_work,
         "skipped_candidates": skipped_candidates,
+    }
+
+
+def invalid_request_result(message: str) -> dict[str, Any]:
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "source_statuses": [
+            source_status(
+                "request",
+                "request",
+                "failed_invalid_payload",
+                0,
+                0,
+                message,
+            )
+        ],
+        "selected_work": [],
+        "skipped_candidates": [],
     }
 
 
@@ -535,7 +554,7 @@ def beads_dependencies(dependencies: list[Any]) -> list[dict[str, str]]:
         normalized.append(
             {
                 "id": str(dependency_id or ""),
-                "status": str(dependency.get("status") or "unknown"),
+                "status": normalize_relation_status(dependency.get("status")),
                 "type": str(dependency_type or "blocks"),
             }
         )
@@ -673,8 +692,8 @@ def invalid_candidate(source_id: str, source_type: str, raw_item: Any) -> dict[s
 
 def normalize_candidate(source_id: str, source_type: str, raw_item: Any) -> dict[str, Any]:
     item = raw_item if isinstance(raw_item, dict) else {}
-    dependencies = list(item.get("dependencies") or [])
-    blockers = list(item.get("blockers") or [])
+    dependencies = normalize_relations(item.get("dependencies") or [])
+    blockers = normalize_relations(item.get("blockers") or [])
     return {
         "source_id": source_id,
         "source_type": source_type,
@@ -698,12 +717,33 @@ def dependency_status(dependencies: list[Any], blockers: list[Any]) -> str:
     for relation in [*dependencies, *blockers]:
         if not isinstance(relation, dict):
             return "unknown"
-        status = relation.get("status")
-        if status in {None, "", "unknown"}:
+        status = normalize_relation_status(relation.get("status"))
+        if status == "unknown":
             return "unknown"
         if status != "closed":
             return "blocked"
     return "clear"
+
+
+def normalize_relations(relations: Any) -> list[Any]:
+    normalized = []
+    for relation in relations:
+        if not isinstance(relation, dict):
+            normalized.append(relation)
+            continue
+        relation_copy = dict(relation)
+        relation_copy["status"] = normalize_relation_status(relation_copy.get("status"))
+        normalized.append(relation_copy)
+    return normalized
+
+
+def normalize_relation_status(value: Any) -> str:
+    status = str(value or "unknown").strip().lower()
+    if status in {"closed", "resolved", "done"}:
+        return "closed"
+    if status in {"open", "blocked", "in_progress", "in-progress"}:
+        return "open"
+    return "unknown"
 
 
 def rejection_reason(
@@ -714,6 +754,8 @@ def rejection_reason(
 ) -> str | None:
     if candidate["status"] not in allowed_statuses:
         return "status_not_allowed"
+    if not candidate["external_id"] and not candidate["url"]:
+        return "missing_identity"
     missing_labels = sorted(set(required_labels) - set(candidate["labels"]))
     if missing_labels:
         return f"missing_labels:{','.join(missing_labels)}"
