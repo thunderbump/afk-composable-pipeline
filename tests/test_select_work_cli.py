@@ -151,6 +151,7 @@ sys.exit(9)
                         "type": "beads",
                         "id": "central-beads",
                         "workspace": "/definitely/missing/beads/workspace",
+                        "workspace_kind": "mounted",
                         "labels": ["project:afk-composable-pipeline", "afk:ready"],
                     },
                 ],
@@ -225,6 +226,38 @@ sys.exit(9)
                         "candidate_count": 0,
                         "selected_count": 0,
                         "message": "fixture items must be a list",
+                    }
+                ],
+            )
+
+    def test_invalid_top_level_request_payload_records_failure(self):
+        request = {"required_labels": "afk:ready", "sources": []}
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ledger = Path(temp_dir) / "ledger"
+            completed = run_afk(
+                "run-step",
+                "select-work",
+                "--input",
+                json.dumps(request),
+                "--ledger",
+                str(ledger),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+            self.assertEqual(
+                result["output"]["source_statuses"],
+                [
+                    {
+                        "source_id": "request",
+                        "source_type": "request",
+                        "status": "failed_invalid_payload",
+                        "candidate_count": 0,
+                        "selected_count": 0,
+                        "message": "required_labels must be a list of strings",
                     }
                 ],
             )
@@ -729,6 +762,7 @@ else:
                         "type": "beads",
                         "id": "central-beads",
                         "workspace": str(workspace),
+                        "workspace_kind": "mounted",
                         "labels": ["project:afk-composable-pipeline", "afk:ready"],
                     }
                 ],
@@ -807,6 +841,7 @@ raise SystemExit("bd should not be called for project-local .beads")
                         "type": "beads",
                         "id": "project-local",
                         "workspace": str(workspace),
+                        "workspace_kind": "mounted",
                         "labels": ["project:afk-composable-pipeline"],
                     }
                 ],
@@ -890,7 +925,7 @@ raise SystemExit("bd should not be called without an explicit workspace_kind")
             )
             self.assertEqual(
                 result["output"]["source_statuses"][0]["message"],
-                "workspace with .beads requires workspace_kind central or mounted",
+                "beads workspace_kind must be central or mounted",
             )
 
     def test_beads_source_rejects_symlink_to_project_local_beads_workspace(self):
@@ -915,6 +950,7 @@ raise SystemExit("bd should not be called for symlinked project-local .beads")
                         "type": "beads",
                         "id": "symlinked-local",
                         "workspace": str(workspace_link),
+                        "workspace_kind": "mounted",
                         "labels": ["project:afk-composable-pipeline"],
                     }
                 ],
@@ -980,6 +1016,7 @@ else:
                         "type": "beads",
                         "id": "central-beads",
                         "workspace": str(workspace),
+                        "workspace_kind": "mounted",
                         "labels": ["project:afk-composable-pipeline"],
                     }
                 ],
@@ -1043,6 +1080,7 @@ else:
                         "type": "beads",
                         "id": "central-beads",
                         "workspace": str(workspace),
+                        "workspace_kind": "mounted",
                         "labels": ["project:afk-composable-pipeline"],
                     }
                 ],
@@ -1089,6 +1127,7 @@ raise SystemExit("bd should not be called without credentials")
                         "type": "beads",
                         "id": "central-beads",
                         "workspace": str(workspace),
+                        "workspace_kind": "mounted",
                         "labels": ["project:afk-composable-pipeline"],
                     }
                 ],
@@ -1144,6 +1183,7 @@ raise SystemExit("bd should not be called with credentials_path override")
                         "type": "beads",
                         "id": "central-beads",
                         "workspace": str(workspace),
+                        "workspace_kind": "mounted",
                         "credentials_path": str(outside_secret),
                         "labels": ["project:afk-composable-pipeline"],
                     }

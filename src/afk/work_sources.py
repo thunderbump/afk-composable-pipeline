@@ -24,9 +24,31 @@ def select_work_step(context: Any) -> dict[str, Any]:
 
 def select_work(input_data: Any, *, project_contract: Any = None) -> dict[str, Any]:
     request = input_data if isinstance(input_data, dict) else {}
-    required_labels = list(request.get("required_labels") or default_required_labels(project_contract))
-    required_metadata = list(request.get("required_metadata") or [])
-    allowed_statuses = set(request.get("allowed_statuses") or ["open"])
+    request_error = request_payload_error(request)
+    if request_error is not None:
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "source_statuses": [
+                source_status(
+                    "request",
+                    "request",
+                    "failed_invalid_payload",
+                    0,
+                    0,
+                    request_error,
+                )
+            ],
+            "selected_work": [],
+            "skipped_candidates": [],
+        }
+
+    required_labels = (
+        list(request["required_labels"])
+        if "required_labels" in request
+        else default_required_labels(project_contract)
+    )
+    required_metadata = list(request.get("required_metadata", []))
+    allowed_statuses = set(request.get("allowed_statuses", ["open"]))
 
     source_statuses: list[dict[str, Any]] = []
     selected_work: list[dict[str, Any]] = []
@@ -115,6 +137,19 @@ def select_work(input_data: Any, *, project_contract: Any = None) -> dict[str, A
     }
 
 
+def request_payload_error(request: dict[str, Any]) -> str | None:
+    for key in ("required_labels", "required_metadata", "allowed_statuses"):
+        if key in request and not is_string_list(request[key]):
+            return f"{key} must be a list of strings"
+    if "sources" in request and not isinstance(request["sources"], list):
+        return "sources must be a list"
+    return None
+
+
+def is_string_list(value: Any) -> bool:
+    return isinstance(value, list) and all(isinstance(item, str) for item in value)
+
+
 def source_prerequisite_status(source: dict[str, Any]) -> dict[str, Any] | None:
     source_type = str(source.get("type") or "")
     source_id = str(source.get("id") or source_type or "unknown")
@@ -160,6 +195,15 @@ def source_prerequisite_status(source: dict[str, Any]) -> dict[str, Any] | None:
                 0,
                 "beads workspace is required",
             )
+        if source.get("workspace_kind") not in {"central", "mounted"}:
+            return source_status(
+                source_id,
+                source_type,
+                "skipped_unconfigured",
+                0,
+                0,
+                "beads workspace_kind must be central or mounted",
+            )
         if source.get("credentials_path"):
             return source_status(
                 source_id,
@@ -198,18 +242,6 @@ def source_prerequisite_status(source: dict[str, Any]) -> dict[str, Any] | None:
                 0,
                 0,
                 "project-local .beads workspace is not allowed",
-            )
-        if (resolved_workspace_path / ".beads").exists() and source.get("workspace_kind") not in {
-            "central",
-            "mounted",
-        }:
-            return source_status(
-                source_id,
-                source_type,
-                "skipped_unconfigured",
-                0,
-                0,
-                "workspace with .beads requires workspace_kind central or mounted",
             )
         if not resolved_workspace_path.is_dir():
             return source_status(

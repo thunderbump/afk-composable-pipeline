@@ -47,10 +47,11 @@ The selector attempts every configured source. Unreachable or unauthenticated
 GitHub/Beads sources are skipped with explicit source status evidence instead
 of failing the whole run.
 
-Beads sources must point at an explicit absolute workspace mount. If that
-workspace contains a `.beads` directory, the source must also declare
+Beads sources must point at an explicit absolute workspace mount and declare
 `"workspace_kind": "central"` or `"workspace_kind": "mounted"` so a target
-checkout is not accidentally treated as the issue tracker.
+checkout is not accidentally treated as the issue tracker. Credential path
+overrides are not accepted; the mounted workspace must provide
+`secrets/dolt_beads_password.txt`.
 
 ## Ledger Artifacts
 
