@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "afk-composable-pipeline"
+version = "0.1.0"
+description = "Composable AFK pipeline scaffold with ledgered step execution."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+afk = "afk.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
