@@ -1011,6 +1011,62 @@ raise SystemExit("bd should not be called without credentials")
                 ],
             )
 
+    def test_beads_source_rejects_credentials_path_override(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            fake_bin = temp_path / "bin"
+            workspace = temp_path / "beads"
+            workspace.mkdir()
+            outside_secret = temp_path / "outside-secret"
+            outside_secret.write_text("secret", encoding="utf-8")
+            fake_bin.mkdir()
+            write_executable(
+                fake_bin / "bd",
+                f"""#!{sys.executable}
+raise SystemExit("bd should not be called with credentials_path override")
+""",
+            )
+
+            request = {
+                "sources": [
+                    {
+                        "type": "beads",
+                        "id": "central-beads",
+                        "workspace": str(workspace),
+                        "credentials_path": str(outside_secret),
+                        "labels": ["project:afk-composable-pipeline"],
+                    }
+                ],
+            }
+            ledger = temp_path / "ledger"
+            completed = run_afk(
+                "run-step",
+                "select-work",
+                "--input",
+                json.dumps(request),
+                "--ledger",
+                str(ledger),
+                env={"PATH": str(fake_bin)},
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+            self.assertEqual(
+                result["output"]["source_statuses"],
+                [
+                    {
+                        "source_id": "central-beads",
+                        "source_type": "beads",
+                        "status": "skipped_unconfigured",
+                        "candidate_count": 0,
+                        "selected_count": 0,
+                        "message": "credentials_path override is not supported",
+                    }
+                ],
+            )
+
 
 def write_executable(path, contents):
     path.write_text(contents, encoding="utf-8")

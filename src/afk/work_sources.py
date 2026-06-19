@@ -160,6 +160,15 @@ def source_prerequisite_status(source: dict[str, Any]) -> dict[str, Any] | None:
                 0,
                 "beads workspace is required",
             )
+        if source.get("credentials_path"):
+            return source_status(
+                source_id,
+                source_type,
+                "skipped_unconfigured",
+                0,
+                0,
+                "credentials_path override is not supported",
+            )
         workspace_path = Path(str(workspace))
         if not workspace_path.is_absolute():
             return source_status(
@@ -209,11 +218,7 @@ def source_prerequisite_status(source: dict[str, Any]) -> dict[str, Any] | None:
                 0,
                 "bd command is not available",
             )
-        credentials_path = source.get("credentials_path") or os.path.join(
-            str(workspace),
-            "secrets",
-            "dolt_beads_password.txt",
-        )
+        credentials_path = os.path.join(str(workspace), "secrets", "dolt_beads_password.txt")
         if not os.path.isfile(str(credentials_path)):
             return source_status(
                 source_id,
@@ -377,9 +382,7 @@ def github_afk_metadata(labels: list[str]) -> dict[str, Any]:
 
 def load_beads_issues(source: dict[str, Any]) -> list[dict[str, Any]]:
     workspace = Path(str(source["workspace"]))
-    credentials_path = Path(
-        str(source.get("credentials_path") or workspace / "secrets" / "dolt_beads_password.txt")
-    )
+    credentials_path = workspace / "secrets" / "dolt_beads_password.txt"
     password = read_beads_password(credentials_path)
     env = os.environ.copy()
     env["BEADS_DOLT_PASSWORD"] = password
