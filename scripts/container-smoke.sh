@@ -111,7 +111,7 @@ submodule_sha="$(git -C "$submodule_repo" rev-parse HEAD)"
   -v "$tmpdir:/work" \
   "$tag" \
   run-step prepare-checkout \
-  --input '{"repo_url":"/work/repo-src","base_ref":"main","checkout_path":"/work/checkout","review_branch":"afk/smoke-review"}' \
+  --input '{"repo_url":"/work/repo-src","base_ref":"main","checkout_root":"/work","checkout_path":"/work/checkout","review_branch":"afk/smoke-review"}' \
   --ledger /ledger > "$tmpdir/prepare-checkout-out.json"
 
 python3 - "$tmpdir/prepare-checkout-out.json" "$ledger" "$checkout" "$start_commit" "$submodule_sha" <<'PY'
@@ -127,6 +127,7 @@ submodule_sha = sys.argv[5]
 run_dir = ledger / "runs" / summary["run_id"]
 
 result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+publication = json.loads((run_dir / "publication-result.json").read_text(encoding="utf-8"))
 prepared = result["output"]
 submodule_git_file = checkout / "deps/submodule/.git"
 gitdir_prefix = "gitdir: "
@@ -139,6 +140,9 @@ assert prepared["status"] == "prepared", prepared
 assert prepared["start_commit"] == start_commit, prepared
 assert prepared["dirty"] is False, prepared
 assert prepared["publication"]["status"] == "skipped_disabled", prepared
+assert prepared["artifacts"]["publication"] == "publication-result.json", prepared
+assert publication["artifact_type"] == "checkout-publication", publication
+assert publication["output"] == prepared["publication"], publication
 assert prepared["submodules"] == [
     {
         "path": "deps/submodule",

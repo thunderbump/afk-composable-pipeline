@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import unquote, urlsplit
+
+from afk.redaction import redact_text, redact_url
 
 
 SCHEMA_VERSION = 1
@@ -45,6 +48,7 @@ def prepare_checkout(
         return request
 
     checkout_path = Path(request["checkout_path"])
+    checkout_root = Path(request["checkout_root"])
     repo_url = request["repo_url"]
     base_ref = request["base_ref"]
     requested_ref = request["requested_ref"]
@@ -68,12 +72,35 @@ def prepare_checkout(
                     dirty=True,
                     dirty_status=dirty["status_lines"],
                 )
+            origin_url = git(["remote", "get-url", "origin"], cwd=checkout_path)
+            if not repo_urls_match(origin_url, repo_url):
+                return failure_result(
+                    "failed_repo_mismatch",
+                    "existing checkout origin does not match requested repo_url",
+                    request,
+                    dirty=False,
+                    origin_url=origin_url,
+                )
         else:
             checkout_path.parent.mkdir(parents=True, exist_ok=True)
             git(["clone", repo_url, str(checkout_path)])
 
         git(["fetch", "origin", requested_ref], cwd=checkout_path)
-        git(["checkout", "-B", review_branch, "FETCH_HEAD"], cwd=checkout_path)
+        target_commit = git(["rev-parse", "FETCH_HEAD"], cwd=checkout_path)
+        branch_commit = local_branch_commit(checkout_path, review_branch)
+        if branch_commit and branch_commit != target_commit:
+            return failure_result(
+                "failed_existing_branch",
+                "review_branch already exists at a different commit; choose a fresh branch or remove it before reuse",
+                request,
+                dirty=False,
+                branch_commit=branch_commit,
+                target_commit=target_commit,
+            )
+        if branch_commit:
+            git(["checkout", review_branch], cwd=checkout_path)
+        else:
+            git(["checkout", "-b", review_branch, target_commit], cwd=checkout_path)
         git(["submodule", "update", "--init", "--recursive"], cwd=checkout_path)
 
         start_commit = git(["rev-parse", "HEAD"], cwd=checkout_path)
@@ -85,6 +112,7 @@ def prepare_checkout(
             "repo_url": redact_url(repo_url),
             "base_ref": base_ref,
             "requested_ref": requested_ref,
+            "checkout_root": str(checkout_root),
             "start_commit": start_commit,
             "review_branch": review_branch,
             "checkout_path": str(checkout_path),
@@ -92,6 +120,7 @@ def prepare_checkout(
             "dirty_status": dirty["status_lines"],
             "submodules": submodule_records(checkout_path),
             "publication": publication,
+            "artifacts": {"publication": "publication-result.json"},
         }
     except GitCommandError as exc:
         return git_failure_result(exc, request)
@@ -109,20 +138,38 @@ def normalize_request(input_data: Any, *, project_contract: Any, run_id: str) ->
         or base_ref
     )
     checkout_path = string_field(input_data, "checkout_path")
+    checkout_root = string_field(input_data, "checkout_root")
     review_branch = string_field(input_data, "review_branch") or f"afk/{run_id}"
     publish = input_data.get("publish", {"enabled": False})
 
-    for key in ("repo_url", "base_ref", "requested_ref", "ref", "checkout_path", "review_branch"):
+    for key in (
+        "repo_url",
+        "base_ref",
+        "requested_ref",
+        "ref",
+        "checkout_path",
+        "checkout_root",
+        "review_branch",
+    ):
         if key in input_data and input_data[key] is not None and not isinstance(input_data[key], str):
             return invalid_request(f"{key} must be a string")
     if not repo_url:
         return invalid_request("repo_url is required")
+    if url_has_credentials(repo_url):
+        return invalid_request("repo_url must not contain embedded credentials")
     if not base_ref:
         return invalid_request("base_ref is required")
     if not requested_ref:
         return invalid_request("requested_ref is required")
+    if not checkout_root:
+        return invalid_request("checkout_root is required")
     if not checkout_path:
         return invalid_request("checkout_path is required")
+    path_error = checkout_path_error(checkout_root, checkout_path)
+    if path_error is not None:
+        return invalid_request(path_error)
+    if not review_branch_allowed(review_branch):
+        return invalid_request("review_branch must be a safe afk/* branch name")
     if "publish" in input_data and not isinstance(publish, dict):
         return invalid_request("publish must be an object")
     if not isinstance(publish.get("enabled", False), bool):
@@ -130,6 +177,11 @@ def normalize_request(input_data: Any, *, project_contract: Any, run_id: str) ->
     for key in ("remote", "branch"):
         if key in publish and publish[key] is not None and not isinstance(publish[key], str):
             return invalid_request(f"publish.{key} must be a string")
+    if publish.get("remote") not in (None, "origin"):
+        return invalid_request("publish.remote must be origin")
+    publish_branch = string_field(publish, "branch") or review_branch
+    if not review_branch_allowed(publish_branch):
+        return invalid_request("publish.branch must be a safe afk/* branch name")
 
     return {
         "schema_version": SCHEMA_VERSION,
@@ -137,6 +189,7 @@ def normalize_request(input_data: Any, *, project_contract: Any, run_id: str) ->
         "repo_url": repo_url,
         "base_ref": base_ref,
         "requested_ref": requested_ref,
+        "checkout_root": checkout_root,
         "checkout_path": checkout_path,
         "review_branch": review_branch,
         "publish": publish,
@@ -149,6 +202,7 @@ def invalid_request(message: str) -> dict[str, Any]:
         "status": "failed_invalid_payload",
         "message": message,
         "publication": disabled_publication(),
+        "artifacts": {"publication": "publication-result.json"},
     }
 
 
@@ -161,6 +215,34 @@ def string_field(input_data: dict[str, Any], key: str) -> str | None:
 
 def is_git_checkout(path: Path) -> bool:
     return (path / ".git").is_dir()
+
+
+def checkout_path_error(checkout_root: str, checkout_path: str) -> str | None:
+    root = Path(checkout_root)
+    path = Path(checkout_path)
+    if not root.is_absolute():
+        return "checkout_root must be absolute"
+    if not path.is_absolute():
+        return "checkout_path must be absolute"
+    root_resolved = root.resolve(strict=False)
+    path_resolved = path.resolve(strict=False)
+    if path_resolved == root_resolved:
+        return "checkout_path must be inside checkout_root, not equal to it"
+    try:
+        path_resolved.relative_to(root_resolved)
+    except ValueError:
+        return "checkout_path must be inside checkout_root"
+    return None
+
+
+def review_branch_allowed(branch: str) -> bool:
+    if not branch.startswith("afk/"):
+        return False
+    if branch.endswith("/") or branch.endswith(".lock"):
+        return False
+    if ".." in branch or "//" in branch or "@{" in branch:
+        return False
+    return re.fullmatch(r"[A-Za-z0-9._/-]+", branch) is not None
 
 
 def dirty_tree(path: Path) -> dict[str, Any]:
@@ -236,21 +318,33 @@ def failure_result(
     *,
     dirty: bool,
     dirty_status: list[str] | None = None,
+    origin_url: str | None = None,
+    branch_commit: str | None = None,
+    target_commit: str | None = None,
 ) -> dict[str, Any]:
-    return {
+    result = {
         "schema_version": SCHEMA_VERSION,
         "status": status,
         "message": message,
         "repo_url": redact_url(str(request.get("repo_url") or "")),
         "base_ref": request.get("base_ref"),
         "requested_ref": request.get("requested_ref"),
+        "checkout_root": request.get("checkout_root"),
         "review_branch": request.get("review_branch"),
         "checkout_path": request.get("checkout_path"),
         "dirty": dirty,
         "dirty_status": dirty_status or [],
         "submodules": [],
         "publication": disabled_publication(),
+        "artifacts": {"publication": "publication-result.json"},
     }
+    if origin_url is not None:
+        result["origin_url"] = redact_url(origin_url)
+    if branch_commit is not None:
+        result["branch_commit"] = branch_commit
+    if target_commit is not None:
+        result["target_commit"] = target_commit
+    return result
 
 
 def git_failure_result(exc: GitCommandError, request: dict[str, Any]) -> dict[str, Any]:
@@ -264,7 +358,7 @@ def git_failure_result(exc: GitCommandError, request: dict[str, Any]) -> dict[st
         "command": safe_command(exc.command),
         "cwd": str(exc.cwd) if exc.cwd else None,
         "returncode": exc.returncode,
-        "stderr": exc.stderr[-2000:],
+        "stderr": redact_text(exc.stderr[-2000:]),
     }
     return result
 
@@ -299,11 +393,35 @@ def safe_command(command: list[str]) -> list[str]:
     return [redact_url(part) for part in command]
 
 
-def redact_url(value: str) -> str:
+def local_branch_commit(checkout_path: Path, branch: str) -> str | None:
+    try:
+        return git(["rev-parse", "--verify", f"refs/heads/{branch}"], cwd=checkout_path)
+    except GitCommandError:
+        return None
+
+
+def repo_urls_match(existing_url: str, requested_url: str) -> bool:
+    return repo_url_identity(existing_url) == repo_url_identity(requested_url)
+
+
+def repo_url_identity(value: str) -> tuple[str, str]:
     parsed = urlsplit(value)
-    if not parsed.scheme or "@" not in parsed.netloc:
-        return value
-    host = parsed.hostname or ""
-    if parsed.port is not None:
-        host = f"{host}:{parsed.port}"
-    return urlunsplit((parsed.scheme, host, parsed.path, parsed.query, parsed.fragment))
+    if parsed.scheme == "file":
+        return ("path", str(Path(unquote(parsed.path)).resolve(strict=False)))
+    if parsed.scheme:
+        netloc = parsed.netloc.lower()
+        path = parsed.path.rstrip("/")
+        if path.endswith(".git"):
+            path = path[:-4]
+        return ("url", f"{parsed.scheme.lower()}://{netloc}{path}")
+    if "://" not in value and not value.startswith("git@") and ":" not in value:
+        return ("path", str(Path(value).resolve(strict=False)))
+    normalized = value.rstrip("/")
+    if normalized.endswith(".git"):
+        normalized = normalized[:-4]
+    return ("url", normalized)
+
+
+def url_has_credentials(value: str) -> bool:
+    parsed = urlsplit(value)
+    return bool(parsed.scheme and (parsed.username or parsed.password))
