@@ -130,15 +130,6 @@ def source_prerequisite_status(source: dict[str, Any]) -> dict[str, Any] | None:
                 0,
                 "GitHub repo and labels or query are required",
             )
-        if not (os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")):
-            return source_status(
-                source_id,
-                source_type,
-                "skipped_no_auth",
-                0,
-                0,
-                "GH_TOKEN or GITHUB_TOKEN is required",
-            )
         if shutil.which("gh") is None:
             return source_status(
                 source_id,
@@ -147,6 +138,15 @@ def source_prerequisite_status(source: dict[str, Any]) -> dict[str, Any] | None:
                 0,
                 0,
                 "gh command is not available",
+            )
+        if not github_auth_available():
+            return source_status(
+                source_id,
+                source_type,
+                "skipped_no_auth",
+                0,
+                0,
+                "GH_TOKEN or GITHUB_TOKEN is required",
             )
         return None
     if source_type == "beads":
@@ -178,6 +178,18 @@ def source_prerequisite_status(source: dict[str, Any]) -> dict[str, Any] | None:
                 0,
                 0,
                 "project-local .beads workspace is not allowed",
+            )
+        if (workspace_path / ".beads").exists() and source.get("workspace_kind") not in {
+            "central",
+            "mounted",
+        }:
+            return source_status(
+                source_id,
+                source_type,
+                "skipped_unconfigured",
+                0,
+                0,
+                "workspace with .beads requires workspace_kind central or mounted",
             )
         if not os.path.isdir(str(workspace)):
             return source_status(
@@ -220,6 +232,22 @@ def source_prerequisite_status(source: dict[str, Any]) -> dict[str, Any] | None:
         0,
         "unsupported source type",
     )
+
+
+def github_auth_available() -> bool:
+    if os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN"):
+        return True
+    try:
+        completed = subprocess.run(
+            ["gh", "auth", "status", "--hostname", "github.com"],
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=15,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return completed.returncode == 0
 
 
 def load_source_items(source: dict[str, Any]) -> Any:
@@ -516,7 +544,7 @@ def run_json_command(
 
 def extract_acceptance_criteria(value: Any) -> list[str]:
     if isinstance(value, list):
-        return [str(item) for item in value if str(item)]
+        return [item for item in value if isinstance(item, str) and item]
     if not isinstance(value, str):
         return []
     criteria = []
@@ -551,6 +579,8 @@ def candidate_payload_error(raw_item: Any) -> str | None:
     if not isinstance(raw_item, dict):
         return "invalid_candidate_payload"
     if "labels" in raw_item and not isinstance(raw_item["labels"], list):
+        return "invalid_candidate_payload"
+    if "labels" in raw_item and any(not isinstance(label, str) for label in raw_item["labels"]):
         return "invalid_candidate_payload"
     if "dependencies" in raw_item and not isinstance(raw_item["dependencies"], list):
         return "invalid_candidate_payload"
