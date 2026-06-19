@@ -7,6 +7,10 @@ from urllib.parse import urlsplit, urlunsplit
 URL_PATTERN = re.compile(r"(?P<url>[A-Za-z][A-Za-z0-9+.-]*://[^\s\"'<>]+)")
 TRAILING_URL_PUNCTUATION = ".,;:)]}"
 SECRET_KEY_PATTERN = re.compile(r"(auth|credential|password|secret|token|api[_-]?key|env)", re.IGNORECASE)
+SECRET_FLAG_PATTERN = re.compile(
+    r"^--?(auth-file|auth_file|credentials|credentials-path|credentials_path|token|api-key|api_key|password)(=.*)?$",
+    re.IGNORECASE,
+)
 SECRET_ASSIGNMENT_PATTERN = re.compile(
     r"(?P<key>[A-Za-z_][A-Za-z0-9_]*(?:TOKEN|SECRET|PASSWORD|AUTH|API_KEY|CREDENTIAL)[A-Za-z0-9_]*)"
     r"(?P<separator>\s*[:=]\s*)"
@@ -28,10 +32,35 @@ def redact_artifact_value_for_key(key: str | None, value: Any) -> Any:
             for item_key, item in value.items()
         }
     if isinstance(value, list):
+        if key == "command":
+            return redact_command_list(value)
         return [redact_artifact_value_for_key(key, item) for item in value]
     if isinstance(value, str):
         return redact_text(value)
     return value
+
+
+def redact_command_list(value: list[Any]) -> list[Any]:
+    redacted: list[Any] = []
+    redact_next = False
+    for item in value:
+        if not isinstance(item, str):
+            redacted.append(redact_artifact_value_for_key(None, item))
+            redact_next = False
+            continue
+        if redact_next:
+            redacted.append("[REDACTED]")
+            redact_next = False
+            continue
+        if SECRET_FLAG_PATTERN.match(item):
+            if "=" in item:
+                redacted.append(item.split("=", 1)[0] + "=[REDACTED]")
+            else:
+                redacted.append(item)
+                redact_next = True
+            continue
+        redacted.append(redact_text(item))
+    return redacted
 
 
 def redact_text(value: str) -> str:

@@ -86,7 +86,7 @@ def implement(
         stdout = redact_text(exc.stdout)
         stderr = redact_text(exc.stderr or exc.message)
         write_adapter_logs(stdout, stderr)
-        after_metadata = git_metadata(checkout_path, request["checkout"]["start_commit"])
+        after_metadata = safe_git_metadata(checkout_path, request["checkout"]["start_commit"])
         normalized = normalized_agent_result(
             status="failed_runtime",
             classification="runtime_failure",
@@ -109,7 +109,7 @@ def implement(
         cleanup=True,
     )
     if agent_payload["status"] != "valid":
-        after_metadata = git_metadata(checkout_path, request["checkout"]["start_commit"])
+        after_metadata = safe_git_metadata(checkout_path, request["checkout"]["start_commit"])
         normalized = normalized_agent_result(
             status="failed_protocol",
             classification="protocol_failure",
@@ -122,7 +122,7 @@ def implement(
         )
         return implement_output(capsule, normalized, after_metadata)
 
-    after_metadata = git_metadata(checkout_path, request["checkout"]["start_commit"])
+    after_metadata = safe_git_metadata(checkout_path, request["checkout"]["start_commit"])
     normalized = normalize_agent_payload(
         agent_payload["payload"],
         adapter={"type": request["agent"]["type"], "returncode": adapter_result["returncode"]},
@@ -292,6 +292,9 @@ def normalize_agent(agent: Any) -> dict[str, Any]:
     command = agent.get("command")
     if not is_string_list(command):
         return {"status": "invalid", "message": "agent.command must be a list of strings"}
+    command_secret_error = agent_command_secret_error(command)
+    if command_secret_error:
+        return {"status": "invalid", "message": command_secret_error}
     result_path = string_field(agent, "result_path") or "agent-result.json"
     if result_path_error(result_path) is not None:
         return {"status": "invalid", "message": result_path_error(result_path)}
@@ -380,7 +383,7 @@ def run_fake_pi_command(
 
 def minimal_agent_environment() -> dict[str, str]:
     env: dict[str, str] = {}
-    for key in ("PATH", "HOME", "LANG", "LC_ALL", "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL"):
+    for key in ("PATH", "LANG", "LC_ALL", "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL"):
         value = os.environ.get(key)
         if value is not None:
             env[key] = value
@@ -565,6 +568,17 @@ def fallback_git_metadata(start_commit: str) -> dict[str, Any]:
     }
 
 
+def safe_git_metadata(checkout_path: Path, before_commit: str) -> dict[str, Any]:
+    try:
+        return git_metadata(checkout_path, before_commit)
+    except AgentRuntimeError as exc:
+        return {
+            **fallback_git_metadata(before_commit),
+            "metadata_status": "failed",
+            "metadata_error": redact_text(exc.message),
+        }
+
+
 def git_metadata(checkout_path: Path, before_commit: str) -> dict[str, Any]:
     after_commit = git(checkout_path, ["rev-parse", "HEAD"])
     dirty_lines = [line for line in git(checkout_path, ["status", "--porcelain=v1"]).splitlines() if line]
@@ -639,11 +653,35 @@ def write_adapter_logs(stdout: str, stderr: str) -> None:
 
 
 def result_path_error(result_path: str) -> str | None:
+    if result_path != "agent-result.json":
+        return "agent.result_path must be agent-result.json"
     path = Path(result_path)
     if path.is_absolute():
         return "agent.result_path must be relative"
     if any(part in {"", ".", ".."} for part in path.parts):
         return "agent.result_path must stay inside the checkout"
+    return None
+
+
+def agent_command_secret_error(command: list[str]) -> str | None:
+    forbidden_flags = {
+        "--auth-file",
+        "--auth_file",
+        "--credentials",
+        "--credentials-path",
+        "--credentials_path",
+        "--token",
+        "--api-key",
+        "--api_key",
+        "--password",
+    }
+    for part in command:
+        normalized = part.strip().lower()
+        if normalized in forbidden_flags:
+            return f"agent.command must not include credential flag {normalized}"
+        if any(normalized.startswith(f"{flag}=") for flag in forbidden_flags):
+            flag = normalized.split("=", 1)[0]
+            return f"agent.command must not include credential flag {flag}"
     return None
 
 

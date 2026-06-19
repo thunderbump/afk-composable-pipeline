@@ -6,7 +6,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from afk.redaction import redact_text, redact_url  # noqa: E402
+from afk.redaction import redact_artifact_value, redact_text, redact_url  # noqa: E402
 
 
 class RedactionTest(unittest.TestCase):
@@ -28,6 +28,28 @@ class RedactionTest(unittest.TestCase):
         self.assertNotIn("hidden-secret", redacted)
         self.assertNotIn("token=", redacted)
         self.assertIn("'https://example.invalid/private.git':", redacted)
+
+    def test_redacts_command_list_credential_flags(self):
+        payload = {
+            "agent": {
+                "command": [
+                    "pi",
+                    "--auth-file",
+                    "/tmp/pi-auth-secret-token",
+                    "--token=pi-secret-token",
+                ]
+            }
+        }
+
+        redacted = redact_artifact_value(payload)
+        text = repr(redacted)
+
+        self.assertNotIn("pi-auth-secret-token", text)
+        self.assertNotIn("pi-secret-token", text)
+        self.assertEqual(
+            redacted["agent"]["command"],
+            ["pi", "--auth-file", "[REDACTED]", "--token=[REDACTED]"],
+        )
 
 
 if __name__ == "__main__":
