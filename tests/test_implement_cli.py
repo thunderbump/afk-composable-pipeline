@@ -707,6 +707,9 @@ class ImplementCliTest(unittest.TestCase):
                                 f"--credential.file=/tmp/{secret}-dotted-credential",
                                 "--access-token",
                                 f"{secret}-access",
+                                "--api.key",
+                                f"{secret}-api-dot",
+                                f"--api.key={secret}-api-dot-equals",
                                 f"--token={secret}",
                                 f"--github-token={secret}-github",
                             ],
@@ -732,6 +735,8 @@ class ImplementCliTest(unittest.TestCase):
             self.assertNotIn(secret, artifact_text)
             self.assertNotIn(f"{secret}-dotted-auth", artifact_text)
             self.assertNotIn(f"{secret}-dotted-credential", artifact_text)
+            self.assertNotIn(f"{secret}-api-dot", artifact_text)
+            self.assertNotIn(f"{secret}-api-dot-equals", artifact_text)
             self.assertNotIn("should not run", (run_dir / "stdout.log").read_text(encoding="utf-8"))
 
     def test_implement_refuses_checkout_with_mismatched_start_commit_before_adapter_runs(self):

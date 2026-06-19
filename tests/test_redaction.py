@@ -43,6 +43,9 @@ class RedactionTest(unittest.TestCase):
                     "--credential.file=/tmp/pi-dotted-credential-secret",
                     "--access-token",
                     "access-secret",
+                    "--api.key",
+                    "api-dot-secret",
+                    "--api.key=api-dot-equals-secret",
                     "--token=pi-secret-token",
                     "--github-token=github-secret",
                 ]
@@ -57,6 +60,8 @@ class RedactionTest(unittest.TestCase):
         self.assertNotIn("pi-credential-secret", text)
         self.assertNotIn("pi-dotted-credential-secret", text)
         self.assertNotIn("access-secret", text)
+        self.assertNotIn("api-dot-secret", text)
+        self.assertNotIn("api-dot-equals-secret", text)
         self.assertNotIn("pi-secret-token", text)
         self.assertNotIn("github-secret", text)
         self.assertEqual(
@@ -72,6 +77,9 @@ class RedactionTest(unittest.TestCase):
                 "--credential.file=[REDACTED]",
                 "--access-token",
                 "[REDACTED]",
+                "--api.key",
+                "[REDACTED]",
+                "--api.key=[REDACTED]",
                 "--token=[REDACTED]",
                 "--github-token=[REDACTED]",
             ],

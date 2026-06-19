@@ -6,9 +6,9 @@ from urllib.parse import urlsplit, urlunsplit
 
 URL_PATTERN = re.compile(r"(?P<url>[A-Za-z][A-Za-z0-9+.-]*://[^\s\"'<>]+)")
 TRAILING_URL_PUNCTUATION = ".,;:)]}"
-SECRET_KEY_PATTERN = re.compile(r"(auth|credential|password|secret|token|api[_-]?key|env)", re.IGNORECASE)
+SECRET_KEY_PATTERN = re.compile(r"(auth|credential|password|secret|token|api[._-]?key|env)", re.IGNORECASE)
 SECRET_FLAG_NAME_PATTERN = re.compile(
-    r"(auth|credential|password|secret|token|api[-_]?key)",
+    r"(auth|credential|password|secret|token|api[._-]?key)",
     re.IGNORECASE,
 )
 SECRET_ASSIGNMENT_PATTERN = re.compile(
