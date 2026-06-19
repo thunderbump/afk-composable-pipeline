@@ -460,6 +460,47 @@ class PrepareCheckoutCliTest(unittest.TestCase):
             self.assertNotIn(secret, artifact_text)
             self.assertIn("https://example.invalid/repo.git", artifact_text)
 
+    def test_prepare_checkout_redacts_query_token_repo_url_from_artifacts(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            secret = "query-secret-token"
+            completed = run_afk(
+                "run-step",
+                "prepare-checkout",
+                "--input",
+                json.dumps(
+                    {
+                        "repo_url": f"https://example.invalid/repo.git?token={secret}",
+                        "base_ref": "main",
+                        "checkout_root": str(temp_path),
+                        "checkout_path": str(temp_path / "checkout"),
+                        "review_branch": "afk/test-review",
+                    }
+                ),
+                "--ledger",
+                str(temp_path / "ledger"),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = temp_path / "ledger/runs" / summary["run_id"]
+            artifact_text = "\n".join(
+                path.read_text(encoding="utf-8")
+                for path in [
+                    run_dir / "command.json",
+                    run_dir / "ledger.jsonl",
+                    run_dir / "step-result.json",
+                    run_dir / "publication-result.json",
+                    run_dir / "stdout.log",
+                    run_dir / "stderr.log",
+                ]
+            )
+            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+            self.assertEqual(result["output"]["status"], "failed_invalid_payload")
+            self.assertNotIn(secret, artifact_text)
+            self.assertNotIn("token=", artifact_text)
+            self.assertIn("https://example.invalid/repo.git", artifact_text)
+
     def test_prepare_checkout_requires_checkout_path_inside_root(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
@@ -495,31 +536,33 @@ class PrepareCheckoutCliTest(unittest.TestCase):
             temp_path = Path(temp_dir)
             repo, _start_commit, _submodule_sha = create_repo_with_submodule(temp_path)
 
-            main_branch = run_afk(
-                "run-step",
-                "prepare-checkout",
-                "--input",
-                json.dumps(
-                    {
-                        "repo_url": str(repo),
-                        "base_ref": "main",
-                        "checkout_root": str(temp_path),
-                        "checkout_path": str(temp_path / "checkout-main"),
-                        "review_branch": "main",
-                    }
-                ),
-                "--ledger",
-                str(temp_path / "ledger"),
-                env_overrides={"GIT_ALLOW_PROTOCOL": "file"},
-            )
-            self.assertEqual(main_branch.returncode, 0, main_branch.stderr)
-            summary = json.loads(main_branch.stdout)
-            run_dir = temp_path / "ledger/runs" / summary["run_id"]
-            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
-            self.assertEqual(
-                result["output"]["message"],
-                "review_branch must be a safe afk/* branch name",
-            )
+            for branch in ("main", "afk/.hidden", "afk/foo.lock/bar", "afk/trailing."):
+                with self.subTest(branch=branch):
+                    completed = run_afk(
+                        "run-step",
+                        "prepare-checkout",
+                        "--input",
+                        json.dumps(
+                            {
+                                "repo_url": str(repo),
+                                "base_ref": "main",
+                                "checkout_root": str(temp_path),
+                                "checkout_path": str(temp_path / f"checkout-{branch.replace('/', '-')}"),
+                                "review_branch": branch,
+                            }
+                        ),
+                        "--ledger",
+                        str(temp_path / "ledger"),
+                        env_overrides={"GIT_ALLOW_PROTOCOL": "file"},
+                    )
+                    self.assertEqual(completed.returncode, 0, completed.stderr)
+                    summary = json.loads(completed.stdout)
+                    run_dir = temp_path / "ledger/runs" / summary["run_id"]
+                    result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+                    self.assertEqual(
+                        result["output"]["message"],
+                        "review_branch must be a safe afk/* branch name",
+                    )
 
             publish_main = run_afk(
                 "run-step",

@@ -155,8 +155,8 @@ def normalize_request(input_data: Any, *, project_contract: Any, run_id: str) ->
             return invalid_request(f"{key} must be a string")
     if not repo_url:
         return invalid_request("repo_url is required")
-    if url_has_credentials(repo_url):
-        return invalid_request("repo_url must not contain embedded credentials")
+    if url_has_secret_material(repo_url):
+        return invalid_request("repo_url must not contain embedded credentials or query parameters")
     if not base_ref:
         return invalid_request("base_ref is required")
     if not requested_ref:
@@ -242,7 +242,16 @@ def review_branch_allowed(branch: str) -> bool:
         return False
     if ".." in branch or "//" in branch or "@{" in branch:
         return False
-    return re.fullmatch(r"[A-Za-z0-9._/-]+", branch) is not None
+    if re.fullmatch(r"[A-Za-z0-9._/-]+", branch) is None:
+        return False
+    for component in branch.split("/"):
+        if not component:
+            return False
+        if component.startswith(".") or component.endswith("."):
+            return False
+        if component.endswith(".lock"):
+            return False
+    return True
 
 
 def dirty_tree(path: Path) -> dict[str, Any]:
@@ -422,6 +431,6 @@ def repo_url_identity(value: str) -> tuple[str, str]:
     return ("url", normalized)
 
 
-def url_has_credentials(value: str) -> bool:
+def url_has_secret_material(value: str) -> bool:
     parsed = urlsplit(value)
-    return bool(parsed.scheme and (parsed.username or parsed.password))
+    return bool(parsed.scheme and (parsed.username or parsed.password or parsed.query or parsed.fragment))
