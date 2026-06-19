@@ -1068,6 +1068,189 @@ else:
                 result["output"]["source_statuses"][0]["message"],
             )
 
+    def test_beads_source_rejects_non_scalar_issue_ids(self):
+        secret = "beads-secret-value"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            fake_bin = temp_path / "bin"
+            workspace = temp_path / "beads"
+            (workspace / "secrets").mkdir(parents=True)
+            (workspace / "secrets" / "dolt_beads_password.txt").write_text(secret, encoding="utf-8")
+            fake_bin.mkdir()
+            write_executable(
+                fake_bin / "bd",
+                f"""#!{sys.executable}
+import json
+import sys
+
+if len(sys.argv) > 1 and sys.argv[1] == "list":
+    print(json.dumps([{{"id": "central-lve.badid"}}]))
+elif len(sys.argv) > 2 and sys.argv[1] == "show":
+    print(json.dumps({{
+        "id": ["central-lve.badid"],
+        "title": "Malformed id",
+        "status": "open",
+        "labels": ["afk:ready"],
+        "metadata": {{"afk_ready": True}},
+        "dependencies": [],
+    }}))
+else:
+    sys.exit(9)
+""",
+            )
+
+            request = {
+                "sources": [
+                    {
+                        "type": "beads",
+                        "id": "central-beads",
+                        "workspace": str(workspace),
+                        "workspace_kind": "mounted",
+                        "labels": ["afk:ready"],
+                    }
+                ],
+            }
+            ledger = temp_path / "ledger"
+            completed = run_afk(
+                "run-step",
+                "select-work",
+                "--input",
+                json.dumps(request),
+                "--ledger",
+                str(ledger),
+                env={"PATH": str(fake_bin)},
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+            self.assertEqual(result["output"]["selected_work"], [])
+            self.assertEqual(result["output"]["skipped_candidates"], [])
+            self.assertEqual(result["output"]["source_statuses"][0]["status"], "failed_invalid_payload")
+            self.assertEqual(
+                result["output"]["source_statuses"][0]["message"],
+                "bd show returned issue without stable id",
+            )
+
+    def test_beads_source_rejects_non_scalar_list_ids_before_show(self):
+        secret = "beads-secret-value"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            fake_bin = temp_path / "bin"
+            workspace = temp_path / "beads"
+            (workspace / "secrets").mkdir(parents=True)
+            (workspace / "secrets" / "dolt_beads_password.txt").write_text(secret, encoding="utf-8")
+            fake_bin.mkdir()
+            write_executable(
+                fake_bin / "bd",
+                f"""#!{sys.executable}
+import json
+import sys
+
+if len(sys.argv) > 1 and sys.argv[1] == "list":
+    print(json.dumps([{{"id": ["central-lve.badid"]}}]))
+elif len(sys.argv) > 2 and sys.argv[1] == "show":
+    raise SystemExit("bd show should not be called for non-scalar list ids")
+else:
+    sys.exit(9)
+""",
+            )
+
+            request = {
+                "sources": [
+                    {
+                        "type": "beads",
+                        "id": "central-beads",
+                        "workspace": str(workspace),
+                        "workspace_kind": "mounted",
+                        "labels": ["afk:ready"],
+                    }
+                ],
+            }
+            ledger = temp_path / "ledger"
+            completed = run_afk(
+                "run-step",
+                "select-work",
+                "--input",
+                json.dumps(request),
+                "--ledger",
+                str(ledger),
+                env={"PATH": str(fake_bin)},
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+            self.assertEqual(result["output"]["selected_work"], [])
+            self.assertEqual(result["output"]["source_statuses"][0]["status"], "failed_invalid_payload")
+            self.assertEqual(
+                result["output"]["source_statuses"][0]["message"],
+                "bd list returned issue without id",
+            )
+
+    def test_github_source_rejects_issue_without_numeric_number(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            fake_bin = temp_path / "bin"
+            fake_bin.mkdir()
+            write_executable(
+                fake_bin / "gh",
+                f"""#!{sys.executable}
+import json
+import sys
+
+if sys.argv[1:3] == ["issue", "list"]:
+    print(json.dumps([
+        {{
+            "number": ["not-a-number"],
+            "title": "Malformed GitHub issue",
+            "state": "OPEN",
+            "url": "https://github.com/example/repo/issues/bad",
+            "body": "",
+            "labels": [{{"name": "afk:ready"}}],
+        }}
+    ]))
+elif sys.argv[1:2] == ["api"]:
+    raise SystemExit("gh api should not be called for malformed issue number")
+else:
+    sys.exit(9)
+""",
+            )
+
+            request = {
+                "sources": [
+                    {
+                        "type": "github_issues",
+                        "id": "github",
+                        "repo": "example/repo",
+                        "labels": ["afk:ready"],
+                    }
+                ],
+            }
+            ledger = temp_path / "ledger"
+            completed = run_afk(
+                "run-step",
+                "select-work",
+                "--input",
+                json.dumps(request),
+                "--ledger",
+                str(ledger),
+                env={"GH_TOKEN": "fake-token", "PATH": str(fake_bin)},
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+            self.assertEqual(result["output"]["selected_work"], [])
+            self.assertEqual(result["output"]["source_statuses"][0]["status"], "failed_invalid_payload")
+            self.assertEqual(
+                result["output"]["source_statuses"][0]["message"],
+                "gh issue list returned issue without numeric number",
+            )
+
     def test_beads_source_rejects_project_local_beads_workspace(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)

@@ -360,6 +360,8 @@ def load_github_issues(source: dict[str, Any]) -> list[dict[str, Any]]:
     for issue in issues:
         if not isinstance(issue, dict):
             raise SourceLoadError("failed_invalid_payload", "gh issue list returned invalid issue")
+        if not isinstance(issue.get("number"), int) or isinstance(issue.get("number"), bool):
+            raise SourceLoadError("failed_invalid_payload", "gh issue list returned issue without numeric number")
         dependencies = load_github_dependencies(repo, issue.get("number"))
         normalized.append(
             normalize_github_issue(str(source.get("id") or "github"), source, issue, dependencies)
@@ -478,9 +480,9 @@ def load_beads_issues(source: dict[str, Any]) -> list[dict[str, Any]]:
     normalized = []
     for issue_summary in issues:
         issue_id = issue_summary.get("id") if isinstance(issue_summary, dict) else None
-        if not issue_id:
+        if not is_non_blank_string(issue_id):
             raise SourceLoadError("failed_invalid_payload", "bd list returned issue without id")
-        issue = load_beads_issue(str(issue_id), workspace=workspace, env=env)
+        issue = load_beads_issue(issue_id.strip(), workspace=workspace, env=env)
         normalized.append(normalize_beads_issue(str(source.get("id") or "beads"), source, issue))
     return normalized
 
@@ -511,10 +513,13 @@ def load_beads_issue(issue_id: str, *, workspace: Path, env: dict[str, str]) -> 
 
 
 def normalize_beads_issue(source_id: str, source: dict[str, Any], issue: dict[str, Any]) -> dict[str, Any]:
+    issue_id = issue.get("id")
+    if not is_non_blank_string(issue_id):
+        raise SourceLoadError("failed_invalid_payload", "bd show returned issue without stable id")
     metadata = issue.get("metadata") if isinstance(issue.get("metadata"), dict) else {}
     labels = [str(label) for label in issue.get("labels") or []]
     return {
-        "external_id": str(issue.get("id") or ""),
+        "external_id": issue_id.strip(),
         "url": beads_issue_url(source, issue),
         "title": str(issue.get("title") or ""),
         "status": str(issue.get("status") or ""),
@@ -525,7 +530,7 @@ def normalize_beads_issue(source_id: str, source: dict[str, Any], issue: dict[st
         "dependencies": beads_dependencies(issue.get("dependencies") or []),
         "blockers": [],
         "afk": beads_afk_metadata(metadata, labels),
-        "raw": {"beads": {"id": issue.get("id")}},
+        "raw": {"beads": {"id": issue_id.strip()}},
     }
 
 
