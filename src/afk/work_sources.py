@@ -360,7 +360,7 @@ def load_github_issues(source: dict[str, Any]) -> list[dict[str, Any]]:
     for issue in issues:
         if not isinstance(issue, dict):
             raise SourceLoadError("failed_invalid_payload", "gh issue list returned invalid issue")
-        if not isinstance(issue.get("number"), int) or isinstance(issue.get("number"), bool):
+        if not valid_github_issue_number(issue.get("number")):
             raise SourceLoadError("failed_invalid_payload", "gh issue list returned issue without numeric number")
         dependencies = load_github_dependencies(repo, issue.get("number"))
         normalized.append(
@@ -370,7 +370,7 @@ def load_github_issues(source: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def load_github_dependencies(repo: str, issue_number: Any) -> list[dict[str, str]]:
-    if isinstance(issue_number, bool) or not isinstance(issue_number, int):
+    if not valid_github_issue_number(issue_number):
         return unknown_github_dependency()
     endpoint = f"repos/{repo}/issues/{issue_number}/dependencies/blocked_by"
     try:
@@ -384,6 +384,10 @@ def load_github_dependencies(repo: str, issue_number: Any) -> list[dict[str, str
     if not isinstance(dependencies, list):
         return unknown_github_dependency()
     return [normalize_github_dependency(dependency) for dependency in dependencies]
+
+
+def valid_github_issue_number(issue_number: Any) -> bool:
+    return isinstance(issue_number, int) and not isinstance(issue_number, bool) and issue_number > 0
 
 
 def unknown_github_dependency() -> list[dict[str, str]]:
