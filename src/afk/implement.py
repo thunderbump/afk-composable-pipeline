@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from afk.jsonutil import canonical_json
-from afk.redaction import SECRET_FLAG_NAME_PATTERN, redact_artifact_value, redact_text
+from afk.redaction import is_secret_command_flag, redact_artifact_value, redact_text
 
 
 SCHEMA_VERSION = 1
@@ -342,9 +342,10 @@ def run_fake_pi_command(
     capsule: dict[str, Any],
 ) -> dict[str, Any]:
     with tempfile.TemporaryDirectory() as temp_dir:
-        capsule_path = Path(temp_dir) / "job-capsule.json"
+        temp_path = Path(temp_dir)
+        capsule_path = temp_path / "job-capsule.json"
         capsule_path.write_text(canonical_json(capsule) + "\n", encoding="utf-8")
-        env = minimal_agent_environment()
+        env = minimal_agent_environment(temp_path)
         env["AFK_JOB_CAPSULE"] = str(capsule_path)
         try:
             completed = subprocess.run(
@@ -381,20 +382,28 @@ def run_fake_pi_command(
     }
 
 
-def minimal_agent_environment() -> dict[str, str]:
+def minimal_agent_environment(temp_path: Path) -> dict[str, str]:
     env: dict[str, str] = {}
     for key in ("PATH", "LANG", "LC_ALL", "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL"):
         value = os.environ.get(key)
         if value is not None:
             env[key] = value
+    home_path = temp_path / "home"
+    xdg_config_home = temp_path / "xdg-config"
+    home_path.mkdir()
+    xdg_config_home.mkdir()
+    env["HOME"] = str(home_path)
+    env["XDG_CONFIG_HOME"] = str(xdg_config_home)
     return env
 
 
 def remove_existing_agent_result(agent_result_path: Path, checkout_path: Path) -> dict[str, Any]:
     try:
-        agent_result_path.resolve(strict=False).relative_to(checkout_path.resolve())
+        agent_result_path.parent.resolve(strict=False).relative_to(checkout_path.resolve())
     except ValueError:
         return {"status": "invalid", "message": "agent result_path escaped checkout"}
+    if agent_result_path.is_symlink():
+        return {"status": "invalid", "message": "agent result_path exists but is a symlink"}
     if not agent_result_path.exists():
         return {"status": "valid"}
     try:
@@ -412,11 +421,13 @@ def read_agent_payload(
     *,
     cleanup: bool,
 ) -> dict[str, Any]:
-    path = (checkout_path / result_path).resolve(strict=False)
+    path = checkout_path / result_path
     try:
-        path.relative_to(checkout_path.resolve())
+        path.parent.resolve(strict=False).relative_to(checkout_path.resolve())
     except ValueError:
         return {"status": "invalid", "message": "agent result_path escaped checkout"}
+    if path.is_symlink():
+        return {"status": "invalid", "message": "agent result_path is a symlink"}
     try:
         raw = path.read_text(encoding="utf-8")
     except OSError:
@@ -665,12 +676,8 @@ def result_path_error(result_path: str) -> str | None:
 
 def agent_command_secret_error(command: list[str]) -> str | None:
     for part in command:
-        normalized = part.strip().lower()
-        if not normalized.startswith("-"):
-            continue
-        flag = normalized.split("=", 1)[0]
-        flag_name = flag.lstrip("-")
-        if SECRET_FLAG_NAME_PATTERN.search(flag_name):
+        if is_secret_command_flag(part):
+            flag = part.strip().split("=", 1)[0].lower()
             return f"agent.command must not include credential flag {flag}"
     return None
 

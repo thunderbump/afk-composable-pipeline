@@ -382,6 +382,8 @@ class ImplementCliTest(unittest.TestCase):
             ledger = temp_path / "ledger"
             fake_home = temp_path / "home-with-secrets"
             fake_home.mkdir()
+            fake_config = temp_path / "config-with-secrets"
+            fake_config.mkdir()
             secret = "ambient-pi-secret"
             agent_code = textwrap.dedent(
                 """
@@ -389,15 +391,27 @@ class ImplementCliTest(unittest.TestCase):
                 import os
                 from pathlib import Path
 
-                saw_ambient_secret = "PI_TOKEN" in os.environ or "GITHUB_TOKEN" in os.environ or "HOME" in os.environ
+                capsule_dir = Path(os.environ["AFK_JOB_CAPSULE"]).parent
+                home = os.environ.get("HOME")
+                xdg_config_home = os.environ.get("XDG_CONFIG_HOME")
+                isolated_home = (
+                    home
+                    and Path(home).is_dir()
+                    and Path(home).is_relative_to(capsule_dir)
+                    and xdg_config_home
+                    and Path(xdg_config_home).is_dir()
+                    and Path(xdg_config_home).is_relative_to(capsule_dir)
+                )
+                saw_ambient_secret = "PI_TOKEN" in os.environ or "GITHUB_TOKEN" in os.environ
                 print("PI_TOKEN=" + os.environ.get("PI_TOKEN", "missing"))
                 print("GITHUB_TOKEN=" + os.environ.get("GITHUB_TOKEN", "missing"))
                 print("HOME=" + os.environ.get("HOME", "missing"))
+                print("XDG_CONFIG_HOME=" + os.environ.get("XDG_CONFIG_HOME", "missing"))
                 Path("agent-result.json").write_text(
                     json.dumps(
                         {
                             "status": "completed",
-                            "summary": "ambient secret visible" if saw_ambient_secret else "env checked",
+                            "summary": "env isolated" if isolated_home and not saw_ambient_secret else "ambient secret visible",
                         }
                     ),
                     encoding="utf-8",
@@ -434,6 +448,7 @@ class ImplementCliTest(unittest.TestCase):
                     "PI_TOKEN": secret,
                     "GITHUB_TOKEN": secret,
                     "HOME": str(fake_home),
+                    "XDG_CONFIG_HOME": str(fake_config),
                 },
             )
 
@@ -446,12 +461,16 @@ class ImplementCliTest(unittest.TestCase):
                 for path in run_dir.iterdir()
                 if path.is_file()
             )
-            self.assertEqual(result["output"]["summary"], "env checked")
+            self.assertEqual(result["output"]["summary"], "env isolated")
             self.assertNotIn(secret, artifact_text)
             self.assertNotIn(str(fake_home), artifact_text)
+            self.assertNotIn(str(fake_config), artifact_text)
             self.assertIn("PI_TOKEN=[REDACTED]", artifact_text)
             self.assertIn("GITHUB_TOKEN=[REDACTED]", artifact_text)
-            self.assertIn("HOME=missing", artifact_text)
+            self.assertIn("HOME=", artifact_text)
+            self.assertIn("XDG_CONFIG_HOME=", artifact_text)
+            self.assertNotIn("HOME=missing", artifact_text)
+            self.assertNotIn("XDG_CONFIG_HOME=missing", artifact_text)
 
     def test_implement_ignores_stale_agent_result_and_requires_fresh_result(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -500,6 +519,110 @@ class ImplementCliTest(unittest.TestCase):
             self.assertEqual(agent_result["result"]["summary"], "agent result file was not produced")
             self.assertNotIn("stale success", json.dumps(result))
             self.assertFalse((checkout / "agent-result.json").exists())
+
+    def test_implement_rejects_preexisting_agent_result_symlink_without_removing_it(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            checkout = temp_path / "checkout"
+            start_commit = init_checkout(checkout)
+            ledger = temp_path / "ledger"
+            readme_before = (checkout / "README.md").read_text(encoding="utf-8")
+            (checkout / "agent-result.json").symlink_to("README.md")
+
+            completed = run_afk(
+                "run-step",
+                "implement",
+                "--input",
+                json.dumps(
+                    {
+                        "work_selection": {"schema_version": 1, "selected_work": [selected_work()]},
+                        "checkout": {
+                            "status": "prepared",
+                            "checkout_path": str(checkout),
+                            "review_branch": "afk/test-work",
+                            "requested_ref": "main",
+                            "start_commit": start_commit,
+                        },
+                        "guardrails": [],
+                        "validation": {"profile": "tier1", "commands": []},
+                        "agent": {
+                            "type": "fake-pi-command",
+                            "command": [sys.executable, "-c", "print('should not run')"],
+                            "result_path": "agent-result.json",
+                        },
+                    }
+                ),
+                "--ledger",
+                str(ledger),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+            agent_result = json.loads((run_dir / "agent-result.json").read_text(encoding="utf-8"))
+            self.assertEqual(result["output"]["status"], "failed_protocol")
+            self.assertEqual(
+                agent_result["result"]["summary"],
+                "agent result_path exists but is a symlink",
+            )
+            self.assertTrue((checkout / "agent-result.json").is_symlink())
+            self.assertEqual(os.readlink(checkout / "agent-result.json"), "README.md")
+            self.assertEqual((checkout / "README.md").read_text(encoding="utf-8"), readme_before)
+            self.assertNotIn("should not run", (run_dir / "stdout.log").read_text(encoding="utf-8"))
+
+    def test_implement_rejects_agent_result_symlink_without_deleting_target(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            checkout = temp_path / "checkout"
+            start_commit = init_checkout(checkout)
+            ledger = temp_path / "ledger"
+            readme_before = (checkout / "README.md").read_text(encoding="utf-8")
+            agent_code = textwrap.dedent(
+                """
+                from pathlib import Path
+
+                Path("agent-result.json").symlink_to("README.md")
+                print("symlink result produced")
+                """
+            ).strip()
+
+            completed = run_afk(
+                "run-step",
+                "implement",
+                "--input",
+                json.dumps(
+                    {
+                        "work_selection": {"schema_version": 1, "selected_work": [selected_work()]},
+                        "checkout": {
+                            "status": "prepared",
+                            "checkout_path": str(checkout),
+                            "review_branch": "afk/test-work",
+                            "requested_ref": "main",
+                            "start_commit": start_commit,
+                        },
+                        "guardrails": [],
+                        "validation": {"profile": "tier1", "commands": []},
+                        "agent": {
+                            "type": "fake-pi-command",
+                            "command": [sys.executable, "-c", agent_code],
+                            "result_path": "agent-result.json",
+                        },
+                    }
+                ),
+                "--ledger",
+                str(ledger),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+            agent_result = json.loads((run_dir / "agent-result.json").read_text(encoding="utf-8"))
+            self.assertEqual(result["output"]["status"], "failed_protocol")
+            self.assertEqual(agent_result["result"]["summary"], "agent result_path is a symlink")
+            self.assertEqual((checkout / "README.md").read_text(encoding="utf-8"), readme_before)
+            self.assertIn("symlink result produced", (run_dir / "stdout.log").read_text(encoding="utf-8"))
 
     def test_implement_rejects_non_reserved_agent_result_path_without_deleting_files(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -577,8 +700,11 @@ class ImplementCliTest(unittest.TestCase):
                                 "print('should not run')",
                                 "--auth-file",
                                 f"/tmp/{secret}",
+                                "--auth.file",
+                                f"/tmp/{secret}-dotted-auth",
                                 "--credential-file",
                                 f"/tmp/{secret}-credential",
+                                f"--credential.file=/tmp/{secret}-dotted-credential",
                                 "--access-token",
                                 f"{secret}-access",
                                 f"--token={secret}",
@@ -604,6 +730,8 @@ class ImplementCliTest(unittest.TestCase):
             self.assertEqual(result["output"]["status"], "failed_invalid_payload")
             self.assertIn("agent.command must not include credential flag", result["output"]["message"])
             self.assertNotIn(secret, artifact_text)
+            self.assertNotIn(f"{secret}-dotted-auth", artifact_text)
+            self.assertNotIn(f"{secret}-dotted-credential", artifact_text)
             self.assertNotIn("should not run", (run_dir / "stdout.log").read_text(encoding="utf-8"))
 
     def test_implement_refuses_checkout_with_mismatched_start_commit_before_adapter_runs(self):
