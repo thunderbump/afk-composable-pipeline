@@ -1,16 +1,21 @@
 from __future__ import annotations
 
 import argparse
-import contextlib
-import hashlib
-import io
 import json
-import sys
 import uuid
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
+
+from afk.contracts import ContractError, ProjectContract, load_project_contract
+from afk.jsonutil import canonical_json, sha256_json
+from afk.registry import (
+    StepContext,
+    StepRegistry,
+    StepResult,
+    UnknownStepError,
+    default_step_registry,
+)
 
 
 SCHEMA_VERSION = 1
@@ -26,7 +31,21 @@ def main(argv: list[str] | None = None) -> int:
         except json.JSONDecodeError as exc:
             parser.error(f"--input must be valid JSON: {exc.msg}")
 
-        result = run_step(args.step, input_data, Path(args.ledger))
+        project_contract = None
+        if args.project:
+            try:
+                project_contract = load_project_contract(
+                    args.project,
+                    Path(args.contracts_dir),
+                    cwd=Path.cwd(),
+                )
+            except ContractError as exc:
+                parser.error(str(exc))
+
+        try:
+            result = run_step(args.step, input_data, Path(args.ledger), project_contract)
+        except UnknownStepError as exc:
+            parser.error(str(exc))
         print(
             canonical_json(
                 {
@@ -48,27 +67,53 @@ def build_parser() -> argparse.ArgumentParser:
     subcommands = parser.add_subparsers(dest="command")
 
     run_step_parser = subcommands.add_parser("run-step", help="Run one pipeline step")
-    run_step_parser.add_argument("step", choices=["noop"])
+    run_step_parser.add_argument("step")
     run_step_parser.add_argument("--input", required=True, help="JSON input payload")
     run_step_parser.add_argument("--ledger", required=True, help="Ledger output directory")
+    run_step_parser.add_argument("--project", help="Project slug for contract resolution")
+    run_step_parser.add_argument(
+        "--contracts-dir",
+        default="project-contracts",
+        help="Directory containing project contract JSON files",
+    )
 
     return parser
 
 
-def run_step(step: str, input_data: Any, ledger_dir: Path) -> "StepResult":
+def run_step(
+    step: str,
+    input_data: Any,
+    ledger_dir: Path,
+    project_contract: ProjectContract | None = None,
+    registry: StepRegistry | None = None,
+) -> StepResult:
+    registry = registry or default_step_registry()
+    registry.require_known_step(step)
+
     run_id = new_run_id()
     ledger = RunLedger(ledger_dir, run_id)
-    runner = StepRunner({"noop": noop_step})
 
     input_sha256 = sha256_json(input_data)
     ledger.prepare()
-    ledger.write_command(step, input_data, input_sha256)
-    ledger.append_event("run.started", step=step, input_sha256=input_sha256)
+    ledger.write_command(step, input_data, input_sha256, project_contract)
+    ledger.append_event(
+        "run.started",
+        step=step,
+        input_sha256=input_sha256,
+        **project_contract_fields(project_contract),
+    )
     ledger.append_event("step.started", step=step)
 
-    result = runner.run(step, StepContext(input_data=input_data, run_id=run_id))
+    result = registry.run(
+        step,
+        StepContext(
+            input_data=input_data,
+            run_id=run_id,
+            project_contract=project_contract,
+        ),
+    )
     ledger.write_logs(result.stdout, result.stderr)
-    ledger.write_result(result, input_sha256)
+    ledger.write_result(result, input_sha256, project_contract)
     ledger.append_event(
         "step.completed",
         step=step,
@@ -82,45 +127,6 @@ def run_step(step: str, input_data: Any, ledger_dir: Path) -> "StepResult":
     return result
 
 
-@dataclass(frozen=True)
-class StepContext:
-    input_data: Any
-    run_id: str
-
-
-@dataclass(frozen=True)
-class StepResult:
-    run_id: str
-    step: str
-    status: str
-    output: Any
-    stdout: str
-    stderr: str
-    result_sha256: str
-
-
-class StepRunner:
-    def __init__(self, steps: dict[str, Callable[[StepContext], Any]]):
-        self._steps = steps
-
-    def run(self, step: str, context: StepContext) -> StepResult:
-        handler = self._steps[step]
-        stdout = io.StringIO()
-        stderr = io.StringIO()
-        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
-            output = handler(context)
-
-        return StepResult(
-            run_id=context.run_id,
-            step=step,
-            status="succeeded",
-            output=output,
-            stdout=stdout.getvalue(),
-            stderr=stderr.getvalue(),
-            result_sha256=sha256_json(output),
-        )
-
-
 class RunLedger:
     def __init__(self, ledger_dir: Path, run_id: str):
         self.run_id = run_id
@@ -130,37 +136,46 @@ class RunLedger:
     def prepare(self) -> None:
         self.run_dir.mkdir(parents=True, exist_ok=False)
 
-    def write_command(self, step: str, input_data: Any, input_sha256: str) -> None:
-        self.write_json(
-            "command.json",
-            {
-                "schema_version": SCHEMA_VERSION,
-                "run_id": self.run_id,
-                "created_at": utc_now(),
-                "command": ["afk", "run-step", step],
-                "step": step,
-                "input": input_data,
-                "input_sha256": input_sha256,
-            },
-        )
+    def write_command(
+        self,
+        step: str,
+        input_data: Any,
+        input_sha256: str,
+        project_contract: ProjectContract | None,
+    ) -> None:
+        payload = {
+            "schema_version": SCHEMA_VERSION,
+            "run_id": self.run_id,
+            "created_at": utc_now(),
+            "command": ["afk", "run-step", step],
+            "step": step,
+            "input": input_data,
+            "input_sha256": input_sha256,
+            **project_contract_fields(project_contract),
+        }
+        self.write_json("command.json", payload)
 
     def write_logs(self, stdout: str, stderr: str) -> None:
         (self.run_dir / "stdout.log").write_text(stdout, encoding="utf-8")
         (self.run_dir / "stderr.log").write_text(stderr, encoding="utf-8")
 
-    def write_result(self, result: StepResult, input_sha256: str) -> None:
-        self.write_json(
-            "step-result.json",
-            {
-                "schema_version": SCHEMA_VERSION,
-                "run_id": result.run_id,
-                "step": result.step,
-                "status": result.status,
-                "input_sha256": input_sha256,
-                "output": result.output,
-                "result_sha256": result.result_sha256,
-            },
-        )
+    def write_result(
+        self,
+        result: StepResult,
+        input_sha256: str,
+        project_contract: ProjectContract | None,
+    ) -> None:
+        payload = {
+            "schema_version": SCHEMA_VERSION,
+            "run_id": result.run_id,
+            "step": result.step,
+            "status": result.status,
+            "input_sha256": input_sha256,
+            "output": result.output,
+            "result_sha256": result.result_sha256,
+            **project_contract_fields(project_contract),
+        }
+        self.write_json("step-result.json", payload)
 
     def append_event(self, event: str, **fields: Any) -> None:
         payload = {
@@ -178,21 +193,18 @@ class RunLedger:
         (self.run_dir / name).write_text(canonical_json(payload) + "\n", encoding="utf-8")
 
 
-def noop_step(context: StepContext) -> Any:
-    return context.input_data
+def project_contract_fields(project_contract: ProjectContract | None) -> dict[str, Any]:
+    if project_contract is None:
+        return {}
+    return {
+        "project": project_contract.project_slug,
+        "project_contract": project_contract.identity.as_json(),
+    }
 
 
 def new_run_id() -> str:
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     return f"{stamp}-{uuid.uuid4().hex[:8]}"
-
-
-def sha256_json(value: Any) -> str:
-    return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
-
-
-def canonical_json(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
 def utc_now() -> str:

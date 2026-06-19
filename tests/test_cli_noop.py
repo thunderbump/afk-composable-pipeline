@@ -25,6 +25,103 @@ def run_afk(*args):
 
 
 class NoopCliTest(unittest.TestCase):
+    def test_unknown_step_is_rejected_with_registry_error(self):
+        input_json = (FIXTURES / "noop-input.json").read_text(encoding="utf-8")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ledger = Path(temp_dir) / "ledger"
+            completed = run_afk(
+                "run-step",
+                "missing-step",
+                "--input",
+                input_json,
+                "--ledger",
+                str(ledger),
+            )
+
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("unknown step 'missing-step'", completed.stderr)
+            self.assertIn("known steps: noop", completed.stderr)
+            self.assertFalse(ledger.exists())
+
+    def test_project_contract_validation_errors_are_reported(self):
+        input_json = (FIXTURES / "noop-input.json").read_text(encoding="utf-8")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            contracts_dir = temp_path / "contracts"
+            contracts_dir.mkdir()
+            (contracts_dir / "bump-eqemu.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "project_slug": "bump-eqemu",
+                        "repo_url": "git@github.com:thunderbump/bump-EQEmu.git",
+                        "base_branch": "main",
+                        "beads_labels": ["project:bump-eqemu"],
+                        "validation_profiles": ["unit"],
+                        "artifact_retention": {"ledger_days": -1, "log_days": 30},
+                        "pr_target": {"remote": "origin", "branch": "main"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            completed = run_afk(
+                "run-step",
+                "noop",
+                "--project",
+                "bump-eqemu",
+                "--contracts-dir",
+                str(contracts_dir),
+                "--input",
+                input_json,
+                "--ledger",
+                str(temp_path / "ledger"),
+            )
+
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("invalid project contract", completed.stderr)
+            self.assertIn("artifact_retention.ledger_days", completed.stderr)
+            self.assertFalse((temp_path / "ledger").exists())
+
+    def test_noop_step_records_project_contract_identity(self):
+        input_json = (FIXTURES / "noop-input.json").read_text(encoding="utf-8")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ledger = Path(temp_dir) / "ledger"
+            completed = run_afk(
+                "run-step",
+                "noop",
+                "--project",
+                "bump-eqemu",
+                "--contracts-dir",
+                "project-contracts",
+                "--input",
+                input_json,
+                "--ledger",
+                str(ledger),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+
+            command = json.loads((run_dir / "command.json").read_text(encoding="utf-8"))
+            self.assertEqual(command["project"], "bump-eqemu")
+            self.assertEqual(
+                command["project_contract"]["path"],
+                "project-contracts/bump-eqemu.json",
+            )
+            self.assertRegex(command["project_contract"]["sha256"], r"^[0-9a-f]{64}$")
+
+            events = [
+                json.loads(line)
+                for line in (run_dir / "ledger.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual(events[0]["project"], "bump-eqemu")
+            self.assertEqual(events[0]["project_contract"], command["project_contract"])
+
     def test_noop_step_records_replayable_ledger(self):
         input_json = (FIXTURES / "noop-input.json").read_text(encoding="utf-8")
         input_data = json.loads(input_json)
