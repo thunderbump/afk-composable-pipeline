@@ -76,6 +76,12 @@ def select_work(input_data: Any, *, project_contract: Any = None) -> dict[str, A
 
         selected_count = 0
         for raw_item in raw_items:
+            payload_error = candidate_payload_error(raw_item)
+            if payload_error is not None:
+                skipped_candidates.append(
+                    {"candidate": invalid_candidate(source_id, source_type, raw_item), "reason": payload_error}
+                )
+                continue
             candidate = normalize_candidate(source_id, source_type, raw_item)
             rejection = rejection_reason(candidate, required_labels, required_metadata, allowed_statuses)
             if rejection is not None:
@@ -153,6 +159,25 @@ def source_prerequisite_status(source: dict[str, Any]) -> dict[str, Any] | None:
                 0,
                 0,
                 "beads workspace is required",
+            )
+        workspace_path = Path(str(workspace))
+        if not workspace_path.is_absolute():
+            return source_status(
+                source_id,
+                source_type,
+                "skipped_unconfigured",
+                0,
+                0,
+                "beads workspace must be an absolute mounted path",
+            )
+        if ".beads" in workspace_path.parts:
+            return source_status(
+                source_id,
+                source_type,
+                "skipped_unconfigured",
+                0,
+                0,
+                "project-local .beads workspace is not allowed",
             )
         if not os.path.isdir(str(workspace)):
             return source_status(
@@ -439,11 +464,25 @@ def beads_dependencies(dependencies: list[Any]) -> list[dict[str, str]]:
 
 def beads_afk_metadata(metadata: dict[str, Any], labels: list[str]) -> dict[str, Any]:
     ready = metadata.get("afk.ready", metadata.get("afk_ready", "afk:ready" in labels))
-    afk: dict[str, Any] = {"ready": bool(ready)}
+    afk: dict[str, Any] = {"ready": metadata_bool(ready)}
     active_run_id = metadata.get("active_run_id") or metadata.get("afk_active_run_id")
     if active_run_id:
         afk["active_run_id"] = str(active_run_id)
     return afk
+
+
+def metadata_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"false", "0", "no", "off", ""}:
+            return False
+        if normalized in {"true", "1", "yes", "on"}:
+            return True
+    if isinstance(value, (int, float)):
+        return value != 0
+    return bool(value)
 
 
 def run_json_command(
@@ -453,15 +492,20 @@ def run_json_command(
     env: dict[str, str] | None = None,
     status_on_failure: str,
     message_on_failure: str,
+    timeout_seconds: float = 60,
 ) -> Any:
-    completed = subprocess.run(
-        command,
-        cwd=cwd,
-        env=env,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=cwd,
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=timeout_seconds,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise SourceLoadError(status_on_failure, message_on_failure) from exc
     if completed.returncode != 0:
         raise SourceLoadError(status_on_failure, message_on_failure)
     try:
@@ -503,6 +547,48 @@ def default_required_labels(project_contract: Any) -> list[str]:
     return list(project_contract.beads_labels)
 
 
+def candidate_payload_error(raw_item: Any) -> str | None:
+    if not isinstance(raw_item, dict):
+        return "invalid_candidate_payload"
+    if "labels" in raw_item and not isinstance(raw_item["labels"], list):
+        return "invalid_candidate_payload"
+    if "dependencies" in raw_item and not isinstance(raw_item["dependencies"], list):
+        return "invalid_candidate_payload"
+    if "blockers" in raw_item and not isinstance(raw_item["blockers"], list):
+        return "invalid_candidate_payload"
+    if "acceptance_criteria" in raw_item and not isinstance(
+        raw_item["acceptance_criteria"],
+        (list, str),
+    ):
+        return "invalid_candidate_payload"
+    if "afk" in raw_item and not isinstance(raw_item["afk"], dict):
+        return "invalid_candidate_payload"
+    if "raw" in raw_item and not isinstance(raw_item["raw"], dict):
+        return "invalid_candidate_payload"
+    return None
+
+
+def invalid_candidate(source_id: str, source_type: str, raw_item: Any) -> dict[str, Any]:
+    item = raw_item if isinstance(raw_item, dict) else {}
+    return {
+        "source_id": source_id,
+        "source_type": source_type,
+        "external_id": str(item.get("external_id") or item.get("id") or ""),
+        "url": str(item.get("url") or ""),
+        "title": str(item.get("title") or ""),
+        "status": str(item.get("status") or "").lower(),
+        "labels": [],
+        "parent": item.get("parent"),
+        "workstream": item.get("workstream"),
+        "acceptance_criteria": [],
+        "dependencies": [],
+        "blockers": [],
+        "dependency_status": "unknown",
+        "afk": {},
+        "raw": {},
+    }
+
+
 def normalize_candidate(source_id: str, source_type: str, raw_item: Any) -> dict[str, Any]:
     item = raw_item if isinstance(raw_item, dict) else {}
     dependencies = list(item.get("dependencies") or [])
@@ -513,7 +599,7 @@ def normalize_candidate(source_id: str, source_type: str, raw_item: Any) -> dict
         "external_id": str(item.get("external_id") or item.get("id") or ""),
         "url": str(item.get("url") or ""),
         "title": str(item.get("title") or ""),
-        "status": str(item.get("status") or ""),
+        "status": str(item.get("status") or "").lower(),
         "labels": list(item.get("labels") or []),
         "parent": item.get("parent"),
         "workstream": item.get("workstream"),
