@@ -179,7 +179,18 @@ def source_prerequisite_status(source: dict[str, Any]) -> dict[str, Any] | None:
                 0,
                 "beads workspace must be an absolute mounted path",
             )
-        if ".beads" in workspace_path.parts:
+        try:
+            resolved_workspace_path = workspace_path.resolve(strict=True)
+        except OSError:
+            return source_status(
+                source_id,
+                source_type,
+                "skipped_unreachable",
+                0,
+                0,
+                "beads workspace is not available",
+            )
+        if ".beads" in resolved_workspace_path.parts:
             return source_status(
                 source_id,
                 source_type,
@@ -188,7 +199,7 @@ def source_prerequisite_status(source: dict[str, Any]) -> dict[str, Any] | None:
                 0,
                 "project-local .beads workspace is not allowed",
             )
-        if (workspace_path / ".beads").exists() and source.get("workspace_kind") not in {
+        if (resolved_workspace_path / ".beads").exists() and source.get("workspace_kind") not in {
             "central",
             "mounted",
         }:
@@ -200,7 +211,7 @@ def source_prerequisite_status(source: dict[str, Any]) -> dict[str, Any] | None:
                 0,
                 "workspace with .beads requires workspace_kind central or mounted",
             )
-        if not os.path.isdir(str(workspace)):
+        if not resolved_workspace_path.is_dir():
             return source_status(
                 source_id,
                 source_type,
@@ -218,8 +229,8 @@ def source_prerequisite_status(source: dict[str, Any]) -> dict[str, Any] | None:
                 0,
                 "bd command is not available",
             )
-        credentials_path = os.path.join(str(workspace), "secrets", "dolt_beads_password.txt")
-        if not os.path.isfile(str(credentials_path)):
+        credentials_path = resolved_workspace_path / "secrets" / "dolt_beads_password.txt"
+        if not credentials_path.is_file():
             return source_status(
                 source_id,
                 source_type,
@@ -381,7 +392,10 @@ def github_afk_metadata(labels: list[str]) -> dict[str, Any]:
 
 
 def load_beads_issues(source: dict[str, Any]) -> list[dict[str, Any]]:
-    workspace = Path(str(source["workspace"]))
+    try:
+        workspace = Path(str(source["workspace"])).resolve(strict=True)
+    except OSError as exc:
+        raise SourceLoadError("skipped_unreachable", "beads workspace is not available") from exc
     credentials_path = workspace / "secrets" / "dolt_beads_password.txt"
     password = read_beads_password(credentials_path)
     env = os.environ.copy()
@@ -478,6 +492,9 @@ def beads_dependencies(dependencies: list[Any]) -> list[dict[str, str]]:
     normalized = []
     for dependency in dependencies:
         if not isinstance(dependency, dict):
+            normalized.append(
+                {"id": "beads-dependency", "status": "unknown", "type": "blocks"}
+            )
             continue
         dependency_type = dependency.get("dependency_type") or dependency.get("type")
         if dependency_type == "parent-child":

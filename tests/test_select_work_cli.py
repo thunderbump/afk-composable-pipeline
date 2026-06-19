@@ -893,6 +893,52 @@ raise SystemExit("bd should not be called without an explicit workspace_kind")
                 "workspace with .beads requires workspace_kind central or mounted",
             )
 
+    def test_beads_source_rejects_symlink_to_project_local_beads_workspace(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            fake_bin = temp_path / "bin"
+            project_beads = temp_path / "repo" / ".beads"
+            project_beads.mkdir(parents=True)
+            workspace_link = temp_path / "beads-link"
+            workspace_link.symlink_to(project_beads, target_is_directory=True)
+            fake_bin.mkdir()
+            write_executable(
+                fake_bin / "bd",
+                f"""#!{sys.executable}
+raise SystemExit("bd should not be called for symlinked project-local .beads")
+""",
+            )
+
+            request = {
+                "sources": [
+                    {
+                        "type": "beads",
+                        "id": "symlinked-local",
+                        "workspace": str(workspace_link),
+                        "labels": ["project:afk-composable-pipeline"],
+                    }
+                ],
+            }
+            ledger = temp_path / "ledger"
+            completed = run_afk(
+                "run-step",
+                "select-work",
+                "--input",
+                json.dumps(request),
+                "--ledger",
+                str(ledger),
+                env={"PATH": str(fake_bin)},
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+            self.assertEqual(
+                result["output"]["source_statuses"][0]["message"],
+                "project-local .beads workspace is not allowed",
+            )
+
     def test_beads_false_ready_metadata_does_not_select_candidate(self):
         secret = "beads-secret-value"
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -956,6 +1002,71 @@ else:
             self.assertEqual(result["output"]["selected_work"], [])
             self.assertEqual(result["output"]["skipped_candidates"][0]["reason"], "missing_metadata:afk.ready")
             self.assertEqual(result["output"]["skipped_candidates"][0]["candidate"]["afk"], {"ready": False})
+
+    def test_malformed_beads_dependency_forces_unknown_dependency_rejection(self):
+        secret = "beads-secret-value"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            fake_bin = temp_path / "bin"
+            workspace = temp_path / "beads"
+            (workspace / "secrets").mkdir(parents=True)
+            (workspace / "secrets" / "dolt_beads_password.txt").write_text(secret, encoding="utf-8")
+            fake_bin.mkdir()
+            write_executable(
+                fake_bin / "bd",
+                f"""#!{sys.executable}
+import json
+import sys
+
+if len(sys.argv) > 1 and sys.argv[1] == "list":
+    print(json.dumps([{{"id": "central-lve.baddep"}}]))
+elif len(sys.argv) > 2 and sys.argv[1] == "show":
+    print(json.dumps([
+        {{
+            "id": "central-lve.baddep",
+            "title": "Bad dependency",
+            "acceptance_criteria": "- [ ] not selected",
+            "status": "open",
+            "labels": ["project:afk-composable-pipeline"],
+            "metadata": {{"workstream": "central-lve", "afk_ready": True}},
+            "dependencies": ["malformed"],
+        }}
+    ]))
+else:
+    sys.exit(9)
+""",
+            )
+
+            request = {
+                "sources": [
+                    {
+                        "type": "beads",
+                        "id": "central-beads",
+                        "workspace": str(workspace),
+                        "labels": ["project:afk-composable-pipeline"],
+                    }
+                ],
+            }
+            ledger = temp_path / "ledger"
+            completed = run_afk(
+                "run-step",
+                "select-work",
+                "--input",
+                json.dumps(request),
+                "--ledger",
+                str(ledger),
+                env={"PATH": str(fake_bin)},
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+            self.assertEqual(result["output"]["selected_work"], [])
+            self.assertEqual(
+                result["output"]["skipped_candidates"][0]["reason"],
+                "dependency_status_unknown",
+            )
 
     def test_beads_source_skips_empty_credentials_file(self):
         with tempfile.TemporaryDirectory() as temp_dir:
