@@ -65,7 +65,7 @@ class NoopCliTest(unittest.TestCase):
 
             self.assertNotEqual(completed.returncode, 0)
             self.assertIn("unknown step 'missing-step'", completed.stderr)
-            self.assertIn("known steps: noop", completed.stderr)
+            self.assertIn("known steps: implement, noop, prepare-checkout, select-work", completed.stderr)
             self.assertFalse(ledger.exists())
 
     def test_project_contract_validation_errors_are_reported(self):

@@ -6,15 +6,25 @@ from urllib.parse import urlsplit, urlunsplit
 
 URL_PATTERN = re.compile(r"(?P<url>[A-Za-z][A-Za-z0-9+.-]*://[^\s\"'<>]+)")
 TRAILING_URL_PUNCTUATION = ".,;:)]}"
+SECRET_KEY_PATTERN = re.compile(r"(auth|credential|password|secret|token|api[_-]?key|env)", re.IGNORECASE)
 
 
 def redact_artifact_value(value: Any) -> Any:
+    return redact_artifact_value_for_key(None, value)
+
+
+def redact_artifact_value_for_key(key: str | None, value: Any) -> Any:
+    if key is not None and SECRET_KEY_PATTERN.search(key):
+        return "[REDACTED]"
     if isinstance(value, dict):
-        return {key: redact_artifact_value(item) for key, item in value.items()}
+        return {
+            item_key: redact_artifact_value_for_key(str(item_key), item)
+            for item_key, item in value.items()
+        }
     if isinstance(value, list):
-        return [redact_artifact_value(item) for item in value]
+        return [redact_artifact_value_for_key(key, item) for item in value]
     if isinstance(value, str):
-        return redact_url(value)
+        return redact_text(value)
     return value
 
 

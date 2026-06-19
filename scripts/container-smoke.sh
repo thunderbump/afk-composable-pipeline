@@ -154,3 +154,109 @@ assert (checkout / ".git").is_dir(), checkout
 assert str(submodule_gitdir).startswith(str((checkout / ".git/modules").resolve())), submodule_gitdir
 print(f"container-smoke prepare-checkout: PASS {summary['run_id']}")
 PY
+
+python3 - "$tmpdir/implement-input.json" "$start_commit" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+agent_code = """
+import json
+import os
+import subprocess
+from pathlib import Path
+
+capsule = json.loads(Path(os.environ["AFK_JOB_CAPSULE"]).read_text(encoding="utf-8"))
+Path("implemented-smoke.txt").write_text(capsule["work_item"]["external_id"] + "\\n", encoding="utf-8")
+subprocess.run(["git", "add", "implemented-smoke.txt"], check=True)
+subprocess.run(["git", "commit", "-m", "implement smoke"], check=True)
+Path("agent-result.json").write_text(
+    json.dumps({"status": "completed", "summary": "smoke implemented"}),
+    encoding="utf-8",
+)
+print("implement smoke complete")
+""".strip()
+
+payload = {
+    "work_selection": {
+        "schema_version": 1,
+        "selected_work": [
+            {
+                "source_id": "fixture",
+                "source_type": "fixture",
+                "external_id": "smoke-implement",
+                "url": "",
+                "title": "Smoke implement",
+                "status": "open",
+                "labels": ["afk:ready"],
+                "parent": None,
+                "workstream": "smoke",
+                "acceptance_criteria": ["implement smoke passes"],
+                "dependencies": [],
+                "blockers": [],
+                "dependency_status": "clear",
+                "afk": {"ready": True},
+            }
+        ],
+    },
+    "checkout": {
+        "status": "prepared",
+        "checkout_path": "/work/checkout",
+        "review_branch": "afk/smoke-review",
+        "requested_ref": "main",
+        "start_commit": sys.argv[2],
+    },
+    "guardrails": ["stay within checkout"],
+    "validation": {"profile": "smoke", "commands": [["python3", "-m", "unittest", "discover", "-s", "tests"]]},
+    "agent": {
+        "type": "fake-pi-command",
+        "command": ["python3", "-c", agent_code],
+        "result_path": "agent-result.json",
+    },
+}
+Path(sys.argv[1]).write_text(json.dumps(payload), encoding="utf-8")
+PY
+
+"$runtime" run --rm \
+  -e GIT_AUTHOR_NAME="AFK Smoke" \
+  -e GIT_AUTHOR_EMAIL="afk-smoke@example.test" \
+  -e GIT_COMMITTER_NAME="AFK Smoke" \
+  -e GIT_COMMITTER_EMAIL="afk-smoke@example.test" \
+  -v "$ledger:/ledger" \
+  -v "$tmpdir:/work" \
+  "$tag" \
+  run-step implement \
+  --input "$(cat "$tmpdir/implement-input.json")" \
+  --ledger /ledger > "$tmpdir/implement-out.json"
+
+python3 - "$tmpdir/implement-out.json" "$ledger" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+summary = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+ledger = Path(sys.argv[2])
+run_dir = ledger / "runs" / summary["run_id"]
+
+result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+capsule = json.loads((run_dir / "job-capsule.json").read_text(encoding="utf-8"))
+agent_result = json.loads((run_dir / "agent-result.json").read_text(encoding="utf-8"))
+stdout_log = (run_dir / "stdout.log").read_text(encoding="utf-8")
+
+implemented = result["output"]
+assert summary["step"] == "implement", summary
+assert summary["status"] == "succeeded", summary
+assert implemented["status"] == "implemented", implemented
+assert implemented["classification"] == "success", implemented
+assert implemented["git"]["changed_files"] == ["implemented-smoke.txt"], implemented
+assert implemented["artifacts"] == {
+    "job_capsule": "job-capsule.json",
+    "agent_result": "agent-result.json",
+}, implemented
+assert capsule["artifact_type"] == "job-capsule", capsule
+assert capsule["capsule"]["work_item"]["external_id"] == "smoke-implement", capsule
+assert agent_result["artifact_type"] == "agent-result", agent_result
+assert agent_result["result"]["summary"] == "smoke implemented", agent_result
+assert "implement smoke complete" in stdout_log, stdout_log
+print(f"container-smoke implement: PASS {summary['run_id']}")
+PY

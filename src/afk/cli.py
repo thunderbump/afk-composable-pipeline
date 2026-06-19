@@ -191,6 +191,29 @@ class RunLedger:
                     "output": result.output.get("publication"),
                 },
             )
+        if result.step == "implement" and isinstance(result.output, dict):
+            if artifact_paths.get("job_capsule"):
+                self.write_json(
+                    artifact_paths["job_capsule"],
+                    {
+                        "schema_version": SCHEMA_VERSION,
+                        "run_id": result.run_id,
+                        "step": result.step,
+                        "artifact_type": "job-capsule",
+                        "capsule": result.output.get("job_capsule"),
+                    },
+                )
+            if artifact_paths.get("agent_result"):
+                self.write_json(
+                    artifact_paths["agent_result"],
+                    {
+                        "schema_version": SCHEMA_VERSION,
+                        "run_id": result.run_id,
+                        "step": result.step,
+                        "artifact_type": "agent-result",
+                        "result": result.output.get("agent_result"),
+                    },
+                )
 
     def append_event(self, event: str, **fields: Any) -> None:
         payload = {
@@ -218,6 +241,18 @@ def project_contract_fields(project_contract: ProjectContract | None) -> dict[st
 
 
 def result_artifact_paths(step: str, output: Any) -> dict[str, str]:
+    if step == "implement":
+        if not isinstance(output, dict):
+            return {}
+        artifacts = output.get("artifacts")
+        if not isinstance(artifacts, dict):
+            return {}
+        paths = {}
+        if artifacts.get("job_capsule") == "job-capsule.json":
+            paths["job_capsule"] = "job-capsule.json"
+        if artifacts.get("agent_result") == "agent-result.json":
+            paths["agent_result"] = "agent-result.json"
+        return paths
     if step != "prepare-checkout":
         return {}
     if not isinstance(output, dict):

@@ -71,6 +71,22 @@ recorded in `publication-result.json`; passing
 `"publish":{"enabled":true,"branch":"afk/example"}` pushes the prepared `afk/*`
 branch to `origin` and records the fetchable ref.
 
+Run a fake/local Pi implementation adapter against a prepared checkout:
+
+```sh
+PYTHONPATH=src python3 -m afk run-step implement \
+  --input '{"work_selection":{"selected_work":[{"source_id":"fixture","source_type":"fixture","external_id":"demo-1","title":"Demo","status":"open","labels":["afk:ready"],"acceptance_criteria":["implemented"],"dependencies":[],"blockers":[],"dependency_status":"clear","afk":{"ready":true}}]},"checkout":{"status":"prepared","checkout_path":"/work/bump-EQEmu","review_branch":"afk/example","requested_ref":"master","start_commit":"<sha>"},"guardrails":["stay within checkout"],"validation":{"profile":"tier1","commands":[["python3","-m","unittest","discover","-s","tests"]]},"agent":{"type":"fake-pi-command","command":["python3","-c","from pathlib import Path; Path(\"agent-result.json\").write_text(\"{\\\"status\\\":\\\"completed\\\",\\\"summary\\\":\\\"done\\\"}\", encoding=\"utf-8\")"],"result_path":"agent-result.json"}}' \
+  --ledger ledger
+```
+
+`implement` consumes the normalized `WorkSelection` item and checkout metadata,
+builds a `job-capsule.json` with work context, guardrails, checkout ref, and
+validation hints, invokes the configured fake/local Pi command, normalizes the
+adapter result into `agent-result.json`, and records post-run git metadata.
+Adapter runtime failures, adapter protocol failures, and target-code failures
+are classified separately. Adapter stdout/stderr are redacted and written to
+the normal ledger logs.
+
 ## Ledger Artifacts
 
 Each invocation writes a new run directory:
@@ -97,7 +113,9 @@ ledger/
 JSON input. For `select-work`, this is a normalized `WorkSelection` with source
 statuses, selected work, and skipped candidates. For `prepare-checkout`, this is
 the checkout provenance and a pointer to `publication-result.json`, which stores
-the publication result separately.
+the publication result separately. For `implement`, it contains normalized work,
+checkout, agent, and git metadata plus pointers to `job-capsule.json` and
+`agent-result.json`.
 
 ## Development
 
@@ -114,6 +132,7 @@ Run the container smoke test:
 ```
 
 The smoke script builds the image and runs `afk run-step noop`, a fixture-backed
-`afk run-step select-work`, and `afk run-step prepare-checkout` against a mounted
-local repo with a real submodule when Docker or Podman is available. If neither
-runtime exists, it exits successfully with a clear skip message.
+`afk run-step select-work`, `afk run-step prepare-checkout` against a mounted
+local repo with a real submodule, and `afk run-step implement` with a fake/local
+Pi command when Docker or Podman is available. If neither runtime exists, it
+exits successfully with a clear skip message.
