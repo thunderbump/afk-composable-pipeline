@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from afk.jsonutil import canonical_json
-from afk.redaction import redact_artifact_value, redact_text
+from afk.redaction import SECRET_FLAG_NAME_PATTERN, redact_artifact_value, redact_text
 
 
 SCHEMA_VERSION = 1
@@ -664,23 +664,13 @@ def result_path_error(result_path: str) -> str | None:
 
 
 def agent_command_secret_error(command: list[str]) -> str | None:
-    forbidden_flags = {
-        "--auth-file",
-        "--auth_file",
-        "--credentials",
-        "--credentials-path",
-        "--credentials_path",
-        "--token",
-        "--api-key",
-        "--api_key",
-        "--password",
-    }
     for part in command:
         normalized = part.strip().lower()
-        if normalized in forbidden_flags:
-            return f"agent.command must not include credential flag {normalized}"
-        if any(normalized.startswith(f"{flag}=") for flag in forbidden_flags):
-            flag = normalized.split("=", 1)[0]
+        if not normalized.startswith("-"):
+            continue
+        flag = normalized.split("=", 1)[0]
+        flag_name = flag.lstrip("-")
+        if SECRET_FLAG_NAME_PATTERN.search(flag_name):
             return f"agent.command must not include credential flag {flag}"
     return None
 
