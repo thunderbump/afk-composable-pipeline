@@ -374,6 +374,231 @@ class ImplementCliTest(unittest.TestCase):
             self.assertEqual(agent_result["result"]["adapter"]["returncode"], 0)
             self.assertIn("no result produced", agent_result["result"]["evidence"]["stdout_excerpt"])
 
+    def test_implement_does_not_expose_ambient_secrets_to_adapter(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            checkout = temp_path / "checkout"
+            start_commit = init_checkout(checkout)
+            ledger = temp_path / "ledger"
+            secret = "ambient-pi-secret"
+            agent_code = textwrap.dedent(
+                """
+                import json
+                import os
+                from pathlib import Path
+
+                saw_ambient_secret = "PI_TOKEN" in os.environ or "GITHUB_TOKEN" in os.environ
+                print("PI_TOKEN=" + os.environ.get("PI_TOKEN", "missing"))
+                print("GITHUB_TOKEN=" + os.environ.get("GITHUB_TOKEN", "missing"))
+                Path("agent-result.json").write_text(
+                    json.dumps(
+                        {
+                            "status": "completed",
+                            "summary": "ambient secret visible" if saw_ambient_secret else "env checked",
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                """
+            ).strip()
+
+            completed = run_afk(
+                "run-step",
+                "implement",
+                "--input",
+                json.dumps(
+                    {
+                        "work_selection": {"schema_version": 1, "selected_work": [selected_work()]},
+                        "checkout": {
+                            "status": "prepared",
+                            "checkout_path": str(checkout),
+                            "review_branch": "afk/test-work",
+                            "requested_ref": "main",
+                            "start_commit": start_commit,
+                        },
+                        "guardrails": [],
+                        "validation": {"profile": "tier1", "commands": []},
+                        "agent": {
+                            "type": "fake-pi-command",
+                            "command": [sys.executable, "-c", agent_code],
+                            "result_path": "agent-result.json",
+                        },
+                    }
+                ),
+                "--ledger",
+                str(ledger),
+                env_overrides={
+                    "PI_TOKEN": secret,
+                    "GITHUB_TOKEN": secret,
+                },
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+            artifact_text = "\n".join(
+                path.read_text(encoding="utf-8")
+                for path in run_dir.iterdir()
+                if path.is_file()
+            )
+            self.assertEqual(result["output"]["summary"], "env checked")
+            self.assertNotIn(secret, artifact_text)
+            self.assertIn("PI_TOKEN=[REDACTED]", artifact_text)
+            self.assertIn("GITHUB_TOKEN=[REDACTED]", artifact_text)
+
+    def test_implement_ignores_stale_agent_result_and_requires_fresh_result(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            checkout = temp_path / "checkout"
+            start_commit = init_checkout(checkout)
+            ledger = temp_path / "ledger"
+            (checkout / "agent-result.json").write_text(
+                json.dumps({"status": "completed", "summary": "stale success"}),
+                encoding="utf-8",
+            )
+
+            completed = run_afk(
+                "run-step",
+                "implement",
+                "--input",
+                json.dumps(
+                    {
+                        "work_selection": {"schema_version": 1, "selected_work": [selected_work()]},
+                        "checkout": {
+                            "status": "prepared",
+                            "checkout_path": str(checkout),
+                            "review_branch": "afk/test-work",
+                            "requested_ref": "main",
+                            "start_commit": start_commit,
+                        },
+                        "guardrails": [],
+                        "validation": {"profile": "tier1", "commands": []},
+                        "agent": {
+                            "type": "fake-pi-command",
+                            "command": [sys.executable, "-c", "print('no fresh result')"],
+                            "result_path": "agent-result.json",
+                        },
+                    }
+                ),
+                "--ledger",
+                str(ledger),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+            agent_result = json.loads((run_dir / "agent-result.json").read_text(encoding="utf-8"))
+            self.assertEqual(result["output"]["status"], "failed_protocol")
+            self.assertEqual(agent_result["result"]["summary"], "agent result file was not produced")
+            self.assertNotIn("stale success", json.dumps(result))
+            self.assertFalse((checkout / "agent-result.json").exists())
+
+    def test_implement_refuses_checkout_with_mismatched_start_commit_before_adapter_runs(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            checkout = temp_path / "checkout"
+            start_commit = init_checkout(checkout)
+            commit_file = checkout / "later.txt"
+            commit_file.write_text("later\n", encoding="utf-8")
+            git(checkout, "add", "later.txt")
+            git(checkout, "commit", "-m", "later commit")
+            ledger = temp_path / "ledger"
+
+            completed = run_afk(
+                "run-step",
+                "implement",
+                "--input",
+                json.dumps(
+                    {
+                        "work_selection": {"schema_version": 1, "selected_work": [selected_work()]},
+                        "checkout": {
+                            "status": "prepared",
+                            "checkout_path": str(checkout),
+                            "review_branch": "afk/test-work",
+                            "requested_ref": "main",
+                            "start_commit": start_commit,
+                        },
+                        "guardrails": [],
+                        "validation": {"profile": "tier1", "commands": []},
+                        "agent": {
+                            "type": "fake-pi-command",
+                            "command": [
+                                sys.executable,
+                                "-c",
+                                "raise SystemExit('adapter should not run')",
+                            ],
+                            "result_path": "agent-result.json",
+                        },
+                    }
+                ),
+                "--ledger",
+                str(ledger),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+            self.assertEqual(result["output"]["status"], "failed_protocol")
+            self.assertEqual(
+                result["output"]["summary"],
+                "checkout HEAD does not match checkout.start_commit",
+            )
+            self.assertNotIn("adapter should not run", (run_dir / "stderr.log").read_text(encoding="utf-8"))
+
+    def test_implement_refuses_dirty_checkout_before_adapter_runs(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            checkout = temp_path / "checkout"
+            start_commit = init_checkout(checkout)
+            (checkout / "dirty.txt").write_text("dirty\n", encoding="utf-8")
+            ledger = temp_path / "ledger"
+
+            completed = run_afk(
+                "run-step",
+                "implement",
+                "--input",
+                json.dumps(
+                    {
+                        "work_selection": {"schema_version": 1, "selected_work": [selected_work()]},
+                        "checkout": {
+                            "status": "prepared",
+                            "checkout_path": str(checkout),
+                            "review_branch": "afk/test-work",
+                            "requested_ref": "main",
+                            "start_commit": start_commit,
+                        },
+                        "guardrails": [],
+                        "validation": {"profile": "tier1", "commands": []},
+                        "agent": {
+                            "type": "fake-pi-command",
+                            "command": [
+                                sys.executable,
+                                "-c",
+                                "raise SystemExit('adapter should not run')",
+                            ],
+                            "result_path": "agent-result.json",
+                        },
+                    }
+                ),
+                "--ledger",
+                str(ledger),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+            self.assertEqual(result["output"]["status"], "failed_protocol")
+            self.assertEqual(
+                result["output"]["summary"],
+                "checkout has uncommitted changes before agent execution",
+            )
+            self.assertEqual(result["output"]["git"]["changed_files"], ["dirty.txt"])
+            self.assertNotIn("adapter should not run", (run_dir / "stderr.log").read_text(encoding="utf-8"))
+
     def test_implement_consumes_normalized_work_items_without_source_specific_structures(self):
         for source_type, external_id in (
             ("fixture", "central-lve.5"),

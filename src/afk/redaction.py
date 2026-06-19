@@ -7,6 +7,12 @@ from urllib.parse import urlsplit, urlunsplit
 URL_PATTERN = re.compile(r"(?P<url>[A-Za-z][A-Za-z0-9+.-]*://[^\s\"'<>]+)")
 TRAILING_URL_PUNCTUATION = ".,;:)]}"
 SECRET_KEY_PATTERN = re.compile(r"(auth|credential|password|secret|token|api[_-]?key|env)", re.IGNORECASE)
+SECRET_ASSIGNMENT_PATTERN = re.compile(
+    r"(?P<key>[A-Za-z_][A-Za-z0-9_]*(?:TOKEN|SECRET|PASSWORD|AUTH|API_KEY|CREDENTIAL)[A-Za-z0-9_]*)"
+    r"(?P<separator>\s*[:=]\s*)"
+    r"(?P<value>[^\s,;]+)",
+    re.IGNORECASE,
+)
 
 
 def redact_artifact_value(value: Any) -> Any:
@@ -29,7 +35,12 @@ def redact_artifact_value_for_key(key: str | None, value: Any) -> Any:
 
 
 def redact_text(value: str) -> str:
-    return URL_PATTERN.sub(redact_url_match, value)
+    redacted = URL_PATTERN.sub(redact_url_match, value)
+    return SECRET_ASSIGNMENT_PATTERN.sub(redact_secret_assignment, redacted)
+
+
+def redact_secret_assignment(match: re.Match[str]) -> str:
+    return f"{match.group('key')}{match.group('separator')}[REDACTED]"
 
 
 def redact_url_match(match: re.Match[str]) -> str:

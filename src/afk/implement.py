@@ -50,9 +50,35 @@ def implement(
         return request
 
     checkout_path = Path(request["checkout"]["path"])
-    capsule = build_job_capsule(request, run_id=run_id)
     agent_result_path = checkout_path / request["agent"]["result_path"]
-    agent_result_existed = agent_result_path.exists()
+    stale_result = remove_existing_agent_result(agent_result_path, checkout_path)
+    capsule = build_job_capsule(request, run_id=run_id)
+    if stale_result["status"] != "valid":
+        normalized = normalized_agent_result(
+            status="failed_protocol",
+            classification="protocol_failure",
+            summary=stale_result["message"],
+            notes=[],
+            failures=[{"type": "protocol", "message": stale_result["message"]}],
+            adapter={"type": request["agent"]["type"], "returncode": None},
+            stdout="",
+            stderr="",
+        )
+        return implement_output(capsule, normalized, fallback_git_metadata(request["checkout"]["start_commit"]))
+
+    checkout_preflight = validate_checkout_provenance(checkout_path, request["checkout"]["start_commit"])
+    if checkout_preflight["status"] != "valid":
+        normalized = normalized_agent_result(
+            status="failed_protocol",
+            classification="protocol_failure",
+            summary=checkout_preflight["message"],
+            notes=[],
+            failures=[{"type": "protocol", "message": checkout_preflight["message"]}],
+            adapter={"type": request["agent"]["type"], "returncode": None},
+            stdout="",
+            stderr="",
+        )
+        return implement_output(capsule, normalized, checkout_preflight["metadata"])
 
     try:
         adapter_result = run_fake_pi_command(request["agent"], checkout_path, capsule)
@@ -80,7 +106,7 @@ def implement(
     agent_payload = read_agent_payload(
         checkout_path,
         request["agent"]["result_path"],
-        cleanup=not agent_result_existed,
+        cleanup=True,
     )
     if agent_payload["status"] != "valid":
         after_metadata = git_metadata(checkout_path, request["checkout"]["start_commit"])
@@ -315,7 +341,7 @@ def run_fake_pi_command(
     with tempfile.TemporaryDirectory() as temp_dir:
         capsule_path = Path(temp_dir) / "job-capsule.json"
         capsule_path.write_text(canonical_json(capsule) + "\n", encoding="utf-8")
-        env = os.environ.copy()
+        env = minimal_agent_environment()
         env["AFK_JOB_CAPSULE"] = str(capsule_path)
         try:
             completed = subprocess.run(
@@ -350,6 +376,31 @@ def run_fake_pi_command(
         "stdout": completed.stdout,
         "stderr": completed.stderr,
     }
+
+
+def minimal_agent_environment() -> dict[str, str]:
+    env: dict[str, str] = {}
+    for key in ("PATH", "HOME", "LANG", "LC_ALL", "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL"):
+        value = os.environ.get(key)
+        if value is not None:
+            env[key] = value
+    return env
+
+
+def remove_existing_agent_result(agent_result_path: Path, checkout_path: Path) -> dict[str, Any]:
+    try:
+        agent_result_path.resolve(strict=False).relative_to(checkout_path.resolve())
+    except ValueError:
+        return {"status": "invalid", "message": "agent result_path escaped checkout"}
+    if not agent_result_path.exists():
+        return {"status": "valid"}
+    try:
+        if not agent_result_path.is_file():
+            return {"status": "invalid", "message": "agent result_path exists but is not a file"}
+        agent_result_path.unlink()
+    except OSError:
+        return {"status": "invalid", "message": "pre-existing agent result file could not be removed"}
+    return {"status": "valid"}
 
 
 def read_agent_payload(
@@ -458,6 +509,59 @@ def implement_output(
         "agent_result": agent_result,
         "job_capsule": capsule,
         "artifacts": {"job_capsule": "job-capsule.json", "agent_result": "agent-result.json"},
+    }
+
+
+def validate_checkout_provenance(checkout_path: Path, start_commit: str) -> dict[str, Any]:
+    try:
+        resolved_start = git(checkout_path, ["rev-parse", "--verify", f"{start_commit}^{{commit}}"])
+        head = git(checkout_path, ["rev-parse", "HEAD"])
+        dirty_lines = [line for line in git(checkout_path, ["status", "--porcelain=v1"]).splitlines() if line]
+    except AgentRuntimeError as exc:
+        return {
+            "status": "invalid",
+            "message": "checkout provenance could not be verified",
+            "metadata": fallback_git_metadata(start_commit),
+        }
+    if head != resolved_start:
+        return {
+            "status": "invalid",
+            "message": "checkout HEAD does not match checkout.start_commit",
+            "metadata": {
+                **fallback_git_metadata(start_commit),
+                "after_commit": head,
+            },
+        }
+    if dirty_lines:
+        return {
+            "status": "invalid",
+            "message": "checkout has uncommitted changes before agent execution",
+            "metadata": {
+                **fallback_git_metadata(start_commit),
+                "after_commit": head,
+                "dirty": True,
+                "dirty_status": dirty_lines,
+                "changed_files": dirty_files(dirty_lines),
+            },
+        }
+    return {
+        "status": "valid",
+        "metadata": {
+            **fallback_git_metadata(start_commit),
+            "after_commit": head,
+        },
+    }
+
+
+def fallback_git_metadata(start_commit: str) -> dict[str, Any]:
+    return {
+        "before_commit": start_commit,
+        "after_commit": start_commit,
+        "changed_files": [],
+        "dirty": False,
+        "dirty_status": [],
+        "commits": [],
+        "diff_stat": "",
     }
 
 
