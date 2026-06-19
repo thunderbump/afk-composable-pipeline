@@ -53,6 +53,22 @@ checkout is not accidentally treated as the issue tracker. Credential path
 overrides are not accepted; the mounted workspace must provide
 `secrets/dolt_beads_password.txt`.
 
+Prepare a real clone for implementation or validation:
+
+```sh
+PYTHONPATH=src python3 -m afk run-step prepare-checkout \
+  --input '{"repo_url":"git@github.com:thunderbump/bump-EQEmu.git","base_ref":"master","checkout_path":"work/bump-EQEmu","review_branch":"afk/example"}' \
+  --ledger ledger
+```
+
+`prepare-checkout` creates or reuses a full clone, checks out the requested ref
+onto the review branch, initializes submodules, and records repo URL, base/ref,
+start commit, checkout path, dirty-tree state, and submodule SHAs. Existing dirty
+checkouts are refused with actionable status evidence. Branch publication is
+off by default and is recorded as a separate `publication` artifact; passing
+`"publish":{"enabled":true,"branch":"afk/example"}` pushes the prepared branch
+and records the fetchable ref.
+
 ## Ledger Artifacts
 
 Each invocation writes a new run directory:
@@ -77,7 +93,8 @@ ledger/
 
 `step-result.json` contains the step output. For `noop`, this is the original
 JSON input. For `select-work`, this is a normalized `WorkSelection` with source
-statuses, selected work, and skipped candidates.
+statuses, selected work, and skipped candidates. For `prepare-checkout`, this is
+the checkout provenance and optional publication artifact.
 
 ## Development
 
@@ -93,6 +110,7 @@ Run the container smoke test:
 ./scripts/container-smoke.sh
 ```
 
-The smoke script builds the image and runs `afk run-step noop` and a
-fixture-backed `afk run-step select-work` when Docker or Podman is available. If
-neither runtime exists, it exits successfully with a clear skip message.
+The smoke script builds the image and runs `afk run-step noop`, a fixture-backed
+`afk run-step select-work`, and `afk run-step prepare-checkout` against a mounted
+local repo with a real submodule when Docker or Podman is available. If neither
+runtime exists, it exits successfully with a clear skip message.
