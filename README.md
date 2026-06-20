@@ -204,9 +204,20 @@ agent auth/config state must be validated before the adapter runs:
   directory outside the target checkout.
 - `agent.env.PI_CONFIG_HOME` sets `PI_CONFIG_HOME`; must be an **absolute**,
   existing directory outside the target checkout.
+- `agent.wrapper_secret_files` optionally exposes runner-local mounted secret
+  files to a wrapper command as **path metadata only**. Keys must be non-secret
+  logical names such as `primary` or `codex`, and values must be **absolute**,
+  existing files outside the target checkout.
 
 If any mount is missing, unreachable, relative, or inside the checkout, the step
 fails early as `failed_invalid_payload` and does not execute the adapter.
+
+AFK may validate and forward wrapper secret file paths, but it must not read
+their contents, inject them into `agent.env`, turn them into command flags, or
+persist them into Beads comments, ledgers, PR bodies, stdout/stderr, or images.
+Runner-local wrappers consume the mounted file paths through
+`AFK_JOB_CAPSULE -> capsule.agent_mounts.wrapper_secret_files` and perform any
+token export or CLI wiring inside the runner.
 
 Minimal recipe fragment for remote/container portability (for `central-afk-pr.7`):
 
@@ -238,6 +249,42 @@ Ledger artifacts keep mount path evidence for `agent.codex_home` and
 `PI_CONFIG_HOME` is validated as an existing mount path before execution and
 the sanitized mount evidence appears in `job-capsule.agent_mounts` as
 `codex_home`, `config_home`, and `pi_config_home` paths.
+
+Interim wrapper example for runner-local secret resolution:
+
+```json
+{
+  "name": "implement",
+  "input": {
+    "guardrails": ["stay within the prepared checkout", "do not write secrets"],
+    "validation": { "profile": "tier1", "commands": [] },
+    "agent": {
+      "type": "real-agent-command",
+      "command": ["/runner/bin/pi-wrapper"],
+      "result_path": "agent-result.json",
+      "codex_home": "/work/mounts/codex-home",
+      "config_home": "/work/mounts/xdg-config",
+      "env": {
+        "PI_CONFIG_HOME": "/work/mounts/pi-config"
+      },
+      "wrapper_secret_files": {
+        "primary": "/work/mounts/secrets/openai-api-key.txt"
+      }
+    }
+  }
+}
+```
+
+The wrapper stays runner-local. AFK only passes the mounted file path in the job
+capsule; the wrapper can read that file, export `OPENAI_API_KEY` or populate
+Pi/Codex auth state locally, invoke the real CLI, and exit without echoing the
+secret. Direct secret-bearing `agent.env` values such as `OPENAI_API_KEY=...`
+and direct secret-bearing command flags such as `--token`, `--auth-file`, or
+`--api-key` remain rejected.
+
+This contract is interim. Replace `agent.wrapper_secret_files` with
+secrets-manager-backed secret references once AFK has a first-class secret
+reference contract and runner integration.
 
 ## Ledger Artifacts
 

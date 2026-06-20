@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -20,6 +21,7 @@ from afk.redaction import (
 
 
 SCHEMA_VERSION = 1
+WRAPPER_SECRET_FILE_NAME_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9_-]*$")
 
 
 class AgentRuntimeError(RuntimeError):
@@ -304,7 +306,7 @@ def normalize_agent(agent: Any, *, checkout_path: Path) -> dict[str, Any]:
     fake_agent = agent_type == "fake-pi-command"
     forbidden_keys = ("credentials_path", "auth_file", "token", "api_key")
     if fake_agent:
-        forbidden_keys = (*forbidden_keys, "env", "codex_home", "config_home")
+        forbidden_keys = (*forbidden_keys, "env", "codex_home", "config_home", "wrapper_secret_files")
     for forbidden_key in forbidden_keys:
         if forbidden_key in agent:
             return {"status": "invalid", "message": f"agent.{forbidden_key} is not supported"}
@@ -328,6 +330,7 @@ def normalize_agent(agent: Any, *, checkout_path: Path) -> dict[str, Any]:
         "env": {},
         "codex_home": "",
         "config_home": "",
+        "wrapper_secret_files": {},
     }
     if not fake_agent:
         env = normalize_agent_env(
@@ -353,9 +356,16 @@ def normalize_agent(agent: Any, *, checkout_path: Path) -> dict[str, Any]:
         )
         if config_home["status"] != "valid":
             return {"status": "invalid", "message": config_home["message"]}
+        wrapper_secret_files = normalize_wrapper_secret_files(
+            agent.get("wrapper_secret_files", {}),
+            checkout_path=checkout_path,
+        )
+        if wrapper_secret_files["status"] != "valid":
+            return {"status": "invalid", "message": wrapper_secret_files["message"]}
         normalized_agent["env"] = env["env"]
         normalized_agent["codex_home"] = codex_home["path"]
         normalized_agent["config_home"] = config_home["path"]
+        normalized_agent["wrapper_secret_files"] = wrapper_secret_files["files"]
     return {
         "status": "valid",
         "agent": normalized_agent,
@@ -457,6 +467,50 @@ def normalize_absolute_dir(
     return {"status": "valid", "path": str(path)}
 
 
+def normalize_wrapper_secret_files(
+    value: Any,
+    *,
+    checkout_path: Path,
+) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {"status": "invalid", "message": "agent.wrapper_secret_files must be an object"}
+    normalized: dict[str, str] = {}
+    for key, raw_path in value.items():
+        if not isinstance(key, str) or not WRAPPER_SECRET_FILE_NAME_PATTERN.match(key):
+            return {
+                "status": "invalid",
+                "message": "agent.wrapper_secret_files keys must match [A-Za-z][A-Za-z0-9_-]*",
+            }
+        if is_secret_key(key):
+            return {
+                "status": "invalid",
+                "message": f"agent.wrapper_secret_files.{key} must use a non-secret logical name",
+            }
+        if not isinstance(raw_path, str) or not raw_path.strip():
+            return {
+                "status": "invalid",
+                "message": f"agent.wrapper_secret_files.{key} must be an absolute file path outside checkout",
+            }
+        path = Path(raw_path)
+        if not path.is_absolute():
+            return {
+                "status": "invalid",
+                "message": f"agent.wrapper_secret_files.{key} must be an absolute file path outside checkout",
+            }
+        if path_is_equal_to_or_inside(path, checkout_path):
+            return {
+                "status": "invalid",
+                "message": f"agent.wrapper_secret_files.{key} must be outside checkout",
+            }
+        if not path.is_file():
+            return {
+                "status": "invalid",
+                "message": f"agent.wrapper_secret_files.{key} must be an existing file",
+            }
+        normalized[key] = str(path)
+    return {"status": "valid", "files": normalized}
+
+
 def path_is_equal_to_or_inside(path: Path, parent: Path) -> bool:
     for candidate in (path, path.resolve()):
         try:
@@ -474,17 +528,21 @@ def normalize_string_list(value: Any, field: str) -> dict[str, Any]:
 
 
 def build_job_capsule(request: dict[str, Any], *, run_id: str) -> dict[str, Any]:
+    agent_mounts = {
+        "codex_home": request["agent"].get("codex_home", ""),
+        "config_home": request["agent"].get("config_home", ""),
+        "pi_config_home": request["agent"].get("env", {}).get("PI_CONFIG_HOME", ""),
+    }
+    wrapper_secret_files = request["agent"].get("wrapper_secret_files", {})
+    if wrapper_secret_files:
+        agent_mounts["wrapper_secret_files"] = wrapper_secret_files
     return {
         "schema_version": SCHEMA_VERSION,
         "run_id": run_id,
         "work_item": request["work_item"],
         "acceptance_criteria": request["work_item"]["acceptance_criteria"],
         "checkout": request["checkout"],
-        "agent_mounts": {
-            "codex_home": request["agent"].get("codex_home", ""),
-            "config_home": request["agent"].get("config_home", ""),
-            "pi_config_home": request["agent"].get("env", {}).get("PI_CONFIG_HOME", ""),
-        },
+        "agent_mounts": agent_mounts,
         "guardrails": request["guardrails"],
         "validation": request["validation"],
         "expected_result_schema": {
