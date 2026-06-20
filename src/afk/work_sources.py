@@ -66,8 +66,12 @@ def select_work(input_data: Any, *, project_contract: Any = None) -> dict[str, A
             source_statuses.append(adapter_status)
             continue
 
+        source_for_load = dict(source)
+        if source_type == "beads" and target_ids:
+            source_for_load["target_ids"] = sorted(target_ids)
+
         try:
-            raw_items = load_source_items(source)
+            raw_items = load_source_items(source_for_load)
         except SourceLoadError as exc:
             source_statuses.append(
                 source_status(source_id, source_type, exc.status, 0, 0, exc.message)
@@ -464,6 +468,17 @@ def load_beads_issues(source: dict[str, Any]) -> list[dict[str, Any]]:
     password = read_beads_password(credentials_path)
     env = os.environ.copy()
     env["BEADS_DOLT_PASSWORD"] = password
+
+    target_ids = source.get("target_ids")
+    if target_ids:
+        return [
+            normalize_beads_issue(
+                str(source.get("id") or "beads"),
+                source,
+                load_beads_issue(str(issue_id), workspace=workspace, env=env),
+            )
+            for issue_id in target_ids
+        ]
 
     command = [
         "bd",

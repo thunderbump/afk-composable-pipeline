@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from afk.checkouts import checkout_path_error
 from afk.contracts import ContractError, ProjectContract, load_project_contract
 from afk.jsonutil import canonical_json, sha256_json
 from afk.redaction import redact_artifact_value
@@ -134,6 +135,9 @@ def main(argv: list[str] | None = None) -> int:
                 f"--validation-profile must be declared by project {project_contract.project_slug}: "
                 f"{', '.join(project_contract.validation_profiles)}"
             )
+        path_error = checkout_path_error(args.checkout_root, args.checkout_path)
+        if path_error is not None:
+            parser.error(path_error)
         recipe = generate_workstream_recipe(
             workstream_id=args.workstream_id,
             project_contract=project_contract,

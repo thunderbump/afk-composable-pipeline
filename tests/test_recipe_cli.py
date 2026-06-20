@@ -162,7 +162,93 @@ class GenerateRecipeCliTest(unittest.TestCase):
             self.assertEqual(recipe["steps"][3]["input"]["validation"]["profile"], "tier1")
             self.assertEqual(recipe["publisher"], {"enabled": False})
 
-    def test_generated_recipe_runs_and_records_selected_bead_and_skipped_candidates(self):
+    def test_generate_recipe_rejects_relative_checkout_paths_without_writing_recipe(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            contracts_dir = temp_path / "contracts"
+            repo = temp_path / "repo-src"
+            output = temp_path / "recipe.json"
+            ledger = temp_path / "ledger"
+            beads_workspace = temp_path / "central-beads"
+            contracts_dir.mkdir()
+            init_repo(repo)
+            write_contract(contracts_dir / "demo.json", project_slug="demo", repo_url=str(repo))
+            beads_workspace.mkdir()
+
+            cases = [
+                ("checkout-root", "relative-root", str(temp_path / "checkouts" / "demo"), "checkout_root must be absolute"),
+                ("checkout-path", str(temp_path / "checkouts"), "relative-checkout", "checkout_path must be absolute"),
+            ]
+            for name, checkout_root, checkout_path, expected_error in cases:
+                with self.subTest(name=name):
+                    completed = run_afk(
+                        "generate-recipe",
+                        "--workstream-id",
+                        "central-afk-pr.1",
+                        "--project",
+                        "demo",
+                        "--contracts-dir",
+                        str(contracts_dir),
+                        "--ledger",
+                        str(ledger),
+                        "--beads-workspace",
+                        str(beads_workspace),
+                        "--checkout-root",
+                        checkout_root,
+                        "--checkout-path",
+                        checkout_path,
+                        "--validation-profile",
+                        "tier1",
+                        "--output",
+                        str(output),
+                    )
+
+                    self.assertNotEqual(completed.returncode, 0, completed.stdout)
+                    self.assertIn(expected_error, completed.stderr)
+                    self.assertFalse(output.exists())
+
+    def test_generate_recipe_rejects_checkout_path_outside_root_without_writing_recipe(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            contracts_dir = temp_path / "contracts"
+            repo = temp_path / "repo-src"
+            output = temp_path / "recipe.json"
+            ledger = temp_path / "ledger"
+            beads_workspace = temp_path / "central-beads"
+            checkout_root = temp_path / "checkouts"
+            outside_checkout = temp_path / "outside" / "demo"
+            contracts_dir.mkdir()
+            init_repo(repo)
+            write_contract(contracts_dir / "demo.json", project_slug="demo", repo_url=str(repo))
+            beads_workspace.mkdir()
+
+            completed = run_afk(
+                "generate-recipe",
+                "--workstream-id",
+                "central-afk-pr.1",
+                "--project",
+                "demo",
+                "--contracts-dir",
+                str(contracts_dir),
+                "--ledger",
+                str(ledger),
+                "--beads-workspace",
+                str(beads_workspace),
+                "--checkout-root",
+                str(checkout_root),
+                "--checkout-path",
+                str(outside_checkout),
+                "--validation-profile",
+                "tier1",
+                "--output",
+                str(output),
+            )
+
+            self.assertNotEqual(completed.returncode, 0, completed.stdout)
+            self.assertIn("checkout_path must be inside checkout_root", completed.stderr)
+            self.assertFalse(output.exists())
+
+    def test_generated_recipe_runs_and_records_directly_selected_bead(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
             repo = temp_path / "repo-src"
@@ -268,13 +354,7 @@ sys.exit(9)
                 [item["external_id"] for item in select_result["output"]["selected_work"]],
                 ["central-afk-pr.1"],
             )
-            self.assertEqual(
-                [
-                    (item["candidate"]["external_id"], item["reason"])
-                    for item in select_result["output"]["skipped_candidates"]
-                ],
-                [("central-afk-pr.2", "target_id_mismatch")],
-            )
+            self.assertEqual(select_result["output"]["skipped_candidates"], [])
 
     def test_generated_recipe_records_actionable_beads_auth_and_unreachable_evidence(self):
         with tempfile.TemporaryDirectory() as temp_dir:
