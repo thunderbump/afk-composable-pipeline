@@ -18,7 +18,7 @@ class RegistryTest(unittest.TestCase):
             StepContext(input_data={"message": "hello"}, run_id="test-run"),
         )
 
-        self.assertEqual(registry.step_names, ("noop", "select-work"))
+        self.assertEqual(registry.step_names, ("noop", "prepare-checkout", "select-work"))
         self.assertEqual(result.run_id, "test-run")
         self.assertEqual(result.step, "noop")
         self.assertEqual(result.status, "succeeded")

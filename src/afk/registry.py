@@ -5,6 +5,7 @@ import io
 from dataclasses import dataclass
 from typing import Any, Mapping, Protocol
 
+from afk.checkouts import prepare_checkout_step
 from afk.contracts import ProjectContract
 from afk.jsonutil import sha256_json
 from afk.work_sources import select_work_step
@@ -71,7 +72,13 @@ class StepRegistry:
 
 
 def default_step_registry() -> StepRegistry:
-    return StepRegistry({"noop": noop_step, "select-work": select_work_step})
+    return StepRegistry(
+        {
+            "noop": noop_step,
+            "prepare-checkout": prepare_checkout_step,
+            "select-work": select_work_step,
+        }
+    )
 
 
 def noop_step(context: StepContext) -> Any:

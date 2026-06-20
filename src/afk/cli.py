@@ -9,6 +9,7 @@ from typing import Any
 
 from afk.contracts import ContractError, ProjectContract, load_project_contract
 from afk.jsonutil import canonical_json, sha256_json
+from afk.redaction import redact_artifact_value
 from afk.registry import (
     StepContext,
     StepRegistry,
@@ -114,6 +115,7 @@ def run_step(
     )
     ledger.write_logs(result.stdout, result.stderr)
     ledger.write_result(result, input_sha256, project_contract)
+    artifact_paths = result_artifact_paths(result.step, result.output)
     ledger.append_event(
         "step.completed",
         step=step,
@@ -122,6 +124,7 @@ def run_step(
         result_sha256=result.result_sha256,
         stdout_path="stdout.log",
         stderr_path="stderr.log",
+        artifacts=artifact_paths,
     )
     ledger.append_event("run.completed", step=step, status=result.status)
     return result
@@ -149,7 +152,7 @@ class RunLedger:
             "created_at": utc_now(),
             "command": ["afk", "run-step", step],
             "step": step,
-            "input": input_data,
+            "input": redact_artifact_value(input_data),
             "input_sha256": input_sha256,
             **project_contract_fields(project_contract),
         }
@@ -176,6 +179,18 @@ class RunLedger:
             **project_contract_fields(project_contract),
         }
         self.write_json("step-result.json", payload)
+        artifact_paths = result_artifact_paths(result.step, result.output)
+        if artifact_paths.get("publication") and isinstance(result.output, dict):
+            self.write_json(
+                artifact_paths["publication"],
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "run_id": result.run_id,
+                    "step": result.step,
+                    "artifact_type": "checkout-publication",
+                    "output": result.output.get("publication"),
+                },
+            )
 
     def append_event(self, event: str, **fields: Any) -> None:
         payload = {
@@ -200,6 +215,20 @@ def project_contract_fields(project_contract: ProjectContract | None) -> dict[st
         "project": project_contract.project_slug,
         "project_contract": project_contract.identity.as_json(),
     }
+
+
+def result_artifact_paths(step: str, output: Any) -> dict[str, str]:
+    if step != "prepare-checkout":
+        return {}
+    if not isinstance(output, dict):
+        return {}
+    artifacts = output.get("artifacts")
+    if not isinstance(artifacts, dict):
+        return {}
+    publication = artifacts.get("publication")
+    if publication == "publication-result.json":
+        return {"publication": publication}
+    return {}
 
 
 def new_run_id() -> str:
