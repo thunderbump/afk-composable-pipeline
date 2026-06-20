@@ -138,14 +138,17 @@ def main(argv: list[str] | None = None) -> int:
         path_error = checkout_path_error(args.checkout_root, args.checkout_path)
         if path_error is not None:
             parser.error(path_error)
-        recipe = generate_workstream_recipe(
-            workstream_id=args.workstream_id,
-            project_contract=project_contract,
-            beads_workspace=Path(args.beads_workspace),
-            checkout_root=Path(args.checkout_root),
-            checkout_path=Path(args.checkout_path),
-            validation_profile=args.validation_profile,
-        )
+        try:
+            recipe = generate_workstream_recipe(
+                workstream_id=args.workstream_id,
+                project_contract=project_contract,
+                beads_workspace=Path(args.beads_workspace),
+                checkout_root=Path(args.checkout_root),
+                checkout_path=Path(args.checkout_path),
+                validation_profile=args.validation_profile,
+            )
+        except ValueError as exc:
+            parser.error(str(exc))
         output_path = Path(args.output)
         write_recipe(output_path, recipe)
         print(

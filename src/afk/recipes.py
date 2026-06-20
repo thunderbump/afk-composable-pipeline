@@ -5,6 +5,7 @@ import re
 from pathlib import Path
 from typing import Any
 
+from afk.checkouts import url_has_secret_material
 from afk.contracts import ProjectContract
 
 
@@ -20,6 +21,9 @@ def generate_workstream_recipe(
     checkout_path: Path,
     validation_profile: str,
 ) -> dict[str, Any]:
+    if url_has_secret_material(project_contract.repo_url):
+        raise ValueError("project contract repo_url must not contain embedded credentials or query parameters")
+
     review_branch = f"afk/{branch_slug(workstream_id)}"
     required_labels = list(project_contract.beads_labels)
     return {

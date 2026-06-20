@@ -111,6 +111,10 @@ def select_work(input_data: Any, *, project_contract: Any = None) -> dict[str, A
                 )
                 continue
             candidate = normalize_candidate(source_id, source_type, raw_item)
+            selection_skip_reason = raw_item.get("selection_skip_reason")
+            if isinstance(selection_skip_reason, str) and selection_skip_reason:
+                skipped_candidates.append({"candidate": candidate, "reason": selection_skip_reason})
+                continue
             rejection = rejection_reason(
                 candidate,
                 required_labels,
@@ -471,14 +475,18 @@ def load_beads_issues(source: dict[str, Any]) -> list[dict[str, Any]]:
 
     target_ids = source.get("target_ids")
     if target_ids:
-        return [
-            normalize_beads_issue(
-                str(source.get("id") or "beads"),
-                source,
-                load_beads_issue(str(issue_id), workspace=workspace, env=env),
-            )
-            for issue_id in target_ids
-        ]
+        normalized = []
+        for issue_id in target_ids:
+            requested_id = str(issue_id)
+            try:
+                issue = load_beads_issue(requested_id, workspace=workspace, env=env, missing_ok=True)
+            except SourceLoadError as exc:
+                if exc.status != "skipped_missing_target":
+                    raise
+                normalized.append(missing_beads_target(requested_id))
+                continue
+            normalized.append(normalize_beads_issue(str(source.get("id") or "beads"), source, issue))
+        return normalized
 
     command = [
         "bd",
@@ -523,19 +531,70 @@ def read_beads_password(credentials_path: Path) -> str:
     return lines[0]
 
 
-def load_beads_issue(issue_id: str, *, workspace: Path, env: dict[str, str]) -> dict[str, Any]:
-    payload = run_json_command(
-        ["bd", "show", issue_id, "--json"],
-        cwd=workspace,
-        env=env,
-        status_on_failure="skipped_unreachable",
-        message_on_failure="bd show failed",
-    )
+def load_beads_issue(
+    issue_id: str,
+    *,
+    workspace: Path,
+    env: dict[str, str],
+    missing_ok: bool = False,
+) -> dict[str, Any]:
+    try:
+        completed = subprocess.run(
+            ["bd", "show", issue_id, "--json"],
+            cwd=workspace,
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=60,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise SourceLoadError("skipped_unreachable", "bd show failed") from exc
+    if completed.returncode != 0:
+        if missing_ok and beads_show_missing_issue(issue_id, completed.stdout, completed.stderr):
+            raise SourceLoadError("skipped_missing_target", f"requested Beads issue was not found: {issue_id}")
+        raise SourceLoadError("skipped_unreachable", "bd show failed")
+    try:
+        payload = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise SourceLoadError("failed_invalid_payload", "bd show failed") from exc
     if isinstance(payload, list) and payload and isinstance(payload[0], dict):
         return payload[0]
     if isinstance(payload, dict):
         return payload
     raise SourceLoadError("failed_invalid_payload", "bd show returned invalid JSON payload")
+
+
+def beads_show_missing_issue(issue_id: str, stdout: str, stderr: str) -> bool:
+    output = f"{stdout}\n{stderr}".lower()
+    normalized_issue_id = issue_id.lower()
+    return normalized_issue_id in output and any(
+        marker in output
+        for marker in (
+            "not found",
+            "no issue",
+            "does not exist",
+            "unknown issue",
+        )
+    )
+
+
+def missing_beads_target(issue_id: str) -> dict[str, Any]:
+    return {
+        "external_id": issue_id,
+        "url": "",
+        "title": "Requested Beads issue was not found",
+        "status": "open",
+        "labels": [],
+        "parent": None,
+        "workstream": None,
+        "acceptance_criteria": [],
+        "dependencies": [],
+        "blockers": [],
+        "afk": {},
+        "raw": {"beads": {"id": issue_id}, "missing": True},
+        "selection_skip_reason": "missing_target_id",
+    }
 
 
 def normalize_beads_issue(source_id: str, source: dict[str, Any], issue: dict[str, Any]) -> dict[str, Any]:

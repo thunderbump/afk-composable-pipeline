@@ -1094,6 +1094,95 @@ sys.exit(9)
                 ["central-lve.9"],
             )
 
+    def test_beads_source_records_missing_target_id_without_dropping_loaded_targets(self):
+        secret = "beads-secret-value"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            fake_bin = temp_path / "bin"
+            workspace = temp_path / "beads"
+            (workspace / "secrets").mkdir(parents=True)
+            (workspace / "secrets" / "dolt_beads_password.txt").write_text(secret, encoding="utf-8")
+            fake_bin.mkdir()
+            write_executable(
+                fake_bin / "bd",
+                f"""#!{sys.executable}
+import json
+import os
+import sys
+
+if os.environ.get("BEADS_DOLT_PASSWORD") != "{secret}":
+    sys.exit(8)
+
+if len(sys.argv) > 1 and sys.argv[1] == "list":
+    raise SystemExit("bd list should not be used for explicit target_ids")
+
+if len(sys.argv) > 2 and sys.argv[1] == "show" and sys.argv[2] == "central-lve.9":
+    print(json.dumps({{
+        "id": "central-lve.9",
+        "title": "Loadable direct target",
+        "acceptance_criteria": ["Direct target lookup selects the item"],
+        "status": "open",
+        "labels": ["project:afk-composable-pipeline", "afk:ready"],
+        "parent": "central-lve",
+        "metadata": {{"workstream": "central-lve", "afk.ready": True}},
+        "dependencies": [],
+    }}))
+    sys.exit(0)
+
+if len(sys.argv) > 2 and sys.argv[1] == "show" and sys.argv[2] == "central-lve.missing":
+    print("issue not found: central-lve.missing", file=sys.stderr)
+    sys.exit(1)
+
+print("unexpected bd args: " + " ".join(sys.argv[1:]), file=sys.stderr)
+sys.exit(9)
+""",
+            )
+
+            request = {
+                "target_ids": ["central-lve.9", "central-lve.missing"],
+                "required_labels": ["project:afk-composable-pipeline", "afk:ready"],
+                "required_metadata": ["workstream", "acceptance_criteria", "afk.ready"],
+                "sources": [
+                    {
+                        "type": "beads",
+                        "id": "central-beads",
+                        "workspace": str(workspace),
+                        "workspace_kind": "mounted",
+                        "labels": ["project:afk-composable-pipeline", "afk:ready"],
+                        "status": "open",
+                    }
+                ],
+            }
+            ledger = temp_path / "ledger"
+            completed = run_afk(
+                "run-step",
+                "select-work",
+                "--input",
+                json.dumps(request),
+                "--ledger",
+                str(ledger),
+                env={"PATH": str(fake_bin)},
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(
+                [item["external_id"] for item in result["output"]["selected_work"]],
+                ["central-lve.9"],
+            )
+            self.assertEqual(result["output"]["source_statuses"][0]["status"], "selected")
+            self.assertEqual(result["output"]["source_statuses"][0]["candidate_count"], 2)
+            self.assertEqual(
+                [
+                    (item["candidate"]["external_id"], item["reason"])
+                    for item in result["output"]["skipped_candidates"]
+                ],
+                [("central-lve.missing", "missing_target_id")],
+            )
+
     def test_malformed_beads_show_payload_records_source_failure_without_crashing(self):
         secret = "beads-secret-value"
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -248,6 +248,48 @@ class GenerateRecipeCliTest(unittest.TestCase):
             self.assertIn("checkout_path must be inside checkout_root", completed.stderr)
             self.assertFalse(output.exists())
 
+    def test_generate_recipe_rejects_credential_repo_url_without_writing_recipe(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            contracts_dir = temp_path / "contracts"
+            output = temp_path / "recipe.json"
+            ledger = temp_path / "ledger"
+            beads_workspace = temp_path / "central-beads"
+            checkout_root = temp_path / "checkouts"
+            contracts_dir.mkdir()
+            beads_workspace.mkdir()
+            write_contract(
+                contracts_dir / "demo.json",
+                project_slug="demo",
+                repo_url="https://user:secret-token@example.invalid/repo.git",
+            )
+
+            completed = run_afk(
+                "generate-recipe",
+                "--workstream-id",
+                "central-afk-pr.1",
+                "--project",
+                "demo",
+                "--contracts-dir",
+                str(contracts_dir),
+                "--ledger",
+                str(ledger),
+                "--beads-workspace",
+                str(beads_workspace),
+                "--checkout-root",
+                str(checkout_root),
+                "--checkout-path",
+                str(checkout_root / "demo"),
+                "--validation-profile",
+                "tier1",
+                "--output",
+                str(output),
+            )
+
+            self.assertNotEqual(completed.returncode, 0, completed.stdout)
+            self.assertIn("project contract repo_url must not contain embedded credentials or query parameters", completed.stderr)
+            self.assertFalse(output.exists())
+
     def test_generated_recipe_runs_and_records_directly_selected_bead(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
