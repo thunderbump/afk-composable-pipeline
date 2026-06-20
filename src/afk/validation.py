@@ -94,19 +94,6 @@ def validate(
 
     raw_payload = read_worker_payload(result_path)
     if raw_payload["status"] != "valid":
-        if raw_payload["status"] == "missing" and adapter_result["returncode"] != 0:
-            normalized = normalized_worker_result(
-                status="failed_runtime",
-                classification="runtime_failure",
-                summary="worker command failed",
-                raw_result=None,
-                adapter=adapter_record(request["worker"], adapter_result["returncode"], False),
-                stdout=stdout,
-                stderr=stderr,
-            )
-            worker_result = {"raw": None, "normalized": normalized}
-            write_worker_result(worker_result_path, run_id, worker_result)
-            return validate_output(request, worker_request, worker_result)
         if raw_payload["status"] == "missing":
             status = "failed_missing_result"
             classification = "missing_worker_result"
@@ -435,10 +422,25 @@ def normalize_worker_payload(
 ) -> dict[str, Any]:
     raw_status = string_field(payload, "status") or ""
     returncode = adapter.get("returncode")
-    if isinstance(returncode, int) and returncode != 0 and raw_status not in {"fail", "failed"}:
+    success_statuses = {"pass", "passed", "success", "succeeded", "completed"}
+    skip_statuses = {"skip", "skipped"}
+    failure_statuses = {"fail", "failed"}
+    if raw_status in success_statuses:
+        status = "validated"
+        classification = "success"
+    elif raw_status in skip_statuses:
+        status = "skipped_profile"
+        classification = "profile_skipped"
+    elif raw_status in failure_statuses:
+        status = "failed_validation"
+        classification = "worker_failure"
+    else:
+        status = "failed_protocol"
+        classification = "protocol_failure"
+    if isinstance(returncode, int) and returncode != 0 and raw_status in success_statuses | skip_statuses:
         status = "failed_runtime"
         classification = "runtime_failure"
-        summary = f"worker command exited {returncode} after reporting {raw_status or 'no status'}"
+        summary = f"worker command exited {returncode} after reporting {raw_status}"
         return normalized_worker_result(
             status=status,
             classification=classification,
@@ -448,18 +450,6 @@ def normalize_worker_payload(
             stdout=stdout,
             stderr=stderr,
         )
-    if raw_status in {"pass", "passed", "success", "succeeded", "completed"}:
-        status = "validated"
-        classification = "success"
-    elif raw_status in {"skip", "skipped"}:
-        status = "skipped_profile"
-        classification = "profile_skipped"
-    elif raw_status in {"fail", "failed"}:
-        status = "failed_validation"
-        classification = "worker_failure"
-    else:
-        status = "failed_protocol"
-        classification = "protocol_failure"
     summary = string_field(payload, "summary") or status
     return normalized_worker_result(
         status=status,
