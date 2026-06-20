@@ -204,8 +204,6 @@ def normalize_recipe(
     resolved_parent = parent or string_field(recipe, "parent") or ""
     review_branch = string_field(recipe, "review_branch") or f"afk/{resolved_workstream_id}"
     publisher = recipe.get("publisher", {"enabled": False})
-    if not isinstance(publisher, dict):
-        raise WorkstreamError("publisher must be an object")
     return {
         "schema_version": SCHEMA_VERSION,
         "workstream_id": resolved_workstream_id,
@@ -227,9 +225,11 @@ def composed_step_input(
     if step_name == "prepare-checkout":
         input_data["review_branch"] = normalized["review_branch"]
     elif step_name == "implement":
-        input_data.setdefault("work_selection", {"schema_version": SCHEMA_VERSION, "selected_work": state["selected_work"]})
+        input_data["work_selection"] = {"schema_version": SCHEMA_VERSION, "selected_work": state["selected_work"]}
         if state.get("checkout") is not None:
-            input_data.setdefault("checkout", state["checkout"])
+            input_data["checkout"] = state["checkout"]
+        else:
+            input_data.pop("checkout", None)
     elif step_name == "validate":
         if state.get("checkout") is not None:
             input_data["checkout"] = state["checkout"]
@@ -246,7 +246,13 @@ def composed_step_input(
             input_data["checkout"] = state["checkout"]
         if state.get("implementation") is not None:
             input_data["implementation"] = state["implementation"]
-        input_data.setdefault("validation", {"required_artifacts": validation_artifact_refs(state, ledger_dir)})
+        validation = input_data.get("validation", {})
+        if not isinstance(validation, dict):
+            validation = {}
+        input_data["validation"] = {
+            **validation,
+            "required_artifacts": validation_artifact_refs(state, ledger_dir),
+        }
         input_data.setdefault("cleanup", {"status": "clean", "resources": []})
     return input_data
 
@@ -259,7 +265,8 @@ def equivalent_run_step_command(
     profile: str | None,
     project_contract: ProjectContract | None,
 ) -> list[str]:
-    command = ["afk", "run-step", step_name, "--input", canonical_json(input_data), "--ledger", str(ledger_dir)]
+    redacted_input = redact_artifact_value(input_data)
+    command = ["afk", "run-step", step_name, "--input", canonical_json(redacted_input), "--ledger", str(ledger_dir)]
     if profile:
         command.extend(["--profile", profile])
     if project_contract is not None:
@@ -430,7 +437,7 @@ def review_checkout_commit(review: dict[str, Any]) -> str:
 
 
 def publish_terminal_pr(
-    publisher: dict[str, Any],
+    publisher: Any,
     *,
     normalized: dict[str, Any],
     state: dict[str, Any],
@@ -438,6 +445,8 @@ def publish_terminal_pr(
     selected_work: list[dict[str, Any]],
     ledger: "WorkstreamLedger",
 ) -> dict[str, Any]:
+    if not isinstance(publisher, dict):
+        return failed_publication_config("publisher must be an object", normalized)
     if not publisher.get("enabled", True):
         return {"status": "skipped_disabled", "enabled": False}
     try:
