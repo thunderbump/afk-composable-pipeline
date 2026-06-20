@@ -310,29 +310,35 @@ def normalize_validation(validation: Any) -> dict[str, Any]:
         step_path = Path(step_result_path)
         worker_path = Path(worker_result_path) if worker_result_path else None
         step_path_errors = validation_artifact_path_errors(step_path, "step-result.json")
-        worker_path_errors = []
+        worker_path_errors = ["worker-result.json path is required"] if worker_path is None else []
         pair_path_errors = []
         if worker_path is not None:
             worker_path_errors = validation_artifact_path_errors(worker_path, "worker-result.json")
             pair_path_errors = validation_artifact_pair_path_errors(step_path, worker_path)
         path_errors = step_path_errors + worker_path_errors + pair_path_errors
-        if pair_path_errors:
-            step_result = invalid_validation_artifact_path_result(step_path, pair_path_errors)
-            worker_result = invalid_validation_artifact_path_result(worker_path, pair_path_errors)
-        else:
-            step_result = read_validation_artifact(step_path, "step-result.json")
-            worker_result = (
-                read_validation_artifact(worker_path, "worker-result.json")
-                if worker_path is not None
-                else {"status": "missing"}
+        if path_errors:
+            step_result = invalid_validation_artifact_path_result(
+                step_path,
+                step_path_errors or pair_path_errors or path_errors,
             )
+            worker_result = invalid_validation_artifact_path_result(
+                worker_path,
+                worker_path_errors or pair_path_errors or path_errors,
+            )
+        else:
+            step_result = read_json_artifact(step_path)
+            worker_result = read_json_artifact(worker_path)
         output = step_result.get("output") if isinstance(step_result.get("output"), dict) else {}
         worker_normalized = worker_validation_result(worker_result)
-        evidence_errors = path_errors + validation_evidence_errors(
-            step_result,
-            worker_result,
-            worker_result_path=worker_result_path,
-        )
+        evidence_errors = list(path_errors)
+        if not path_errors:
+            evidence_errors.extend(
+                validation_evidence_errors(
+                    step_result,
+                    worker_result,
+                    worker_result_path=worker_result_path,
+                )
+            )
         normalized.append(
             redact_artifact_value(
                 {
