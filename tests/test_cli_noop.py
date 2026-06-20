@@ -65,7 +65,7 @@ class NoopCliTest(unittest.TestCase):
 
             self.assertNotEqual(completed.returncode, 0)
             self.assertIn("unknown step 'missing-step'", completed.stderr)
-            self.assertIn("known steps: noop", completed.stderr)
+            self.assertIn("known steps: implement, noop, prepare-checkout, select-work", completed.stderr)
             self.assertFalse(ledger.exists())
 
     def test_project_contract_validation_errors_are_reported(self):
@@ -211,6 +211,34 @@ class NoopCliTest(unittest.TestCase):
                 ]
             )
             self.assertNotIn(str(Path.home()), artifact_text)
+
+    def test_noop_output_cannot_request_extra_ledger_artifacts(self):
+        input_data = {
+            "artifacts": {"publication": "publication-result.json"},
+            "publication": {"status": "should-not-write"},
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ledger = Path(temp_dir) / "ledger"
+            completed = run_afk(
+                "run-step",
+                "noop",
+                "--input",
+                json.dumps(input_data),
+                "--ledger",
+                str(ledger),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            self.assertFalse((run_dir / "publication-result.json").exists())
+            events = [
+                json.loads(line)
+                for line in (run_dir / "ledger.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            completed_event = next(event for event in events if event["event"] == "step.completed")
+            self.assertEqual(completed_event["artifacts"], {})
 
 
 if __name__ == "__main__":
