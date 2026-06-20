@@ -308,6 +308,8 @@ class ImplementCliTest(unittest.TestCase):
             self.assertNotEqual(observation["home"], os.environ.get("HOME"))
             self.assertEqual(observation["ambient_pi_token"], "missing")
             self.assertEqual(observation["ambient_openai_key"], "missing")
+            self.assertIn(str(codex_home), artifact_text)
+            self.assertIn(str(config_home), artifact_text)
             self.assertNotIn("ambient-pi-secret", artifact_text)
             self.assertNotIn("ambient-openai-secret", artifact_text)
 
@@ -450,6 +452,8 @@ class ImplementCliTest(unittest.TestCase):
             ("config_home", "xdg-config", "agent.config_home must be absolute"),
             ("codex_home", "checkout", "agent.codex_home must be outside checkout"),
             ("config_home", "checkout/config", "agent.config_home must be outside checkout"),
+            ("codex_home", "missing-codex-home", "agent.codex_home must be an existing directory"),
+            ("config_home", "missing-xdg-config", "agent.config_home must be an existing directory"),
         ]
         for field, path_kind, expected_message in cases:
             with self.subTest(field=field, path_kind=path_kind):
@@ -469,6 +473,8 @@ class ImplementCliTest(unittest.TestCase):
                         "xdg-config": "xdg-config",
                         "checkout": str(checkout),
                         "checkout/config": str(checkout_config),
+                        "missing-codex-home": str(temp_path / "missing-codex-home"),
+                        "missing-xdg-config": str(temp_path / "missing-xdg-config"),
                     }[path_kind]
                     agent = {
                         "type": "real-agent-command",
@@ -510,6 +516,53 @@ class ImplementCliTest(unittest.TestCase):
                     self.assertEqual(result["output"]["status"], "failed_invalid_payload")
                     self.assertEqual(result["output"]["message"], expected_message)
                     self.assertNotIn("should not run", (run_dir / "stdout.log").read_text(encoding="utf-8"))
+
+    def test_implement_rejects_real_agent_command_missing_remote_auth_mount_paths(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            checkout = temp_path / "checkout"
+            start_commit = init_checkout(checkout)
+            ledger = temp_path / "ledger"
+            outside_pi_config = temp_path / "pi-config-missing"
+            completed = run_afk(
+                "run-step",
+                "implement",
+                "--input",
+                json.dumps(
+                    {
+                        "work_selection": {"schema_version": 1, "selected_work": [selected_work()]},
+                        "checkout": {
+                            "status": "prepared",
+                            "checkout_path": str(checkout),
+                            "review_branch": "afk/test-work",
+                            "requested_ref": "main",
+                            "start_commit": start_commit,
+                        },
+                        "guardrails": [],
+                        "validation": {"profile": "tier1", "commands": []},
+                        "agent": {
+                            "type": "real-agent-command",
+                            "command": [sys.executable, "-c", "print('should not run')"],
+                            "result_path": "agent-result.json",
+                            "env": {"PI_CONFIG_HOME": str(outside_pi_config)},
+                        },
+                    }
+                ),
+                "--ledger",
+                str(ledger),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(result["output"]["status"], "failed_invalid_payload")
+            self.assertEqual(
+                result["output"]["message"],
+                "agent.env.PI_CONFIG_HOME must be an existing directory",
+            )
+            self.assertNotIn("should not run", (run_dir / "stdout.log").read_text(encoding="utf-8"))
 
     def test_implement_rejects_real_agent_command_checkout_internal_config_env_paths(self):
         cases = [

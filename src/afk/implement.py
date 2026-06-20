@@ -389,12 +389,18 @@ def unsafe_agent_env_path(key: str, value: str, checkout_path: Path) -> str | No
         return f"agent.env.{key} must be an absolute path outside checkout"
     if path_is_equal_to_or_inside(path, checkout_path):
         return f"agent.env.{key} must be outside checkout"
+    if path_is_existing_directory_mount(key) and not path.is_dir():
+        return f"agent.env.{key} must be an existing directory"
     return None
 
 
 def is_config_state_env_key(key: str) -> bool:
     components = key_components(key)
     return any(component in {"cache", "config", "home", "path", "session", "state"} for component in components)
+
+
+def path_is_existing_directory_mount(key: str) -> bool:
+    return key.upper().endswith("_CONFIG_HOME")
 
 
 def normalize_absolute_dir(value: Any, field: str, *, checkout_path: Path | None = None) -> dict[str, Any]:
