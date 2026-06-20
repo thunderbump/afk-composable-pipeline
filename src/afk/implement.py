@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from afk.jsonutil import canonical_json
-from afk.redaction import is_secret_command_flag, is_secret_key, redact_artifact_value, redact_text
+from afk.redaction import is_secret_command_flag, is_secret_key, is_secret_value, redact_artifact_value, redact_text
 
 
 SCHEMA_VERSION = 1
@@ -152,7 +152,7 @@ def normalize_request(input_data: Any, *, project_contract: Any, run_id: str) ->
     if validation["status"] != "valid":
         return invalid_request(validation["message"])
 
-    agent = normalize_agent(input_data.get("agent"))
+    agent = normalize_agent(input_data.get("agent"), checkout_path=Path(checkout["checkout"]["path"]))
     if agent["status"] != "valid":
         return invalid_request(agent["message"])
 
@@ -281,7 +281,7 @@ def normalize_validation(validation: Any, project_contract: Any) -> dict[str, An
     }
 
 
-def normalize_agent(agent: Any) -> dict[str, Any]:
+def normalize_agent(agent: Any, *, checkout_path: Path) -> dict[str, Any]:
     if not isinstance(agent, dict):
         return {"status": "invalid", "message": "agent must be an object"}
     agent_type = agent.get("type")
@@ -319,10 +319,18 @@ def normalize_agent(agent: Any) -> dict[str, Any]:
         env = normalize_agent_env(agent.get("env", {}))
         if env["status"] != "valid":
             return {"status": "invalid", "message": env["message"]}
-        codex_home = normalize_absolute_dir(agent.get("codex_home"), "agent.codex_home")
+        codex_home = normalize_absolute_dir(
+            agent.get("codex_home"),
+            "agent.codex_home",
+            checkout_path=checkout_path,
+        )
         if codex_home["status"] != "valid":
             return {"status": "invalid", "message": codex_home["message"]}
-        config_home = normalize_absolute_dir(agent.get("config_home"), "agent.config_home")
+        config_home = normalize_absolute_dir(
+            agent.get("config_home"),
+            "agent.config_home",
+            checkout_path=checkout_path,
+        )
         if config_home["status"] != "valid":
             return {"status": "invalid", "message": config_home["message"]}
         normalized_agent["env"] = env["env"]
@@ -348,11 +356,13 @@ def normalize_agent_env(env: Any) -> dict[str, Any]:
             return {"status": "invalid", "message": f"agent.env must not include secret variable {key}"}
         if not isinstance(value, str):
             return {"status": "invalid", "message": f"agent.env.{key} must be a string"}
+        if is_secret_value(value):
+            return {"status": "invalid", "message": f"agent.env.{key} must not include a secret-looking value"}
         normalized[key] = value
     return {"status": "valid", "env": normalized}
 
 
-def normalize_absolute_dir(value: Any, field: str) -> dict[str, Any]:
+def normalize_absolute_dir(value: Any, field: str, *, checkout_path: Path | None = None) -> dict[str, Any]:
     if value is None:
         return {"status": "valid", "path": ""}
     if not isinstance(value, str) or not value.strip():
@@ -362,7 +372,19 @@ def normalize_absolute_dir(value: Any, field: str) -> dict[str, Any]:
         return {"status": "invalid", "message": f"{field} must be absolute"}
     if not path.is_dir():
         return {"status": "invalid", "message": f"{field} must be an existing directory"}
+    if checkout_path is not None and path_is_equal_to_or_inside(path, checkout_path):
+        return {"status": "invalid", "message": f"{field} must be outside checkout"}
     return {"status": "valid", "path": str(path)}
+
+
+def path_is_equal_to_or_inside(path: Path, parent: Path) -> bool:
+    for candidate in (path, path.resolve()):
+        try:
+            candidate.relative_to(parent.resolve())
+            return True
+        except ValueError:
+            pass
+    return False
 
 
 def normalize_string_list(value: Any, field: str) -> dict[str, Any]:

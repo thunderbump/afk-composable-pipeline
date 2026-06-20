@@ -311,6 +311,73 @@ class ImplementCliTest(unittest.TestCase):
             self.assertNotIn("ambient-pi-secret", artifact_text)
             self.assertNotIn("ambient-openai-secret", artifact_text)
 
+    def test_implement_rejects_real_agent_command_auth_config_paths_inside_checkout_or_relative(self):
+        cases = [
+            ("codex_home", "codex-cache", "agent.codex_home must be absolute"),
+            ("config_home", "xdg-config", "agent.config_home must be absolute"),
+            ("codex_home", "checkout", "agent.codex_home must be outside checkout"),
+            ("config_home", "checkout/config", "agent.config_home must be outside checkout"),
+        ]
+        for field, path_kind, expected_message in cases:
+            with self.subTest(field=field, path_kind=path_kind):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    temp_path = Path(temp_dir)
+                    checkout = temp_path / "checkout"
+                    start_commit = init_checkout(checkout)
+                    ledger = temp_path / "ledger"
+                    outside_codex_home = temp_path / "codex-home"
+                    outside_config_home = temp_path / "xdg-config"
+                    outside_codex_home.mkdir()
+                    outside_config_home.mkdir()
+                    checkout_config = checkout / "config"
+                    checkout_config.mkdir()
+                    path_value = {
+                        "codex-cache": "codex-cache",
+                        "xdg-config": "xdg-config",
+                        "checkout": str(checkout),
+                        "checkout/config": str(checkout_config),
+                    }[path_kind]
+                    agent = {
+                        "type": "real-agent-command",
+                        "command": [sys.executable, "-c", "print('should not run')"],
+                        "result_path": "agent-result.json",
+                        "codex_home": str(outside_codex_home),
+                        "config_home": str(outside_config_home),
+                    }
+                    agent[field] = path_value
+
+                    completed = run_afk(
+                        "run-step",
+                        "implement",
+                        "--input",
+                        json.dumps(
+                            {
+                                "work_selection": {"schema_version": 1, "selected_work": [selected_work()]},
+                                "checkout": {
+                                    "status": "prepared",
+                                    "checkout_path": str(checkout),
+                                    "review_branch": "afk/test-work",
+                                    "requested_ref": "main",
+                                    "start_commit": start_commit,
+                                },
+                                "guardrails": [],
+                                "validation": {"profile": "tier1", "commands": []},
+                                "agent": agent,
+                            }
+                        ),
+                        "--ledger",
+                        str(ledger),
+                    )
+
+                    self.assertEqual(completed.returncode, 0, completed.stderr)
+                    summary = json.loads(completed.stdout)
+                    run_dir = ledger / "runs" / summary["run_id"]
+                    result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+
+                    self.assertEqual(result["output"]["status"], "failed_invalid_payload")
+                    self.assertEqual(result["output"]["message"], expected_message)
+                    self.assertNotIn("should not run", (run_dir / "stdout.log").read_text(encoding="utf-8"))
+
     def test_implement_rejects_real_agent_command_secret_env_without_exposing_value(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
@@ -361,6 +428,60 @@ class ImplementCliTest(unittest.TestCase):
             self.assertEqual(
                 result["output"]["message"],
                 "agent.env must not include secret variable OPENAI_API_KEY",
+            )
+            self.assertNotIn(secret, artifact_text)
+            self.assertNotIn("should not run", (run_dir / "stdout.log").read_text(encoding="utf-8"))
+
+    def test_implement_rejects_real_agent_command_secret_shaped_env_value_without_exposing_value(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            checkout = temp_path / "checkout"
+            start_commit = init_checkout(checkout)
+            ledger = temp_path / "ledger"
+            secret = "ghp_secretshapedvalue1234567890"
+
+            completed = run_afk(
+                "run-step",
+                "implement",
+                "--input",
+                json.dumps(
+                    {
+                        "work_selection": {"schema_version": 1, "selected_work": [selected_work()]},
+                        "checkout": {
+                            "status": "prepared",
+                            "checkout_path": str(checkout),
+                            "review_branch": "afk/test-work",
+                            "requested_ref": "main",
+                            "start_commit": start_commit,
+                        },
+                        "guardrails": [],
+                        "validation": {"profile": "tier1", "commands": []},
+                        "agent": {
+                            "type": "real-agent-command",
+                            "command": [sys.executable, "-c", "print('should not run')"],
+                            "result_path": "agent-result.json",
+                            "env": {"PIPELINE_LABEL": secret},
+                        },
+                    }
+                ),
+                "--ledger",
+                str(ledger),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+            artifact_text = "\n".join(
+                path.read_text(encoding="utf-8")
+                for path in run_dir.iterdir()
+                if path.is_file()
+            )
+
+            self.assertEqual(result["output"]["status"], "failed_invalid_payload")
+            self.assertEqual(
+                result["output"]["message"],
+                "agent.env.PIPELINE_LABEL must not include a secret-looking value",
             )
             self.assertNotIn(secret, artifact_text)
             self.assertNotIn("should not run", (run_dir / "stdout.log").read_text(encoding="utf-8"))

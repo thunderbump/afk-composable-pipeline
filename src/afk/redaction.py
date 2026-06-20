@@ -103,6 +103,10 @@ def is_secret_key(value: str) -> bool:
     return any(left == "api" and right == "key" for left, right in zip(components, components[1:]))
 
 
+def is_secret_value(value: str) -> bool:
+    return redact_text(value) != value
+
+
 def key_components(value: str) -> list[str]:
     components = []
     for chunk in re.split(r"[._-]+", value):
