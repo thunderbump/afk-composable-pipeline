@@ -94,7 +94,7 @@ def validate(
 
     raw_payload = read_worker_payload(result_path)
     if raw_payload["status"] != "valid":
-        if adapter_result["returncode"] != 0:
+        if raw_payload["status"] == "missing" and adapter_result["returncode"] != 0:
             normalized = normalized_worker_result(
                 status="failed_runtime",
                 classification="runtime_failure",
@@ -107,9 +107,15 @@ def validate(
             worker_result = {"raw": None, "normalized": normalized}
             write_worker_result(worker_result_path, run_id, worker_result)
             return validate_output(request, worker_request, worker_result)
+        if raw_payload["status"] == "missing":
+            status = "failed_missing_result"
+            classification = "missing_worker_result"
+        else:
+            status = "failed_protocol"
+            classification = "protocol_failure"
         normalized = normalized_worker_result(
-            status="failed_missing_result",
-            classification="missing_worker_result",
+            status=status,
+            classification=classification,
             summary=raw_payload["message"],
             raw_result=None,
             adapter=adapter_record(request["worker"], adapter_result["returncode"], False),
@@ -405,8 +411,10 @@ def minimal_worker_environment(temp_path: Path) -> dict[str, str]:
 def read_worker_payload(path: Path) -> dict[str, Any]:
     try:
         raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return {"status": "missing", "message": "worker result file was not produced"}
     except OSError:
-        return {"status": "invalid", "message": "worker result file was not produced"}
+        return {"status": "invalid", "message": "worker result file could not be read"}
     try:
         import json
 
@@ -426,6 +434,20 @@ def normalize_worker_payload(
     stderr: str,
 ) -> dict[str, Any]:
     raw_status = string_field(payload, "status") or ""
+    returncode = adapter.get("returncode")
+    if isinstance(returncode, int) and returncode != 0 and raw_status not in {"fail", "failed"}:
+        status = "failed_runtime"
+        classification = "runtime_failure"
+        summary = f"worker command exited {returncode} after reporting {raw_status or 'no status'}"
+        return normalized_worker_result(
+            status=status,
+            classification=classification,
+            summary=summary,
+            raw_result=payload,
+            adapter=adapter,
+            stdout=stdout,
+            stderr=stderr,
+        )
     if raw_status in {"pass", "passed", "success", "succeeded", "completed"}:
         status = "validated"
         classification = "success"

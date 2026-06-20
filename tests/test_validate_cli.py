@@ -322,6 +322,66 @@ class ValidateCliTest(unittest.TestCase):
                 worker_result["result"]["normalized"]["evidence"]["stdout_excerpt"],
             )
 
+    def test_validate_classifies_invalid_worker_json_as_protocol_failure(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            checkout = temp_path / "checkout"
+            start_commit = init_checkout(checkout)
+            ledger = temp_path / "ledger"
+            worker_code = textwrap.dedent(
+                """
+                import os
+                from pathlib import Path
+
+                Path(os.environ["AFK_WORKER_RESULT"]).write_text("{not valid json", encoding="utf-8")
+                print("wrote malformed result")
+                """
+            ).strip()
+
+            completed = run_afk(
+                "run-step",
+                "validate",
+                "--profile",
+                "tier3-harness",
+                "--input",
+                json.dumps(
+                    {
+                        "checkout": {
+                            "status": "prepared",
+                            "checkout_path": str(checkout),
+                            "review_branch": "afk/validate",
+                            "requested_ref": "main",
+                            "start_commit": start_commit,
+                        },
+                        "worker": {
+                            "type": "local-command",
+                            "command": [sys.executable, "-c", worker_code],
+                        },
+                    }
+                ),
+                "--ledger",
+                str(ledger),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+            worker_result = json.loads((run_dir / "worker-result.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(result["output"]["status"], "failed_protocol")
+            self.assertEqual(result["output"]["classification"], "protocol_failure")
+            self.assertIsNone(worker_result["result"]["raw"])
+            self.assertEqual(
+                worker_result["result"]["normalized"]["summary"],
+                "worker result file is not valid JSON",
+            )
+            self.assertEqual(worker_result["result"]["normalized"]["adapter"]["returncode"], 0)
+            self.assertIn(
+                "wrote malformed result",
+                worker_result["result"]["normalized"]["evidence"]["stdout_excerpt"],
+            )
+
     def test_validate_classifies_worker_timeout_separately(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
@@ -367,6 +427,76 @@ class ValidateCliTest(unittest.TestCase):
             self.assertEqual(
                 worker_result["result"]["normalized"]["summary"],
                 "worker command timed out",
+            )
+
+    def test_validate_rejects_pass_result_when_adapter_exits_nonzero(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            checkout = temp_path / "checkout"
+            start_commit = init_checkout(checkout)
+            ledger = temp_path / "ledger"
+            worker_code = textwrap.dedent(
+                """
+                import json
+                import os
+                import sys
+                from pathlib import Path
+
+                Path(os.environ["AFK_WORKER_RESULT"]).write_text(
+                    json.dumps(
+                        {
+                            "profile": "tier3-harness",
+                            "status": "pass",
+                            "summary": "validation passed",
+                            "steps": [],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                print("reported pass before adapter failure")
+                sys.exit(7)
+                """
+            ).strip()
+
+            completed = run_afk(
+                "run-step",
+                "validate",
+                "--profile",
+                "tier3-harness",
+                "--input",
+                json.dumps(
+                    {
+                        "checkout": {
+                            "status": "prepared",
+                            "checkout_path": str(checkout),
+                            "review_branch": "afk/validate",
+                            "requested_ref": "main",
+                            "start_commit": start_commit,
+                        },
+                        "worker": {
+                            "type": "local-command",
+                            "command": [sys.executable, "-c", worker_code],
+                        },
+                    }
+                ),
+                "--ledger",
+                str(ledger),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+            worker_result = json.loads((run_dir / "worker-result.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(result["output"]["status"], "failed_runtime")
+            self.assertEqual(result["output"]["classification"], "runtime_failure")
+            self.assertEqual(worker_result["result"]["raw"]["status"], "pass")
+            self.assertEqual(worker_result["result"]["normalized"]["classification"], "runtime_failure")
+            self.assertEqual(worker_result["result"]["normalized"]["adapter"]["returncode"], 7)
+            self.assertIn(
+                "reported pass before adapter failure",
+                worker_result["result"]["normalized"]["evidence"]["stdout_excerpt"],
             )
 
     def test_validate_classifies_worker_reported_failure_even_when_adapter_exits_nonzero(self):
