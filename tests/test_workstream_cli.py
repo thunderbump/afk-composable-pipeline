@@ -456,6 +456,109 @@ sys.exit(0)
                 str((ledger / "runs" / validate_step["run_id"] / "worker-result.json").resolve(strict=False)),
             )
 
+    def test_workstream_later_implementation_requires_fresh_validation_before_review(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repo = temp_path / "repo-src"
+            checkout = temp_path / "checkout"
+            ledger = temp_path / "ledger"
+            fake_calls = temp_path / "fake-calls.jsonl"
+            reviewer_invoked = temp_path / "reviewer-invoked"
+            init_repo(repo)
+            fake_git = temp_path / "publisher-git"
+            fake_gh = temp_path / "publisher-gh"
+            write_executable(
+                fake_git,
+                f"""#!{sys.executable}
+from pathlib import Path
+Path({str(fake_calls)!r}).write_text("git should not run\\n", encoding="utf-8")
+""",
+            )
+            write_executable(
+                fake_gh,
+                f"""#!{sys.executable}
+from pathlib import Path
+Path({str(fake_calls)!r}).write_text("gh should not run\\n", encoding="utf-8")
+""",
+            )
+            second_agent_code = textwrap.dedent(
+                """
+                import json
+                import subprocess
+                from pathlib import Path
+
+                Path("second-implementation.txt").write_text("later implementation\\n", encoding="utf-8")
+                subprocess.run(["git", "add", "second-implementation.txt"], check=True)
+                subprocess.run(["git", "commit", "-m", "later implementation"], check=True)
+                Path("agent-result.json").write_text(
+                    json.dumps({"status": "completed", "summary": "later implementation"}),
+                    encoding="utf-8",
+                )
+                """
+            ).strip()
+            reviewer_code = textwrap.dedent(
+                f"""
+                import json
+                import os
+                from pathlib import Path
+
+                Path({str(reviewer_invoked)!r}).write_text("reviewer ran\\n", encoding="utf-8")
+                Path(os.environ["AFK_REVIEWER_RESULT"]).write_text(
+                    json.dumps({{"status": "pass", "summary": "stale validation accepted", "findings": []}}),
+                    encoding="utf-8",
+                )
+                """
+            ).strip()
+            recipe = successful_recipe(temp_path, repo, checkout, fake_git, fake_gh)
+            recipe["steps"].insert(
+                4,
+                {
+                    "name": "implement",
+                    "input": {
+                        "guardrails": ["stay within checkout"],
+                        "agent": {
+                            "type": "fake-pi-command",
+                            "command": [sys.executable, "-c", second_agent_code],
+                            "result_path": "agent-result.json",
+                        },
+                    },
+                },
+            )
+            recipe["steps"][5]["input"]["reviewer"]["command"] = [sys.executable, "-c", reviewer_code]
+
+            completed = run_afk(
+                "run-workstream",
+                "--workstream-id",
+                "central-lve.9",
+                "--input",
+                json.dumps(recipe),
+                "--ledger",
+                str(ledger),
+                env_overrides={
+                    "GIT_ALLOW_PROTOCOL": "file",
+                    "GIT_AUTHOR_NAME": "AFK Test",
+                    "GIT_AUTHOR_EMAIL": "afk-test@example.test",
+                    "GIT_COMMITTER_NAME": "AFK Test",
+                    "GIT_COMMITTER_EMAIL": "afk-test@example.test",
+                },
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            result = json.loads((ledger / summary["result_path"]).read_text(encoding="utf-8"))
+
+            self.assertEqual(summary["status"], "blocked")
+            self.assertEqual(result["status"], "blocked")
+            self.assertEqual(result["publication"]["status"], "blocked")
+            self.assertIn("validation evidence", result["publication"]["reason"])
+            self.assertEqual(
+                [step["name"] for step in result["steps"]],
+                ["select-work", "prepare-checkout", "implement", "validate", "implement"],
+            )
+            self.assertEqual(result["selected_work"][0]["result"], "implemented")
+            self.assertFalse(reviewer_invoked.exists())
+            self.assertFalse(fake_calls.exists())
+
     def test_workstream_implement_uses_selected_work_and_prepared_checkout_over_recipe_refs(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)

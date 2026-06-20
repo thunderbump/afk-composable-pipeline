@@ -121,17 +121,19 @@ def run_workstream(
             state["blocked_reason"] = blocked_reason
             break
 
-    selected_work = selected_work_records(state, review_status(state))
     publication: dict[str, Any]
     if state["blocked_reason"]:
+        selected_work = selected_work_records(state, review_status(state))
         publication = blocked_publication(state["blocked_reason"], normalized, run_id)
         status = "blocked"
     else:
         publication_gate = publication_gate_reason(state)
         if publication_gate:
+            selected_work = selected_work_records(state, gated_selected_work_status(state))
             publication = blocked_publication(publication_gate, normalized, run_id)
             status = "blocked"
         else:
+            selected_work = selected_work_records(state, review_status(state))
             publication = publish_terminal_pr(
                 normalized["publisher"],
                 normalized=normalized,
@@ -310,6 +312,9 @@ def update_state_from_step(
     elif step_name == "implement":
         state["implementation"] = output
         state["checkout"] = checkout_after_implementation(state.get("checkout"), output)
+        if output.get("status") == "implemented":
+            state["validations"] = []
+            state["review"] = None
     elif step_name == "validate":
         state["validations"].append(
             {
@@ -336,6 +341,11 @@ def workflow_order_blocking_reason(step_name: str, state: dict[str, Any]) -> str
             return "review requires implementation evidence before final review"
         if not state["validations"]:
             return "review requires final validation evidence after implementation"
+        implemented_commit = implemented_after_commit(state)
+        if implemented_commit and not any(
+            validation_checkout_commit(validation) == implemented_commit for validation in state["validations"]
+        ):
+            return "review requires final validation evidence for implemented HEAD"
     return ""
 
 
@@ -709,6 +719,13 @@ def review_status(state: dict[str, Any]) -> str:
     if implementation.get("status") == "implemented":
         return "implemented"
     return "selected"
+
+
+def gated_selected_work_status(state: dict[str, Any]) -> str:
+    status = review_status(state)
+    if status == "passed":
+        return "implemented" if implemented_after_commit(state) else "selected"
+    return status
 
 
 def blocked_publication(reason: str, normalized: dict[str, Any], run_id: str) -> dict[str, Any]:
