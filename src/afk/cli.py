@@ -10,6 +10,7 @@ from typing import Any
 from afk.contracts import ContractError, ProjectContract, load_project_contract
 from afk.jsonutil import canonical_json, sha256_json
 from afk.redaction import redact_artifact_value
+from afk.recipes import generate_workstream_recipe, write_recipe
 from afk.registry import (
     StepContext,
     StepRegistry,
@@ -119,6 +120,41 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
 
+    if args.command == "generate-recipe":
+        try:
+            project_contract = load_project_contract(
+                args.project,
+                Path(args.contracts_dir),
+                cwd=Path.cwd(),
+            )
+        except ContractError as exc:
+            parser.error(str(exc))
+        if args.validation_profile not in project_contract.validation_profiles:
+            parser.error(
+                f"--validation-profile must be declared by project {project_contract.project_slug}: "
+                f"{', '.join(project_contract.validation_profiles)}"
+            )
+        recipe = generate_workstream_recipe(
+            workstream_id=args.workstream_id,
+            project_contract=project_contract,
+            beads_workspace=Path(args.beads_workspace),
+            checkout_root=Path(args.checkout_root),
+            checkout_path=Path(args.checkout_path),
+            validation_profile=args.validation_profile,
+        )
+        output_path = Path(args.output)
+        write_recipe(output_path, recipe)
+        print(
+            canonical_json(
+                {
+                    "command": "generate-recipe",
+                    "workstream_id": recipe["workstream_id"],
+                    "output_path": str(output_path),
+                }
+            )
+        )
+        return 0
+
     parser.print_help()
     return 1
 
@@ -153,6 +189,24 @@ def build_parser() -> argparse.ArgumentParser:
         default="project-contracts",
         help="Directory containing project contract JSON files",
     )
+
+    generate_recipe_parser = subcommands.add_parser(
+        "generate-recipe",
+        help="Generate an inspectable run-workstream recipe from a Beads work item",
+    )
+    generate_recipe_parser.add_argument("--workstream-id", required=True, help="Beads item/workstream id to run")
+    generate_recipe_parser.add_argument("--project", required=True, help="Project slug for contract resolution")
+    generate_recipe_parser.add_argument(
+        "--contracts-dir",
+        default="project-contracts",
+        help="Directory containing project contract JSON files",
+    )
+    generate_recipe_parser.add_argument("--ledger", required=True, help="Ledger directory used when running the recipe")
+    generate_recipe_parser.add_argument("--beads-workspace", required=True, help="Absolute mounted central Beads workspace")
+    generate_recipe_parser.add_argument("--checkout-root", required=True, help="Explicit checkout root mount")
+    generate_recipe_parser.add_argument("--checkout-path", required=True, help="Explicit checkout path under checkout root")
+    generate_recipe_parser.add_argument("--validation-profile", required=True, help="Project validation profile name")
+    generate_recipe_parser.add_argument("--output", required=True, help="Path to write the JSON recipe")
 
     return parser
 

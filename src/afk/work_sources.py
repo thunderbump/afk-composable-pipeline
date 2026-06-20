@@ -38,6 +38,7 @@ def select_work(input_data: Any, *, project_contract: Any = None) -> dict[str, A
     )
     required_metadata = list(request.get("required_metadata", []))
     allowed_statuses = set(request.get("allowed_statuses", ["open"]))
+    target_ids = set(request.get("target_ids", []))
 
     source_statuses: list[dict[str, Any]] = []
     selected_work: list[dict[str, Any]] = []
@@ -106,7 +107,13 @@ def select_work(input_data: Any, *, project_contract: Any = None) -> dict[str, A
                 )
                 continue
             candidate = normalize_candidate(source_id, source_type, raw_item)
-            rejection = rejection_reason(candidate, required_labels, required_metadata, allowed_statuses)
+            rejection = rejection_reason(
+                candidate,
+                required_labels,
+                required_metadata,
+                allowed_statuses,
+                target_ids,
+            )
             if rejection is not None:
                 skipped_candidates.append({"candidate": candidate, "reason": rejection})
                 continue
@@ -157,7 +164,7 @@ def invalid_request_result(message: str) -> dict[str, Any]:
 
 
 def request_payload_error(request: dict[str, Any]) -> str | None:
-    for key in ("required_labels", "required_metadata", "allowed_statuses"):
+    for key in ("required_labels", "required_metadata", "allowed_statuses", "target_ids"):
         if key in request and not is_string_list(request[key]):
             return f"{key} must be a list of strings"
     if "sources" in request and not isinstance(request["sources"], list):
@@ -774,11 +781,14 @@ def rejection_reason(
     required_labels: list[str],
     required_metadata: list[str],
     allowed_statuses: set[str],
+    target_ids: set[str],
 ) -> str | None:
     if candidate["status"] not in allowed_statuses:
         return "status_not_allowed"
     if not candidate["external_id"] and not candidate["url"]:
         return "missing_identity"
+    if target_ids and candidate["external_id"] not in target_ids:
+        return "target_id_mismatch"
     missing_labels = sorted(set(required_labels) - set(candidate["labels"]))
     if missing_labels:
         return f"missing_labels:{','.join(missing_labels)}"

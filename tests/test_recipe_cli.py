@@ -1,0 +1,376 @@
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def run_afk(*args, env=None):
+    run_env = os.environ.copy()
+    run_env["PYTHONPATH"] = str(ROOT / "src")
+    if env:
+        run_env.update(env)
+    return subprocess.run(
+        [sys.executable, "-m", "afk", *args],
+        cwd=ROOT,
+        env=run_env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+def git(cwd, *args):
+    env = os.environ.copy()
+    env.update(
+        {
+            "GIT_AUTHOR_NAME": "AFK Test",
+            "GIT_AUTHOR_EMAIL": "afk-test@example.test",
+            "GIT_COMMITTER_NAME": "AFK Test",
+            "GIT_COMMITTER_EMAIL": "afk-test@example.test",
+            "GIT_ALLOW_PROTOCOL": "file",
+        }
+    )
+    completed = subprocess.run(
+        ["git", *args],
+        cwd=cwd,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise AssertionError(
+            f"git {' '.join(args)} failed\nstdout:\n{completed.stdout}\nstderr:\n{completed.stderr}"
+        )
+    return completed.stdout.strip()
+
+
+def init_repo(path):
+    path.mkdir(parents=True)
+    git(path, "init", "--initial-branch", "main")
+    git(path, "config", "user.name", "AFK Test")
+    git(path, "config", "user.email", "afk-test@example.test")
+    (path / "README.md").write_text("seed\n", encoding="utf-8")
+    git(path, "add", "README.md")
+    git(path, "commit", "-m", "seed")
+
+
+def write_executable(path, content):
+    path.write_text(content, encoding="utf-8")
+    path.chmod(0o755)
+
+
+def write_contract(path, *, project_slug, repo_url):
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "project_slug": project_slug,
+                "repo_url": repo_url,
+                "base_branch": "main",
+                "beads_labels": [f"project:{project_slug}"],
+                "validation_profiles": ["tier1"],
+                "validation_profile_requests": {"tier1": {"profile": "tier1"}},
+                "artifact_retention": {"ledger_days": 30, "log_days": 30},
+                "pr_target": {"remote": "origin", "branch": "main"},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+class GenerateRecipeCliTest(unittest.TestCase):
+    def test_generate_recipe_writes_complete_single_item_workstream_recipe_from_project_contract(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            output = temp_path / "recipe.json"
+            ledger = temp_path / "ledger"
+            beads_workspace = temp_path / "central-beads"
+            checkout_root = temp_path / "checkouts"
+            checkout_path = checkout_root / "bump-EQEmu"
+            beads_workspace.mkdir()
+            checkout_root.mkdir()
+
+            completed = run_afk(
+                "generate-recipe",
+                "--workstream-id",
+                "central-afk-pr.1",
+                "--project",
+                "bump-eqemu",
+                "--contracts-dir",
+                "project-contracts",
+                "--ledger",
+                str(ledger),
+                "--beads-workspace",
+                str(beads_workspace),
+                "--checkout-root",
+                str(checkout_root),
+                "--checkout-path",
+                str(checkout_path),
+                "--validation-profile",
+                "tier1",
+                "--output",
+                str(output),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            self.assertEqual(summary["command"], "generate-recipe")
+            self.assertEqual(summary["workstream_id"], "central-afk-pr.1")
+            self.assertEqual(summary["output_path"], str(output))
+
+            recipe = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(recipe["schema_version"], 1)
+            self.assertEqual(recipe["workstream_id"], "central-afk-pr.1")
+            self.assertEqual(recipe["parent"], "central-afk-pr")
+            self.assertEqual(recipe["review_branch"], "afk/central-afk-pr-1")
+            self.assertEqual(
+                [step["name"] for step in recipe["steps"]],
+                ["select-work", "prepare-checkout", "implement", "validate", "review"],
+            )
+
+            select_input = recipe["steps"][0]["input"]
+            self.assertEqual(select_input["target_ids"], ["central-afk-pr.1"])
+            self.assertEqual(select_input["required_labels"], ["project:bump-eqemu"])
+            self.assertEqual(
+                select_input["sources"],
+                [
+                    {
+                        "type": "beads",
+                        "id": "central-beads",
+                        "workspace": str(beads_workspace),
+                        "workspace_kind": "central",
+                        "labels": ["project:bump-eqemu"],
+                        "status": "open",
+                    }
+                ],
+            )
+
+            checkout_input = recipe["steps"][1]["input"]
+            self.assertEqual(checkout_input["repo_url"], "git@github.com:thunderbump/bump-EQEmu.git")
+            self.assertEqual(checkout_input["base_ref"], "master")
+            self.assertEqual(checkout_input["checkout_root"], str(checkout_root))
+            self.assertEqual(checkout_input["checkout_path"], str(checkout_path))
+
+            self.assertEqual(recipe["steps"][3]["profile"], "tier1")
+            self.assertEqual(recipe["steps"][3]["input"]["validation"]["profile"], "tier1")
+            self.assertEqual(recipe["publisher"], {"enabled": False})
+
+    def test_generated_recipe_runs_and_records_selected_bead_and_skipped_candidates(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repo = temp_path / "repo-src"
+            contracts_dir = temp_path / "contracts"
+            output = temp_path / "recipe.json"
+            ledger = temp_path / "ledger"
+            beads_workspace = temp_path / "central-beads"
+            checkout_root = temp_path / "checkouts"
+            checkout_path = checkout_root / "demo"
+            fake_bin = temp_path / "bin"
+            init_repo(repo)
+            contracts_dir.mkdir()
+            write_contract(contracts_dir / "demo.json", project_slug="demo", repo_url=str(repo))
+            (beads_workspace / "secrets").mkdir(parents=True)
+            (beads_workspace / "secrets" / "dolt_beads_password.txt").write_text("fixture-password\n", encoding="utf-8")
+            fake_bin.mkdir()
+            write_executable(
+                fake_bin / "bd",
+                f"""#!{sys.executable}
+import json
+import sys
+
+if sys.argv[1:3] == ["list", "--json"]:
+    print(json.dumps([{{"id": "central-afk-pr.1"}}, {{"id": "central-afk-pr.2"}}]))
+    sys.exit(0)
+
+if sys.argv[1] == "show":
+    issue_id = sys.argv[2]
+    payloads = {{
+        "central-afk-pr.1": {{
+            "id": "central-afk-pr.1",
+            "title": "Generate runnable workstream recipes",
+            "status": "open",
+            "labels": ["project:demo"],
+            "parent": "central-afk-pr",
+            "acceptance_criteria": ["Generated recipe runs"],
+            "dependencies": [{{"id": "central-afk-pr.0", "status": "closed"}}],
+            "metadata": {{"afk.ready": True}},
+        }},
+        "central-afk-pr.2": {{
+            "id": "central-afk-pr.2",
+            "title": "Different candidate",
+            "status": "open",
+            "labels": ["project:demo"],
+            "parent": "central-afk-pr",
+            "acceptance_criteria": ["Should not be selected"],
+            "dependencies": [{{"id": "central-afk-pr.0", "status": "closed"}}],
+            "metadata": {{"afk.ready": True}},
+        }},
+    }}
+    print(json.dumps(payloads[issue_id]))
+    sys.exit(0)
+
+sys.exit(9)
+""",
+            )
+
+            generated = run_afk(
+                "generate-recipe",
+                "--workstream-id",
+                "central-afk-pr.1",
+                "--project",
+                "demo",
+                "--contracts-dir",
+                str(contracts_dir),
+                "--ledger",
+                str(ledger),
+                "--beads-workspace",
+                str(beads_workspace),
+                "--checkout-root",
+                str(checkout_root),
+                "--checkout-path",
+                str(checkout_path),
+                "--validation-profile",
+                "tier1",
+                "--output",
+                str(output),
+            )
+            self.assertEqual(generated.returncode, 0, generated.stderr)
+
+            completed = run_afk(
+                "run-workstream",
+                "--input",
+                output.read_text(encoding="utf-8"),
+                "--ledger",
+                str(ledger),
+                "--project",
+                "demo",
+                "--contracts-dir",
+                str(contracts_dir),
+                env={"PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}", "GIT_ALLOW_PROTOCOL": "file"},
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            self.assertEqual(summary["status"], "completed")
+            self.assertEqual(summary["publication_status"], "skipped_disabled")
+
+            workstream = json.loads((ledger / summary["result_path"]).read_text(encoding="utf-8"))
+            select_result_path = workstream["steps"][0]["result_path"]
+            select_result = json.loads((ledger / select_result_path).read_text(encoding="utf-8"))
+            self.assertEqual(
+                [item["external_id"] for item in select_result["output"]["selected_work"]],
+                ["central-afk-pr.1"],
+            )
+            self.assertEqual(
+                [
+                    (item["candidate"]["external_id"], item["reason"])
+                    for item in select_result["output"]["skipped_candidates"]
+                ],
+                [("central-afk-pr.2", "target_id_mismatch")],
+            )
+
+    def test_generated_recipe_records_actionable_beads_auth_and_unreachable_evidence(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repo = temp_path / "repo-src"
+            contracts_dir = temp_path / "contracts"
+            ledger = temp_path / "ledger"
+            checkout_root = temp_path / "checkouts"
+            fake_bin = temp_path / "bin"
+            init_repo(repo)
+            contracts_dir.mkdir()
+            checkout_root.mkdir()
+            write_contract(contracts_dir / "demo.json", project_slug="demo", repo_url=str(repo))
+            fake_bin.mkdir()
+            write_executable(
+                fake_bin / "bd",
+                f"""#!{sys.executable}
+import sys
+sys.exit(9)
+""",
+            )
+
+            missing_auth_workspace = temp_path / "beads-without-secret"
+            missing_auth_workspace.mkdir()
+            unreachable_workspace = temp_path / "missing-beads-workspace"
+
+            cases = [
+                (
+                    "missing-auth",
+                    missing_auth_workspace,
+                    "skipped_no_auth",
+                    "beads credentials are not available",
+                ),
+                (
+                    "unreachable",
+                    unreachable_workspace,
+                    "skipped_unreachable",
+                    "beads workspace is not available",
+                ),
+            ]
+
+            for name, beads_workspace, expected_status, expected_message in cases:
+                with self.subTest(name=name):
+                    output = temp_path / f"{name}-recipe.json"
+                    generated = run_afk(
+                        "generate-recipe",
+                        "--workstream-id",
+                        "central-afk-pr.1",
+                        "--project",
+                        "demo",
+                        "--contracts-dir",
+                        str(contracts_dir),
+                        "--ledger",
+                        str(ledger),
+                        "--beads-workspace",
+                        str(beads_workspace),
+                        "--checkout-root",
+                        str(checkout_root),
+                        "--checkout-path",
+                        str(checkout_root / name),
+                        "--validation-profile",
+                        "tier1",
+                        "--output",
+                        str(output),
+                    )
+                    self.assertEqual(generated.returncode, 0, generated.stderr)
+
+                    completed = run_afk(
+                        "run-workstream",
+                        "--input",
+                        output.read_text(encoding="utf-8"),
+                        "--ledger",
+                        str(ledger),
+                        "--project",
+                        "demo",
+                        "--contracts-dir",
+                        str(contracts_dir),
+                        env={"PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}"},
+                    )
+
+                    self.assertEqual(completed.returncode, 0, completed.stderr)
+                    summary = json.loads(completed.stdout)
+                    self.assertEqual(summary["status"], "blocked")
+                    workstream = json.loads((ledger / summary["result_path"]).read_text(encoding="utf-8"))
+                    self.assertEqual(workstream["publication"]["reason"], "select-work selected no work items")
+                    select_result = json.loads((ledger / workstream["steps"][0]["result_path"]).read_text(encoding="utf-8"))
+                    self.assertEqual(
+                        select_result["output"]["source_statuses"],
+                        [
+                            {
+                                "source_id": "central-beads",
+                                "source_type": "beads",
+                                "status": expected_status,
+                                "candidate_count": 0,
+                                "selected_count": 0,
+                                "message": expected_message,
+                            }
+                        ],
+                    )
