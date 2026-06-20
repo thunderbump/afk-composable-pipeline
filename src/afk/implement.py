@@ -330,13 +330,18 @@ def normalize_agent(agent: Any, *, checkout_path: Path) -> dict[str, Any]:
         "config_home": "",
     }
     if not fake_agent:
-        env = normalize_agent_env(agent.get("env", {}), checkout_path=checkout_path)
+        env = normalize_agent_env(
+            agent.get("env", {}),
+            checkout_path=checkout_path,
+            required_keys={"PI_CONFIG_HOME"},
+        )
         if env["status"] != "valid":
             return {"status": "invalid", "message": env["message"]}
         codex_home = normalize_absolute_dir(
             agent.get("codex_home"),
             "agent.codex_home",
             checkout_path=checkout_path,
+            required=True,
         )
         if codex_home["status"] != "valid":
             return {"status": "invalid", "message": codex_home["message"]}
@@ -344,6 +349,7 @@ def normalize_agent(agent: Any, *, checkout_path: Path) -> dict[str, Any]:
             agent.get("config_home"),
             "agent.config_home",
             checkout_path=checkout_path,
+            required=True,
         )
         if config_home["status"] != "valid":
             return {"status": "invalid", "message": config_home["message"]}
@@ -356,14 +362,23 @@ def normalize_agent(agent: Any, *, checkout_path: Path) -> dict[str, Any]:
     }
 
 
-def normalize_agent_env(env: Any, *, checkout_path: Path) -> dict[str, Any]:
+def normalize_agent_env(
+    env: Any,
+    *,
+    checkout_path: Path,
+    required_keys: set[str] | None = None,
+) -> dict[str, Any]:
     if not isinstance(env, dict):
         return {"status": "invalid", "message": "agent.env must be an object"}
     normalized = {}
+    required = set(required_keys or ())
+    seen = set()
     reserved = {"AFK_JOB_CAPSULE", "AFK_AGENT_RESULT_PATH", "HOME", "XDG_CONFIG_HOME"}
     for key, value in env.items():
         if not isinstance(key, str) or not key:
             return {"status": "invalid", "message": "agent.env keys must be non-empty strings"}
+        if key in required:
+            seen.add(key)
         if key in reserved:
             return {"status": "invalid", "message": f"agent.env must not override {key}"}
         if is_secret_key(key):
@@ -376,6 +391,12 @@ def normalize_agent_env(env: Any, *, checkout_path: Path) -> dict[str, Any]:
         if unsafe_path is not None:
             return {"status": "invalid", "message": unsafe_path}
         normalized[key] = value
+    missing = sorted(required.difference(seen))
+    if missing:
+        return {
+            "status": "invalid",
+            "message": "agent.env must include " + ", ".join(missing),
+        }
     return {"status": "valid", "env": normalized}
 
 
@@ -389,7 +410,7 @@ def unsafe_agent_env_path(key: str, value: str, checkout_path: Path) -> str | No
         return f"agent.env.{key} must be an absolute path outside checkout"
     if path_is_equal_to_or_inside(path, checkout_path):
         return f"agent.env.{key} must be outside checkout"
-    if path_is_existing_directory_mount(key) and not path.is_dir():
+    if path_is_required_existing_directory_mount(key) and not path.is_dir():
         return f"agent.env.{key} must be an existing directory"
     return None
 
@@ -399,12 +420,20 @@ def is_config_state_env_key(key: str) -> bool:
     return any(component in {"cache", "config", "home", "path", "session", "state"} for component in components)
 
 
-def path_is_existing_directory_mount(key: str) -> bool:
-    return key.upper().endswith("_CONFIG_HOME")
+def path_is_required_existing_directory_mount(key: str) -> bool:
+    return key.upper() in {"PI_CONFIG_HOME"}
 
 
-def normalize_absolute_dir(value: Any, field: str, *, checkout_path: Path | None = None) -> dict[str, Any]:
+def normalize_absolute_dir(
+    value: Any,
+    field: str,
+    *,
+    checkout_path: Path | None = None,
+    required: bool = False,
+) -> dict[str, Any]:
     if value is None:
+        if required:
+            return {"status": "invalid", "message": f"{field} is required"}
         return {"status": "valid", "path": ""}
     if not isinstance(value, str) or not value.strip():
         return {"status": "invalid", "message": f"{field} must be an absolute directory path"}
@@ -441,6 +470,11 @@ def build_job_capsule(request: dict[str, Any], *, run_id: str) -> dict[str, Any]
         "work_item": request["work_item"],
         "acceptance_criteria": request["work_item"]["acceptance_criteria"],
         "checkout": request["checkout"],
+        "agent_mounts": {
+            "codex_home": request["agent"].get("codex_home", ""),
+            "config_home": request["agent"].get("config_home", ""),
+            "pi_config_home": request["agent"].get("env", {}).get("PI_CONFIG_HOME", ""),
+        },
         "guardrails": request["guardrails"],
         "validation": request["validation"],
         "expected_result_schema": {

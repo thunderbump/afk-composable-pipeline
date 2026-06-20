@@ -234,9 +234,10 @@ Do not add token values to request JSON. `PI_TOKEN`, `OPENAI_API_KEY`, and other
 secret variables are rejected by contract validation or redacted from all ledger
 artifacts.
 Ledger artifacts keep mount path evidence for `agent.codex_home` and
-`agent.config_home` while keeping secret-bearing values redacted. `PI_CONFIG_HOME`
-is validated as an existing mount path before execution and redacted in
-artifacts.
+`agent.config_home` and `PI_CONFIG_HOME` while keeping secret-bearing values redacted.
+`PI_CONFIG_HOME` is validated as an existing mount path before execution and
+the sanitized mount evidence appears in `job-capsule.agent_mounts` as
+`codex_home`, `config_home`, and `pi_config_home` paths.
 
 ## Ledger Artifacts
 

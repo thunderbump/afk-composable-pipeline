@@ -286,6 +286,7 @@ class ImplementCliTest(unittest.TestCase):
             result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
             agent_result = json.loads((run_dir / "agent-result.json").read_text(encoding="utf-8"))
             observation = json.loads(agent_observation.read_text(encoding="utf-8"))
+            job_capsule = json.loads((run_dir / "job-capsule.json").read_text(encoding="utf-8"))
             artifact_text = "\n".join(
                 path.read_text(encoding="utf-8")
                 for path in run_dir.iterdir()
@@ -308,8 +309,17 @@ class ImplementCliTest(unittest.TestCase):
             self.assertNotEqual(observation["home"], os.environ.get("HOME"))
             self.assertEqual(observation["ambient_pi_token"], "missing")
             self.assertEqual(observation["ambient_openai_key"], "missing")
+            self.assertEqual(
+                job_capsule["capsule"]["agent_mounts"],
+                {
+                    "codex_home": str(codex_home),
+                    "config_home": str(config_home),
+                    "pi_config_home": str(pi_config_home),
+                },
+            )
             self.assertIn(str(codex_home), artifact_text)
             self.assertIn(str(config_home), artifact_text)
+            self.assertIn(str(pi_config_home), artifact_text)
             self.assertNotIn("ambient-pi-secret", artifact_text)
             self.assertNotIn("ambient-openai-secret", artifact_text)
 
@@ -319,6 +329,12 @@ class ImplementCliTest(unittest.TestCase):
             checkout = temp_path / "checkout"
             start_commit = init_checkout(checkout)
             ledger = temp_path / "ledger"
+            codex_home = temp_path / "codex-home"
+            config_home = temp_path / "xdg-config"
+            pi_config_home = temp_path / "pi-config"
+            codex_home.mkdir()
+            config_home.mkdir()
+            pi_config_home.mkdir()
             agent_code = textwrap.dedent(
                 """
                 import json
@@ -352,6 +368,9 @@ class ImplementCliTest(unittest.TestCase):
                             "type": "real-agent-command",
                             "command": [sys.executable, "-c", agent_code],
                             "result_path": "agent-result.json",
+                            "codex_home": str(codex_home),
+                            "config_home": str(config_home),
+                            "env": {"PI_CONFIG_HOME": str(pi_config_home)},
                         },
                     }
                 ),
@@ -383,6 +402,12 @@ class ImplementCliTest(unittest.TestCase):
             checkout = temp_path / "checkout"
             start_commit = init_checkout(checkout)
             ledger = temp_path / "ledger"
+            codex_home = temp_path / "codex-home"
+            config_home = temp_path / "xdg-config"
+            pi_config_home = temp_path / "pi-config"
+            codex_home.mkdir()
+            config_home.mkdir()
+            pi_config_home.mkdir()
             agent_code = textwrap.dedent(
                 """
                 import json
@@ -417,6 +442,9 @@ class ImplementCliTest(unittest.TestCase):
                             "type": "real-agent-command",
                             "command": [sys.executable, "-c", agent_code],
                             "result_path": "agent-result.json",
+                            "codex_home": str(codex_home),
+                            "config_home": str(config_home),
+                            "env": {"PI_CONFIG_HOME": str(pi_config_home)},
                         },
                     }
                 ),
@@ -482,6 +510,7 @@ class ImplementCliTest(unittest.TestCase):
                         "result_path": "agent-result.json",
                         "codex_home": str(outside_codex_home),
                         "config_home": str(outside_config_home),
+                        "env": {"PI_CONFIG_HOME": str(outside_config_home)},
                     }
                     agent[field] = path_value
 
@@ -523,6 +552,10 @@ class ImplementCliTest(unittest.TestCase):
             checkout = temp_path / "checkout"
             start_commit = init_checkout(checkout)
             ledger = temp_path / "ledger"
+            outside_codex_home = temp_path / "codex-home"
+            outside_config_home = temp_path / "xdg-config"
+            outside_codex_home.mkdir()
+            outside_config_home.mkdir()
             outside_pi_config = temp_path / "pi-config-missing"
             completed = run_afk(
                 "run-step",
@@ -540,14 +573,16 @@ class ImplementCliTest(unittest.TestCase):
                         },
                         "guardrails": [],
                         "validation": {"profile": "tier1", "commands": []},
-                        "agent": {
-                            "type": "real-agent-command",
-                            "command": [sys.executable, "-c", "print('should not run')"],
-                            "result_path": "agent-result.json",
-                            "env": {"PI_CONFIG_HOME": str(outside_pi_config)},
-                        },
-                    }
-                ),
+                            "agent": {
+                                "type": "real-agent-command",
+                                "command": [sys.executable, "-c", "print('should not run')"],
+                                "result_path": "agent-result.json",
+                                "codex_home": str(outside_codex_home),
+                                "config_home": str(outside_config_home),
+                                "env": {"PI_CONFIG_HOME": str(outside_pi_config)},
+                            },
+                        }
+                    ),
                 "--ledger",
                 str(ledger),
             )
@@ -564,6 +599,73 @@ class ImplementCliTest(unittest.TestCase):
             )
             self.assertNotIn("should not run", (run_dir / "stdout.log").read_text(encoding="utf-8"))
 
+    def test_implement_rejects_real_agent_command_missing_required_auth_mounts(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            checkout = temp_path / "checkout"
+            start_commit = init_checkout(checkout)
+            ledger = temp_path / "ledger"
+            codex_home = temp_path / "codex-home"
+            config_home = temp_path / "xdg-config"
+            pi_config_home = temp_path / "pi-config"
+            codex_home.mkdir()
+            config_home.mkdir()
+            pi_config_home.mkdir()
+            base_agent = {
+                "type": "real-agent-command",
+                "command": [sys.executable, "-c", "print('should not run')"],
+                "result_path": "agent-result.json",
+                "codex_home": str(codex_home),
+                "config_home": str(config_home),
+                "env": {"PI_CONFIG_HOME": str(pi_config_home)},
+            }
+            missing_cases = [
+                ("codex_home", "agent.codex_home is required", {"codex_home": None}),
+                ("config_home", "agent.config_home is required", {"config_home": None}),
+                ("PI_CONFIG_HOME", "agent.env must include PI_CONFIG_HOME", {"env": {}}),
+            ]
+            for field, expected_message, mutation in missing_cases:
+                with self.subTest(field=field):
+                    agent = dict(base_agent)
+                    if "codex_home" in mutation and mutation["codex_home"] is None:
+                        agent.pop("codex_home")
+                    if "config_home" in mutation and mutation["config_home"] is None:
+                        agent.pop("config_home")
+                    if "env" in mutation:
+                        agent["env"] = mutation["env"]
+
+                    completed = run_afk(
+                        "run-step",
+                        "implement",
+                        "--input",
+                        json.dumps(
+                            {
+                                "work_selection": {"schema_version": 1, "selected_work": [selected_work()]},
+                                "checkout": {
+                                    "status": "prepared",
+                                    "checkout_path": str(checkout),
+                                    "review_branch": "afk/test-work",
+                                    "requested_ref": "main",
+                                    "start_commit": start_commit,
+                                },
+                                "guardrails": [],
+                                "validation": {"profile": "tier1", "commands": []},
+                                "agent": agent,
+                            }
+                        ),
+                        "--ledger",
+                        str(ledger),
+                    )
+
+                    self.assertEqual(completed.returncode, 0, completed.stderr)
+                    summary = json.loads(completed.stdout)
+                    run_dir = ledger / "runs" / summary["run_id"]
+                    result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+
+                    self.assertEqual(result["output"]["status"], "failed_invalid_payload")
+                    self.assertEqual(result["output"]["message"], expected_message)
+                    self.assertNotIn("should not run", (run_dir / "stdout.log").read_text(encoding="utf-8"))
+
     def test_implement_rejects_real_agent_command_checkout_internal_config_env_paths(self):
         cases = [
             ("PI_CONFIG_HOME", "checkout/.pi-config", "agent.env.PI_CONFIG_HOME must be outside checkout"),
@@ -578,10 +680,16 @@ class ImplementCliTest(unittest.TestCase):
                     checkout = temp_path / "checkout"
                     start_commit = init_checkout(checkout)
                     ledger = temp_path / "ledger"
+                    required_pi_config_home = temp_path / "required-pi-config"
+                    required_codex_home = temp_path / "codex-home"
+                    required_config_home = temp_path / "xdg-config"
                     checkout_config = checkout / ".pi-config"
                     checkout_cache = checkout / ".pi-cache"
                     checkout_config.mkdir()
                     checkout_cache.mkdir()
+                    required_pi_config_home.mkdir()
+                    required_codex_home.mkdir()
+                    required_config_home.mkdir()
                     path_value = {
                         "checkout/.pi-config": str(checkout_config),
                         "checkout/.pi-cache": str(checkout_cache),
@@ -609,7 +717,12 @@ class ImplementCliTest(unittest.TestCase):
                                     "type": "real-agent-command",
                                     "command": [sys.executable, "-c", "print('should not run')"],
                                     "result_path": "agent-result.json",
-                                    "env": {key: path_value},
+                                    "codex_home": str(required_codex_home),
+                                    "config_home": str(required_config_home),
+                                    "env": {
+                                        "PI_CONFIG_HOME": str(required_pi_config_home),
+                                        key: path_value,
+                                    },
                                 },
                             }
                         ),
@@ -626,6 +739,84 @@ class ImplementCliTest(unittest.TestCase):
                     self.assertEqual(result["output"]["message"], expected_message)
                     self.assertNotIn("should not run", (run_dir / "stdout.log").read_text(encoding="utf-8"))
 
+    def test_implement_allows_non_required_config_like_env_path_without_directory(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            checkout = temp_path / "checkout"
+            start_commit = init_checkout(checkout)
+            ledger = temp_path / "ledger"
+            codex_home = temp_path / "codex-home"
+            config_home = temp_path / "xdg-config"
+            required_pi_config = temp_path / "pi-config"
+            codex_home.mkdir()
+            config_home.mkdir()
+            required_pi_config.mkdir()
+            missing_optional_config = temp_path / "missing-config-like"
+            agent_code = textwrap.dedent(
+                """
+                import json
+                from pathlib import Path
+
+                Path("agent-result.json").write_text(
+                    json.dumps({"status": "completed", "summary": "noop"}),
+                    encoding="utf-8",
+                )
+                """
+            ).strip()
+
+            completed = run_afk(
+                "run-step",
+                "implement",
+                "--input",
+                json.dumps(
+                    {
+                        "work_selection": {"schema_version": 1, "selected_work": [selected_work()]},
+                        "checkout": {
+                            "status": "prepared",
+                            "checkout_path": str(checkout),
+                            "review_branch": "afk/test-work",
+                            "requested_ref": "main",
+                            "start_commit": start_commit,
+                        },
+                        "guardrails": [],
+                        "validation": {"profile": "tier1", "commands": []},
+                        "agent": {
+                            "type": "real-agent-command",
+                            "command": [sys.executable, "-c", agent_code],
+                            "result_path": "agent-result.json",
+                            "codex_home": str(codex_home),
+                            "config_home": str(config_home),
+                            "env": {
+                                "PI_CONFIG_HOME": str(required_pi_config),
+                                "FOO_CONFIG_HOME": str(missing_optional_config),
+                            },
+                        },
+                    }
+                ),
+                "--ledger",
+                str(ledger),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(result["output"]["status"], "failed_protocol")
+            self.assertEqual(
+                result["output"]["summary"],
+                "agent reported success but produced no new commit",
+            )
+            self.assertNotIn(
+                "agent.env.FOO_CONFIG_HOME must be an existing directory",
+                json.dumps(result),
+            )
+            self.assertNotIn(
+                "agent.env must include PI_CONFIG_HOME",
+                json.dumps(result),
+            )
+            self.assertNotIn("should not run", (run_dir / "stdout.log").read_text(encoding="utf-8"))
+
     def test_implement_rejects_real_agent_command_secret_env_without_exposing_value(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
@@ -633,6 +824,12 @@ class ImplementCliTest(unittest.TestCase):
             start_commit = init_checkout(checkout)
             ledger = temp_path / "ledger"
             secret = "recipe-embedded-secret"
+            codex_home = temp_path / "codex-home"
+            config_home = temp_path / "xdg-config"
+            pi_config_home = temp_path / "pi-config"
+            codex_home.mkdir()
+            config_home.mkdir()
+            pi_config_home.mkdir()
 
             completed = run_afk(
                 "run-step",
@@ -654,7 +851,12 @@ class ImplementCliTest(unittest.TestCase):
                             "type": "real-agent-command",
                             "command": [sys.executable, "-c", "print('should not run')"],
                             "result_path": "agent-result.json",
-                            "env": {"OPENAI_API_KEY": secret},
+                            "codex_home": str(codex_home),
+                            "config_home": str(config_home),
+                            "env": {
+                                "PI_CONFIG_HOME": str(pi_config_home),
+                                "OPENAI_API_KEY": secret,
+                            },
                         },
                     }
                 ),
@@ -687,6 +889,12 @@ class ImplementCliTest(unittest.TestCase):
             start_commit = init_checkout(checkout)
             ledger = temp_path / "ledger"
             secret = "ghp_secretshapedvalue1234567890"
+            codex_home = temp_path / "codex-home"
+            config_home = temp_path / "xdg-config"
+            pi_config_home = temp_path / "pi-config"
+            codex_home.mkdir()
+            config_home.mkdir()
+            pi_config_home.mkdir()
 
             completed = run_afk(
                 "run-step",
@@ -708,7 +916,12 @@ class ImplementCliTest(unittest.TestCase):
                             "type": "real-agent-command",
                             "command": [sys.executable, "-c", "print('should not run')"],
                             "result_path": "agent-result.json",
-                            "env": {"PIPELINE_LABEL": secret},
+                            "codex_home": str(codex_home),
+                            "config_home": str(config_home),
+                            "env": {
+                                "PI_CONFIG_HOME": str(pi_config_home),
+                                "PIPELINE_LABEL": secret,
+                            },
                         },
                     }
                 ),
@@ -740,6 +953,12 @@ class ImplementCliTest(unittest.TestCase):
             checkout = temp_path / "checkout"
             start_commit = init_checkout(checkout)
             ledger = temp_path / "ledger"
+            codex_home = temp_path / "codex-home"
+            config_home = temp_path / "xdg-config"
+            pi_config_home = temp_path / "pi-config"
+            codex_home.mkdir()
+            config_home.mkdir()
+            pi_config_home.mkdir()
             service_url = "https://example.invalid/api?mode=test"
             observation_path = temp_path / "agent-observation.json"
             agent_code = textwrap.dedent(
@@ -783,7 +1002,12 @@ class ImplementCliTest(unittest.TestCase):
                             "type": "real-agent-command",
                             "command": [sys.executable, "-c", agent_code],
                             "result_path": "agent-result.json",
-                            "env": {"SERVICE_URL": service_url},
+                            "codex_home": str(codex_home),
+                            "config_home": str(config_home),
+                            "env": {
+                                "PI_CONFIG_HOME": str(pi_config_home),
+                                "SERVICE_URL": service_url,
+                            },
                         },
                     }
                 ),
