@@ -739,6 +739,59 @@ class ImplementCliTest(unittest.TestCase):
                     self.assertEqual(result["output"]["message"], expected_message)
                     self.assertNotIn("should not run", (run_dir / "stdout.log").read_text(encoding="utf-8"))
 
+    def test_implement_rejects_real_agent_command_required_auth_mount_url_value(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            checkout = temp_path / "checkout"
+            start_commit = init_checkout(checkout)
+            ledger = temp_path / "ledger"
+            codex_home = temp_path / "codex-home"
+            config_home = temp_path / "xdg-config"
+            codex_home.mkdir()
+            config_home.mkdir()
+
+            completed = run_afk(
+                "run-step",
+                "implement",
+                "--input",
+                json.dumps(
+                    {
+                        "work_selection": {"schema_version": 1, "selected_work": [selected_work()]},
+                        "checkout": {
+                            "status": "prepared",
+                            "checkout_path": str(checkout),
+                            "review_branch": "afk/test-work",
+                            "requested_ref": "main",
+                            "start_commit": start_commit,
+                        },
+                        "guardrails": [],
+                        "validation": {"profile": "tier1", "commands": []},
+                        "agent": {
+                            "type": "real-agent-command",
+                            "command": [sys.executable, "-c", "print('should not run')"],
+                            "result_path": "agent-result.json",
+                            "codex_home": str(codex_home),
+                            "config_home": str(config_home),
+                            "env": {"PI_CONFIG_HOME": "https://example.invalid/pi-config"},
+                        },
+                    }
+                ),
+                "--ledger",
+                str(ledger),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(result["output"]["status"], "failed_invalid_payload")
+            self.assertEqual(
+                result["output"]["message"],
+                "agent.env.PI_CONFIG_HOME must be an absolute path outside checkout",
+            )
+            self.assertNotIn("should not run", (run_dir / "stdout.log").read_text(encoding="utf-8"))
+
     def test_implement_allows_non_required_config_like_env_path_without_directory(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)

@@ -387,7 +387,12 @@ def normalize_agent_env(
             return {"status": "invalid", "message": f"agent.env.{key} must be a string"}
         if is_secret_value(value):
             return {"status": "invalid", "message": f"agent.env.{key} must not include a secret-looking value"}
-        unsafe_path = unsafe_agent_env_path(key, value, checkout_path)
+        unsafe_path = unsafe_agent_env_path(
+            key,
+            value,
+            checkout_path,
+            required=(key in required),
+        )
         if unsafe_path is not None:
             return {"status": "invalid", "message": unsafe_path}
         normalized[key] = value
@@ -400,10 +405,15 @@ def normalize_agent_env(
     return {"status": "valid", "env": normalized}
 
 
-def unsafe_agent_env_path(key: str, value: str, checkout_path: Path) -> str | None:
+def unsafe_agent_env_path(
+    key: str,
+    value: str,
+    checkout_path: Path,
+    required: bool = False,
+) -> str | None:
     if not is_config_state_env_key(key):
         return None
-    if "://" in value:
+    if not required and "://" in value:
         return None
     path = Path(value)
     if not path.is_absolute():
