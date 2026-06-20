@@ -112,6 +112,24 @@ timeouts/runtime failures, worker-reported validation failures, and skipped
 profiles. Worker request/result payloads and stdout/stderr excerpts are
 redacted before being stored in the ledger.
 
+Run final review against explicit implementation and validation evidence:
+
+```sh
+PYTHONPATH=src python3 -m afk run-step review \
+  --input '{"work_item":{"source_id":"fixture","source_type":"fixture","external_id":"demo-1","title":"Demo","status":"open","labels":["afk:ready"],"acceptance_criteria":["reviewed"],"dependencies":[],"blockers":[],"dependency_status":"clear","afk":{"ready":true}},"checkout":{"status":"prepared","checkout_path":"/work/bump-EQEmu","review_branch":"afk/example","requested_ref":"master","start_commit":"<sha>"},"implementation":{"status":"implemented","summary":"done","git":{"before_commit":"<sha>","after_commit":"<sha2>","changed_files":["src/example.py"],"commits":[{"commit":"<sha2>","subject":"implement demo"}],"dirty":false,"dirty_status":[]}},"validation":{"required_artifacts":[{"name":"tier3-harness","step_result_path":"/ledger/runs/<validation-run>/step-result.json","worker_result_path":"/ledger/runs/<validation-run>/worker-result.json"}]},"guardrails":[{"name":"no secrets","status":"pass"}],"cleanup":{"status":"clean","resources":[]},"reviewer":{"type":"fake-reviewer-command","command":["python3","-c","import json, os; from pathlib import Path; request=json.loads(Path(os.environ[\"AFK_REVIEWER_REQUEST\"]).read_text(encoding=\"utf-8\")); assert request[\"evidence_pack\"][\"validation\"][\"required\"][0][\"status\"] == \"validated\"; Path(os.environ[\"AFK_REVIEWER_RESULT\"]).write_text(json.dumps({\"status\":\"pass\",\"summary\":\"ready\",\"findings\":[]}), encoding=\"utf-8\")"]}}' \
+  --ledger ledger
+```
+
+`review` builds `evidence-pack.json` from the supplied work item acceptance
+criteria, checkout metadata, changed files/commits, validation artifact
+summaries, guardrails, cleanup status, and redaction metadata. It writes
+`reviewer-request.json`, invokes a fake/local reviewer command with
+`AFK_REVIEWER_REQUEST` and `AFK_REVIEWER_RESULT`, then stores the normalized
+`reviewer-result.json` plus `review-summary.md`. Reviewer statuses are
+normalized to `passed`, `failed`, or `request_revision`. The step refuses to
+pass before invoking the reviewer when any required final validation artifact is
+missing, skipped, failed, malformed, or otherwise not `validated`.
+
 ## Ledger Artifacts
 
 Each invocation writes a new run directory:
@@ -142,7 +160,9 @@ the publication result separately. For `implement`, it contains normalized work,
 checkout, agent, and git metadata plus pointers to `job-capsule.json` and
 `agent-result.json`. For `validate`, it contains normalized checkout,
 validation, adapter, and worker evidence plus pointers to `worker-request.json`
-and `worker-result.json`.
+and `worker-result.json`. For `review`, it contains the normalized final review
+status plus pointers to `evidence-pack.json`, `reviewer-request.json`,
+`reviewer-result.json`, and `review-summary.md`.
 
 ## Development
 
@@ -161,6 +181,7 @@ Run the container smoke test:
 The smoke script builds the image and runs `afk run-step noop`, a fixture-backed
 `afk run-step select-work`, `afk run-step prepare-checkout` against a mounted
 local repo with a real submodule, `afk run-step validate` with a fake/local
-Validation Worker, and `afk run-step implement` with a fake/local Pi command
-when Docker or Podman is available. If neither runtime exists, it exits
+Validation Worker, `afk run-step implement` with a fake/local Pi command, and
+`afk run-step review` with a fake/local reviewer command when Docker or Podman
+is available. If neither runtime exists, it exits
 successfully with a clear skip message.

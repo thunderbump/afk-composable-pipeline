@@ -20,7 +20,7 @@ class RegistryTest(unittest.TestCase):
 
         self.assertEqual(
             registry.step_names,
-            ("implement", "noop", "prepare-checkout", "select-work", "validate"),
+            ("implement", "noop", "prepare-checkout", "review", "select-work", "validate"),
         )
         self.assertEqual(result.run_id, "test-run")
         self.assertEqual(result.step, "noop")

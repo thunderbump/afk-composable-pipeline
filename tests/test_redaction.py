@@ -85,6 +85,54 @@ class RedactionTest(unittest.TestCase):
             ],
         )
 
+    def test_redacts_json_shaped_secret_key_values_in_text(self):
+        text = (
+            'stdout {"token":"token-secret","api_key": "api-key-secret", '
+            '"password" : "password-secret"}'
+        )
+
+        redacted = redact_text(text)
+
+        self.assertNotIn("token-secret", redacted)
+        self.assertNotIn("api-key-secret", redacted)
+        self.assertNotIn("password-secret", redacted)
+        self.assertIn('"token":"[REDACTED]"', redacted)
+        self.assertIn('"api_key": "[REDACTED]"', redacted)
+        self.assertIn('"password" : "[REDACTED]"', redacted)
+
+    def test_redacts_camel_case_secret_key_values_in_artifacts_and_text(self):
+        payload = {
+            "accessToken": "access-token-secret",
+            "refreshToken": "refresh-token-secret",
+            "clientSecret": "client-secret",
+            "nested": {"apiKey": "api-key-secret"},
+        }
+        text = (
+            'stdout {"accessToken":"access-token-secret", '
+            '"refreshToken": "refresh-token-secret", '
+            '"clientSecret" : "client-secret", '
+            '"apiKey": "api-key-secret"}'
+        )
+
+        redacted_payload = redact_artifact_value(payload)
+        redacted_text = redact_text(text)
+
+        self.assertEqual(redacted_payload["accessToken"], "[REDACTED]")
+        self.assertEqual(redacted_payload["refreshToken"], "[REDACTED]")
+        self.assertEqual(redacted_payload["clientSecret"], "[REDACTED]")
+        self.assertEqual(redacted_payload["nested"]["apiKey"], "[REDACTED]")
+        for secret in (
+            "access-token-secret",
+            "refresh-token-secret",
+            "client-secret",
+            "api-key-secret",
+        ):
+            self.assertNotIn(secret, redacted_text)
+        self.assertIn('"accessToken":"[REDACTED]"', redacted_text)
+        self.assertIn('"refreshToken": "[REDACTED]"', redacted_text)
+        self.assertIn('"clientSecret" : "[REDACTED]"', redacted_text)
+        self.assertIn('"apiKey": "[REDACTED]"', redacted_text)
+
     def test_does_not_redact_safe_command_flags_that_contain_secret_words(self):
         payload = {
             "agent": {
@@ -103,6 +151,22 @@ class RedactionTest(unittest.TestCase):
         }
 
         self.assertEqual(redact_artifact_value(payload), payload)
+
+    def test_does_not_redact_normal_words_that_contain_secret_terms(self):
+        payload = {
+            "author": "pipeline-bot",
+            "authority": "local",
+            "text_tokenize": "words",
+            "office_secretary": "notes",
+        }
+        text = (
+            "author=pipeline-bot authority=local "
+            "text_tokenize=words office_secretary=notes "
+            '{"tokenize": "words", "secretary": "notes"}'
+        )
+
+        self.assertEqual(redact_artifact_value(payload), payload)
+        self.assertEqual(redact_text(text), text)
 
 
 if __name__ == "__main__":

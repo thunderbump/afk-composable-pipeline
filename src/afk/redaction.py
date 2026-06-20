@@ -10,11 +10,19 @@ SECRET_KEY_PATTERN = re.compile(
     r"(^|[._-])(auth|credentials?|password|secret|token|api[._-]?key|env)($|[._-])",
     re.IGNORECASE,
 )
+SECRET_KEY_COMPONENTS = {"auth", "credential", "credentials", "password", "secret", "token", "env"}
+KEY_COMPONENT_PATTERN = re.compile(r"[A-Z]+(?=[A-Z][a-z]|[0-9]|$)|[A-Z]?[a-z]+|[0-9]+")
 SECRET_FLAG_COMPONENTS = {"auth", "credential", "credentials", "password", "secret", "token"}
 SECRET_ASSIGNMENT_PATTERN = re.compile(
-    r"(?P<key>[A-Za-z_][A-Za-z0-9_]*(?:TOKEN|SECRET|PASSWORD|AUTH|API_KEY|CREDENTIAL)[A-Za-z0-9_]*)"
+    r"(?P<key>[A-Za-z_][A-Za-z0-9_.-]*)"
     r"(?P<separator>\s*[:=]\s*)"
     r"(?P<value>[^\s,;]+)",
+)
+JSON_SECRET_STRING_PATTERN = re.compile(
+    r"(?P<prefix>(?P<key_quote>[\"'])(?P<key>[A-Za-z_][A-Za-z0-9_.-]*)"
+    r"(?P=key_quote)\s*:\s*(?P<value_quote>[\"']))"
+    r"(?P<value>[^\"'\r\n]*)"
+    r"(?P=value_quote)",
     re.IGNORECASE,
 )
 
@@ -24,7 +32,7 @@ def redact_artifact_value(value: Any) -> Any:
 
 
 def redact_artifact_value_for_key(key: str | None, value: Any) -> Any:
-    if key is not None and SECRET_KEY_PATTERN.search(key):
+    if key is not None and is_secret_key(key):
         return "[REDACTED]"
     if isinstance(value, dict):
         return {
@@ -77,12 +85,39 @@ def is_secret_command_flag(value: str) -> bool:
     return any(left == "api" and right == "key" for left, right in zip(components, components[1:]))
 
 
+def is_secret_key(value: str) -> bool:
+    if SECRET_KEY_PATTERN.search(value):
+        return True
+    components = key_components(value)
+    if any(component in SECRET_KEY_COMPONENTS for component in components):
+        return True
+    if "apikey" in components:
+        return True
+    return any(left == "api" and right == "key" for left, right in zip(components, components[1:]))
+
+
+def key_components(value: str) -> list[str]:
+    components = []
+    for chunk in re.split(r"[._-]+", value):
+        components.extend(match.group(0).lower() for match in KEY_COMPONENT_PATTERN.finditer(chunk))
+    return components
+
+
 def redact_text(value: str) -> str:
     redacted = URL_PATTERN.sub(redact_url_match, value)
+    redacted = JSON_SECRET_STRING_PATTERN.sub(redact_json_secret_string, redacted)
     return SECRET_ASSIGNMENT_PATTERN.sub(redact_secret_assignment, redacted)
 
 
+def redact_json_secret_string(match: re.Match[str]) -> str:
+    if not is_secret_key(match.group("key")):
+        return match.group(0)
+    return f"{match.group('prefix')}[REDACTED]{match.group('value_quote')}"
+
+
 def redact_secret_assignment(match: re.Match[str]) -> str:
+    if not is_secret_key(match.group("key")):
+        return match.group(0)
     return f"{match.group('key')}{match.group('separator')}[REDACTED]"
 
 

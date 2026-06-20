@@ -282,6 +282,22 @@ def result_artifact_paths(step: str, output: Any) -> dict[str, str]:
         if artifacts.get("worker_result") == "worker-result.json":
             paths["worker_result"] = "worker-result.json"
         return paths
+    if step == "review":
+        if not isinstance(output, dict):
+            return {}
+        artifacts = output.get("artifacts")
+        if not isinstance(artifacts, dict):
+            return {}
+        paths = {}
+        if artifacts.get("evidence_pack") == "evidence-pack.json":
+            paths["evidence_pack"] = "evidence-pack.json"
+        if artifacts.get("reviewer_request") == "reviewer-request.json":
+            paths["reviewer_request"] = "reviewer-request.json"
+        if artifacts.get("reviewer_result") == "reviewer-result.json":
+            paths["reviewer_result"] = "reviewer-result.json"
+        if artifacts.get("review_summary") == "review-summary.md":
+            paths["review_summary"] = "review-summary.md"
+        return paths
     if step != "prepare-checkout":
         return {}
     if not isinstance(output, dict):
