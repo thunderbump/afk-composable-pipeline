@@ -7,6 +7,7 @@ from typing import Any, Mapping, Protocol
 
 from afk.contracts import ProjectContract
 from afk.jsonutil import sha256_json
+from afk.work_sources import select_work_step
 
 
 @dataclass(frozen=True)
@@ -70,7 +71,7 @@ class StepRegistry:
 
 
 def default_step_registry() -> StepRegistry:
-    return StepRegistry({"noop": noop_step})
+    return StepRegistry({"noop": noop_step, "select-work": select_work_step})
 
 
 def noop_step(context: StepContext) -> Any:
