@@ -10,6 +10,7 @@ from afk.checkouts import prepare_checkout_step
 from afk.contracts import ProjectContract
 from afk.implement import implement_step
 from afk.jsonutil import sha256_json
+from afk.review import review_step
 from afk.validation import validate_step
 from afk.work_sources import select_work_step
 
@@ -81,6 +82,7 @@ def default_step_registry() -> StepRegistry:
             "implement": implement_step,
             "noop": noop_step,
             "prepare-checkout": prepare_checkout_step,
+            "review": review_step,
             "select-work": select_work_step,
             "validate": validate_step,
         }

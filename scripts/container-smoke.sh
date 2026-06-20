@@ -352,3 +352,114 @@ assert agent_result["result"]["summary"] == "smoke implemented", agent_result
 assert "implement smoke complete" in stdout_log, stdout_log
 print(f"container-smoke implement: PASS {summary['run_id']}")
 PY
+
+python3 - "$tmpdir/review-input.json" "$tmpdir/implement-out.json" "$tmpdir/validate-out.json" "$ledger" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+implement_summary = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
+validate_summary = json.loads(Path(sys.argv[3]).read_text(encoding="utf-8"))
+host_ledger = Path(sys.argv[4])
+implement_run = host_ledger / "runs" / implement_summary["run_id"]
+implemented = json.loads((implement_run / "step-result.json").read_text(encoding="utf-8"))["output"]
+
+reviewer_code = """
+import json
+import os
+from pathlib import Path
+
+request = json.loads(Path(os.environ["AFK_REVIEWER_REQUEST"]).read_text(encoding="utf-8"))
+pack = request["evidence_pack"]
+assert pack["work_item"]["external_id"] == "smoke-implement"
+assert pack["implementation"]["git"]["changed_files"] == ["implemented-smoke.txt"]
+assert pack["validation"]["required"][0]["status"] == "validated"
+Path(os.environ["AFK_REVIEWER_RESULT"]).write_text(
+    json.dumps(
+        {
+            "status": "pass",
+            "summary": "smoke review passed",
+            "findings": [{"status": "pass", "title": "Smoke evidence complete"}],
+        }
+    ),
+    encoding="utf-8",
+)
+print("review smoke complete")
+""".strip()
+
+payload = {
+    "work_item": implemented["work_item"],
+    "checkout": {
+        "status": "prepared",
+        "checkout_path": "/work/checkout",
+        "review_branch": "afk/smoke-review",
+        "requested_ref": "main",
+        "start_commit": implemented["git"]["before_commit"],
+    },
+    "implementation": {
+        "status": implemented["status"],
+        "summary": implemented["summary"],
+        "git": implemented["git"],
+    },
+    "validation": {
+        "required_artifacts": [
+            {
+                "name": "tier3-harness",
+                "step_result_path": f"/ledger/runs/{validate_summary['run_id']}/step-result.json",
+                "worker_result_path": f"/ledger/runs/{validate_summary['run_id']}/worker-result.json",
+            }
+        ]
+    },
+    "guardrails": [{"name": "stay within checkout", "status": "pass"}],
+    "cleanup": {"status": "clean", "resources": []},
+    "reviewer": {
+        "type": "fake-reviewer-command",
+        "command": ["python3", "-c", reviewer_code],
+        "timeout_seconds": 30,
+    },
+}
+Path(sys.argv[1]).write_text(json.dumps(payload), encoding="utf-8")
+PY
+
+"$runtime" run --rm \
+  -v "$ledger:/ledger" \
+  -v "$tmpdir:/work" \
+  "$tag" \
+  run-step review \
+  --input "$(cat "$tmpdir/review-input.json")" \
+  --ledger /ledger > "$tmpdir/review-out.json"
+
+python3 - "$tmpdir/review-out.json" "$ledger" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+summary = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+ledger = Path(sys.argv[2])
+run_dir = ledger / "runs" / summary["run_id"]
+
+result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+evidence_pack = json.loads((run_dir / "evidence-pack.json").read_text(encoding="utf-8"))
+reviewer_result = json.loads((run_dir / "reviewer-result.json").read_text(encoding="utf-8"))
+review_summary = (run_dir / "review-summary.md").read_text(encoding="utf-8")
+stdout_log = (run_dir / "stdout.log").read_text(encoding="utf-8")
+
+reviewed = result["output"]
+assert summary["step"] == "review", summary
+assert summary["status"] == "succeeded", summary
+assert reviewed["status"] == "passed", reviewed
+assert reviewed["classification"] == "success", reviewed
+assert reviewed["artifacts"] == {
+    "evidence_pack": "evidence-pack.json",
+    "reviewer_request": "reviewer-request.json",
+    "reviewer_result": "reviewer-result.json",
+    "review_summary": "review-summary.md",
+}, reviewed
+assert evidence_pack["artifact_type"] == "evidence-pack", evidence_pack
+assert evidence_pack["evidence_pack"]["validation"]["required"][0]["status"] == "validated", evidence_pack
+assert reviewer_result["artifact_type"] == "reviewer-result", reviewer_result
+assert reviewer_result["result"]["summary"] == "smoke review passed", reviewer_result
+assert "Smoke evidence complete" in review_summary, review_summary
+assert "review smoke complete" in stdout_log, stdout_log
+print(f"container-smoke review: PASS {summary['run_id']}")
+PY

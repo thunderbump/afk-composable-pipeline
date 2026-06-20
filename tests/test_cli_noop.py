@@ -72,7 +72,7 @@ class NoopCliTest(unittest.TestCase):
             self.assertNotEqual(completed.returncode, 0)
             self.assertIn("unknown step 'missing-step'", completed.stderr)
             self.assertIn(
-                "known steps: implement, noop, prepare-checkout, select-work, validate",
+                "known steps: implement, noop, prepare-checkout, review, select-work, validate",
                 completed.stderr,
             )
             self.assertFalse(ledger.exists())

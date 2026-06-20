@@ -12,7 +12,8 @@ SECRET_KEY_PATTERN = re.compile(
 )
 SECRET_FLAG_COMPONENTS = {"auth", "credential", "credentials", "password", "secret", "token"}
 SECRET_ASSIGNMENT_PATTERN = re.compile(
-    r"(?P<key>[A-Za-z_][A-Za-z0-9_]*(?:TOKEN|SECRET|PASSWORD|AUTH|API_KEY|CREDENTIAL)[A-Za-z0-9_]*)"
+    r"(?P<key>[A-Za-z_][A-Za-z0-9_]*(?:TOKEN|SECRET|PASSWORD|AUTH|API_KEY|CREDENTIAL)[A-Za-z0-9_]*"
+    r"|TOKEN|SECRET|PASSWORD|AUTH|API_KEY|CREDENTIAL)"
     r"(?P<separator>\s*[:=]\s*)"
     r"(?P<value>[^\s,;]+)",
     re.IGNORECASE,
