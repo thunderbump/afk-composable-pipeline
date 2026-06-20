@@ -536,9 +536,18 @@ def read_wrapper_secret_redaction_set(wrapper_secret_files: dict[str, str]) -> d
         try:
             raw_value = path.read_text(encoding="utf-8")
         except OSError as exc:
+            detail = exc.strerror or str(exc)
             return {
                 "status": "invalid",
-                "message": f"agent.wrapper_secret_files.{key} could not be read at runtime: {exc.strerror or exc}",
+                "message": f"agent.wrapper_secret_files.{key} could not be read at runtime from {path}: {detail}",
+            }
+        except UnicodeDecodeError as exc:
+            return {
+                "status": "invalid",
+                "message": (
+                    f"agent.wrapper_secret_files.{key} could not be read at runtime from {path}: "
+                    f"expected UTF-8 text ({exc})"
+                ),
             }
         exact_secrets.update(wrapper_secret_redaction_candidates(raw_value))
     return {"status": "valid", "exact_secrets": normalize_exact_secrets(exact_secrets)}

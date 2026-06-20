@@ -612,6 +612,71 @@ class ImplementCliTest(unittest.TestCase):
             self.assertIn("could not be read", result["output"]["summary"])
             self.assertNotIn("should not run", (run_dir / "stdout.log").read_text(encoding="utf-8"))
 
+    def test_implement_fails_protocol_when_wrapper_secret_file_is_not_utf8_at_runtime(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            checkout = temp_path / "checkout"
+            start_commit = init_checkout(checkout)
+            ledger = temp_path / "ledger"
+            codex_home = temp_path / "codex-home"
+            pi_config_home = temp_path / "pi-config"
+            config_home = temp_path / "xdg-config-explicit"
+            wrapper_secret_dir = temp_path / "runner-secrets"
+            wrapper_secret_file = wrapper_secret_dir / "plain-secret.txt"
+            codex_home.mkdir()
+            pi_config_home.mkdir()
+            config_home.mkdir()
+            wrapper_secret_dir.mkdir()
+            wrapper_secret_file.write_bytes(b"\xff\xfe\x00\x81")
+
+            completed = run_afk(
+                "run-step",
+                "implement",
+                "--input",
+                json.dumps(
+                    {
+                        "work_selection": {"schema_version": 1, "selected_work": [selected_work()]},
+                        "checkout": {
+                            "status": "prepared",
+                            "checkout_path": str(checkout),
+                            "review_branch": "afk/test-work",
+                            "requested_ref": "main",
+                            "start_commit": start_commit,
+                        },
+                        "guardrails": ["stay within checkout"],
+                        "validation": {"profile": "tier1", "commands": []},
+                        "agent": {
+                            "type": "real-agent-command",
+                            "command": [
+                                sys.executable,
+                                "-c",
+                                "print('should not run')",
+                            ],
+                            "result_path": "agent-result.json",
+                            "timeout_seconds": 10,
+                            "codex_home": str(codex_home),
+                            "config_home": str(config_home),
+                            "env": {"PI_CONFIG_HOME": str(pi_config_home)},
+                            "wrapper_secret_files": {"primary": str(wrapper_secret_file)},
+                        },
+                    }
+                ),
+                "--ledger",
+                str(ledger),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(result["output"]["status"], "failed_protocol")
+            self.assertEqual(result["output"]["classification"], "protocol_failure")
+            self.assertIn("agent.wrapper_secret_files.primary", result["output"]["summary"])
+            self.assertIn("could not be read", result["output"]["summary"])
+            self.assertIn(str(wrapper_secret_file), result["output"]["summary"])
+            self.assertNotIn("should not run", (run_dir / "stdout.log").read_text(encoding="utf-8"))
+
     def test_implement_rejects_real_agent_command_success_without_new_commit(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
