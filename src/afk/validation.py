@@ -4,6 +4,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -76,6 +77,20 @@ def validate(
         stdout = redact_text(exc.stdout)
         stderr = redact_text(exc.stderr or exc.message)
         write_adapter_logs(stdout, stderr)
+        raw_payload = read_worker_payload(result_path)
+        if raw_payload["status"] == "invalid":
+            normalized = normalized_worker_result(
+                status="failed_protocol",
+                classification="protocol_failure",
+                summary=raw_payload["message"],
+                raw_result=None,
+                adapter=adapter_record(request["worker"], exc.returncode, exc.timed_out),
+                stdout=stdout,
+                stderr=stderr,
+            )
+            worker_result = {"raw": None, "normalized": normalized}
+            write_worker_result(worker_result_path, run_id, worker_result)
+            return validate_output(request, worker_request, worker_result)
         normalized = normalized_worker_result(
             status="failed_timeout" if exc.timed_out else "failed_runtime",
             classification="timeout" if exc.timed_out else "runtime_failure",
@@ -419,7 +434,9 @@ def read_worker_payload(path: Path) -> dict[str, Any]:
         return {"status": "invalid", "message": message}
     redacted_payload = redact_artifact_value(payload)
     if not replace_worker_result_evidence(path, redacted_payload):
-        return {"status": "invalid", "message": "worker result file could not be sanitized"}
+        message = "worker result file could not be sanitized"
+        replace_worker_result_evidence(path, protocol_error_evidence(message))
+        return {"status": "invalid", "message": message}
     return {"status": "valid", "payload": redacted_payload}
 
 
@@ -433,12 +450,45 @@ def protocol_error_evidence(message: str) -> dict[str, Any]:
 
 
 def replace_worker_result_evidence(path: Path, payload: dict[str, Any]) -> bool:
+    content = canonical_json(payload) + "\n"
+    temp_path: Path | None = None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists() and path.is_dir():
+            shutil.rmtree(path)
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temp_file:
+            temp_path = Path(temp_file.name)
+            temp_file.write(content)
+        os.replace(temp_path, path)
+        return True
+    except OSError:
+        if temp_path is not None:
+            try:
+                temp_path.unlink()
+            except OSError:
+                pass
+    try:
+        if path.exists() and not path.is_dir() and not path.is_symlink():
+            path.chmod(0o600)
+            path.write_text(content, encoding="utf-8")
+            return True
+    except OSError:
+        pass
     try:
         if path.is_symlink():
             path.unlink()
         elif path.exists() and path.is_dir():
             shutil.rmtree(path)
-        write_json(path, payload)
+        elif path.exists():
+            path.unlink()
+        path.write_text(content, encoding="utf-8")
     except OSError:
         return False
     return True
