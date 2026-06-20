@@ -63,6 +63,14 @@ def init_checkout(path):
     return git(path, "rev-parse", "HEAD")
 
 
+def run_dir_text(run_dir):
+    return "\n".join(
+        path.read_text(encoding="utf-8", errors="replace")
+        for path in sorted(run_dir.rglob("*"))
+        if path.is_file()
+    )
+
+
 class ValidateCliTest(unittest.TestCase):
     def test_validate_runs_local_worker_and_records_request_and_result_artifacts(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -432,6 +440,72 @@ class ValidateCliTest(unittest.TestCase):
                 "wrote malformed result",
                 worker_result["result"]["normalized"]["evidence"]["stdout_excerpt"],
             )
+
+    def test_validate_sanitizes_invalid_worker_json_evidence(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            checkout = temp_path / "checkout"
+            start_commit = init_checkout(checkout)
+            ledger = temp_path / "ledger"
+            worker_code = textwrap.dedent(
+                """
+                import os
+                from pathlib import Path
+
+                token = "invalid-token-" + "secret"
+                Path(os.environ["AFK_WORKER_RESULT"]).write_text(
+                    "API_TOKEN=" + token + " {not valid json",
+                    encoding="utf-8",
+                )
+                print("wrote malformed result with token")
+                """
+            ).strip()
+
+            completed = run_afk(
+                "run-step",
+                "validate",
+                "--profile",
+                "tier3-harness",
+                "--input",
+                json.dumps(
+                    {
+                        "checkout": {
+                            "status": "prepared",
+                            "checkout_path": str(checkout),
+                            "review_branch": "afk/validate",
+                            "requested_ref": "main",
+                            "start_commit": start_commit,
+                        },
+                        "worker": {
+                            "type": "local-command",
+                            "command": [sys.executable, "-c", worker_code],
+                        },
+                    }
+                ),
+                "--ledger",
+                str(ledger),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+            worker_result = json.loads((run_dir / "worker-result.json").read_text(encoding="utf-8"))
+            artifact_text = run_dir_text(run_dir)
+            evidence_result = json.loads(
+                (run_dir / "validation-evidence" / "result.json").read_text(encoding="utf-8")
+            )
+
+            self.assertEqual(result["output"]["status"], "failed_protocol")
+            self.assertEqual(result["output"]["classification"], "protocol_failure")
+            self.assertIsNone(worker_result["result"]["raw"])
+            self.assertEqual(
+                worker_result["result"]["normalized"]["summary"],
+                "worker result file is not valid JSON",
+            )
+            self.assertNotIn("invalid-token-secret", artifact_text)
+            self.assertEqual(evidence_result["status"], "failed_protocol")
+            self.assertEqual(evidence_result["classification"], "protocol_failure")
 
     def test_validate_classifies_unknown_worker_status_as_protocol_failure_when_adapter_exits_nonzero(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -884,11 +958,7 @@ class ValidateCliTest(unittest.TestCase):
             self.assertEqual(completed.returncode, 0, completed.stderr)
             summary = json.loads(completed.stdout)
             run_dir = ledger / "runs" / summary["run_id"]
-            artifact_text = "\n".join(
-                path.read_text(encoding="utf-8")
-                for path in run_dir.iterdir()
-                if path.is_file()
-            )
+            artifact_text = run_dir_text(run_dir)
 
             self.assertNotIn("validate-secret", artifact_text)
             self.assertNotIn("query-secret", artifact_text)
@@ -896,6 +966,81 @@ class ValidateCliTest(unittest.TestCase):
             self.assertNotIn("result-secret", artifact_text)
             self.assertIn("https://example.invalid/repo.git", artifact_text)
             self.assertIn("API_TOKEN=[REDACTED]", artifact_text)
+
+    def test_validate_redacts_nested_worker_result_evidence(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            checkout = temp_path / "checkout"
+            start_commit = init_checkout(checkout)
+            ledger = temp_path / "ledger"
+            worker_code = textwrap.dedent(
+                """
+                import json
+                import os
+                from pathlib import Path
+
+                token = "nested-token-" + "secret"
+                password = "db-password-" + "secret"
+                credential = "credential-" + "secret"
+                Path(os.environ["AFK_WORKER_RESULT"]).write_text(
+                    json.dumps(
+                        {
+                            "profile": "preflight",
+                            "status": "pass",
+                            "metadata": {
+                                "token": token,
+                                "database": {"password": password},
+                                "service_credentials": {"value": credential},
+                            },
+                            "steps": [],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                """
+            ).strip()
+
+            completed = run_afk(
+                "run-step",
+                "validate",
+                "--profile",
+                "preflight",
+                "--input",
+                json.dumps(
+                    {
+                        "checkout": {
+                            "status": "prepared",
+                            "checkout_path": str(checkout),
+                            "review_branch": "afk/validate",
+                            "requested_ref": "main",
+                            "start_commit": start_commit,
+                        },
+                        "worker": {
+                            "type": "local-command",
+                            "command": [sys.executable, "-c", worker_code],
+                        },
+                    }
+                ),
+                "--ledger",
+                str(ledger),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+            evidence_result = json.loads(
+                (run_dir / "validation-evidence" / "result.json").read_text(encoding="utf-8")
+            )
+
+            self.assertEqual(result["output"]["status"], "validated")
+            self.assertEqual(evidence_result["metadata"]["token"], "[REDACTED]")
+            self.assertEqual(evidence_result["metadata"]["database"]["password"], "[REDACTED]")
+            self.assertEqual(evidence_result["metadata"]["service_credentials"], "[REDACTED]")
+            artifact_text = run_dir_text(run_dir)
+            self.assertNotIn("nested-token-secret", artifact_text)
+            self.assertNotIn("db-password-secret", artifact_text)
+            self.assertNotIn("credential-secret", artifact_text)
 
     def test_validate_defaults_to_bump_eqemu_validation_worker_script_when_project_is_bump_eqemu(self):
         with tempfile.TemporaryDirectory() as temp_dir:

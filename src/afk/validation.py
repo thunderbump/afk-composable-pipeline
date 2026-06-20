@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -401,16 +402,46 @@ def read_worker_payload(path: Path) -> dict[str, Any]:
     except FileNotFoundError:
         return {"status": "missing", "message": "worker result file was not produced"}
     except OSError:
-        return {"status": "invalid", "message": "worker result file could not be read"}
+        message = "worker result file could not be read"
+        replace_worker_result_evidence(path, protocol_error_evidence(message))
+        return {"status": "invalid", "message": message}
     try:
         import json
 
         payload = json.loads(raw)
     except json.JSONDecodeError:
-        return {"status": "invalid", "message": "worker result file is not valid JSON"}
+        message = "worker result file is not valid JSON"
+        replace_worker_result_evidence(path, protocol_error_evidence(message))
+        return {"status": "invalid", "message": message}
     if not isinstance(payload, dict):
-        return {"status": "invalid", "message": "worker result file must contain an object"}
-    return {"status": "valid", "payload": redact_artifact_value(payload)}
+        message = "worker result file must contain an object"
+        replace_worker_result_evidence(path, protocol_error_evidence(message))
+        return {"status": "invalid", "message": message}
+    redacted_payload = redact_artifact_value(payload)
+    if not replace_worker_result_evidence(path, redacted_payload):
+        return {"status": "invalid", "message": "worker result file could not be sanitized"}
+    return {"status": "valid", "payload": redacted_payload}
+
+
+def protocol_error_evidence(message: str) -> dict[str, Any]:
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "status": "failed_protocol",
+        "classification": "protocol_failure",
+        "summary": message,
+    }
+
+
+def replace_worker_result_evidence(path: Path, payload: dict[str, Any]) -> bool:
+    try:
+        if path.is_symlink():
+            path.unlink()
+        elif path.exists() and path.is_dir():
+            shutil.rmtree(path)
+        write_json(path, payload)
+    except OSError:
+        return False
+    return True
 
 
 def normalize_worker_payload(
