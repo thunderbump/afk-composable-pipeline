@@ -375,6 +375,75 @@ class ImplementCliTest(unittest.TestCase):
             self.assertEqual(result["output"]["git"]["commits"], [])
             self.assertIn("agent reported success", agent_result["result"]["evidence"]["stdout_excerpt"])
 
+    def test_implement_rejects_real_agent_command_success_when_post_run_git_metadata_fails(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            checkout = temp_path / "checkout"
+            start_commit = init_checkout(checkout)
+            ledger = temp_path / "ledger"
+            agent_code = textwrap.dedent(
+                """
+                import json
+                from pathlib import Path
+
+                Path("agent-result.json").write_text(
+                    json.dumps({"status": "completed", "summary": "reported success before metadata failed"}),
+                    encoding="utf-8",
+                )
+                Path(".git").rename(".git-broken")
+                print("agent reported success before metadata failed")
+                """
+            ).strip()
+
+            completed = run_afk(
+                "run-step",
+                "implement",
+                "--input",
+                json.dumps(
+                    {
+                        "work_selection": {"schema_version": 1, "selected_work": [selected_work()]},
+                        "checkout": {
+                            "status": "prepared",
+                            "checkout_path": str(checkout),
+                            "review_branch": "afk/test-work",
+                            "requested_ref": "main",
+                            "start_commit": start_commit,
+                        },
+                        "guardrails": [],
+                        "validation": {"profile": "tier1", "commands": []},
+                        "agent": {
+                            "type": "real-agent-command",
+                            "command": [sys.executable, "-c", agent_code],
+                            "result_path": "agent-result.json",
+                        },
+                    }
+                ),
+                "--ledger",
+                str(ledger),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+            agent_result = json.loads((run_dir / "agent-result.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(result["output"]["status"], "failed_protocol")
+            self.assertEqual(result["output"]["classification"], "protocol_failure")
+            self.assertEqual(
+                result["output"]["summary"],
+                "agent reported success but post-run git metadata could not be verified",
+            )
+            self.assertEqual(agent_result["result"]["status"], "failed_protocol")
+            self.assertEqual(result["output"]["git"]["metadata_status"], "failed")
+            self.assertEqual(result["output"]["git"]["before_commit"], start_commit)
+            self.assertEqual(result["output"]["git"]["after_commit"], start_commit)
+            self.assertEqual(result["output"]["git"]["commits"], [])
+            self.assertIn(
+                "agent reported success before metadata failed",
+                agent_result["result"]["evidence"]["stdout_excerpt"],
+            )
+
     def test_implement_rejects_real_agent_command_auth_config_paths_inside_checkout_or_relative(self):
         cases = [
             ("codex_home", "codex-cache", "agent.codex_home must be absolute"),

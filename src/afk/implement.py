@@ -609,7 +609,17 @@ def require_commit_for_implemented_result(
     if adapter.get("type") != "real-agent-command":
         return agent_result
     if metadata.get("metadata_status") == "failed":
-        return agent_result
+        message = "agent reported success but post-run git metadata could not be verified"
+        return normalized_agent_result(
+            status="failed_protocol",
+            classification="protocol_failure",
+            summary=message,
+            notes=agent_result["notes"],
+            failures=[{"type": "protocol", "message": message}],
+            adapter=adapter,
+            stdout=stdout,
+            stderr=stderr,
+        )
     if metadata.get("before_commit") != metadata.get("after_commit") and metadata.get("commits"):
         return agent_result
     message = "agent reported success but produced no new commit"
