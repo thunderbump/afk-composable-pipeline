@@ -309,16 +309,23 @@ def normalize_validation(validation: Any) -> dict[str, Any]:
             return {"status": "invalid", "message": "validation artifact step_result_path is required"}
         step_path = Path(step_result_path)
         worker_path = Path(worker_result_path) if worker_result_path else None
-        path_errors = validation_artifact_path_errors(step_path, "step-result.json")
+        step_path_errors = validation_artifact_path_errors(step_path, "step-result.json")
+        worker_path_errors = []
+        pair_path_errors = []
         if worker_path is not None:
-            path_errors.extend(validation_artifact_path_errors(worker_path, "worker-result.json"))
-            path_errors.extend(validation_artifact_pair_path_errors(step_path, worker_path))
-        step_result = read_validation_artifact(step_path, "step-result.json")
-        worker_result = (
-            read_validation_artifact(worker_path, "worker-result.json")
-            if worker_path is not None
-            else {"status": "missing"}
-        )
+            worker_path_errors = validation_artifact_path_errors(worker_path, "worker-result.json")
+            pair_path_errors = validation_artifact_pair_path_errors(step_path, worker_path)
+        path_errors = step_path_errors + worker_path_errors + pair_path_errors
+        if pair_path_errors:
+            step_result = invalid_validation_artifact_path_result(step_path, pair_path_errors)
+            worker_result = invalid_validation_artifact_path_result(worker_path, pair_path_errors)
+        else:
+            step_result = read_validation_artifact(step_path, "step-result.json")
+            worker_result = (
+                read_validation_artifact(worker_path, "worker-result.json")
+                if worker_path is not None
+                else {"status": "missing"}
+            )
         output = step_result.get("output") if isinstance(step_result.get("output"), dict) else {}
         worker_normalized = worker_validation_result(worker_result)
         evidence_errors = path_errors + validation_evidence_errors(
@@ -351,12 +358,16 @@ def normalize_validation(validation: Any) -> dict[str, Any]:
 def read_validation_artifact(path: Path, expected_filename: str) -> dict[str, Any]:
     errors = validation_artifact_path_errors(path, expected_filename)
     if errors:
-        return {
-            "status": "invalid_path",
-            "path": str(path),
-            "message": "; ".join(errors),
-        }
+        return invalid_validation_artifact_path_result(path, errors)
     return read_json_artifact(path)
+
+
+def invalid_validation_artifact_path_result(path: Path | None, errors: list[str]) -> dict[str, Any]:
+    return {
+        "status": "invalid_path",
+        "path": str(path) if path is not None else "",
+        "message": "; ".join(errors),
+    }
 
 
 def validation_artifact_path_errors(path: Path, expected_filename: str) -> list[str]:
@@ -426,6 +437,10 @@ def validation_evidence_errors(
 
     step_run_id = string_field(step_result, "run_id")
     worker_run_id = string_field(worker_result, "run_id")
+    if not step_run_id:
+        errors.append("step_result run_id is required")
+    if not worker_run_id:
+        errors.append("worker_result run_id is required")
     if step_run_id and worker_run_id and step_run_id != worker_run_id:
         errors.append("step_result and worker_result run_id must match")
     return errors
