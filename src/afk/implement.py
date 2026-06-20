@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -14,12 +15,15 @@ from afk.redaction import (
     is_secret_key,
     is_secret_value,
     key_components,
+    normalize_exact_secrets,
     redact_artifact_value,
     redact_text,
 )
 
 
 SCHEMA_VERSION = 1
+WRAPPER_SECRET_FILE_NAME_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9_-]*$")
+MIN_RUNTIME_SECRET_LENGTH = 4
 
 
 class AgentRuntimeError(RuntimeError):
@@ -87,11 +91,26 @@ def implement(
         )
         return implement_output(capsule, normalized, checkout_preflight["metadata"])
 
+    runtime_redaction = read_wrapper_secret_redaction_set(request["agent"].get("wrapper_secret_files", {}))
+    if runtime_redaction["status"] != "valid":
+        normalized = normalized_agent_result(
+            status="failed_protocol",
+            classification="protocol_failure",
+            summary=runtime_redaction["message"],
+            notes=[],
+            failures=[{"type": "protocol", "message": runtime_redaction["message"]}],
+            adapter={"type": request["agent"]["type"], "returncode": None},
+            stdout="",
+            stderr="",
+        )
+        return implement_output(capsule, normalized, fallback_git_metadata(request["checkout"]["start_commit"]))
+    exact_secrets = runtime_redaction["exact_secrets"]
+
     try:
         adapter_result = run_agent_command(request["agent"], checkout_path, capsule)
     except AgentRuntimeError as exc:
-        stdout = redact_text(exc.stdout)
-        stderr = redact_text(exc.stderr or exc.message)
+        stdout = redact_text(exc.stdout, exact_secrets=exact_secrets)
+        stderr = redact_text(exc.stderr or exc.message, exact_secrets=exact_secrets)
         write_adapter_logs(stdout, stderr)
         after_metadata = safe_git_metadata(checkout_path, request["checkout"]["start_commit"])
         normalized = normalized_agent_result(
@@ -106,14 +125,15 @@ def implement(
         )
         return implement_output(capsule, normalized, after_metadata)
 
-    stdout = redact_text(adapter_result["stdout"])
-    stderr = redact_text(adapter_result["stderr"])
+    stdout = redact_text(adapter_result["stdout"], exact_secrets=exact_secrets)
+    stderr = redact_text(adapter_result["stderr"], exact_secrets=exact_secrets)
     write_adapter_logs(stdout, stderr)
 
     agent_payload = read_agent_payload(
         checkout_path,
         request["agent"]["result_path"],
         cleanup=True,
+        exact_secrets=exact_secrets,
     )
     if agent_payload["status"] != "valid":
         after_metadata = safe_git_metadata(checkout_path, request["checkout"]["start_commit"])
@@ -304,7 +324,7 @@ def normalize_agent(agent: Any, *, checkout_path: Path) -> dict[str, Any]:
     fake_agent = agent_type == "fake-pi-command"
     forbidden_keys = ("credentials_path", "auth_file", "token", "api_key")
     if fake_agent:
-        forbidden_keys = (*forbidden_keys, "env", "codex_home", "config_home")
+        forbidden_keys = (*forbidden_keys, "env", "codex_home", "config_home", "wrapper_secret_files")
     for forbidden_key in forbidden_keys:
         if forbidden_key in agent:
             return {"status": "invalid", "message": f"agent.{forbidden_key} is not supported"}
@@ -328,6 +348,7 @@ def normalize_agent(agent: Any, *, checkout_path: Path) -> dict[str, Any]:
         "env": {},
         "codex_home": "",
         "config_home": "",
+        "wrapper_secret_files": {},
     }
     if not fake_agent:
         env = normalize_agent_env(
@@ -353,9 +374,16 @@ def normalize_agent(agent: Any, *, checkout_path: Path) -> dict[str, Any]:
         )
         if config_home["status"] != "valid":
             return {"status": "invalid", "message": config_home["message"]}
+        wrapper_secret_files = normalize_wrapper_secret_files(
+            agent.get("wrapper_secret_files", {}),
+            checkout_path=checkout_path,
+        )
+        if wrapper_secret_files["status"] != "valid":
+            return {"status": "invalid", "message": wrapper_secret_files["message"]}
         normalized_agent["env"] = env["env"]
         normalized_agent["codex_home"] = codex_home["path"]
         normalized_agent["config_home"] = config_home["path"]
+        normalized_agent["wrapper_secret_files"] = wrapper_secret_files["files"]
     return {
         "status": "valid",
         "agent": normalized_agent,
@@ -457,6 +485,86 @@ def normalize_absolute_dir(
     return {"status": "valid", "path": str(path)}
 
 
+def normalize_wrapper_secret_files(
+    value: Any,
+    *,
+    checkout_path: Path,
+) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {"status": "invalid", "message": "agent.wrapper_secret_files must be an object"}
+    normalized: dict[str, str] = {}
+    for key, raw_path in value.items():
+        if not isinstance(key, str) or not WRAPPER_SECRET_FILE_NAME_PATTERN.match(key):
+            return {
+                "status": "invalid",
+                "message": "agent.wrapper_secret_files keys must match [A-Za-z][A-Za-z0-9_-]*",
+            }
+        if is_secret_key(key):
+            return {
+                "status": "invalid",
+                "message": f"agent.wrapper_secret_files.{key} must use a non-secret logical name",
+            }
+        if not isinstance(raw_path, str) or not raw_path.strip():
+            return {
+                "status": "invalid",
+                "message": f"agent.wrapper_secret_files.{key} must be an absolute file path outside checkout",
+            }
+        path = Path(raw_path)
+        if not path.is_absolute():
+            return {
+                "status": "invalid",
+                "message": f"agent.wrapper_secret_files.{key} must be an absolute file path outside checkout",
+            }
+        if path_is_equal_to_or_inside(path, checkout_path):
+            return {
+                "status": "invalid",
+                "message": f"agent.wrapper_secret_files.{key} must be outside checkout",
+            }
+        if not path.is_file():
+            return {
+                "status": "invalid",
+                "message": f"agent.wrapper_secret_files.{key} must be an existing file",
+            }
+        normalized[key] = str(path)
+    return {"status": "valid", "files": normalized}
+
+
+def read_wrapper_secret_redaction_set(wrapper_secret_files: dict[str, str]) -> dict[str, Any]:
+    exact_secrets: set[str] = set()
+    for key, raw_path in wrapper_secret_files.items():
+        path = Path(raw_path)
+        try:
+            raw_value = path.read_text(encoding="utf-8")
+        except OSError as exc:
+            detail = exc.strerror or str(exc)
+            return {
+                "status": "invalid",
+                "message": f"agent.wrapper_secret_files.{key} could not be read at runtime from {path}: {detail}",
+            }
+        except UnicodeDecodeError as exc:
+            return {
+                "status": "invalid",
+                "message": (
+                    f"agent.wrapper_secret_files.{key} could not be read at runtime from {path}: "
+                    f"expected UTF-8 text ({exc})"
+                ),
+            }
+        exact_secrets.update(wrapper_secret_redaction_candidates(raw_value))
+    return {"status": "valid", "exact_secrets": normalize_exact_secrets(exact_secrets)}
+
+
+def wrapper_secret_redaction_candidates(raw_value: str) -> set[str]:
+    candidates: set[str] = set()
+    stripped = raw_value.strip()
+    if len(stripped) >= MIN_RUNTIME_SECRET_LENGTH:
+        candidates.add(stripped)
+    for line in raw_value.splitlines():
+        line_value = line.strip()
+        if len(line_value) >= MIN_RUNTIME_SECRET_LENGTH:
+            candidates.add(line_value)
+    return candidates
+
+
 def path_is_equal_to_or_inside(path: Path, parent: Path) -> bool:
     for candidate in (path, path.resolve()):
         try:
@@ -474,17 +582,21 @@ def normalize_string_list(value: Any, field: str) -> dict[str, Any]:
 
 
 def build_job_capsule(request: dict[str, Any], *, run_id: str) -> dict[str, Any]:
+    agent_mounts = {
+        "codex_home": request["agent"].get("codex_home", ""),
+        "config_home": request["agent"].get("config_home", ""),
+        "pi_config_home": request["agent"].get("env", {}).get("PI_CONFIG_HOME", ""),
+    }
+    wrapper_secret_files = request["agent"].get("wrapper_secret_files", {})
+    if wrapper_secret_files:
+        agent_mounts["wrapper_secret_files"] = wrapper_secret_files
     return {
         "schema_version": SCHEMA_VERSION,
         "run_id": run_id,
         "work_item": request["work_item"],
         "acceptance_criteria": request["work_item"]["acceptance_criteria"],
         "checkout": request["checkout"],
-        "agent_mounts": {
-            "codex_home": request["agent"].get("codex_home", ""),
-            "config_home": request["agent"].get("config_home", ""),
-            "pi_config_home": request["agent"].get("env", {}).get("PI_CONFIG_HOME", ""),
-        },
+        "agent_mounts": agent_mounts,
         "guardrails": request["guardrails"],
         "validation": request["validation"],
         "expected_result_schema": {
@@ -587,6 +699,7 @@ def read_agent_payload(
     result_path: str,
     *,
     cleanup: bool,
+    exact_secrets: set[str] | None = None,
 ) -> dict[str, Any]:
     path = checkout_path / result_path
     try:
@@ -610,7 +723,7 @@ def read_agent_payload(
         return {"status": "invalid", "message": "agent result file is not valid JSON"}
     if not isinstance(payload, dict):
         return {"status": "invalid", "message": "agent result file must contain an object"}
-    return {"status": "valid", "payload": redact_artifact_value(payload)}
+    return {"status": "valid", "payload": redact_artifact_value(payload, exact_secrets=exact_secrets)}
 
 
 def normalize_agent_payload(

@@ -6,7 +6,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from afk.redaction import is_secret_value, redact_artifact_value, redact_text, redact_url  # noqa: E402
+from afk.redaction import (  # noqa: E402
+    is_secret_value,
+    redact_artifact_value,
+    redact_text,
+    redact_url,
+)
 
 
 class RedactionTest(unittest.TestCase):
@@ -181,6 +186,22 @@ class RedactionTest(unittest.TestCase):
             redact_text("service=https://example.invalid/api?mode=test#section"),
             "service=https://example.invalid/api",
         )
+
+    def test_runtime_redacts_exact_secret_values_from_strings_and_nested_artifacts(self):
+        payload = {
+            "summary": "plain-secret-value",
+            "notes": ["saw plain-secret-value in wrapper output"],
+            "nested": {"text": "prefix plain-secret-value suffix"},
+        }
+        text = "stdout plain-secret-value stderr"
+
+        redacted_payload = redact_artifact_value(payload, exact_secrets={"plain-secret-value"})
+        redacted_text = redact_text(text, exact_secrets={"plain-secret-value"})
+
+        self.assertEqual(redacted_payload["summary"], "[REDACTED]")
+        self.assertEqual(redacted_payload["notes"], ["saw [REDACTED] in wrapper output"])
+        self.assertEqual(redacted_payload["nested"]["text"], "prefix [REDACTED] suffix")
+        self.assertEqual(redacted_text, "stdout [REDACTED] stderr")
 
 
 if __name__ == "__main__":
