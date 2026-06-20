@@ -87,6 +87,31 @@ Adapter runtime failures, adapter protocol failures, and target-code failures
 are classified separately. Adapter stdout/stderr are redacted and written to
 the normal ledger logs.
 
+Run project validation through a Validation Worker adapter:
+
+```sh
+PYTHONPATH=src python3 -m afk run-step validate \
+  --profile tier3-harness \
+  --input '{"checkout":{"status":"prepared","repo_url":"git@github.com:thunderbump/bump-EQEmu.git","checkout_path":"/work/bump-EQEmu","review_branch":"afk/example","requested_ref":"master","start_commit":"<sha>"},"validation":{"dry_run":true,"timeout_seconds":30},"worker":{"type":"local-command","command":["python3","-c","import json, os; from pathlib import Path; request=json.loads(Path(os.environ[\"AFK_WORKER_REQUEST\"]).read_text(encoding=\"utf-8\")); Path(os.environ[\"AFK_WORKER_RESULT\"]).write_text(json.dumps({\"profile\":request[\"profile\"],\"status\":\"pass\",\"steps\":[]}), encoding=\"utf-8\")"]}}' \
+  --ledger ledger
+```
+
+`validate` consumes prepared checkout metadata and a validation profile, writes
+`worker-request.json`, invokes a configured local-command or remote-command
+adapter, reads the worker evidence result, and records `worker-result.json`.
+Local adapters receive `repo.path` plus `repo.commit`; remote-command adapters
+receive `repo.url`, `repo.ref` when available, and pinned `repo.commit`.
+Adapters receive `AFK_WORKER_REQUEST`, `AFK_WORKER_RESULT`, and
+`AFK_WORKER_EVIDENCE_DIR`. The Bump EQEmu project contract maps AFK profiles
+to the central-lve.6 worker request profiles and defaults to
+`scripts/validation-worker.sh run --request <request>` when no explicit worker
+adapter is supplied.
+
+Validation failure categories distinguish missing worker results, adapter
+timeouts/runtime failures, worker-reported validation failures, and skipped
+profiles. Worker request/result payloads and stdout/stderr excerpts are
+redacted before being stored in the ledger.
+
 ## Ledger Artifacts
 
 Each invocation writes a new run directory:
@@ -115,7 +140,9 @@ statuses, selected work, and skipped candidates. For `prepare-checkout`, this is
 the checkout provenance and a pointer to `publication-result.json`, which stores
 the publication result separately. For `implement`, it contains normalized work,
 checkout, agent, and git metadata plus pointers to `job-capsule.json` and
-`agent-result.json`.
+`agent-result.json`. For `validate`, it contains normalized checkout,
+validation, adapter, and worker evidence plus pointers to `worker-request.json`
+and `worker-result.json`.
 
 ## Development
 
@@ -133,6 +160,7 @@ Run the container smoke test:
 
 The smoke script builds the image and runs `afk run-step noop`, a fixture-backed
 `afk run-step select-work`, `afk run-step prepare-checkout` against a mounted
-local repo with a real submodule, and `afk run-step implement` with a fake/local
-Pi command when Docker or Podman is available. If neither runtime exists, it
-exits successfully with a clear skip message.
+local repo with a real submodule, `afk run-step validate` with a fake/local
+Validation Worker, and `afk run-step implement` with a fake/local Pi command
+when Docker or Podman is available. If neither runtime exists, it exits
+successfully with a clear skip message.

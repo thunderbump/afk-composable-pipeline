@@ -30,6 +30,7 @@ class ProjectContract:
     base_branch: str
     beads_labels: tuple[str, ...]
     validation_profiles: tuple[str, ...]
+    validation_profile_requests: dict[str, dict[str, Any]]
     artifact_retention: dict[str, Any]
     pr_target: dict[str, str]
     identity: ProjectContractIdentity
@@ -62,6 +63,7 @@ def load_project_contract(
         base_branch=contract["base_branch"],
         beads_labels=tuple(contract["beads_labels"]),
         validation_profiles=tuple(contract["validation_profiles"]),
+        validation_profile_requests=dict(contract["validation_profile_requests"]),
         artifact_retention=dict(contract["artifact_retention"]),
         pr_target=dict(contract["pr_target"]),
         identity=ProjectContractIdentity(
@@ -86,6 +88,7 @@ def validate_project_contract(
     require_string(data, "base_branch", path)
     beads_labels = require_string_list(data, "beads_labels", path)
     validation_profiles = require_string_list(data, "validation_profiles", path)
+    validation_profile_requests = optional_profile_request_map(data, "validation_profile_requests", path)
     artifact_retention = require_object(data, "artifact_retention", path)
     pr_target = require_object(data, "pr_target", path)
 
@@ -114,6 +117,7 @@ def validate_project_contract(
         "base_branch": data["base_branch"],
         "beads_labels": beads_labels,
         "validation_profiles": validation_profiles,
+        "validation_profile_requests": validation_profile_requests,
         "artifact_retention": {"ledger_days": ledger_days, "log_days": log_days},
         "pr_target": {
             "remote": pr_target["remote"],
@@ -152,6 +156,24 @@ def require_object(data: dict[str, Any], key: str, path: Path) -> dict[str, Any]
     if not isinstance(value, dict):
         raise ContractError(f"invalid project contract {path}: {key} must be an object")
     return dict(value)
+
+
+def optional_profile_request_map(data: dict[str, Any], key: str, path: Path) -> dict[str, dict[str, Any]]:
+    value = data.get(key, {})
+    if not isinstance(value, dict):
+        raise ContractError(f"invalid project contract {path}: {key} must be an object")
+    mapping: dict[str, dict[str, Any]] = {}
+    for profile, request in value.items():
+        if not isinstance(profile, str) or not profile:
+            raise ContractError(f"invalid project contract {path}: {key} keys must be non-empty strings")
+        if not isinstance(request, dict):
+            raise ContractError(f"invalid project contract {path}: {key}.{profile} must be an object")
+        if "profile" in request and (not isinstance(request["profile"], str) or not request["profile"]):
+            raise ContractError(
+                f"invalid project contract {path}: {key}.{profile}.profile must be a non-empty string"
+            )
+        mapping[profile] = dict(request)
+    return mapping
 
 
 def require_positive_int(
