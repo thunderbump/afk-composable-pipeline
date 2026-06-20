@@ -130,6 +130,39 @@ normalized to `passed`, `failed`, or `request_revision`. The step refuses to
 pass before invoking the reviewer when any required final validation artifact is
 missing, skipped, failed, malformed, or otherwise not `validated`.
 
+Run a shared-branch workstream recipe and terminal PR publisher:
+
+```sh
+PYTHONPATH=src python3 -m afk run-workstream \
+  --workstream-id central-lve.9 \
+  --parent central-lve \
+  --input '{"workstream_id":"central-lve.9","review_branch":"afk/central-lve-9","steps":[{"name":"select-work","input":{"sources":[]}},{"name":"prepare-checkout","input":{"repo_url":"git@github.com:thunderbump/afk-composable-pipeline.git","base_ref":"afk/central-lve-8-final-review","checkout_root":"/work","checkout_path":"/work/afk-composable-pipeline"}},{"name":"implement","input":{"guardrails":[],"validation":{"profile":"tier1","commands":[]},"agent":{"type":"fake-pi-command","command":["python3","agent.py"]}}},{"name":"validate","profile":"tier1","input":{"validation":{"dry_run":false},"worker":{"type":"local-command","command":["python3","validate.py"]}}},{"name":"review","input":{"guardrails":[],"cleanup":{"status":"clean","resources":[]},"reviewer":{"type":"fake-reviewer-command","command":["python3","review.py"]}}}],"publisher":{"enabled":true,"mode":"create","repo":"thunderbump/afk-composable-pipeline","base":"afk/central-lve-8-final-review","head":"afk/central-lve-9","title":"central-lve.9: Workstream publisher","git":{"push":true,"remote":"origin"},"gh":{}}}' \
+  --ledger ledger
+```
+
+The recipe schema is intentionally small:
+
+- `workstream_id`, `parent`, and `review_branch` identify the workstream and
+  shared review branch. CLI `--workstream-id` and `--parent` override the recipe
+  values.
+- `steps` is an ordered list of existing step names: `select-work`,
+  `prepare-checkout`, `implement`, `validate`, and `review`. Each step has an
+  explicit `input` object, plus optional `profile` for `validate`.
+- The runner injects prior step outputs when omitted: selected work and checkout
+  into `implement`, checkout and profile into `validate`, and work item,
+  checkout, implementation, final validation artifacts, and cleanup into
+  `review`.
+- `publisher` supports `mode: "create"` with `gh pr create` or `mode: "update"`
+  with `gh pr edit`. `git.path`/`gh.path` may point at fake command shims for
+  offline tests. `git.push: true` pushes `HEAD` to the configured PR head before
+  invoking `gh`.
+
+Publication is blocked unless at least one final `validate` step produced
+`validated` evidence and the final `review` step produced `passed`. The PR body
+is generated from ledger facts: workstream identity, selected work, changed
+files, commits, validation artifact refs/statuses, review result, cleanup,
+retry status, and artifact paths.
+
 ## Ledger Artifacts
 
 Each invocation writes a new run directory:
@@ -143,6 +176,12 @@ ledger/
       stdout.log
       stderr.log
       step-result.json
+  workstreams/
+    <workstream-run-id>/
+      command.json
+      pr-body.md
+      publication-result.json
+      workstream-result.json
 ```
 
 `ledger.jsonl` is append-only within the run and records the public event stream:
@@ -163,6 +202,14 @@ validation, adapter, and worker evidence plus pointers to `worker-request.json`
 and `worker-result.json`. For `review`, it contains the normalized final review
 status plus pointers to `evidence-pack.json`, `reviewer-request.json`,
 `reviewer-result.json`, and `review-summary.md`.
+
+`run-workstream` records one workstream directory and one normal `runs/<run-id>/`
+directory for each composed step. `workstream-result.json` lists every step run,
+its ledger result path, the generated equivalent `afk run-step ...` command,
+selected work result summaries, cleanup status, retry instructions, and terminal
+PR publication status. `publication-result.json` records a blocked/skipped/
+failed/published publisher result. `pr-body.md` is written before terminal PR
+commands run, so fake/offline publisher tests can inspect the exact body.
 
 ## Development
 

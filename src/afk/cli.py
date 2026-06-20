@@ -74,6 +74,51 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
 
+    if args.command == "run-workstream":
+        from afk.workstream import WorkstreamError, run_workstream
+
+        try:
+            input_data = json.loads(args.input)
+        except json.JSONDecodeError as exc:
+            parser.error(f"--input must be valid JSON: {exc.msg}")
+
+        project_contract = None
+        if args.project:
+            try:
+                project_contract = load_project_contract(
+                    args.project,
+                    Path(args.contracts_dir),
+                    cwd=Path.cwd(),
+                )
+            except ContractError as exc:
+                parser.error(str(exc))
+
+        try:
+            result = run_workstream(
+                input_data,
+                ledger_dir=Path(args.ledger),
+                step_runner=run_step,
+                parent=args.parent,
+                workstream_id=args.workstream_id,
+                project_contract=project_contract,
+            )
+        except (UnknownStepError, WorkstreamError) as exc:
+            parser.error(str(exc))
+        print(
+            canonical_json(
+                {
+                    "command": "run-workstream",
+                    "run_id": result.run_id,
+                    "workstream_id": result.workstream_id,
+                    "parent": result.parent,
+                    "status": result.status,
+                    "publication_status": result.publication_status,
+                    "result_path": result.result_path,
+                }
+            )
+        )
+        return 0
+
     parser.print_help()
     return 1
 
@@ -89,6 +134,21 @@ def build_parser() -> argparse.ArgumentParser:
     run_step_parser.add_argument("--ledger", required=True, help="Ledger output directory")
     run_step_parser.add_argument("--project", help="Project slug for contract resolution")
     run_step_parser.add_argument(
+        "--contracts-dir",
+        default="project-contracts",
+        help="Directory containing project contract JSON files",
+    )
+
+    run_workstream_parser = subcommands.add_parser(
+        "run-workstream",
+        help="Run a declarative workstream recipe and terminal PR publisher",
+    )
+    run_workstream_parser.add_argument("--input", required=True, help="JSON workstream recipe")
+    run_workstream_parser.add_argument("--ledger", required=True, help="Ledger output directory")
+    run_workstream_parser.add_argument("--parent", help="Parent workstream or issue id")
+    run_workstream_parser.add_argument("--workstream-id", help="Workstream id")
+    run_workstream_parser.add_argument("--project", help="Project slug for contract resolution")
+    run_workstream_parser.add_argument(
         "--contracts-dir",
         default="project-contracts",
         help="Directory containing project contract JSON files",
