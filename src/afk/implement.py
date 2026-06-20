@@ -9,7 +9,14 @@ from pathlib import Path
 from typing import Any
 
 from afk.jsonutil import canonical_json
-from afk.redaction import is_secret_command_flag, is_secret_key, is_secret_value, redact_artifact_value, redact_text
+from afk.redaction import (
+    is_secret_command_flag,
+    is_secret_key,
+    is_secret_value,
+    key_components,
+    redact_artifact_value,
+    redact_text,
+)
 
 
 SCHEMA_VERSION = 1
@@ -125,6 +132,13 @@ def implement(
     after_metadata = safe_git_metadata(checkout_path, request["checkout"]["start_commit"])
     normalized = normalize_agent_payload(
         agent_payload["payload"],
+        adapter={"type": request["agent"]["type"], "returncode": adapter_result["returncode"]},
+        stdout=stdout,
+        stderr=stderr,
+    )
+    normalized = require_commit_for_implemented_result(
+        normalized,
+        after_metadata,
         adapter={"type": request["agent"]["type"], "returncode": adapter_result["returncode"]},
         stdout=stdout,
         stderr=stderr,
@@ -316,7 +330,7 @@ def normalize_agent(agent: Any, *, checkout_path: Path) -> dict[str, Any]:
         "config_home": "",
     }
     if not fake_agent:
-        env = normalize_agent_env(agent.get("env", {}))
+        env = normalize_agent_env(agent.get("env", {}), checkout_path=checkout_path)
         if env["status"] != "valid":
             return {"status": "invalid", "message": env["message"]}
         codex_home = normalize_absolute_dir(
@@ -342,7 +356,7 @@ def normalize_agent(agent: Any, *, checkout_path: Path) -> dict[str, Any]:
     }
 
 
-def normalize_agent_env(env: Any) -> dict[str, Any]:
+def normalize_agent_env(env: Any, *, checkout_path: Path) -> dict[str, Any]:
     if not isinstance(env, dict):
         return {"status": "invalid", "message": "agent.env must be an object"}
     normalized = {}
@@ -358,8 +372,29 @@ def normalize_agent_env(env: Any) -> dict[str, Any]:
             return {"status": "invalid", "message": f"agent.env.{key} must be a string"}
         if is_secret_value(value):
             return {"status": "invalid", "message": f"agent.env.{key} must not include a secret-looking value"}
+        unsafe_path = unsafe_agent_env_path(key, value, checkout_path)
+        if unsafe_path is not None:
+            return {"status": "invalid", "message": unsafe_path}
         normalized[key] = value
     return {"status": "valid", "env": normalized}
+
+
+def unsafe_agent_env_path(key: str, value: str, checkout_path: Path) -> str | None:
+    if not is_config_state_env_key(key):
+        return None
+    if "://" in value:
+        return None
+    path = Path(value)
+    if not path.is_absolute():
+        return f"agent.env.{key} must be an absolute path outside checkout"
+    if path_is_equal_to_or_inside(path, checkout_path):
+        return f"agent.env.{key} must be outside checkout"
+    return None
+
+
+def is_config_state_env_key(key: str) -> bool:
+    components = key_components(key)
+    return any(component in {"cache", "config", "home", "path", "session", "state"} for component in components)
 
 
 def normalize_absolute_dir(value: Any, field: str, *, checkout_path: Path | None = None) -> dict[str, Any]:
@@ -555,6 +590,35 @@ def normalize_agent_payload(
         summary=summary,
         notes=notes,
         failures=failures,
+        adapter=adapter,
+        stdout=stdout,
+        stderr=stderr,
+    )
+
+
+def require_commit_for_implemented_result(
+    agent_result: dict[str, Any],
+    metadata: dict[str, Any],
+    *,
+    adapter: dict[str, Any],
+    stdout: str,
+    stderr: str,
+) -> dict[str, Any]:
+    if agent_result["status"] != "implemented":
+        return agent_result
+    if adapter.get("type") != "real-agent-command":
+        return agent_result
+    if metadata.get("metadata_status") == "failed":
+        return agent_result
+    if metadata.get("before_commit") != metadata.get("after_commit") and metadata.get("commits"):
+        return agent_result
+    message = "agent reported success but produced no new commit"
+    return normalized_agent_result(
+        status="failed_protocol",
+        classification="protocol_failure",
+        summary=message,
+        notes=agent_result["notes"],
+        failures=[{"type": "protocol", "message": message}],
         adapter=adapter,
         stdout=stdout,
         stderr=stderr,

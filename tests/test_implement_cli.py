@@ -311,6 +311,70 @@ class ImplementCliTest(unittest.TestCase):
             self.assertNotIn("ambient-pi-secret", artifact_text)
             self.assertNotIn("ambient-openai-secret", artifact_text)
 
+    def test_implement_rejects_real_agent_command_success_without_new_commit(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            checkout = temp_path / "checkout"
+            start_commit = init_checkout(checkout)
+            ledger = temp_path / "ledger"
+            agent_code = textwrap.dedent(
+                """
+                import json
+                from pathlib import Path
+
+                Path("agent-result.json").write_text(
+                    json.dumps({"status": "completed", "summary": "reported success without commit"}),
+                    encoding="utf-8",
+                )
+                print("agent reported success")
+                """
+            ).strip()
+
+            completed = run_afk(
+                "run-step",
+                "implement",
+                "--input",
+                json.dumps(
+                    {
+                        "work_selection": {"schema_version": 1, "selected_work": [selected_work()]},
+                        "checkout": {
+                            "status": "prepared",
+                            "checkout_path": str(checkout),
+                            "review_branch": "afk/test-work",
+                            "requested_ref": "main",
+                            "start_commit": start_commit,
+                        },
+                        "guardrails": [],
+                        "validation": {"profile": "tier1", "commands": []},
+                        "agent": {
+                            "type": "real-agent-command",
+                            "command": [sys.executable, "-c", agent_code],
+                            "result_path": "agent-result.json",
+                        },
+                    }
+                ),
+                "--ledger",
+                str(ledger),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+            agent_result = json.loads((run_dir / "agent-result.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(result["output"]["status"], "failed_protocol")
+            self.assertEqual(result["output"]["classification"], "protocol_failure")
+            self.assertEqual(
+                result["output"]["summary"],
+                "agent reported success but produced no new commit",
+            )
+            self.assertEqual(agent_result["result"]["status"], "failed_protocol")
+            self.assertEqual(result["output"]["git"]["before_commit"], start_commit)
+            self.assertEqual(result["output"]["git"]["after_commit"], start_commit)
+            self.assertEqual(result["output"]["git"]["commits"], [])
+            self.assertIn("agent reported success", agent_result["result"]["evidence"]["stdout_excerpt"])
+
     def test_implement_rejects_real_agent_command_auth_config_paths_inside_checkout_or_relative(self):
         cases = [
             ("codex_home", "codex-cache", "agent.codex_home must be absolute"),
@@ -363,6 +427,68 @@ class ImplementCliTest(unittest.TestCase):
                                 "guardrails": [],
                                 "validation": {"profile": "tier1", "commands": []},
                                 "agent": agent,
+                            }
+                        ),
+                        "--ledger",
+                        str(ledger),
+                    )
+
+                    self.assertEqual(completed.returncode, 0, completed.stderr)
+                    summary = json.loads(completed.stdout)
+                    run_dir = ledger / "runs" / summary["run_id"]
+                    result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+
+                    self.assertEqual(result["output"]["status"], "failed_invalid_payload")
+                    self.assertEqual(result["output"]["message"], expected_message)
+                    self.assertNotIn("should not run", (run_dir / "stdout.log").read_text(encoding="utf-8"))
+
+    def test_implement_rejects_real_agent_command_checkout_internal_config_env_paths(self):
+        cases = [
+            ("PI_CONFIG_HOME", "checkout/.pi-config", "agent.env.PI_CONFIG_HOME must be outside checkout"),
+            ("PI_CACHE_DIR", "checkout/.pi-cache", "agent.env.PI_CACHE_DIR must be outside checkout"),
+            ("PI_SESSION_PATH", "checkout/session.json", "agent.env.PI_SESSION_PATH must be outside checkout"),
+            ("PI_CONFIG_HOME", "relative/.pi-config", "agent.env.PI_CONFIG_HOME must be an absolute path outside checkout"),
+        ]
+        for key, path_kind, expected_message in cases:
+            with self.subTest(key=key, path_kind=path_kind):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    temp_path = Path(temp_dir)
+                    checkout = temp_path / "checkout"
+                    start_commit = init_checkout(checkout)
+                    ledger = temp_path / "ledger"
+                    checkout_config = checkout / ".pi-config"
+                    checkout_cache = checkout / ".pi-cache"
+                    checkout_config.mkdir()
+                    checkout_cache.mkdir()
+                    path_value = {
+                        "checkout/.pi-config": str(checkout_config),
+                        "checkout/.pi-cache": str(checkout_cache),
+                        "checkout/session.json": str(checkout / "session.json"),
+                        "relative/.pi-config": ".pi-config",
+                    }[path_kind]
+
+                    completed = run_afk(
+                        "run-step",
+                        "implement",
+                        "--input",
+                        json.dumps(
+                            {
+                                "work_selection": {"schema_version": 1, "selected_work": [selected_work()]},
+                                "checkout": {
+                                    "status": "prepared",
+                                    "checkout_path": str(checkout),
+                                    "review_branch": "afk/test-work",
+                                    "requested_ref": "main",
+                                    "start_commit": start_commit,
+                                },
+                                "guardrails": [],
+                                "validation": {"profile": "tier1", "commands": []},
+                                "agent": {
+                                    "type": "real-agent-command",
+                                    "command": [sys.executable, "-c", "print('should not run')"],
+                                    "result_path": "agent-result.json",
+                                    "env": {key: path_value},
+                                },
                             }
                         ),
                         "--ledger",
@@ -498,12 +624,16 @@ class ImplementCliTest(unittest.TestCase):
                 f"""
                 import json
                 import os
+                import subprocess
                 from pathlib import Path
 
                 Path({str(observation_path)!r}).write_text(
                     json.dumps({{"service_url": os.environ.get("SERVICE_URL")}}),
                     encoding="utf-8",
                 )
+                Path("safe-url-env.txt").write_text(os.environ.get("SERVICE_URL", "") + "\\n", encoding="utf-8")
+                subprocess.run(["git", "add", "safe-url-env.txt"], check=True)
+                subprocess.run(["git", "commit", "-m", "safe url env accepted"], check=True)
                 Path("agent-result.json").write_text(
                     json.dumps({{"status": "completed", "summary": "safe url env accepted"}}),
                     encoding="utf-8",
@@ -546,6 +676,7 @@ class ImplementCliTest(unittest.TestCase):
 
             self.assertEqual(result["output"]["status"], "implemented")
             self.assertEqual(result["output"]["summary"], "safe url env accepted")
+            self.assertEqual(result["output"]["git"]["changed_files"], ["safe-url-env.txt"])
             observation = json.loads(observation_path.read_text(encoding="utf-8"))
             self.assertEqual(observation["service_url"], service_url)
 
