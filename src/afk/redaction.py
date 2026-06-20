@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from typing import Any
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
 URL_PATTERN = re.compile(r"(?P<url>[A-Za-z][A-Za-z0-9+.-]*://[^\s\"'<>]+)")
 TRAILING_URL_PUNCTUATION = ".,;:)]}"
@@ -104,7 +104,13 @@ def is_secret_key(value: str) -> bool:
 
 
 def is_secret_value(value: str) -> bool:
-    return redact_text(value) != value
+    if SECRET_TOKEN_VALUE_PATTERN.search(value):
+        return True
+    if any(is_secret_key(match.group("key")) for match in JSON_SECRET_STRING_PATTERN.finditer(value)):
+        return True
+    if any(is_secret_key(match.group("key")) for match in SECRET_ASSIGNMENT_PATTERN.finditer(value)):
+        return True
+    return any(url_has_secret_value(match.group("url")) for match in URL_PATTERN.finditer(value))
 
 
 def key_components(value: str) -> list[str]:
@@ -140,6 +146,17 @@ def redact_url_match(match: re.Match[str]) -> str:
         suffix = raw_url[-1] + suffix
         raw_url = raw_url[:-1]
     return redact_url(raw_url) + suffix
+
+
+def url_has_secret_value(value: str) -> bool:
+    while value and value[-1] in TRAILING_URL_PUNCTUATION:
+        value = value[:-1]
+    parsed = urlsplit(value)
+    if parsed.username or parsed.password:
+        return True
+    query_keys = [key for key, _ in parse_qsl(parsed.query, keep_blank_values=True)]
+    fragment_keys = [key for key, _ in parse_qsl(parsed.fragment, keep_blank_values=True)]
+    return any(is_secret_key(key) for key in [*query_keys, *fragment_keys])
 
 
 def redact_url(value: str) -> str:

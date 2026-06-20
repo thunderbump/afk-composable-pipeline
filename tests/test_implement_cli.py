@@ -486,6 +486,69 @@ class ImplementCliTest(unittest.TestCase):
             self.assertNotIn(secret, artifact_text)
             self.assertNotIn("should not run", (run_dir / "stdout.log").read_text(encoding="utf-8"))
 
+    def test_implement_allows_real_agent_command_safe_url_env_value_with_query(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            checkout = temp_path / "checkout"
+            start_commit = init_checkout(checkout)
+            ledger = temp_path / "ledger"
+            service_url = "https://example.invalid/api?mode=test"
+            observation_path = temp_path / "agent-observation.json"
+            agent_code = textwrap.dedent(
+                f"""
+                import json
+                import os
+                from pathlib import Path
+
+                Path({str(observation_path)!r}).write_text(
+                    json.dumps({{"service_url": os.environ.get("SERVICE_URL")}}),
+                    encoding="utf-8",
+                )
+                Path("agent-result.json").write_text(
+                    json.dumps({{"status": "completed", "summary": "safe url env accepted"}}),
+                    encoding="utf-8",
+                )
+                """
+            ).strip()
+
+            completed = run_afk(
+                "run-step",
+                "implement",
+                "--input",
+                json.dumps(
+                    {
+                        "work_selection": {"schema_version": 1, "selected_work": [selected_work()]},
+                        "checkout": {
+                            "status": "prepared",
+                            "checkout_path": str(checkout),
+                            "review_branch": "afk/test-work",
+                            "requested_ref": "main",
+                            "start_commit": start_commit,
+                        },
+                        "guardrails": [],
+                        "validation": {"profile": "tier1", "commands": []},
+                        "agent": {
+                            "type": "real-agent-command",
+                            "command": [sys.executable, "-c", agent_code],
+                            "result_path": "agent-result.json",
+                            "env": {"SERVICE_URL": service_url},
+                        },
+                    }
+                ),
+                "--ledger",
+                str(ledger),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(result["output"]["status"], "implemented")
+            self.assertEqual(result["output"]["summary"], "safe url env accepted")
+            observation = json.loads(observation_path.read_text(encoding="utf-8"))
+            self.assertEqual(observation["service_url"], service_url)
+
     def test_implement_classifies_adapter_nonzero_as_runtime_failure_with_redacted_evidence(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
