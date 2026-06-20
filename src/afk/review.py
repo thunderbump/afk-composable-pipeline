@@ -305,14 +305,16 @@ def normalize_validation(validation: Any) -> dict[str, Any]:
         name = string_field(artifact, "name") or f"validation-{index + 1}"
         step_result_path = string_field(artifact, "step_result_path")
         worker_result_path = string_field(artifact, "worker_result_path")
-        if not step_result_path:
-            return {"status": "invalid", "message": "validation artifact step_result_path is required"}
-        step_path = Path(step_result_path)
+        step_path = Path(step_result_path) if step_result_path else None
         worker_path = Path(worker_result_path) if worker_result_path else None
-        step_path_errors = validation_artifact_path_errors(step_path, "step-result.json")
+        step_path_errors = (
+            ["step-result.json path is required"]
+            if step_path is None
+            else validation_artifact_path_errors(step_path, "step-result.json")
+        )
         worker_path_errors = ["worker-result.json path is required"] if worker_path is None else []
         pair_path_errors = []
-        if worker_path is not None:
+        if step_path is not None and worker_path is not None:
             worker_path_errors = validation_artifact_path_errors(worker_path, "worker-result.json")
             pair_path_errors = validation_artifact_pair_path_errors(step_path, worker_path)
         path_errors = step_path_errors + worker_path_errors + pair_path_errors
@@ -343,7 +345,7 @@ def normalize_validation(validation: Any) -> dict[str, Any]:
             redact_artifact_value(
                 {
                     "name": name,
-                    "step_result_path": step_result_path,
+                    "step_result_path": step_result_path or "",
                     "worker_result_path": worker_result_path or "",
                     "evidence_status": "invalid" if evidence_errors else "valid",
                     "evidence_errors": evidence_errors,

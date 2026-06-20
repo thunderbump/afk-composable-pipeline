@@ -428,6 +428,83 @@ class ReviewCliTest(unittest.TestCase):
                 self.assertIn("tier1", review_summary)
                 self.assertNotIn("reviewer should not run", (run_dir / "stdout.log").read_text(encoding="utf-8"))
 
+    def test_review_refuses_missing_required_validation_artifact_paths_as_validation_evidence(self):
+        cases = [
+            (
+                "step_result_path",
+                "step-result.json path is required",
+                "step_result",
+                "step_result_path",
+            ),
+            (
+                "worker_result_path",
+                "worker-result.json path is required",
+                "worker_result",
+                "worker_result_path",
+            ),
+        ]
+        for missing_path, expected_error, result_key, path_key in cases:
+            with self.subTest(missing_path=missing_path), tempfile.TemporaryDirectory() as temp_dir:
+                temp_path = Path(temp_dir)
+                checkout = temp_path / "checkout"
+                start_commit = init_checkout(checkout)
+                head_commit = git(checkout, "rev-parse", "HEAD")
+                validation_step, validation_worker = write_validation_artifacts(temp_path / "validation-run")
+                ledger = temp_path / "ledger"
+                reviewer_code = textwrap.dedent(
+                    """
+                    import json
+                    import os
+                    from pathlib import Path
+
+                    Path(os.environ["AFK_REVIEWER_RESULT"]).write_text(
+                        json.dumps({"status": "pass", "summary": "reviewer should not decide"}),
+                        encoding="utf-8",
+                    )
+                    print("reviewer should not run")
+                    """
+                ).strip()
+                request = review_input(
+                    checkout=checkout,
+                    start_commit=start_commit,
+                    head_commit=head_commit,
+                    validation_step=validation_step,
+                    validation_worker=validation_worker,
+                    reviewer_code=reviewer_code,
+                )
+                del request["validation"]["required_artifacts"][0][missing_path]
+
+                completed = run_afk(
+                    "run-step",
+                    "review",
+                    "--input",
+                    json.dumps(request),
+                    "--ledger",
+                    str(ledger),
+                )
+
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                summary = json.loads(completed.stdout)
+                run_dir = ledger / "runs" / summary["run_id"]
+                result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+                reviewer_result = json.loads((run_dir / "reviewer-result.json").read_text(encoding="utf-8"))
+                evidence_pack = json.loads((run_dir / "evidence-pack.json").read_text(encoding="utf-8"))
+                required = evidence_pack["evidence_pack"]["validation"]["required"][0]
+                finding = reviewer_result["result"]["findings"][0]
+
+                self.assertEqual(result["output"]["status"], "failed_validation_evidence")
+                self.assertEqual(result["output"]["classification"], "validation_evidence_incomplete")
+                self.assertEqual(reviewer_result["artifact_type"], "reviewer-result")
+                self.assertEqual(reviewer_result["result"]["status"], "failed_validation_evidence")
+                self.assertEqual(reviewer_result["result"]["classification"], "validation_evidence_incomplete")
+                self.assertEqual(required["evidence_status"], "invalid")
+                self.assertEqual(required[path_key], "")
+                self.assertEqual(required[result_key]["status"], "invalid_path")
+                self.assertIn(expected_error, required["evidence_errors"])
+                self.assertIn(expected_error, finding["summary"])
+                self.assertEqual(finding["validation"]["name"], "tier1")
+                self.assertNotIn("reviewer should not run", (run_dir / "stdout.log").read_text(encoding="utf-8"))
+
     def test_review_refuses_pass_when_required_worker_result_artifact_is_missing(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
