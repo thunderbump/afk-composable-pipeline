@@ -307,16 +307,33 @@ def normalize_validation(validation: Any) -> dict[str, Any]:
         worker_result_path = string_field(artifact, "worker_result_path")
         if not step_result_path:
             return {"status": "invalid", "message": "validation artifact step_result_path is required"}
-        step_result = read_json_artifact(Path(step_result_path))
-        worker_result = read_json_artifact(Path(worker_result_path)) if worker_result_path else {"status": "missing"}
+        step_path = Path(step_result_path)
+        worker_path = Path(worker_result_path) if worker_result_path else None
+        path_errors = validation_artifact_path_errors(step_path, "step-result.json")
+        if worker_path is not None:
+            path_errors.extend(validation_artifact_path_errors(worker_path, "worker-result.json"))
+            path_errors.extend(validation_artifact_pair_path_errors(step_path, worker_path))
+        step_result = read_validation_artifact(step_path, "step-result.json")
+        worker_result = (
+            read_validation_artifact(worker_path, "worker-result.json")
+            if worker_path is not None
+            else {"status": "missing"}
+        )
         output = step_result.get("output") if isinstance(step_result.get("output"), dict) else {}
         worker_normalized = worker_validation_result(worker_result)
+        evidence_errors = path_errors + validation_evidence_errors(
+            step_result,
+            worker_result,
+            worker_result_path=worker_result_path,
+        )
         normalized.append(
             redact_artifact_value(
                 {
                     "name": name,
                     "step_result_path": step_result_path,
                     "worker_result_path": worker_result_path or "",
+                    "evidence_status": "invalid" if evidence_errors else "valid",
+                    "evidence_errors": evidence_errors,
                     "status": string_field(output, "status") or "missing",
                     "classification": string_field(output, "classification") or "",
                     "summary": string_field(output, "summary") or "",
@@ -329,6 +346,89 @@ def normalize_validation(validation: Any) -> dict[str, Any]:
             )
         )
     return {"status": "valid", "validation": {"required": normalized}}
+
+
+def read_validation_artifact(path: Path, expected_filename: str) -> dict[str, Any]:
+    errors = validation_artifact_path_errors(path, expected_filename)
+    if errors:
+        return {
+            "status": "invalid_path",
+            "path": str(path),
+            "message": "; ".join(errors),
+        }
+    return read_json_artifact(path)
+
+
+def validation_artifact_path_errors(path: Path, expected_filename: str) -> list[str]:
+    errors = []
+    if not path.is_absolute():
+        errors.append(f"{expected_filename} path must be absolute")
+    if ".." in path.parts:
+        errors.append(f"{expected_filename} path must not contain traversal")
+    if path.name != expected_filename:
+        errors.append(f"validation artifact filename must be {expected_filename}")
+    try:
+        for item in (path, *path.parents):
+            if item.exists() and item.is_symlink():
+                errors.append(f"{expected_filename} path must not use symlinks")
+                break
+        if not path.is_file():
+            errors.append(f"{expected_filename} path must be a regular JSON file")
+    except OSError:
+        errors.append(f"{expected_filename} path could not be inspected")
+    return errors
+
+
+def validation_artifact_pair_path_errors(step_path: Path, worker_path: Path) -> list[str]:
+    if not step_path.is_absolute() or not worker_path.is_absolute():
+        return []
+    if step_path.parent == worker_path.parent:
+        return []
+    if step_path.parent.parent == worker_path.parent.parent:
+        return []
+    return ["validation artifacts must be in the same or sibling ledger run directory"]
+
+
+def validation_evidence_errors(
+    step_result: dict[str, Any],
+    worker_result: dict[str, Any],
+    *,
+    worker_result_path: str | None,
+) -> list[str]:
+    errors = []
+    output = step_result.get("output") if isinstance(step_result.get("output"), dict) else None
+    if step_result.get("step") != "validate":
+        errors.append("step_result step must be validate")
+    if step_result.get("status") != "succeeded":
+        errors.append("step_result status must be succeeded")
+    if output is None:
+        errors.append("step_result output must be an object")
+    else:
+        if output.get("status") != "validated":
+            errors.append("step_result output status must be validated")
+        if worker_result_path:
+            artifacts = output.get("artifacts") if isinstance(output.get("artifacts"), dict) else {}
+            if artifacts.get("worker_result") != Path(worker_result_path).name:
+                errors.append("step_result output artifacts must reference worker_result")
+
+    worker_normalized = {}
+    worker_result_result = worker_result.get("result") if isinstance(worker_result.get("result"), dict) else {}
+    if isinstance(worker_result_result.get("normalized"), dict):
+        worker_normalized = worker_result_result["normalized"]
+    if worker_result.get("step") != "validate":
+        errors.append("worker_result step must be validate")
+    if worker_result.get("artifact_type") != "worker-result":
+        errors.append("worker_result artifact_type must be worker-result")
+    if not worker_normalized:
+        errors.append("worker_result result.normalized must be an object")
+    elif worker_normalized.get("status") != "validated":
+        errors.append("worker_result normalized status must be validated")
+
+    step_run_id = string_field(step_result, "run_id")
+    worker_run_id = string_field(worker_result, "run_id")
+    if step_run_id and worker_run_id and step_run_id != worker_run_id:
+        errors.append("step_result and worker_result run_id must match")
+    return errors
 
 
 def worker_validation_result(worker_result: dict[str, Any]) -> dict[str, str]:
@@ -459,8 +559,12 @@ def required_validation_failures(evidence_pack: dict[str, Any]) -> list[dict[str
         status = string_field(item, "status") or "missing"
         name = string_field(item, "name") or "validation"
         worker_status = string_field(item, "worker_status") or "missing"
-        if status != "validated" or worker_status != "validated":
-            failure_summary = string_field(item, "summary") or f"{name} status is {status}"
+        evidence_status = string_field(item, "evidence_status") or "invalid"
+        if status != "validated" or worker_status != "validated" or evidence_status != "valid":
+            evidence_errors = item.get("evidence_errors") if isinstance(item.get("evidence_errors"), list) else []
+            failure_summary = "; ".join(str(error) for error in evidence_errors if isinstance(error, str))
+            if not failure_summary:
+                failure_summary = string_field(item, "summary") or f"{name} status is {status}"
             if status == "validated" and worker_status != "validated":
                 failure_summary = (
                     string_field(item, "worker_summary")
@@ -475,6 +579,8 @@ def required_validation_failures(evidence_pack: dict[str, Any]) -> list[dict[str
                         "name": name,
                         "status": status,
                         "classification": string_field(item, "classification") or "",
+                        "evidence_status": evidence_status,
+                        "evidence_errors": evidence_errors,
                         "worker_status": worker_status,
                         "worker_classification": string_field(item, "worker_classification") or "",
                         "step_result_path": string_field(item, "step_result_path") or "",
@@ -499,8 +605,11 @@ def validation_gate_summary(validation_failures: list[dict[str, Any]]) -> str:
         validation = failure.get("validation") if isinstance(failure.get("validation"), dict) else {}
         name = string_field(validation, "name")
         status = string_field(validation, "status")
+        evidence_status = string_field(validation, "evidence_status")
         worker_status = string_field(validation, "worker_status")
-        if name and status and worker_status and status == "validated" and worker_status != "validated":
+        if name and evidence_status and evidence_status != "valid":
+            names.append(f"{name} ({evidence_status} evidence)")
+        elif name and status and worker_status and status == "validated" and worker_status != "validated":
             names.append(f"{name} (worker {worker_status})")
         elif name and status:
             names.append(f"{name} ({status})")

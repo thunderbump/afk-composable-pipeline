@@ -85,6 +85,21 @@ class RedactionTest(unittest.TestCase):
             ],
         )
 
+    def test_redacts_json_shaped_secret_key_values_in_text(self):
+        text = (
+            'stdout {"token":"token-secret","api_key": "api-key-secret", '
+            '"password" : "password-secret"}'
+        )
+
+        redacted = redact_text(text)
+
+        self.assertNotIn("token-secret", redacted)
+        self.assertNotIn("api-key-secret", redacted)
+        self.assertNotIn("password-secret", redacted)
+        self.assertIn('"token":"[REDACTED]"', redacted)
+        self.assertIn('"api_key": "[REDACTED]"', redacted)
+        self.assertIn('"password" : "[REDACTED]"', redacted)
+
     def test_does_not_redact_safe_command_flags_that_contain_secret_words(self):
         payload = {
             "agent": {

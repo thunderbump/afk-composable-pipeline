@@ -485,6 +485,131 @@ class ReviewCliTest(unittest.TestCase):
             )
             self.assertNotIn("reviewer should not run", (run_dir / "stdout.log").read_text(encoding="utf-8"))
 
+    def test_review_refuses_forged_validation_artifacts_with_validated_nested_statuses(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            checkout = temp_path / "checkout"
+            start_commit = init_checkout(checkout)
+            head_commit = git(checkout, "rev-parse", "HEAD")
+            validation_step, validation_worker = write_validation_artifacts(temp_path / "validation-run")
+            step_payload = json.loads(validation_step.read_text(encoding="utf-8"))
+            step_payload["step"] = "review"
+            step_payload["status"] = "failed"
+            validation_step.write_text(json.dumps(step_payload), encoding="utf-8")
+            worker_payload = json.loads(validation_worker.read_text(encoding="utf-8"))
+            worker_payload["run_id"] = "forged-worker-run"
+            validation_worker.write_text(json.dumps(worker_payload), encoding="utf-8")
+            ledger = temp_path / "ledger"
+            reviewer_code = textwrap.dedent(
+                """
+                import json
+                import os
+                from pathlib import Path
+
+                Path(os.environ["AFK_REVIEWER_RESULT"]).write_text(
+                    json.dumps({"status": "pass", "summary": "reviewer should not decide"}),
+                    encoding="utf-8",
+                )
+                print("reviewer should not run")
+                """
+            ).strip()
+
+            completed = run_afk(
+                "run-step",
+                "review",
+                "--input",
+                json.dumps(
+                    review_input(
+                        checkout=checkout,
+                        start_commit=start_commit,
+                        head_commit=head_commit,
+                        validation_step=validation_step,
+                        validation_worker=validation_worker,
+                        reviewer_code=reviewer_code,
+                    )
+                ),
+                "--ledger",
+                str(ledger),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+            reviewer_result = json.loads((run_dir / "reviewer-result.json").read_text(encoding="utf-8"))
+            evidence_pack = json.loads((run_dir / "evidence-pack.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(result["output"]["status"], "failed_validation_evidence")
+            self.assertEqual(reviewer_result["result"]["status"], "failed_validation_evidence")
+            self.assertIn("tier1", reviewer_result["result"]["summary"])
+            self.assertEqual(evidence_pack["evidence_pack"]["validation"]["required"][0]["status"], "validated")
+            self.assertEqual(
+                evidence_pack["evidence_pack"]["validation"]["required"][0]["evidence_status"],
+                "invalid",
+            )
+            self.assertNotIn("reviewer should not run", (run_dir / "stdout.log").read_text(encoding="utf-8"))
+
+    def test_review_rejects_arbitrary_validation_artifact_filenames_without_reading_them(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            checkout = temp_path / "checkout"
+            start_commit = init_checkout(checkout)
+            head_commit = git(checkout, "rev-parse", "HEAD")
+            validation_step, validation_worker = write_validation_artifacts(temp_path / "validation-run")
+            arbitrary_artifact = temp_path / "secrets.json"
+            step_payload = json.loads(validation_step.read_text(encoding="utf-8"))
+            step_payload["leak"] = "arbitrary-json-secret"
+            arbitrary_artifact.write_text(json.dumps(step_payload), encoding="utf-8")
+            ledger = temp_path / "ledger"
+            reviewer_code = textwrap.dedent(
+                """
+                import json
+                import os
+                from pathlib import Path
+
+                Path(os.environ["AFK_REVIEWER_RESULT"]).write_text(
+                    json.dumps({"status": "pass", "summary": "reviewer should not decide"}),
+                    encoding="utf-8",
+                )
+                print("reviewer should not run")
+                """
+            ).strip()
+
+            completed = run_afk(
+                "run-step",
+                "review",
+                "--input",
+                json.dumps(
+                    review_input(
+                        checkout=checkout,
+                        start_commit=start_commit,
+                        head_commit=head_commit,
+                        validation_step=arbitrary_artifact,
+                        validation_worker=validation_worker,
+                        reviewer_code=reviewer_code,
+                    )
+                ),
+                "--ledger",
+                str(ledger),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+            reviewer_result = json.loads((run_dir / "reviewer-result.json").read_text(encoding="utf-8"))
+            evidence_pack = json.loads((run_dir / "evidence-pack.json").read_text(encoding="utf-8"))
+            artifact_text = run_dir_text(run_dir)
+
+            self.assertEqual(result["output"]["status"], "failed_validation_evidence")
+            self.assertEqual(reviewer_result["result"]["status"], "failed_validation_evidence")
+            self.assertEqual(
+                evidence_pack["evidence_pack"]["validation"]["required"][0]["step_result"]["status"],
+                "invalid_path",
+            )
+            self.assertNotIn("arbitrary-json-secret", artifact_text)
+            self.assertNotIn("reviewer should not run", (run_dir / "stdout.log").read_text(encoding="utf-8"))
+
     def test_review_records_reviewer_fail_and_request_revision_statuses(self):
         cases = [
             ("fail", "failed", "review_failure"),
@@ -582,8 +707,13 @@ class ReviewCliTest(unittest.TestCase):
 
                 saw_secret = "REVIEW_TOKEN" in os.environ or "GITHUB_TOKEN" in os.environ
                 raw_secret = "raw-reviewer-" + "secret"
+                json_stdout_secret = "json-stdout-" + "secret"
+                json_stderr_secret = "json-stderr-" + "secret"
+                json_api_secret = "json-api-" + "secret"
                 print("REVIEW_TOKEN=" + os.environ.get("REVIEW_TOKEN", "missing"))
+                print(json.dumps({"token": json_stdout_secret, "api_key": json_api_secret}))
                 print("GITHUB_TOKEN=" + os.environ.get("GITHUB_TOKEN", "missing"), file=sys.stderr)
+                print(json.dumps({"password": json_stderr_secret}), file=sys.stderr)
                 Path(os.environ["AFK_REVIEWER_RESULT"]).write_text(
                     json.dumps(
                         {
@@ -647,6 +777,8 @@ class ReviewCliTest(unittest.TestCase):
             result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
             evidence_pack = json.loads((run_dir / "evidence-pack.json").read_text(encoding="utf-8"))
             reviewer_result = json.loads((run_dir / "reviewer-result.json").read_text(encoding="utf-8"))
+            stdout_log = (run_dir / "stdout.log").read_text(encoding="utf-8")
+            stderr_log = (run_dir / "stderr.log").read_text(encoding="utf-8")
             artifact_text = run_dir_text(run_dir)
 
             self.assertEqual(result["output"]["status"], "passed")
@@ -658,6 +790,11 @@ class ReviewCliTest(unittest.TestCase):
             self.assertEqual(reviewer_result["result"]["summary"], "API_TOKEN=[REDACTED]")
             self.assertEqual(reviewer_result["result"]["findings"][0]["details"], "PASSWORD=[REDACTED]")
             self.assertIn("REVIEW_TOKEN=[REDACTED]", artifact_text)
+            self.assertIn('"token": "[REDACTED]"', stdout_log)
+            self.assertIn('"api_key": "[REDACTED]"', stdout_log)
+            self.assertIn('"password": "[REDACTED]"', stderr_log)
+            self.assertIn('"token": "[REDACTED]"', reviewer_result["result"]["evidence"]["stdout_excerpt"])
+            self.assertIn('"password": "[REDACTED]"', reviewer_result["result"]["evidence"]["stderr_excerpt"])
             self.assertIn("GITHUB_TOKEN=[REDACTED]", artifact_text)
             self.assertNotIn(validation_secret, artifact_text)
             self.assertNotIn("work-item-token-secret", artifact_text)
@@ -665,6 +802,9 @@ class ReviewCliTest(unittest.TestCase):
             self.assertNotIn("cleanup-password-secret", artifact_text)
             self.assertNotIn("raw-reviewer-secret", artifact_text)
             self.assertNotIn(ambient_secret, artifact_text)
+            self.assertNotIn("json-stdout-secret", artifact_text)
+            self.assertNotIn("json-stderr-secret", artifact_text)
+            self.assertNotIn("json-api-secret", artifact_text)
 
 
 if __name__ == "__main__":
