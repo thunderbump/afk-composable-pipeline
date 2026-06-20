@@ -196,6 +196,559 @@ class ImplementCliTest(unittest.TestCase):
             self.assertEqual(events[2]["artifacts"]["job_capsule"], "job-capsule.json")
             self.assertEqual(events[2]["artifacts"]["agent_result"], "agent-result.json")
 
+    def test_implement_runs_real_agent_command_with_explicit_auth_config_and_normalizes_success(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            checkout = temp_path / "checkout"
+            start_commit = init_checkout(checkout)
+            ledger = temp_path / "ledger"
+            codex_home = temp_path / "codex-home"
+            pi_config_home = temp_path / "pi-config"
+            config_home = temp_path / "xdg-config-explicit"
+            codex_home.mkdir()
+            pi_config_home.mkdir()
+            config_home.mkdir()
+            agent_observation = temp_path / "agent-observation.json"
+            agent_code = textwrap.dedent(
+                f"""
+                import json
+                import os
+                import subprocess
+                from pathlib import Path
+
+                capsule = json.loads(Path(os.environ["AFK_JOB_CAPSULE"]).read_text(encoding="utf-8"))
+                result_path = Path(os.environ["AFK_AGENT_RESULT_PATH"])
+                observation = {{
+                    "cwd": os.getcwd(),
+                    "capsule_external_id": capsule["work_item"]["external_id"],
+                    "codex_home": os.environ.get("CODEX_HOME"),
+                    "pi_config_home": os.environ.get("PI_CONFIG_HOME"),
+                    "home": os.environ.get("HOME"),
+                    "xdg_config_home": os.environ.get("XDG_CONFIG_HOME"),
+                    "home_exists": Path(os.environ["HOME"]).is_dir(),
+                    "xdg_config_home_exists": Path(os.environ["XDG_CONFIG_HOME"]).is_dir(),
+                    "ambient_pi_token": os.environ.get("PI_TOKEN", "missing"),
+                    "ambient_openai_key": os.environ.get("OPENAI_API_KEY", "missing"),
+                }}
+                Path({str(agent_observation)!r}).write_text(json.dumps(observation), encoding="utf-8")
+                Path("implemented.txt").write_text("real adapter smoke\\n", encoding="utf-8")
+                subprocess.run(["git", "add", "implemented.txt"], check=True)
+                subprocess.run(["git", "commit", "-m", "real adapter smoke"], check=True)
+                result_path.write_text(
+                    json.dumps({{"status": "completed", "summary": "real adapter smoke implemented"}}),
+                    encoding="utf-8",
+                )
+                """
+            ).strip()
+
+            completed = run_afk(
+                "run-step",
+                "implement",
+                "--input",
+                json.dumps(
+                    {
+                        "work_selection": {"schema_version": 1, "selected_work": [selected_work()]},
+                        "checkout": {
+                            "status": "prepared",
+                            "checkout_path": str(checkout),
+                            "review_branch": "afk/test-work",
+                            "requested_ref": "main",
+                            "start_commit": start_commit,
+                        },
+                        "guardrails": ["stay within checkout"],
+                        "validation": {"profile": "tier1", "commands": []},
+                        "agent": {
+                            "type": "real-agent-command",
+                            "command": [sys.executable, "-c", agent_code],
+                            "result_path": "agent-result.json",
+                            "timeout_seconds": 10,
+                            "codex_home": str(codex_home),
+                            "config_home": str(config_home),
+                            "env": {"PI_CONFIG_HOME": str(pi_config_home)},
+                        },
+                    }
+                ),
+                "--ledger",
+                str(ledger),
+                env_overrides={
+                    "PI_TOKEN": "ambient-pi-secret",
+                    "OPENAI_API_KEY": "ambient-openai-secret",
+                    "GIT_AUTHOR_NAME": "AFK Test",
+                    "GIT_AUTHOR_EMAIL": "afk-test@example.test",
+                    "GIT_COMMITTER_NAME": "AFK Test",
+                    "GIT_COMMITTER_EMAIL": "afk-test@example.test",
+                },
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+            agent_result = json.loads((run_dir / "agent-result.json").read_text(encoding="utf-8"))
+            observation = json.loads(agent_observation.read_text(encoding="utf-8"))
+            artifact_text = "\n".join(
+                path.read_text(encoding="utf-8")
+                for path in run_dir.iterdir()
+                if path.is_file()
+            )
+
+            self.assertEqual(result["output"]["status"], "implemented")
+            self.assertEqual(result["output"]["classification"], "success")
+            self.assertEqual(result["output"]["summary"], "real adapter smoke implemented")
+            self.assertEqual(agent_result["result"]["adapter"]["type"], "real-agent-command")
+            self.assertEqual(result["output"]["git"]["changed_files"], ["implemented.txt"])
+            self.assertEqual(result["output"]["git"]["dirty"], False)
+            self.assertEqual(observation["cwd"], str(checkout))
+            self.assertEqual(observation["capsule_external_id"], "central-lve.5")
+            self.assertEqual(observation["codex_home"], str(codex_home))
+            self.assertEqual(observation["pi_config_home"], str(pi_config_home))
+            self.assertEqual(observation["xdg_config_home"], str(config_home))
+            self.assertTrue(observation["home_exists"])
+            self.assertTrue(observation["xdg_config_home_exists"])
+            self.assertNotEqual(observation["home"], os.environ.get("HOME"))
+            self.assertEqual(observation["ambient_pi_token"], "missing")
+            self.assertEqual(observation["ambient_openai_key"], "missing")
+            self.assertNotIn("ambient-pi-secret", artifact_text)
+            self.assertNotIn("ambient-openai-secret", artifact_text)
+
+    def test_implement_rejects_real_agent_command_success_without_new_commit(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            checkout = temp_path / "checkout"
+            start_commit = init_checkout(checkout)
+            ledger = temp_path / "ledger"
+            agent_code = textwrap.dedent(
+                """
+                import json
+                from pathlib import Path
+
+                Path("agent-result.json").write_text(
+                    json.dumps({"status": "completed", "summary": "reported success without commit"}),
+                    encoding="utf-8",
+                )
+                print("agent reported success")
+                """
+            ).strip()
+
+            completed = run_afk(
+                "run-step",
+                "implement",
+                "--input",
+                json.dumps(
+                    {
+                        "work_selection": {"schema_version": 1, "selected_work": [selected_work()]},
+                        "checkout": {
+                            "status": "prepared",
+                            "checkout_path": str(checkout),
+                            "review_branch": "afk/test-work",
+                            "requested_ref": "main",
+                            "start_commit": start_commit,
+                        },
+                        "guardrails": [],
+                        "validation": {"profile": "tier1", "commands": []},
+                        "agent": {
+                            "type": "real-agent-command",
+                            "command": [sys.executable, "-c", agent_code],
+                            "result_path": "agent-result.json",
+                        },
+                    }
+                ),
+                "--ledger",
+                str(ledger),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+            agent_result = json.loads((run_dir / "agent-result.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(result["output"]["status"], "failed_protocol")
+            self.assertEqual(result["output"]["classification"], "protocol_failure")
+            self.assertEqual(
+                result["output"]["summary"],
+                "agent reported success but produced no new commit",
+            )
+            self.assertEqual(agent_result["result"]["status"], "failed_protocol")
+            self.assertEqual(result["output"]["git"]["before_commit"], start_commit)
+            self.assertEqual(result["output"]["git"]["after_commit"], start_commit)
+            self.assertEqual(result["output"]["git"]["commits"], [])
+            self.assertIn("agent reported success", agent_result["result"]["evidence"]["stdout_excerpt"])
+
+    def test_implement_rejects_real_agent_command_success_when_post_run_git_metadata_fails(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            checkout = temp_path / "checkout"
+            start_commit = init_checkout(checkout)
+            ledger = temp_path / "ledger"
+            agent_code = textwrap.dedent(
+                """
+                import json
+                from pathlib import Path
+
+                Path("agent-result.json").write_text(
+                    json.dumps({"status": "completed", "summary": "reported success before metadata failed"}),
+                    encoding="utf-8",
+                )
+                Path(".git").rename(".git-broken")
+                print("agent reported success before metadata failed")
+                """
+            ).strip()
+
+            completed = run_afk(
+                "run-step",
+                "implement",
+                "--input",
+                json.dumps(
+                    {
+                        "work_selection": {"schema_version": 1, "selected_work": [selected_work()]},
+                        "checkout": {
+                            "status": "prepared",
+                            "checkout_path": str(checkout),
+                            "review_branch": "afk/test-work",
+                            "requested_ref": "main",
+                            "start_commit": start_commit,
+                        },
+                        "guardrails": [],
+                        "validation": {"profile": "tier1", "commands": []},
+                        "agent": {
+                            "type": "real-agent-command",
+                            "command": [sys.executable, "-c", agent_code],
+                            "result_path": "agent-result.json",
+                        },
+                    }
+                ),
+                "--ledger",
+                str(ledger),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+            agent_result = json.loads((run_dir / "agent-result.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(result["output"]["status"], "failed_protocol")
+            self.assertEqual(result["output"]["classification"], "protocol_failure")
+            self.assertEqual(
+                result["output"]["summary"],
+                "agent reported success but post-run git metadata could not be verified",
+            )
+            self.assertEqual(agent_result["result"]["status"], "failed_protocol")
+            self.assertEqual(result["output"]["git"]["metadata_status"], "failed")
+            self.assertEqual(result["output"]["git"]["before_commit"], start_commit)
+            self.assertEqual(result["output"]["git"]["after_commit"], start_commit)
+            self.assertEqual(result["output"]["git"]["commits"], [])
+            self.assertIn(
+                "agent reported success before metadata failed",
+                agent_result["result"]["evidence"]["stdout_excerpt"],
+            )
+
+    def test_implement_rejects_real_agent_command_auth_config_paths_inside_checkout_or_relative(self):
+        cases = [
+            ("codex_home", "codex-cache", "agent.codex_home must be absolute"),
+            ("config_home", "xdg-config", "agent.config_home must be absolute"),
+            ("codex_home", "checkout", "agent.codex_home must be outside checkout"),
+            ("config_home", "checkout/config", "agent.config_home must be outside checkout"),
+        ]
+        for field, path_kind, expected_message in cases:
+            with self.subTest(field=field, path_kind=path_kind):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    temp_path = Path(temp_dir)
+                    checkout = temp_path / "checkout"
+                    start_commit = init_checkout(checkout)
+                    ledger = temp_path / "ledger"
+                    outside_codex_home = temp_path / "codex-home"
+                    outside_config_home = temp_path / "xdg-config"
+                    outside_codex_home.mkdir()
+                    outside_config_home.mkdir()
+                    checkout_config = checkout / "config"
+                    checkout_config.mkdir()
+                    path_value = {
+                        "codex-cache": "codex-cache",
+                        "xdg-config": "xdg-config",
+                        "checkout": str(checkout),
+                        "checkout/config": str(checkout_config),
+                    }[path_kind]
+                    agent = {
+                        "type": "real-agent-command",
+                        "command": [sys.executable, "-c", "print('should not run')"],
+                        "result_path": "agent-result.json",
+                        "codex_home": str(outside_codex_home),
+                        "config_home": str(outside_config_home),
+                    }
+                    agent[field] = path_value
+
+                    completed = run_afk(
+                        "run-step",
+                        "implement",
+                        "--input",
+                        json.dumps(
+                            {
+                                "work_selection": {"schema_version": 1, "selected_work": [selected_work()]},
+                                "checkout": {
+                                    "status": "prepared",
+                                    "checkout_path": str(checkout),
+                                    "review_branch": "afk/test-work",
+                                    "requested_ref": "main",
+                                    "start_commit": start_commit,
+                                },
+                                "guardrails": [],
+                                "validation": {"profile": "tier1", "commands": []},
+                                "agent": agent,
+                            }
+                        ),
+                        "--ledger",
+                        str(ledger),
+                    )
+
+                    self.assertEqual(completed.returncode, 0, completed.stderr)
+                    summary = json.loads(completed.stdout)
+                    run_dir = ledger / "runs" / summary["run_id"]
+                    result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+
+                    self.assertEqual(result["output"]["status"], "failed_invalid_payload")
+                    self.assertEqual(result["output"]["message"], expected_message)
+                    self.assertNotIn("should not run", (run_dir / "stdout.log").read_text(encoding="utf-8"))
+
+    def test_implement_rejects_real_agent_command_checkout_internal_config_env_paths(self):
+        cases = [
+            ("PI_CONFIG_HOME", "checkout/.pi-config", "agent.env.PI_CONFIG_HOME must be outside checkout"),
+            ("PI_CACHE_DIR", "checkout/.pi-cache", "agent.env.PI_CACHE_DIR must be outside checkout"),
+            ("PI_SESSION_PATH", "checkout/session.json", "agent.env.PI_SESSION_PATH must be outside checkout"),
+            ("PI_CONFIG_HOME", "relative/.pi-config", "agent.env.PI_CONFIG_HOME must be an absolute path outside checkout"),
+        ]
+        for key, path_kind, expected_message in cases:
+            with self.subTest(key=key, path_kind=path_kind):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    temp_path = Path(temp_dir)
+                    checkout = temp_path / "checkout"
+                    start_commit = init_checkout(checkout)
+                    ledger = temp_path / "ledger"
+                    checkout_config = checkout / ".pi-config"
+                    checkout_cache = checkout / ".pi-cache"
+                    checkout_config.mkdir()
+                    checkout_cache.mkdir()
+                    path_value = {
+                        "checkout/.pi-config": str(checkout_config),
+                        "checkout/.pi-cache": str(checkout_cache),
+                        "checkout/session.json": str(checkout / "session.json"),
+                        "relative/.pi-config": ".pi-config",
+                    }[path_kind]
+
+                    completed = run_afk(
+                        "run-step",
+                        "implement",
+                        "--input",
+                        json.dumps(
+                            {
+                                "work_selection": {"schema_version": 1, "selected_work": [selected_work()]},
+                                "checkout": {
+                                    "status": "prepared",
+                                    "checkout_path": str(checkout),
+                                    "review_branch": "afk/test-work",
+                                    "requested_ref": "main",
+                                    "start_commit": start_commit,
+                                },
+                                "guardrails": [],
+                                "validation": {"profile": "tier1", "commands": []},
+                                "agent": {
+                                    "type": "real-agent-command",
+                                    "command": [sys.executable, "-c", "print('should not run')"],
+                                    "result_path": "agent-result.json",
+                                    "env": {key: path_value},
+                                },
+                            }
+                        ),
+                        "--ledger",
+                        str(ledger),
+                    )
+
+                    self.assertEqual(completed.returncode, 0, completed.stderr)
+                    summary = json.loads(completed.stdout)
+                    run_dir = ledger / "runs" / summary["run_id"]
+                    result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+
+                    self.assertEqual(result["output"]["status"], "failed_invalid_payload")
+                    self.assertEqual(result["output"]["message"], expected_message)
+                    self.assertNotIn("should not run", (run_dir / "stdout.log").read_text(encoding="utf-8"))
+
+    def test_implement_rejects_real_agent_command_secret_env_without_exposing_value(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            checkout = temp_path / "checkout"
+            start_commit = init_checkout(checkout)
+            ledger = temp_path / "ledger"
+            secret = "recipe-embedded-secret"
+
+            completed = run_afk(
+                "run-step",
+                "implement",
+                "--input",
+                json.dumps(
+                    {
+                        "work_selection": {"schema_version": 1, "selected_work": [selected_work()]},
+                        "checkout": {
+                            "status": "prepared",
+                            "checkout_path": str(checkout),
+                            "review_branch": "afk/test-work",
+                            "requested_ref": "main",
+                            "start_commit": start_commit,
+                        },
+                        "guardrails": [],
+                        "validation": {"profile": "tier1", "commands": []},
+                        "agent": {
+                            "type": "real-agent-command",
+                            "command": [sys.executable, "-c", "print('should not run')"],
+                            "result_path": "agent-result.json",
+                            "env": {"OPENAI_API_KEY": secret},
+                        },
+                    }
+                ),
+                "--ledger",
+                str(ledger),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+            artifact_text = "\n".join(
+                path.read_text(encoding="utf-8")
+                for path in run_dir.iterdir()
+                if path.is_file()
+            )
+
+            self.assertEqual(result["output"]["status"], "failed_invalid_payload")
+            self.assertEqual(
+                result["output"]["message"],
+                "agent.env must not include secret variable OPENAI_API_KEY",
+            )
+            self.assertNotIn(secret, artifact_text)
+            self.assertNotIn("should not run", (run_dir / "stdout.log").read_text(encoding="utf-8"))
+
+    def test_implement_rejects_real_agent_command_secret_shaped_env_value_without_exposing_value(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            checkout = temp_path / "checkout"
+            start_commit = init_checkout(checkout)
+            ledger = temp_path / "ledger"
+            secret = "ghp_secretshapedvalue1234567890"
+
+            completed = run_afk(
+                "run-step",
+                "implement",
+                "--input",
+                json.dumps(
+                    {
+                        "work_selection": {"schema_version": 1, "selected_work": [selected_work()]},
+                        "checkout": {
+                            "status": "prepared",
+                            "checkout_path": str(checkout),
+                            "review_branch": "afk/test-work",
+                            "requested_ref": "main",
+                            "start_commit": start_commit,
+                        },
+                        "guardrails": [],
+                        "validation": {"profile": "tier1", "commands": []},
+                        "agent": {
+                            "type": "real-agent-command",
+                            "command": [sys.executable, "-c", "print('should not run')"],
+                            "result_path": "agent-result.json",
+                            "env": {"PIPELINE_LABEL": secret},
+                        },
+                    }
+                ),
+                "--ledger",
+                str(ledger),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+            artifact_text = "\n".join(
+                path.read_text(encoding="utf-8")
+                for path in run_dir.iterdir()
+                if path.is_file()
+            )
+
+            self.assertEqual(result["output"]["status"], "failed_invalid_payload")
+            self.assertEqual(
+                result["output"]["message"],
+                "agent.env.PIPELINE_LABEL must not include a secret-looking value",
+            )
+            self.assertNotIn(secret, artifact_text)
+            self.assertNotIn("should not run", (run_dir / "stdout.log").read_text(encoding="utf-8"))
+
+    def test_implement_allows_real_agent_command_safe_url_env_value_with_query(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            checkout = temp_path / "checkout"
+            start_commit = init_checkout(checkout)
+            ledger = temp_path / "ledger"
+            service_url = "https://example.invalid/api?mode=test"
+            observation_path = temp_path / "agent-observation.json"
+            agent_code = textwrap.dedent(
+                f"""
+                import json
+                import os
+                import subprocess
+                from pathlib import Path
+
+                Path({str(observation_path)!r}).write_text(
+                    json.dumps({{"service_url": os.environ.get("SERVICE_URL")}}),
+                    encoding="utf-8",
+                )
+                Path("safe-url-env.txt").write_text(os.environ.get("SERVICE_URL", "") + "\\n", encoding="utf-8")
+                subprocess.run(["git", "add", "safe-url-env.txt"], check=True)
+                subprocess.run(["git", "commit", "-m", "safe url env accepted"], check=True)
+                Path("agent-result.json").write_text(
+                    json.dumps({{"status": "completed", "summary": "safe url env accepted"}}),
+                    encoding="utf-8",
+                )
+                """
+            ).strip()
+
+            completed = run_afk(
+                "run-step",
+                "implement",
+                "--input",
+                json.dumps(
+                    {
+                        "work_selection": {"schema_version": 1, "selected_work": [selected_work()]},
+                        "checkout": {
+                            "status": "prepared",
+                            "checkout_path": str(checkout),
+                            "review_branch": "afk/test-work",
+                            "requested_ref": "main",
+                            "start_commit": start_commit,
+                        },
+                        "guardrails": [],
+                        "validation": {"profile": "tier1", "commands": []},
+                        "agent": {
+                            "type": "real-agent-command",
+                            "command": [sys.executable, "-c", agent_code],
+                            "result_path": "agent-result.json",
+                            "env": {"SERVICE_URL": service_url},
+                        },
+                    }
+                ),
+                "--ledger",
+                str(ledger),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(result["output"]["status"], "implemented")
+            self.assertEqual(result["output"]["summary"], "safe url env accepted")
+            self.assertEqual(result["output"]["git"]["changed_files"], ["safe-url-env.txt"])
+            observation = json.loads(observation_path.read_text(encoding="utf-8"))
+            self.assertEqual(observation["service_url"], service_url)
+
     def test_implement_classifies_adapter_nonzero_as_runtime_failure_with_redacted_evidence(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)

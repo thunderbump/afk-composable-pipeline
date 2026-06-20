@@ -6,7 +6,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from afk.redaction import redact_artifact_value, redact_text, redact_url  # noqa: E402
+from afk.redaction import is_secret_value, redact_artifact_value, redact_text, redact_url  # noqa: E402
 
 
 class RedactionTest(unittest.TestCase):
@@ -167,6 +167,20 @@ class RedactionTest(unittest.TestCase):
 
         self.assertEqual(redact_artifact_value(payload), payload)
         self.assertEqual(redact_text(text), text)
+
+    def test_secret_value_detection_allows_safe_url_query_values(self):
+        self.assertFalse(is_secret_value("https://example.invalid/api?mode=test#section"))
+
+    def test_secret_value_detection_rejects_credential_bearing_urls(self):
+        self.assertTrue(is_secret_value("https://user:secret@example.invalid/api?mode=test"))
+        self.assertTrue(is_secret_value("https://example.invalid/api?token=hidden"))
+        self.assertTrue(is_secret_value("https://example.invalid/api#access_token=hidden"))
+
+    def test_artifact_redaction_still_removes_safe_url_query_strings(self):
+        self.assertEqual(
+            redact_text("service=https://example.invalid/api?mode=test#section"),
+            "service=https://example.invalid/api",
+        )
 
 
 if __name__ == "__main__":

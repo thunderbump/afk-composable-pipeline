@@ -9,7 +9,14 @@ from pathlib import Path
 from typing import Any
 
 from afk.jsonutil import canonical_json
-from afk.redaction import is_secret_command_flag, redact_artifact_value, redact_text
+from afk.redaction import (
+    is_secret_command_flag,
+    is_secret_key,
+    is_secret_value,
+    key_components,
+    redact_artifact_value,
+    redact_text,
+)
 
 
 SCHEMA_VERSION = 1
@@ -81,7 +88,7 @@ def implement(
         return implement_output(capsule, normalized, checkout_preflight["metadata"])
 
     try:
-        adapter_result = run_fake_pi_command(request["agent"], checkout_path, capsule)
+        adapter_result = run_agent_command(request["agent"], checkout_path, capsule)
     except AgentRuntimeError as exc:
         stdout = redact_text(exc.stdout)
         stderr = redact_text(exc.stderr or exc.message)
@@ -129,6 +136,13 @@ def implement(
         stdout=stdout,
         stderr=stderr,
     )
+    normalized = require_commit_for_implemented_result(
+        normalized,
+        after_metadata,
+        adapter={"type": request["agent"]["type"], "returncode": adapter_result["returncode"]},
+        stdout=stdout,
+        stderr=stderr,
+    )
     return implement_output(capsule, normalized, after_metadata)
 
 
@@ -152,7 +166,7 @@ def normalize_request(input_data: Any, *, project_contract: Any, run_id: str) ->
     if validation["status"] != "valid":
         return invalid_request(validation["message"])
 
-    agent = normalize_agent(input_data.get("agent"))
+    agent = normalize_agent(input_data.get("agent"), checkout_path=Path(checkout["checkout"]["path"]))
     if agent["status"] != "valid":
         return invalid_request(agent["message"])
 
@@ -281,12 +295,17 @@ def normalize_validation(validation: Any, project_contract: Any) -> dict[str, An
     }
 
 
-def normalize_agent(agent: Any) -> dict[str, Any]:
+def normalize_agent(agent: Any, *, checkout_path: Path) -> dict[str, Any]:
     if not isinstance(agent, dict):
         return {"status": "invalid", "message": "agent must be an object"}
-    if agent.get("type") != "fake-pi-command":
-        return {"status": "invalid", "message": "agent.type must be fake-pi-command"}
-    for forbidden_key in ("credentials_path", "auth_file", "token", "api_key", "env"):
+    agent_type = agent.get("type")
+    if agent_type not in {"fake-pi-command", "real-agent-command"}:
+        return {"status": "invalid", "message": "agent.type must be fake-pi-command or real-agent-command"}
+    fake_agent = agent_type == "fake-pi-command"
+    forbidden_keys = ("credentials_path", "auth_file", "token", "api_key")
+    if fake_agent:
+        forbidden_keys = (*forbidden_keys, "env", "codex_home", "config_home")
+    for forbidden_key in forbidden_keys:
         if forbidden_key in agent:
             return {"status": "invalid", "message": f"agent.{forbidden_key} is not supported"}
     command = agent.get("command")
@@ -301,15 +320,106 @@ def normalize_agent(agent: Any) -> dict[str, Any]:
     timeout_seconds = agent.get("timeout_seconds", 120)
     if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float)) or timeout_seconds <= 0:
         return {"status": "invalid", "message": "agent.timeout_seconds must be a positive number"}
+    normalized_agent: dict[str, Any] = {
+        "type": agent_type,
+        "command": list(command),
+        "result_path": result_path,
+        "timeout_seconds": float(timeout_seconds),
+        "env": {},
+        "codex_home": "",
+        "config_home": "",
+    }
+    if not fake_agent:
+        env = normalize_agent_env(agent.get("env", {}), checkout_path=checkout_path)
+        if env["status"] != "valid":
+            return {"status": "invalid", "message": env["message"]}
+        codex_home = normalize_absolute_dir(
+            agent.get("codex_home"),
+            "agent.codex_home",
+            checkout_path=checkout_path,
+        )
+        if codex_home["status"] != "valid":
+            return {"status": "invalid", "message": codex_home["message"]}
+        config_home = normalize_absolute_dir(
+            agent.get("config_home"),
+            "agent.config_home",
+            checkout_path=checkout_path,
+        )
+        if config_home["status"] != "valid":
+            return {"status": "invalid", "message": config_home["message"]}
+        normalized_agent["env"] = env["env"]
+        normalized_agent["codex_home"] = codex_home["path"]
+        normalized_agent["config_home"] = config_home["path"]
     return {
         "status": "valid",
-        "agent": {
-            "type": "fake-pi-command",
-            "command": list(command),
-            "result_path": result_path,
-            "timeout_seconds": float(timeout_seconds),
-        },
+        "agent": normalized_agent,
     }
+
+
+def normalize_agent_env(env: Any, *, checkout_path: Path) -> dict[str, Any]:
+    if not isinstance(env, dict):
+        return {"status": "invalid", "message": "agent.env must be an object"}
+    normalized = {}
+    reserved = {"AFK_JOB_CAPSULE", "AFK_AGENT_RESULT_PATH", "HOME", "XDG_CONFIG_HOME"}
+    for key, value in env.items():
+        if not isinstance(key, str) or not key:
+            return {"status": "invalid", "message": "agent.env keys must be non-empty strings"}
+        if key in reserved:
+            return {"status": "invalid", "message": f"agent.env must not override {key}"}
+        if is_secret_key(key):
+            return {"status": "invalid", "message": f"agent.env must not include secret variable {key}"}
+        if not isinstance(value, str):
+            return {"status": "invalid", "message": f"agent.env.{key} must be a string"}
+        if is_secret_value(value):
+            return {"status": "invalid", "message": f"agent.env.{key} must not include a secret-looking value"}
+        unsafe_path = unsafe_agent_env_path(key, value, checkout_path)
+        if unsafe_path is not None:
+            return {"status": "invalid", "message": unsafe_path}
+        normalized[key] = value
+    return {"status": "valid", "env": normalized}
+
+
+def unsafe_agent_env_path(key: str, value: str, checkout_path: Path) -> str | None:
+    if not is_config_state_env_key(key):
+        return None
+    if "://" in value:
+        return None
+    path = Path(value)
+    if not path.is_absolute():
+        return f"agent.env.{key} must be an absolute path outside checkout"
+    if path_is_equal_to_or_inside(path, checkout_path):
+        return f"agent.env.{key} must be outside checkout"
+    return None
+
+
+def is_config_state_env_key(key: str) -> bool:
+    components = key_components(key)
+    return any(component in {"cache", "config", "home", "path", "session", "state"} for component in components)
+
+
+def normalize_absolute_dir(value: Any, field: str, *, checkout_path: Path | None = None) -> dict[str, Any]:
+    if value is None:
+        return {"status": "valid", "path": ""}
+    if not isinstance(value, str) or not value.strip():
+        return {"status": "invalid", "message": f"{field} must be an absolute directory path"}
+    path = Path(value)
+    if not path.is_absolute():
+        return {"status": "invalid", "message": f"{field} must be absolute"}
+    if not path.is_dir():
+        return {"status": "invalid", "message": f"{field} must be an existing directory"}
+    if checkout_path is not None and path_is_equal_to_or_inside(path, checkout_path):
+        return {"status": "invalid", "message": f"{field} must be outside checkout"}
+    return {"status": "valid", "path": str(path)}
+
+
+def path_is_equal_to_or_inside(path: Path, parent: Path) -> bool:
+    for candidate in (path, path.resolve()):
+        try:
+            candidate.relative_to(parent.resolve())
+            return True
+        except ValueError:
+            pass
+    return False
 
 
 def normalize_string_list(value: Any, field: str) -> dict[str, Any]:
@@ -336,7 +446,7 @@ def build_job_capsule(request: dict[str, Any], *, run_id: str) -> dict[str, Any]
     }
 
 
-def run_fake_pi_command(
+def run_agent_command(
     agent: dict[str, Any],
     checkout_path: Path,
     capsule: dict[str, Any],
@@ -345,8 +455,12 @@ def run_fake_pi_command(
         temp_path = Path(temp_dir)
         capsule_path = temp_path / "job-capsule.json"
         capsule_path.write_text(canonical_json(capsule) + "\n", encoding="utf-8")
-        env = minimal_agent_environment(temp_path)
+        env = minimal_agent_environment(temp_path, config_home=agent.get("config_home") or "")
+        env.update(agent.get("env") or {})
+        if agent.get("codex_home"):
+            env["CODEX_HOME"] = agent["codex_home"]
         env["AFK_JOB_CAPSULE"] = str(capsule_path)
+        env["AFK_AGENT_RESULT_PATH"] = agent["result_path"]
         try:
             completed = subprocess.run(
                 agent["command"],
@@ -382,18 +496,21 @@ def run_fake_pi_command(
     }
 
 
-def minimal_agent_environment(temp_path: Path) -> dict[str, str]:
+def minimal_agent_environment(temp_path: Path, *, config_home: str = "") -> dict[str, str]:
     env: dict[str, str] = {}
     for key in ("PATH", "LANG", "LC_ALL", "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL"):
         value = os.environ.get(key)
         if value is not None:
             env[key] = value
     home_path = temp_path / "home"
-    xdg_config_home = temp_path / "xdg-config"
     home_path.mkdir()
-    xdg_config_home.mkdir()
     env["HOME"] = str(home_path)
-    env["XDG_CONFIG_HOME"] = str(xdg_config_home)
+    if config_home:
+        env["XDG_CONFIG_HOME"] = config_home
+    else:
+        xdg_config_home = temp_path / "xdg-config"
+        xdg_config_home.mkdir()
+        env["XDG_CONFIG_HOME"] = str(xdg_config_home)
     return env
 
 
@@ -473,6 +590,45 @@ def normalize_agent_payload(
         summary=summary,
         notes=notes,
         failures=failures,
+        adapter=adapter,
+        stdout=stdout,
+        stderr=stderr,
+    )
+
+
+def require_commit_for_implemented_result(
+    agent_result: dict[str, Any],
+    metadata: dict[str, Any],
+    *,
+    adapter: dict[str, Any],
+    stdout: str,
+    stderr: str,
+) -> dict[str, Any]:
+    if agent_result["status"] != "implemented":
+        return agent_result
+    if adapter.get("type") != "real-agent-command":
+        return agent_result
+    if metadata.get("metadata_status") == "failed":
+        message = "agent reported success but post-run git metadata could not be verified"
+        return normalized_agent_result(
+            status="failed_protocol",
+            classification="protocol_failure",
+            summary=message,
+            notes=agent_result["notes"],
+            failures=[{"type": "protocol", "message": message}],
+            adapter=adapter,
+            stdout=stdout,
+            stderr=stderr,
+        )
+    if metadata.get("before_commit") != metadata.get("after_commit") and metadata.get("commits"):
+        return agent_result
+    message = "agent reported success but produced no new commit"
+    return normalized_agent_result(
+        status="failed_protocol",
+        classification="protocol_failure",
+        summary=message,
+        notes=agent_result["notes"],
+        failures=[{"type": "protocol", "message": message}],
         adapter=adapter,
         stdout=stdout,
         stderr=stderr,
