@@ -510,7 +510,7 @@ def publish_terminal_pr(
         "status": "published",
         "enabled": True,
         "mode": config["mode"],
-        "url": completed.stdout.strip().splitlines()[-1] if completed.stdout.strip() else "",
+        "url": successful_publisher_url(completed.stdout),
         "commands": {
             "gh": redact_artifact_value(command),
             "git_push": (
@@ -521,6 +521,10 @@ def publish_terminal_pr(
         },
         "body_path": str(ledger.path / "pr-body.md"),
     }
+
+
+def successful_publisher_url(stdout: str) -> str:
+    return redact_text(stdout.strip().splitlines()[-1]) if stdout.strip() else ""
 
 
 def normalize_publisher_config(publisher: dict[str, Any], normalized: dict[str, Any]) -> dict[str, Any]:

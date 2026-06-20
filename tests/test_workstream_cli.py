@@ -1369,6 +1369,87 @@ sys.exit(0)
                 self.assertNotIn(review_secret, body)
                 self.assertIn("[REDACTED]", body)
 
+    def test_workstream_redacts_secret_shaped_successful_publisher_stdout_from_artifacts(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repo = temp_path / "repo-src"
+            checkout = temp_path / "checkout"
+            ledger = temp_path / "ledger"
+            fake_calls = temp_path / "fake-calls.jsonl"
+            init_repo(repo)
+            fake_git = temp_path / "publisher-git"
+            fake_gh = temp_path / "publisher-gh"
+            write_executable(
+                fake_git,
+                f"""#!{sys.executable}
+import json
+import os
+import sys
+from pathlib import Path
+
+Path({str(fake_calls)!r}).open("a", encoding="utf-8").write(
+    json.dumps({{"tool": "git", "cwd": os.getcwd(), "argv": sys.argv[1:]}}) + "\\n"
+)
+sys.exit(0)
+""",
+            )
+            stdout_secret = "ghp_success_stdout_secret_1234567890"
+            write_executable(
+                fake_gh,
+                f"""#!{sys.executable}
+import json
+import sys
+from pathlib import Path
+
+body_file = sys.argv[sys.argv.index("--body-file") + 1]
+Path({str(fake_calls)!r}).open("a", encoding="utf-8").write(
+    json.dumps(
+        {{
+            "tool": "gh",
+            "argv": sys.argv[1:],
+            "body": Path(body_file).read_text(encoding="utf-8"),
+        }}
+    )
+    + "\\n"
+)
+print({stdout_secret!r})
+sys.exit(0)
+""",
+            )
+
+            completed = run_afk(
+                "run-workstream",
+                "--workstream-id",
+                "central-lve.9",
+                "--input",
+                json.dumps(successful_recipe(temp_path, repo, checkout, fake_git, fake_gh)),
+                "--ledger",
+                str(ledger),
+                env_overrides={
+                    "GIT_ALLOW_PROTOCOL": "file",
+                    "GIT_AUTHOR_NAME": "AFK Test",
+                    "GIT_AUTHOR_EMAIL": "afk-test@example.test",
+                    "GIT_COMMITTER_NAME": "AFK Test",
+                    "GIT_COMMITTER_EMAIL": "afk-test@example.test",
+                },
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            result_path = ledger / summary["result_path"]
+            workstream_result_text = result_path.read_text(encoding="utf-8")
+            publication_result_text = result_path.parent.joinpath("publication-result.json").read_text(
+                encoding="utf-8"
+            )
+            result = json.loads(workstream_result_text)
+            publication = json.loads(publication_result_text)
+
+            self.assertEqual(summary["status"], "published")
+            self.assertEqual(result["publication"]["url"], "[REDACTED]")
+            self.assertEqual(publication["url"], "[REDACTED]")
+            self.assertNotIn(stdout_secret, workstream_result_text)
+            self.assertNotIn(stdout_secret, publication_result_text)
+
     def test_workstream_records_terminal_result_for_non_object_publisher_config(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
