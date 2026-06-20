@@ -212,10 +212,13 @@ agent auth/config state must be validated before the adapter runs:
 If any mount is missing, unreachable, relative, or inside the checkout, the step
 fails early as `failed_invalid_payload` and does not execute the adapter.
 
-AFK may validate and forward wrapper secret file paths, but it must not read
-their contents, inject them into `agent.env`, turn them into command flags, or
-persist them into Beads comments, ledgers, PR bodies, stdout/stderr, or images.
-Runner-local wrappers consume the mounted file paths through
+AFK may validate and forward wrapper secret file paths. During execution it may
+read those mounted files only to build an in-memory exact-value redaction set
+for stdout/stderr and normalized result payloads before ledger artifacts are
+written. AFK must not inject secret contents into `agent.env`, turn them into
+command flags, or persist them into Beads comments, ledgers, PR bodies, job
+capsules, stdout/stderr, or images. Runner-local wrappers consume the mounted
+file paths through
 `AFK_JOB_CAPSULE -> capsule.agent_mounts.wrapper_secret_files` and perform any
 token export or CLI wiring inside the runner.
 

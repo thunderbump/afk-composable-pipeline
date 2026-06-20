@@ -32,35 +32,41 @@ SECRET_TOKEN_VALUE_PATTERN = re.compile(
     r"AKIA[0-9A-Z]{16}"
     r")\b"
 )
+MIN_EXACT_SECRET_LENGTH = 4
 
 
-def redact_artifact_value(value: Any) -> Any:
-    return redact_artifact_value_for_key(None, value)
+def redact_artifact_value(value: Any, *, exact_secrets: set[str] | None = None) -> Any:
+    return redact_artifact_value_for_key(None, value, exact_secrets=exact_secrets)
 
 
-def redact_artifact_value_for_key(key: str | None, value: Any) -> Any:
+def redact_artifact_value_for_key(
+    key: str | None,
+    value: Any,
+    *,
+    exact_secrets: set[str] | None = None,
+) -> Any:
     if key is not None and is_secret_key(key):
         return "[REDACTED]"
     if isinstance(value, dict):
         return {
-            item_key: redact_artifact_value_for_key(str(item_key), item)
+            item_key: redact_artifact_value_for_key(str(item_key), item, exact_secrets=exact_secrets)
             for item_key, item in value.items()
         }
     if isinstance(value, list):
         if key == "command":
-            return redact_command_list(value)
-        return [redact_artifact_value_for_key(key, item) for item in value]
+            return redact_command_list(value, exact_secrets=exact_secrets)
+        return [redact_artifact_value_for_key(key, item, exact_secrets=exact_secrets) for item in value]
     if isinstance(value, str):
-        return redact_text(value)
+        return redact_text(value, exact_secrets=exact_secrets)
     return value
 
 
-def redact_command_list(value: list[Any]) -> list[Any]:
+def redact_command_list(value: list[Any], *, exact_secrets: set[str] | None = None) -> list[Any]:
     redacted: list[Any] = []
     redact_next = False
     for item in value:
         if not isinstance(item, str):
-            redacted.append(redact_artifact_value_for_key(None, item))
+            redacted.append(redact_artifact_value_for_key(None, item, exact_secrets=exact_secrets))
             redact_next = False
             continue
         if redact_next:
@@ -74,7 +80,7 @@ def redact_command_list(value: list[Any]) -> list[Any]:
                 redacted.append(item)
                 redact_next = True
             continue
-        redacted.append(redact_text(item))
+        redacted.append(redact_text(item, exact_secrets=exact_secrets))
     return redacted
 
 
@@ -120,11 +126,35 @@ def key_components(value: str) -> list[str]:
     return components
 
 
-def redact_text(value: str) -> str:
+def redact_text(value: str, *, exact_secrets: set[str] | None = None) -> str:
     redacted = URL_PATTERN.sub(redact_url_match, value)
     redacted = JSON_SECRET_STRING_PATTERN.sub(redact_json_secret_string, redacted)
     redacted = SECRET_ASSIGNMENT_PATTERN.sub(redact_secret_assignment, redacted)
-    return SECRET_TOKEN_VALUE_PATTERN.sub("[REDACTED]", redacted)
+    redacted = SECRET_TOKEN_VALUE_PATTERN.sub("[REDACTED]", redacted)
+    return redact_exact_secret_values(redacted, exact_secrets=exact_secrets)
+
+
+def redact_exact_secret_values(value: str, *, exact_secrets: set[str] | None = None) -> str:
+    if not exact_secrets:
+        return value
+    redacted = value
+    for secret in sorted(normalize_exact_secrets(exact_secrets), key=len, reverse=True):
+        redacted = redacted.replace(secret, "[REDACTED]")
+    return redacted
+
+
+def normalize_exact_secrets(values: set[str] | None) -> set[str]:
+    if not values:
+        return set()
+    normalized = set()
+    for value in values:
+        if not isinstance(value, str):
+            continue
+        stripped = value.strip()
+        if len(stripped) < MIN_EXACT_SECRET_LENGTH:
+            continue
+        normalized.add(stripped)
+    return normalized
 
 
 def redact_json_secret_string(match: re.Match[str]) -> str:

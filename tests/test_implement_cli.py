@@ -431,6 +431,187 @@ class ImplementCliTest(unittest.TestCase):
             self.assertNotIn(wrapper_secret, artifact_text)
             self.assertNotIn("ambient-openai-secret", artifact_text)
 
+    def test_implement_redacts_runtime_wrapper_secret_leaks_from_logs_and_artifacts(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            checkout = temp_path / "checkout"
+            start_commit = init_checkout(checkout)
+            ledger = temp_path / "ledger"
+            codex_home = temp_path / "codex-home"
+            pi_config_home = temp_path / "pi-config"
+            config_home = temp_path / "xdg-config-explicit"
+            wrapper_secret_dir = temp_path / "runner-secrets"
+            wrapper_secret_file = wrapper_secret_dir / "plain-secret.txt"
+            codex_home.mkdir()
+            pi_config_home.mkdir()
+            config_home.mkdir()
+            wrapper_secret_dir.mkdir()
+            wrapper_secret = "plain-runtime-wrapper-secret"
+            wrapper_secret_file.write_text(wrapper_secret + "\n", encoding="utf-8")
+            wrapper_code = textwrap.dedent(
+                """
+                import json
+                import os
+                import subprocess
+                from pathlib import Path
+
+                capsule = json.loads(Path(os.environ["AFK_JOB_CAPSULE"]).read_text(encoding="utf-8"))
+                secret_path = Path(capsule["agent_mounts"]["wrapper_secret_files"]["primary"])
+                secret_value = secret_path.read_text(encoding="utf-8").strip()
+                Path("implemented.txt").write_text("wrapper secret redaction\\n", encoding="utf-8")
+                subprocess.run(["git", "add", "implemented.txt"], check=True)
+                subprocess.run(["git", "commit", "-m", "wrapper secret redaction"], check=True)
+                Path(os.environ["AFK_AGENT_RESULT_PATH"]).write_text(
+                    json.dumps(
+                        {
+                            "status": "completed",
+                            "summary": secret_value,
+                            "notes": [f"stdout copy {secret_value}"],
+                            "details": {"artifact_text": f"artifact {secret_value} leak"},
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                print(f"stdout {secret_value}")
+                print(f"stderr {secret_value}", file=sys.stderr)
+                """
+            ).strip()
+
+            completed = run_afk(
+                "run-step",
+                "implement",
+                "--input",
+                json.dumps(
+                    {
+                        "work_selection": {"schema_version": 1, "selected_work": [selected_work()]},
+                        "checkout": {
+                            "status": "prepared",
+                            "checkout_path": str(checkout),
+                            "review_branch": "afk/test-work",
+                            "requested_ref": "main",
+                            "start_commit": start_commit,
+                        },
+                        "guardrails": ["stay within checkout"],
+                        "validation": {"profile": "tier1", "commands": []},
+                        "agent": {
+                            "type": "real-agent-command",
+                            "command": [
+                                sys.executable,
+                                "-c",
+                                "import sys\n" + wrapper_code,
+                            ],
+                            "result_path": "agent-result.json",
+                            "timeout_seconds": 10,
+                            "codex_home": str(codex_home),
+                            "config_home": str(config_home),
+                            "env": {"PI_CONFIG_HOME": str(pi_config_home)},
+                            "wrapper_secret_files": {"primary": str(wrapper_secret_file)},
+                        },
+                    }
+                ),
+                "--ledger",
+                str(ledger),
+                env_overrides={
+                    "GIT_AUTHOR_NAME": "AFK Test",
+                    "GIT_AUTHOR_EMAIL": "afk-test@example.test",
+                    "GIT_COMMITTER_NAME": "AFK Test",
+                    "GIT_COMMITTER_EMAIL": "afk-test@example.test",
+                },
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+            job_capsule = json.loads((run_dir / "job-capsule.json").read_text(encoding="utf-8"))
+            agent_result = json.loads((run_dir / "agent-result.json").read_text(encoding="utf-8"))
+            artifact_text = "\n".join(
+                path.read_text(encoding="utf-8")
+                for path in run_dir.iterdir()
+                if path.is_file()
+            )
+
+            self.assertEqual(result["output"]["status"], "implemented")
+            self.assertEqual(result["output"]["summary"], "[REDACTED]")
+            self.assertEqual(result["output"]["agent_result"]["summary"], "[REDACTED]")
+            self.assertIn("[REDACTED]", result["output"]["agent_result"]["notes"][0])
+            self.assertEqual(agent_result["result"]["summary"], "[REDACTED]")
+            self.assertEqual(
+                job_capsule["capsule"]["agent_mounts"]["wrapper_secret_files"],
+                {"primary": str(wrapper_secret_file)},
+            )
+            self.assertIn("[REDACTED]", (run_dir / "stdout.log").read_text(encoding="utf-8"))
+            self.assertIn("[REDACTED]", (run_dir / "stderr.log").read_text(encoding="utf-8"))
+            self.assertNotIn(wrapper_secret, artifact_text)
+
+    def test_implement_fails_protocol_when_wrapper_secret_file_cannot_be_read_at_runtime(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            checkout = temp_path / "checkout"
+            start_commit = init_checkout(checkout)
+            ledger = temp_path / "ledger"
+            codex_home = temp_path / "codex-home"
+            pi_config_home = temp_path / "pi-config"
+            config_home = temp_path / "xdg-config-explicit"
+            wrapper_secret_dir = temp_path / "runner-secrets"
+            wrapper_secret_file = wrapper_secret_dir / "plain-secret.txt"
+            codex_home.mkdir()
+            pi_config_home.mkdir()
+            config_home.mkdir()
+            wrapper_secret_dir.mkdir()
+            wrapper_secret_file.write_text("plain-runtime-wrapper-secret\n", encoding="utf-8")
+            wrapper_secret_file.chmod(0)
+
+            try:
+                completed = run_afk(
+                    "run-step",
+                    "implement",
+                    "--input",
+                    json.dumps(
+                        {
+                            "work_selection": {"schema_version": 1, "selected_work": [selected_work()]},
+                            "checkout": {
+                                "status": "prepared",
+                                "checkout_path": str(checkout),
+                                "review_branch": "afk/test-work",
+                                "requested_ref": "main",
+                                "start_commit": start_commit,
+                            },
+                            "guardrails": ["stay within checkout"],
+                            "validation": {"profile": "tier1", "commands": []},
+                            "agent": {
+                                "type": "real-agent-command",
+                                "command": [
+                                    sys.executable,
+                                    "-c",
+                                    "print('should not run')",
+                                ],
+                                "result_path": "agent-result.json",
+                                "timeout_seconds": 10,
+                                "codex_home": str(codex_home),
+                                "config_home": str(config_home),
+                                "env": {"PI_CONFIG_HOME": str(pi_config_home)},
+                                "wrapper_secret_files": {"primary": str(wrapper_secret_file)},
+                            },
+                        }
+                    ),
+                    "--ledger",
+                    str(ledger),
+                )
+            finally:
+                wrapper_secret_file.chmod(0o600)
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(result["output"]["status"], "failed_protocol")
+            self.assertEqual(result["output"]["classification"], "protocol_failure")
+            self.assertIn("agent.wrapper_secret_files.primary", result["output"]["summary"])
+            self.assertIn("could not be read", result["output"]["summary"])
+            self.assertNotIn("should not run", (run_dir / "stdout.log").read_text(encoding="utf-8"))
+
     def test_implement_rejects_real_agent_command_success_without_new_commit(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
