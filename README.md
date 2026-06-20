@@ -163,6 +163,36 @@ is generated from ledger facts: workstream identity, selected work, changed
 files, commits, validation artifact refs/statuses, review result, cleanup,
 retry status, and artifact paths.
 
+Generate the common single-item recipe from a Beads id and project contract:
+
+```sh
+PYTHONPATH=src python3 -m afk generate-recipe \
+  --workstream-id central-afk-pr.1 \
+  --project bump-eqemu \
+  --contracts-dir project-contracts \
+  --ledger ledger \
+  --beads-workspace /home/bump/Projects/beads \
+  --checkout-root /work \
+  --checkout-path /work/bump-EQEmu \
+  --validation-profile tier1 \
+  --output recipes/central-afk-pr.1.json
+```
+
+The generated recipe is inspectable JSON for `afk run-workstream --input`.
+It uses the contract repo URL/base branch, explicit Beads workspace and checkout
+mounts, a `target_ids` selector for the requested Beads item, the named
+validation profile, local fake implementation/validation/review adapters, and
+`"publisher": {"enabled": false}`. Replace the local adapters or publisher only
+when real worker/publisher credentials are intentionally available; the
+generator does not invent credentials.
+
+Selection evidence is recorded by the normal `select-work` step. The generated
+selector records the requested item in `selected_work`; non-target Beads
+candidates are recorded in `skipped_candidates` with `target_id_mismatch`.
+Unreachable or unauthenticated Beads workspaces block the workstream at
+selection and leave actionable `source_statuses` such as `skipped_unreachable`
+or `skipped_no_auth`.
+
 ## Ledger Artifacts
 
 Each invocation writes a new run directory:

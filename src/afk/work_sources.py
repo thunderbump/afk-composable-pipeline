@@ -38,6 +38,7 @@ def select_work(input_data: Any, *, project_contract: Any = None) -> dict[str, A
     )
     required_metadata = list(request.get("required_metadata", []))
     allowed_statuses = set(request.get("allowed_statuses", ["open"]))
+    target_ids = set(request.get("target_ids", []))
 
     source_statuses: list[dict[str, Any]] = []
     selected_work: list[dict[str, Any]] = []
@@ -65,8 +66,12 @@ def select_work(input_data: Any, *, project_contract: Any = None) -> dict[str, A
             source_statuses.append(adapter_status)
             continue
 
+        source_for_load = dict(source)
+        if source_type == "beads" and target_ids:
+            source_for_load["target_ids"] = sorted(target_ids)
+
         try:
-            raw_items = load_source_items(source)
+            raw_items = load_source_items(source_for_load)
         except SourceLoadError as exc:
             source_statuses.append(
                 source_status(source_id, source_type, exc.status, 0, 0, exc.message)
@@ -106,7 +111,17 @@ def select_work(input_data: Any, *, project_contract: Any = None) -> dict[str, A
                 )
                 continue
             candidate = normalize_candidate(source_id, source_type, raw_item)
-            rejection = rejection_reason(candidate, required_labels, required_metadata, allowed_statuses)
+            selection_skip_reason = raw_item.get("selection_skip_reason")
+            if isinstance(selection_skip_reason, str) and selection_skip_reason:
+                skipped_candidates.append({"candidate": candidate, "reason": selection_skip_reason})
+                continue
+            rejection = rejection_reason(
+                candidate,
+                required_labels,
+                required_metadata,
+                allowed_statuses,
+                target_ids,
+            )
             if rejection is not None:
                 skipped_candidates.append({"candidate": candidate, "reason": rejection})
                 continue
@@ -157,7 +172,7 @@ def invalid_request_result(message: str) -> dict[str, Any]:
 
 
 def request_payload_error(request: dict[str, Any]) -> str | None:
-    for key in ("required_labels", "required_metadata", "allowed_statuses"):
+    for key in ("required_labels", "required_metadata", "allowed_statuses", "target_ids"):
         if key in request and not is_string_list(request[key]):
             return f"{key} must be a list of strings"
     if "sources" in request and not isinstance(request["sources"], list):
@@ -458,6 +473,21 @@ def load_beads_issues(source: dict[str, Any]) -> list[dict[str, Any]]:
     env = os.environ.copy()
     env["BEADS_DOLT_PASSWORD"] = password
 
+    target_ids = source.get("target_ids")
+    if target_ids:
+        normalized = []
+        for issue_id in target_ids:
+            requested_id = str(issue_id)
+            try:
+                issue = load_beads_issue(requested_id, workspace=workspace, env=env, missing_ok=True)
+            except SourceLoadError as exc:
+                if exc.status != "skipped_missing_target":
+                    raise
+                normalized.append(missing_beads_target(requested_id))
+                continue
+            normalized.append(normalize_beads_issue(str(source.get("id") or "beads"), source, issue))
+        return normalized
+
     command = [
         "bd",
         "list",
@@ -501,19 +531,70 @@ def read_beads_password(credentials_path: Path) -> str:
     return lines[0]
 
 
-def load_beads_issue(issue_id: str, *, workspace: Path, env: dict[str, str]) -> dict[str, Any]:
-    payload = run_json_command(
-        ["bd", "show", issue_id, "--json"],
-        cwd=workspace,
-        env=env,
-        status_on_failure="skipped_unreachable",
-        message_on_failure="bd show failed",
-    )
+def load_beads_issue(
+    issue_id: str,
+    *,
+    workspace: Path,
+    env: dict[str, str],
+    missing_ok: bool = False,
+) -> dict[str, Any]:
+    try:
+        completed = subprocess.run(
+            ["bd", "show", issue_id, "--json"],
+            cwd=workspace,
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=60,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise SourceLoadError("skipped_unreachable", "bd show failed") from exc
+    if completed.returncode != 0:
+        if missing_ok and beads_show_missing_issue(issue_id, completed.stdout, completed.stderr):
+            raise SourceLoadError("skipped_missing_target", f"requested Beads issue was not found: {issue_id}")
+        raise SourceLoadError("skipped_unreachable", "bd show failed")
+    try:
+        payload = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise SourceLoadError("failed_invalid_payload", "bd show failed") from exc
     if isinstance(payload, list) and payload and isinstance(payload[0], dict):
         return payload[0]
     if isinstance(payload, dict):
         return payload
     raise SourceLoadError("failed_invalid_payload", "bd show returned invalid JSON payload")
+
+
+def beads_show_missing_issue(issue_id: str, stdout: str, stderr: str) -> bool:
+    output = f"{stdout}\n{stderr}".lower()
+    normalized_issue_id = issue_id.lower()
+    return normalized_issue_id in output and any(
+        marker in output
+        for marker in (
+            "not found",
+            "no issue",
+            "does not exist",
+            "unknown issue",
+        )
+    )
+
+
+def missing_beads_target(issue_id: str) -> dict[str, Any]:
+    return {
+        "external_id": issue_id,
+        "url": "",
+        "title": "Requested Beads issue was not found",
+        "status": "open",
+        "labels": [],
+        "parent": None,
+        "workstream": None,
+        "acceptance_criteria": [],
+        "dependencies": [],
+        "blockers": [],
+        "afk": {},
+        "raw": {"beads": {"id": issue_id}, "missing": True},
+        "selection_skip_reason": "missing_target_id",
+    }
 
 
 def normalize_beads_issue(source_id: str, source: dict[str, Any], issue: dict[str, Any]) -> dict[str, Any]:
@@ -774,11 +855,14 @@ def rejection_reason(
     required_labels: list[str],
     required_metadata: list[str],
     allowed_statuses: set[str],
+    target_ids: set[str],
 ) -> str | None:
     if candidate["status"] not in allowed_statuses:
         return "status_not_allowed"
     if not candidate["external_id"] and not candidate["url"]:
         return "missing_identity"
+    if target_ids and candidate["external_id"] not in target_ids:
+        return "target_id_mismatch"
     missing_labels = sorted(set(required_labels) - set(candidate["labels"]))
     if missing_labels:
         return f"missing_labels:{','.join(missing_labels)}"
