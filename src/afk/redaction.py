@@ -25,6 +25,13 @@ JSON_SECRET_STRING_PATTERN = re.compile(
     r"(?P=value_quote)",
     re.IGNORECASE,
 )
+SECRET_TOKEN_VALUE_PATTERN = re.compile(
+    r"\b("
+    r"gh[pousr]_[A-Za-z0-9_]{8,}|"
+    r"github_pat_[A-Za-z0-9_]{20,}|"
+    r"AKIA[0-9A-Z]{16}"
+    r")\b"
+)
 
 
 def redact_artifact_value(value: Any) -> Any:
@@ -106,7 +113,8 @@ def key_components(value: str) -> list[str]:
 def redact_text(value: str) -> str:
     redacted = URL_PATTERN.sub(redact_url_match, value)
     redacted = JSON_SECRET_STRING_PATTERN.sub(redact_json_secret_string, redacted)
-    return SECRET_ASSIGNMENT_PATTERN.sub(redact_secret_assignment, redacted)
+    redacted = SECRET_ASSIGNMENT_PATTERN.sub(redact_secret_assignment, redacted)
+    return SECRET_TOKEN_VALUE_PATTERN.sub("[REDACTED]", redacted)
 
 
 def redact_json_secret_string(match: re.Match[str]) -> str:

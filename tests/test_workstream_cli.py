@@ -226,7 +226,15 @@ import sys
 from pathlib import Path
 
 Path({str(fake_calls)!r}).open("a", encoding="utf-8").write(
-    json.dumps({{"tool": "git", "cwd": os.getcwd(), "argv": sys.argv[1:]}}) + "\\n"
+    json.dumps(
+        {{
+            "tool": "git",
+            "cwd": os.getcwd(),
+            "argv": sys.argv[1:],
+            "publisher_secret": os.environ.get("AFK_PUBLISHER_SECRET", ""),
+        }}
+    )
+    + "\\n"
 )
 sys.exit(0)
 """,
@@ -235,6 +243,7 @@ sys.exit(0)
                 fake_gh,
                 f"""#!{sys.executable}
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -245,6 +254,7 @@ Path({str(fake_calls)!r}).open("a", encoding="utf-8").write(
             "tool": "gh",
             "argv": sys.argv[1:],
             "body": Path(body_file).read_text(encoding="utf-8"),
+            "publisher_secret": os.environ.get("AFK_PUBLISHER_SECRET", ""),
         }}
     )
     + "\\n"
@@ -268,6 +278,7 @@ sys.exit(0)
                     "GIT_AUTHOR_EMAIL": "afk-test@example.test",
                     "GIT_COMMITTER_NAME": "AFK Test",
                     "GIT_COMMITTER_EMAIL": "afk-test@example.test",
+                    "AFK_PUBLISHER_SECRET": "publisher-secret-should-not-leak",
                 },
             )
 
@@ -290,6 +301,17 @@ sys.exit(0)
                 [step["name"] for step in result["steps"]],
                 ["select-work", "prepare-checkout", "implement", "validate", "review"],
             )
+            implemented_head = git(checkout, "rev-parse", "HEAD")
+            self.assertNotEqual(implemented_head, git(repo, "rev-parse", "HEAD"))
+            validate_step = next(step for step in result["steps"] if step["name"] == "validate")
+            worker_request = json.loads(
+                (ledger / "runs" / validate_step["run_id"] / "worker-request.json").read_text(encoding="utf-8")
+            )
+            validate_result = json.loads(
+                (ledger / "runs" / validate_step["run_id"] / "step-result.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(worker_request["repo"]["commit"], implemented_head)
+            self.assertEqual(validate_result["output"]["checkout"]["requested_ref"], implemented_head)
             self.assertTrue(
                 all(step["equivalent_command"][0:3] == ["afk", "run-step", step["name"]] for step in result["steps"])
             )
@@ -313,6 +335,8 @@ sys.exit(0)
             gh_calls = [call for call in calls if call["tool"] == "gh"]
             self.assertEqual(len(git_calls), 1)
             self.assertEqual(len(gh_calls), 1)
+            self.assertEqual(git_calls[0]["publisher_secret"], "")
+            self.assertEqual(gh_calls[0]["publisher_secret"], "")
             self.assertEqual(git_calls[0]["cwd"], str(checkout))
             self.assertEqual(
                 git_calls[0]["argv"],
@@ -405,10 +429,142 @@ Path({str(fake_calls)!r}).write_text("gh should not run\\n", encoding="utf-8")
             self.assertIn("validate did not reach validated", result["publication"]["reason"])
             self.assertEqual(result["cleanup"], {"status": "unknown", "resources": []})
             self.assertIn("afk run-workstream", result["retry"])
+            self.assertNotIn("pr_body", result["artifacts"])
+            self.assertFalse((ledger / summary["result_path"]).parent.joinpath("pr-body.md").exists())
             self.assertEqual(
                 [step["name"] for step in result["steps"]],
                 ["select-work", "prepare-checkout", "implement", "validate"],
             )
+            self.assertFalse(fake_calls.exists())
+
+    def test_workstream_blocks_validation_before_implementation(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repo = temp_path / "repo-src"
+            checkout = temp_path / "checkout"
+            ledger = temp_path / "ledger"
+            fake_calls = temp_path / "fake-calls.jsonl"
+            init_repo(repo)
+            fake_git = temp_path / "publisher-git"
+            fake_gh = temp_path / "publisher-gh"
+            write_executable(
+                fake_git,
+                f"""#!{sys.executable}
+from pathlib import Path
+Path({str(fake_calls)!r}).write_text("git should not run\\n", encoding="utf-8")
+""",
+            )
+            write_executable(
+                fake_gh,
+                f"""#!{sys.executable}
+from pathlib import Path
+Path({str(fake_calls)!r}).write_text("gh should not run\\n", encoding="utf-8")
+""",
+            )
+            recipe = successful_recipe(temp_path, repo, checkout, fake_git, fake_gh)
+            recipe["steps"][2], recipe["steps"][3] = recipe["steps"][3], recipe["steps"][2]
+
+            completed = run_afk(
+                "run-workstream",
+                "--workstream-id",
+                "central-lve.9",
+                "--input",
+                json.dumps(recipe),
+                "--ledger",
+                str(ledger),
+                env_overrides={
+                    "GIT_ALLOW_PROTOCOL": "file",
+                    "GIT_AUTHOR_NAME": "AFK Test",
+                    "GIT_AUTHOR_EMAIL": "afk-test@example.test",
+                    "GIT_COMMITTER_NAME": "AFK Test",
+                    "GIT_COMMITTER_EMAIL": "afk-test@example.test",
+                },
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            result = json.loads((ledger / summary["result_path"]).read_text(encoding="utf-8"))
+
+            self.assertEqual(summary["status"], "blocked")
+            self.assertEqual(result["status"], "blocked")
+            self.assertEqual(result["publication"]["status"], "blocked")
+            self.assertIn("validate requires implementation", result["publication"]["reason"])
+            self.assertEqual(
+                [step["name"] for step in result["steps"]],
+                ["select-work", "prepare-checkout"],
+            )
+            self.assertFalse(fake_calls.exists())
+
+    def test_workstream_blocks_multi_item_selection_before_implementation(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repo = temp_path / "repo-src"
+            checkout = temp_path / "checkout"
+            ledger = temp_path / "ledger"
+            fake_calls = temp_path / "fake-calls.jsonl"
+            init_repo(repo)
+            fake_git = temp_path / "publisher-git"
+            fake_gh = temp_path / "publisher-gh"
+            write_executable(
+                fake_git,
+                f"""#!{sys.executable}
+from pathlib import Path
+Path({str(fake_calls)!r}).write_text("git should not run\\n", encoding="utf-8")
+""",
+            )
+            write_executable(
+                fake_gh,
+                f"""#!{sys.executable}
+from pathlib import Path
+Path({str(fake_calls)!r}).write_text("gh should not run\\n", encoding="utf-8")
+""",
+            )
+            second_item = {
+                **selected_fixture_item(),
+                "external_id": "central-lve.10",
+                "url": "https://tracker.example/central-lve.10",
+                "title": "Follow-up terminal publisher hardening",
+            }
+            recipe = successful_recipe(temp_path, repo, checkout, fake_git, fake_gh)
+            recipe["steps"][0]["input"]["sources"][0]["items"] = [
+                selected_fixture_item(),
+                second_item,
+            ]
+
+            completed = run_afk(
+                "run-workstream",
+                "--workstream-id",
+                "central-lve.9",
+                "--input",
+                json.dumps(recipe),
+                "--ledger",
+                str(ledger),
+                env_overrides={
+                    "GIT_ALLOW_PROTOCOL": "file",
+                    "GIT_AUTHOR_NAME": "AFK Test",
+                    "GIT_AUTHOR_EMAIL": "afk-test@example.test",
+                    "GIT_COMMITTER_NAME": "AFK Test",
+                    "GIT_COMMITTER_EMAIL": "afk-test@example.test",
+                },
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            result = json.loads((ledger / summary["result_path"]).read_text(encoding="utf-8"))
+
+            self.assertEqual(summary["status"], "blocked")
+            self.assertEqual(result["publication"]["status"], "blocked")
+            self.assertIn("single selected work item", result["publication"]["reason"])
+            self.assertEqual(
+                [step["name"] for step in result["steps"]],
+                ["select-work", "prepare-checkout"],
+            )
+            self.assertEqual(
+                [item["external_id"] for item in result["selected_work"]],
+                ["central-lve.9", "central-lve.10"],
+            )
+            self.assertEqual([item["result"] for item in result["selected_work"]], ["selected", "selected"])
+            self.assertNotIn("passed", [item["result"] for item in result["selected_work"]])
             self.assertFalse(fake_calls.exists())
 
     def test_workstream_update_mode_edits_existing_terminal_pr(self):
@@ -626,3 +782,299 @@ Path({str(fake_calls)!r}).open("a", encoding="utf-8").write("gh should not run\\
             self.assertEqual(result["cleanup"], {"status": "clean", "resources": []})
             self.assertIn("afk run-workstream", result["retry"])
             self.assertEqual([call["tool"] for call in calls], ["git"])
+
+    def test_workstream_disabled_publisher_does_not_advertise_absent_pr_body(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repo = temp_path / "repo-src"
+            checkout = temp_path / "checkout"
+            ledger = temp_path / "ledger"
+            fake_calls = temp_path / "fake-calls.jsonl"
+            init_repo(repo)
+            fake_git = temp_path / "publisher-git"
+            fake_gh = temp_path / "publisher-gh"
+            write_executable(
+                fake_git,
+                f"""#!{sys.executable}
+from pathlib import Path
+Path({str(fake_calls)!r}).write_text("git should not run\\n", encoding="utf-8")
+""",
+            )
+            write_executable(
+                fake_gh,
+                f"""#!{sys.executable}
+from pathlib import Path
+Path({str(fake_calls)!r}).write_text("gh should not run\\n", encoding="utf-8")
+""",
+            )
+            recipe = successful_recipe(temp_path, repo, checkout, fake_git, fake_gh)
+            recipe["publisher"] = {"enabled": False}
+
+            completed = run_afk(
+                "run-workstream",
+                "--workstream-id",
+                "central-lve.9",
+                "--input",
+                json.dumps(recipe),
+                "--ledger",
+                str(ledger),
+                env_overrides={
+                    "GIT_ALLOW_PROTOCOL": "file",
+                    "GIT_AUTHOR_NAME": "AFK Test",
+                    "GIT_AUTHOR_EMAIL": "afk-test@example.test",
+                    "GIT_COMMITTER_NAME": "AFK Test",
+                    "GIT_COMMITTER_EMAIL": "afk-test@example.test",
+                },
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            result_path = ledger / summary["result_path"]
+            result = json.loads(result_path.read_text(encoding="utf-8"))
+
+            self.assertEqual(summary["status"], "completed")
+            self.assertEqual(result["publication"]["status"], "skipped_disabled")
+            self.assertNotIn("pr_body", result["artifacts"])
+            self.assertFalse(result_path.parent.joinpath("pr-body.md").exists())
+            self.assertFalse(fake_calls.exists())
+
+    def test_workstream_redacts_secret_shaped_values_from_pr_body_and_published_body(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repo = temp_path / "repo-src"
+            checkout = temp_path / "checkout"
+            ledger = temp_path / "ledger"
+            fake_calls = temp_path / "fake-calls.jsonl"
+            init_repo(repo)
+            fake_git = temp_path / "publisher-git"
+            fake_gh = temp_path / "publisher-gh"
+            write_executable(
+                fake_git,
+                f"""#!{sys.executable}
+import json
+import os
+import sys
+from pathlib import Path
+
+Path({str(fake_calls)!r}).open("a", encoding="utf-8").write(
+    json.dumps({{"tool": "git", "cwd": os.getcwd(), "argv": sys.argv[1:]}}) + "\\n"
+)
+sys.exit(0)
+""",
+            )
+            write_executable(
+                fake_gh,
+                f"""#!{sys.executable}
+import json
+import sys
+from pathlib import Path
+
+body_file = sys.argv[sys.argv.index("--body-file") + 1]
+Path({str(fake_calls)!r}).open("a", encoding="utf-8").write(
+    json.dumps(
+        {{
+            "tool": "gh",
+            "argv": sys.argv[1:],
+            "body": Path(body_file).read_text(encoding="utf-8"),
+        }}
+    )
+    + "\\n"
+)
+print("https://github.example/pr/123")
+sys.exit(0)
+""",
+            )
+            issue_secret = "ghp_issue_title_secret_1234567890"
+            commit_secret = "ghp_commit_subject_secret_1234567890"
+            review_secret = "ghp_review_summary_secret_1234567890"
+            agent_code = textwrap.dedent(
+                f"""
+                import json
+                import subprocess
+                from pathlib import Path
+
+                Path("implemented.txt").write_text("central-lve.9\\n", encoding="utf-8")
+                subprocess.run(["git", "add", "implemented.txt"], check=True)
+                subprocess.run(["git", "commit", "-m", "{commit_secret}"], check=True)
+                Path("agent-result.json").write_text(
+                    json.dumps({{"status": "completed", "summary": "implemented workstream publisher"}}),
+                    encoding="utf-8",
+                )
+                """
+            ).strip()
+            reviewer_code = textwrap.dedent(
+                f"""
+                import json
+                import os
+                from pathlib import Path
+
+                Path(os.environ["AFK_REVIEWER_RESULT"]).write_text(
+                    json.dumps({{"status": "pass", "summary": "{review_secret}", "findings": []}}),
+                    encoding="utf-8",
+                )
+                """
+            ).strip()
+            recipe = successful_recipe(temp_path, repo, checkout, fake_git, fake_gh)
+            recipe["steps"][0]["input"]["sources"][0]["items"][0]["title"] = issue_secret
+            recipe["steps"][2]["input"]["agent"]["command"] = [sys.executable, "-c", agent_code]
+            recipe["steps"][4]["input"]["reviewer"]["command"] = [sys.executable, "-c", reviewer_code]
+
+            completed = run_afk(
+                "run-workstream",
+                "--workstream-id",
+                "central-lve.9",
+                "--input",
+                json.dumps(recipe),
+                "--ledger",
+                str(ledger),
+                env_overrides={
+                    "GIT_ALLOW_PROTOCOL": "file",
+                    "GIT_AUTHOR_NAME": "AFK Test",
+                    "GIT_AUTHOR_EMAIL": "afk-test@example.test",
+                    "GIT_COMMITTER_NAME": "AFK Test",
+                    "GIT_COMMITTER_EMAIL": "afk-test@example.test",
+                },
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            result_path = ledger / summary["result_path"]
+            workstream_result_text = result_path.read_text(encoding="utf-8")
+            pr_body = result_path.parent.joinpath("pr-body.md").read_text(encoding="utf-8")
+            calls = [
+                json.loads(line)
+                for line in fake_calls.read_text(encoding="utf-8").splitlines()
+            ]
+            gh_body = next(call["body"] for call in calls if call["tool"] == "gh")
+
+            for body in (workstream_result_text, pr_body, gh_body):
+                self.assertNotIn(issue_secret, body)
+                self.assertNotIn(commit_secret, body)
+                self.assertNotIn(review_secret, body)
+                self.assertIn("[REDACTED]", body)
+
+    def test_workstream_records_terminal_result_for_invalid_publisher_config(self):
+        cases = [
+            ("missing_repo", lambda publisher: publisher.pop("repo"), "publisher.repo is required"),
+            (
+                "invalid_mode",
+                lambda publisher: publisher.__setitem__("mode", "delete"),
+                "publisher.mode must be create or update",
+            ),
+        ]
+        for case_name, mutate_publisher, expected_reason in cases:
+            with self.subTest(case_name=case_name):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    temp_path = Path(temp_dir)
+                    repo = temp_path / "repo-src"
+                    checkout = temp_path / "checkout"
+                    ledger = temp_path / "ledger"
+                    fake_calls = temp_path / "fake-calls.jsonl"
+                    init_repo(repo)
+                    fake_git = temp_path / "publisher-git"
+                    fake_gh = temp_path / "publisher-gh"
+                    write_executable(
+                        fake_git,
+                        f"""#!{sys.executable}
+from pathlib import Path
+Path({str(fake_calls)!r}).write_text("git should not run\\n", encoding="utf-8")
+""",
+                    )
+                    write_executable(
+                        fake_gh,
+                        f"""#!{sys.executable}
+from pathlib import Path
+Path({str(fake_calls)!r}).write_text("gh should not run\\n", encoding="utf-8")
+""",
+                    )
+                    recipe = successful_recipe(temp_path, repo, checkout, fake_git, fake_gh)
+                    mutate_publisher(recipe["publisher"])
+
+                    completed = run_afk(
+                        "run-workstream",
+                        "--workstream-id",
+                        "central-lve.9",
+                        "--input",
+                        json.dumps(recipe),
+                        "--ledger",
+                        str(ledger),
+                        env_overrides={
+                            "GIT_ALLOW_PROTOCOL": "file",
+                            "GIT_AUTHOR_NAME": "AFK Test",
+                            "GIT_AUTHOR_EMAIL": "afk-test@example.test",
+                            "GIT_COMMITTER_NAME": "AFK Test",
+                            "GIT_COMMITTER_EMAIL": "afk-test@example.test",
+                        },
+                    )
+
+                    self.assertEqual(completed.returncode, 0, completed.stderr)
+                    summary = json.loads(completed.stdout)
+                    result_path = ledger / summary["result_path"]
+                    result = json.loads(result_path.read_text(encoding="utf-8"))
+                    publication = json.loads(
+                        (result_path.parent / "publication-result.json").read_text(encoding="utf-8")
+                    )
+
+                    self.assertEqual(summary["status"], "failed_publication")
+                    self.assertEqual(result["status"], "failed_publication")
+                    self.assertEqual(result["publication"]["status"], "failed")
+                    self.assertEqual(publication["status"], "failed")
+                    self.assertIn(expected_reason, result["publication"]["reason"])
+                    self.assertEqual(result["cleanup"], {"status": "clean", "resources": []})
+                    self.assertIn("afk run-workstream", result["retry"])
+                    self.assertIn("afk run-workstream", publication["retry"])
+                    self.assertFalse(fake_calls.exists())
+
+    def test_workstream_rejects_publisher_head_that_differs_from_review_branch(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repo = temp_path / "repo-src"
+            checkout = temp_path / "checkout"
+            ledger = temp_path / "ledger"
+            fake_calls = temp_path / "fake-calls.jsonl"
+            init_repo(repo)
+            fake_git = temp_path / "publisher-git"
+            fake_gh = temp_path / "publisher-gh"
+            write_executable(
+                fake_git,
+                f"""#!{sys.executable}
+from pathlib import Path
+Path({str(fake_calls)!r}).write_text("git should not run\\n", encoding="utf-8")
+""",
+            )
+            write_executable(
+                fake_gh,
+                f"""#!{sys.executable}
+from pathlib import Path
+Path({str(fake_calls)!r}).write_text("gh should not run\\n", encoding="utf-8")
+""",
+            )
+            recipe = successful_recipe(temp_path, repo, checkout, fake_git, fake_gh)
+            recipe["publisher"]["head"] = "afk/different-terminal-pr"
+
+            completed = run_afk(
+                "run-workstream",
+                "--workstream-id",
+                "central-lve.9",
+                "--input",
+                json.dumps(recipe),
+                "--ledger",
+                str(ledger),
+                env_overrides={
+                    "GIT_ALLOW_PROTOCOL": "file",
+                    "GIT_AUTHOR_NAME": "AFK Test",
+                    "GIT_AUTHOR_EMAIL": "afk-test@example.test",
+                    "GIT_COMMITTER_NAME": "AFK Test",
+                    "GIT_COMMITTER_EMAIL": "afk-test@example.test",
+                },
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            result = json.loads((ledger / summary["result_path"]).read_text(encoding="utf-8"))
+
+            self.assertEqual(summary["status"], "failed_publication")
+            self.assertEqual(result["publication"]["status"], "failed")
+            self.assertIn("publisher.head must match review_branch", result["publication"]["reason"])
+            self.assertEqual(result["cleanup"], {"status": "clean", "resources": []})
+            self.assertFalse(fake_calls.exists())

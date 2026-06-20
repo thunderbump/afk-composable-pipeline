@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import os
 import subprocess
+import tempfile
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -92,6 +94,10 @@ def run_workstream(
 
     for step_spec in normalized["steps"]:
         step_name = step_spec["name"]
+        blocked_reason = workflow_order_blocking_reason(step_name, state)
+        if blocked_reason:
+            state["blocked_reason"] = blocked_reason
+            break
         step_input = composed_step_input(step_spec, normalized, state, ledger_dir)
         step_profile = step_spec.get("profile")
         equivalent_command = equivalent_run_step_command(
@@ -148,12 +154,7 @@ def run_workstream(
         "cleanup": state["cleanup"],
         "retry": retry_instructions(normalized, run_id),
         "publication": publication,
-        "artifacts": {
-            "workstream_result": "workstream-result.json",
-            "command": "command.json",
-            "publication": "publication-result.json",
-            "pr_body": "pr-body.md",
-        },
+        "artifacts": workstream_artifacts(ledger),
     }
     ledger.write_json("publication-result.json", publication)
     ledger.write_json("workstream-result.json", result_payload)
@@ -231,7 +232,7 @@ def composed_step_input(
             input_data.setdefault("checkout", state["checkout"])
     elif step_name == "validate":
         if state.get("checkout") is not None:
-            input_data.setdefault("checkout", state["checkout"])
+            input_data["checkout"] = state["checkout"]
         profile = step_spec.get("profile")
         if profile:
             validation = input_data.get("validation", {})
@@ -240,11 +241,11 @@ def composed_step_input(
             input_data["validation"] = {**validation, "profile": profile}
     elif step_name == "review":
         if state["selected_work"]:
-            input_data.setdefault("work_item", state["selected_work"][0])
+            input_data["work_item"] = state["selected_work"][0]
         if state.get("checkout") is not None:
-            input_data.setdefault("checkout", state["checkout"])
+            input_data["checkout"] = state["checkout"]
         if state.get("implementation") is not None:
-            input_data.setdefault("implementation", state["implementation"])
+            input_data["implementation"] = state["implementation"]
         input_data.setdefault("validation", {"required_artifacts": validation_artifact_refs(state, ledger_dir)})
         input_data.setdefault("cleanup", {"status": "clean", "resources": []})
     return input_data
@@ -283,7 +284,7 @@ def step_execution_record(
         "output_status": output_status,
         "result_path": run_result_path,
         "result_abspath": str((ledger_dir / run_result_path).resolve(strict=False)),
-        "equivalent_command": equivalent_command,
+        "equivalent_command": redact_artifact_value(equivalent_command),
     }
 
 
@@ -301,6 +302,7 @@ def update_state_from_step(
         state["checkout"] = output
     elif step_name == "implement":
         state["implementation"] = output
+        state["checkout"] = checkout_after_implementation(state.get("checkout"), output)
     elif step_name == "validate":
         state["validations"].append(
             {
@@ -315,6 +317,45 @@ def update_state_from_step(
         cleanup = output.get("cleanup")
         if isinstance(cleanup, dict):
             state["cleanup"] = cleanup
+
+
+def workflow_order_blocking_reason(step_name: str, state: dict[str, Any]) -> str:
+    if step_name in {"implement", "review"} and selected_work_count(state) > 1:
+        return "MVP supports a single selected work item; narrow the selection and rerun"
+    if step_name == "validate" and not implemented_after_commit(state):
+        return "validate requires implementation evidence before final validation"
+    if step_name == "review":
+        if not implemented_after_commit(state):
+            return "review requires implementation evidence before final review"
+        if not state["validations"]:
+            return "review requires final validation evidence after implementation"
+    return ""
+
+
+def selected_work_count(state: dict[str, Any]) -> int:
+    selected_work = state.get("selected_work")
+    return len(selected_work) if isinstance(selected_work, list) else 0
+
+
+def checkout_after_implementation(checkout: Any, implementation: dict[str, Any]) -> Any:
+    if not isinstance(checkout, dict) or implementation.get("status") != "implemented":
+        return checkout
+    git_info = implementation.get("git") if isinstance(implementation.get("git"), dict) else {}
+    after_commit = string_field(git_info, "after_commit")
+    if not after_commit:
+        return checkout
+    updated = dict(checkout)
+    updated["start_commit"] = after_commit
+    updated["requested_ref"] = after_commit
+    return updated
+
+
+def implemented_after_commit(state: dict[str, Any]) -> str:
+    implementation = state.get("implementation") if isinstance(state.get("implementation"), dict) else {}
+    if implementation.get("status") != "implemented":
+        return ""
+    git_info = implementation.get("git") if isinstance(implementation.get("git"), dict) else {}
+    return string_field(git_info, "after_commit") or ""
 
 
 def blocking_reason_for_step(step_name: str, result: StepResult) -> str:
@@ -358,12 +399,34 @@ def publication_gate_reason(state: dict[str, Any]) -> str:
     if failed_validations:
         names = ", ".join(validation_name(item) for item in failed_validations)
         return f"required final validation evidence did not pass: {names}"
+    implemented_commit = implemented_after_commit(state)
+    stale_validations = [
+        validation
+        for validation in state["validations"]
+        if implemented_commit and validation_checkout_commit(validation) != implemented_commit
+    ]
+    if stale_validations:
+        names = ", ".join(validation_name(item) for item in stale_validations)
+        return f"required final validation evidence is stale for implemented HEAD: {names}"
     review = state.get("review")
     if not isinstance(review, dict):
         return "required final review evidence is missing"
     if review.get("status") != "passed":
         return f"final review did not pass: {review.get('status') or 'missing status'}"
+    if implemented_commit and review_checkout_commit(review) != implemented_commit:
+        return "final review evidence is stale for implemented HEAD"
     return ""
+
+
+def validation_checkout_commit(validation: dict[str, Any]) -> str:
+    output = validation.get("output") if isinstance(validation.get("output"), dict) else {}
+    checkout = output.get("checkout") if isinstance(output.get("checkout"), dict) else {}
+    return string_field(checkout, "start_commit") or ""
+
+
+def review_checkout_commit(review: dict[str, Any]) -> str:
+    checkout = review.get("checkout") if isinstance(review.get("checkout"), dict) else {}
+    return string_field(checkout, "start_commit") or ""
 
 
 def publish_terminal_pr(
@@ -377,9 +440,12 @@ def publish_terminal_pr(
 ) -> dict[str, Any]:
     if not publisher.get("enabled", True):
         return {"status": "skipped_disabled", "enabled": False}
+    try:
+        config = normalize_publisher_config(publisher, normalized)
+    except WorkstreamError as exc:
+        return failed_publication_config(str(exc), normalized)
     body = pr_body_markdown(normalized, state, steps, selected_work, ledger)
     ledger.write_text("pr-body.md", body)
-    config = normalize_publisher_config(publisher, normalized)
     checkout_path = checkout_path_from_state(state)
     try:
         if config["push"]:
@@ -447,6 +513,8 @@ def normalize_publisher_config(publisher: dict[str, Any], normalized: dict[str, 
     if not isinstance(gh, dict) or not isinstance(git, dict):
         raise WorkstreamError("publisher.gh and publisher.git must be objects when present")
     head = string_field(publisher, "head") or normalized["review_branch"]
+    if head != normalized["review_branch"]:
+        raise WorkstreamError("publisher.head must match review_branch")
     title = string_field(publisher, "title") or f"{normalized['workstream_id']}: workstream"
     repo = string_field(publisher, "repo") or ""
     base = string_field(publisher, "base") or ""
@@ -470,10 +538,23 @@ def normalize_publisher_config(publisher: dict[str, Any], normalized: dict[str, 
 
 
 def run_publisher_command(command: list[str], *, cwd: Path, tool: str) -> subprocess.CompletedProcess[str]:
+    with tempfile.TemporaryDirectory(prefix="afk-publisher-") as temp_dir:
+        env = minimal_publisher_environment(Path(temp_dir))
+        return run_publisher_command_once(command, cwd=cwd, tool=tool, env=env)
+
+
+def run_publisher_command_once(
+    command: list[str],
+    *,
+    cwd: Path,
+    tool: str,
+    env: dict[str, str],
+) -> subprocess.CompletedProcess[str]:
     try:
         completed = subprocess.run(
             command,
             cwd=cwd,
+            env=env,
             text=True,
             capture_output=True,
             check=False,
@@ -491,6 +572,27 @@ def run_publisher_command(command: list[str], *, cwd: Path, tool: str) -> subpro
     return completed
 
 
+def minimal_publisher_environment(temp_path: Path) -> dict[str, str]:
+    env: dict[str, str] = {}
+    for key in ("PATH", "LANG", "LC_ALL"):
+        value = os.environ.get(key)
+        if value is not None:
+            env[key] = value
+    home_path = temp_path / "home"
+    xdg_config_home = temp_path / "xdg-config"
+    xdg_cache_home = temp_path / "xdg-cache"
+    xdg_state_home = temp_path / "xdg-state"
+    tmp_path = temp_path / "tmp"
+    for path in (home_path, xdg_config_home, xdg_cache_home, xdg_state_home, tmp_path):
+        path.mkdir()
+    env["HOME"] = str(home_path)
+    env["XDG_CONFIG_HOME"] = str(xdg_config_home)
+    env["XDG_CACHE_HOME"] = str(xdg_cache_home)
+    env["XDG_STATE_HOME"] = str(xdg_state_home)
+    env["TMPDIR"] = str(tmp_path)
+    return env
+
+
 def pr_body_markdown(
     normalized: dict[str, Any],
     state: dict[str, Any],
@@ -504,27 +606,33 @@ def pr_body_markdown(
     commits = list(git_info.get("commits") or [])
     review = state.get("review") if isinstance(state.get("review"), dict) else {}
     lines = [
-        f"# Workstream {normalized['workstream_id']}",
+        f"# Workstream {pr_body_value(normalized['workstream_id'])}",
         "",
-        f"Workstream: {normalized['workstream_id']}",
-        f"Parent: {normalized['parent'] or '(none)'}",
-        f"Review branch: {normalized['review_branch']}",
+        f"Workstream: {pr_body_value(normalized['workstream_id'])}",
+        f"Parent: {pr_body_value(normalized['parent'] or '(none)')}",
+        f"Review branch: {pr_body_value(normalized['review_branch'])}",
         "",
         "## Selected Work",
         "",
     ]
     for item in selected_work:
-        lines.append(f"- {item['external_id']} - {item['title']} ({item['result']})")
+        lines.append(
+            f"- {pr_body_value(item['external_id'])} - "
+            f"{pr_body_value(item['title'])} ({pr_body_value(item['result'])})"
+        )
     lines.extend(["", "## Changed files", ""])
     if changed_files:
-        lines.extend(f"- {path}" for path in changed_files)
+        lines.extend(f"- {pr_body_value(path)}" for path in changed_files)
     else:
         lines.append("- None recorded")
     lines.extend(["", "## Commits", ""])
     if commits:
         for commit in commits:
             if isinstance(commit, dict):
-                lines.append(f"- {commit.get('commit', '')} {commit.get('subject', '')}".rstrip())
+                lines.append(
+                    f"- {pr_body_value(commit.get('commit', ''))} "
+                    f"{pr_body_value(commit.get('subject', ''))}".rstrip()
+                )
     else:
         lines.append("- None recorded")
     lines.extend(["", "## Validation", ""])
@@ -532,17 +640,18 @@ def pr_body_markdown(
         step_ref = ledger_relative_path(validation["step_result_path"])
         worker_ref = ledger_relative_path(validation["worker_result_path"])
         lines.append(
-            f"- {validation_name(validation)}: {validation['output'].get('status', 'missing')} "
-            f"({step_ref}; {worker_ref})"
+            f"- {pr_body_value(validation_name(validation))}: "
+            f"{pr_body_value(validation['output'].get('status', 'missing'))} "
+            f"({pr_body_value(step_ref)}; {pr_body_value(worker_ref)})"
         )
-    lines.extend(["", f"Review: {review.get('status', 'missing')}", ""])
+    lines.extend(["", f"Review: {pr_body_value(review.get('status', 'missing'))}", ""])
     if review.get("summary"):
-        lines.extend(["## Review Summary", "", str(review["summary"]), ""])
+        lines.extend(["## Review Summary", "", pr_body_value(review["summary"]), ""])
     lines.extend(
         [
             "## Cleanup",
             "",
-            f"Cleanup: {state['cleanup'].get('status', 'unknown')}",
+            f"Cleanup: {pr_body_value(state['cleanup'].get('status', 'unknown'))}",
             "",
             "## Retry",
             "",
@@ -550,13 +659,17 @@ def pr_body_markdown(
             "",
             "## Artifacts",
             "",
-            f"- Workstream result: workstreams/{ledger.run_id}/workstream-result.json",
+            f"- Workstream result: {pr_body_value(f'workstreams/{ledger.run_id}/workstream-result.json')}",
         ]
     )
     for step in steps:
-        lines.append(f"- {step['name']}: {step['result_path']}")
+        lines.append(f"- {pr_body_value(step['name'])}: {pr_body_value(step['result_path'])}")
     lines.append("")
     return "\n".join(lines)
+
+
+def pr_body_value(value: Any) -> str:
+    return redact_text(str(value))
 
 
 def selected_work_records(state: dict[str, Any], result_status: str) -> list[dict[str, str]]:
@@ -566,11 +679,11 @@ def selected_work_records(state: dict[str, Any], result_status: str) -> list[dic
             continue
         records.append(
             {
-                "external_id": str(item.get("external_id") or ""),
-                "title": str(item.get("title") or ""),
-                "source_id": str(item.get("source_id") or ""),
-                "source_type": str(item.get("source_type") or ""),
-                "result": result_status,
+                "external_id": redact_text(str(item.get("external_id") or "")),
+                "title": redact_text(str(item.get("title") or "")),
+                "source_id": redact_text(str(item.get("source_id") or "")),
+                "source_type": redact_text(str(item.get("source_type") or "")),
+                "result": redact_text(result_status),
             }
         )
     return records
@@ -583,7 +696,8 @@ def review_status(state: dict[str, Any]) -> str:
         return "passed"
     if isinstance(status, str) and status:
         return status
-    if state.get("implementation", {}).get("status") == "implemented":
+    implementation = state.get("implementation") if isinstance(state.get("implementation"), dict) else {}
+    if implementation.get("status") == "implemented":
         return "implemented"
     return "selected"
 
@@ -606,6 +720,17 @@ def workstream_status_from_publication(publication: dict[str, Any]) -> str:
     return "failed_publication"
 
 
+def workstream_artifacts(ledger: "WorkstreamLedger") -> dict[str, str]:
+    artifacts = {
+        "workstream_result": "workstream-result.json",
+        "command": "command.json",
+        "publication": "publication-result.json",
+    }
+    if (ledger.path / "pr-body.md").is_file():
+        artifacts["pr_body"] = "pr-body.md"
+    return artifacts
+
+
 def failed_publication(exc: PublisherError, normalized: dict[str, Any]) -> dict[str, Any]:
     return {
         "schema_version": SCHEMA_VERSION,
@@ -616,6 +741,20 @@ def failed_publication(exc: PublisherError, normalized: dict[str, Any]) -> dict[
         "command": redact_artifact_value(exc.command),
         "stdout_excerpt": redact_text(exc.stdout[-2000:]),
         "stderr_excerpt": redact_text(exc.stderr[-2000:]),
+        "retry": retry_instructions(normalized, "latest"),
+    }
+
+
+def failed_publication_config(reason: str, normalized: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "status": "failed",
+        "enabled": True,
+        "reason": reason,
+        "returncode": None,
+        "command": [],
+        "stdout_excerpt": "",
+        "stderr_excerpt": "",
         "retry": retry_instructions(normalized, "latest"),
     }
 
