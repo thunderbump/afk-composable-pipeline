@@ -193,6 +193,52 @@ Unreachable or unauthenticated Beads workspaces block the workstream at
 selection and leave actionable `source_statuses` such as `skipped_unreachable`
 or `skipped_no_auth`.
 
+### Real Agent Container Contract
+
+For container/remote execution with `agent.type: real-agent-command`, mounts for
+agent auth/config state must be validated before the adapter runs:
+
+- `agent.codex_home` sets `CODEX_HOME`; must be an **absolute**, existing
+  directory outside the target checkout.
+- `agent.config_home` sets `XDG_CONFIG_HOME`; must be an **absolute**, existing
+  directory outside the target checkout.
+- `agent.env.PI_CONFIG_HOME` sets `PI_CONFIG_HOME`; must be an **absolute**,
+  existing directory outside the target checkout.
+
+If any mount is missing, unreachable, relative, or inside the checkout, the step
+fails early as `failed_invalid_payload` and does not execute the adapter.
+
+Minimal recipe fragment for remote/container portability (for `central-afk-pr.7`):
+
+```json
+{
+  "name": "implement",
+  "input": {
+    "guardrails": ["stay within the prepared checkout", "do not write secrets"],
+    "validation": { "profile": "tier1", "commands": [] },
+    "agent": {
+      "type": "real-agent-command",
+      "command": ["python3", "agent.py"],
+      "result_path": "agent-result.json",
+      "codex_home": "/work/mounts/codex-home",
+      "config_home": "/work/mounts/xdg-config",
+      "env": {
+        "PI_CONFIG_HOME": "/work/mounts/pi-config"
+      }
+    }
+  }
+}
+```
+
+Do not add token values to request JSON. `PI_TOKEN`, `OPENAI_API_KEY`, and other
+secret variables are rejected by contract validation or redacted from all ledger
+artifacts.
+Ledger artifacts keep mount path evidence for `agent.codex_home` and
+`agent.config_home` and `PI_CONFIG_HOME` while keeping secret-bearing values redacted.
+`PI_CONFIG_HOME` is validated as an existing mount path before execution and
+the sanitized mount evidence appears in `job-capsule.agent_mounts` as
+`codex_home`, `config_home`, and `pi_config_home` paths.
+
 ## Ledger Artifacts
 
 Each invocation writes a new run directory:
