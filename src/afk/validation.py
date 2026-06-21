@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -24,6 +25,7 @@ class WorkerRuntimeError(RuntimeError):
         stderr: str = "",
         returncode: int | None = None,
         timed_out: bool = False,
+        command: list[str] | None = None,
     ):
         super().__init__(message)
         self.message = message
@@ -31,6 +33,7 @@ class WorkerRuntimeError(RuntimeError):
         self.stderr = stderr
         self.returncode = returncode
         self.timed_out = timed_out
+        self.command = list(command) if isinstance(command, list) else None
 
 
 def validate_step(context: Any) -> dict[str, Any]:
@@ -84,7 +87,7 @@ def validate(
                 classification="protocol_failure",
                 summary=raw_payload["message"],
                 raw_result=None,
-                adapter=adapter_record(request["worker"], exc.returncode, exc.timed_out),
+                adapter=adapter_record(request["worker"], exc.returncode, exc.timed_out, command=exc.command),
                 stdout=stdout,
                 stderr=stderr,
             )
@@ -96,7 +99,7 @@ def validate(
             classification="timeout" if exc.timed_out else "runtime_failure",
             summary=exc.message,
             raw_result=None,
-            adapter=adapter_record(request["worker"], exc.returncode, exc.timed_out),
+            adapter=adapter_record(request["worker"], exc.returncode, exc.timed_out, command=exc.command),
             stdout=stdout,
             stderr=stderr,
         )
@@ -121,7 +124,12 @@ def validate(
             classification=classification,
             summary=raw_payload["message"],
             raw_result=None,
-            adapter=adapter_record(request["worker"], adapter_result["returncode"], False),
+            adapter=adapter_record(
+                request["worker"],
+                adapter_result["returncode"],
+                False,
+                command=adapter_result.get("command"),
+            ),
             stdout=stdout,
             stderr=stderr,
         )
@@ -132,7 +140,12 @@ def validate(
     raw_result = raw_payload["payload"]
     normalized = normalize_worker_payload(
         raw_result,
-        adapter=adapter_record(request["worker"], adapter_result["returncode"], False),
+        adapter=adapter_record(
+            request["worker"],
+            adapter_result["returncode"],
+            False,
+            command=adapter_result.get("command"),
+        ),
         stdout=stdout,
         stderr=stderr,
     )
@@ -359,7 +372,7 @@ def run_command_adapter(
             timeout=worker["timeout_seconds"],
         )
     except OSError as exc:
-        raise WorkerRuntimeError(str(exc), stderr=str(exc), returncode=None) from exc
+        raise WorkerRuntimeError(str(exc), stderr=str(exc), returncode=None, command=command) from exc
     except subprocess.TimeoutExpired as exc:
         stdout = exc.stdout if isinstance(exc.stdout, str) else ""
         stderr = exc.stderr if isinstance(exc.stderr, str) else ""
@@ -369,8 +382,10 @@ def run_command_adapter(
             stderr=stderr or "worker command timed out",
             returncode=None,
             timed_out=True,
+            command=command,
         ) from exc
     return {
+        "command": command,
         "returncode": completed.returncode,
         "stdout": completed.stdout,
         "stderr": completed.stderr,
@@ -565,28 +580,48 @@ def normalized_worker_result(
     stdout: str,
     stderr: str,
 ) -> dict[str, Any]:
+    failures = failure_records(raw_result)
+    evidence = {
+        "stdout_path": "stdout.log",
+        "stderr_path": "stderr.log",
+        "stdout_excerpt": stdout[-2000:],
+        "stderr_excerpt": stderr[-2000:],
+    }
+    actionable_failures = actionable_failure_records(
+        status=status,
+        classification=classification,
+        summary=summary,
+        failures=failures,
+        adapter=adapter,
+        evidence=evidence,
+    )
     return {
         "schema_version": SCHEMA_VERSION,
         "status": status,
         "classification": classification,
         "summary": summary,
-        "failures": failure_records(raw_result),
+        "actionable_summary": actionable_summary(status, summary, actionable_failures),
+        "actionable_failures": actionable_failures,
+        "failures": failures,
         "adapter": adapter,
-        "evidence": {
-            "stdout_path": "stdout.log",
-            "stderr_path": "stderr.log",
-            "stdout_excerpt": stdout[-2000:],
-            "stderr_excerpt": stderr[-2000:],
-        },
+        "evidence": evidence,
     }
 
 
-def adapter_record(worker: dict[str, Any], returncode: int | None, timed_out: bool) -> dict[str, Any]:
+def adapter_record(
+    worker: dict[str, Any],
+    returncode: int | None,
+    timed_out: bool,
+    *,
+    command: list[str] | None = None,
+) -> dict[str, Any]:
     adapter = {
         "type": worker["type"],
         "returncode": returncode,
         "timed_out": timed_out,
     }
+    if command is not None:
+        adapter["command"] = redact_artifact_value(command)
     if worker.get("host"):
         adapter["host"] = worker["host"]
     return adapter
@@ -608,6 +643,260 @@ def failure_records(raw_result: dict[str, Any] | None) -> list[Any]:
     ]
 
 
+def actionable_failure_records(
+    *,
+    status: str,
+    classification: str,
+    summary: str,
+    failures: list[Any],
+    adapter: dict[str, Any],
+    evidence: dict[str, Any],
+) -> list[dict[str, Any]]:
+    records = [summarize_failure_record(failure) for failure in failures if isinstance(failure, dict)]
+    if records:
+        return records
+    if status == "validated":
+        return []
+    return [summarize_adapter_failure(status, classification, summary, adapter, evidence)]
+
+
+def summarize_failure_record(failure: dict[str, Any]) -> dict[str, Any]:
+    log_path = string_field(failure, "log") or ""
+    reason = string_field(failure, "reason") or ""
+    excerpt = log_failure_excerpt(log_path, default_excerpt=reason)
+    return {
+        "name": string_field(failure, "name") or "",
+        "status": string_field(failure, "status") or "",
+        "category": classify_failure_record(failure, excerpt),
+        "reason": reason,
+        "command": string_field(failure, "command") or "",
+        "exit_code": integer_field(failure.get("exitCode")),
+        "log_path": log_path,
+        "excerpt": excerpt,
+    }
+
+
+def summarize_adapter_failure(
+    status: str,
+    classification: str,
+    summary: str,
+    adapter: dict[str, Any],
+    evidence: dict[str, Any],
+) -> dict[str, Any]:
+    log_path, excerpt = adapter_failure_excerpt(summary, evidence)
+    return {
+        "name": "worker",
+        "status": status,
+        "category": classify_adapter_failure(status, classification, excerpt),
+        "reason": summary,
+        "command": display_command(adapter.get("command")),
+        "exit_code": integer_field(adapter.get("returncode")),
+        "log_path": log_path,
+        "excerpt": excerpt,
+    }
+
+
+def actionable_summary(status: str, summary: str, failures: list[dict[str, Any]]) -> str:
+    if not failures:
+        return summary
+    if not is_generic_failure_summary(status, summary):
+        return summary
+    return "; ".join(summary_line(item) for item in failures[:2])
+
+
+def summary_line(item: dict[str, Any]) -> str:
+    name = string_field(item, "name") or "worker"
+    category = string_field(item, "category") or "failure"
+    excerpt = string_field(item, "excerpt") or string_field(item, "reason") or ""
+    log_path = string_field(item, "log_path") or ""
+    exit_code = integer_field(item.get("exit_code"))
+    parts = [f"{name} [{category}]"]
+    if exit_code is not None:
+        parts.append(f"exit {exit_code}")
+    if log_path:
+        parts.append(log_path)
+    if excerpt:
+        parts.append(excerpt.replace("\n", " "))
+    return ": ".join(parts)
+
+
+def is_generic_failure_summary(status: str, summary: str) -> bool:
+    generic = {
+        "",
+        "failed_validation",
+        "failed_timeout",
+        "failed_runtime",
+        "failed_protocol",
+        "failed_missing_result",
+        "skipped_profile",
+        "worker command timed out",
+        "worker result file was not produced",
+        "worker result file could not be read",
+        "worker result file is not valid JSON",
+        "worker result file must contain an object",
+        "worker result file could not be sanitized",
+    }
+    return summary.strip() in generic or summary.strip() == status
+
+
+def classify_failure_record(failure: dict[str, Any], excerpt: str) -> str:
+    category = string_field(failure, "category") or ""
+    status = string_field(failure, "status") or ""
+    if category == "prerequisite_failed" or status in {"skip", "skipped"}:
+        return "prerequisite_skip"
+    kind = excerpt_kind(excerpt)
+    if kind in {"compiler", "test"}:
+        return kind
+    return category or "validation"
+
+
+def classify_adapter_failure(status: str, classification: str, excerpt: str) -> str:
+    if status == "failed_timeout" or classification == "timeout":
+        return "timeout"
+    if status == "failed_missing_result" or classification == "missing_worker_result":
+        return "missing_result"
+    excerpt_type = excerpt_kind(excerpt)
+    if excerpt_type in {"compiler", "test"}:
+        return excerpt_type
+    if classification == "runtime_failure":
+        return "runtime"
+    if classification == "protocol_failure":
+        return "protocol"
+    return classification or status
+
+
+def adapter_failure_excerpt(summary: str, evidence: dict[str, Any]) -> tuple[str, str]:
+    candidates = [
+        (
+            string_field(evidence, "stdout_path") or "stdout.log",
+            string_field(evidence, "stdout_excerpt") or "",
+        ),
+        (
+            string_field(evidence, "stderr_path") or "stderr.log",
+            string_field(evidence, "stderr_excerpt") or "",
+        ),
+    ]
+    for path, text in candidates:
+        excerpt = text_excerpt(text, default_excerpt="")
+        if excerpt and excerpt != summary:
+            return path, excerpt
+    for path, text in candidates:
+        excerpt = text_excerpt(text, default_excerpt="")
+        if excerpt:
+            return path, excerpt
+    fallback_path = string_field(evidence, "stderr_path") or string_field(evidence, "stdout_path") or "stderr.log"
+    return fallback_path, redact_text(summary)
+
+
+def log_failure_excerpt(log_path: str, *, default_excerpt: str) -> str:
+    if not log_path:
+        return redact_text(default_excerpt)
+    try:
+        text = Path(log_path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return redact_text(default_excerpt)
+    return text_excerpt(text, default_excerpt=default_excerpt)
+
+
+def text_excerpt(text: str, *, default_excerpt: str) -> str:
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        kind = actionable_line_kind(line)
+        if kind is None:
+            continue
+        excerpt = excerpt_from_lines(lines, index, kind)
+        if excerpt:
+            return redact_text(excerpt)
+    return redact_text(default_excerpt or first_informative_line(lines))
+
+
+def excerpt_from_lines(lines: list[str], start: int, kind: str) -> str:
+    line = lines[start].strip()
+    if not line:
+        return ""
+    if line.lower().startswith("reason:"):
+        return line.split(":", 1)[1].strip()
+    excerpt_lines = [line]
+    for candidate in lines[start + 1 : start + 4]:
+        stripped = candidate.strip()
+        if not stripped:
+            break
+        lowered = stripped.lower()
+        if lowered.startswith(("step:", "status:", "category:", "command:", "exitcode:", "startedat:", "endedat:")):
+            break
+        if lowered.startswith("preset cmake variables"):
+            break
+        if is_warning_only_line(lowered):
+            break
+        if actionable_line_kind(stripped) in {kind, "generic"}:
+            excerpt_lines.append(stripped)
+            continue
+        break
+    return "\n".join(excerpt_lines)
+
+
+def actionable_line_kind(line: str) -> str | None:
+    stripped = line.strip()
+    if not stripped:
+        return None
+    lowered = stripped.lower()
+    if is_warning_only_line(lowered):
+        return None
+    if lowered.startswith("reason:"):
+        return "generic"
+    if any(token in lowered for token in ("cmake error", "fatal error", "undefined reference", "ld: error")):
+        return "compiler"
+    if re.search(r"(^|[^a-z])error:", lowered):
+        return "compiler"
+    if any(token in lowered for token in ("traceback (most recent call last):", "assertionerror", "failed:", "fail:")):
+        return "test"
+    if any(token in lowered for token in ("timed out", "exception", "permission denied", "no such file or directory")):
+        return "generic"
+    if " failed" in lowered or lowered.startswith("failed "):
+        return "test"
+    return None
+
+
+def excerpt_kind(excerpt: str) -> str:
+    lowered = excerpt.lower()
+    if any(token in lowered for token in ("cmake error", "fatal error", "undefined reference", "ld: error")):
+        return "compiler"
+    if re.search(r"(^|[^a-z])error:", lowered):
+        return "compiler"
+    if any(token in lowered for token in ("traceback (most recent call last):", "assertionerror", "failed:", "fail:")):
+        return "test"
+    return "generic"
+
+
+def is_warning_only_line(line: str) -> bool:
+    return "warning" in line and not any(token in line for token in ("error", "fail", "exception", "traceback"))
+
+
+def first_informative_line(lines: list[str]) -> str:
+    for line in lines:
+        stripped = line.strip()
+        if stripped and not is_warning_only_line(stripped.lower()):
+            return stripped
+    for line in lines:
+        if line.strip():
+            return line.strip()
+    return ""
+
+
+def display_command(command: Any) -> str:
+    if isinstance(command, list):
+        return " ".join(str(item) for item in command)
+    if isinstance(command, str):
+        return command
+    return ""
+
+
+def integer_field(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
+
+
 def validate_output(
     request: dict[str, Any],
     worker_request: dict[str, Any],
@@ -618,7 +907,8 @@ def validate_output(
         "schema_version": SCHEMA_VERSION,
         "status": normalized["status"],
         "classification": normalized["classification"],
-        "summary": normalized["summary"],
+        "summary": normalized["actionable_summary"],
+        "actionable_failures": normalized["actionable_failures"],
         "validation": request["validation"],
         "checkout": request["checkout"],
         "worker_request": redact_artifact_value(worker_request),

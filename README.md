@@ -110,7 +110,10 @@ adapter is supplied.
 Validation failure categories distinguish missing worker results, adapter
 timeouts/runtime failures, worker-reported validation failures, and skipped
 profiles. Worker request/result payloads and stdout/stderr excerpts are
-redacted before being stored in the ledger.
+redacted before being stored in the ledger. Failed validations also record
+`actionable_failures` with the failing command, exit code, exact log path, and
+first actionable excerpt so follow-up work does not need manual `rg`/`tail`
+inspection of worker logs.
 
 Run final review against explicit implementation and validation evidence:
 
@@ -401,9 +404,10 @@ the checkout provenance and a pointer to `publication-result.json`, which stores
 the publication result separately. For `implement`, it contains normalized work,
 checkout, agent, and git metadata plus pointers to `job-capsule.json` and
 `agent-result.json`. For `validate`, it contains normalized checkout,
-validation, adapter, and worker evidence plus pointers to `worker-request.json`
-and `worker-result.json`. For `review`, it contains the normalized final review
-status plus pointers to `evidence-pack.json`, `reviewer-request.json`,
+validation, adapter, worker evidence, and derived `actionable_failures` plus
+pointers to `worker-request.json` and `worker-result.json`. For `review`, it
+contains the normalized final review status plus pointers to
+`evidence-pack.json`, `reviewer-request.json`,
 `reviewer-result.json`, and `review-summary.md`.
 
 `run-workstream` records one workstream directory and one normal `runs/<run-id>/`
