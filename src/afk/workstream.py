@@ -99,7 +99,7 @@ def run_workstream(
         stop_reason = terminal_stop_reason(step_name, state)
         if stop_reason:
             state["stop_reason"] = stop_reason
-            state["next_allowed_command"] = next_allowed_command_for_terminal_stop(state)
+            state["next_allowed_command"] = next_allowed_command_for_terminal_stop(state, normalized)
             break
         blocked_reason = workflow_order_blocking_reason(step_name, state)
         if blocked_reason:
@@ -140,7 +140,7 @@ def run_workstream(
                 selected_work = selected_work_records(state, terminal_selected_work_status(state))
                 publication = validated_unpublished_publication(
                     state["stop_reason"],
-                    next_allowed_command=state["next_allowed_command"] or "publish",
+                    next_allowed_command=state["next_allowed_command"] or rerun_workstream_command(normalized),
                 )
             else:
                 selected_work = selected_work_records(state, gated_selected_work_status(state))
@@ -378,9 +378,9 @@ def terminal_stop_reason(step_name: str, state: dict[str, Any]) -> str:
     return ""
 
 
-def next_allowed_command_for_terminal_stop(state: dict[str, Any]) -> str:
+def next_allowed_command_for_terminal_stop(state: dict[str, Any], normalized: dict[str, Any]) -> str:
     if review_passed(state) or has_current_validated_evidence(state):
-        return "publish"
+        return rerun_workstream_command(normalized)
     return "none"
 
 
@@ -506,7 +506,7 @@ def publish_terminal_pr(
     if not publisher.get("enabled", True):
         return validated_unpublished_publication(
             "workstream validated and reviewed, but publisher is disabled",
-            next_allowed_command="publish",
+            next_allowed_command=rerun_workstream_command(normalized),
         )
     try:
         config = normalize_publisher_config(publisher, normalized)

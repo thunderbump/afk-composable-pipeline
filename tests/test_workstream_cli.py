@@ -1010,7 +1010,10 @@ Path({str(fake_calls)!r}).write_text("gh should not run\\n", encoding="utf-8")
                 ["select-work", "prepare-checkout", "implement", "validate"],
             )
             self.assertIn("validated terminal state", result["terminal_reason"])
-            self.assertEqual(result["next_allowed_command"], "publish")
+            self.assertEqual(
+                result["next_allowed_command"],
+                "afk run-workstream --workstream-id central-lve.9 --ledger <ledger> --input <recipe>",
+            )
             self.assertFalse(fake_calls.exists())
 
     def test_workstream_implement_uses_selected_work_and_prepared_checkout_over_recipe_refs(self):
@@ -1707,7 +1710,10 @@ Path({str(fake_calls)!r}).write_text("gh should not run\\n", encoding="utf-8")
 
             self.assertEqual(summary["status"], "validated-unpublished")
             self.assertEqual(result["publication"]["status"], "validated-unpublished")
-            self.assertEqual(result["next_allowed_command"], "publish")
+            self.assertEqual(
+                result["next_allowed_command"],
+                "afk run-workstream --workstream-id central-lve.9 --ledger <ledger> --input <recipe>",
+            )
             self.assertNotIn("pr_body", result["artifacts"])
             self.assertFalse(result_path.parent.joinpath("pr-body.md").exists())
             self.assertFalse(fake_calls.exists())
