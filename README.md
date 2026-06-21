@@ -156,15 +156,18 @@ The recipe schema is intentionally small:
   with `gh pr edit`. `git.path`/`gh.path` may point at fake command shims for
   offline tests. `git.push: true` pushes `HEAD` to the configured PR head before
   invoking `gh`.
-- Publisher auth stays on the minimal scrubbed environment by default. To
-  publish a real GitHub PR deliberately, mount a GitHub CLI config directory
-  outside the checkout and set `publisher.gh.auth.config_dir` to that absolute
-  path. AFK passes it to `gh` through `GH_CONFIG_DIR` after validating that the
-  directory exists and is outside the target checkout.
+- AFK always runs `gh auth status --hostname github.com` before any `git push`
+  or `gh pr create/edit` attempt. Publisher auth stays on the minimal scrubbed
+  environment by default, so missing GitHub auth blocks publication before
+  push with terminal evidence and retry instructions. To publish a real GitHub
+  PR deliberately, mount a GitHub CLI config directory outside the checkout and
+  set `publisher.gh.auth.config_dir` to that absolute path. AFK passes it to
+  `gh` through `GH_CONFIG_DIR` after validating that the directory exists and
+  is outside the target checkout.
 - Do not place raw token values in recipes. `publisher.gh.token`,
-  `publisher.gh.github_token`, and similar ad hoc secret-bearing auth keys are
-  rejected. Ambient `GH_TOKEN`, `GITHUB_TOKEN`, and similar variables are not
-  inherited by publisher commands.
+  `publisher.gh.github_token`, `publisher.gh.access_token`, `publisher.gh.api_key`,
+  and similar ad hoc secret-bearing auth keys are rejected. Ambient `GH_TOKEN`,
+  `GITHUB_TOKEN`, and similar variables are not inherited by publisher commands.
 
 Publication is blocked unless at least one final `validate` step produced
 `validated` evidence and the final `review` step produced `passed`. The PR body

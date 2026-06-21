@@ -249,20 +249,19 @@ import os
 import sys
 from pathlib import Path
 
-body_file = sys.argv[sys.argv.index("--body-file") + 1]
-Path({str(fake_calls)!r}).open("a", encoding="utf-8").write(
-    json.dumps(
-        {{
-            "tool": "gh",
-            "argv": sys.argv[1:],
-            "body": Path(body_file).read_text(encoding="utf-8"),
-            "publisher_secret": os.environ.get("AFK_PUBLISHER_SECRET", ""),
-            "gh_token": os.environ.get("GH_TOKEN", ""),
-            "github_token": os.environ.get("GITHUB_TOKEN", ""),
-        }}
-    )
-    + "\\n"
-)
+record = {{
+    "tool": "gh",
+    "argv": sys.argv[1:],
+    "publisher_secret": os.environ.get("AFK_PUBLISHER_SECRET", ""),
+    "gh_token": os.environ.get("GH_TOKEN", ""),
+    "github_token": os.environ.get("GITHUB_TOKEN", ""),
+}}
+if "--body-file" in sys.argv:
+    body_file = sys.argv[sys.argv.index("--body-file") + 1]
+    record["body"] = Path(body_file).read_text(encoding="utf-8")
+Path({str(fake_calls)!r}).open("a", encoding="utf-8").write(json.dumps(record) + "\\n")
+if sys.argv[1:4] == ["auth", "status", "--hostname"]:
+    sys.exit(0)
 print("https://github.example/pr/123")
 sys.exit(0)
 """,
@@ -340,20 +339,23 @@ sys.exit(0)
             git_calls = [call for call in calls if call["tool"] == "git"]
             gh_calls = [call for call in calls if call["tool"] == "gh"]
             self.assertEqual(len(git_calls), 1)
-            self.assertEqual(len(gh_calls), 1)
+            self.assertEqual(len(gh_calls), 2)
             self.assertEqual(git_calls[0]["publisher_secret"], "")
-            self.assertEqual(gh_calls[0]["publisher_secret"], "")
+            for gh_call in gh_calls:
+                self.assertEqual(gh_call["publisher_secret"], "")
             self.assertEqual(git_calls[0]["gh_token"], "")
             self.assertEqual(git_calls[0]["github_token"], "")
-            self.assertEqual(gh_calls[0]["gh_token"], "")
-            self.assertEqual(gh_calls[0]["github_token"], "")
+            for gh_call in gh_calls:
+                self.assertEqual(gh_call["gh_token"], "")
+                self.assertEqual(gh_call["github_token"], "")
             self.assertEqual(git_calls[0]["cwd"], str(checkout))
             self.assertEqual(
                 git_calls[0]["argv"],
                 ["push", "origin", "HEAD:refs/heads/afk/workstream-terminal-pr"],
             )
-            self.assertEqual(gh_calls[0]["argv"][0:3], ["pr", "create", "--repo"])
-            body = gh_calls[0]["body"]
+            self.assertEqual(gh_calls[0]["argv"][0:3], ["auth", "status", "--hostname"])
+            self.assertEqual(gh_calls[1]["argv"][0:3], ["pr", "create", "--repo"])
+            body = gh_calls[1]["body"]
             self.assertIn("Workstream: central-lve.9", body)
             self.assertIn("Parent: central-lve", body)
             self.assertIn("central-lve.9 - Compose workstream recipe and terminal PR publisher", body)
@@ -483,6 +485,13 @@ sys.exit(0)
                     "token", "ghp_recipe_secret_1234567890"
                 ),
                 "publisher.gh.token is not supported; mount gh auth config instead",
+            ),
+            (
+                "secret_like_top_level_key_rejected",
+                lambda publisher, _temp_path, _checkout: publisher["gh"].__setitem__(
+                    "access_token", "ghp_recipe_secret_1234567890"
+                ),
+                "publisher.gh.access_token is not supported; mount gh auth config instead",
             ),
             (
                 "relative_config_dir",
@@ -655,6 +664,92 @@ sys.exit(1)
             self.assertEqual(calls[0]["gh_token"], "")
             self.assertEqual(calls[0]["github_token"], "")
 
+    def test_workstream_default_publisher_path_preflights_gh_auth_before_push_and_blocks_on_failure(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repo = temp_path / "repo-src"
+            checkout = temp_path / "checkout"
+            ledger = temp_path / "ledger"
+            fake_calls = temp_path / "fake-calls.jsonl"
+            init_repo(repo)
+            fake_git = temp_path / "publisher-git"
+            fake_gh = temp_path / "publisher-gh"
+            stderr_secret = "ghp_default_auth_status_failure_secret_1234567890"
+            write_executable(
+                fake_git,
+                f"""#!{sys.executable}
+from pathlib import Path
+Path({str(fake_calls)!r}).write_text("git should not run\\n", encoding="utf-8")
+""",
+            )
+            write_executable(
+                fake_gh,
+                f"""#!{sys.executable}
+import json
+import os
+import sys
+from pathlib import Path
+
+Path({str(fake_calls)!r}).open("a", encoding="utf-8").write(
+    json.dumps(
+        {{
+            "argv": sys.argv[1:],
+            "gh_config_dir": os.environ.get("GH_CONFIG_DIR", ""),
+            "gh_token": os.environ.get("GH_TOKEN", ""),
+            "github_token": os.environ.get("GITHUB_TOKEN", ""),
+        }}
+    )
+    + "\\n"
+)
+print("auth failed {stderr_secret}", file=sys.stderr)
+sys.exit(1)
+""",
+            )
+            recipe = successful_recipe(temp_path, repo, checkout, fake_git, fake_gh)
+
+            completed = run_afk(
+                "run-workstream",
+                "--workstream-id",
+                "central-lve.9",
+                "--input",
+                json.dumps(recipe),
+                "--ledger",
+                str(ledger),
+                env_overrides={
+                    "GIT_ALLOW_PROTOCOL": "file",
+                    "GIT_AUTHOR_NAME": "AFK Test",
+                    "GIT_AUTHOR_EMAIL": "afk-test@example.test",
+                    "GIT_COMMITTER_NAME": "AFK Test",
+                    "GIT_COMMITTER_EMAIL": "afk-test@example.test",
+                    "GH_TOKEN": "ghp_ambient_gh_token_secret_1234567890",
+                    "GITHUB_TOKEN": "github_pat_ambient_token_secret_12345678901234567890",
+                },
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            result_path = ledger / summary["result_path"]
+            result = json.loads(result_path.read_text(encoding="utf-8"))
+            publication_text = (result_path.parent / "publication-result.json").read_text(encoding="utf-8")
+            calls = [
+                json.loads(line)
+                for line in fake_calls.read_text(encoding="utf-8").splitlines()
+            ]
+
+            self.assertEqual(summary["status"], "failed_publication")
+            self.assertEqual(result["publication"]["status"], "failed")
+            self.assertEqual(result["publication"]["auth"]["source"], "minimal_env")
+            self.assertIn("gh auth status failed", result["publication"]["reason"])
+            self.assertIn("publisher.gh.auth.config_dir", result["publication"]["retry"])
+            self.assertEqual(result["publication"]["command"][1:3], ["auth", "status"])
+            self.assertNotIn(stderr_secret, publication_text)
+            self.assertIn("[REDACTED]", publication_text)
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(calls[0]["argv"][0:3], ["auth", "status", "--hostname"])
+            self.assertEqual(calls[0]["gh_config_dir"], "")
+            self.assertEqual(calls[0]["gh_token"], "")
+            self.assertEqual(calls[0]["github_token"], "")
+
     def test_workstream_review_uses_final_validation_artifacts_over_recipe_refs(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
@@ -686,17 +781,13 @@ import json
 import sys
 from pathlib import Path
 
-body_file = sys.argv[sys.argv.index("--body-file") + 1]
-Path({str(fake_calls)!r}).open("a", encoding="utf-8").write(
-    json.dumps(
-        {{
-            "tool": "gh",
-            "argv": sys.argv[1:],
-            "body": Path(body_file).read_text(encoding="utf-8"),
-        }}
-    )
-    + "\\n"
-)
+record = {{"tool": "gh", "argv": sys.argv[1:]}}
+if "--body-file" in sys.argv:
+    body_file = sys.argv[sys.argv.index("--body-file") + 1]
+    record["body"] = Path(body_file).read_text(encoding="utf-8")
+Path({str(fake_calls)!r}).open("a", encoding="utf-8").write(json.dumps(record) + "\\n")
+if sys.argv[1:4] == ["auth", "status", "--hostname"]:
+    sys.exit(0)
 print("https://github.example/pr/123")
 sys.exit(0)
 """,
@@ -918,17 +1009,13 @@ import json
 import sys
 from pathlib import Path
 
-body_file = sys.argv[sys.argv.index("--body-file") + 1]
-Path({str(fake_calls)!r}).open("a", encoding="utf-8").write(
-    json.dumps(
-        {{
-            "tool": "gh",
-            "argv": sys.argv[1:],
-            "body": Path(body_file).read_text(encoding="utf-8"),
-        }}
-    )
-    + "\\n"
-)
+record = {{"tool": "gh", "argv": sys.argv[1:]}}
+if "--body-file" in sys.argv:
+    body_file = sys.argv[sys.argv.index("--body-file") + 1]
+    record["body"] = Path(body_file).read_text(encoding="utf-8")
+Path({str(fake_calls)!r}).open("a", encoding="utf-8").write(json.dumps(record) + "\\n")
+if sys.argv[1:4] == ["auth", "status", "--hostname"]:
+    sys.exit(0)
 print("https://github.example/pr/123")
 sys.exit(0)
 """,
@@ -1307,17 +1394,13 @@ import json
 import sys
 from pathlib import Path
 
-body_file = sys.argv[sys.argv.index("--body-file") + 1]
-Path({str(fake_calls)!r}).open("a", encoding="utf-8").write(
-    json.dumps(
-        {{
-            "tool": "gh",
-            "argv": sys.argv[1:],
-            "body": Path(body_file).read_text(encoding="utf-8"),
-        }}
-    )
-    + "\\n"
-)
+record = {{"tool": "gh", "argv": sys.argv[1:]}}
+if "--body-file" in sys.argv:
+    body_file = sys.argv[sys.argv.index("--body-file") + 1]
+    record["body"] = Path(body_file).read_text(encoding="utf-8")
+Path({str(fake_calls)!r}).open("a", encoding="utf-8").write(json.dumps(record) + "\\n")
+if sys.argv[1:4] == ["auth", "status", "--hostname"]:
+    sys.exit(0)
 print("https://github.example/pr/123")
 """,
             )
@@ -1353,10 +1436,12 @@ print("https://github.example/pr/123")
 
             self.assertEqual(result["publication"]["status"], "published")
             self.assertEqual(result["publication"]["mode"], "update")
-            self.assertEqual(len(calls), 1)
+            self.assertEqual(len(calls), 2)
             self.assertEqual(calls[0]["tool"], "gh")
-            self.assertEqual(calls[0]["argv"][0:4], ["pr", "edit", "123", "--repo"])
-            self.assertIn("central-lve.9 - Compose workstream recipe", calls[0]["body"])
+            self.assertEqual(calls[0]["argv"][0:3], ["auth", "status", "--hostname"])
+            self.assertEqual(calls[1]["tool"], "gh")
+            self.assertEqual(calls[1]["argv"][0:4], ["pr", "edit", "123", "--repo"])
+            self.assertIn("central-lve.9 - Compose workstream recipe", calls[1]["body"])
 
     def test_workstream_blocks_publication_when_final_review_fails(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1459,7 +1544,15 @@ sys.exit(9)
             write_executable(
                 fake_gh,
                 f"""#!{sys.executable}
+import json
+import sys
 from pathlib import Path
+
+Path({str(fake_calls)!r}).open("a", encoding="utf-8").write(
+    json.dumps({{"tool": "gh", "argv": sys.argv[1:]}}) + "\\n"
+)
+if sys.argv[1:4] == ["auth", "status", "--hostname"]:
+    sys.exit(0)
 Path({str(fake_calls)!r}).open("a", encoding="utf-8").write("gh should not run\\n")
 """,
             )
@@ -1497,7 +1590,8 @@ Path({str(fake_calls)!r}).open("a", encoding="utf-8").write("gh should not run\\
             self.assertIn("push rejected", result["publication"]["stderr_excerpt"])
             self.assertEqual(result["cleanup"], {"status": "clean", "resources": []})
             self.assertIn("afk run-workstream", result["retry"])
-            self.assertEqual([call["tool"] for call in calls], ["git"])
+            self.assertEqual([call["tool"] for call in calls], ["gh", "git"])
+            self.assertEqual(calls[0]["argv"][0:3], ["auth", "status", "--hostname"])
 
     def test_workstream_disabled_publisher_does_not_advertise_absent_pr_body(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1585,17 +1679,13 @@ import json
 import sys
 from pathlib import Path
 
-body_file = sys.argv[sys.argv.index("--body-file") + 1]
-Path({str(fake_calls)!r}).open("a", encoding="utf-8").write(
-    json.dumps(
-        {{
-            "tool": "gh",
-            "argv": sys.argv[1:],
-            "body": Path(body_file).read_text(encoding="utf-8"),
-        }}
-    )
-    + "\\n"
-)
+record = {{"tool": "gh", "argv": sys.argv[1:]}}
+if "--body-file" in sys.argv:
+    body_file = sys.argv[sys.argv.index("--body-file") + 1]
+    record["body"] = Path(body_file).read_text(encoding="utf-8")
+Path({str(fake_calls)!r}).open("a", encoding="utf-8").write(json.dumps(record) + "\\n")
+if sys.argv[1:4] == ["auth", "status", "--hostname"]:
+    sys.exit(0)
 print("https://github.example/pr/123")
 sys.exit(0)
 """,
@@ -1661,7 +1751,7 @@ sys.exit(0)
                 json.loads(line)
                 for line in fake_calls.read_text(encoding="utf-8").splitlines()
             ]
-            gh_body = next(call["body"] for call in calls if call["tool"] == "gh")
+            gh_body = next(call["body"] for call in calls if call["tool"] == "gh" and "body" in call)
 
             for body in (workstream_result_text, pr_body, gh_body):
                 self.assertNotIn(issue_secret, body)
@@ -1701,17 +1791,13 @@ import json
 import sys
 from pathlib import Path
 
-body_file = sys.argv[sys.argv.index("--body-file") + 1]
-Path({str(fake_calls)!r}).open("a", encoding="utf-8").write(
-    json.dumps(
-        {{
-            "tool": "gh",
-            "argv": sys.argv[1:],
-            "body": Path(body_file).read_text(encoding="utf-8"),
-        }}
-    )
-    + "\\n"
-)
+record = {{"tool": "gh", "argv": sys.argv[1:]}}
+if "--body-file" in sys.argv:
+    body_file = sys.argv[sys.argv.index("--body-file") + 1]
+    record["body"] = Path(body_file).read_text(encoding="utf-8")
+Path({str(fake_calls)!r}).open("a", encoding="utf-8").write(json.dumps(record) + "\\n")
+if sys.argv[1:4] == ["auth", "status", "--hostname"]:
+    sys.exit(0)
 print({stdout_secret!r})
 sys.exit(0)
 """,

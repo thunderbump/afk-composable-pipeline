@@ -11,7 +11,7 @@ from typing import Any, Callable
 
 from afk.contracts import ProjectContract
 from afk.jsonutil import canonical_json, sha256_json
-from afk.redaction import redact_artifact_value, redact_text
+from afk.redaction import is_secret_key, redact_artifact_value, redact_text
 from afk.registry import StepResult
 
 
@@ -477,14 +477,13 @@ def publish_terminal_pr(
     body = pr_body_markdown(normalized, state, steps, selected_work, ledger)
     ledger.write_text("pr-body.md", body)
     try:
-        if auth["configured"]:
-            run_publisher_command(
-                [config["gh_path"], "auth", "status", "--hostname", "github.com"],
-                cwd=checkout_path,
-                tool="gh",
-                auth=auth,
-                message_on_failure="gh auth status failed",
-            )
+        run_publisher_command(
+            [config["gh_path"], "auth", "status", "--hostname", "github.com"],
+            cwd=checkout_path,
+            tool="gh",
+            auth=auth,
+            message_on_failure="gh auth status failed",
+        )
         if config["push"]:
             run_publisher_command(
                 [config["git_path"], "push", config["remote"], f"HEAD:refs/heads/{config['head']}"],
@@ -583,9 +582,11 @@ def normalize_publisher_config(publisher: dict[str, Any], normalized: dict[str, 
 
 
 def normalize_publisher_gh_auth(gh: dict[str, Any]) -> dict[str, Any]:
-    for forbidden in ("token", "gh_token", "github_token"):
-        if forbidden in gh:
-            raise WorkstreamError(f"publisher.gh.{forbidden} is not supported; mount gh auth config instead")
+    for key in gh:
+        if key in {"path", "auth"}:
+            continue
+        if is_secret_key(key):
+            raise WorkstreamError(f"publisher.gh.{key} is not supported; mount gh auth config instead")
     raw_auth = gh.get("auth")
     if raw_auth is None:
         return {"configured": False, "source": "minimal_env", "config_dir": ""}
