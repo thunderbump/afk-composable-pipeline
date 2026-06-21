@@ -741,12 +741,25 @@ def actionable_summary(status: str, summary: str, failures: list[dict[str, Any]]
         return summary
     first = failures[0]
     if not is_generic_failure_summary(status, summary):
-        if string_field(first, "name") == "worker":
-            command = compact_command(string_field(first, "command") or "")
-            if command and command not in summary:
-                return f"{summary}; cmd: {command}"
+        details = compact_failure_summary(first)
+        if details and details not in summary:
+            return f"{summary}; {details}"
         return summary
     return "; ".join(summary_line(item) for item in failures[:2])
+
+
+def compact_failure_summary(item: dict[str, Any]) -> str:
+    command = compact_command(string_field(item, "command") or "")
+    exit_code = integer_field(item.get("exit_code"))
+    log_path = string_field(item, "log_path") or ""
+    parts = []
+    if command:
+        parts.append(f"cmd: {command}")
+    if exit_code is not None:
+        parts.append(f"exit: {exit_code}")
+    if log_path:
+        parts.append(log_path)
+    return ", ".join(parts)
 
 
 def summary_line(item: dict[str, Any]) -> str:

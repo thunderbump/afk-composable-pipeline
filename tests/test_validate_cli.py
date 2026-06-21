@@ -886,36 +886,37 @@ class ValidateCliTest(unittest.TestCase):
             checkout = temp_path / "checkout"
             start_commit = init_checkout(checkout)
             ledger = temp_path / "ledger"
-            worker_code = textwrap.dedent(
-                """
-                import json
-                import os
-                import sys
-                from pathlib import Path
-
-                Path(os.environ["AFK_WORKER_RESULT"]).write_text(
-                    json.dumps(
-                        {
-                            "profile": "tier3-harness",
-                            "status": "fail",
-                            "failureCount": 1,
-                            "summary": "tier3 harness failed",
-                            "steps": [
-                                {
-                                    "name": "tier3_harness",
-                                    "status": "fail",
-                                    "category": "validation_failed",
-                                    "reason": "zone harness exited 1",
-                                }
-                            ],
-                        }
-                    ),
-                    encoding="utf-8",
-                )
-                print("validation_failed")
-                sys.exit(1)
-                """
-            ).strip()
+            worker_code = (
+                "import json\n"
+                "import os\n"
+                "import sys\n"
+                "from pathlib import Path\n"
+                "evidence_dir = Path(os.environ['AFK_WORKER_RESULT']).parent\n"
+                "steps_dir = evidence_dir / 'steps'\n"
+                "steps_dir.mkdir(parents=True, exist_ok=True)\n"
+                "step_log = steps_dir / 'tier3_harness.log'\n"
+                "step_log.write_text('zone harness exited 1\\n', encoding='utf-8')\n"
+                "payload = {\n"
+                "    'profile': 'tier3-harness',\n"
+                "    'status': 'fail',\n"
+                "    'failureCount': 1,\n"
+                "    'summary': 'tier3 harness failed',\n"
+                "    'steps': [\n"
+                "        {\n"
+                "            'name': 'tier3_harness',\n"
+                "            'status': 'fail',\n"
+                "            'category': 'validation_failed',\n"
+                "            'reason': 'zone harness exited 1',\n"
+                "            'command': 'python3 -m unittest tests.test_auth.AuthTest.test_login --failfast',\n"
+                "            'exitCode': 1,\n"
+                "            'log': str(step_log),\n"
+                "        }\n"
+                "    ],\n"
+                "}\n"
+                "Path(os.environ['AFK_WORKER_RESULT']).write_text(json.dumps(payload), encoding='utf-8')\n"
+                "print('validation_failed')\n"
+                "sys.exit(1)"
+            )
 
             completed = run_afk(
                 "run-step",
@@ -955,6 +956,13 @@ class ValidateCliTest(unittest.TestCase):
             self.assertEqual(
                 worker_result["result"]["normalized"]["failures"][0]["category"],
                 "validation_failed",
+            )
+            self.assertIn("tier3 harness failed", result["output"]["summary"])
+            self.assertIn("cmd:", result["output"]["summary"])
+            self.assertIn("exit:", result["output"]["summary"])
+            self.assertIn(
+                str(run_dir / "validation-evidence" / "steps" / "tier3_harness.log"),
+                result["output"]["summary"],
             )
 
     def test_validate_summarizes_compiler_failure_from_step_log_before_warning_tail(self):
