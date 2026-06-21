@@ -89,11 +89,18 @@ def run_workstream(
         "review": None,
         "cleanup": {"status": "unknown", "resources": []},
         "blocked_reason": "",
+        "stop_reason": "",
+        "next_allowed_command": "",
     }
     steps = []
 
     for step_spec in normalized["steps"]:
         step_name = step_spec["name"]
+        stop_reason = terminal_stop_reason(step_name, state)
+        if stop_reason:
+            state["stop_reason"] = stop_reason
+            state["next_allowed_command"] = next_allowed_command_for_terminal_stop(state)
+            break
         blocked_reason = workflow_order_blocking_reason(step_name, state)
         if blocked_reason:
             state["blocked_reason"] = blocked_reason
@@ -125,13 +132,20 @@ def run_workstream(
     if state["blocked_reason"]:
         selected_work = selected_work_records(state, review_status(state))
         publication = blocked_publication(state["blocked_reason"], normalized, run_id)
-        status = "blocked"
+        status = publication["status"]
     else:
         publication_gate = publication_gate_reason(state)
         if publication_gate:
-            selected_work = selected_work_records(state, gated_selected_work_status(state))
-            publication = blocked_publication(publication_gate, normalized, run_id)
-            status = "blocked"
+            if state["stop_reason"] and has_current_validated_evidence(state):
+                selected_work = selected_work_records(state, terminal_selected_work_status(state))
+                publication = validated_unpublished_publication(
+                    state["stop_reason"],
+                    next_allowed_command=state["next_allowed_command"] or "publish",
+                )
+            else:
+                selected_work = selected_work_records(state, gated_selected_work_status(state))
+                publication = blocked_publication(publication_gate, normalized, run_id)
+            status = publication["status"]
         else:
             selected_work = selected_work_records(state, review_status(state))
             publication = publish_terminal_pr(
@@ -143,6 +157,8 @@ def run_workstream(
                 ledger=ledger,
             )
             status = workstream_status_from_publication(publication)
+            if status == "validated-unpublished":
+                selected_work = selected_work_records(state, terminal_selected_work_status(state))
 
     result_payload = {
         "schema_version": SCHEMA_VERSION,
@@ -154,7 +170,9 @@ def run_workstream(
         "steps": steps,
         "selected_work": selected_work,
         "cleanup": state["cleanup"],
-        "retry": retry_instructions(normalized, run_id),
+        "retry": publication.get("retry", ""),
+        "terminal_reason": publication.get("reason", ""),
+        "next_allowed_command": publication.get("next_allowed_command", ""),
         "publication": publication,
         "artifacts": workstream_artifacts(ledger),
     }
@@ -349,6 +367,23 @@ def workflow_order_blocking_reason(step_name: str, state: dict[str, Any]) -> str
     return ""
 
 
+def terminal_stop_reason(step_name: str, state: dict[str, Any]) -> str:
+    if review_passed(state):
+        return f"workstream already reached terminal review state before {step_name}; no further workstream steps are allowed"
+    if step_name in {"select-work", "prepare-checkout", "implement"} and has_current_validated_evidence(state):
+        return (
+            f"workstream reached validated terminal state before {step_name}; "
+            "do not start a fresh work cycle for the same work item"
+        )
+    return ""
+
+
+def next_allowed_command_for_terminal_stop(state: dict[str, Any]) -> str:
+    if review_passed(state) or has_current_validated_evidence(state):
+        return "publish"
+    return "none"
+
+
 def selected_work_count(state: dict[str, Any]) -> int:
     selected_work = state.get("selected_work")
     return len(selected_work) if isinstance(selected_work, list) else 0
@@ -373,6 +408,17 @@ def implemented_after_commit(state: dict[str, Any]) -> str:
         return ""
     git_info = implementation.get("git") if isinstance(implementation.get("git"), dict) else {}
     return string_field(git_info, "after_commit") or ""
+
+
+def has_current_validated_evidence(state: dict[str, Any]) -> bool:
+    implemented_commit = implemented_after_commit(state)
+    if not implemented_commit:
+        return False
+    return any(
+        validation["output"].get("status") == "validated"
+        and validation_checkout_commit(validation) == implemented_commit
+        for validation in state["validations"]
+    )
 
 
 def blocking_reason_for_step(step_name: str, result: StepResult) -> str:
@@ -458,7 +504,10 @@ def publish_terminal_pr(
     if not isinstance(publisher, dict):
         return failed_publication_config("publisher must be an object", normalized)
     if not publisher.get("enabled", True):
-        return {"status": "skipped_disabled", "enabled": False}
+        return validated_unpublished_publication(
+            "workstream validated and reviewed, but publisher is disabled",
+            next_allowed_command="publish",
+        )
     try:
         config = normalize_publisher_config(publisher, normalized)
     except WorkstreamError as exc:
@@ -528,8 +577,11 @@ def publish_terminal_pr(
         "status": "published",
         "enabled": True,
         "mode": config["mode"],
+        "reason": "terminal PR published",
         "auth": auth_artifact,
         "url": successful_publisher_url(completed.stdout),
+        "next_allowed_command": "none",
+        "retry": "",
         "commands": {
             "gh": redact_artifact_value(command),
             "git_push": (
@@ -813,6 +865,11 @@ def review_status(state: dict[str, Any]) -> str:
     return "selected"
 
 
+def review_passed(state: dict[str, Any]) -> bool:
+    review = state.get("review") if isinstance(state.get("review"), dict) else {}
+    return review.get("status") == "passed"
+
+
 def gated_selected_work_status(state: dict[str, Any]) -> str:
     status = review_status(state)
     if status == "passed":
@@ -820,22 +877,43 @@ def gated_selected_work_status(state: dict[str, Any]) -> str:
     return status
 
 
+def terminal_selected_work_status(state: dict[str, Any]) -> str:
+    if review_passed(state) or has_current_validated_evidence(state):
+        return "validated"
+    return gated_selected_work_status(state)
+
+
 def blocked_publication(reason: str, normalized: dict[str, Any], run_id: str) -> dict[str, Any]:
+    next_allowed_command = rerun_workstream_command(normalized)
     return {
         "schema_version": SCHEMA_VERSION,
         "status": "blocked",
         "enabled": True,
         "reason": reason,
+        "next_allowed_command": next_allowed_command,
         "retry": retry_instructions(normalized, run_id),
+    }
+
+
+def validated_unpublished_publication(reason: str, *, next_allowed_command: str) -> dict[str, Any]:
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "status": "validated-unpublished",
+        "enabled": False,
+        "reason": reason,
+        "next_allowed_command": next_allowed_command,
+        "retry": "",
     }
 
 
 def workstream_status_from_publication(publication: dict[str, Any]) -> str:
     if publication["status"] == "published":
         return "published"
-    if publication["status"] == "skipped_disabled":
-        return "completed"
-    return "failed_publication"
+    if publication["status"] == "validated-unpublished":
+        return "validated-unpublished"
+    if publication["status"] == "blocked":
+        return "blocked"
+    return "failed-needs-human"
 
 
 def workstream_artifacts(ledger: "WorkstreamLedger") -> dict[str, str]:
@@ -855,9 +933,10 @@ def failed_publication(
     *,
     auth: dict[str, Any],
 ) -> dict[str, Any]:
+    next_allowed_command = rerun_workstream_command(normalized)
     return {
         "schema_version": SCHEMA_VERSION,
-        "status": "failed",
+        "status": "failed-needs-human",
         "enabled": True,
         "reason": exc.message,
         "auth": auth,
@@ -865,6 +944,7 @@ def failed_publication(
         "command": redact_artifact_value(exc.command),
         "stdout_excerpt": redact_text(exc.stdout[-2000:]),
         "stderr_excerpt": redact_text(exc.stderr[-2000:]),
+        "next_allowed_command": next_allowed_command,
         "retry": retry_instructions(normalized, "latest", auth_hint=True),
     }
 
@@ -875,9 +955,10 @@ def failed_publication_config(
     *,
     auth: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    next_allowed_command = rerun_workstream_command(normalized)
     return {
         "schema_version": SCHEMA_VERSION,
-        "status": "failed",
+        "status": "failed-needs-human",
         "enabled": True,
         "reason": reason,
         "auth": auth or {"configured": False, "source": "minimal_env"},
@@ -885,15 +966,16 @@ def failed_publication_config(
         "command": [],
         "stdout_excerpt": "",
         "stderr_excerpt": "",
+        "next_allowed_command": next_allowed_command,
         "retry": retry_instructions(normalized, "latest", auth_hint=True),
     }
 
 
 def retry_instructions(normalized: dict[str, Any], run_id: str, auth_hint: bool = False) -> str:
+    rerun_command = rerun_workstream_command(normalized)
     instructions = (
         "Fix the failed evidence, keep the shared review branch, and rerun "
-        f"afk run-workstream --workstream-id {normalized['workstream_id']} --ledger <ledger> "
-        f"--input <recipe>; previous workstream run: {run_id}"
+        f"{rerun_command}; previous workstream run: {run_id}"
     )
     if auth_hint:
         instructions += (
@@ -901,6 +983,13 @@ def retry_instructions(normalized: dict[str, Any], run_id: str, auth_hint: bool 
             "and set publisher.gh.auth.config_dir in the recipe before rerunning"
         )
     return instructions
+
+
+def rerun_workstream_command(normalized: dict[str, Any]) -> str:
+    return (
+        f"afk run-workstream --workstream-id {normalized['workstream_id']} --ledger <ledger> "
+        "--input <recipe>"
+    )
 
 
 def checkout_path_from_state(state: dict[str, Any]) -> Path:

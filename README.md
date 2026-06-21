@@ -391,10 +391,12 @@ status plus pointers to `evidence-pack.json`, `reviewer-request.json`,
 `run-workstream` records one workstream directory and one normal `runs/<run-id>/`
 directory for each composed step. `workstream-result.json` lists every step run,
 its ledger result path, the generated equivalent `afk run-step ...` command,
-selected work result summaries, cleanup status, retry instructions, and terminal
-PR publication status. `publication-result.json` records a blocked/skipped/
-failed/published publisher result. `pr-body.md` is written before terminal PR
-commands run, so fake/offline publisher tests can inspect the exact body.
+selected work result summaries, cleanup status, terminal reason, next allowed
+command, retry instructions, and terminal PR publication status.
+`publication-result.json` records one of four explicit terminal states:
+`blocked`, `validated-unpublished`, `failed-needs-human`, or `published`.
+`pr-body.md` is written before terminal PR commands run, so fake/offline
+publisher tests can inspect the exact body.
 
 ## Development
 
