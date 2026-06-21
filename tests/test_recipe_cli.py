@@ -386,8 +386,8 @@ sys.exit(9)
 
             self.assertEqual(completed.returncode, 0, completed.stderr)
             summary = json.loads(completed.stdout)
-            self.assertEqual(summary["status"], "completed")
-            self.assertEqual(summary["publication_status"], "skipped_disabled")
+            self.assertEqual(summary["status"], "validated-unpublished")
+            self.assertEqual(summary["publication_status"], "validated-unpublished")
 
             workstream = json.loads((ledger / summary["result_path"]).read_text(encoding="utf-8"))
             select_result_path = workstream["steps"][0]["result_path"]

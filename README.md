@@ -169,11 +169,29 @@ The recipe schema is intentionally small:
   and similar ad hoc secret-bearing auth keys are rejected. Ambient `GH_TOKEN`,
   `GITHUB_TOKEN`, and similar variables are not inherited by publisher commands.
 
-Publication is blocked unless at least one final `validate` step produced
-`validated` evidence and the final `review` step produced `passed`. The PR body
-is generated from ledger facts: workstream identity, selected work, changed
-files, commits, validation artifact refs/statuses, review result, cleanup,
-retry status, and artifact paths.
+Actual PR publication is blocked unless at least one final `validate` step
+produced `validated` evidence for the implemented HEAD and the final `review`
+step produced `passed` for that same HEAD. A workstream can still finish as
+`validated-unpublished` in two cases:
+
+- the current HEAD already has final validation evidence and the next configured
+  step would start a fresh `select-work` / `prepare-checkout` / `implement`
+  cycle for the same item. AFK only allows a follow-up `select-work` to proceed
+  when its configured input proves it excludes the current item; today that
+  proof is limited to explicit `target_ids` or fully enumerated fixture
+  candidates. Otherwise AFK stops conservatively and treats the follow-up as a
+  same-item retry/fresh-cycle attempt.
+- the current HEAD has final validation plus a passed final review, but
+  `publisher.enabled` is `false`
+
+In both cases `next_allowed_command` points at `afk run-workstream ...`, not a
+separate `afk publish` command. Treat it as the follow-up entrypoint: rerun the
+workstream with an updated recipe that keeps the same review branch/current HEAD
+and either adds the remaining final review/publisher path or enables the
+publisher for the already-reviewed HEAD. The PR body is generated from ledger
+facts: workstream identity, selected work, changed files, commits, validation
+artifact refs/statuses, review result, cleanup, retry status, and artifact
+paths.
 
 ### GitHub PR Smoke
 
@@ -391,10 +409,15 @@ status plus pointers to `evidence-pack.json`, `reviewer-request.json`,
 `run-workstream` records one workstream directory and one normal `runs/<run-id>/`
 directory for each composed step. `workstream-result.json` lists every step run,
 its ledger result path, the generated equivalent `afk run-step ...` command,
-selected work result summaries, cleanup status, retry instructions, and terminal
-PR publication status. `publication-result.json` records a blocked/skipped/
-failed/published publisher result. `pr-body.md` is written before terminal PR
-commands run, so fake/offline publisher tests can inspect the exact body.
+selected work result summaries, cleanup status, terminal reason, next allowed
+command, retry instructions, and terminal PR publication status.
+`publication-result.json` records one of four explicit terminal states:
+`blocked`, `validated-unpublished`, `failed-needs-human`, or `published`.
+`validated-unpublished` means the current HEAD is terminally validated but AFK
+did not publish a PR in that run; only the subset with a passed final review is
+immediately eligible for PR publication on a follow-up rerun.
+`pr-body.md` is written before terminal PR commands run, so fake/offline
+publisher tests can inspect the exact body.
 
 ## Development
 

@@ -9,6 +9,9 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
+
+from afk.workstream import select_work_proves_different_item  # noqa: E402
 
 
 def run_afk(*args, env_overrides=None):
@@ -67,11 +70,18 @@ def write_executable(path, content):
     path.chmod(0o755)
 
 
-def selected_fixture_item():
+def selected_fixture_item(external_id="central-lve.9", title=None):
+    resolved_title = title
+    if resolved_title is None:
+        resolved_title = (
+            "Compose workstream recipe and terminal PR publisher"
+            if external_id == "central-lve.9"
+            else f"Work item {external_id}"
+        )
     return {
-        "external_id": "central-lve.9",
-        "url": "https://tracker.example/central-lve.9",
-        "title": "Compose workstream recipe and terminal PR publisher",
+        "external_id": external_id,
+        "url": f"https://tracker.example/{external_id}",
+        "title": resolved_title,
         "status": "open",
         "labels": ["project:afk-composable-pipeline", "afk:ready"],
         "parent": "central-lve",
@@ -207,6 +217,49 @@ def successful_recipe(temp_path, repo, checkout, fake_git, fake_gh):
 
 
 class WorkstreamCliTest(unittest.TestCase):
+    def test_select_work_proves_different_item_with_fixture_enumerated_candidates(self):
+        state = {"selected_work": [selected_fixture_item("central-lve.9")]}
+        input_data = {
+            "sources": [
+                {
+                    "type": "fixture",
+                    "id": "fixture",
+                    "items": [selected_fixture_item("central-lve.10")],
+                }
+            ]
+        }
+
+        self.assertTrue(select_work_proves_different_item(input_data, state))
+
+    def test_select_work_does_not_prove_different_item_with_non_fixture_enumerated_candidates(self):
+        state = {"selected_work": [selected_fixture_item("central-lve.9")]}
+        input_data = {
+            "sources": [
+                {
+                    "type": "github",
+                    "id": "issues",
+                    "items": [selected_fixture_item("central-lve.10")],
+                }
+            ]
+        }
+
+        self.assertFalse(select_work_proves_different_item(input_data, state))
+
+    def test_select_work_target_ids_prove_different_item_regardless_of_source_shape(self):
+        state = {"selected_work": [selected_fixture_item("central-lve.9")]}
+        input_data = {
+            "target_ids": ["central-lve.10"],
+            "sources": [
+                {
+                    "type": "github",
+                    "id": "issues",
+                    "items": [selected_fixture_item("central-lve.9")],
+                }
+            ],
+        }
+
+        self.assertTrue(select_work_proves_different_item(input_data, state))
+
     def test_workstream_composes_steps_and_creates_one_terminal_pr_from_ledger_evidence(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
@@ -568,9 +621,9 @@ Path({str(fake_calls)!r}).write_text("gh should not run\\n", encoding="utf-8")
                         (result_path.parent / "publication-result.json").read_text(encoding="utf-8")
                     )
 
-                    self.assertEqual(summary["status"], "failed_publication")
-                    self.assertEqual(result["publication"]["status"], "failed")
-                    self.assertEqual(publication["status"], "failed")
+                    self.assertEqual(summary["status"], "failed-needs-human")
+                    self.assertEqual(result["publication"]["status"], "failed-needs-human")
+                    self.assertEqual(publication["status"], "failed-needs-human")
                     self.assertIn(expected_reason, result["publication"]["reason"])
                     self.assertIn("publisher.gh.auth.config_dir", result["publication"]["retry"])
                     self.assertIn("publisher.gh.auth.config_dir", publication["retry"])
@@ -651,8 +704,8 @@ sys.exit(1)
                 for line in fake_calls.read_text(encoding="utf-8").splitlines()
             ]
 
-            self.assertEqual(summary["status"], "failed_publication")
-            self.assertEqual(result["publication"]["status"], "failed")
+            self.assertEqual(summary["status"], "failed-needs-human")
+            self.assertEqual(result["publication"]["status"], "failed-needs-human")
             self.assertIn("gh auth status failed", result["publication"]["reason"])
             self.assertIn("publisher.gh.auth.config_dir", result["publication"]["retry"])
             self.assertEqual(result["publication"]["command"][1:3], ["auth", "status"])
@@ -736,8 +789,8 @@ sys.exit(1)
                 for line in fake_calls.read_text(encoding="utf-8").splitlines()
             ]
 
-            self.assertEqual(summary["status"], "failed_publication")
-            self.assertEqual(result["publication"]["status"], "failed")
+            self.assertEqual(summary["status"], "failed-needs-human")
+            self.assertEqual(result["publication"]["status"], "failed-needs-human")
             self.assertEqual(result["publication"]["auth"]["source"], "minimal_env")
             self.assertIn("gh auth status failed", result["publication"]["reason"])
             self.assertIn("publisher.gh.auth.config_dir", result["publication"]["retry"])
@@ -938,16 +991,281 @@ Path({str(fake_calls)!r}).write_text("gh should not run\\n", encoding="utf-8")
             summary = json.loads(completed.stdout)
             result = json.loads((ledger / summary["result_path"]).read_text(encoding="utf-8"))
 
-            self.assertEqual(summary["status"], "blocked")
-            self.assertEqual(result["status"], "blocked")
-            self.assertEqual(result["publication"]["status"], "blocked")
-            self.assertIn("validation evidence", result["publication"]["reason"])
+            self.assertEqual(summary["status"], "validated-unpublished")
+            self.assertEqual(result["status"], "validated-unpublished")
+            self.assertEqual(result["publication"]["status"], "validated-unpublished")
+            self.assertIn("validated terminal state", result["publication"]["reason"])
             self.assertEqual(
                 [step["name"] for step in result["steps"]],
-                ["select-work", "prepare-checkout", "implement", "validate", "implement"],
+                ["select-work", "prepare-checkout", "implement", "validate"],
             )
-            self.assertEqual(result["selected_work"][0]["result"], "implemented")
+            self.assertEqual(result["selected_work"][0]["result"], "validated")
             self.assertFalse(reviewer_invoked.exists())
+            self.assertFalse(fake_calls.exists())
+
+    def test_workstream_stops_before_fresh_select_cycle_after_successful_validation(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repo = temp_path / "repo-src"
+            checkout = temp_path / "checkout"
+            ledger = temp_path / "ledger"
+            fake_calls = temp_path / "fake-calls.jsonl"
+            init_repo(repo)
+            fake_git = temp_path / "publisher-git"
+            fake_gh = temp_path / "publisher-gh"
+            write_executable(
+                fake_git,
+                f"""#!{sys.executable}
+from pathlib import Path
+Path({str(fake_calls)!r}).write_text("git should not run\\n", encoding="utf-8")
+""",
+            )
+            write_executable(
+                fake_gh,
+                f"""#!{sys.executable}
+from pathlib import Path
+Path({str(fake_calls)!r}).write_text("gh should not run\\n", encoding="utf-8")
+""",
+            )
+            recipe = successful_recipe(temp_path, repo, checkout, fake_git, fake_gh)
+            recipe["publisher"] = {"enabled": False}
+            recipe["steps"] = recipe["steps"][:4] + [
+                recipe["steps"][0],
+                recipe["steps"][1],
+            ]
+
+            completed = run_afk(
+                "run-workstream",
+                "--workstream-id",
+                "central-lve.9",
+                "--input",
+                json.dumps(recipe),
+                "--ledger",
+                str(ledger),
+                env_overrides={
+                    "GIT_ALLOW_PROTOCOL": "file",
+                    "GIT_AUTHOR_NAME": "AFK Test",
+                    "GIT_AUTHOR_EMAIL": "afk-test@example.test",
+                    "GIT_COMMITTER_NAME": "AFK Test",
+                    "GIT_COMMITTER_EMAIL": "afk-test@example.test",
+                },
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            result = json.loads((ledger / summary["result_path"]).read_text(encoding="utf-8"))
+
+            self.assertEqual(summary["status"], "validated-unpublished")
+            self.assertEqual(result["status"], "validated-unpublished")
+            self.assertEqual(result["publication"]["status"], "validated-unpublished")
+            self.assertEqual(
+                [step["name"] for step in result["steps"]],
+                ["select-work", "prepare-checkout", "implement", "validate"],
+            )
+            self.assertIn("validated terminal state", result["terminal_reason"])
+            self.assertEqual(
+                result["next_allowed_command"],
+                "afk run-workstream --workstream-id central-lve.9 --ledger <ledger> --input <recipe>",
+            )
+            self.assertFalse(fake_calls.exists())
+
+    def test_workstream_stops_before_non_fixture_enumerated_follow_up_selection_after_validation(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repo = temp_path / "repo-src"
+            checkout = temp_path / "checkout"
+            ledger = temp_path / "ledger"
+            fake_calls = temp_path / "fake-calls.jsonl"
+            init_repo(repo)
+            fake_git = temp_path / "publisher-git"
+            fake_gh = temp_path / "publisher-gh"
+            write_executable(
+                fake_git,
+                f"""#!{sys.executable}
+from pathlib import Path
+Path({str(fake_calls)!r}).write_text("git should not run\\n", encoding="utf-8")
+""",
+            )
+            write_executable(
+                fake_gh,
+                f"""#!{sys.executable}
+from pathlib import Path
+Path({str(fake_calls)!r}).write_text("gh should not run\\n", encoding="utf-8")
+""",
+            )
+            recipe = successful_recipe(temp_path, repo, checkout, fake_git, fake_gh)
+            recipe["publisher"] = {"enabled": False}
+            recipe["steps"] = recipe["steps"][:4] + [
+                {
+                    "name": "select-work",
+                    "input": {
+                        "required_labels": ["afk:ready"],
+                        "sources": [
+                            {
+                                "type": "github",
+                                "id": "issues",
+                                "items": [selected_fixture_item("central-lve.10")],
+                            }
+                        ],
+                    },
+                },
+                recipe["steps"][1],
+            ]
+
+            completed = run_afk(
+                "run-workstream",
+                "--workstream-id",
+                "central-lve.9",
+                "--input",
+                json.dumps(recipe),
+                "--ledger",
+                str(ledger),
+                env_overrides={
+                    "GIT_ALLOW_PROTOCOL": "file",
+                    "GIT_AUTHOR_NAME": "AFK Test",
+                    "GIT_AUTHOR_EMAIL": "afk-test@example.test",
+                    "GIT_COMMITTER_NAME": "AFK Test",
+                    "GIT_COMMITTER_EMAIL": "afk-test@example.test",
+                },
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            result = json.loads((ledger / summary["result_path"]).read_text(encoding="utf-8"))
+
+            self.assertEqual(summary["status"], "validated-unpublished")
+            self.assertEqual(result["status"], "validated-unpublished")
+            self.assertEqual(result["publication"]["status"], "validated-unpublished")
+            self.assertEqual(
+                [step["name"] for step in result["steps"]],
+                ["select-work", "prepare-checkout", "implement", "validate"],
+            )
+            self.assertIn("validated terminal state", result["terminal_reason"])
+            self.assertEqual(
+                result["next_allowed_command"],
+                "afk run-workstream --workstream-id central-lve.9 --ledger <ledger> --input <recipe>",
+            )
+            self.assertFalse(fake_calls.exists())
+
+    def test_workstream_allows_proven_different_item_after_successful_validation(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repo = temp_path / "repo-src"
+            checkout = temp_path / "checkout"
+            second_checkout = temp_path / "checkout-two"
+            ledger = temp_path / "ledger"
+            fake_calls = temp_path / "fake-calls.jsonl"
+            init_repo(repo)
+            fake_git = temp_path / "publisher-git"
+            fake_gh = temp_path / "publisher-gh"
+            write_executable(
+                fake_git,
+                f"""#!{sys.executable}
+from pathlib import Path
+Path({str(fake_calls)!r}).write_text("git should not run\\n", encoding="utf-8")
+""",
+            )
+            write_executable(
+                fake_gh,
+                f"""#!{sys.executable}
+from pathlib import Path
+Path({str(fake_calls)!r}).write_text("gh should not run\\n", encoding="utf-8")
+""",
+            )
+            second_agent_code = textwrap.dedent(
+                """
+                import json
+                import subprocess
+                from pathlib import Path
+
+                Path("implemented-second.txt").write_text("central-lve.10\\n", encoding="utf-8")
+                subprocess.run(["git", "add", "implemented-second.txt"], check=True)
+                subprocess.run(["git", "commit", "-m", "implement central-lve.10"], check=True)
+                Path("agent-result.json").write_text(
+                    json.dumps({"status": "completed", "summary": "implemented second work item"}),
+                    encoding="utf-8",
+                )
+                """
+            ).strip()
+            recipe = successful_recipe(temp_path, repo, checkout, fake_git, fake_gh)
+            recipe["publisher"] = {"enabled": False}
+            recipe["steps"] = recipe["steps"][:4] + [
+                {
+                    "name": "select-work",
+                    "input": {
+                        "target_ids": ["central-lve.10"],
+                        "required_labels": ["afk:ready"],
+                        "sources": [
+                            {
+                                "type": "fixture",
+                                "id": "fixture",
+                                "items": [selected_fixture_item("central-lve.10")],
+                            }
+                        ],
+                    },
+                },
+                {
+                    "name": "prepare-checkout",
+                    "input": {
+                        "repo_url": str(repo),
+                        "base_ref": "main",
+                        "checkout_root": str(temp_path),
+                        "checkout_path": str(second_checkout),
+                    },
+                },
+                {
+                    "name": "implement",
+                    "input": {
+                        "guardrails": ["stay within checkout"],
+                        "validation": {"profile": "tier1", "commands": []},
+                        "agent": {
+                            "type": "fake-pi-command",
+                            "command": [sys.executable, "-c", second_agent_code],
+                            "result_path": "agent-result.json",
+                        },
+                    },
+                },
+            ]
+
+            completed = run_afk(
+                "run-workstream",
+                "--workstream-id",
+                "central-lve.9",
+                "--input",
+                json.dumps(recipe),
+                "--ledger",
+                str(ledger),
+                env_overrides={
+                    "GIT_ALLOW_PROTOCOL": "file",
+                    "GIT_AUTHOR_NAME": "AFK Test",
+                    "GIT_AUTHOR_EMAIL": "afk-test@example.test",
+                    "GIT_COMMITTER_NAME": "AFK Test",
+                    "GIT_COMMITTER_EMAIL": "afk-test@example.test",
+                },
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            result = json.loads((ledger / summary["result_path"]).read_text(encoding="utf-8"))
+
+            self.assertEqual(summary["status"], "blocked")
+            self.assertEqual(result["publication"]["status"], "blocked")
+            self.assertEqual(result["publication"]["reason"], "required final validation evidence is missing")
+            self.assertEqual(
+                [step["name"] for step in result["steps"]],
+                [
+                    "select-work",
+                    "prepare-checkout",
+                    "implement",
+                    "validate",
+                    "select-work",
+                    "prepare-checkout",
+                    "implement",
+                ],
+            )
+            self.assertEqual(result["selected_work"][0]["external_id"], "central-lve.10")
+            self.assertEqual(result["selected_work"][0]["result"], "implemented")
+            self.assertTrue((second_checkout / "implemented-second.txt").exists())
             self.assertFalse(fake_calls.exists())
 
     def test_workstream_implement_uses_selected_work_and_prepared_checkout_over_recipe_refs(self):
@@ -1583,8 +1901,8 @@ Path({str(fake_calls)!r}).open("a", encoding="utf-8").write("gh should not run\\
                 for line in fake_calls.read_text(encoding="utf-8").splitlines()
             ]
 
-            self.assertEqual(summary["status"], "failed_publication")
-            self.assertEqual(result["publication"]["status"], "failed")
+            self.assertEqual(summary["status"], "failed-needs-human")
+            self.assertEqual(result["publication"]["status"], "failed-needs-human")
             self.assertEqual(result["publication"]["returncode"], 9)
             self.assertIn("git command failed", result["publication"]["reason"])
             self.assertIn("push rejected", result["publication"]["stderr_excerpt"])
@@ -1642,8 +1960,12 @@ Path({str(fake_calls)!r}).write_text("gh should not run\\n", encoding="utf-8")
             result_path = ledger / summary["result_path"]
             result = json.loads(result_path.read_text(encoding="utf-8"))
 
-            self.assertEqual(summary["status"], "completed")
-            self.assertEqual(result["publication"]["status"], "skipped_disabled")
+            self.assertEqual(summary["status"], "validated-unpublished")
+            self.assertEqual(result["publication"]["status"], "validated-unpublished")
+            self.assertEqual(
+                result["next_allowed_command"],
+                "afk run-workstream --workstream-id central-lve.9 --ledger <ledger> --input <recipe>",
+            )
             self.assertNotIn("pr_body", result["artifacts"])
             self.assertFalse(result_path.parent.joinpath("pr-body.md").exists())
             self.assertFalse(fake_calls.exists())
@@ -1888,10 +2210,10 @@ Path({str(fake_calls)!r}).write_text("gh should not run\\n", encoding="utf-8")
                 (result_path.parent / "publication-result.json").read_text(encoding="utf-8")
             )
 
-            self.assertEqual(summary["status"], "failed_publication")
-            self.assertEqual(result["status"], "failed_publication")
-            self.assertEqual(result["publication"]["status"], "failed")
-            self.assertEqual(publication["status"], "failed")
+            self.assertEqual(summary["status"], "failed-needs-human")
+            self.assertEqual(result["status"], "failed-needs-human")
+            self.assertEqual(result["publication"]["status"], "failed-needs-human")
+            self.assertEqual(publication["status"], "failed-needs-human")
             self.assertIn("publisher must be an object", result["publication"]["reason"])
             self.assertIn("publisher must be an object", publication["reason"])
             self.assertEqual(result["cleanup"], {"status": "clean", "resources": []})
@@ -1960,10 +2282,10 @@ Path({str(fake_calls)!r}).write_text("gh should not run\\n", encoding="utf-8")
                         (result_path.parent / "publication-result.json").read_text(encoding="utf-8")
                     )
 
-                    self.assertEqual(summary["status"], "failed_publication")
-                    self.assertEqual(result["status"], "failed_publication")
-                    self.assertEqual(result["publication"]["status"], "failed")
-                    self.assertEqual(publication["status"], "failed")
+                    self.assertEqual(summary["status"], "failed-needs-human")
+                    self.assertEqual(result["status"], "failed-needs-human")
+                    self.assertEqual(result["publication"]["status"], "failed-needs-human")
+                    self.assertEqual(publication["status"], "failed-needs-human")
                     self.assertIn(expected_reason, result["publication"]["reason"])
                     self.assertEqual(result["cleanup"], {"status": "clean", "resources": []})
                     self.assertIn("afk run-workstream", result["retry"])
@@ -2018,8 +2340,8 @@ Path({str(fake_calls)!r}).write_text("gh should not run\\n", encoding="utf-8")
             summary = json.loads(completed.stdout)
             result = json.loads((ledger / summary["result_path"]).read_text(encoding="utf-8"))
 
-            self.assertEqual(summary["status"], "failed_publication")
-            self.assertEqual(result["publication"]["status"], "failed")
+            self.assertEqual(summary["status"], "failed-needs-human")
+            self.assertEqual(result["publication"]["status"], "failed-needs-human")
             self.assertIn("publisher.head must match review_branch", result["publication"]["reason"])
             self.assertEqual(result["cleanup"], {"status": "clean", "resources": []})
             self.assertFalse(fake_calls.exists())
