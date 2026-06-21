@@ -96,7 +96,7 @@ def run_workstream(
 
     for step_spec in normalized["steps"]:
         step_name = step_spec["name"]
-        stop_reason = terminal_stop_reason(step_name, state)
+        stop_reason = terminal_stop_reason(step_spec, state)
         if stop_reason:
             state["stop_reason"] = stop_reason
             state["next_allowed_command"] = next_allowed_command_for_terminal_stop(state, normalized)
@@ -323,8 +323,11 @@ def update_state_from_step(
 ) -> None:
     output = result.output if isinstance(result.output, dict) else {}
     if step_name == "select-work":
+        previous_identity = current_selected_work_identity(state)
         selected = output.get("selected_work")
         state["selected_work"] = list(selected) if isinstance(selected, list) else []
+        if previous_identity and current_selected_work_identity(state) != previous_identity:
+            reset_cycle_state_for_new_selection(state)
     elif step_name == "prepare-checkout":
         state["checkout"] = output
     elif step_name == "implement":
@@ -367,10 +370,13 @@ def workflow_order_blocking_reason(step_name: str, state: dict[str, Any]) -> str
     return ""
 
 
-def terminal_stop_reason(step_name: str, state: dict[str, Any]) -> str:
+def terminal_stop_reason(step_spec: dict[str, Any], state: dict[str, Any]) -> str:
+    step_name = step_spec["name"]
     if review_passed(state):
         return f"workstream already reached terminal review state before {step_name}; no further workstream steps are allowed"
     if step_name in {"select-work", "prepare-checkout", "implement"} and has_current_validated_evidence(state):
+        if step_name == "select-work" and select_work_proves_different_item(step_spec.get("input"), state):
+            return ""
         return (
             f"workstream reached validated terminal state before {step_name}; "
             "do not start a fresh work cycle for the same work item"
@@ -387,6 +393,81 @@ def next_allowed_command_for_terminal_stop(state: dict[str, Any], normalized: di
 def selected_work_count(state: dict[str, Any]) -> int:
     selected_work = state.get("selected_work")
     return len(selected_work) if isinstance(selected_work, list) else 0
+
+
+def current_selected_work_identity(state: dict[str, Any]) -> str:
+    selected_work = state.get("selected_work")
+    if not isinstance(selected_work, list) or not selected_work:
+        return ""
+    first_item = selected_work[0]
+    if not isinstance(first_item, dict):
+        return ""
+    return work_item_identity(first_item)
+
+
+def work_item_identity(item: dict[str, Any]) -> str:
+    return string_field(item, "url") or string_field(item, "external_id") or ""
+
+
+def select_work_proves_different_item(input_data: Any, state: dict[str, Any]) -> bool:
+    current_identity = current_selected_work_identity(state)
+    current_external_id = current_selected_work_external_id(state)
+    if not current_identity and not current_external_id:
+        return False
+    if not isinstance(input_data, dict):
+        return False
+
+    target_ids = input_data.get("target_ids")
+    if isinstance(target_ids, list) and target_ids and all(isinstance(item, str) and item.strip() for item in target_ids):
+        return current_external_id not in {item.strip() for item in target_ids}
+
+    candidate_identities = select_work_candidate_identities(input_data)
+    if not candidate_identities:
+        return False
+    return current_identity not in candidate_identities and current_external_id not in candidate_identities
+
+
+def current_selected_work_external_id(state: dict[str, Any]) -> str:
+    selected_work = state.get("selected_work")
+    if not isinstance(selected_work, list) or not selected_work:
+        return ""
+    first_item = selected_work[0]
+    if not isinstance(first_item, dict):
+        return ""
+    return string_field(first_item, "external_id") or ""
+
+
+def select_work_candidate_identities(input_data: dict[str, Any]) -> set[str]:
+    sources = input_data.get("sources")
+    if not isinstance(sources, list):
+        return set()
+    identities: set[str] = set()
+    for source in sources:
+        if not isinstance(source, dict):
+            return set()
+        items = source.get("items")
+        if not isinstance(items, list):
+            return set()
+        for item in items:
+            if not isinstance(item, dict):
+                return set()
+            identity = work_item_identity(item)
+            external_id = string_field(item, "external_id")
+            if not identity and not external_id:
+                return set()
+            if identity:
+                identities.add(identity)
+            if external_id:
+                identities.add(external_id)
+    return identities
+
+
+def reset_cycle_state_for_new_selection(state: dict[str, Any]) -> None:
+    state["checkout"] = None
+    state["implementation"] = None
+    state["validations"] = []
+    state["review"] = None
+    state["cleanup"] = {"status": "unknown", "resources": []}
 
 
 def checkout_after_implementation(checkout: Any, implementation: dict[str, Any]) -> Any:

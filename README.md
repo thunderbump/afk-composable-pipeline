@@ -176,7 +176,11 @@ step produced `passed` for that same HEAD. A workstream can still finish as
 
 - the current HEAD already has final validation evidence and the next configured
   step would start a fresh `select-work` / `prepare-checkout` / `implement`
-  cycle for the same item
+  cycle for the same item. AFK only allows a follow-up `select-work` to proceed
+  when its configured input proves it excludes the current item; today that
+  proof is limited to explicit `target_ids` or fully enumerated fixture
+  candidates. Otherwise AFK stops conservatively and treats the follow-up as a
+  same-item retry/fresh-cycle attempt.
 - the current HEAD has final validation plus a passed final review, but
   `publisher.enabled` is `false`
 
