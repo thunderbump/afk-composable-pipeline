@@ -11,7 +11,7 @@ from typing import Any, Callable
 
 from afk.contracts import ProjectContract
 from afk.jsonutil import canonical_json, sha256_json
-from afk.redaction import redact_artifact_value, redact_text
+from afk.redaction import is_secret_key, redact_artifact_value, redact_text
 from afk.registry import StepResult
 
 
@@ -463,15 +463,33 @@ def publish_terminal_pr(
         config = normalize_publisher_config(publisher, normalized)
     except WorkstreamError as exc:
         return failed_publication_config(str(exc), normalized)
-    body = pr_body_markdown(normalized, state, steps, selected_work, ledger)
-    ledger.write_text("pr-body.md", body)
     checkout_path = checkout_path_from_state(state)
     try:
+        config["gh_auth"] = validate_publisher_auth_config(config["gh_auth"], checkout_path)
+    except WorkstreamError as exc:
+        return failed_publication_config(
+            str(exc),
+            normalized,
+            auth=publisher_auth_artifact(config["gh_auth"]),
+        )
+    auth = config["gh_auth"]
+    auth_artifact = publisher_auth_artifact(auth)
+    body = pr_body_markdown(normalized, state, steps, selected_work, ledger)
+    ledger.write_text("pr-body.md", body)
+    try:
+        run_publisher_command(
+            [config["gh_path"], "auth", "status", "--hostname", "github.com"],
+            cwd=checkout_path,
+            tool="gh",
+            auth=auth,
+            message_on_failure="gh auth status failed",
+        )
         if config["push"]:
             run_publisher_command(
                 [config["git_path"], "push", config["remote"], f"HEAD:refs/heads/{config['head']}"],
                 cwd=checkout_path,
                 tool="git",
+                auth=auth,
             )
         if config["mode"] == "create":
             command = [
@@ -502,14 +520,15 @@ def publish_terminal_pr(
                 "--body-file",
                 str(ledger.path / "pr-body.md"),
             ]
-        completed = run_publisher_command(command, cwd=checkout_path, tool="gh")
+        completed = run_publisher_command(command, cwd=checkout_path, tool="gh", auth=auth)
     except PublisherError as exc:
-        return failed_publication(exc, normalized)
+        return failed_publication(exc, normalized, auth=auth_artifact)
     return {
         "schema_version": SCHEMA_VERSION,
         "status": "published",
         "enabled": True,
         "mode": config["mode"],
+        "auth": auth_artifact,
         "url": successful_publisher_url(completed.stdout),
         "commands": {
             "gh": redact_artifact_value(command),
@@ -546,9 +565,11 @@ def normalize_publisher_config(publisher: dict[str, Any], normalized: dict[str, 
         raise WorkstreamError("publisher.repo is required")
     if mode == "create" and not base:
         raise WorkstreamError("publisher.base is required for create")
+    gh_auth = normalize_publisher_gh_auth(gh)
     return {
         "mode": mode,
         "gh_path": string_field(gh, "path") or "gh",
+        "gh_auth": gh_auth,
         "git_path": string_field(git, "path") or "git",
         "push": bool(git.get("push", False)),
         "remote": string_field(git, "remote") or "origin",
@@ -560,10 +581,74 @@ def normalize_publisher_config(publisher: dict[str, Any], normalized: dict[str, 
     }
 
 
-def run_publisher_command(command: list[str], *, cwd: Path, tool: str) -> subprocess.CompletedProcess[str]:
+def normalize_publisher_gh_auth(gh: dict[str, Any]) -> dict[str, Any]:
+    for key in gh:
+        if key in {"path", "auth"}:
+            continue
+        if is_secret_key(key):
+            raise WorkstreamError(f"publisher.gh.{key} is not supported; mount gh auth config instead")
+    raw_auth = gh.get("auth")
+    if raw_auth is None:
+        return {"configured": False, "source": "minimal_env", "config_dir": ""}
+    if not isinstance(raw_auth, dict):
+        raise WorkstreamError("publisher.gh.auth must be an object")
+    unsupported = [key for key in raw_auth.keys() if key != "config_dir"]
+    if unsupported:
+        raise WorkstreamError("publisher.gh.auth only supports config_dir")
+    config_dir = string_field(raw_auth, "config_dir")
+    if not config_dir:
+        raise WorkstreamError("publisher.gh.auth.config_dir is required")
+    return {
+        "configured": True,
+        "source": "gh_config_dir",
+        "config_dir": config_dir,
+    }
+
+
+def validate_publisher_auth_config(auth: dict[str, Any], checkout_path: Path) -> dict[str, Any]:
+    if not auth.get("configured"):
+        return {"configured": False, "source": "minimal_env", "config_dir": ""}
+    config_dir = Path(str(auth["config_dir"]))
+    if not config_dir.is_absolute():
+        raise WorkstreamError("publisher.gh.auth.config_dir must be absolute")
+    if not config_dir.is_dir():
+        raise WorkstreamError("publisher.gh.auth.config_dir must be an existing directory")
+    if path_is_equal_to_or_inside(config_dir, checkout_path):
+        raise WorkstreamError("publisher.gh.auth.config_dir must be outside checkout")
+    return {
+        "configured": True,
+        "source": "gh_config_dir",
+        "config_dir": str(config_dir),
+    }
+
+
+def publisher_auth_artifact(auth: dict[str, Any]) -> dict[str, Any]:
+    artifact = {
+        "configured": bool(auth.get("configured")),
+        "source": str(auth.get("source") or "minimal_env"),
+    }
+    if auth.get("configured"):
+        artifact["path"] = "[REDACTED]"
+    return artifact
+
+
+def run_publisher_command(
+    command: list[str],
+    *,
+    cwd: Path,
+    tool: str,
+    auth: dict[str, Any],
+    message_on_failure: str | None = None,
+) -> subprocess.CompletedProcess[str]:
     with tempfile.TemporaryDirectory(prefix="afk-publisher-") as temp_dir:
-        env = minimal_publisher_environment(Path(temp_dir))
-        return run_publisher_command_once(command, cwd=cwd, tool=tool, env=env)
+        env = minimal_publisher_environment(Path(temp_dir), auth=auth)
+        return run_publisher_command_once(
+            command,
+            cwd=cwd,
+            tool=tool,
+            env=env,
+            message_on_failure=message_on_failure,
+        )
 
 
 def run_publisher_command_once(
@@ -572,6 +657,7 @@ def run_publisher_command_once(
     cwd: Path,
     tool: str,
     env: dict[str, str],
+    message_on_failure: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
     try:
         completed = subprocess.run(
@@ -586,7 +672,7 @@ def run_publisher_command_once(
         raise PublisherError(str(exc), command=command, returncode=None, stderr=str(exc)) from exc
     if completed.returncode != 0:
         raise PublisherError(
-            f"{tool} command failed",
+            message_on_failure or f"{tool} command failed",
             command=command,
             returncode=completed.returncode,
             stdout=completed.stdout,
@@ -595,7 +681,7 @@ def run_publisher_command_once(
     return completed
 
 
-def minimal_publisher_environment(temp_path: Path) -> dict[str, str]:
+def minimal_publisher_environment(temp_path: Path, *, auth: dict[str, Any]) -> dict[str, str]:
     env: dict[str, str] = {}
     for key in ("PATH", "LANG", "LC_ALL"):
         value = os.environ.get(key)
@@ -613,6 +699,8 @@ def minimal_publisher_environment(temp_path: Path) -> dict[str, str]:
     env["XDG_CACHE_HOME"] = str(xdg_cache_home)
     env["XDG_STATE_HOME"] = str(xdg_state_home)
     env["TMPDIR"] = str(tmp_path)
+    if auth.get("configured") and auth.get("source") == "gh_config_dir":
+        env["GH_CONFIG_DIR"] = str(auth["config_dir"])
     return env
 
 
@@ -761,40 +849,58 @@ def workstream_artifacts(ledger: "WorkstreamLedger") -> dict[str, str]:
     return artifacts
 
 
-def failed_publication(exc: PublisherError, normalized: dict[str, Any]) -> dict[str, Any]:
+def failed_publication(
+    exc: PublisherError,
+    normalized: dict[str, Any],
+    *,
+    auth: dict[str, Any],
+) -> dict[str, Any]:
     return {
         "schema_version": SCHEMA_VERSION,
         "status": "failed",
         "enabled": True,
         "reason": exc.message,
+        "auth": auth,
         "returncode": exc.returncode,
         "command": redact_artifact_value(exc.command),
         "stdout_excerpt": redact_text(exc.stdout[-2000:]),
         "stderr_excerpt": redact_text(exc.stderr[-2000:]),
-        "retry": retry_instructions(normalized, "latest"),
+        "retry": retry_instructions(normalized, "latest", auth_hint=True),
     }
 
 
-def failed_publication_config(reason: str, normalized: dict[str, Any]) -> dict[str, Any]:
+def failed_publication_config(
+    reason: str,
+    normalized: dict[str, Any],
+    *,
+    auth: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     return {
         "schema_version": SCHEMA_VERSION,
         "status": "failed",
         "enabled": True,
         "reason": reason,
+        "auth": auth or {"configured": False, "source": "minimal_env"},
         "returncode": None,
         "command": [],
         "stdout_excerpt": "",
         "stderr_excerpt": "",
-        "retry": retry_instructions(normalized, "latest"),
+        "retry": retry_instructions(normalized, "latest", auth_hint=True),
     }
 
 
-def retry_instructions(normalized: dict[str, Any], run_id: str) -> str:
-    return (
+def retry_instructions(normalized: dict[str, Any], run_id: str, auth_hint: bool = False) -> str:
+    instructions = (
         "Fix the failed evidence, keep the shared review branch, and rerun "
         f"afk run-workstream --workstream-id {normalized['workstream_id']} --ledger <ledger> "
         f"--input <recipe>; previous workstream run: {run_id}"
     )
+    if auth_hint:
+        instructions += (
+            ". For GitHub publication, mount a GitHub CLI config directory outside the checkout "
+            "and set publisher.gh.auth.config_dir in the recipe before rerunning"
+        )
+    return instructions
 
 
 def checkout_path_from_state(state: dict[str, Any]) -> Path:
@@ -826,6 +932,16 @@ def string_field(input_data: dict[str, Any], key: str) -> str | None:
     if isinstance(value, str) and value.strip():
         return value.strip()
     return None
+
+
+def path_is_equal_to_or_inside(path: Path, parent: Path) -> bool:
+    for candidate in (path, path.resolve()):
+        try:
+            candidate.relative_to(parent.resolve())
+            return True
+        except ValueError:
+            pass
+    return False
 
 
 def new_run_id() -> str:

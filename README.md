@@ -136,7 +136,7 @@ Run a shared-branch workstream recipe and terminal PR publisher:
 PYTHONPATH=src python3 -m afk run-workstream \
   --workstream-id central-lve.9 \
   --parent central-lve \
-  --input '{"workstream_id":"central-lve.9","review_branch":"afk/central-lve-9","steps":[{"name":"select-work","input":{"sources":[]}},{"name":"prepare-checkout","input":{"repo_url":"git@github.com:thunderbump/afk-composable-pipeline.git","base_ref":"afk/central-lve-8-final-review","checkout_root":"/work","checkout_path":"/work/afk-composable-pipeline"}},{"name":"implement","input":{"guardrails":[],"validation":{"profile":"tier1","commands":[]},"agent":{"type":"fake-pi-command","command":["python3","agent.py"]}}},{"name":"validate","profile":"tier1","input":{"validation":{"dry_run":false},"worker":{"type":"local-command","command":["python3","validate.py"]}}},{"name":"review","input":{"guardrails":[],"cleanup":{"status":"clean","resources":[]},"reviewer":{"type":"fake-reviewer-command","command":["python3","review.py"]}}}],"publisher":{"enabled":true,"mode":"create","repo":"thunderbump/afk-composable-pipeline","base":"afk/central-lve-8-final-review","head":"afk/central-lve-9","title":"central-lve.9: Workstream publisher","git":{"push":true,"remote":"origin"},"gh":{}}}' \
+  --input '{"workstream_id":"central-lve.9","review_branch":"afk/central-lve-9","steps":[{"name":"select-work","input":{"sources":[]}},{"name":"prepare-checkout","input":{"repo_url":"git@github.com:thunderbump/afk-composable-pipeline.git","base_ref":"afk/central-lve-8-final-review","checkout_root":"/work","checkout_path":"/work/afk-composable-pipeline"}},{"name":"implement","input":{"guardrails":[],"validation":{"profile":"tier1","commands":[]},"agent":{"type":"fake-pi-command","command":["python3","agent.py"]}}},{"name":"validate","profile":"tier1","input":{"validation":{"dry_run":false},"worker":{"type":"local-command","command":["python3","validate.py"]}}},{"name":"review","input":{"guardrails":[],"cleanup":{"status":"clean","resources":[]},"reviewer":{"type":"fake-reviewer-command","command":["python3","review.py"]}}}],"publisher":{"enabled":true,"mode":"create","repo":"thunderbump/afk-composable-pipeline","base":"afk/central-lve-8-final-review","head":"afk/central-lve-9","title":"central-lve.9: Workstream publisher","git":{"push":true,"remote":"origin"},"gh":{"auth":{"config_dir":"/work/mounts/gh-config"}}}}' \
   --ledger ledger
 ```
 
@@ -156,12 +156,71 @@ The recipe schema is intentionally small:
   with `gh pr edit`. `git.path`/`gh.path` may point at fake command shims for
   offline tests. `git.push: true` pushes `HEAD` to the configured PR head before
   invoking `gh`.
+- AFK always runs `gh auth status --hostname github.com` before any `git push`
+  or `gh pr create/edit` attempt. Publisher auth stays on the minimal scrubbed
+  environment by default, so missing GitHub auth blocks publication before
+  push with terminal evidence and retry instructions. To publish a real GitHub
+  PR deliberately, mount a GitHub CLI config directory outside the checkout and
+  set `publisher.gh.auth.config_dir` to that absolute path. AFK passes it to
+  `gh` through `GH_CONFIG_DIR` after validating that the directory exists and
+  is outside the target checkout.
+- Do not place raw token values in recipes. `publisher.gh.token`,
+  `publisher.gh.github_token`, `publisher.gh.access_token`, `publisher.gh.api_key`,
+  and similar ad hoc secret-bearing auth keys are rejected. Ambient `GH_TOKEN`,
+  `GITHUB_TOKEN`, and similar variables are not inherited by publisher commands.
 
 Publication is blocked unless at least one final `validate` step produced
 `validated` evidence and the final `review` step produced `passed`. The PR body
 is generated from ledger facts: workstream identity, selected work, changed
 files, commits, validation artifact refs/statuses, review result, cleanup,
 retry status, and artifact paths.
+
+### GitHub PR Smoke
+
+Real smoke against a disposable/private repository with an intentional mounted
+GitHub CLI config:
+
+1. Prepare a disposable private repo and an absolute checkout-external GitHub
+   CLI config directory such as `/work/mounts/gh-config`.
+2. Run `afk run-workstream` with a publisher block like:
+
+```json
+{
+  "publisher": {
+    "enabled": true,
+    "mode": "create",
+    "repo": "OWNER/DISPOSABLE-REPO",
+    "base": "main",
+    "head": "afk/github-pr-smoke",
+    "title": "central-afk-pr.2: GitHub publisher auth smoke",
+    "git": {
+      "push": true,
+      "remote": "origin"
+    },
+    "gh": {
+      "auth": {
+        "config_dir": "/work/mounts/gh-config"
+      }
+    }
+  }
+}
+```
+
+3. Confirm `publication-result.json` reports `published`, then rerun with
+   `mode: "update"` and `pr` set to the PR number or branch selector to smoke
+   the edit path against the same disposable target.
+
+When GitHub auth is not available, use the documented local substitute instead:
+
+1. Point `publisher.git.path` and `publisher.gh.path` at local fake shims that
+   record argv/env and return success.
+2. Keep the same `publisher.gh.auth.config_dir` shape when you want to verify
+   mounted-config handling locally; the fake shims can assert `GH_CONFIG_DIR`
+   while proving that `GH_TOKEN`, `GITHUB_TOKEN`, and other ambient secrets stay
+   absent.
+3. Inspect `workstream-result.json`, `publication-result.json`, and `pr-body.md`
+   in the ledger. The behavior tests in `tests/test_workstream_cli.py` are the
+   reference substitute.
 
 Generate the common single-item recipe from a Beads id and project contract:
 
