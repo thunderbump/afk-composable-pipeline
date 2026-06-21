@@ -89,9 +89,12 @@ def validate(
                 classification="protocol_failure",
                 summary=raw_payload["message"],
                 raw_result=None,
-                adapter=adapter_record(request["worker"], exc.returncode, exc.timed_out, command=exc.command),
+                adapter=adapter_record(
+                    request["worker"], exc.returncode, exc.timed_out, command=exc.command
+                ),
                 stdout=stdout,
                 stderr=stderr,
+                evidence_dir=evidence_dir,
                 stdout_path=stdout_log_path,
                 stderr_path=stderr_log_path,
             )
@@ -106,6 +109,7 @@ def validate(
             adapter=adapter_record(request["worker"], exc.returncode, exc.timed_out, command=exc.command),
             stdout=stdout,
             stderr=stderr,
+            evidence_dir=evidence_dir,
             stdout_path=stdout_log_path,
             stderr_path=stderr_log_path,
         )
@@ -138,6 +142,7 @@ def validate(
             ),
             stdout=stdout,
             stderr=stderr,
+            evidence_dir=evidence_dir,
             stdout_path=stdout_log_path,
             stderr_path=stderr_log_path,
         )
@@ -156,6 +161,7 @@ def validate(
         ),
         stdout=stdout,
         stderr=stderr,
+        evidence_dir=evidence_dir,
         stdout_path=stdout_log_path,
         stderr_path=stderr_log_path,
     )
@@ -537,6 +543,7 @@ def normalize_worker_payload(
     adapter: dict[str, Any],
     stdout: str,
     stderr: str,
+    evidence_dir: Path,
     stdout_path: Path,
     stderr_path: Path,
 ) -> dict[str, Any]:
@@ -569,6 +576,7 @@ def normalize_worker_payload(
             adapter=adapter,
             stdout=stdout,
             stderr=stderr,
+            evidence_dir=evidence_dir,
             stdout_path=stdout_path,
             stderr_path=stderr_path,
         )
@@ -581,6 +589,7 @@ def normalize_worker_payload(
         adapter=adapter,
         stdout=stdout,
         stderr=stderr,
+        evidence_dir=evidence_dir,
         stdout_path=stdout_path,
         stderr_path=stderr_path,
     )
@@ -595,6 +604,7 @@ def normalized_worker_result(
     adapter: dict[str, Any],
     stdout: str,
     stderr: str,
+    evidence_dir: Path,
     stdout_path: Path,
     stderr_path: Path,
 ) -> dict[str, Any]:
@@ -610,6 +620,7 @@ def normalized_worker_result(
         classification=classification,
         summary=summary,
         failures=failures,
+        evidence_dir=evidence_dir,
         adapter=adapter,
         evidence=evidence,
         adapter_stdout=stdout,
@@ -669,12 +680,17 @@ def actionable_failure_records(
     classification: str,
     summary: str,
     failures: list[Any],
+    evidence_dir: Path,
     adapter: dict[str, Any],
     evidence: dict[str, Any],
     adapter_stdout: str,
     adapter_stderr: str,
 ) -> list[dict[str, Any]]:
-    records = [summarize_failure_record(failure) for failure in failures if isinstance(failure, dict)]
+    records = [
+        summarize_failure_record(failure, evidence_dir=evidence_dir)
+        for failure in failures
+        if isinstance(failure, dict)
+    ]
     if records:
         return prioritized_actionable_failures(records)
     if status == "validated":
@@ -692,8 +708,8 @@ def actionable_failure_records(
     ]
 
 
-def summarize_failure_record(failure: dict[str, Any]) -> dict[str, Any]:
-    log_path = string_field(failure, "log") or ""
+def summarize_failure_record(failure: dict[str, Any], *, evidence_dir: Path) -> dict[str, Any]:
+    log_path = resolve_worker_failure_log_path(failure, evidence_dir=evidence_dir)
     reason = string_field(failure, "reason") or ""
     excerpt = log_failure_excerpt(log_path, default_excerpt=reason)
     return {
@@ -706,6 +722,20 @@ def summarize_failure_record(failure: dict[str, Any]) -> dict[str, Any]:
         "log_path": log_path,
         "excerpt": excerpt,
     }
+
+
+def resolve_worker_failure_log_path(failure: dict[str, Any], *, evidence_dir: Path) -> str:
+    log_path = string_field(failure, "log")
+    if log_path:
+        path = Path(log_path)
+        if not path.is_absolute():
+            path = evidence_dir / path
+        return str(path.resolve())
+    step_name = string_field(failure, "name") or "worker_failure"
+    fallback = Path(step_name).name
+    if not fallback.endswith(".log"):
+        fallback = f"{fallback}.log"
+    return str((evidence_dir / "steps" / fallback).resolve())
 
 
 def summarize_adapter_failure(

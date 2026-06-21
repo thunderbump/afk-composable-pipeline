@@ -966,6 +966,161 @@ class ValidateCliTest(unittest.TestCase):
             )
             self.assertIn("zone harness exited 1", result["output"]["summary"])
 
+    def test_validate_resolves_relative_worker_log_path_for_step_failures(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            checkout = temp_path / "checkout"
+            start_commit = init_checkout(checkout)
+            ledger = temp_path / "ledger"
+            worker_code = textwrap.dedent(
+                """
+                import json
+                import os
+                from pathlib import Path
+
+                evidence_dir = Path(os.environ["AFK_WORKER_RESULT"]).parent
+                steps_dir = evidence_dir / "steps"
+                steps_dir.mkdir(parents=True, exist_ok=True)
+                step_log = steps_dir / "tier3_harness.log"
+                step_log.write_text("AssertionError: relative log failed", encoding="utf-8")
+                Path(os.environ["AFK_WORKER_RESULT"]).write_text(
+                    json.dumps(
+                        {
+                            "profile": "tier3-harness",
+                            "status": "fail",
+                            "failureCount": 1,
+                            "summary": "tier3 harness failed",
+                            "steps": [
+                                {
+                                    "name": "tier3_harness",
+                                    "status": "fail",
+                                    "category": "validation_failed",
+                                    "reason": "relative log path test",
+                                    "command": "python3 -m unittest tests.test_auth.AuthTest.test_login --failfast",
+                                    "exitCode": 1,
+                                    "log": "steps/tier3_harness.log",
+                                }
+                            ],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                print("relative log test")
+                """
+            ).strip()
+
+            completed = run_afk(
+                "run-step",
+                "validate",
+                "--profile",
+                "tier3-harness",
+                "--input",
+                json.dumps(
+                    {
+                        "checkout": {
+                            "status": "prepared",
+                            "checkout_path": str(checkout),
+                            "review_branch": "afk/validate",
+                            "requested_ref": "main",
+                            "start_commit": start_commit,
+                        },
+                        "worker": {
+                            "type": "local-command",
+                            "command": [sys.executable, "-c", worker_code],
+                        },
+                    }
+                ),
+                "--ledger",
+                str(ledger),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+            worker_result = json.loads((run_dir / "worker-result.json").read_text(encoding="utf-8"))
+            actionable = worker_result["result"]["normalized"]["actionable_failures"]
+
+            self.assertEqual(result["output"]["status"], "failed_validation")
+            self.assertEqual(
+                actionable[0]["log_path"],
+                str(run_dir / "validation-evidence" / "steps" / "tier3_harness.log"),
+            )
+            self.assertEqual(actionable[0]["excerpt"], "AssertionError: relative log failed")
+
+    def test_validate_uses_deterministic_fallback_log_path_when_worker_step_log_missing(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            checkout = temp_path / "checkout"
+            start_commit = init_checkout(checkout)
+            ledger = temp_path / "ledger"
+            worker_code = textwrap.dedent(
+                """
+                import json
+                import os
+                from pathlib import Path
+
+                Path(os.environ["AFK_WORKER_RESULT"]).write_text(
+                    json.dumps(
+                        {
+                            "profile": "tier3-harness",
+                            "status": "fail",
+                            "failureCount": 1,
+                            "summary": "tier3 harness failed",
+                            "steps": [
+                                {
+                                    "name": "tier3_harness",
+                                    "status": "fail",
+                                    "category": "validation_failed",
+                                    "reason": "log field omitted",
+                                    "command": "python3 -m unittest tests.test_auth.AuthTest.test_login --failfast",
+                                    "exitCode": 1,
+                                }
+                            ],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                """
+            ).strip()
+
+            completed = run_afk(
+                "run-step",
+                "validate",
+                "--profile",
+                "tier3-harness",
+                "--input",
+                json.dumps(
+                    {
+                        "checkout": {
+                            "status": "prepared",
+                            "checkout_path": str(checkout),
+                            "review_branch": "afk/validate",
+                            "requested_ref": "main",
+                            "start_commit": start_commit,
+                        },
+                        "worker": {
+                            "type": "local-command",
+                            "command": [sys.executable, "-c", worker_code],
+                        },
+                    }
+                ),
+                "--ledger",
+                str(ledger),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            worker_result = json.loads((run_dir / "worker-result.json").read_text(encoding="utf-8"))
+            actionable = worker_result["result"]["normalized"]["actionable_failures"]
+
+            self.assertEqual(
+                actionable[0]["log_path"],
+                str(run_dir / "validation-evidence" / "steps" / "tier3_harness.log"),
+            )
+            self.assertEqual(actionable[0]["excerpt"], "log field omitted")
+
     def test_validate_includes_compact_excerpt_with_non_generic_worker_summary(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
