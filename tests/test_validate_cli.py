@@ -1255,6 +1255,64 @@ class ValidateCliTest(unittest.TestCase):
                 (run_dir / "stdout.log").read_text(encoding="utf-8"),
             )
 
+    def test_validate_default_bump_eqemu_worker_inherits_validation_timeout(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            checkout = temp_path / "checkout"
+            init_checkout(checkout)
+            worker_script = checkout / "scripts" / "validation-worker.sh"
+            worker_script.parent.mkdir()
+            worker_script.write_text(
+                textwrap.dedent(
+                    """\
+                    #!/usr/bin/env bash
+                    set -euo pipefail
+                    sleep 2
+                    """
+                ),
+                encoding="utf-8",
+            )
+            worker_script.chmod(0o755)
+            git(checkout, "add", "scripts/validation-worker.sh")
+            git(checkout, "commit", "-m", "add sleeping validation worker")
+            start_commit = git(checkout, "rev-parse", "HEAD")
+            ledger = temp_path / "ledger"
+
+            completed = run_afk(
+                "run-step",
+                "validate",
+                "--profile",
+                "tier3-harness",
+                "--project",
+                "bump-eqemu",
+                "--input",
+                json.dumps(
+                    {
+                        "checkout": {
+                            "status": "prepared",
+                            "repo_url": "git@github.com:thunderbump/bump-EQEmu.git",
+                            "checkout_path": str(checkout),
+                            "review_branch": "afk/validate",
+                            "requested_ref": "main",
+                            "start_commit": start_commit,
+                        },
+                        "validation": {"timeout_seconds": 1},
+                    }
+                ),
+                "--ledger",
+                str(ledger),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+            worker_result = json.loads((run_dir / "worker-result.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(result["output"]["status"], "failed_timeout")
+            self.assertEqual(result["output"]["classification"], "timeout")
+            self.assertTrue(worker_result["result"]["normalized"]["adapter"]["timed_out"])
+
 
 if __name__ == "__main__":
     unittest.main()
