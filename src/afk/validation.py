@@ -153,7 +153,12 @@ def normalize_request(input_data: Any, *, project_contract: Any, run_id: str) ->
     if validation["status"] != "valid":
         return invalid_request(validation["message"])
 
-    worker = normalize_worker(input_data.get("worker"), checkout["checkout"], project_contract)
+    worker = normalize_worker(
+        input_data.get("worker"),
+        checkout["checkout"],
+        project_contract,
+        default_timeout_seconds=validation["validation"]["timeout_seconds"],
+    )
     if worker["status"] != "valid":
         return invalid_request(worker["message"])
 
@@ -239,7 +244,13 @@ def normalize_validation(validation: Any, project_contract: Any) -> dict[str, An
     }
 
 
-def normalize_worker(worker: Any, checkout: dict[str, Any], project_contract: Any) -> dict[str, Any]:
+def normalize_worker(
+    worker: Any,
+    checkout: dict[str, Any],
+    project_contract: Any,
+    *,
+    default_timeout_seconds: float | None = None,
+) -> dict[str, Any]:
     if worker is None and getattr(project_contract, "project_slug", None) == "bump-eqemu":
         worker = {
             "type": "local-command",
@@ -249,6 +260,7 @@ def normalize_worker(worker: Any, checkout: dict[str, Any], project_contract: An
                 "--request",
                 "{request_path}",
             ],
+            "timeout_seconds": default_timeout_seconds if default_timeout_seconds is not None else 120,
         }
     if not isinstance(worker, dict):
         return {"status": "invalid", "message": "worker must be an object"}
