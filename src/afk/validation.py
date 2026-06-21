@@ -676,7 +676,7 @@ def actionable_failure_records(
 ) -> list[dict[str, Any]]:
     records = [summarize_failure_record(failure) for failure in failures if isinstance(failure, dict)]
     if records:
-        return records
+        return prioritized_actionable_failures(records)
     if status == "validated":
         return []
     return [
@@ -752,6 +752,7 @@ def compact_failure_summary(item: dict[str, Any]) -> str:
     command = compact_command(string_field(item, "command") or "")
     exit_code = integer_field(item.get("exit_code"))
     log_path = string_field(item, "log_path") or ""
+    excerpt = compact_excerpt(string_field(item, "excerpt") or string_field(item, "reason") or "")
     parts = []
     if command:
         parts.append(f"cmd: {command}")
@@ -759,6 +760,8 @@ def compact_failure_summary(item: dict[str, Any]) -> str:
         parts.append(f"exit: {exit_code}")
     if log_path:
         parts.append(log_path)
+    if excerpt:
+        parts.append(excerpt)
     return ", ".join(parts)
 
 
@@ -779,6 +782,26 @@ def summary_line(item: dict[str, Any]) -> str:
     if excerpt:
         parts.append(excerpt.replace("\n", " "))
     return ": ".join(parts)
+
+
+def prioritized_actionable_failures(failures: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return sorted(failures, key=actionable_failure_priority)
+
+
+def actionable_failure_priority(item: dict[str, Any]) -> tuple[int, int]:
+    category = string_field(item, "category") or ""
+    status = string_field(item, "status") or ""
+    is_skip = category == "prerequisite_skip" or status in {"skip", "skipped"}
+    exit_code = integer_field(item.get("exit_code"))
+    no_exit_code = exit_code is None or exit_code == 0
+    return (1 if is_skip else 0, 1 if no_exit_code else 0)
+
+
+def compact_excerpt(text: str, *, limit: int = 160) -> str:
+    excerpt = " ".join(text.replace("\n", " ").split())
+    if len(excerpt) <= limit:
+        return excerpt
+    return excerpt[: limit - 3].rstrip() + "..."
 
 
 def is_generic_failure_summary(status: str, summary: str) -> bool:

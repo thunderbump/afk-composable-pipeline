@@ -964,6 +964,195 @@ class ValidateCliTest(unittest.TestCase):
                 str(run_dir / "validation-evidence" / "steps" / "tier3_harness.log"),
                 result["output"]["summary"],
             )
+            self.assertIn("zone harness exited 1", result["output"]["summary"])
+
+    def test_validate_includes_compact_excerpt_with_non_generic_worker_summary(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            checkout = temp_path / "checkout"
+            start_commit = init_checkout(checkout)
+            ledger = temp_path / "ledger"
+            worker_code = textwrap.dedent(
+                """
+                import json
+                import os
+                from pathlib import Path
+
+                evidence_dir = Path(os.environ["AFK_WORKER_RESULT"]).parent
+                steps_dir = evidence_dir / "steps"
+                steps_dir.mkdir(parents=True, exist_ok=True)
+                step_log = steps_dir / "tier3_harness.log"
+                step_log.write_text(
+                    "\\n".join(
+                        [
+                            "warning: cached environment reused",
+                            "AssertionError: expected 200 != 500",
+                            "API_TOKEN=super-secret-token",
+                        ]
+                    ),
+                    encoding="utf-8",
+                )
+                Path(os.environ["AFK_WORKER_RESULT"]).write_text(
+                    json.dumps(
+                        {
+                            "profile": "tier3-harness",
+                            "status": "fail",
+                            "summary": "tier3 harness failed",
+                            "steps": [
+                                {
+                                    "name": "tier3_harness",
+                                    "status": "fail",
+                                    "category": "validation_failed",
+                                    "reason": "worker reported test failure",
+                                    "command": "python3 -m unittest tests.test_auth.AuthTest.test_login",
+                                    "exitCode": 1,
+                                    "log": str(step_log),
+                                }
+                            ],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                """
+            ).strip()
+
+            completed = run_afk(
+                "run-step",
+                "validate",
+                "--profile",
+                "tier3-harness",
+                "--input",
+                json.dumps(
+                    {
+                        "checkout": {
+                            "status": "prepared",
+                            "checkout_path": str(checkout),
+                            "review_branch": "afk/validate",
+                            "requested_ref": "main",
+                            "start_commit": start_commit,
+                        },
+                        "worker": {
+                            "type": "local-command",
+                            "command": [sys.executable, "-c", worker_code],
+                        },
+                    }
+                ),
+                "--ledger",
+                str(ledger),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+            worker_result = json.loads((run_dir / "worker-result.json").read_text(encoding="utf-8"))
+            actionable = worker_result["result"]["normalized"]["actionable_failures"]
+
+            self.assertEqual(actionable[0]["excerpt"], "AssertionError: expected 200 != 500")
+            self.assertIn("tier3 harness failed", result["output"]["summary"])
+            self.assertIn("AssertionError: expected 200 != 500", result["output"]["summary"])
+            self.assertNotIn("super-secret-token", result["output"]["summary"])
+
+    def test_validate_prioritizes_actual_failure_before_prerequisite_skip_in_summary(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            checkout = temp_path / "checkout"
+            start_commit = init_checkout(checkout)
+            ledger = temp_path / "ledger"
+            worker_code = textwrap.dedent(
+                """
+                import json
+                import os
+                from pathlib import Path
+
+                evidence_dir = Path(os.environ["AFK_WORKER_RESULT"]).parent
+                steps_dir = evidence_dir / "steps"
+                steps_dir.mkdir(parents=True, exist_ok=True)
+                tier1_log = steps_dir / "tier1.log"
+                tier3_log = steps_dir / "tier3_harness.log"
+                tier1_log.write_text(
+                    "\\n".join(
+                        [
+                            "CMake Error: could not configure build directory",
+                            "CMake Error: missing dependency package",
+                        ]
+                    ),
+                    encoding="utf-8",
+                )
+                tier3_log.write_text(
+                    "reason: tier1 failed; skipped tier3-harness\\n",
+                    encoding="utf-8",
+                )
+                Path(os.environ["AFK_WORKER_RESULT"]).write_text(
+                    json.dumps(
+                        {
+                            "profile": "tier1-tier3-harness",
+                            "status": "fail",
+                            "steps": [
+                                {
+                                    "name": "tier3_harness",
+                                    "status": "skip",
+                                    "category": "prerequisite_failed",
+                                    "reason": "tier1 failed; skipped tier3-harness",
+                                    "command": "internal:tier3_harness",
+                                    "exitCode": 0,
+                                    "log": str(tier3_log),
+                                },
+                                {
+                                    "name": "tier1",
+                                    "status": "fail",
+                                    "category": "validation_failed",
+                                    "reason": "command exited with status 1",
+                                    "command": "cmake --build build",
+                                    "exitCode": 1,
+                                    "log": str(tier1_log),
+                                },
+                            ],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                """
+            ).strip()
+
+            completed = run_afk(
+                "run-step",
+                "validate",
+                "--profile",
+                "tier3-harness",
+                "--input",
+                json.dumps(
+                    {
+                        "checkout": {
+                            "status": "prepared",
+                            "checkout_path": str(checkout),
+                            "review_branch": "afk/validate",
+                            "requested_ref": "main",
+                            "start_commit": start_commit,
+                        },
+                        "worker": {
+                            "type": "local-command",
+                            "command": [sys.executable, "-c", worker_code],
+                        },
+                    }
+                ),
+                "--ledger",
+                str(ledger),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+            worker_result = json.loads((run_dir / "worker-result.json").read_text(encoding="utf-8"))
+            actionable = worker_result["result"]["normalized"]["actionable_failures"]
+
+            self.assertEqual(actionable[0]["name"], "tier1")
+            self.assertEqual(actionable[0]["category"], "compiler")
+            self.assertEqual(actionable[1]["name"], "tier3_harness")
+            self.assertEqual(actionable[1]["category"], "prerequisite_skip")
+            self.assertTrue(result["output"]["summary"].startswith("tier1 [compiler]"))
+            self.assertIn("CMake Error: could not configure build directory", result["output"]["summary"])
 
     def test_validate_summarizes_compiler_failure_from_step_log_before_warning_tail(self):
         with tempfile.TemporaryDirectory() as temp_dir:
