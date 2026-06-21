@@ -63,6 +63,8 @@ def validate(
     evidence_dir = Path(worker_request["evidence_dir"])
     result_path = evidence_dir / "result.json"
     worker_result_path = run_dir / "worker-result.json"
+    stdout_log_path = run_dir / "stdout.log"
+    stderr_log_path = run_dir / "stderr.log"
 
     write_json(request_path, redact_artifact_value(worker_request))
 
@@ -90,6 +92,8 @@ def validate(
                 adapter=adapter_record(request["worker"], exc.returncode, exc.timed_out, command=exc.command),
                 stdout=stdout,
                 stderr=stderr,
+                stdout_path=stdout_log_path,
+                stderr_path=stderr_log_path,
             )
             worker_result = {"raw": None, "normalized": normalized}
             write_worker_result(worker_result_path, run_id, worker_result)
@@ -102,6 +106,8 @@ def validate(
             adapter=adapter_record(request["worker"], exc.returncode, exc.timed_out, command=exc.command),
             stdout=stdout,
             stderr=stderr,
+            stdout_path=stdout_log_path,
+            stderr_path=stderr_log_path,
         )
         worker_result = {"raw": None, "normalized": normalized}
         write_worker_result(worker_result_path, run_id, worker_result)
@@ -132,6 +138,8 @@ def validate(
             ),
             stdout=stdout,
             stderr=stderr,
+            stdout_path=stdout_log_path,
+            stderr_path=stderr_log_path,
         )
         worker_result = {"raw": None, "normalized": normalized}
         write_worker_result(worker_result_path, run_id, worker_result)
@@ -148,6 +156,8 @@ def validate(
         ),
         stdout=stdout,
         stderr=stderr,
+        stdout_path=stdout_log_path,
+        stderr_path=stderr_log_path,
     )
     worker_result = {"raw": raw_result, "normalized": normalized}
     write_worker_result(worker_result_path, run_id, worker_result)
@@ -527,6 +537,8 @@ def normalize_worker_payload(
     adapter: dict[str, Any],
     stdout: str,
     stderr: str,
+    stdout_path: Path,
+    stderr_path: Path,
 ) -> dict[str, Any]:
     raw_status = string_field(payload, "status") or ""
     returncode = adapter.get("returncode")
@@ -557,6 +569,8 @@ def normalize_worker_payload(
             adapter=adapter,
             stdout=stdout,
             stderr=stderr,
+            stdout_path=stdout_path,
+            stderr_path=stderr_path,
         )
     summary = string_field(payload, "summary") or status
     return normalized_worker_result(
@@ -567,6 +581,8 @@ def normalize_worker_payload(
         adapter=adapter,
         stdout=stdout,
         stderr=stderr,
+        stdout_path=stdout_path,
+        stderr_path=stderr_path,
     )
 
 
@@ -579,11 +595,13 @@ def normalized_worker_result(
     adapter: dict[str, Any],
     stdout: str,
     stderr: str,
+    stdout_path: Path,
+    stderr_path: Path,
 ) -> dict[str, Any]:
     failures = failure_records(raw_result)
     evidence = {
-        "stdout_path": "stdout.log",
-        "stderr_path": "stderr.log",
+        "stdout_path": str(stdout_path),
+        "stderr_path": str(stderr_path),
         "stdout_excerpt": stdout[-2000:],
         "stderr_excerpt": stderr[-2000:],
     }
@@ -594,6 +612,8 @@ def normalized_worker_result(
         failures=failures,
         adapter=adapter,
         evidence=evidence,
+        adapter_stdout=stdout,
+        adapter_stderr=stderr,
     )
     return {
         "schema_version": SCHEMA_VERSION,
@@ -651,13 +671,25 @@ def actionable_failure_records(
     failures: list[Any],
     adapter: dict[str, Any],
     evidence: dict[str, Any],
+    adapter_stdout: str,
+    adapter_stderr: str,
 ) -> list[dict[str, Any]]:
     records = [summarize_failure_record(failure) for failure in failures if isinstance(failure, dict)]
     if records:
         return records
     if status == "validated":
         return []
-    return [summarize_adapter_failure(status, classification, summary, adapter, evidence)]
+    return [
+        summarize_adapter_failure(
+            status,
+            classification,
+            summary,
+            adapter,
+            evidence,
+            adapter_stdout=adapter_stdout,
+            adapter_stderr=adapter_stderr,
+        )
+    ]
 
 
 def summarize_failure_record(failure: dict[str, Any]) -> dict[str, Any]:
@@ -682,8 +714,16 @@ def summarize_adapter_failure(
     summary: str,
     adapter: dict[str, Any],
     evidence: dict[str, Any],
+    *,
+    adapter_stdout: str,
+    adapter_stderr: str,
 ) -> dict[str, Any]:
-    log_path, excerpt = adapter_failure_excerpt(summary, evidence)
+    log_path, excerpt = adapter_failure_excerpt(
+        summary,
+        evidence,
+        adapter_stdout=adapter_stdout,
+        adapter_stderr=adapter_stderr,
+    )
     return {
         "name": "worker",
         "status": status,
@@ -699,7 +739,12 @@ def summarize_adapter_failure(
 def actionable_summary(status: str, summary: str, failures: list[dict[str, Any]]) -> str:
     if not failures:
         return summary
+    first = failures[0]
     if not is_generic_failure_summary(status, summary):
+        if string_field(first, "name") == "worker":
+            command = compact_command(string_field(first, "command") or "")
+            if command and command not in summary:
+                return f"{summary}; cmd: {command}"
         return summary
     return "; ".join(summary_line(item) for item in failures[:2])
 
@@ -708,9 +753,12 @@ def summary_line(item: dict[str, Any]) -> str:
     name = string_field(item, "name") or "worker"
     category = string_field(item, "category") or "failure"
     excerpt = string_field(item, "excerpt") or string_field(item, "reason") or ""
+    command = compact_command(string_field(item, "command") or "")
     log_path = string_field(item, "log_path") or ""
     exit_code = integer_field(item.get("exit_code"))
     parts = [f"{name} [{category}]"]
+    if command:
+        parts.append(command)
     if exit_code is not None:
         parts.append(f"exit {exit_code}")
     if log_path:
@@ -765,15 +813,21 @@ def classify_adapter_failure(status: str, classification: str, excerpt: str) -> 
     return classification or status
 
 
-def adapter_failure_excerpt(summary: str, evidence: dict[str, Any]) -> tuple[str, str]:
+def adapter_failure_excerpt(
+    summary: str,
+    evidence: dict[str, Any],
+    *,
+    adapter_stdout: str,
+    adapter_stderr: str,
+) -> tuple[str, str]:
     candidates = [
         (
             string_field(evidence, "stdout_path") or "stdout.log",
-            string_field(evidence, "stdout_excerpt") or "",
+            adapter_stdout or string_field(evidence, "stdout_excerpt") or "",
         ),
         (
             string_field(evidence, "stderr_path") or "stderr.log",
-            string_field(evidence, "stderr_excerpt") or "",
+            adapter_stderr or string_field(evidence, "stderr_excerpt") or "",
         ),
     ]
     for path, text in candidates:
@@ -889,6 +943,15 @@ def display_command(command: Any) -> str:
     if isinstance(command, str):
         return command
     return ""
+
+
+def compact_command(command: str, *, max_length: int = 120) -> str:
+    command = command.strip()
+    if not command:
+        return ""
+    if len(command) <= max_length:
+        return command
+    return command[: max_length - 3].rstrip() + "..."
 
 
 def integer_field(value: Any) -> int | None:

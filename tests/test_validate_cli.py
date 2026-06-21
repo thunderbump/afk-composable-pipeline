@@ -428,10 +428,11 @@ class ValidateCliTest(unittest.TestCase):
             self.assertEqual(result["output"]["status"], "failed_missing_result")
             self.assertEqual(actionable[0]["category"], "missing_result")
             self.assertEqual(actionable[0]["exit_code"], 5)
-            self.assertEqual(actionable[0]["log_path"], "stdout.log")
+            self.assertEqual(actionable[0]["log_path"], str(run_dir / "stdout.log"))
             self.assertIn("error: worker never wrote result", actionable[0]["excerpt"])
             self.assertIn(sys.executable, actionable[0]["command"])
-            self.assertIn("stdout.log", result["output"]["summary"])
+            self.assertIn(str(run_dir / "stdout.log"), result["output"]["summary"])
+            self.assertIn(sys.executable, result["output"]["summary"])
             self.assertIn("error: worker never wrote result", result["output"]["summary"])
 
     def test_validate_classifies_invalid_worker_json_as_protocol_failure(self):
@@ -489,6 +490,9 @@ class ValidateCliTest(unittest.TestCase):
                 "worker result file is not valid JSON",
             )
             self.assertEqual(worker_result["result"]["normalized"]["adapter"]["returncode"], 0)
+            actionable = worker_result["result"]["normalized"]["actionable_failures"]
+            self.assertEqual(actionable[0]["log_path"], str(run_dir / "stdout.log"))
+            self.assertIn(sys.executable, result["output"]["summary"])
             self.assertIn(
                 "wrote malformed result",
                 worker_result["result"]["normalized"]["evidence"]["stdout_excerpt"],
@@ -674,8 +678,9 @@ class ValidateCliTest(unittest.TestCase):
             )
             self.assertEqual(
                 worker_result["result"]["normalized"]["actionable_failures"][0]["log_path"],
-                "stderr.log",
+                str(run_dir / "stderr.log"),
             )
+            self.assertIn(sys.executable, result["output"]["summary"])
             self.assertIn("worker command timed out", result["output"]["summary"])
 
     def test_validate_sanitizes_worker_result_evidence_after_timeout(self):
@@ -813,10 +818,67 @@ class ValidateCliTest(unittest.TestCase):
             self.assertEqual(worker_result["result"]["raw"]["status"], "pass")
             self.assertEqual(worker_result["result"]["normalized"]["classification"], "runtime_failure")
             self.assertEqual(worker_result["result"]["normalized"]["adapter"]["returncode"], 7)
+            actionable = worker_result["result"]["normalized"]["actionable_failures"]
+            self.assertEqual(actionable[0]["log_path"], str(run_dir / "stdout.log"))
+            self.assertIn(sys.executable, result["output"]["summary"])
             self.assertIn(
                 "reported pass before adapter failure",
                 worker_result["result"]["normalized"]["evidence"]["stdout_excerpt"],
             )
+
+    def test_validate_summarizes_adapter_failure_from_full_output_before_warning_tail(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            checkout = temp_path / "checkout"
+            start_commit = init_checkout(checkout)
+            ledger = temp_path / "ledger"
+            warning_tail = "\\n".join(f"warning: cache warmup {index:04d}" for index in range(400))
+            worker_code = textwrap.dedent(
+                f"""
+                import sys
+
+                print("error: worker never wrote result")
+                print({warning_tail!r})
+                sys.exit(5)
+                """
+            ).strip()
+
+            completed = run_afk(
+                "run-step",
+                "validate",
+                "--profile",
+                "tier3-harness",
+                "--input",
+                json.dumps(
+                    {
+                        "checkout": {
+                            "status": "prepared",
+                            "checkout_path": str(checkout),
+                            "review_branch": "afk/validate",
+                            "requested_ref": "main",
+                            "start_commit": start_commit,
+                        },
+                        "worker": {
+                            "type": "local-command",
+                            "command": [sys.executable, "-c", worker_code],
+                        },
+                    }
+                ),
+                "--ledger",
+                str(ledger),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+            worker_result = json.loads((run_dir / "worker-result.json").read_text(encoding="utf-8"))
+            actionable = worker_result["result"]["normalized"]["actionable_failures"]
+
+            self.assertEqual(result["output"]["status"], "failed_missing_result")
+            self.assertEqual(actionable[0]["log_path"], str(run_dir / "stdout.log"))
+            self.assertIn("error: worker never wrote result", actionable[0]["excerpt"])
+            self.assertNotIn("warning: cache warmup 0399", actionable[0]["excerpt"])
 
     def test_validate_classifies_worker_reported_failure_even_when_adapter_exits_nonzero(self):
         with tempfile.TemporaryDirectory() as temp_dir:
