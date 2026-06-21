@@ -9,6 +9,9 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
+
+from afk.workstream import select_work_proves_different_item  # noqa: E402
 
 
 def run_afk(*args, env_overrides=None):
@@ -214,6 +217,49 @@ def successful_recipe(temp_path, repo, checkout, fake_git, fake_gh):
 
 
 class WorkstreamCliTest(unittest.TestCase):
+    def test_select_work_proves_different_item_with_fixture_enumerated_candidates(self):
+        state = {"selected_work": [selected_fixture_item("central-lve.9")]}
+        input_data = {
+            "sources": [
+                {
+                    "type": "fixture",
+                    "id": "fixture",
+                    "items": [selected_fixture_item("central-lve.10")],
+                }
+            ]
+        }
+
+        self.assertTrue(select_work_proves_different_item(input_data, state))
+
+    def test_select_work_does_not_prove_different_item_with_non_fixture_enumerated_candidates(self):
+        state = {"selected_work": [selected_fixture_item("central-lve.9")]}
+        input_data = {
+            "sources": [
+                {
+                    "type": "github",
+                    "id": "issues",
+                    "items": [selected_fixture_item("central-lve.10")],
+                }
+            ]
+        }
+
+        self.assertFalse(select_work_proves_different_item(input_data, state))
+
+    def test_select_work_target_ids_prove_different_item_regardless_of_source_shape(self):
+        state = {"selected_work": [selected_fixture_item("central-lve.9")]}
+        input_data = {
+            "target_ids": ["central-lve.10"],
+            "sources": [
+                {
+                    "type": "github",
+                    "id": "issues",
+                    "items": [selected_fixture_item("central-lve.9")],
+                }
+            ],
+        }
+
+        self.assertTrue(select_work_proves_different_item(input_data, state))
+
     def test_workstream_composes_steps_and_creates_one_terminal_pr_from_ledger_evidence(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
@@ -985,6 +1031,84 @@ Path({str(fake_calls)!r}).write_text("gh should not run\\n", encoding="utf-8")
             recipe["publisher"] = {"enabled": False}
             recipe["steps"] = recipe["steps"][:4] + [
                 recipe["steps"][0],
+                recipe["steps"][1],
+            ]
+
+            completed = run_afk(
+                "run-workstream",
+                "--workstream-id",
+                "central-lve.9",
+                "--input",
+                json.dumps(recipe),
+                "--ledger",
+                str(ledger),
+                env_overrides={
+                    "GIT_ALLOW_PROTOCOL": "file",
+                    "GIT_AUTHOR_NAME": "AFK Test",
+                    "GIT_AUTHOR_EMAIL": "afk-test@example.test",
+                    "GIT_COMMITTER_NAME": "AFK Test",
+                    "GIT_COMMITTER_EMAIL": "afk-test@example.test",
+                },
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            result = json.loads((ledger / summary["result_path"]).read_text(encoding="utf-8"))
+
+            self.assertEqual(summary["status"], "validated-unpublished")
+            self.assertEqual(result["status"], "validated-unpublished")
+            self.assertEqual(result["publication"]["status"], "validated-unpublished")
+            self.assertEqual(
+                [step["name"] for step in result["steps"]],
+                ["select-work", "prepare-checkout", "implement", "validate"],
+            )
+            self.assertIn("validated terminal state", result["terminal_reason"])
+            self.assertEqual(
+                result["next_allowed_command"],
+                "afk run-workstream --workstream-id central-lve.9 --ledger <ledger> --input <recipe>",
+            )
+            self.assertFalse(fake_calls.exists())
+
+    def test_workstream_stops_before_non_fixture_enumerated_follow_up_selection_after_validation(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repo = temp_path / "repo-src"
+            checkout = temp_path / "checkout"
+            ledger = temp_path / "ledger"
+            fake_calls = temp_path / "fake-calls.jsonl"
+            init_repo(repo)
+            fake_git = temp_path / "publisher-git"
+            fake_gh = temp_path / "publisher-gh"
+            write_executable(
+                fake_git,
+                f"""#!{sys.executable}
+from pathlib import Path
+Path({str(fake_calls)!r}).write_text("git should not run\\n", encoding="utf-8")
+""",
+            )
+            write_executable(
+                fake_gh,
+                f"""#!{sys.executable}
+from pathlib import Path
+Path({str(fake_calls)!r}).write_text("gh should not run\\n", encoding="utf-8")
+""",
+            )
+            recipe = successful_recipe(temp_path, repo, checkout, fake_git, fake_gh)
+            recipe["publisher"] = {"enabled": False}
+            recipe["steps"] = recipe["steps"][:4] + [
+                {
+                    "name": "select-work",
+                    "input": {
+                        "required_labels": ["afk:ready"],
+                        "sources": [
+                            {
+                                "type": "github",
+                                "id": "issues",
+                                "items": [selected_fixture_item("central-lve.10")],
+                            }
+                        ],
+                    },
+                },
                 recipe["steps"][1],
             ]
 

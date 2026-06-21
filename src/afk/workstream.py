@@ -445,6 +445,8 @@ def select_work_candidate_identities(input_data: dict[str, Any]) -> set[str]:
     for source in sources:
         if not isinstance(source, dict):
             return set()
+        if string_field(source, "type") != "fixture":
+            continue
         items = source.get("items")
         if not isinstance(items, list):
             return set()
