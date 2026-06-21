@@ -1046,9 +1046,10 @@ class ValidateCliTest(unittest.TestCase):
                 actionable[0]["log_path"],
                 str(run_dir / "validation-evidence" / "steps" / "tier3_harness.log"),
             )
+            self.assertEqual(actionable[0]["log_path_status"], "exact")
             self.assertEqual(actionable[0]["excerpt"], "AssertionError: relative log failed")
 
-    def test_validate_uses_deterministic_fallback_log_path_when_worker_step_log_missing(self):
+    def test_validate_reports_missing_worker_log_path_as_unavailable(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
             checkout = temp_path / "checkout"
@@ -1117,8 +1118,9 @@ class ValidateCliTest(unittest.TestCase):
 
             self.assertEqual(
                 actionable[0]["log_path"],
-                str(run_dir / "validation-evidence" / "steps" / "tier3_harness.log"),
+                None,
             )
+            self.assertEqual(actionable[0]["log_path_status"], "unavailable")
             self.assertEqual(actionable[0]["excerpt"], "log field omitted")
 
     def test_validate_includes_compact_excerpt_with_non_generic_worker_summary(self):

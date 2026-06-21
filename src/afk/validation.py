@@ -709,7 +709,7 @@ def actionable_failure_records(
 
 
 def summarize_failure_record(failure: dict[str, Any], *, evidence_dir: Path) -> dict[str, Any]:
-    log_path = resolve_worker_failure_log_path(failure, evidence_dir=evidence_dir)
+    log_path, log_path_status = resolve_worker_failure_log_path(failure, evidence_dir=evidence_dir)
     reason = string_field(failure, "reason") or ""
     excerpt = log_failure_excerpt(log_path, default_excerpt=reason)
     return {
@@ -720,22 +720,19 @@ def summarize_failure_record(failure: dict[str, Any], *, evidence_dir: Path) -> 
         "command": string_field(failure, "command") or "",
         "exit_code": integer_field(failure.get("exitCode")),
         "log_path": log_path,
+        "log_path_status": log_path_status,
         "excerpt": excerpt,
     }
 
 
-def resolve_worker_failure_log_path(failure: dict[str, Any], *, evidence_dir: Path) -> str:
+def resolve_worker_failure_log_path(failure: dict[str, Any], *, evidence_dir: Path) -> tuple[str | None, str]:
     log_path = string_field(failure, "log")
     if log_path:
         path = Path(log_path)
         if not path.is_absolute():
             path = evidence_dir / path
-        return str(path.resolve())
-    step_name = string_field(failure, "name") or "worker_failure"
-    fallback = Path(step_name).name
-    if not fallback.endswith(".log"):
-        fallback = f"{fallback}.log"
-    return str((evidence_dir / "steps" / fallback).resolve())
+        return str(path.resolve()), "exact"
+    return None, "unavailable"
 
 
 def summarize_adapter_failure(
@@ -908,7 +905,7 @@ def adapter_failure_excerpt(
     return fallback_path, redact_text(summary)
 
 
-def log_failure_excerpt(log_path: str, *, default_excerpt: str) -> str:
+def log_failure_excerpt(log_path: str | None, *, default_excerpt: str) -> str:
     if not log_path:
         return redact_text(default_excerpt)
     try:

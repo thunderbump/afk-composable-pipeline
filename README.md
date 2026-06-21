@@ -111,9 +111,12 @@ Validation failure categories distinguish missing worker results, adapter
 timeouts/runtime failures, worker-reported validation failures, and skipped
 profiles. Worker request/result payloads and stdout/stderr excerpts are
 redacted before being stored in the ledger. Failed validations also record
-`actionable_failures` with the failing command, exit code, exact log path, and
-first actionable excerpt so follow-up work does not need manual `rg`/`tail`
-inspection of worker logs.
+`actionable_failures` with the failing command, exit code, and a log-path field
+that is explicit about availability: when a worker provides a relative or
+absolute log path, AFK records it as the exact resolved `log_path`; when no
+path is provided, `log_path` is `null` and `log_path_status` is `unavailable`.
+The first actionable excerpt is also preserved so follow-up work does not need
+manual `rg`/`tail` inspection of worker logs.
 
 Run final review against explicit implementation and validation evidence:
 
