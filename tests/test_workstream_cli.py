@@ -1877,6 +1877,153 @@ Path({str(fake_calls)!r}).write_text("gh should not run\\n", encoding="utf-8")
             self.assertFalse(blocked_checkout.exists())
             self.assertFalse(fake_calls.exists())
 
+    def test_workstream_blocks_new_retry_checkout_when_prior_retry_is_awaiting_validation(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repo = temp_path / "repo-src"
+            checkout = temp_path / "checkout"
+            retry_checkout = temp_path / "retry-checkout"
+            blocked_checkout = temp_path / "retry-checkout-2"
+            ledger = temp_path / "ledger"
+            fake_calls = temp_path / "fake-calls.jsonl"
+            init_repo(repo)
+            fake_git = temp_path / "publisher-git"
+            fake_gh = temp_path / "publisher-gh"
+            write_executable(
+                fake_git,
+                f"""#!{sys.executable}
+from pathlib import Path
+Path({str(fake_calls)!r}).write_text("git should not run\\n", encoding="utf-8")
+""",
+            )
+            write_executable(
+                fake_gh,
+                f"""#!{sys.executable}
+from pathlib import Path
+Path({str(fake_calls)!r}).write_text("gh should not run\\n", encoding="utf-8")
+""",
+            )
+            failing_worker_code = textwrap.dedent(
+                """
+                import json
+                import os
+                from pathlib import Path
+
+                request = json.loads(Path(os.environ["AFK_WORKER_REQUEST"]).read_text(encoding="utf-8"))
+                Path(os.environ["AFK_WORKER_RESULT"]).write_text(
+                    json.dumps(
+                        {
+                            "profile": request["profile"],
+                            "status": "fail",
+                            "summary": "unit tests failed",
+                            "steps": [{"name": "unit", "status": "fail"}],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                """
+            ).strip()
+            retry_agent_code = textwrap.dedent(
+                """
+                import json
+                import subprocess
+                from pathlib import Path
+
+                Path("retry-implementation.txt").write_text("retry implementation\\n", encoding="utf-8")
+                subprocess.run(["git", "add", "retry-implementation.txt"], check=True)
+                subprocess.run(["git", "commit", "-m", "retry implementation"], check=True)
+                Path("agent-result.json").write_text(
+                    json.dumps({"status": "completed", "summary": "retry implementation"}),
+                    encoding="utf-8",
+                )
+                """
+            ).strip()
+            recipe = successful_recipe(temp_path, repo, checkout, fake_git, fake_gh)
+            recipe["publisher"] = {"enabled": False}
+            recipe["retry_policy"] = {"max_retries": 2}
+            recipe["steps"][3]["input"]["worker"]["command"] = [sys.executable, "-c", failing_worker_code]
+            recipe["steps"] = recipe["steps"][:4] + [
+                {
+                    "name": "prepare-checkout",
+                    "input": {
+                        "repo_url": str(repo),
+                        "base_ref": "main",
+                        "checkout_root": str(temp_path),
+                        "checkout_path": str(retry_checkout),
+                    },
+                },
+                {
+                    "name": "implement",
+                    "input": {
+                        "guardrails": ["stay within checkout"],
+                        "validation": {"profile": "tier1", "commands": []},
+                        "agent": {
+                            "type": "fake-pi-command",
+                            "command": [sys.executable, "-c", retry_agent_code],
+                            "result_path": "agent-result.json",
+                        },
+                    },
+                },
+                {
+                    "name": "prepare-checkout",
+                    "input": {
+                        "repo_url": str(repo),
+                        "base_ref": "main",
+                        "checkout_root": str(temp_path),
+                        "checkout_path": str(blocked_checkout),
+                    },
+                },
+            ]
+
+            completed = run_afk(
+                "run-workstream",
+                "--workstream-id",
+                "central-lve.9",
+                "--input",
+                json.dumps(recipe),
+                "--ledger",
+                str(ledger),
+                env_overrides={
+                    "GIT_ALLOW_PROTOCOL": "file",
+                    "GIT_AUTHOR_NAME": "AFK Test",
+                    "GIT_AUTHOR_EMAIL": "afk-test@example.test",
+                    "GIT_COMMITTER_NAME": "AFK Test",
+                    "GIT_COMMITTER_EMAIL": "afk-test@example.test",
+                },
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            result = json.loads((ledger / summary["result_path"]).read_text(encoding="utf-8"))
+
+            self.assertEqual(summary["status"], "blocked")
+            self.assertEqual(result["status"], "blocked")
+            self.assertEqual(result["publication"]["status"], "blocked")
+            self.assertIn("still running validation", result["publication"]["reason"])
+            self.assertEqual(
+                result["retry_budget"],
+                {
+                    "max_retries": 2,
+                    "attempted_retries": 1,
+                    "remaining_retries": 1,
+                },
+            )
+            self.assertEqual(len(result["retry_attempts"]), 1)
+            retry_attempt = result["retry_attempts"][0]
+            self.assertEqual(retry_attempt["repairing_failure_class"], "failed_validation")
+            self.assertEqual(retry_attempt["checkout_path"], str(retry_checkout))
+            self.assertEqual(retry_attempt["review_branch"], "afk/workstream-terminal-pr")
+            self.assertEqual(retry_attempt["status"], "awaiting_validation")
+            self.assertTrue(retry_attempt["commit"])
+            self.assertEqual(result["cleanup"]["status"], "unknown")
+            self.assertEqual(result["cleanup"]["resources"], [])
+            self.assertEqual(
+                [step["name"] for step in result["steps"]],
+                ["select-work", "prepare-checkout", "implement", "validate", "prepare-checkout", "implement"],
+            )
+            self.assertFalse(blocked_checkout.exists())
+            self.assertFalse(fake_calls.exists())
+
     def test_workstream_keeps_dirty_retry_evidence_after_validation_failure_and_blocks_further_retries(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
