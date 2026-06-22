@@ -464,3 +464,5 @@ Validation Worker, `afk run-step implement` with a fake/local Pi command, and
 `afk run-step review` with a fake/local reviewer command when Docker or Podman
 is available. If neither runtime exists, it exits
 successfully with a clear skip message.
+
+<!-- AFK_SUCCESS_DOGFOOD: central-afk-pr.16 --> Dogfood success marker for central-afk-pr.16 (docs-only, pipeline path).
