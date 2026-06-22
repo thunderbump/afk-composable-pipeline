@@ -983,6 +983,7 @@ def append_checkout_attempt(state: dict[str, Any], checkout: dict[str, Any]) -> 
             "commit": string_field(checkout, "start_commit") or "",
             "status": "prepared",
             "failure_class": "",
+            "dirty": False,
             "dirty_status": [],
         }
     )
@@ -997,8 +998,9 @@ def update_checkout_attempt_after_implementation(state: dict[str, Any], implemen
     if after_commit:
         attempt["commit"] = after_commit
     dirty_status = git_info.get("dirty_status")
+    attempt["dirty"] = bool(git_info.get("dirty"))
     attempt["dirty_status"] = list(dirty_status) if isinstance(dirty_status, list) else []
-    attempt["status"] = "dirty" if git_info.get("dirty") else "awaiting_validation"
+    attempt["status"] = "dirty" if attempt["dirty"] else "awaiting_validation"
 
 
 def update_checkout_attempt_after_validation(state: dict[str, Any], validation: dict[str, Any]) -> None:
@@ -1008,8 +1010,9 @@ def update_checkout_attempt_after_validation(state: dict[str, Any], validation: 
     status = string_field(validation, "status") or ""
     if not status:
         return
-    attempt["status"] = status
     attempt["failure_class"] = "" if status == "validated" else status
+    if not checkout_attempt_is_dirty(attempt):
+        attempt["status"] = status
 
 
 def latest_checkout_attempt(state: dict[str, Any]) -> dict[str, Any] | None:
@@ -1037,6 +1040,10 @@ def previous_failure_class_for_retry(state: dict[str, Any]) -> str:
     return string_field(latest, "failure_class") or string_field(latest, "status") or ""
 
 
+def checkout_attempt_is_dirty(attempt: dict[str, Any]) -> bool:
+    return bool(attempt.get("dirty"))
+
+
 def retry_prepare_checkout_blocking_reason(state: dict[str, Any], retry_policy: dict[str, int]) -> str:
     attempts = state.get("checkout_attempts")
     if not isinstance(attempts, list) or not attempts:
@@ -1050,7 +1057,7 @@ def retry_prepare_checkout_blocking_reason(state: dict[str, Any], retry_policy: 
     prior_retry = latest_retry_attempt(state)
     if prior_retry is None:
         return ""
-    if string_field(prior_retry, "status") == "dirty":
+    if checkout_attempt_is_dirty(prior_retry):
         return "retry checkout blocked: prior retry checkout is dirty and still needs cleanup"
     if string_field(prior_retry, "status") in {"prepared", "awaiting_validation"}:
         return "retry checkout blocked: prior retry checkout is still running validation"
@@ -1101,7 +1108,7 @@ def retry_attempt_records(state: dict[str, Any]) -> list[dict[str, Any]]:
                 "checkout_path": string_field(attempt, "checkout_path") or "",
                 "review_branch": string_field(attempt, "review_branch") or "",
                 "commit": string_field(attempt, "commit") or "",
-                "status": string_field(attempt, "status") or "unknown",
+                "status": "dirty" if checkout_attempt_is_dirty(attempt) else string_field(attempt, "status") or "unknown",
             }
         )
     return records
@@ -1129,7 +1136,7 @@ def dirty_retry_checkout_resources(state: dict[str, Any]) -> list[dict[str, str]
     for attempt in attempts:
         if not isinstance(attempt, dict) or integer_retry_number(attempt) <= 0:
             continue
-        if string_field(attempt, "status") != "dirty":
+        if not checkout_attempt_is_dirty(attempt):
             continue
         resources.append(
             {

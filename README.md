@@ -189,13 +189,22 @@ step produced `passed` for that same HEAD. A workstream can still finish as
   proof is limited to explicit `target_ids` or fully enumerated fixture
   candidates. Otherwise AFK stops conservatively and treats the follow-up as a
   same-item retry/fresh-cycle attempt.
-- a failed validation is followed by a same-item retry path that exceeds
-  `retry_policy.max_retries`, or tries to start a fresh retry checkout while the
-  previous retry checkout is still dirty or still awaiting validation evidence.
 - the current HEAD has final validation plus a passed final review, but
   `publisher.enabled` is `false`
 
-In both cases `next_allowed_command` points at `afk run-workstream ...`, not a
+Retry-hygiene terminal stops stay `blocked`, not `validated-unpublished`,
+because they end on a failed-validation retry chain rather than a publishable
+validated HEAD. Those blocked cases include:
+
+- a failed validation followed by a same-item retry path that exceeds
+  `retry_policy.max_retries`
+- a failed validation followed by an attempt to start a fresh retry checkout
+  while the previous retry checkout is still dirty
+- a failed validation followed by an attempt to start a fresh retry checkout
+  while the previous retry checkout is still awaiting validation evidence
+
+In both terminal outcomes `next_allowed_command` points at
+`afk run-workstream ...`, not a
 separate `afk publish` command. Treat it as the follow-up entrypoint: rerun the
 workstream with an updated recipe that keeps the same review branch/current HEAD
 and either adds the remaining final review/publisher path or enables the
