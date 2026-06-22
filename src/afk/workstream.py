@@ -84,6 +84,7 @@ def run_workstream(
     state: dict[str, Any] = {
         "selected_work": [],
         "checkout": None,
+        "checkout_attempts": [],
         "implementation": None,
         "validations": [],
         "review": None,
@@ -94,14 +95,15 @@ def run_workstream(
     }
     steps = []
 
-    for step_spec in normalized["steps"]:
+    for index, step_spec in enumerate(normalized["steps"]):
         step_name = step_spec["name"]
+        remaining_steps = normalized["steps"][index + 1 :]
         stop_reason = terminal_stop_reason(step_spec, state)
         if stop_reason:
             state["stop_reason"] = stop_reason
             state["next_allowed_command"] = next_allowed_command_for_terminal_stop(state, normalized)
             break
-        blocked_reason = workflow_order_blocking_reason(step_name, state)
+        blocked_reason = workflow_order_blocking_reason(step_name, state, normalized["retry_policy"])
         if blocked_reason:
             state["blocked_reason"] = blocked_reason
             break
@@ -123,10 +125,12 @@ def run_workstream(
         )
         steps.append(step_record)
         update_state_from_step(state, step_name, result, ledger_dir)
-        blocked_reason = blocking_reason_for_step(step_name, result)
+        blocked_reason = blocking_reason_for_step(step_name, result, remaining_steps)
         if blocked_reason:
             state["blocked_reason"] = blocked_reason
             break
+
+    state["cleanup"] = final_cleanup_state(state)
 
     publication: dict[str, Any]
     if state["blocked_reason"]:
@@ -170,6 +174,8 @@ def run_workstream(
         "steps": steps,
         "selected_work": selected_work,
         "cleanup": state["cleanup"],
+        "retry_budget": retry_budget_record(state, normalized["retry_policy"]),
+        "retry_attempts": retry_attempt_records(state),
         "retry": publication.get("retry", ""),
         "terminal_reason": publication.get("reason", ""),
         "next_allowed_command": publication.get("next_allowed_command", ""),
@@ -224,6 +230,7 @@ def normalize_recipe(
     resolved_parent = parent or string_field(recipe, "parent") or ""
     review_branch = string_field(recipe, "review_branch") or f"afk/{resolved_workstream_id}"
     publisher = recipe.get("publisher", {"enabled": False})
+    retry_policy = normalize_retry_policy(recipe.get("retry_policy"))
     return {
         "schema_version": SCHEMA_VERSION,
         "workstream_id": resolved_workstream_id,
@@ -231,6 +238,7 @@ def normalize_recipe(
         "review_branch": review_branch,
         "steps": normalized_steps,
         "publisher": publisher,
+        "retry_policy": retry_policy,
     }
 
 
@@ -330,9 +338,11 @@ def update_state_from_step(
             reset_cycle_state_for_new_selection(state)
     elif step_name == "prepare-checkout":
         state["checkout"] = output
+        append_checkout_attempt(state, output)
     elif step_name == "implement":
         state["implementation"] = output
         state["checkout"] = checkout_after_implementation(state.get("checkout"), output)
+        update_checkout_attempt_after_implementation(state, output)
         if output.get("status") == "implemented":
             state["validations"] = []
             state["review"] = None
@@ -345,6 +355,7 @@ def update_state_from_step(
                 "worker_result_path": str((ledger_dir / "runs" / result.run_id / "worker-result.json").resolve(strict=False)),
             }
         )
+        update_checkout_attempt_after_validation(state, output)
     elif step_name == "review":
         state["review"] = output
         cleanup = output.get("cleanup")
@@ -352,9 +363,17 @@ def update_state_from_step(
             state["cleanup"] = cleanup
 
 
-def workflow_order_blocking_reason(step_name: str, state: dict[str, Any]) -> str:
+def workflow_order_blocking_reason(
+    step_name: str,
+    state: dict[str, Any],
+    retry_policy: dict[str, int],
+) -> str:
     if step_name in {"implement", "review"} and selected_work_count(state) > 1:
         return "MVP supports a single selected work item; narrow the selection and rerun"
+    if step_name == "prepare-checkout":
+        retry_block = retry_prepare_checkout_blocking_reason(state, retry_policy)
+        if retry_block:
+            return retry_block
     if step_name == "validate" and not implemented_after_commit(state):
         return "validate requires implementation evidence before final validation"
     if step_name == "review":
@@ -466,6 +485,7 @@ def select_work_candidate_identities(input_data: dict[str, Any]) -> set[str]:
 
 def reset_cycle_state_for_new_selection(state: dict[str, Any]) -> None:
     state["checkout"] = None
+    state["checkout_attempts"] = []
     state["implementation"] = None
     state["validations"] = []
     state["review"] = None
@@ -504,7 +524,11 @@ def has_current_validated_evidence(state: dict[str, Any]) -> bool:
     )
 
 
-def blocking_reason_for_step(step_name: str, result: StepResult) -> str:
+def blocking_reason_for_step(
+    step_name: str,
+    result: StepResult,
+    remaining_steps: list[dict[str, Any]],
+) -> str:
     output = result.output if isinstance(result.output, dict) else {}
     status = output.get("status")
     if step_name == "select-work" and not output.get("selected_work"):
@@ -515,6 +539,8 @@ def blocking_reason_for_step(step_name: str, result: StepResult) -> str:
         "validate": "validated",
         "review": "passed",
     }.get(step_name)
+    if step_name == "validate" and status != expected and validation_failure_allows_retry_follow_up(remaining_steps):
+        return ""
     if expected and status != expected:
         return f"{step_name} did not reach {expected}: {status or 'missing status'}"
     return ""
@@ -908,10 +934,220 @@ def pr_body_markdown(
             f"- Workstream result: {pr_body_value(f'workstreams/{ledger.run_id}/workstream-result.json')}",
         ]
     )
+    cleanup_resources = state["cleanup"].get("resources")
+    if isinstance(cleanup_resources, list) and cleanup_resources:
+        lines.extend(["- Cleanup resources:"])
+        for resource in cleanup_resources:
+            if not isinstance(resource, dict):
+                continue
+            lines.append(
+                "  - "
+                f"{pr_body_value(resource.get('kind', 'resource'))}: "
+                f"{pr_body_value(resource.get('path', ''))} "
+                f"{pr_body_value(resource.get('branch', ''))} "
+                f"{pr_body_value(resource.get('commit', ''))} "
+                f"({pr_body_value(resource.get('status', 'unknown'))})"
+            )
     for step in steps:
         lines.append(f"- {pr_body_value(step['name'])}: {pr_body_value(step['result_path'])}")
     lines.append("")
     return "\n".join(lines)
+
+
+def normalize_retry_policy(retry_policy: Any) -> dict[str, int]:
+    if retry_policy is None:
+        return {"max_retries": 0}
+    if not isinstance(retry_policy, dict):
+        raise WorkstreamError("retry_policy must be an object")
+    unsupported = [key for key in retry_policy if key != "max_retries"]
+    if unsupported:
+        raise WorkstreamError("retry_policy only supports max_retries")
+    max_retries = retry_policy.get("max_retries", 0)
+    if isinstance(max_retries, bool) or not isinstance(max_retries, int) or max_retries < 0:
+        raise WorkstreamError("retry_policy.max_retries must be a non-negative integer")
+    return {"max_retries": max_retries}
+
+
+def append_checkout_attempt(state: dict[str, Any], checkout: dict[str, Any]) -> None:
+    if checkout.get("status") != "prepared":
+        return
+    attempt_number = len(state["checkout_attempts"]) + 1
+    retry_number = max(0, attempt_number - 1)
+    state["checkout_attempts"].append(
+        {
+            "attempt": attempt_number,
+            "retry_number": retry_number,
+            "repairing_failure_class": previous_failure_class_for_retry(state) if retry_number else "",
+            "checkout_path": string_field(checkout, "checkout_path") or "",
+            "review_branch": string_field(checkout, "review_branch") or "",
+            "commit": string_field(checkout, "start_commit") or "",
+            "status": "prepared",
+            "failure_class": "",
+            "dirty_status": [],
+        }
+    )
+
+
+def update_checkout_attempt_after_implementation(state: dict[str, Any], implementation: dict[str, Any]) -> None:
+    attempt = latest_checkout_attempt(state)
+    if attempt is None or implementation.get("status") != "implemented":
+        return
+    git_info = implementation.get("git") if isinstance(implementation.get("git"), dict) else {}
+    after_commit = string_field(git_info, "after_commit")
+    if after_commit:
+        attempt["commit"] = after_commit
+    dirty_status = git_info.get("dirty_status")
+    attempt["dirty_status"] = list(dirty_status) if isinstance(dirty_status, list) else []
+    attempt["status"] = "dirty" if git_info.get("dirty") else "awaiting_validation"
+
+
+def update_checkout_attempt_after_validation(state: dict[str, Any], validation: dict[str, Any]) -> None:
+    attempt = latest_checkout_attempt(state)
+    if attempt is None:
+        return
+    status = string_field(validation, "status") or ""
+    if not status:
+        return
+    attempt["status"] = status
+    attempt["failure_class"] = "" if status == "validated" else status
+
+
+def latest_checkout_attempt(state: dict[str, Any]) -> dict[str, Any] | None:
+    attempts = state.get("checkout_attempts")
+    if not isinstance(attempts, list) or not attempts:
+        return None
+    latest = attempts[-1]
+    return latest if isinstance(latest, dict) else None
+
+
+def latest_retry_attempt(state: dict[str, Any]) -> dict[str, Any] | None:
+    attempts = state.get("checkout_attempts")
+    if not isinstance(attempts, list):
+        return None
+    for attempt in reversed(attempts):
+        if isinstance(attempt, dict) and integer_retry_number(attempt) > 0:
+            return attempt
+    return None
+
+
+def previous_failure_class_for_retry(state: dict[str, Any]) -> str:
+    latest = latest_checkout_attempt(state)
+    if latest is None:
+        return ""
+    return string_field(latest, "failure_class") or string_field(latest, "status") or ""
+
+
+def retry_prepare_checkout_blocking_reason(state: dict[str, Any], retry_policy: dict[str, int]) -> str:
+    attempts = state.get("checkout_attempts")
+    if not isinstance(attempts, list) or not attempts:
+        return ""
+    attempted_retries = retry_attempt_count(state)
+    if attempted_retries >= retry_policy["max_retries"]:
+        return (
+            "retry budget exhausted: "
+            f"{attempted_retries} retries attempted, max_retries={retry_policy['max_retries']}"
+        )
+    prior_retry = latest_retry_attempt(state)
+    if prior_retry is None:
+        return ""
+    if string_field(prior_retry, "status") == "dirty":
+        return "retry checkout blocked: prior retry checkout is dirty and still needs cleanup"
+    if string_field(prior_retry, "status") in {"prepared", "awaiting_validation"}:
+        return "retry checkout blocked: prior retry checkout is still running validation"
+    return ""
+
+
+def validation_failure_allows_retry_follow_up(remaining_steps: list[dict[str, Any]]) -> bool:
+    for step in remaining_steps:
+        if not isinstance(step, dict):
+            continue
+        name = step.get("name")
+        if name in {"prepare-checkout", "select-work"}:
+            return True
+        if name in {"review", "validate"}:
+            return False
+    return False
+
+
+def retry_attempt_count(state: dict[str, Any]) -> int:
+    attempts = state.get("checkout_attempts")
+    if not isinstance(attempts, list):
+        return 0
+    return sum(1 for attempt in attempts if isinstance(attempt, dict) and integer_retry_number(attempt) > 0)
+
+
+def retry_budget_record(state: dict[str, Any], retry_policy: dict[str, int]) -> dict[str, int]:
+    attempted_retries = retry_attempt_count(state)
+    max_retries = retry_policy["max_retries"]
+    return {
+        "max_retries": max_retries,
+        "attempted_retries": attempted_retries,
+        "remaining_retries": max(0, max_retries - attempted_retries),
+    }
+
+
+def retry_attempt_records(state: dict[str, Any]) -> list[dict[str, Any]]:
+    attempts = state.get("checkout_attempts")
+    if not isinstance(attempts, list):
+        return []
+    records = []
+    for attempt in attempts:
+        if not isinstance(attempt, dict) or integer_retry_number(attempt) <= 0:
+            continue
+        records.append(
+            {
+                "attempt": int(attempt["attempt"]),
+                "repairing_failure_class": string_field(attempt, "repairing_failure_class") or "",
+                "checkout_path": string_field(attempt, "checkout_path") or "",
+                "review_branch": string_field(attempt, "review_branch") or "",
+                "commit": string_field(attempt, "commit") or "",
+                "status": string_field(attempt, "status") or "unknown",
+            }
+        )
+    return records
+
+
+def final_cleanup_state(state: dict[str, Any]) -> dict[str, Any]:
+    cleanup = state.get("cleanup")
+    base = dict(cleanup) if isinstance(cleanup, dict) else {"status": "unknown", "resources": []}
+    resources = list(base.get("resources")) if isinstance(base.get("resources"), list) else []
+    dirty_retry_resources = dirty_retry_checkout_resources(state)
+    if not dirty_retry_resources:
+        base["resources"] = resources
+        return base
+    return {
+        "status": "dirty_retry_checkouts",
+        "resources": resources + dirty_retry_resources,
+    }
+
+
+def dirty_retry_checkout_resources(state: dict[str, Any]) -> list[dict[str, str]]:
+    attempts = state.get("checkout_attempts")
+    if not isinstance(attempts, list):
+        return []
+    resources = []
+    for attempt in attempts:
+        if not isinstance(attempt, dict) or integer_retry_number(attempt) <= 0:
+            continue
+        if string_field(attempt, "status") != "dirty":
+            continue
+        resources.append(
+            {
+                "kind": "retry_checkout",
+                "path": string_field(attempt, "checkout_path") or "",
+                "branch": string_field(attempt, "review_branch") or "",
+                "commit": string_field(attempt, "commit") or "",
+                "status": "dirty",
+            }
+        )
+    return resources
+
+
+def integer_retry_number(attempt: dict[str, Any]) -> int:
+    value = attempt.get("retry_number")
+    if isinstance(value, bool) or not isinstance(value, int):
+        return 0
+    return value
 
 
 def pr_body_value(value: Any) -> str:

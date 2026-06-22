@@ -151,6 +151,8 @@ The recipe schema is intentionally small:
 - `workstream_id`, `parent`, and `review_branch` identify the workstream and
   shared review branch. CLI `--workstream-id` and `--parent` override the recipe
   values.
+- `retry_policy.max_retries` is optional and defaults to `0`. It bounds how many
+  same-item retry checkout cycles may start after a failed validation.
 - `steps` is an ordered list of existing step names: `select-work`,
   `prepare-checkout`, `implement`, `validate`, and `review`. Each step has an
   explicit `input` object, plus optional `profile` for `validate`.
@@ -187,6 +189,9 @@ step produced `passed` for that same HEAD. A workstream can still finish as
   proof is limited to explicit `target_ids` or fully enumerated fixture
   candidates. Otherwise AFK stops conservatively and treats the follow-up as a
   same-item retry/fresh-cycle attempt.
+- a failed validation is followed by a same-item retry path that exceeds
+  `retry_policy.max_retries`, or tries to start a fresh retry checkout while the
+  previous retry checkout is still dirty or still awaiting validation evidence.
 - the current HEAD has final validation plus a passed final review, but
   `publisher.enabled` is `false`
 
@@ -416,8 +421,11 @@ contains the normalized final review status plus pointers to
 `run-workstream` records one workstream directory and one normal `runs/<run-id>/`
 directory for each composed step. `workstream-result.json` lists every step run,
 its ledger result path, the generated equivalent `afk run-step ...` command,
-selected work result summaries, cleanup status, terminal reason, next allowed
-command, retry instructions, and terminal PR publication status.
+selected work result summaries, cleanup status, `retry_budget`,
+`retry_attempts`, terminal reason, next allowed command, retry instructions,
+and terminal PR publication status. Dirty retry checkouts are surfaced through
+`cleanup.resources` with path, branch, commit, and status so failed retry
+attempts stay visible without spawning more sibling checkouts.
 `publication-result.json` records one of four explicit terminal states:
 `blocked`, `validated-unpublished`, `failed-needs-human`, or `published`.
 `validated-unpublished` means the current HEAD is terminally validated but AFK
