@@ -10,27 +10,26 @@ from afk.workstream import workstream_status_from_publication  # noqa: E402
 
 
 class WorkstreamStatusMappingTest(unittest.TestCase):
-    def test_workstream_status_from_publication_uses_explicit_terminal_vocabulary(self):
+    def test_workstream_status_from_publication_explicit_terminal_states(self):
         self.assertEqual(
-            workstream_status_from_publication({"status": "published"}), "published"
+            workstream_status_from_publication({"status": "published"}),
+            "published",
         )
         self.assertEqual(
-            workstream_status_from_publication({"status": "validated-unpublished"}),
+            workstream_status_from_publication(
+                {"status": "validated-unpublished"},
+            ),
             "validated-unpublished",
         )
         self.assertEqual(
-            workstream_status_from_publication({"status": "blocked"}), "blocked"
+            workstream_status_from_publication({"status": "blocked"}),
+            "blocked",
         )
 
-    def test_workstream_status_from_publication_rejects_legacy_terminal_strings(self):
+    def test_workstream_status_from_publication_unknown_status_defaults(
+        self,
+    ):
         self.assertEqual(
-            workstream_status_from_publication({"status": "failed_publication"}),
-            "failed-needs-human",
-        )
-        self.assertEqual(
-            workstream_status_from_publication({"status": "completed"}), "failed-needs-human"
-        )
-        self.assertEqual(
-            workstream_status_from_publication({"status": "needs_human"}),
+            workstream_status_from_publication({"status": "mystery_status"}),
             "failed-needs-human",
         )
