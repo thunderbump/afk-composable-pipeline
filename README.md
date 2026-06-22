@@ -437,6 +437,17 @@ and terminal PR publication status. Dirty retry checkouts are surfaced through
 attempts stay visible without spawning more sibling checkouts.
 `publication-result.json` records one of four explicit terminal states:
 `blocked`, `validated-unpublished`, `failed-needs-human`, or `published`.
+Step-level outputs may still use other status strings; specifically,
+`prepare-checkout` uses `publication.status == "skipped_disabled"` when
+the checkout publisher path is intentionally disabled.
+
+Audit note (PR #17): searched downstream `run-workstream` terminal consumers for
+publication status handling and found no dedicated mapping branch for legacy
+terminal strings (`completed`, `failed_publication`, `needs_human`); unknown
+publication states are mapped to `failed-needs-human` at the terminal boundary.
+`prepare-checkout`'s `publication.status == "skipped_disabled"` remains a
+step-level value and is intentionally not part of terminal-status branching in
+workstream runs.
 `validated-unpublished` means the current HEAD is terminally validated but AFK
 did not publish a PR in that run; only the subset with a passed final review is
 immediately eligible for PR publication on a follow-up rerun.
