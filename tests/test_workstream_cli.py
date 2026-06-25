@@ -11,7 +11,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from afk.workstream import select_work_proves_different_item  # noqa: E402
+from afk.workstream import WorkstreamLedger, pr_body_markdown, select_work_proves_different_item  # noqa: E402
 
 
 def run_afk(*args, env_overrides=None):
@@ -385,7 +385,7 @@ sys.exit(0)
                     }
                 ],
             )
-            self.assertEqual(result["publication"]["status"], "published")
+            self.assertEqual(result["publication"]["status"], "published", result["publication"])
             self.assertEqual(result["publication"]["mode"], "create")
             self.assertEqual(result["publication"]["url"], "https://github.example/pr/123")
 
@@ -416,6 +416,11 @@ sys.exit(0)
             self.assertIn("implemented.txt", body)
             self.assertIn("Validation", body)
             self.assertIn("tier1: validated", body)
+            self.assertIn("unit=pass", body)
+            self.assertIn("command:", body)
+            self.assertIn("summary: validated", body)
+            self.assertIn("evidence: runs/", body)
+            self.assertNotRegex(body, r"(?m)^-\s*:\s")
             self.assertIn("Review: passed", body)
             self.assertIn("Artifacts", body)
             self.assertIn(result["steps"][-1]["result_path"], body)
@@ -2343,6 +2348,292 @@ print("https://github.example/pr/123")
             self.assertEqual(calls[1]["tool"], "gh")
             self.assertEqual(calls[1]["argv"][0:4], ["pr", "edit", "123", "--repo"])
             self.assertIn("central-lve.9 - Compose workstream recipe", calls[1]["body"])
+
+    def test_workstream_update_mode_falls_back_to_rest_when_pr_edit_hits_projects_classic_failure(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repo = temp_path / "repo-src"
+            checkout = temp_path / "checkout"
+            ledger = temp_path / "ledger"
+            fake_calls = temp_path / "fake-calls.jsonl"
+            init_repo(repo)
+            fake_git = temp_path / "publisher-git"
+            fake_gh = temp_path / "publisher-gh"
+            write_executable(
+                fake_git,
+                f"""#!{sys.executable}
+from pathlib import Path
+Path({str(fake_calls)!r}).write_text("git should not run\\n", encoding="utf-8")
+""",
+            )
+            write_executable(
+                fake_gh,
+                f"""#!{sys.executable}
+import json
+import sys
+from pathlib import Path
+
+record = {{"tool": "gh", "argv": sys.argv[1:]}}
+if "--body-file" in sys.argv:
+    body_file = sys.argv[sys.argv.index("--body-file") + 1]
+    record["body"] = Path(body_file).read_text(encoding="utf-8")
+if "--input" in sys.argv:
+    input_file = sys.argv[sys.argv.index("--input") + 1]
+    record["input"] = json.loads(Path(input_file).read_text(encoding="utf-8"))
+Path({str(fake_calls)!r}).open("a", encoding="utf-8").write(json.dumps(record) + "\\n")
+if sys.argv[1:4] == ["auth", "status", "--hostname"]:
+    sys.exit(0)
+if sys.argv[1:4] == ["pr", "edit", "afk/workstream-terminal-pr"]:
+    print("GraphQL: Projects (classic) is being deprecated in favor of the new Projects experience", file=sys.stderr)
+    sys.exit(1)
+if sys.argv[1:4] == ["pr", "view", "afk/workstream-terminal-pr"]:
+    print("123")
+    sys.exit(0)
+if sys.argv[1:4] == ["api", "--method", "PATCH"]:
+    print("https://github.example/pr/123")
+    sys.exit(0)
+sys.exit(9)
+""",
+            )
+            recipe = successful_recipe(temp_path, repo, checkout, fake_git, fake_gh)
+            recipe["publisher"]["mode"] = "update"
+            recipe["publisher"]["pr"] = "afk/workstream-terminal-pr"
+            recipe["publisher"]["git"]["push"] = False
+
+            completed = run_afk(
+                "run-workstream",
+                "--workstream-id",
+                "central-lve.9",
+                "--input",
+                json.dumps(recipe),
+                "--ledger",
+                str(ledger),
+                env_overrides={
+                    "GIT_ALLOW_PROTOCOL": "file",
+                    "GIT_AUTHOR_NAME": "AFK Test",
+                    "GIT_AUTHOR_EMAIL": "afk-test@example.test",
+                    "GIT_COMMITTER_NAME": "AFK Test",
+                    "GIT_COMMITTER_EMAIL": "afk-test@example.test",
+                },
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            result = json.loads((ledger / summary["result_path"]).read_text(encoding="utf-8"))
+            calls = [
+                json.loads(line)
+                for line in fake_calls.read_text(encoding="utf-8").splitlines()
+            ]
+
+            self.assertEqual(result["publication"]["status"], "published", result["publication"])
+            self.assertEqual(result["publication"]["mode"], "update")
+            self.assertEqual(
+                [call["argv"][0:2] for call in calls],
+                [["auth", "status"], ["pr", "edit"], ["pr", "view"], ["api", "--method"]],
+            )
+            self.assertEqual(
+                calls[3]["argv"],
+                [
+                    "api",
+                    "--method",
+                    "PATCH",
+                    "repos/thunderbump/afk-composable-pipeline/pulls/123",
+                    "--input",
+                    calls[3]["argv"][5],
+                    "--jq",
+                    ".html_url",
+                ],
+            )
+            self.assertEqual(
+                calls[3]["input"]["title"],
+                "central-lve.9: Compose workstream recipe and terminal PR publisher",
+            )
+            body = calls[3]["input"]["body"]
+            self.assertIn("central-lve.9 - Compose workstream recipe", body)
+            self.assertIn("Validation", body)
+            self.assertIn("tier1: validated", body)
+            self.assertIn("unit=pass", body)
+            self.assertIn("command:", body)
+            self.assertIn("summary: validated", body)
+            self.assertIn("evidence: runs/", body)
+            self.assertNotRegex(body, r"(?m)^-\s*:\s")
+
+    def test_workstream_update_mode_resolves_non_numeric_pr_refs_before_rest_fallback(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repo = temp_path / "repo-src"
+            checkout = temp_path / "checkout"
+            ledger = temp_path / "ledger"
+            fake_calls = temp_path / "fake-calls.jsonl"
+            init_repo(repo)
+            fake_git = temp_path / "publisher-git"
+            fake_gh = temp_path / "publisher-gh"
+            write_executable(
+                fake_git,
+                f"""#!{sys.executable}
+from pathlib import Path
+Path({str(fake_calls)!r}).write_text("git should not run\\n", encoding="utf-8")
+""",
+            )
+            write_executable(
+                fake_gh,
+                f"""#!{sys.executable}
+import json
+import sys
+from pathlib import Path
+
+record = {{"tool": "gh", "argv": sys.argv[1:]}}
+if "--input" in sys.argv:
+    input_file = sys.argv[sys.argv.index("--input") + 1]
+    record["input"] = json.loads(Path(input_file).read_text(encoding="utf-8"))
+Path({str(fake_calls)!r}).open("a", encoding="utf-8").write(json.dumps(record) + "\\n")
+if sys.argv[1:4] == ["auth", "status", "--hostname"]:
+    sys.exit(0)
+if sys.argv[1:4] == ["pr", "edit", "feature/pull/123"]:
+    print("GraphQL: Projects (classic) is being deprecated in favor of the new Projects experience", file=sys.stderr)
+    sys.exit(1)
+if sys.argv[1:4] == ["pr", "view", "feature/pull/123"]:
+    print("987")
+    sys.exit(0)
+if sys.argv[1:4] == ["api", "--method", "PATCH"]:
+    print("https://github.example/pr/987")
+    sys.exit(0)
+sys.exit(9)
+""",
+            )
+            recipe = successful_recipe(temp_path, repo, checkout, fake_git, fake_gh)
+            recipe["publisher"]["mode"] = "update"
+            recipe["publisher"]["pr"] = "feature/pull/123"
+            recipe["publisher"]["git"]["push"] = False
+
+            completed = run_afk(
+                "run-workstream",
+                "--workstream-id",
+                "central-lve.9",
+                "--input",
+                json.dumps(recipe),
+                "--ledger",
+                str(ledger),
+                env_overrides={
+                    "GIT_ALLOW_PROTOCOL": "file",
+                    "GIT_AUTHOR_NAME": "AFK Test",
+                    "GIT_AUTHOR_EMAIL": "afk-test@example.test",
+                    "GIT_COMMITTER_NAME": "AFK Test",
+                    "GIT_COMMITTER_EMAIL": "afk-test@example.test",
+                },
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            calls = [
+                json.loads(line)
+                for line in fake_calls.read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual(
+                [call["argv"][0:3] for call in calls],
+                [
+                    ["auth", "status", "--hostname"],
+                    ["pr", "edit", "feature/pull/123"],
+                    ["pr", "view", "feature/pull/123"],
+                    ["api", "--method", "PATCH"],
+                ],
+            )
+            self.assertEqual(calls[3]["argv"][3], "repos/thunderbump/afk-composable-pipeline/pulls/987")
+
+    def test_workstream_pr_body_redacts_validation_worker_command_secret_args(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            body = pr_body_markdown(
+                {
+                    "workstream_id": "central-lve.9",
+                    "parent": "central-lve",
+                    "review_branch": "afk/workstream-terminal-pr",
+                },
+                {
+                    "implementation": {"git": {"changed_files": [], "commits": []}},
+                    "validations": [
+                        {
+                            "step_result_path": str(temp_path / "ledger" / "runs" / "validate" / "step-result.json"),
+                            "worker_result_path": str(temp_path / "ledger" / "runs" / "validate" / "worker-result.json"),
+                            "output": {
+                                "status": "validated",
+                                "summary": "validated",
+                                "validation": {"requested_profile": "tier1"},
+                                "worker_result": {
+                                    "raw": {"steps": [{"name": "unit", "status": "pass"}]},
+                                    "normalized": {
+                                        "adapter": {
+                                            "command": [
+                                                sys.executable,
+                                                "worker.py",
+                                                "--token",
+                                                "plain-secret-value",
+                                                "--api-key=plain-api-secret",
+                                            ]
+                                        }
+                                    },
+                                },
+                            },
+                        }
+                    ],
+                    "review": {"status": "passed"},
+                    "cleanup": {"status": "clean", "resources": []},
+                },
+                [{"name": "validate", "result_path": "runs/validate/step-result.json"}],
+                [
+                    {
+                        "external_id": "central-lve.9",
+                        "title": "Compose workstream recipe",
+                        "result": "passed",
+                    }
+                ],
+                WorkstreamLedger(temp_path / "ledger", "run-1"),
+            )
+
+            self.assertIn("command:", body)
+            self.assertIn("--token [REDACTED]", body)
+            self.assertIn("--api-key=[REDACTED]", body)
+            self.assertNotIn("plain-secret-value", body)
+            self.assertNotIn("plain-api-secret", body)
+
+    def test_workstream_pr_body_preserves_validation_contract_when_worker_evidence_is_missing(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            body = pr_body_markdown(
+                {
+                    "workstream_id": "central-lve.9",
+                    "parent": "central-lve",
+                    "review_branch": "afk/workstream-terminal-pr",
+                },
+                {
+                    "implementation": {"git": {"changed_files": [], "commits": []}},
+                    "validations": [
+                        {
+                            "step_result_path": str(temp_path / "ledger" / "runs" / "validate" / "step-result.json"),
+                            "worker_result_path": "",
+                            "output": {
+                                "status": "validated",
+                                "validation": {"requested_profile": "tier1"},
+                            },
+                        }
+                    ],
+                    "review": {"status": "passed"},
+                    "cleanup": {"status": "clean", "resources": []},
+                },
+                [{"name": "validate", "result_path": "runs/validate/step-result.json"}],
+                [
+                    {
+                        "external_id": "central-lve.9",
+                        "title": "Compose workstream recipe",
+                        "result": "passed",
+                    }
+                ],
+                WorkstreamLedger(temp_path / "ledger", "run-1"),
+            )
+
+            self.assertIn(
+                "- tier1: validated - result: missing - command: missing - summary: missing - evidence: runs/validate/step-result.json",
+                body,
+            )
 
     def test_workstream_blocks_publication_when_final_review_fails(self):
         with tempfile.TemporaryDirectory() as temp_dir:
