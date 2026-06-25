@@ -85,9 +85,9 @@ def validate(
         write_adapter_logs(stdout, stderr)
         raw_payload = read_worker_payload(result_path, fallback_path=evidence_result_path)
         if raw_payload["status"] == "valid":
-            sync_worker_evidence_result(evidence_result_path, raw_payload["payload"])
+            sync_worker_payload_artifacts(result_path, evidence_result_path, raw_payload["payload"])
         if raw_payload["status"] == "invalid":
-            sync_worker_evidence_protocol_error(evidence_result_path, raw_payload["message"])
+            sync_worker_protocol_artifacts(result_path, evidence_result_path, raw_payload["message"])
             normalized = normalized_worker_result(
                 status="failed_protocol",
                 classification="protocol_failure",
@@ -127,9 +127,9 @@ def validate(
 
     raw_payload = read_worker_payload(result_path, fallback_path=evidence_result_path)
     if raw_payload["status"] == "valid":
-        sync_worker_evidence_result(evidence_result_path, raw_payload["payload"])
+        sync_worker_payload_artifacts(result_path, evidence_result_path, raw_payload["payload"])
     elif raw_payload["status"] == "invalid":
-        sync_worker_evidence_protocol_error(evidence_result_path, raw_payload["message"])
+        sync_worker_protocol_artifacts(result_path, evidence_result_path, raw_payload["message"])
     if raw_payload["status"] != "valid":
         if raw_payload["status"] == "missing":
             status = "failed_missing_result"
@@ -547,12 +547,15 @@ def replace_worker_result_evidence(path: Path, payload: dict[str, Any]) -> bool:
     return True
 
 
-def sync_worker_evidence_result(path: Path, payload: dict[str, Any]) -> None:
-    replace_worker_result_evidence(path, payload)
+def sync_worker_payload_artifacts(worker_output_path: Path, evidence_result_path: Path, payload: dict[str, Any]) -> None:
+    replace_worker_result_evidence(worker_output_path, payload)
+    replace_worker_result_evidence(evidence_result_path, payload)
 
 
-def sync_worker_evidence_protocol_error(path: Path, message: str) -> None:
-    replace_worker_result_evidence(path, protocol_error_evidence(message))
+def sync_worker_protocol_artifacts(worker_output_path: Path, evidence_result_path: Path, message: str) -> None:
+    payload = protocol_error_evidence(message)
+    replace_worker_result_evidence(worker_output_path, payload)
+    replace_worker_result_evidence(evidence_result_path, payload)
 
 
 def normalize_worker_payload(

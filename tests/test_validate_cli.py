@@ -2028,9 +2028,13 @@ class ValidateCliTest(unittest.TestCase):
             run_dir = ledger / "runs" / summary["run_id"]
             result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
             worker_result = json.loads((run_dir / "worker-result.json").read_text(encoding="utf-8"))
+            evidence_result = run_dir / "validation-evidence" / "result.json"
+            worker_output = run_dir / "validation-evidence" / "worker-output.json"
 
             self.assertEqual(result["output"]["status"], "validated")
             self.assertEqual(worker_result["result"]["raw"]["profile"], "tier3-harness")
+            self.assertTrue(worker_output.is_file())
+            self.assertEqual(evidence_result.read_text(encoding="utf-8"), worker_output.read_text(encoding="utf-8"))
             self.assertIn(
                 "default validation worker tier3-harness",
                 (run_dir / "stdout.log").read_text(encoding="utf-8"),
