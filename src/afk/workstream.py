@@ -1440,17 +1440,10 @@ def validation_worker_evidence_for_body(output: dict[str, Any]) -> str:
     worker_result = output.get("worker_result") if isinstance(output.get("worker_result"), dict) else {}
     raw_result = worker_result.get("raw") if isinstance(worker_result.get("raw"), dict) else {}
     normalized = worker_result.get("normalized") if isinstance(worker_result.get("normalized"), dict) else {}
-    result = validation_worker_result_summary(raw_result)
-    command = validation_worker_command_summary(normalized)
-    summary = string_field(output, "summary") or string_field(normalized, "summary")
-    parts = []
-    if result:
-        parts.append(f"result: {result}")
-    if command:
-        parts.append(f"command: {command}")
-    if summary:
-        parts.append(f"summary: {summary}")
-    return " - ".join(parts)
+    result = validation_worker_result_summary(raw_result) or "missing"
+    command = validation_worker_command_summary(normalized) or "missing"
+    summary = string_field(output, "summary") or string_field(normalized, "summary") or "missing"
+    return f"result: {result} - command: {command} - summary: {summary}"
 
 
 def validation_worker_result_summary(raw_result: dict[str, Any]) -> str:
