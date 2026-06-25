@@ -1631,6 +1631,159 @@ class ImplementCliTest(unittest.TestCase):
             self.assertEqual(result["output"]["git"]["before_commit"], start_commit)
             self.assertEqual(result["output"]["git"]["after_commit"], start_commit)
 
+    def test_implement_records_pi_auth_failure_as_runtime_evidence_for_real_agent(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            checkout = temp_path / "checkout"
+            start_commit = init_checkout(checkout)
+            ledger = temp_path / "ledger"
+            codex_home = temp_path / "codex-home"
+            config_home = temp_path / "xdg-config"
+            pi_config_home = temp_path / "pi-config"
+            codex_home.mkdir()
+            config_home.mkdir()
+            pi_config_home.mkdir()
+            agent_code = textwrap.dedent(
+                """
+                import sys
+                print("Replaying remote auth state", file=sys.stderr)
+                print("OAuth refresh failed: expired OAuth credential for openai-codex", file=sys.stderr)
+                print("Error: No API key for provider: openai-codex", file=sys.stderr)
+                sys.exit(1)
+                """
+            ).strip()
+
+            completed = run_afk(
+                "run-step",
+                "implement",
+                "--input",
+                json.dumps(
+                    {
+                        "work_selection": {"schema_version": 1, "selected_work": [selected_work()]},
+                        "checkout": {
+                            "status": "prepared",
+                            "checkout_path": str(checkout),
+                            "review_branch": "afk/test-work",
+                            "requested_ref": "main",
+                            "start_commit": start_commit,
+                        },
+                        "guardrails": [],
+                        "validation": {"profile": "tier1", "commands": []},
+                        "agent": {
+                            "type": "real-agent-command",
+                            "command": [sys.executable, "-c", agent_code],
+                            "result_path": "agent-result.json",
+                            "codex_home": str(codex_home),
+                            "config_home": str(config_home),
+                            "env": {"PI_CONFIG_HOME": str(pi_config_home)},
+                        },
+                    }
+                ),
+                "--ledger",
+                str(ledger),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+            agent_result = json.loads((run_dir / "agent-result.json").read_text(encoding="utf-8"))
+            artifact_text = "\n".join(
+                path.read_text(encoding="utf-8")
+                for path in [
+                    run_dir / "command.json",
+                    run_dir / "step-result.json",
+                    run_dir / "agent-result.json",
+                    run_dir / "stdout.log",
+                    run_dir / "stderr.log",
+                ]
+            )
+
+            self.assertEqual(result["output"]["status"], "failed_runtime")
+            self.assertEqual(result["output"]["classification"], "runtime_failure")
+            self.assertEqual(
+                result["output"]["summary"],
+                "OAuth refresh failed: expired OAuth credential for openai-codex",
+            )
+            self.assertEqual(
+                agent_result["result"]["summary"],
+                "OAuth refresh failed: expired OAuth credential for openai-codex",
+            )
+            self.assertEqual(agent_result["result"]["adapter"]["type"], "real-agent-command")
+            self.assertEqual(agent_result["result"]["adapter"]["returncode"], 1)
+            self.assertIn(
+                "OAuth refresh failed: expired OAuth credential for openai-codex",
+                agent_result["result"]["evidence"]["stderr_excerpt"],
+            )
+            self.assertIn(
+                "Error: No API key for provider: openai-codex",
+                agent_result["result"]["evidence"]["stderr_excerpt"],
+            )
+            self.assertNotIn("access_token=", artifact_text)
+            self.assertNotIn("refresh_token=", artifact_text)
+            self.assertEqual(result["output"]["git"]["before_commit"], start_commit)
+            self.assertEqual(result["output"]["git"]["after_commit"], start_commit)
+
+    def test_implement_prefers_auth_error_line_over_remote_auth_preamble(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            checkout = temp_path / "checkout"
+            start_commit = init_checkout(checkout)
+            ledger = temp_path / "ledger"
+            codex_home = temp_path / "codex-home"
+            config_home = temp_path / "xdg-config"
+            pi_config_home = temp_path / "pi-config"
+            codex_home.mkdir()
+            config_home.mkdir()
+            pi_config_home.mkdir()
+            agent_code = textwrap.dedent(
+                """
+                import sys
+                print("Replaying remote auth state", file=sys.stderr)
+                print("loading auth mount", file=sys.stderr)
+                print("No API key for provider: openai-codex", file=sys.stderr)
+                sys.exit(1)
+                """
+            ).strip()
+
+            completed = run_afk(
+                "run-step",
+                "implement",
+                "--input",
+                json.dumps(
+                    {
+                        "work_selection": {"schema_version": 1, "selected_work": [selected_work()]},
+                        "checkout": {
+                            "status": "prepared",
+                            "checkout_path": str(checkout),
+                            "review_branch": "afk/test-work",
+                            "requested_ref": "main",
+                            "start_commit": start_commit,
+                        },
+                        "guardrails": [],
+                        "validation": {"profile": "tier1", "commands": []},
+                        "agent": {
+                            "type": "real-agent-command",
+                            "command": [sys.executable, "-c", agent_code],
+                            "result_path": "agent-result.json",
+                            "codex_home": str(codex_home),
+                            "config_home": str(config_home),
+                            "env": {"PI_CONFIG_HOME": str(pi_config_home)},
+                        },
+                    }
+                ),
+                "--ledger",
+                str(ledger),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(result["output"]["status"], "failed_runtime")
+            self.assertEqual(result["output"]["summary"], "No API key for provider: openai-codex")
+
     def test_implement_classifies_agent_reported_target_failure_separately(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)

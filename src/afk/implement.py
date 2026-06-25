@@ -113,12 +113,13 @@ def implement(
         stderr = redact_text(exc.stderr or exc.message, exact_secrets=exact_secrets)
         write_adapter_logs(stdout, stderr)
         after_metadata = safe_git_metadata(checkout_path, request["checkout"]["start_commit"])
+        summary = runtime_failure_summary(exc.message, stdout=stdout, stderr=stderr)
         normalized = normalized_agent_result(
             status="failed_runtime",
             classification="runtime_failure",
-            summary=exc.message,
+            summary=summary,
             notes=[],
-            failures=[{"type": "runtime", "message": exc.message}],
+            failures=[{"type": "runtime", "message": summary}],
             adapter={"type": request["agent"]["type"], "returncode": exc.returncode},
             stdout=stdout,
             stderr=stderr,
@@ -824,6 +825,50 @@ def normalized_agent_result(
             "stderr_excerpt": stderr[-2000:],
         },
     }
+
+
+def runtime_failure_summary(message: str, *, stdout: str, stderr: str) -> str:
+    if not runtime_summary_is_generic(message):
+        return message
+    for text in (stderr, stdout):
+        candidate = runtime_failure_excerpt(text)
+        if candidate:
+            return candidate
+    return message
+
+
+def runtime_summary_is_generic(message: str) -> bool:
+    return message.strip() in {"agent command failed", "agent command timed out"}
+
+
+def runtime_failure_excerpt(text: str) -> str:
+    informative_lines = []
+    auth_related_lines = []
+    error_lines = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        lowered = line.lower()
+        if any(token in lowered for token in ("error:", "failed", "exception", "timed out", "no api key")):
+            error_lines.append(line)
+            continue
+        if any(token in lowered for token in ("oauth", "auth", "api key")):
+            auth_related_lines.append(line)
+        informative_lines.append(line)
+    if error_lines:
+        return auth_error_summary(error_lines) or error_lines[0]
+    if auth_related_lines:
+        return auth_related_lines[0]
+    return informative_lines[0] if informative_lines else ""
+
+
+def auth_error_summary(error_lines: list[str]) -> str:
+    for line in error_lines:
+        lowered = line.lower()
+        if any(token in lowered for token in ("oauth", "auth", "api key", "no api key")):
+            return line
+    return ""
 
 
 def implement_output(
