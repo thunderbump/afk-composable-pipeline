@@ -61,7 +61,8 @@ def validate(
     worker_request = build_worker_request(request, run_dir)
     request_path = run_dir / "worker-request.json"
     evidence_dir = Path(worker_request["evidence_dir"])
-    result_path = evidence_dir / "result.json"
+    evidence_result_path = evidence_dir / "result.json"
+    result_path = evidence_dir / "worker-output.json"
     worker_result_path = run_dir / "worker-result.json"
     stdout_log_path = run_dir / "stdout.log"
     stderr_log_path = run_dir / "stderr.log"
@@ -82,8 +83,11 @@ def validate(
         stdout = redact_text(exc.stdout)
         stderr = redact_text(exc.stderr or exc.message)
         write_adapter_logs(stdout, stderr)
-        raw_payload = read_worker_payload(result_path)
+        raw_payload = read_worker_payload(result_path, fallback_path=evidence_result_path)
+        if raw_payload["status"] == "valid":
+            sync_worker_evidence_result(evidence_result_path, raw_payload["payload"])
         if raw_payload["status"] == "invalid":
+            sync_worker_evidence_protocol_error(evidence_result_path, raw_payload["message"])
             normalized = normalized_worker_result(
                 status="failed_protocol",
                 classification="protocol_failure",
@@ -121,7 +125,11 @@ def validate(
     stderr = redact_text(adapter_result["stderr"])
     write_adapter_logs(stdout, stderr)
 
-    raw_payload = read_worker_payload(result_path)
+    raw_payload = read_worker_payload(result_path, fallback_path=evidence_result_path)
+    if raw_payload["status"] == "valid":
+        sync_worker_evidence_result(evidence_result_path, raw_payload["payload"])
+    elif raw_payload["status"] == "invalid":
+        sync_worker_evidence_protocol_error(evidence_result_path, raw_payload["message"])
     if raw_payload["status"] != "valid":
         if raw_payload["status"] == "missing":
             status = "failed_missing_result"
@@ -454,10 +462,12 @@ def minimal_worker_environment(temp_path: Path) -> dict[str, str]:
     return env
 
 
-def read_worker_payload(path: Path) -> dict[str, Any]:
+def read_worker_payload(path: Path, *, fallback_path: Path | None = None) -> dict[str, Any]:
     try:
         raw = path.read_text(encoding="utf-8")
     except FileNotFoundError:
+        if fallback_path is not None and fallback_path != path:
+            return read_worker_payload(fallback_path)
         return {"status": "missing", "message": "worker result file was not produced"}
     except OSError:
         message = "worker result file could not be read"
@@ -535,6 +545,14 @@ def replace_worker_result_evidence(path: Path, payload: dict[str, Any]) -> bool:
     except OSError:
         return False
     return True
+
+
+def sync_worker_evidence_result(path: Path, payload: dict[str, Any]) -> None:
+    replace_worker_result_evidence(path, payload)
+
+
+def sync_worker_evidence_protocol_error(path: Path, message: str) -> None:
+    replace_worker_result_evidence(path, protocol_error_evidence(message))
 
 
 def normalize_worker_payload(
