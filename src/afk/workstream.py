@@ -739,6 +739,8 @@ def run_pr_update_command(
         f"repos/{config['repo']}/pulls/{pr_number}",
         "--input",
         str(ledger.path / "pr-update.json"),
+        "--jq",
+        ".html_url",
     ]
     return run_publisher_command(fallback_command, cwd=checkout_path, tool="gh", auth=auth), fallback_command
 

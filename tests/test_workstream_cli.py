@@ -2423,8 +2423,17 @@ sys.exit(9)
             self.assertEqual(result["publication"]["mode"], "update")
             self.assertEqual([call["argv"][0] for call in calls], ["auth", "pr", "api"])
             self.assertEqual(
-                calls[2]["argv"][0:4],
-                ["api", "--method", "PATCH", "repos/thunderbump/afk-composable-pipeline/pulls/123"],
+                calls[2]["argv"],
+                [
+                    "api",
+                    "--method",
+                    "PATCH",
+                    "repos/thunderbump/afk-composable-pipeline/pulls/123",
+                    "--input",
+                    calls[2]["argv"][5],
+                    "--jq",
+                    ".html_url",
+                ],
             )
             self.assertEqual(
                 calls[2]["input"]["title"],
