@@ -764,8 +764,8 @@ def pr_number_for_rest_update(
     checkout_path: Path,
     auth: dict[str, Any],
 ) -> str:
-    direct_number = pull_request_number_from_ref(pr_ref)
-    if direct_number:
+    direct_number = string_field({"pr": pr_ref}, "pr")
+    if direct_number and direct_number.isdigit():
         return direct_number
     command = [
         config["gh_path"],
@@ -780,27 +780,16 @@ def pr_number_for_rest_update(
         ".number",
     ]
     completed = run_publisher_command(command, cwd=checkout_path, tool="gh", auth=auth)
-    resolved = pull_request_number_from_ref(completed.stdout.strip())
-    if not resolved:
-        raise PublisherError(
-            "could not resolve PR number for REST update fallback",
-            command=command,
-            returncode=completed.returncode,
-            stdout=completed.stdout,
-            stderr=completed.stderr,
-        )
-    return resolved
-
-
-def pull_request_number_from_ref(pr_ref: str) -> str:
-    ref = str(pr_ref or "").strip().rstrip("/")
-    if ref.isdigit():
-        return ref
-    marker = "/pull/"
-    if marker not in ref:
-        return ""
-    candidate = ref.rsplit(marker, 1)[1].split("/", 1)[0]
-    return candidate if candidate.isdigit() else ""
+    resolved = string_field({"number": completed.stdout}, "number")
+    if resolved and resolved.isdigit():
+        return resolved
+    raise PublisherError(
+        "could not resolve PR number for REST update fallback",
+        command=command,
+        returncode=completed.returncode,
+        stdout=completed.stdout,
+        stderr=completed.stderr,
+    )
 
 
 def normalize_publisher_config(publisher: dict[str, Any], normalized: dict[str, Any]) -> dict[str, Any]:
@@ -1486,7 +1475,10 @@ def validation_worker_command_summary(normalized: dict[str, Any]) -> str:
     command = adapter.get("command")
     if not isinstance(command, list) or not command:
         return ""
-    rendered = " ".join(str(part) for part in command if str(part).strip())
+    redacted = redact_artifact_value({"command": command}).get("command", [])
+    if not isinstance(redacted, list):
+        return ""
+    rendered = " ".join(str(part) for part in redacted if str(part).strip())
     if len(rendered) > 160:
         return rendered[:157].rstrip() + "..."
     return rendered
