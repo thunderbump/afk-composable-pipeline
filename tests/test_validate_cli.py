@@ -880,6 +880,81 @@ class ValidateCliTest(unittest.TestCase):
             self.assertIn("error: worker never wrote result", actionable[0]["excerpt"])
             self.assertNotIn("warning: cache warmup 0399", actionable[0]["excerpt"])
 
+    def test_validate_tolerates_copying_evidence_result_into_distinct_worker_result_path(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            checkout = temp_path / "checkout"
+            start_commit = init_checkout(checkout)
+            ledger = temp_path / "ledger"
+            worker_code = textwrap.dedent(
+                """
+                import json
+                import os
+                import shutil
+                from pathlib import Path
+
+                evidence_dir = Path(os.environ["AFK_WORKER_EVIDENCE_DIR"])
+                evidence_result = evidence_dir / "result.json"
+                request = json.loads(Path(os.environ["AFK_WORKER_REQUEST"]).read_text(encoding="utf-8"))
+                evidence_result.write_text(
+                    json.dumps(
+                        {
+                            "profile": request["profile"],
+                            "status": "pass",
+                            "summary": "copied from evidence",
+                            "steps": [],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                shutil.copyfile(evidence_result, Path(os.environ["AFK_WORKER_RESULT"]))
+                print(str(evidence_result))
+                print(os.environ["AFK_WORKER_RESULT"])
+                """
+            ).strip()
+
+            completed = run_afk(
+                "run-step",
+                "validate",
+                "--profile",
+                "tier3-harness",
+                "--input",
+                json.dumps(
+                    {
+                        "checkout": {
+                            "status": "prepared",
+                            "checkout_path": str(checkout),
+                            "review_branch": "afk/validate",
+                            "requested_ref": "main",
+                            "start_commit": start_commit,
+                        },
+                        "worker": {
+                            "type": "local-command",
+                            "command": [sys.executable, "-c", worker_code],
+                        },
+                    }
+                ),
+                "--ledger",
+                str(ledger),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+            worker_result = json.loads((run_dir / "worker-result.json").read_text(encoding="utf-8"))
+            evidence_result = run_dir / "validation-evidence" / "result.json"
+            worker_output = run_dir / "validation-evidence" / "worker-output.json"
+
+            self.assertEqual(result["output"]["status"], "validated")
+            self.assertEqual(result["output"]["classification"], "success")
+            self.assertEqual(worker_result["result"]["raw"]["summary"], "copied from evidence")
+            self.assertEqual(evidence_result.read_text(encoding="utf-8"), worker_output.read_text(encoding="utf-8"))
+            stdout_log = (run_dir / "stdout.log").read_text(encoding="utf-8")
+            self.assertIn(str(evidence_result), stdout_log)
+            self.assertIn(str(worker_output), stdout_log)
+            self.assertNotEqual(str(evidence_result), str(worker_output))
+
     def test_validate_classifies_worker_reported_failure_even_when_adapter_exits_nonzero(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
@@ -1953,9 +2028,13 @@ class ValidateCliTest(unittest.TestCase):
             run_dir = ledger / "runs" / summary["run_id"]
             result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
             worker_result = json.loads((run_dir / "worker-result.json").read_text(encoding="utf-8"))
+            evidence_result = run_dir / "validation-evidence" / "result.json"
+            worker_output = run_dir / "validation-evidence" / "worker-output.json"
 
             self.assertEqual(result["output"]["status"], "validated")
             self.assertEqual(worker_result["result"]["raw"]["profile"], "tier3-harness")
+            self.assertTrue(worker_output.is_file())
+            self.assertEqual(evidence_result.read_text(encoding="utf-8"), worker_output.read_text(encoding="utf-8"))
             self.assertIn(
                 "default validation worker tier3-harness",
                 (run_dir / "stdout.log").read_text(encoding="utf-8"),
