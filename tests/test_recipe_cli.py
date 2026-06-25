@@ -138,6 +138,7 @@ class GenerateRecipeCliTest(unittest.TestCase):
             select_input = recipe["steps"][0]["input"]
             self.assertEqual(select_input["target_ids"], ["central-afk-pr.1"])
             self.assertEqual(select_input["required_labels"], ["project:bump-eqemu"])
+            self.assertEqual(select_input["allowed_statuses"], ["open", "in_progress"])
             self.assertEqual(
                 select_input["sources"],
                 [
@@ -392,6 +393,112 @@ sys.exit(9)
             workstream = json.loads((ledger / summary["result_path"]).read_text(encoding="utf-8"))
             select_result_path = workstream["steps"][0]["result_path"]
             select_result = json.loads((ledger / select_result_path).read_text(encoding="utf-8"))
+            self.assertEqual(
+                [item["external_id"] for item in select_result["output"]["selected_work"]],
+                ["central-afk-pr.1"],
+            )
+            self.assertEqual(select_result["output"]["skipped_candidates"], [])
+
+    def test_generated_recipe_runs_when_directly_selected_bead_is_in_progress(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repo = temp_path / "repo-src"
+            contracts_dir = temp_path / "contracts"
+            output = temp_path / "recipe.json"
+            ledger = temp_path / "ledger"
+            beads_workspace = temp_path / "central-beads"
+            checkout_root = temp_path / "checkouts"
+            checkout_path = checkout_root / "demo"
+            fake_bin = temp_path / "bin"
+            init_repo(repo)
+            contracts_dir.mkdir()
+            write_contract(contracts_dir / "demo.json", project_slug="demo", repo_url=str(repo))
+            (beads_workspace / "secrets").mkdir(parents=True)
+            (beads_workspace / "secrets" / "dolt_beads_password.txt").write_text("fixture-password\n", encoding="utf-8")
+            fake_bin.mkdir()
+            write_executable(
+                fake_bin / "bd",
+                f"""#!{sys.executable}
+import json
+import sys
+
+if sys.argv[1:3] == ["list", "--json"]:
+    print(json.dumps([{{"id": "central-afk-pr.1"}}, {{"id": "central-afk-pr.2"}}]))
+    sys.exit(0)
+
+if sys.argv[1] == "show":
+    issue_id = sys.argv[2]
+    payloads = {{
+        "central-afk-pr.1": {{
+            "id": "central-afk-pr.1",
+            "title": "Generate runnable workstream recipes",
+            "status": "in_progress",
+            "labels": ["project:demo"],
+            "parent": "central-afk-pr",
+            "acceptance_criteria": ["Generated recipe runs"],
+            "dependencies": [{{"id": "central-afk-pr.0", "status": "closed"}}],
+            "metadata": {{"afk.ready": True}},
+        }},
+        "central-afk-pr.2": {{
+            "id": "central-afk-pr.2",
+            "title": "Different candidate",
+            "status": "open",
+            "labels": ["project:demo"],
+            "parent": "central-afk-pr",
+            "acceptance_criteria": ["Should not be selected"],
+            "dependencies": [{{"id": "central-afk-pr.0", "status": "closed"}}],
+            "metadata": {{"afk.ready": True}},
+        }},
+    }}
+    print(json.dumps(payloads[issue_id]))
+    sys.exit(0)
+
+sys.exit(9)
+""",
+            )
+
+            generated = run_afk(
+                "generate-recipe",
+                "--workstream-id",
+                "central-afk-pr.1",
+                "--project",
+                "demo",
+                "--contracts-dir",
+                str(contracts_dir),
+                "--ledger",
+                str(ledger),
+                "--beads-workspace",
+                str(beads_workspace),
+                "--checkout-root",
+                str(checkout_root),
+                "--checkout-path",
+                str(checkout_path),
+                "--validation-profile",
+                "tier1",
+                "--output",
+                str(output),
+            )
+            self.assertEqual(generated.returncode, 0, generated.stderr)
+
+            completed = run_afk(
+                "run-workstream",
+                "--input",
+                output.read_text(encoding="utf-8"),
+                "--ledger",
+                str(ledger),
+                "--project",
+                "demo",
+                "--contracts-dir",
+                str(contracts_dir),
+                env={"PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}", "GIT_ALLOW_PROTOCOL": "file"},
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            self.assertEqual(summary["status"], "validated-unpublished")
+
+            workstream = json.loads((ledger / summary["result_path"]).read_text(encoding="utf-8"))
+            select_result = json.loads((ledger / workstream["steps"][0]["result_path"]).read_text(encoding="utf-8"))
             self.assertEqual(
                 [item["external_id"] for item in select_result["output"]["selected_work"]],
                 ["central-afk-pr.1"],
