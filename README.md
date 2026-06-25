@@ -153,6 +153,12 @@ The recipe schema is intentionally small:
   values.
 - `retry_policy.max_retries` is optional and defaults to `0`. It bounds how many
   same-item retry checkout cycles may start after a failed validation.
+- `tracker.terminal_decision` is optional. Leave it unset while a PR is open or
+  under review. Set `{"status":"merged","merge_commit":"<sha>","pr_url":"<url>"}`
+  only after the PR merges, or
+  `{"status":"no-merge","reason":"<why>","pr_url":"<url>"}` when the branch is
+  intentionally not going to merge and the source Beads item should close with
+  that reason. `pr_url` is optional but should be provided when known.
 - `steps` is an ordered list of existing step names: `select-work`,
   `prepare-checkout`, `implement`, `validate`, and `review`. Each step has an
   explicit `input` object, plus optional `profile` for `validate`.
@@ -446,11 +452,17 @@ directory for each composed step. `workstream-result.json` lists every step run,
 its ledger result path, the generated equivalent `afk run-step ...` command,
 selected work result summaries, cleanup status, `retry_budget`,
 `retry_attempts`, terminal reason, next allowed command, retry instructions,
-and terminal PR publication status. Dirty retry checkouts are surfaced through
-`cleanup.resources` with path, branch, commit, and status so failed retry
-attempts stay visible without spawning more sibling checkouts.
-`publication-result.json` records one of four explicit terminal states:
-`blocked`, `validated-unpublished`, `failed-needs-human`, or `published`.
+terminal PR publication status, and tracker-close guidance. Dirty retry
+checkouts are surfaced through `cleanup.resources` with path, branch, commit,
+and status so failed retry attempts stay visible without spawning more sibling
+checkouts.
+`publication-result.json` records one of five explicit terminal states:
+`blocked`, `validated-unpublished`, `failed-needs-human`, `published`, or
+`tracker-closed`.
+`tracker-result.json` records whether the source Beads item stays open, whether
+it is ready to close, the PR URL when one was opened, any carried-forward review
+findings, and the merge commit or explicit no-merge close reason when one is
+recorded.
 Step-level outputs may still use other status strings; specifically,
 `prepare-checkout` uses `publication.status == "skipped_disabled"` when
 the checkout publisher path is intentionally disabled.
@@ -465,6 +477,11 @@ workstream runs.
 `validated-unpublished` means the current HEAD is terminally validated but AFK
 did not publish a PR in that run; only the subset with a passed final review is
 immediately eligible for PR publication on a follow-up rerun.
+`published` means the PR exists but the source Beads item is still
+`awaiting-review`; it stays open until the PR merges or
+`tracker.terminal_decision.status == "no-merge"` is recorded.
+`tracker-closed` means a terminal merge or no-merge decision was recorded, so
+AFK skipped publisher commands and emitted tracker close guidance instead.
 `pr-body.md` is written before terminal PR commands run, so fake/offline
 publisher tests can inspect the exact body.
 
