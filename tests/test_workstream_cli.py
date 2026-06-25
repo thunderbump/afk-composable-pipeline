@@ -381,13 +381,18 @@ sys.exit(0)
                         "title": "Compose workstream recipe and terminal PR publisher",
                         "source_id": "fixture",
                         "source_type": "fixture",
-                        "result": "passed",
+                        "result": "awaiting-review",
                     }
                 ],
             )
             self.assertEqual(result["publication"]["status"], "published", result["publication"])
             self.assertEqual(result["publication"]["mode"], "create")
             self.assertEqual(result["publication"]["url"], "https://github.example/pr/123")
+            self.assertEqual(result["tracker"]["status"], "awaiting-review")
+            self.assertFalse(result["tracker"]["close_source_item"])
+            self.assertEqual(result["tracker"]["pr_url"], "https://github.example/pr/123")
+            self.assertIn("keep the source Beads item open", result["tracker"]["comment"])
+            self.assertEqual(result["artifacts"]["tracker"], "tracker-result.json")
 
             git_calls = [call for call in calls if call["tool"] == "git"]
             gh_calls = [call for call in calls if call["tool"] == "gh"]
@@ -424,6 +429,201 @@ sys.exit(0)
             self.assertIn("Review: passed", body)
             self.assertIn("Artifacts", body)
             self.assertIn(result["steps"][-1]["result_path"], body)
+
+    def test_workstream_terminal_merge_decision_closes_tracker_without_republishing(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repo = temp_path / "repo-src"
+            checkout = temp_path / "checkout"
+            ledger = temp_path / "ledger"
+            fake_calls = temp_path / "fake-calls.jsonl"
+            init_repo(repo)
+            fake_git = temp_path / "publisher-git"
+            fake_gh = temp_path / "publisher-gh"
+            write_executable(
+                fake_git,
+                f"""#!{sys.executable}
+from pathlib import Path
+Path({str(fake_calls)!r}).write_text("publisher git should not run\\n", encoding="utf-8")
+raise SystemExit(9)
+""",
+            )
+            write_executable(
+                fake_gh,
+                f"""#!{sys.executable}
+from pathlib import Path
+Path({str(fake_calls)!r}).write_text("publisher gh should not run\\n", encoding="utf-8")
+raise SystemExit(9)
+""",
+            )
+            recipe = successful_recipe(temp_path, repo, checkout, fake_git, fake_gh)
+            recipe["tracker"] = {
+                "terminal_decision": {
+                    "status": "merged",
+                    "merge_commit": "deadbeef",
+                    "pr_url": "https://github.example/pr/123",
+                }
+            }
+
+            completed = run_afk(
+                "run-workstream",
+                "--workstream-id",
+                "central-lve.9",
+                "--input",
+                json.dumps(recipe),
+                "--ledger",
+                str(ledger),
+                env_overrides={
+                    "GIT_ALLOW_PROTOCOL": "file",
+                    "GIT_AUTHOR_NAME": "AFK Test",
+                    "GIT_AUTHOR_EMAIL": "afk-test@example.test",
+                    "GIT_COMMITTER_NAME": "AFK Test",
+                    "GIT_COMMITTER_EMAIL": "afk-test@example.test",
+                },
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            result = json.loads((ledger / summary["result_path"]).read_text(encoding="utf-8"))
+
+            self.assertFalse(fake_calls.exists())
+            self.assertEqual(summary["status"], "closed")
+            self.assertEqual(result["publication"]["status"], "tracker-closed")
+            self.assertIn("terminal tracker decision", result["publication"]["reason"])
+            self.assertEqual(result["tracker"]["status"], "closed")
+            self.assertTrue(result["tracker"]["close_source_item"])
+            self.assertEqual(result["tracker"]["merge_commit"], "deadbeef")
+            self.assertEqual(result["tracker"]["pr_url"], "https://github.example/pr/123")
+            self.assertEqual([item["result"] for item in result["selected_work"]], ["closed"])
+            tracker_result = json.loads((ledger / summary["result_path"]).parent.joinpath("tracker-result.json").read_text(encoding="utf-8"))
+            self.assertEqual(tracker_result["merge_commit"], "deadbeef")
+            self.assertEqual(tracker_result["pr_url"], "https://github.example/pr/123")
+
+    def test_workstream_terminal_no_merge_decision_closes_tracker_without_republishing(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repo = temp_path / "repo-src"
+            checkout = temp_path / "checkout"
+            ledger = temp_path / "ledger"
+            fake_calls = temp_path / "fake-calls.jsonl"
+            init_repo(repo)
+            fake_git = temp_path / "publisher-git"
+            fake_gh = temp_path / "publisher-gh"
+            write_executable(
+                fake_git,
+                f"""#!{sys.executable}
+from pathlib import Path
+Path({str(fake_calls)!r}).write_text("publisher git should not run\\n", encoding="utf-8")
+raise SystemExit(9)
+""",
+            )
+            write_executable(
+                fake_gh,
+                f"""#!{sys.executable}
+from pathlib import Path
+Path({str(fake_calls)!r}).write_text("publisher gh should not run\\n", encoding="utf-8")
+raise SystemExit(9)
+""",
+            )
+            recipe = successful_recipe(temp_path, repo, checkout, fake_git, fake_gh)
+            recipe["tracker"] = {
+                "terminal_decision": {
+                    "status": "no-merge",
+                    "reason": "Superseded by follow-up PR",
+                    "pr_url": "https://github.example/pr/123",
+                }
+            }
+
+            completed = run_afk(
+                "run-workstream",
+                "--workstream-id",
+                "central-lve.9",
+                "--input",
+                json.dumps(recipe),
+                "--ledger",
+                str(ledger),
+                env_overrides={
+                    "GIT_ALLOW_PROTOCOL": "file",
+                    "GIT_AUTHOR_NAME": "AFK Test",
+                    "GIT_AUTHOR_EMAIL": "afk-test@example.test",
+                    "GIT_COMMITTER_NAME": "AFK Test",
+                    "GIT_COMMITTER_EMAIL": "afk-test@example.test",
+                },
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            result = json.loads((ledger / summary["result_path"]).read_text(encoding="utf-8"))
+
+            self.assertFalse(fake_calls.exists())
+            self.assertEqual(summary["status"], "closed")
+            self.assertEqual(result["publication"]["status"], "tracker-closed")
+            self.assertEqual(result["tracker"]["status"], "closed")
+            self.assertTrue(result["tracker"]["close_source_item"])
+            self.assertEqual(result["tracker"]["close_reason"], "Superseded by follow-up PR")
+            self.assertEqual(result["tracker"]["pr_url"], "https://github.example/pr/123")
+            self.assertEqual([item["result"] for item in result["selected_work"]], ["closed"])
+
+    def test_workstream_accepts_empty_tracker_terminal_decision_as_unset(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repo = temp_path / "repo-src"
+            checkout = temp_path / "checkout"
+            ledger = temp_path / "ledger"
+            fake_calls = temp_path / "fake-calls.jsonl"
+            init_repo(repo)
+            fake_git = temp_path / "publisher-git"
+            fake_gh = temp_path / "publisher-gh"
+            write_executable(
+                fake_git,
+                f"""#!{sys.executable}
+import json
+import sys
+from pathlib import Path
+Path({str(fake_calls)!r}).open("a", encoding="utf-8").write(json.dumps({{"tool": "git", "argv": sys.argv[1:]}}) + "\\n")
+sys.exit(0)
+""",
+            )
+            write_executable(
+                fake_gh,
+                f"""#!{sys.executable}
+import json
+import sys
+from pathlib import Path
+Path({str(fake_calls)!r}).open("a", encoding="utf-8").write(json.dumps({{"tool": "gh", "argv": sys.argv[1:]}}) + "\\n")
+if sys.argv[1:4] == ["auth", "status", "--hostname"]:
+    sys.exit(0)
+print("https://github.example/pr/123")
+sys.exit(0)
+""",
+            )
+            recipe = successful_recipe(temp_path, repo, checkout, fake_git, fake_gh)
+            recipe["tracker"] = {"terminal_decision": {}}
+
+            completed = run_afk(
+                "run-workstream",
+                "--workstream-id",
+                "central-lve.9",
+                "--input",
+                json.dumps(recipe),
+                "--ledger",
+                str(ledger),
+                env_overrides={
+                    "GIT_ALLOW_PROTOCOL": "file",
+                    "GIT_AUTHOR_NAME": "AFK Test",
+                    "GIT_AUTHOR_EMAIL": "afk-test@example.test",
+                    "GIT_COMMITTER_NAME": "AFK Test",
+                    "GIT_COMMITTER_EMAIL": "afk-test@example.test",
+                },
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            result = json.loads((ledger / summary["result_path"]).read_text(encoding="utf-8"))
+
+            self.assertEqual(summary["status"], "published")
+            self.assertEqual(result["tracker"]["status"], "awaiting-review")
+            self.assertFalse(result["tracker"]["close_source_item"])
 
     def test_workstream_publisher_uses_explicit_gh_config_mount_without_inheriting_ambient_tokens(self):
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -133,36 +133,36 @@ def run_workstream(
     state["cleanup"] = final_cleanup_state(state)
 
     publication: dict[str, Any]
+    selected_work = []
     if state["blocked_reason"]:
-        selected_work = selected_work_records(state, review_status(state))
         publication = blocked_publication(state["blocked_reason"], normalized, run_id)
         status = publication["status"]
     else:
         publication_gate = publication_gate_reason(state)
         if publication_gate:
             if state["stop_reason"] and has_current_validated_evidence(state):
-                selected_work = selected_work_records(state, terminal_selected_work_status(state))
                 publication = validated_unpublished_publication(
                     state["stop_reason"],
                     next_allowed_command=state["next_allowed_command"] or rerun_workstream_command(normalized),
                 )
             else:
-                selected_work = selected_work_records(state, gated_selected_work_status(state))
                 publication = blocked_publication(publication_gate, normalized, run_id)
             status = publication["status"]
         else:
-            selected_work = selected_work_records(state, review_status(state))
-            publication = publish_terminal_pr(
-                normalized["publisher"],
-                normalized=normalized,
-                state=state,
-                steps=steps,
-                selected_work=selected_work,
-                ledger=ledger,
-            )
+            if tracker_terminal_decision_present(normalized):
+                publication = tracker_terminal_decision_publication()
+            else:
+                publication = publish_terminal_pr(
+                    normalized["publisher"],
+                    normalized=normalized,
+                    state=state,
+                    steps=steps,
+                    selected_work=selected_work_records(state, review_status(state)),
+                    ledger=ledger,
+                )
             status = workstream_status_from_publication(publication)
-            if status == "validated-unpublished":
-                selected_work = selected_work_records(state, terminal_selected_work_status(state))
+    tracker = tracker_record(normalized, state, publication)
+    selected_work = selected_work_records(state, tracker_selected_work_status(state, publication, tracker))
 
     result_payload = {
         "schema_version": SCHEMA_VERSION,
@@ -180,9 +180,11 @@ def run_workstream(
         "terminal_reason": publication.get("reason", ""),
         "next_allowed_command": publication.get("next_allowed_command", ""),
         "publication": publication,
+        "tracker": tracker,
         "artifacts": workstream_artifacts(ledger),
     }
     ledger.write_json("publication-result.json", publication)
+    ledger.write_json("tracker-result.json", tracker)
     ledger.write_json("workstream-result.json", result_payload)
     return WorkstreamResult(
         run_id=run_id,
@@ -231,6 +233,7 @@ def normalize_recipe(
     review_branch = string_field(recipe, "review_branch") or f"afk/{resolved_workstream_id}"
     publisher = recipe.get("publisher", {"enabled": False})
     retry_policy = normalize_retry_policy(recipe.get("retry_policy"))
+    tracker = normalize_tracker_config(recipe.get("tracker"))
     return {
         "schema_version": SCHEMA_VERSION,
         "workstream_id": resolved_workstream_id,
@@ -239,6 +242,7 @@ def normalize_recipe(
         "steps": normalized_steps,
         "publisher": publisher,
         "retry_policy": retry_policy,
+        "tracker": tracker,
     }
 
 
@@ -1051,6 +1055,44 @@ def normalize_retry_policy(retry_policy: Any) -> dict[str, int]:
     return {"max_retries": max_retries}
 
 
+def normalize_tracker_config(tracker: Any) -> dict[str, Any]:
+    if tracker is None:
+        return {"terminal_decision": {"status": "", "merge_commit": "", "reason": ""}}
+    if not isinstance(tracker, dict):
+        raise WorkstreamError("tracker must be an object")
+    unsupported = [key for key in tracker if key != "terminal_decision"]
+    if unsupported:
+        raise WorkstreamError("tracker only supports terminal_decision")
+    return {"terminal_decision": normalize_tracker_terminal_decision(tracker.get("terminal_decision"))}
+
+
+def normalize_tracker_terminal_decision(decision: Any) -> dict[str, str]:
+    if decision is None:
+        return {"status": "", "merge_commit": "", "reason": "", "pr_url": ""}
+    if not isinstance(decision, dict):
+        raise WorkstreamError("tracker.terminal_decision must be an object")
+    unsupported = [key for key in decision if key not in {"status", "merge_commit", "reason", "pr_url"}]
+    if unsupported:
+        raise WorkstreamError("tracker.terminal_decision only supports status, merge_commit, reason, pr_url")
+    status = string_field(decision, "status") or ""
+    merge_commit = string_field(decision, "merge_commit") or ""
+    reason = string_field(decision, "reason") or ""
+    pr_url = string_field(decision, "pr_url") or ""
+    if not status and not merge_commit and not reason and not pr_url:
+        return {"status": "", "merge_commit": "", "reason": "", "pr_url": ""}
+    if status not in {"merged", "no-merge"}:
+        raise WorkstreamError("tracker.terminal_decision.status must be merged or no-merge")
+    if status == "merged" and not merge_commit:
+        raise WorkstreamError("tracker.terminal_decision.merge_commit is required for merged")
+    if status == "no-merge" and not reason:
+        raise WorkstreamError("tracker.terminal_decision.reason is required for no-merge")
+    if status == "merged":
+        reason = ""
+    if status == "no-merge":
+        merge_commit = ""
+    return {"status": status, "merge_commit": merge_commit, "reason": reason, "pr_url": pr_url}
+
+
 def append_checkout_attempt(state: dict[str, Any], checkout: dict[str, Any]) -> None:
     if checkout.get("status") != "prepared":
         return
@@ -1261,6 +1303,23 @@ def selected_work_records(state: dict[str, Any], result_status: str) -> list[dic
     return records
 
 
+def tracker_selected_work_status(
+    state: dict[str, Any],
+    publication: dict[str, Any],
+    tracker: dict[str, Any],
+) -> str:
+    if tracker.get("close_source_item"):
+        return "closed"
+    if publication.get("status") == "published":
+        return "awaiting-review"
+    if publication.get("status") == "validated-unpublished":
+        return terminal_selected_work_status(state)
+    status = review_status(state)
+    if status == "passed":
+        return "validated" if has_current_validated_evidence(state) else "implemented"
+    return status
+
+
 def review_status(state: dict[str, Any]) -> str:
     review = state.get("review") if isinstance(state.get("review"), dict) else {}
     status = review.get("status")
@@ -1292,6 +1351,93 @@ def terminal_selected_work_status(state: dict[str, Any]) -> str:
     return gated_selected_work_status(state)
 
 
+def tracker_terminal_decision_present(normalized: dict[str, Any]) -> bool:
+    decision = normalized.get("tracker", {}).get("terminal_decision", {})
+    return bool(isinstance(decision, dict) and decision.get("status"))
+
+
+def tracker_terminal_decision_publication() -> dict[str, Any]:
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "status": "tracker-closed",
+        "enabled": False,
+        "reason": "terminal tracker decision recorded; PR publication skipped",
+        "next_allowed_command": "none",
+        "retry": "",
+    }
+
+
+def tracker_record(
+    normalized: dict[str, Any],
+    state: dict[str, Any],
+    publication: dict[str, Any],
+) -> dict[str, Any]:
+    decision = normalized["tracker"]["terminal_decision"]
+    review = state.get("review") if isinstance(state.get("review"), dict) else {}
+    record = {
+        "schema_version": SCHEMA_VERSION,
+        "status": tracker_progress_status(state),
+        "close_source_item": False,
+        "close_reason": "",
+        "comment": "",
+        "pr_url": "",
+        "merge_commit": "",
+        "source_item_external_id": current_selected_work_external_id(state),
+        "review_status": string_field(review, "status") or "",
+        "review_summary": string_field(review, "summary") or "",
+        "review_findings": tracker_review_findings(review),
+        "terminal_decision": redact_artifact_value(decision),
+    }
+    decision_status = decision.get("status")
+    if decision_status == "merged":
+        record["status"] = "closed"
+        record["close_source_item"] = True
+        record["close_reason"] = f"merged via {decision['merge_commit']}"
+        record["comment"] = "PR merged; close the source Beads item with the recorded merge commit."
+        record["merge_commit"] = redact_text(decision["merge_commit"])
+        record["pr_url"] = redact_text(decision.get("pr_url") or "")
+        return record
+    if decision_status == "no-merge":
+        record["status"] = "closed"
+        record["close_source_item"] = True
+        record["close_reason"] = redact_text(decision["reason"])
+        record["comment"] = "A terminal no-merge decision was recorded; close the source Beads item with this reason."
+        record["pr_url"] = redact_text(decision.get("pr_url") or "")
+        return record
+    if publication.get("status") == "published":
+        record["status"] = "awaiting-review"
+        record["comment"] = "PR opened; keep the source Beads item open until merge or an explicit no-merge decision."
+        record["pr_url"] = redact_text(str(publication.get("url") or ""))
+        return record
+    if publication.get("status") == "validated-unpublished":
+        record["status"] = "validated"
+        record["comment"] = "Validated head is ready, but the source Beads item stays open until merge or no-merge."
+        return record
+    if record["review_findings"]:
+        record["comment"] = "Review findings are available; update the source Beads item and keep it open."
+    elif review_passed(state):
+        record["comment"] = "Final review passed, but keep the source Beads item open until merge or no-merge."
+    return record
+
+
+def tracker_progress_status(state: dict[str, Any]) -> str:
+    if has_current_validated_evidence(state):
+        return "validated"
+    if implemented_after_commit(state):
+        return "implemented"
+    if state.get("selected_work"):
+        return "selected"
+    return "idle"
+
+
+def tracker_review_findings(review: dict[str, Any]) -> list[Any]:
+    reviewer_result = review.get("reviewer_result") if isinstance(review.get("reviewer_result"), dict) else {}
+    findings = reviewer_result.get("findings")
+    if not isinstance(findings, list):
+        return []
+    return redact_artifact_value(findings)
+
+
 def blocked_publication(reason: str, normalized: dict[str, Any], run_id: str) -> dict[str, Any]:
     next_allowed_command = rerun_workstream_command(normalized)
     return {
@@ -1320,6 +1466,8 @@ def workstream_status_from_publication(publication: dict[str, Any]) -> str:
         return "published"
     if publication["status"] == "validated-unpublished":
         return "validated-unpublished"
+    if publication["status"] == "tracker-closed":
+        return "closed"
     if publication["status"] == "blocked":
         return "blocked"
     return "failed-needs-human"
@@ -1330,6 +1478,7 @@ def workstream_artifacts(ledger: "WorkstreamLedger") -> dict[str, str]:
         "workstream_result": "workstream-result.json",
         "command": "command.json",
         "publication": "publication-result.json",
+        "tracker": "tracker-result.json",
     }
     if (ledger.path / "pr-body.md").is_file():
         artifacts["pr_body"] = "pr-body.md"
