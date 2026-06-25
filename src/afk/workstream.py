@@ -665,6 +665,7 @@ def publish_terminal_pr(
                 "--body-file",
                 str(ledger.path / "pr-body.md"),
             ]
+            completed = run_publisher_command(command, cwd=checkout_path, tool="gh", auth=auth)
         else:
             command = [
                 config["gh_path"],
@@ -678,7 +679,14 @@ def publish_terminal_pr(
                 "--body-file",
                 str(ledger.path / "pr-body.md"),
             ]
-        completed = run_publisher_command(command, cwd=checkout_path, tool="gh", auth=auth)
+            completed, command = run_pr_update_command(
+                command,
+                config=config,
+                checkout_path=checkout_path,
+                auth=auth,
+                ledger=ledger,
+                body=body,
+            )
     except PublisherError as exc:
         return failed_publication(exc, normalized, auth=auth_artifact)
     return {
@@ -705,6 +713,92 @@ def publish_terminal_pr(
 
 def successful_publisher_url(stdout: str) -> str:
     return redact_text(stdout.strip().splitlines()[-1]) if stdout.strip() else ""
+
+
+def run_pr_update_command(
+    command: list[str],
+    *,
+    config: dict[str, Any],
+    checkout_path: Path,
+    auth: dict[str, Any],
+    ledger: "WorkstreamLedger",
+    body: str,
+) -> tuple[subprocess.CompletedProcess[str], list[str]]:
+    try:
+        return run_publisher_command(command, cwd=checkout_path, tool="gh", auth=auth), command
+    except PublisherError as exc:
+        if not publisher_error_is_projects_classic_graphql_failure(exc):
+            raise
+    pr_number = pr_number_for_rest_update(config["pr"], config=config, checkout_path=checkout_path, auth=auth)
+    ledger.write_json("pr-update.json", {"title": config["title"], "body": body})
+    fallback_command = [
+        config["gh_path"],
+        "api",
+        "--method",
+        "PATCH",
+        f"repos/{config['repo']}/pulls/{pr_number}",
+        "--input",
+        str(ledger.path / "pr-update.json"),
+    ]
+    return run_publisher_command(fallback_command, cwd=checkout_path, tool="gh", auth=auth), fallback_command
+
+
+def publisher_error_is_projects_classic_graphql_failure(exc: PublisherError) -> bool:
+    text = f"{exc.message}\n{exc.stdout}\n{exc.stderr}".lower()
+    if "graphql" not in text:
+        return False
+    return (
+        "projects (classic)" in text
+        or "projects classic" in text
+        or "projectcards" in text
+        or "classic projects" in text
+    )
+
+
+def pr_number_for_rest_update(
+    pr_ref: str,
+    *,
+    config: dict[str, Any],
+    checkout_path: Path,
+    auth: dict[str, Any],
+) -> str:
+    direct_number = pull_request_number_from_ref(pr_ref)
+    if direct_number:
+        return direct_number
+    command = [
+        config["gh_path"],
+        "pr",
+        "view",
+        pr_ref,
+        "--repo",
+        config["repo"],
+        "--json",
+        "number",
+        "--jq",
+        ".number",
+    ]
+    completed = run_publisher_command(command, cwd=checkout_path, tool="gh", auth=auth)
+    resolved = pull_request_number_from_ref(completed.stdout.strip())
+    if not resolved:
+        raise PublisherError(
+            "could not resolve PR number for REST update fallback",
+            command=command,
+            returncode=completed.returncode,
+            stdout=completed.stdout,
+            stderr=completed.stderr,
+        )
+    return resolved
+
+
+def pull_request_number_from_ref(pr_ref: str) -> str:
+    ref = str(pr_ref or "").strip().rstrip("/")
+    if ref.isdigit():
+        return ref
+    marker = "/pull/"
+    if marker not in ref:
+        return ""
+    candidate = ref.rsplit(marker, 1)[1].split("/", 1)[0]
+    return candidate if candidate.isdigit() else ""
 
 
 def normalize_publisher_config(publisher: dict[str, Any], normalized: dict[str, Any]) -> dict[str, Any]:
@@ -908,14 +1002,12 @@ def pr_body_markdown(
     else:
         lines.append("- None recorded")
     lines.extend(["", "## Validation", ""])
-    for validation in state["validations"]:
-        step_ref = ledger_relative_path(validation["step_result_path"])
-        worker_ref = ledger_relative_path(validation["worker_result_path"])
-        lines.append(
-            f"- {pr_body_value(validation_name(validation))}: "
-            f"{pr_body_value(validation['output'].get('status', 'missing'))} "
-            f"({pr_body_value(step_ref)}; {pr_body_value(worker_ref)})"
-        )
+    validation_lines = [
+        pr_body_validation_line(validation, index)
+        for index, validation in enumerate(state.get("validations") or [])
+        if isinstance(validation, dict)
+    ]
+    lines.extend(validation_lines or ["- None recorded"])
     lines.extend(["", f"Review: {pr_body_value(review.get('status', 'missing'))}", ""])
     if review.get("summary"):
         lines.extend(["## Review Summary", "", pr_body_value(review["summary"]), ""])
@@ -1330,6 +1422,72 @@ def validation_name(validation: dict[str, Any]) -> str:
     output = validation.get("output") if isinstance(validation.get("output"), dict) else {}
     info = output.get("validation") if isinstance(output.get("validation"), dict) else {}
     return string_field(info, "requested_profile") or string_field(info, "worker_profile") or "validation"
+
+
+def pr_body_validation_line(validation: dict[str, Any], index: int) -> str:
+    output = validation.get("output") if isinstance(validation.get("output"), dict) else {}
+    profile = validation_name_for_body(validation, index)
+    status = string_field(output, "status") or "missing"
+    evidence = validation_worker_evidence_for_body(output)
+    step_ref = ledger_relative_path(string_field(validation, "step_result_path") or "")
+    worker_ref = ledger_relative_path(string_field(validation, "worker_result_path") or "")
+    path_evidence = "; ".join(item for item in [step_ref, worker_ref] if item)
+    parts = [f"- {pr_body_value(profile)}: {pr_body_value(status)}"]
+    if evidence:
+        parts.append(pr_body_value(evidence))
+    if path_evidence:
+        parts.append(f"evidence: {pr_body_value(path_evidence)}")
+    return " - ".join(parts)
+
+
+def validation_name_for_body(validation: dict[str, Any], index: int) -> str:
+    name = validation_name(validation)
+    return name if name != "validation" else f"validation-{index + 1}"
+
+
+def validation_worker_evidence_for_body(output: dict[str, Any]) -> str:
+    worker_result = output.get("worker_result") if isinstance(output.get("worker_result"), dict) else {}
+    raw_result = worker_result.get("raw") if isinstance(worker_result.get("raw"), dict) else {}
+    normalized = worker_result.get("normalized") if isinstance(worker_result.get("normalized"), dict) else {}
+    result = validation_worker_result_summary(raw_result)
+    command = validation_worker_command_summary(normalized)
+    summary = string_field(output, "summary") or string_field(normalized, "summary")
+    parts = []
+    if result:
+        parts.append(f"result: {result}")
+    if command:
+        parts.append(f"command: {command}")
+    if summary and summary != result:
+        parts.append(f"summary: {summary}")
+    return " - ".join(parts)
+
+
+def validation_worker_result_summary(raw_result: dict[str, Any]) -> str:
+    steps = raw_result.get("steps")
+    if isinstance(steps, list):
+        labels = []
+        for step in steps:
+            if not isinstance(step, dict):
+                continue
+            name = string_field(step, "name")
+            status = string_field(step, "status")
+            if name and status:
+                labels.append(f"{name}={status}")
+        if labels:
+            return ", ".join(labels[:5])
+    status = string_field(raw_result, "status")
+    return f"worker_status={status}" if status else ""
+
+
+def validation_worker_command_summary(normalized: dict[str, Any]) -> str:
+    adapter = normalized.get("adapter") if isinstance(normalized.get("adapter"), dict) else {}
+    command = adapter.get("command")
+    if not isinstance(command, list) or not command:
+        return ""
+    rendered = " ".join(str(part) for part in command if str(part).strip())
+    if len(rendered) > 160:
+        return rendered[:157].rstrip() + "..."
+    return rendered
 
 
 def ledger_relative_path(path: str) -> str:

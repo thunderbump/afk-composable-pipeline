@@ -161,9 +161,11 @@ The recipe schema is intentionally small:
   checkout, implementation, final validation artifacts, and cleanup into
   `review`.
 - `publisher` supports `mode: "create"` with `gh pr create` or `mode: "update"`
-  with `gh pr edit`. `git.path`/`gh.path` may point at fake command shims for
-  offline tests. `git.push: true` pushes `HEAD` to the configured PR head before
-  invoking `gh`.
+  with `gh pr edit`. If `gh pr edit` fails on the GitHub Projects classic
+  GraphQL deprecation path, AFK falls back to `gh api --method PATCH
+  repos/<owner>/<repo>/pulls/<number> --input <json>`. `git.path`/`gh.path` may
+  point at fake command shims for offline tests. `git.push: true` pushes `HEAD`
+  to the configured PR head before invoking `gh`.
 - AFK always runs `gh auth status --hostname github.com` before any `git push`
   or `gh pr create/edit` attempt. Publisher auth stays on the minimal scrubbed
   environment by default, so missing GitHub auth blocks publication before
@@ -202,6 +204,18 @@ validated HEAD. Those blocked cases include:
   while the previous retry checkout is still dirty
 - a failed validation followed by an attempt to start a fresh retry checkout
   while the previous retry checkout is still awaiting validation evidence
+
+Generated PR bodies include a `## Validation` section. Each validation bullet is
+nonblank and has this contract:
+
+```md
+- <profile>: <status> - result: <worker-result-summary> - command: <worker-command> - summary: <validation-summary> - evidence: <step-result-path>; <worker-result-path>
+```
+
+`<profile>` falls back to `validation-N`, `<status>` falls back to `missing`,
+and evidence fields are included only when available. Worker result summaries
+come from worker evidence such as `steps[].name/status` (`unit=pass`) or the raw
+worker status; ledger paths point to the step and worker result artifacts.
 
 In both terminal outcomes `next_allowed_command` points at
 `afk run-workstream ...`, not a

@@ -416,6 +416,8 @@ sys.exit(0)
             self.assertIn("implemented.txt", body)
             self.assertIn("Validation", body)
             self.assertIn("tier1: validated", body)
+            self.assertIn("unit=pass", body)
+            self.assertNotRegex(body, r"(?m)^-\\s*:\\s")
             self.assertIn("Review: passed", body)
             self.assertIn("Artifacts", body)
             self.assertIn(result["steps"][-1]["result_path"], body)
@@ -2343,6 +2345,92 @@ print("https://github.example/pr/123")
             self.assertEqual(calls[1]["tool"], "gh")
             self.assertEqual(calls[1]["argv"][0:4], ["pr", "edit", "123", "--repo"])
             self.assertIn("central-lve.9 - Compose workstream recipe", calls[1]["body"])
+
+    def test_workstream_update_mode_falls_back_to_rest_when_pr_edit_hits_projects_classic_failure(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repo = temp_path / "repo-src"
+            checkout = temp_path / "checkout"
+            ledger = temp_path / "ledger"
+            fake_calls = temp_path / "fake-calls.jsonl"
+            init_repo(repo)
+            fake_git = temp_path / "publisher-git"
+            fake_gh = temp_path / "publisher-gh"
+            write_executable(
+                fake_git,
+                f"""#!{sys.executable}
+from pathlib import Path
+Path({str(fake_calls)!r}).write_text("git should not run\\n", encoding="utf-8")
+""",
+            )
+            write_executable(
+                fake_gh,
+                f"""#!{sys.executable}
+import json
+import sys
+from pathlib import Path
+
+record = {{"tool": "gh", "argv": sys.argv[1:]}}
+if "--body-file" in sys.argv:
+    body_file = sys.argv[sys.argv.index("--body-file") + 1]
+    record["body"] = Path(body_file).read_text(encoding="utf-8")
+if "--input" in sys.argv:
+    input_file = sys.argv[sys.argv.index("--input") + 1]
+    record["input"] = json.loads(Path(input_file).read_text(encoding="utf-8"))
+Path({str(fake_calls)!r}).open("a", encoding="utf-8").write(json.dumps(record) + "\\n")
+if sys.argv[1:4] == ["auth", "status", "--hostname"]:
+    sys.exit(0)
+if sys.argv[1:4] == ["pr", "edit", "123"]:
+    print("GraphQL: Projects (classic) is being deprecated in favor of the new Projects experience", file=sys.stderr)
+    sys.exit(1)
+if sys.argv[1:4] == ["api", "--method", "PATCH"]:
+    print("https://github.example/pr/123")
+    sys.exit(0)
+sys.exit(9)
+""",
+            )
+            recipe = successful_recipe(temp_path, repo, checkout, fake_git, fake_gh)
+            recipe["publisher"]["mode"] = "update"
+            recipe["publisher"]["pr"] = "123"
+            recipe["publisher"]["git"]["push"] = False
+
+            completed = run_afk(
+                "run-workstream",
+                "--workstream-id",
+                "central-lve.9",
+                "--input",
+                json.dumps(recipe),
+                "--ledger",
+                str(ledger),
+                env_overrides={
+                    "GIT_ALLOW_PROTOCOL": "file",
+                    "GIT_AUTHOR_NAME": "AFK Test",
+                    "GIT_AUTHOR_EMAIL": "afk-test@example.test",
+                    "GIT_COMMITTER_NAME": "AFK Test",
+                    "GIT_COMMITTER_EMAIL": "afk-test@example.test",
+                },
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            result = json.loads((ledger / summary["result_path"]).read_text(encoding="utf-8"))
+            calls = [
+                json.loads(line)
+                for line in fake_calls.read_text(encoding="utf-8").splitlines()
+            ]
+
+            self.assertEqual(result["publication"]["status"], "published")
+            self.assertEqual(result["publication"]["mode"], "update")
+            self.assertEqual([call["argv"][0] for call in calls], ["auth", "pr", "api"])
+            self.assertEqual(
+                calls[2]["argv"][0:4],
+                ["api", "--method", "PATCH", "repos/thunderbump/afk-composable-pipeline/pulls/123"],
+            )
+            self.assertEqual(
+                calls[2]["input"]["title"],
+                "central-lve.9: Compose workstream recipe and terminal PR publisher",
+            )
+            self.assertIn("central-lve.9 - Compose workstream recipe", calls[2]["input"]["body"])
 
     def test_workstream_blocks_publication_when_final_review_fails(self):
         with tempfile.TemporaryDirectory() as temp_dir:
