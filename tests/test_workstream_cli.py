@@ -385,7 +385,7 @@ sys.exit(0)
                     }
                 ],
             )
-            self.assertEqual(result["publication"]["status"], "published")
+            self.assertEqual(result["publication"]["status"], "published", result["publication"])
             self.assertEqual(result["publication"]["mode"], "create")
             self.assertEqual(result["publication"]["url"], "https://github.example/pr/123")
 
@@ -417,7 +417,10 @@ sys.exit(0)
             self.assertIn("Validation", body)
             self.assertIn("tier1: validated", body)
             self.assertIn("unit=pass", body)
-            self.assertNotRegex(body, r"(?m)^-\\s*:\\s")
+            self.assertIn("command:", body)
+            self.assertIn("summary: validated", body)
+            self.assertIn("evidence: runs/", body)
+            self.assertNotRegex(body, r"(?m)^-\s*:\s")
             self.assertIn("Review: passed", body)
             self.assertIn("Artifacts", body)
             self.assertIn(result["steps"][-1]["result_path"], body)
@@ -2380,9 +2383,12 @@ if "--input" in sys.argv:
 Path({str(fake_calls)!r}).open("a", encoding="utf-8").write(json.dumps(record) + "\\n")
 if sys.argv[1:4] == ["auth", "status", "--hostname"]:
     sys.exit(0)
-if sys.argv[1:4] == ["pr", "edit", "123"]:
+if sys.argv[1:4] == ["pr", "edit", "afk/workstream-terminal-pr"]:
     print("GraphQL: Projects (classic) is being deprecated in favor of the new Projects experience", file=sys.stderr)
     sys.exit(1)
+if sys.argv[1:4] == ["pr", "view", "afk/workstream-terminal-pr"]:
+    print("123")
+    sys.exit(0)
 if sys.argv[1:4] == ["api", "--method", "PATCH"]:
     print("https://github.example/pr/123")
     sys.exit(0)
@@ -2391,7 +2397,7 @@ sys.exit(9)
             )
             recipe = successful_recipe(temp_path, repo, checkout, fake_git, fake_gh)
             recipe["publisher"]["mode"] = "update"
-            recipe["publisher"]["pr"] = "123"
+            recipe["publisher"]["pr"] = "afk/workstream-terminal-pr"
             recipe["publisher"]["git"]["push"] = False
 
             completed = run_afk(
@@ -2419,27 +2425,38 @@ sys.exit(9)
                 for line in fake_calls.read_text(encoding="utf-8").splitlines()
             ]
 
-            self.assertEqual(result["publication"]["status"], "published")
+            self.assertEqual(result["publication"]["status"], "published", result["publication"])
             self.assertEqual(result["publication"]["mode"], "update")
-            self.assertEqual([call["argv"][0] for call in calls], ["auth", "pr", "api"])
             self.assertEqual(
-                calls[2]["argv"],
+                [call["argv"][0:2] for call in calls],
+                [["auth", "status"], ["pr", "edit"], ["pr", "view"], ["api", "--method"]],
+            )
+            self.assertEqual(
+                calls[3]["argv"],
                 [
                     "api",
                     "--method",
                     "PATCH",
                     "repos/thunderbump/afk-composable-pipeline/pulls/123",
                     "--input",
-                    calls[2]["argv"][5],
+                    calls[3]["argv"][5],
                     "--jq",
                     ".html_url",
                 ],
             )
             self.assertEqual(
-                calls[2]["input"]["title"],
+                calls[3]["input"]["title"],
                 "central-lve.9: Compose workstream recipe and terminal PR publisher",
             )
-            self.assertIn("central-lve.9 - Compose workstream recipe", calls[2]["input"]["body"])
+            body = calls[3]["input"]["body"]
+            self.assertIn("central-lve.9 - Compose workstream recipe", body)
+            self.assertIn("Validation", body)
+            self.assertIn("tier1: validated", body)
+            self.assertIn("unit=pass", body)
+            self.assertIn("command:", body)
+            self.assertIn("summary: validated", body)
+            self.assertIn("evidence: runs/", body)
+            self.assertNotRegex(body, r"(?m)^-\s*:\s")
 
     def test_workstream_blocks_publication_when_final_review_fails(self):
         with tempfile.TemporaryDirectory() as temp_dir:

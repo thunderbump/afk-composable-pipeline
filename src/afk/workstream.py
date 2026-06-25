@@ -1459,7 +1459,7 @@ def validation_worker_evidence_for_body(output: dict[str, Any]) -> str:
         parts.append(f"result: {result}")
     if command:
         parts.append(f"command: {command}")
-    if summary and summary != result:
+    if summary:
         parts.append(f"summary: {summary}")
     return " - ".join(parts)
 
