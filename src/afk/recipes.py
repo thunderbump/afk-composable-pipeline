@@ -37,6 +37,7 @@ def generate_workstream_recipe(
                 "input": {
                     "target_ids": [workstream_id],
                     "required_labels": required_labels,
+                    "allowed_statuses": ["open", "in_progress"],
                     "sources": [
                         {
                             "type": "beads",
@@ -44,7 +45,6 @@ def generate_workstream_recipe(
                             "workspace": str(beads_workspace),
                             "workspace_kind": "central",
                             "labels": required_labels,
-                            "status": "open",
                         }
                     ],
                 },
