@@ -312,32 +312,43 @@ or `skipped_no_auth`.
 
 ### Real Agent Container Contract
 
-For container/remote execution with `agent.type: real-agent-command`, mounts for
-agent auth/config state must be validated before the adapter runs:
+For container/remote execution with `agent.type: real-agent-command`, AFK validates
+auth/config mounts up front and stores only their paths in the job capsule.
 
-- `agent.codex_home` sets `CODEX_HOME`; must be an **absolute**, existing
-  directory outside the target checkout.
-- `agent.config_home` sets `XDG_CONFIG_HOME`; must be an **absolute**, existing
-  directory outside the target checkout.
-- `agent.env.PI_CONFIG_HOME` sets `PI_CONFIG_HOME`; must be an **absolute**,
-  existing directory outside the target checkout.
-- `agent.wrapper_secret_files` optionally exposes runner-local mounted secret
-  files to a wrapper command as **path metadata only**. Keys must be non-secret
-  logical names such as `primary` or `codex`, and values must be **absolute**,
-  existing files outside the target checkout.
+| mount key | recipe location | env exposed to adapter | required | requirement |
+|---|---|---|---|---|
+| Codex config dir | `agent.codex_home` | `CODEX_HOME` | required | absolute existing directory outside checkout; runner should provision `auth.json` when Codex auth is needed |
+| shared config state | `agent.config_home` | `XDG_CONFIG_HOME` | required | absolute existing directory outside checkout |
+| Pi config | `agent.env.PI_CONFIG_HOME` | `PI_CONFIG_HOME` | required | absolute existing directory outside checkout |
+| Pi coding agent dir | `agent.env.PI_CODING_AGENT_DIR` | `PI_CODING_AGENT_DIR` | recommended | absolute path outside checkout |
+| Pi session state dir | `agent.env.PI_CODING_AGENT_SESSION_DIR` | `PI_CODING_AGENT_SESSION_DIR` | recommended | absolute path outside checkout |
+| wrapped secrets | `agent.wrapper_secret_files.<name>` | `AFK_JOB_CAPSULE -> capsule.agent_mounts.wrapper_secret_files` | optional | absolute existing files outside checkout, path-only values, non-secret logical keys |
 
-If any mount is missing, unreachable, relative, or inside the checkout, the step
-fails early as `failed_invalid_payload` and does not execute the adapter.
+If any required mount is missing, malformed, not absolute, inside checkout, or
+non-existent, AFK fails early as `failed_invalid_payload` and does not execute
+the adapter.
 
-AFK may validate and forward wrapper secret file paths. During execution it may
-read those mounted files only to build an in-memory exact-value redaction set
-for stdout/stderr and normalized result payloads before ledger artifacts are
-written. AFK must not inject secret contents into `agent.env`, turn them into
-command flags, or persist them into Beads comments, ledgers, PR bodies, job
-capsules, stdout/stderr, or images. Runner-local wrappers consume the mounted
-file paths through
-`AFK_JOB_CAPSULE -> capsule.agent_mounts.wrapper_secret_files` and perform any
-token export or CLI wiring inside the runner.
+AFK currently validates the required mount directories and records
+`codex_home`, `config_home`, `pi_config_home`, and wrapper secret file paths in
+the job capsule. Additional Pi path env such as `PI_CODING_AGENT_DIR` and
+`PI_CODING_AGENT_SESSION_DIR` is passed through to the adapter environment after
+path validation, but is not yet copied into `capsule.agent_mounts`.
+
+AFK forwards wrapper secret file paths only; it never forwards secret values in
+`agent.env` or command args. Wrapper-side consumers read mounted files and export
+real tokens before launching real Pi/Codex commands. Secret-bearing values are
+not persisted in artifacts; they are only redacted in stdout/stderr and normalized
+payloads.
+
+Expected runtime auth evidence:
+
+- Missing Codex auth should fail as `failed_runtime` with runtime evidence in
+  `step-result.output.failures` and an adapter stderr/stdout excerpt that shows a
+  missing-credential error (for example `missing credentials`).
+- Expired Pi OAuth should fail as `failed_runtime` and can surface as
+  `No API key for provider: openai-codex` in the adapter stderr excerpt.
+- If an auth mount is invalid, AFK stops before execution and records
+  `agent.env.*`/`agent.*` mount validation messages in the step result message.
 
 Minimal recipe fragment for remote/container portability (for `central-afk-pr.7`):
 
@@ -354,7 +365,9 @@ Minimal recipe fragment for remote/container portability (for `central-afk-pr.7`
       "codex_home": "/work/mounts/codex-home",
       "config_home": "/work/mounts/xdg-config",
       "env": {
-        "PI_CONFIG_HOME": "/work/mounts/pi-config"
+        "PI_CONFIG_HOME": "/work/mounts/pi-config",
+        "PI_CODING_AGENT_DIR": "/work/mounts/pi-coding-agent",
+        "PI_CODING_AGENT_SESSION_DIR": "/work/mounts/pi-session"
       }
     }
   }
@@ -385,22 +398,24 @@ Interim wrapper example for runner-local secret resolution:
       "codex_home": "/work/mounts/codex-home",
       "config_home": "/work/mounts/xdg-config",
       "env": {
-        "PI_CONFIG_HOME": "/work/mounts/pi-config"
+        "PI_CONFIG_HOME": "/work/mounts/pi-config",
+        "PI_CODING_AGENT_DIR": "/work/mounts/pi-coding-agent",
+        "PI_CODING_AGENT_SESSION_DIR": "/work/mounts/pi-session"
       },
       "wrapper_secret_files": {
-        "primary": "/work/mounts/secrets/openai-api-key.txt"
+        "primary": "/work/mounts/secrets/openai-api-key.txt",
+        "secondary": "/work/mounts/secrets/pi-refresh-token.txt"
       }
     }
   }
 }
 ```
 
-The wrapper stays runner-local. AFK only passes the mounted file path in the job
-capsule; the wrapper can read that file, export `OPENAI_API_KEY` or populate
-Pi/Codex auth state locally, invoke the real CLI, and exit without echoing the
-secret. Direct secret-bearing `agent.env` values such as `OPENAI_API_KEY=...`
-and direct secret-bearing command flags such as `--token`, `--auth-file`, or
-`--api-key` remain rejected.
+The wrapper stays runner-local. AFK passes only mounted file paths in the job
+capsule; the wrapper can read those files, export `OPENAI_API_KEY` or token files
+at runtime, run the real CLI, and exit without echoing secrets. Direct
+secret-bearing `agent.env` values such as `OPENAI_API_KEY=...` and flags like
+`--token`, `--auth-file`, or `--api-key` remain rejected.
 
 This contract is interim. Replace `agent.wrapper_secret_files` with
 secrets-manager-backed secret references once AFK has a first-class secret
