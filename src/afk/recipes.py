@@ -45,6 +45,7 @@ def generate_workstream_recipe(
                             "workspace": str(beads_workspace),
                             "workspace_kind": "central",
                             "labels": required_labels,
+                            "status": "open",
                         }
                     ],
                 },

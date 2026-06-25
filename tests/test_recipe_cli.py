@@ -148,6 +148,7 @@ class GenerateRecipeCliTest(unittest.TestCase):
                         "workspace": str(beads_workspace),
                         "workspace_kind": "central",
                         "labels": ["project:bump-eqemu"],
+                        "status": "open",
                     }
                 ],
             )
