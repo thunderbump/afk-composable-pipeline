@@ -86,6 +86,13 @@ def write_contract(path, *, project_slug, repo_url):
 
 
 class GenerateRecipeCliTest(unittest.TestCase):
+    def test_generate_recipe_help_mentions_validation_stack_override(self):
+        completed = run_afk("generate-recipe", "--help")
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("--validation-stack-path", completed.stdout)
+        self.assertIn("Overrides the default host sibling contract", completed.stdout)
+
     def test_generate_recipe_writes_complete_single_item_workstream_recipe_from_project_contract(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
@@ -350,6 +357,55 @@ class GenerateRecipeCliTest(unittest.TestCase):
                 {
                     "role": "validation",
                     "path": str(checkout_root / "bump-akk-stack-validation"),
+                },
+            )
+
+    def test_generate_recipe_project_worker_accepts_explicit_validation_stack_path_for_nested_checkout_root(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            output = temp_path / "recipe.json"
+            ledger = temp_path / "ledger"
+            beads_workspace = temp_path / "central-beads"
+            checkout_root = temp_path / "mounts" / "worktrees" / "bump-eqemu"
+            checkout_path = checkout_root / "bump-EQEmu"
+            validation_stack_path = temp_path / "mounts" / "bump-akk-stack-validation"
+            beads_workspace.mkdir()
+
+            completed = run_afk(
+                "generate-recipe",
+                "--workstream-id",
+                "central-anh.6",
+                "--project",
+                "bump-eqemu",
+                "--contracts-dir",
+                "project-contracts",
+                "--ledger",
+                str(ledger),
+                "--beads-workspace",
+                str(beads_workspace),
+                "--checkout-root",
+                str(checkout_root),
+                "--checkout-path",
+                str(checkout_path),
+                "--validation-profile",
+                "tier3-harness",
+                "--validation-mode",
+                "project-worker",
+                "--validation-stack-path",
+                str(validation_stack_path),
+                "--output",
+                str(output),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            recipe = json.loads(output.read_text(encoding="utf-8"))
+            validation = recipe["steps"][3]["input"]["validation"]
+
+            self.assertEqual(
+                validation["stack"],
+                {
+                    "role": "validation",
+                    "path": str(validation_stack_path),
                 },
             )
 

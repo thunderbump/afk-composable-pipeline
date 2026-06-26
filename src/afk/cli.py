@@ -245,6 +245,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional validation timeout in seconds",
     )
     generate_recipe_parser.add_argument(
+        "--validation-stack-path",
+        help=(
+            "Absolute validation stack path for project-worker recipes. "
+            "Overrides the default host sibling contract when checkout_root is a nested mount."
+        ),
+    )
+    generate_recipe_parser.add_argument(
         "--agent-mode",
         choices=("fake", "real-local"),
         default="fake",
@@ -328,6 +335,10 @@ def recipe_validation_input_from_args(args: argparse.Namespace, *, project_contr
     timeout_seconds = 3600 if timeout_seconds is None else timeout_seconds
     checkout_root = Path(args.checkout_root)
     checkout_path = Path(args.checkout_path)
+    validation_stack_path = project_worker_validation_stack_path_from_args(
+        args,
+        checkout_path=checkout_path,
+    )
     return {
         "validation": {
             "profile": args.validation_profile,
@@ -336,10 +347,27 @@ def recipe_validation_input_from_args(args: argparse.Namespace, *, project_contr
             "worker_home": str(checkout_root / ".validation-worker" / checkout_path.name),
             "stack": {
                 "role": "validation",
-                "path": str(checkout_path.parent / "bump-akk-stack-validation"),
+                "path": str(validation_stack_path),
             },
         }
     }
+
+
+def project_worker_validation_stack_path_from_args(
+    args: argparse.Namespace,
+    *,
+    checkout_path: Path,
+) -> Path:
+    if not args.validation_stack_path:
+        return checkout_path.parent / "bump-akk-stack-validation"
+    validation_stack_path = Path(args.validation_stack_path)
+    if not validation_stack_path.is_absolute():
+        raise ValueError("--validation-stack-path must be absolute")
+    resolved_stack_path = validation_stack_path.resolve(strict=False)
+    resolved_checkout_path = checkout_path.resolve(strict=False)
+    if resolved_stack_path == resolved_checkout_path or resolved_checkout_path in resolved_stack_path.parents:
+        raise ValueError("--validation-stack-path must be outside checkout")
+    return validation_stack_path
 
 
 def project_contract_has_default_worker(project_contract: ProjectContract) -> bool:

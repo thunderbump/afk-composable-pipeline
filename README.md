@@ -303,6 +303,15 @@ validation profile, local fake implementation/validation/review adapters, and
 when real worker/publisher credentials are intentionally available; the
 generator does not invent credentials.
 
+For `--validation-mode project-worker`, the generator embeds the worker host
+contract into `steps[].input.validation`. By default that keeps
+`validation.worker_home` under `checkout_root/.validation-worker/<checkout-name>`
+and derives `validation.stack.path` as a sibling of the checkout path
+(`checkout_path.parent / "bump-akk-stack-validation"`). If `checkout_root` is a
+nested mount such as `/work/mounts/checkouts`, pass an explicit host stack path
+with `--validation-stack-path /work/bump-akk-stack-validation` so the generated
+recipe does not rely on a hidden sibling assumption.
+
 Selection evidence is recorded by the normal `select-work` step. The generated
 selector records the requested item in `selected_work`; non-target Beads
 candidates are recorded in `skipped_candidates` with `target_id_mismatch`.
