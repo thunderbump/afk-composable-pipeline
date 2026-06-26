@@ -11,7 +11,14 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from afk.workstream import WorkstreamLedger, pr_body_markdown, select_work_proves_different_item  # noqa: E402
+from afk.registry import StepResult  # noqa: E402
+from afk.workstream import (  # noqa: E402
+    WorkstreamLedger,
+    composed_step_input,
+    pr_body_markdown,
+    select_work_proves_different_item,
+    update_state_from_step,
+)
 
 
 def run_afk(*args, env_overrides=None):
@@ -1922,6 +1929,379 @@ Path({str(fake_calls)!r}).write_text("gh should not run\\n", encoding="utf-8")
             )
             self.assertFalse(retry_checkout.exists())
             self.assertFalse(fake_calls.exists())
+
+    def test_workstream_retry_reuses_implemented_review_branch_after_validation_failure(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repo = temp_path / "repo-src"
+            checkout = temp_path / "checkout"
+            ledger = temp_path / "ledger"
+            fake_calls = temp_path / "fake-calls.jsonl"
+            init_repo(repo)
+            fake_git = temp_path / "publisher-git"
+            fake_gh = temp_path / "publisher-gh"
+            write_executable(
+                fake_git,
+                f"""#!{sys.executable}
+import json
+import os
+import sys
+from pathlib import Path
+
+Path({str(fake_calls)!r}).open("a", encoding="utf-8").write(
+    json.dumps({{"tool": "git", "cwd": os.getcwd(), "argv": sys.argv[1:]}}) + "\\n"
+)
+sys.exit(0)
+""",
+            )
+            write_executable(
+                fake_gh,
+                f"""#!{sys.executable}
+import json
+import sys
+from pathlib import Path
+
+record = {{"tool": "gh", "argv": sys.argv[1:]}}
+if "--body-file" in sys.argv:
+    body_file = sys.argv[sys.argv.index("--body-file") + 1]
+    record["body"] = Path(body_file).read_text(encoding="utf-8")
+Path({str(fake_calls)!r}).open("a", encoding="utf-8").write(json.dumps(record) + "\\n")
+if sys.argv[1:4] == ["auth", "status", "--hostname"]:
+    sys.exit(0)
+print("https://github.example/pr/123")
+sys.exit(0)
+""",
+            )
+            failing_worker_code = textwrap.dedent(
+                """
+                import json
+                import os
+                from pathlib import Path
+
+                request = json.loads(Path(os.environ["AFK_WORKER_REQUEST"]).read_text(encoding="utf-8"))
+                Path(os.environ["AFK_WORKER_RESULT"]).write_text(
+                    json.dumps(
+                        {
+                            "profile": request["profile"],
+                            "status": "fail",
+                            "summary": "unit tests failed",
+                            "steps": [{"name": "unit", "status": "fail"}],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                """
+            ).strip()
+            passing_worker_code = textwrap.dedent(
+                """
+                import json
+                import os
+                from pathlib import Path
+
+                request = json.loads(Path(os.environ["AFK_WORKER_REQUEST"]).read_text(encoding="utf-8"))
+                Path(os.environ["AFK_WORKER_RESULT"]).write_text(
+                    json.dumps(
+                        {
+                            "profile": request["profile"],
+                            "status": "pass",
+                            "summary": "unit tests passed",
+                            "steps": [{"name": "unit", "status": "pass"}],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                """
+            ).strip()
+            recipe = successful_recipe(temp_path, repo, checkout, fake_git, fake_gh)
+            recipe["retry_policy"] = {"max_retries": 1}
+            recipe["steps"][3]["input"]["worker"]["command"] = [sys.executable, "-c", failing_worker_code]
+            recipe["steps"] = recipe["steps"][:4] + [
+                {
+                    "name": "prepare-checkout",
+                    "input": {
+                        "repo_url": str(repo),
+                        "base_ref": "main",
+                        "checkout_root": str(temp_path),
+                        "checkout_path": str(checkout),
+                    },
+                },
+                {
+                    "name": "validate",
+                    "profile": "tier1",
+                    "input": {
+                        "validation": {"dry_run": True, "timeout_seconds": 30},
+                        "worker": {
+                            "type": "local-command",
+                            "command": [sys.executable, "-c", passing_worker_code],
+                            "timeout_seconds": 10,
+                        },
+                    },
+                },
+                recipe["steps"][4],
+            ]
+
+            completed = run_afk(
+                "run-workstream",
+                "--workstream-id",
+                "central-lve.9",
+                "--input",
+                json.dumps(recipe),
+                "--ledger",
+                str(ledger),
+                env_overrides={
+                    "GIT_ALLOW_PROTOCOL": "file",
+                    "GIT_AUTHOR_NAME": "AFK Test",
+                    "GIT_AUTHOR_EMAIL": "afk-test@example.test",
+                    "GIT_COMMITTER_NAME": "AFK Test",
+                    "GIT_COMMITTER_EMAIL": "afk-test@example.test",
+                },
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            result = json.loads((ledger / summary["result_path"]).read_text(encoding="utf-8"))
+
+            self.assertEqual(summary["status"], "published")
+            self.assertEqual(result["status"], "published")
+            self.assertEqual(
+                [step["name"] for step in result["steps"]],
+                [
+                    "select-work",
+                    "prepare-checkout",
+                    "implement",
+                    "validate",
+                    "prepare-checkout",
+                    "validate",
+                    "review",
+                ],
+            )
+            implemented_commit = result["steps"][2]["result_path"]
+            first_validate = json.loads(
+                (ledger / result["steps"][3]["result_path"]).read_text(encoding="utf-8")
+            )["output"]
+            retried_checkout = json.loads(
+                (ledger / result["steps"][4]["result_path"]).read_text(encoding="utf-8")
+            )["output"]
+            second_validate = json.loads(
+                (ledger / result["steps"][5]["result_path"]).read_text(encoding="utf-8")
+            )["output"]
+            review_result = json.loads(
+                (ledger / result["steps"][6]["result_path"]).read_text(encoding="utf-8")
+            )["output"]
+
+            self.assertEqual(first_validate["status"], "failed_validation")
+            self.assertEqual(retried_checkout["status"], "prepared")
+            self.assertEqual(second_validate["status"], "validated")
+            self.assertEqual(review_result["status"], "passed")
+            self.assertEqual(
+                retried_checkout["start_commit"],
+                second_validate["checkout"]["start_commit"],
+            )
+            self.assertEqual(
+                retried_checkout["requested_ref"],
+                second_validate["checkout"]["requested_ref"],
+            )
+            self.assertEqual(result["publication"]["status"], "published")
+            self.assertEqual(result["publication"]["url"], "https://github.example/pr/123")
+
+    def test_workstream_retry_respects_explicit_prepare_requested_ref_for_same_checkout_path(self):
+        state = {
+            "selected_work": [],
+            "checkout": {
+                "status": "prepared",
+                "checkout_path": "/work/checkout",
+                "start_commit": "1111111111111111111111111111111111111111",
+                "requested_ref": "1111111111111111111111111111111111111111",
+            },
+            "checkout_attempts": [],
+            "implementation": {
+                "status": "implemented",
+                "git": {"after_commit": "2222222222222222222222222222222222222222"},
+            },
+            "validations": [],
+            "review": None,
+        }
+        step_input = composed_step_input(
+            {
+                "name": "prepare-checkout",
+                "input": {
+                    "checkout_path": "/work/checkout",
+                    "requested_ref": "main",
+                },
+            },
+            {"review_branch": "afk/test"},
+            state,
+            Path("/ledger"),
+        )
+
+        self.assertEqual(step_input["requested_ref"], "main")
+
+    def test_workstream_failed_retry_prepare_preserves_current_validation_and_review_state(self):
+        state = {
+            "selected_work": [],
+            "checkout": {
+                "status": "prepared",
+                "checkout_path": "/work/checkout",
+                "start_commit": "1111111111111111111111111111111111111111",
+            },
+            "checkout_attempts": [],
+            "implementation": {
+                "status": "implemented",
+                "git": {"after_commit": "1111111111111111111111111111111111111111"},
+            },
+            "validations": [{"output": {"status": "validated"}}],
+            "review": {"status": "request_revision"},
+            "cleanup": {"status": "unknown", "resources": []},
+        }
+        failed_prepare = {
+            "status": "failed_existing_branch",
+            "checkout_path": "/work/checkout",
+            "review_branch": "afk/test",
+            "dirty": False,
+        }
+
+        update_state_from_step(
+            state,
+            "prepare-checkout",
+            StepResult(
+                run_id="retry",
+                step="prepare-checkout",
+                status="succeeded",
+                output=failed_prepare,
+                stdout="",
+                stderr="",
+                result_sha256="",
+            ),
+            Path("/ledger"),
+        )
+
+        self.assertEqual(state["checkout"]["status"], "prepared")
+        self.assertEqual(state["validations"], [{"output": {"status": "validated"}}])
+        self.assertEqual(state["review"], {"status": "request_revision"})
+        self.assertEqual(state["checkout_attempts"], [])
+
+    def test_workstream_retry_reuses_implemented_review_branch_after_review_failure(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repo = temp_path / "repo-src"
+            checkout = temp_path / "checkout"
+            ledger = temp_path / "ledger"
+            fake_calls = temp_path / "fake-calls.jsonl"
+            init_repo(repo)
+            fake_git = temp_path / "publisher-git"
+            fake_gh = temp_path / "publisher-gh"
+            write_executable(
+                fake_git,
+                f"""#!{sys.executable}
+import json
+import os
+import sys
+from pathlib import Path
+
+Path({str(fake_calls)!r}).open("a", encoding="utf-8").write(
+    json.dumps({{"tool": "git", "cwd": os.getcwd(), "argv": sys.argv[1:]}}) + "\\n"
+)
+sys.exit(0)
+""",
+            )
+            write_executable(
+                fake_gh,
+                f"""#!{sys.executable}
+import json
+import sys
+from pathlib import Path
+
+record = {{"tool": "gh", "argv": sys.argv[1:]}}
+if "--body-file" in sys.argv:
+    body_file = sys.argv[sys.argv.index("--body-file") + 1]
+    record["body"] = Path(body_file).read_text(encoding="utf-8")
+Path({str(fake_calls)!r}).open("a", encoding="utf-8").write(json.dumps(record) + "\\n")
+if sys.argv[1:4] == ["auth", "status", "--hostname"]:
+    sys.exit(0)
+print("https://github.example/pr/123")
+sys.exit(0)
+""",
+            )
+            failing_reviewer_code = textwrap.dedent(
+                """
+                import json
+                import os
+                from pathlib import Path
+
+                json.loads(Path(os.environ["AFK_REVIEWER_REQUEST"]).read_text(encoding="utf-8"))
+                Path(os.environ["AFK_REVIEWER_RESULT"]).write_text(
+                    json.dumps({"status": "request_revision", "summary": "needs fixes", "findings": []}),
+                    encoding="utf-8",
+                )
+                """
+            ).strip()
+            recipe = successful_recipe(temp_path, repo, checkout, fake_git, fake_gh)
+            recipe["retry_policy"] = {"max_retries": 1}
+            first_review = recipe["steps"][4]
+            first_review["input"]["reviewer"]["command"] = [sys.executable, "-c", failing_reviewer_code]
+            recipe["steps"] = recipe["steps"] + [
+                {
+                    "name": "prepare-checkout",
+                    "input": {
+                        "repo_url": str(repo),
+                        "base_ref": "main",
+                        "checkout_root": str(temp_path),
+                        "checkout_path": str(checkout),
+                    },
+                },
+                recipe["steps"][3],
+                successful_recipe(temp_path, repo, checkout, fake_git, fake_gh)["steps"][4],
+            ]
+
+            completed = run_afk(
+                "run-workstream",
+                "--workstream-id",
+                "central-lve.9",
+                "--input",
+                json.dumps(recipe),
+                "--ledger",
+                str(ledger),
+                env_overrides={
+                    "GIT_ALLOW_PROTOCOL": "file",
+					"GIT_AUTHOR_NAME": "AFK Test",
+					"GIT_AUTHOR_EMAIL": "afk-test@example.test",
+					"GIT_COMMITTER_NAME": "AFK Test",
+					"GIT_COMMITTER_EMAIL": "afk-test@example.test",
+				},
+			)
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            result = json.loads((ledger / summary["result_path"]).read_text(encoding="utf-8"))
+            self.assertEqual(summary["status"], "published")
+            self.assertEqual(
+                [step["name"] for step in result["steps"]],
+                [
+                    "select-work",
+                    "prepare-checkout",
+                    "implement",
+                    "validate",
+                    "review",
+                    "prepare-checkout",
+                    "validate",
+                    "review",
+                ],
+            )
+            first_review_output = json.loads(
+                (ledger / result["steps"][4]["result_path"]).read_text(encoding="utf-8")
+            )["output"]
+            retried_checkout = json.loads(
+                (ledger / result["steps"][5]["result_path"]).read_text(encoding="utf-8")
+            )["output"]
+            second_review_output = json.loads(
+                (ledger / result["steps"][7]["result_path"]).read_text(encoding="utf-8")
+            )["output"]
+
+            self.assertEqual(first_review_output["status"], "request_revision")
+            self.assertEqual(retried_checkout["status"], "prepared")
+            self.assertEqual(second_review_output["status"], "passed")
+            self.assertEqual(result["retry_attempts"][0]["repairing_failure_class"], "request_revision")
+            self.assertEqual(result["publication"]["status"], "published")
 
     def test_workstream_blocks_new_retry_checkout_when_prior_retry_is_dirty_and_summarizes_cleanup(self):
         with tempfile.TemporaryDirectory() as temp_dir:
