@@ -30,6 +30,36 @@ class RegistryTest(unittest.TestCase):
         self.assertEqual(result.stderr, "")
         self.assertRegex(result.result_sha256, r"^[0-9a-f]{64}$")
 
+    def test_registry_marks_domain_failure_outputs_as_failed(self):
+        registry = default_step_registry()
+
+        result = registry.run(
+            "noop",
+            StepContext(input_data={"status": "failed_validation"}, run_id="test-run"),
+        )
+
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.output["status"], "failed_validation")
+
+    def test_registry_keeps_skip_and_revision_outputs_successful(self):
+        registry = default_step_registry()
+
+        cases = [
+            "request_revision",
+            "skipped_disabled",
+            "skipped_empty",
+            "skipped_profile",
+        ]
+        for status in cases:
+            with self.subTest(status=status):
+                result = registry.run(
+                    "noop",
+                    StepContext(input_data={"status": status}, run_id="test-run"),
+                )
+
+                self.assertEqual(result.status, "succeeded")
+                self.assertEqual(result.output["status"], status)
+
 
 if __name__ == "__main__":
     unittest.main()

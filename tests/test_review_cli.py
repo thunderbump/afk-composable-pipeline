@@ -95,7 +95,7 @@ def write_validation_artifacts(path, *, status="validated", classification="succ
         "schema_version": 1,
         "run_id": "validation-run",
         "step": "validate",
-        "status": "succeeded",
+        "status": validation_step_result_status(status),
         "output": {
             "schema_version": 1,
             "status": status,
@@ -128,6 +128,14 @@ def write_validation_artifacts(path, *, status="validated", classification="succ
     (path / "step-result.json").write_text(json.dumps(step_result), encoding="utf-8")
     (path / "worker-result.json").write_text(json.dumps(worker_result), encoding="utf-8")
     return path / "step-result.json", path / "worker-result.json"
+
+
+def validation_step_result_status(status):
+    if status == "validated":
+        return "succeeded"
+    if status == "skipped_profile":
+        return "skipped"
+    return "failed"
 
 
 def run_dir_text(run_dir):
@@ -295,6 +303,8 @@ class ReviewCliTest(unittest.TestCase):
             review_summary = (run_dir / "review-summary.md").read_text(encoding="utf-8")
 
             self.assertEqual(summary["step"], "review")
+            self.assertEqual(summary["status"], "succeeded")
+            self.assertEqual(result["status"], "succeeded")
             self.assertEqual(result["output"]["status"], "passed")
             self.assertEqual(result["output"]["classification"], "success")
             self.assertEqual(
@@ -427,6 +437,66 @@ class ReviewCliTest(unittest.TestCase):
                 self.assertIn("tier1", reviewer_result["result"]["summary"])
                 self.assertIn("tier1", review_summary)
                 self.assertNotIn("reviewer should not run", (run_dir / "stdout.log").read_text(encoding="utf-8"))
+
+    def test_review_invalid_payload_marks_top_level_step_status_failed(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            ledger = temp_path / "ledger"
+
+            completed = run_afk(
+                "run-step",
+                "review",
+                "--input",
+                json.dumps({"work_item": None}),
+                "--ledger",
+                str(ledger),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(summary["status"], "failed")
+            self.assertEqual(result["status"], "failed")
+            self.assertEqual(result["output"]["status"], "failed_invalid_payload")
+
+    def test_review_protocol_failure_marks_top_level_step_status_failed(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            checkout = temp_path / "checkout"
+            start_commit = init_checkout(checkout)
+            head_commit = git(checkout, "rev-parse", "HEAD")
+            validation_step, validation_worker = write_validation_artifacts(temp_path / "validation-run")
+            ledger = temp_path / "ledger"
+            reviewer_code = "print('reviewer returned no payload')"
+
+            completed = run_afk(
+                "run-step",
+                "review",
+                "--input",
+                json.dumps(
+                    review_input(
+                        checkout=checkout,
+                        start_commit=start_commit,
+                        head_commit=head_commit,
+                        validation_step=validation_step,
+                        validation_worker=validation_worker,
+                        reviewer_code=reviewer_code,
+                    )
+                ),
+                "--ledger",
+                str(ledger),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(summary["status"], "failed")
+            self.assertEqual(result["status"], "failed")
+            self.assertEqual(result["output"]["status"], "failed_protocol")
 
     def test_review_refuses_missing_required_validation_artifact_paths_as_validation_evidence(self):
         cases = [
@@ -910,10 +980,10 @@ class ReviewCliTest(unittest.TestCase):
 
     def test_review_records_reviewer_fail_and_request_revision_statuses(self):
         cases = [
-            ("fail", "failed", "review_failure"),
-            ("request_revision", "request_revision", "review_revision_requested"),
+            ("fail", "failed", "review_failure", "failed"),
+            ("request_revision", "request_revision", "review_revision_requested", "succeeded"),
         ]
-        for raw_status, expected_status, expected_classification in cases:
+        for raw_status, expected_status, expected_classification, expected_step_status in cases:
             with self.subTest(raw_status=raw_status), tempfile.TemporaryDirectory() as temp_dir:
                 temp_path = Path(temp_dir)
                 checkout = temp_path / "checkout"
@@ -973,6 +1043,8 @@ class ReviewCliTest(unittest.TestCase):
                 reviewer_result = json.loads((run_dir / "reviewer-result.json").read_text(encoding="utf-8"))
                 review_summary = (run_dir / "review-summary.md").read_text(encoding="utf-8")
 
+                self.assertEqual(summary["status"], expected_step_status)
+                self.assertEqual(result["status"], expected_step_status)
                 self.assertEqual(result["output"]["status"], expected_status)
                 self.assertEqual(result["output"]["classification"], expected_classification)
                 self.assertEqual(reviewer_result["result"]["status"], expected_status)
