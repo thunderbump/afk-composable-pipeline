@@ -294,9 +294,64 @@ class GenerateRecipeCliTest(unittest.TestCase):
             self.assertEqual(validate_step["profile"], "tier1")
             self.assertEqual(
                 validate_step["input"]["validation"],
-                {"profile": "tier1", "dry_run": False, "timeout_seconds": 3600},
+                {
+                    "profile": "tier1",
+                    "dry_run": False,
+                    "timeout_seconds": 3600,
+                    "worker_home": str(checkout_root / ".validation-worker" / "demo"),
+                    "stack": {
+                        "role": "validation",
+                        "path": str(checkout_root / "bump-akk-stack-validation"),
+                    },
+                },
             )
             self.assertNotIn("worker", validate_step["input"])
+
+    def test_generate_recipe_derives_project_worker_stack_from_checkout_parent(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            output = temp_path / "recipe.json"
+            ledger = temp_path / "ledger"
+            beads_workspace = temp_path / "central-beads"
+            checkout_root = temp_path / "work"
+            checkout_path = checkout_root / "bump-EQEmu"
+            beads_workspace.mkdir()
+
+            completed = run_afk(
+                "generate-recipe",
+                "--workstream-id",
+                "central-anh.6",
+                "--project",
+                "bump-eqemu",
+                "--contracts-dir",
+                "project-contracts",
+                "--ledger",
+                str(ledger),
+                "--beads-workspace",
+                str(beads_workspace),
+                "--checkout-root",
+                str(checkout_root),
+                "--checkout-path",
+                str(checkout_path),
+                "--validation-profile",
+                "tier3-harness",
+                "--validation-mode",
+                "project-worker",
+                "--output",
+                str(output),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            recipe = json.loads(output.read_text(encoding="utf-8"))
+            validation = recipe["steps"][3]["input"]["validation"]
+
+            self.assertEqual(
+                validation["stack"],
+                {
+                    "role": "validation",
+                    "path": str(checkout_root / "bump-akk-stack-validation"),
+                },
+            )
 
     def test_generate_recipe_rejects_project_worker_without_default_worker_contract(self):
         with tempfile.TemporaryDirectory() as temp_dir:
