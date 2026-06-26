@@ -23,6 +23,7 @@ from afk.redaction import (
 
 SCHEMA_VERSION = 1
 WRAPPER_SECRET_FILE_NAME_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9_-]*$")
+SECRET_REF_LOGICAL_NAME_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9_-]*$")
 MIN_RUNTIME_SECRET_LENGTH = 4
 
 
@@ -325,7 +326,7 @@ def normalize_agent(agent: Any, *, checkout_path: Path) -> dict[str, Any]:
     fake_agent = agent_type == "fake-pi-command"
     forbidden_keys = ("credentials_path", "auth_file", "token", "api_key")
     if fake_agent:
-        forbidden_keys = (*forbidden_keys, "env", "codex_home", "config_home", "wrapper_secret_files")
+        forbidden_keys = (*forbidden_keys, "env", "codex_home", "config_home", "wrapper_secret_files", "secret_refs")
     for forbidden_key in forbidden_keys:
         if forbidden_key in agent:
             return {"status": "invalid", "message": f"agent.{forbidden_key} is not supported"}
@@ -350,6 +351,7 @@ def normalize_agent(agent: Any, *, checkout_path: Path) -> dict[str, Any]:
         "codex_home": "",
         "config_home": "",
         "wrapper_secret_files": {},
+        "secret_refs": {},
     }
     if not fake_agent:
         env = normalize_agent_env(
@@ -381,10 +383,14 @@ def normalize_agent(agent: Any, *, checkout_path: Path) -> dict[str, Any]:
         )
         if wrapper_secret_files["status"] != "valid":
             return {"status": "invalid", "message": wrapper_secret_files["message"]}
+        secret_refs = normalize_secret_refs(agent.get("secret_refs", {}))
+        if secret_refs["status"] != "valid":
+            return {"status": "invalid", "message": secret_refs["message"]}
         normalized_agent["env"] = env["env"]
         normalized_agent["codex_home"] = codex_home["path"]
         normalized_agent["config_home"] = config_home["path"]
         normalized_agent["wrapper_secret_files"] = wrapper_secret_files["files"]
+        normalized_agent["secret_refs"] = secret_refs["secret_refs"]
     return {
         "status": "valid",
         "agent": normalized_agent,
@@ -554,6 +560,72 @@ def read_wrapper_secret_redaction_set(wrapper_secret_files: dict[str, str]) -> d
     return {"status": "valid", "exact_secrets": normalize_exact_secrets(exact_secrets)}
 
 
+def normalize_secret_refs(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {"status": "invalid", "message": "agent.secret_refs must be an object"}
+    normalized: dict[str, dict[str, dict[str, str]]] = {}
+    for key, entry in value.items():
+        if not isinstance(key, str) or not SECRET_REF_LOGICAL_NAME_PATTERN.match(key):
+            return {
+                "status": "invalid",
+                "message": "agent.secret_refs keys must match [A-Za-z][A-Za-z0-9_-]*",
+            }
+        if is_secret_key(key):
+            return {
+                "status": "invalid",
+                "message": f"agent.secret_refs.{key} must use a non-secret logical name",
+            }
+        if not isinstance(entry, dict):
+            return {
+                "status": "invalid",
+                "message": f"agent.secret_refs.{key} must be an object containing only secretRef",
+            }
+        if "value" in entry:
+            return {
+                "status": "invalid",
+                "message": f"agent.secret_refs.{key} must not include plaintext secret fields",
+            }
+        if set(entry) != {"secretRef"}:
+            return {
+                "status": "invalid",
+                "message": f"agent.secret_refs.{key} must be an object containing only secretRef",
+            }
+        secret_ref = normalize_secret_ref(entry["secretRef"], field=f"agent.secret_refs.{key}.secretRef")
+        if secret_ref["status"] != "valid":
+            return {"status": "invalid", "message": secret_ref["message"]}
+        normalized[key] = {"secretRef": secret_ref["secret_ref"]}
+    return {"status": "valid", "secret_refs": normalized}
+
+
+def normalize_secret_ref(value: Any, *, field: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {"status": "invalid", "message": f"{field} must be an object"}
+    allowed_fields = {"provider", "name", "key"}
+    extra_fields = set(value).difference(allowed_fields)
+    if extra_fields:
+        return {
+            "status": "invalid",
+            "message": f"{field} must only contain provider, name, and key",
+        }
+    normalized: dict[str, str] = {}
+    for required_field in ("provider", "name", "key"):
+        raw_value = value.get(required_field)
+        if raw_value is None:
+            return {"status": "invalid", "message": f"{field}.{required_field} is required"}
+        if not isinstance(raw_value, str) or not raw_value.strip():
+            return {
+                "status": "invalid",
+                "message": f"{field}.{required_field} must be a non-empty string",
+            }
+        if is_secret_value(raw_value):
+            return {
+                "status": "invalid",
+                "message": f"{field}.{required_field} must not include a secret-looking value",
+            }
+        normalized[required_field] = raw_value
+    return {"status": "valid", "secret_ref": normalized}
+
+
 def wrapper_secret_redaction_candidates(raw_value: str) -> set[str]:
     candidates: set[str] = set()
     stripped = raw_value.strip()
@@ -591,6 +663,9 @@ def build_job_capsule(request: dict[str, Any], *, run_id: str) -> dict[str, Any]
     wrapper_secret_files = request["agent"].get("wrapper_secret_files", {})
     if wrapper_secret_files:
         agent_mounts["wrapper_secret_files"] = wrapper_secret_files
+    secret_refs = request["agent"].get("secret_refs", {})
+    if secret_refs:
+        agent_mounts["secret_refs"] = secret_refs
     return {
         "schema_version": SCHEMA_VERSION,
         "run_id": run_id,
