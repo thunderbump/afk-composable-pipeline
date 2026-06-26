@@ -128,8 +128,6 @@ def validate(
     raw_payload = read_worker_payload(result_path, fallback_path=evidence_result_path)
     if raw_payload["status"] == "valid":
         sync_worker_payload_artifacts(result_path, evidence_result_path, raw_payload["payload"])
-    elif raw_payload["status"] == "invalid":
-        sync_worker_protocol_artifacts(result_path, evidence_result_path, raw_payload["message"])
     if raw_payload["status"] != "valid":
         if raw_payload["status"] == "missing":
             status = "failed_missing_result"
@@ -137,6 +135,7 @@ def validate(
         else:
             status = "failed_protocol"
             classification = "protocol_failure"
+        sync_worker_failure_artifacts(result_path, evidence_result_path, status, classification, raw_payload["message"])
         normalized = normalized_worker_result(
             status=status,
             classification=classification,
@@ -691,6 +690,23 @@ def sync_worker_protocol_artifacts(worker_output_path: Path, evidence_result_pat
     replace_worker_result_evidence(evidence_result_path, payload)
 
 
+def sync_worker_failure_artifacts(
+    worker_output_path: Path,
+    evidence_result_path: Path,
+    status: str,
+    classification: str,
+    message: str,
+) -> None:
+    payload = {
+        "schema_version": SCHEMA_VERSION,
+        "status": status,
+        "classification": classification,
+        "summary": message,
+    }
+    replace_worker_result_evidence(worker_output_path, payload)
+    replace_worker_result_evidence(evidence_result_path, payload)
+
+
 def normalize_worker_payload(
     payload: dict[str, Any],
     *,
@@ -777,6 +793,7 @@ def normalized_worker_result(
         evidence_dir=evidence_dir,
         adapter=adapter,
         evidence=evidence,
+        evidence_dir_for_logs=evidence_dir,
         adapter_stdout=stdout,
         adapter_stderr=stderr,
     )
@@ -837,6 +854,7 @@ def actionable_failure_records(
     evidence_dir: Path,
     adapter: dict[str, Any],
     evidence: dict[str, Any],
+    evidence_dir_for_logs: Path,
     adapter_stdout: str,
     adapter_stderr: str,
 ) -> list[dict[str, Any]]:
@@ -856,6 +874,7 @@ def actionable_failure_records(
             summary,
             adapter,
             evidence,
+            evidence_dir_for_logs=evidence_dir_for_logs,
             adapter_stdout=adapter_stdout,
             adapter_stderr=adapter_stderr,
         )
@@ -866,6 +885,11 @@ def summarize_failure_record(failure: dict[str, Any], *, evidence_dir: Path) -> 
     log_path, log_path_status = resolve_worker_failure_log_path(failure, evidence_dir=evidence_dir)
     reason = string_field(failure, "reason") or ""
     excerpt = log_failure_excerpt(log_path, default_excerpt=reason)
+    if not log_path and is_generic_failure_reason(reason):
+        fallback = best_evidence_excerpt(evidence_dir, summary=reason)
+        if fallback is not None:
+            log_path, excerpt = fallback
+            log_path_status = "fallback"
     return {
         "name": string_field(failure, "name") or "",
         "status": string_field(failure, "status") or "",
@@ -896,12 +920,14 @@ def summarize_adapter_failure(
     adapter: dict[str, Any],
     evidence: dict[str, Any],
     *,
+    evidence_dir_for_logs: Path,
     adapter_stdout: str,
     adapter_stderr: str,
 ) -> dict[str, Any]:
     log_path, excerpt = adapter_failure_excerpt(
         summary,
         evidence,
+        evidence_dir=evidence_dir_for_logs,
         adapter_stdout=adapter_stdout,
         adapter_stderr=adapter_stderr,
     )
@@ -1004,6 +1030,18 @@ def is_generic_failure_summary(status: str, summary: str) -> bool:
     return summary.strip() in generic or summary.strip() == status
 
 
+def is_generic_failure_reason(reason: str) -> bool:
+    stripped = reason.strip()
+    if is_generic_failure_summary("", stripped):
+        return True
+    lowered = stripped.lower()
+    return bool(
+        re.fullmatch(r"command exited with status \d+", lowered)
+        or re.fullmatch(r"exit status \d+", lowered)
+        or re.fullmatch(r"exited with status \d+", lowered)
+    )
+
+
 def classify_failure_record(failure: dict[str, Any], excerpt: str) -> str:
     category = string_field(failure, "category") or ""
     status = string_field(failure, "status") or ""
@@ -1034,6 +1072,7 @@ def adapter_failure_excerpt(
     summary: str,
     evidence: dict[str, Any],
     *,
+    evidence_dir: Path,
     adapter_stdout: str,
     adapter_stderr: str,
 ) -> tuple[str, str]:
@@ -1047,16 +1086,72 @@ def adapter_failure_excerpt(
             adapter_stderr or string_field(evidence, "stderr_excerpt") or "",
         ),
     ]
-    for path, text in candidates:
-        excerpt = text_excerpt(text, default_excerpt="")
-        if excerpt and excerpt != summary:
-            return path, excerpt
+    candidate_excerpts: list[tuple[str, str, int]] = []
     for path, text in candidates:
         excerpt = text_excerpt(text, default_excerpt="")
         if excerpt:
-            return path, excerpt
+            candidate_excerpts.append((path, excerpt, 1))
+    evidence_excerpt = best_evidence_excerpt(evidence_dir, summary=summary)
+    if evidence_excerpt is not None:
+        source_rank = 2 if Path(evidence_excerpt[0]).suffix == ".json" else 0
+        candidate_excerpts.append((evidence_excerpt[0], evidence_excerpt[1], source_rank))
+    if candidate_excerpts:
+        return min(candidate_excerpts, key=lambda item: evidence_excerpt_priority(item[1], summary, item[2]))[:2]
     fallback_path = string_field(evidence, "stderr_path") or string_field(evidence, "stdout_path") or "stderr.log"
     return fallback_path, redact_text(summary)
+
+
+def best_evidence_excerpt(evidence_dir: Path, *, summary: str) -> tuple[str, str] | None:
+    candidates: list[tuple[str, str, int]] = []
+    for relative_path, source_rank in (
+        ("logs/stack.log", 0),
+        ("logs/validation.log", 0),
+        ("logs/submodule.log", 0),
+        ("logs/fetch.log", 0),
+        ("logs/lock.log", 0),
+        ("logs/request.log", 0),
+        ("result.json", 2),
+        ("worker-output.json", 2),
+    ):
+        log_path = evidence_dir / relative_path
+        try:
+            excerpt = evidence_file_excerpt(log_path)
+        except OSError:
+            continue
+        if excerpt:
+            candidates.append((str(log_path), excerpt, source_rank))
+    if not candidates:
+        return None
+    best = min(candidates, key=lambda item: evidence_excerpt_priority(item[1], summary, item[2]))
+    return best[0], best[1]
+
+
+def evidence_file_excerpt(path: Path) -> str:
+    text = path.read_text(encoding="utf-8", errors="replace")
+    if path.suffix == ".json":
+        try:
+            import json
+
+            payload = json.loads(text)
+        except json.JSONDecodeError:
+            return text_excerpt(text, default_excerpt="")
+        if isinstance(payload, dict):
+            for key in ("summary", "message", "status"):
+                value = string_field(payload, key)
+                if value:
+                    return redact_text(value)
+    return text_excerpt(text, default_excerpt="")
+
+
+def evidence_excerpt_priority(excerpt: str, summary: str, source_rank: int) -> tuple[int, int]:
+    kind = excerpt_kind(excerpt)
+    if kind in {"compiler", "test"}:
+        quality = 0
+    elif is_generic_failure_summary("", excerpt) or excerpt.strip() == summary.strip():
+        quality = 2
+    else:
+        quality = 1
+    return (quality, source_rank)
 
 
 def log_failure_excerpt(log_path: str | None, *, default_excerpt: str) -> str:
