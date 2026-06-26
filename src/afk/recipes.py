@@ -7,6 +7,7 @@ from typing import Any
 
 from afk.checkouts import url_has_secret_material
 from afk.contracts import ProjectContract
+from afk.implement import agent_command_secret_error
 
 
 SCHEMA_VERSION = 1
@@ -147,6 +148,9 @@ def validate_recipe_agent_command(value: Any) -> list[str]:
         if not isinstance(item, str) or not item.strip():
             raise ValueError("agent.command must be a non-empty JSON array of strings")
         command.append(item)
+    secret_error = agent_command_secret_error(command)
+    if secret_error:
+        raise ValueError(secret_error)
     return command
 
 
@@ -219,6 +223,7 @@ def create_recipe_publisher(
         "repo": repo.strip(),
         "base": base.strip(),
         "head": review_branch,
+        "git": {"push": True, "remote": "origin"},
         "gh": {"auth": {"config_dir": config_dir}},
     }
 
