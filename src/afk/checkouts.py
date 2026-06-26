@@ -58,33 +58,37 @@ def prepare_checkout(
     try:
         if checkout_path.exists():
             if not is_git_checkout(checkout_path):
-                return failure_result(
-                    "failed_existing_checkout",
-                    "checkout_path exists but does not have a local .git directory",
-                    request,
-                    dirty=False,
-                )
-            origin_url = git(["remote", "get-url", "origin"], cwd=checkout_path)
-            if not repo_urls_match(origin_url, repo_url):
-                return failure_result(
-                    "failed_repo_mismatch",
-                    "existing checkout origin does not match requested repo_url",
-                    request,
-                    dirty=False,
-                    origin_url=origin_url,
-                )
-            dirty = dirty_tree(checkout_path)
-            if dirty["dirty"]:
-                if clean_reserved_checkout_artifacts(checkout_path, dirty["status_lines"]):
-                    dirty = dirty_tree(checkout_path)
-                if dirty["dirty"]:
+                if checkout_path.is_dir() and is_empty_directory(checkout_path):
+                    git(["clone", repo_url, str(checkout_path)])
+                else:
                     return failure_result(
-                        "failed_dirty_checkout",
-                        "existing checkout has uncommitted changes; commit, stash, or remove it before reuse",
+                        "failed_existing_checkout",
+                        "checkout_path exists but does not have a local .git directory",
                         request,
-                        dirty=True,
-                        dirty_status=dirty["status_lines"],
+                        dirty=False,
                     )
+            else:
+                origin_url = git(["remote", "get-url", "origin"], cwd=checkout_path)
+                if not repo_urls_match(origin_url, repo_url):
+                    return failure_result(
+                        "failed_repo_mismatch",
+                        "existing checkout origin does not match requested repo_url",
+                        request,
+                        dirty=False,
+                        origin_url=origin_url,
+                    )
+                dirty = dirty_tree(checkout_path)
+                if dirty["dirty"]:
+                    if clean_reserved_checkout_artifacts(checkout_path, dirty["status_lines"]):
+                        dirty = dirty_tree(checkout_path)
+                    if dirty["dirty"]:
+                        return failure_result(
+                            "failed_dirty_checkout",
+                            "existing checkout has uncommitted changes; commit, stash, or remove it before reuse",
+                            request,
+                            dirty=True,
+                            dirty_status=dirty["status_lines"],
+                        )
         else:
             checkout_path.parent.mkdir(parents=True, exist_ok=True)
             git(["clone", repo_url, str(checkout_path)])
@@ -133,6 +137,16 @@ def prepare_checkout(
         }
     except GitCommandError as exc:
         return git_failure_result(exc, request)
+
+
+def is_empty_directory(path: Path) -> bool:
+    try:
+        next(path.iterdir())
+    except StopIteration:
+        return True
+    except OSError:
+        return False
+    return False
 
 
 def normalize_request(input_data: Any, *, project_contract: Any, run_id: str) -> dict[str, Any]:

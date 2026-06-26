@@ -5,6 +5,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -177,6 +178,112 @@ class PrepareCheckoutCliTest(unittest.TestCase):
                     }
                 ],
             )
+
+    def test_prepare_checkout_clones_into_empty_existing_checkout_directory(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repo, start_commit, _submodule_sha = create_repo_with_submodule(temp_path)
+            checkout_path = temp_path / "checkout"
+            checkout_path.mkdir()
+            ledger = temp_path / "ledger"
+
+            completed = run_afk(
+                "run-step",
+                "prepare-checkout",
+                "--input",
+                json.dumps(
+                    {
+                        "repo_url": str(repo),
+                        "base_ref": "main",
+                        "checkout_root": str(temp_path),
+                        "checkout_path": str(checkout_path),
+                        "review_branch": "afk/test-review",
+                    }
+                ),
+                "--ledger",
+                str(ledger),
+                env_overrides={"GIT_ALLOW_PROTOCOL": "file"},
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+            prepared = result["output"]
+
+            self.assertEqual(prepared["status"], "prepared")
+            self.assertEqual(prepared["start_commit"], start_commit)
+            self.assertEqual(prepared["checkout_path"], str(checkout_path))
+            self.assertTrue((checkout_path / ".git").is_dir())
+
+    def test_prepare_checkout_refuses_non_empty_existing_non_git_directory(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repo, _start_commit, _submodule_sha = create_repo_with_submodule(temp_path)
+            checkout_path = temp_path / "checkout"
+            checkout_path.mkdir()
+            (checkout_path / "marker.txt").write_text("not a git checkout\n", encoding="utf-8")
+            ledger = temp_path / "ledger"
+
+            completed = run_afk(
+                "run-step",
+                "prepare-checkout",
+                "--input",
+                json.dumps(
+                    {
+                        "repo_url": str(repo),
+                        "base_ref": "main",
+                        "checkout_root": str(temp_path),
+                        "checkout_path": str(checkout_path),
+                        "review_branch": "afk/test-review",
+                    }
+                ),
+                "--ledger",
+                str(ledger),
+                env_overrides={"GIT_ALLOW_PROTOCOL": "file"},
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+            failed = result["output"]
+
+            self.assertEqual(failed["status"], "failed_existing_checkout")
+            self.assertIn("local .git directory", failed["message"])
+            self.assertFalse((checkout_path / ".git").exists())
+            self.assertEqual((checkout_path / "marker.txt").read_text(encoding="utf-8"), "not a git checkout\n")
+
+    def test_prepare_checkout_refuses_unreadable_existing_non_git_directory(self):
+        from afk.checkouts import prepare_checkout
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repo, _start_commit, _submodule_sha = create_repo_with_submodule(temp_path)
+            checkout_path = temp_path / "checkout"
+            checkout_path.mkdir()
+            original_iterdir = Path.iterdir
+
+            def fail_for_checkout(path):
+                if path == checkout_path:
+                    raise PermissionError("permission denied")
+                return original_iterdir(path)
+
+            with mock.patch.object(Path, "iterdir", fail_for_checkout):
+                result = prepare_checkout(
+                    {
+                        "repo_url": str(repo),
+                        "base_ref": "main",
+                        "checkout_root": str(temp_path),
+                        "checkout_path": str(checkout_path),
+                        "review_branch": "afk/test-review",
+                    },
+                    run_id="test-run",
+                )
+
+            self.assertEqual(result["status"], "failed_existing_checkout")
+            self.assertIn("local .git directory", result["message"])
+            self.assertFalse((checkout_path / ".git").exists())
 
     def test_prepare_checkout_refuses_dirty_existing_checkout_with_evidence(self):
         with tempfile.TemporaryDirectory() as temp_dir:
