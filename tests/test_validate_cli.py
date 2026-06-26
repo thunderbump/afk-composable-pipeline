@@ -1176,6 +1176,75 @@ class ValidateCliTest(unittest.TestCase):
             self.assertEqual(actionable[0]["log_path_status"], "exact")
             self.assertEqual(actionable[0]["excerpt"], "AssertionError: relative log failed")
 
+    def test_validate_failed_validation_marks_top_level_step_status_failed(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            checkout = temp_path / "checkout"
+            start_commit = init_checkout(checkout)
+            ledger = temp_path / "ledger"
+            worker_code = textwrap.dedent(
+                """
+                import json
+                import os
+                from pathlib import Path
+
+                request = json.loads(Path(os.environ["AFK_WORKER_REQUEST"]).read_text(encoding="utf-8"))
+                Path(os.environ["AFK_WORKER_RESULT"]).write_text(
+                    json.dumps(
+                        {
+                            "profile": request["profile"],
+                            "status": "fail",
+                            "summary": "commit mismatch",
+                            "steps": [
+                                {
+                                    "name": "tier3_harness",
+                                    "status": "fail",
+                                    "category": "validation_failed",
+                                    "reason": "checkout commit did not match requested commit",
+                                    "exitCode": 0,
+                                }
+                            ],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                """
+            ).strip()
+
+            completed = run_afk(
+                "run-step",
+                "validate",
+                "--profile",
+                "tier3-harness",
+                "--input",
+                json.dumps(
+                    {
+                        "checkout": {
+                            "status": "prepared",
+                            "checkout_path": str(checkout),
+                            "review_branch": "afk/validate",
+                            "requested_ref": "main",
+                            "start_commit": start_commit,
+                        },
+                        "worker": {
+                            "type": "local-command",
+                            "command": [sys.executable, "-c", worker_code],
+                        },
+                    }
+                ),
+                "--ledger",
+                str(ledger),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(summary["status"], "failed")
+            self.assertEqual(result["status"], "failed")
+            self.assertEqual(result["output"]["status"], "failed_validation")
+
     def test_validate_reports_missing_worker_log_path_as_unavailable(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
@@ -1731,6 +1800,8 @@ class ValidateCliTest(unittest.TestCase):
             result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
             worker_result = json.loads((run_dir / "worker-result.json").read_text(encoding="utf-8"))
 
+            self.assertEqual(summary["status"], "succeeded")
+            self.assertEqual(result["status"], "succeeded")
             self.assertEqual(result["output"]["status"], "skipped_profile")
             self.assertEqual(result["output"]["classification"], "profile_skipped")
             self.assertEqual(

@@ -15,6 +15,22 @@ from afk.validation import validate_step
 from afk.work_sources import select_work_step
 
 
+SUCCESSFUL_STEP_OUTPUT_STATUSES = {
+    "prepared",
+    "implemented",
+    "passed",
+    "published",
+    "request_revision",
+    "selected",
+    "skip",
+    "skipped",
+    "skipped_disabled",
+    "succeeded",
+    "success",
+    "validated",
+}
+
+
 @dataclass(frozen=True)
 class StepContext:
     input_data: Any
@@ -68,7 +84,7 @@ class StepRegistry:
         return StepResult(
             run_id=context.run_id,
             step=step,
-            status="succeeded",
+            status=top_level_step_status(output),
             output=output,
             stdout=stdout.getvalue(),
             stderr=stderr.getvalue(),
@@ -91,3 +107,21 @@ def default_step_registry() -> StepRegistry:
 
 def noop_step(context: StepContext) -> Any:
     return context.input_data
+
+
+def top_level_step_status(output: Any) -> str:
+    if not isinstance(output, dict):
+        return "succeeded"
+    raw_status = output.get("status")
+    if not isinstance(raw_status, str):
+        return "succeeded"
+    status = raw_status.strip()
+    if not status:
+        return "succeeded"
+    if status in SUCCESSFUL_STEP_OUTPUT_STATUSES:
+        return "succeeded"
+    if status.startswith("skipped_"):
+        return "succeeded"
+    if status.startswith("failed_") or status in {"error", "failed", "fail"}:
+        return "failed"
+    return "failed"
