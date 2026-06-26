@@ -21,6 +21,7 @@ def generate_workstream_recipe(
     checkout_root: Path,
     checkout_path: Path,
     validation_profile: str,
+    validation_input: dict[str, Any] | None = None,
     agent: dict[str, Any] | None = None,
     publisher: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -30,6 +31,7 @@ def generate_workstream_recipe(
     review_branch = f"afk/{branch_slug(workstream_id)}"
     required_labels = list(project_contract.beads_labels)
     implement_agent = agent if agent is not None else default_recipe_agent()
+    validate_step_input = validation_input if validation_input is not None else default_validation_input(validation_profile)
     recipe_publisher = publisher if publisher is not None else {"enabled": False}
     return {
         "schema_version": SCHEMA_VERSION,
@@ -75,14 +77,7 @@ def generate_workstream_recipe(
             {
                 "name": "validate",
                 "profile": validation_profile,
-                "input": {
-                    "validation": {"profile": validation_profile, "dry_run": True, "timeout_seconds": 30},
-                    "worker": {
-                        "type": "local-command",
-                        "command": ["python3", "-c", default_worker_code()],
-                        "timeout_seconds": 30,
-                    },
-                },
+                "input": validate_step_input,
             },
             {
                 "name": "review",
@@ -137,6 +132,17 @@ def default_recipe_agent() -> dict[str, Any]:
         "type": "fake-pi-command",
         "command": ["python3", "-c", default_agent_code()],
         "result_path": "agent-result.json",
+    }
+
+
+def default_validation_input(validation_profile: str) -> dict[str, Any]:
+    return {
+        "validation": {"profile": validation_profile, "dry_run": True, "timeout_seconds": 30},
+        "worker": {
+            "type": "local-command",
+            "command": ["python3", "-c", default_worker_code()],
+            "timeout_seconds": 30,
+        },
     }
 
 

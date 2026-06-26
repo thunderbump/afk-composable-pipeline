@@ -14,6 +14,7 @@ from afk.redaction import redact_artifact_value
 from afk.recipes import (
     branch_slug,
     create_recipe_publisher,
+    default_worker_code,
     generate_workstream_recipe,
     real_local_recipe_agent,
     write_recipe,
@@ -145,6 +146,7 @@ def main(argv: list[str] | None = None) -> int:
         if path_error is not None:
             parser.error(path_error)
         try:
+            validation_input = recipe_validation_input_from_args(args, project_contract=project_contract)
             recipe_agent = recipe_agent_from_args(args, checkout_path=Path(args.checkout_path))
             recipe_publisher = recipe_publisher_from_args(
                 args,
@@ -161,6 +163,7 @@ def main(argv: list[str] | None = None) -> int:
                 checkout_root=Path(args.checkout_root),
                 checkout_path=Path(args.checkout_path),
                 validation_profile=args.validation_profile,
+                validation_input=validation_input,
                 agent=recipe_agent,
                 publisher=recipe_publisher,
             )
@@ -231,6 +234,17 @@ def build_parser() -> argparse.ArgumentParser:
     generate_recipe_parser.add_argument("--checkout-path", required=True, help="Explicit checkout path under checkout root")
     generate_recipe_parser.add_argument("--validation-profile", required=True, help="Project validation profile name")
     generate_recipe_parser.add_argument(
+        "--validation-mode",
+        choices=("fake", "project-worker"),
+        default="fake",
+        help="Validation adapter mode to embed in the generated recipe",
+    )
+    generate_recipe_parser.add_argument(
+        "--validation-timeout-seconds",
+        type=int,
+        help="Optional validation timeout in seconds",
+    )
+    generate_recipe_parser.add_argument(
         "--agent-mode",
         choices=("fake", "real-local"),
         default="fake",
@@ -287,6 +301,42 @@ def recipe_agent_from_args(args: argparse.Namespace, *, checkout_path: Path) -> 
         checkout_path=checkout_path,
         timeout_seconds=args.agent_timeout_seconds,
     )
+
+
+def recipe_validation_input_from_args(args: argparse.Namespace, *, project_contract: ProjectContract) -> dict[str, Any]:
+    timeout_seconds = args.validation_timeout_seconds
+    if timeout_seconds is not None and timeout_seconds <= 0:
+        raise ValueError("--validation-timeout-seconds must be greater than 0")
+    if args.validation_mode == "fake":
+        timeout_seconds = 30 if timeout_seconds is None else timeout_seconds
+        return {
+            "validation": {
+                "profile": args.validation_profile,
+                "dry_run": True,
+                "timeout_seconds": timeout_seconds,
+            },
+            "worker": {
+                "type": "local-command",
+                "command": ["python3", "-c", default_worker_code()],
+                "timeout_seconds": timeout_seconds,
+            },
+        }
+    if not project_contract_has_default_worker(project_contract):
+        raise ValueError(
+            "--validation-mode=project-worker requires a project contract with a default validation worker"
+        )
+    timeout_seconds = 3600 if timeout_seconds is None else timeout_seconds
+    return {
+        "validation": {
+            "profile": args.validation_profile,
+            "dry_run": False,
+            "timeout_seconds": timeout_seconds,
+        }
+    }
+
+
+def project_contract_has_default_worker(project_contract: ProjectContract) -> bool:
+    return project_contract.project_slug == "bump-eqemu"
 
 
 def recipe_publisher_from_args(
