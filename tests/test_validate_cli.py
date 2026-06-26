@@ -1319,6 +1319,419 @@ class ValidateCliTest(unittest.TestCase):
             self.assertEqual(actionable[0]["log_path_status"], "unavailable")
             self.assertEqual(actionable[0]["excerpt"], "log field omitted")
 
+    def test_validate_uses_validation_log_when_worker_result_is_sparse(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            checkout = temp_path / "checkout"
+            start_commit = init_checkout(checkout)
+            ledger = temp_path / "ledger"
+            worker_code = textwrap.dedent(
+                """
+                import json
+                import os
+                import sys
+                from pathlib import Path
+
+                evidence_dir = Path(os.environ["AFK_WORKER_RESULT"]).parent
+                log_dir = evidence_dir / "logs"
+                log_dir.mkdir(parents=True, exist_ok=True)
+                (log_dir / "validation.log").write_text(
+                    "AkkStack code path points at /tmp/central-lhy6 instead of worker checkout\\n",
+                    encoding="utf-8",
+                )
+                Path(os.environ["AFK_WORKER_RESULT"]).write_text(
+                    json.dumps({"status": "failed", "summary": "failed_validation"}),
+                    encoding="utf-8",
+                )
+                sys.exit(1)
+                """
+            ).strip()
+
+            completed = run_afk(
+                "run-step",
+                "validate",
+                "--profile",
+                "tier3-harness",
+                "--input",
+                json.dumps(
+                    {
+                        "checkout": {
+                            "status": "prepared",
+                            "checkout_path": str(checkout),
+                            "review_branch": "afk/validate",
+                            "requested_ref": "main",
+                            "start_commit": start_commit,
+                        },
+                        "worker": {
+                            "type": "local-command",
+                            "command": [sys.executable, "-c", worker_code],
+                        },
+                    }
+                ),
+                "--ledger",
+                str(ledger),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+            worker_result = json.loads((run_dir / "worker-result.json").read_text(encoding="utf-8"))
+            actionable = worker_result["result"]["normalized"]["actionable_failures"]
+
+            self.assertEqual(result["output"]["status"], "failed_validation")
+            self.assertEqual(
+                actionable[0]["log_path"],
+                str(run_dir / "validation-evidence" / "logs" / "validation.log"),
+            )
+            self.assertIn("AkkStack code path points", actionable[0]["excerpt"])
+            self.assertIn("validation.log", result["output"]["summary"])
+            self.assertIn("AkkStack code path points", result["output"]["summary"])
+
+    def test_validate_prefers_validation_log_over_generic_adapter_stderr(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            checkout = temp_path / "checkout"
+            start_commit = init_checkout(checkout)
+            ledger = temp_path / "ledger"
+            worker_code = textwrap.dedent(
+                """
+                import json
+                import os
+                import sys
+                from pathlib import Path
+
+                evidence_dir = Path(os.environ["AFK_WORKER_RESULT"]).parent
+                log_dir = evidence_dir / "logs"
+                log_dir.mkdir(parents=True, exist_ok=True)
+                (log_dir / "validation.log").write_text(
+                    "AkkStack code path points at /tmp/central-lhy6 instead of worker checkout\\n",
+                    encoding="utf-8",
+                )
+                Path(os.environ["AFK_WORKER_RESULT"]).write_text(
+                    json.dumps({"status": "failed", "summary": "failed_validation"}),
+                    encoding="utf-8",
+                )
+                print("failed", file=sys.stderr)
+                sys.exit(1)
+                """
+            ).strip()
+
+            completed = run_afk(
+                "run-step",
+                "validate",
+                "--profile",
+                "tier3-harness",
+                "--input",
+                json.dumps(
+                    {
+                        "checkout": {
+                            "status": "prepared",
+                            "checkout_path": str(checkout),
+                            "review_branch": "afk/validate",
+                            "requested_ref": "main",
+                            "start_commit": start_commit,
+                        },
+                        "worker": {
+                            "type": "local-command",
+                            "command": [sys.executable, "-c", worker_code],
+                        },
+                    }
+                ),
+                "--ledger",
+                str(ledger),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            worker_result = json.loads((run_dir / "worker-result.json").read_text(encoding="utf-8"))
+            actionable = worker_result["result"]["normalized"]["actionable_failures"]
+
+            self.assertEqual(
+                actionable[0]["log_path"],
+                str(run_dir / "validation-evidence" / "logs" / "validation.log"),
+            )
+            self.assertIn("AkkStack code path points", actionable[0]["excerpt"])
+
+    def test_validate_uses_validation_log_when_step_failure_log_is_missing(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            checkout = temp_path / "checkout"
+            start_commit = init_checkout(checkout)
+            ledger = temp_path / "ledger"
+            worker_code = textwrap.dedent(
+                """
+                import json
+                import os
+                from pathlib import Path
+
+                evidence_dir = Path(os.environ["AFK_WORKER_RESULT"]).parent
+                log_dir = evidence_dir / "logs"
+                log_dir.mkdir(parents=True, exist_ok=True)
+                (log_dir / "validation.log").write_text(
+                    "AkkStack code path points at /tmp/central-lhy6 instead of worker checkout\\n",
+                    encoding="utf-8",
+                )
+                Path(os.environ["AFK_WORKER_RESULT"]).write_text(
+                    json.dumps(
+                        {
+                            "profile": "tier3-harness",
+                            "status": "fail",
+                            "summary": "failed_validation",
+                            "steps": [
+                                {
+                                    "name": "tier3_harness",
+                                    "status": "fail",
+                                    "category": "validation_failed",
+                                    "reason": "failed_validation",
+                                    "command": "scripts/validate.sh tier3-harness",
+                                    "exitCode": 1,
+                                }
+                            ],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                """
+            ).strip()
+
+            completed = run_afk(
+                "run-step",
+                "validate",
+                "--profile",
+                "tier3-harness",
+                "--input",
+                json.dumps(
+                    {
+                        "checkout": {
+                            "status": "prepared",
+                            "checkout_path": str(checkout),
+                            "review_branch": "afk/validate",
+                            "requested_ref": "main",
+                            "start_commit": start_commit,
+                        },
+                        "worker": {
+                            "type": "local-command",
+                            "command": [sys.executable, "-c", worker_code],
+                        },
+                    }
+                ),
+                "--ledger",
+                str(ledger),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+            worker_result = json.loads((run_dir / "worker-result.json").read_text(encoding="utf-8"))
+            actionable = worker_result["result"]["normalized"]["actionable_failures"]
+
+            self.assertEqual(
+                actionable[0]["log_path"],
+                str(run_dir / "validation-evidence" / "logs" / "validation.log"),
+            )
+            self.assertEqual(actionable[0]["log_path_status"], "fallback")
+            self.assertIn("AkkStack code path points", actionable[0]["excerpt"])
+            self.assertIn("validation.log", result["output"]["summary"])
+            self.assertIn("AkkStack code path points", result["output"]["summary"])
+
+    def test_validate_uses_validation_log_for_generic_step_exit_reason(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            checkout = temp_path / "checkout"
+            start_commit = init_checkout(checkout)
+            ledger = temp_path / "ledger"
+            worker_code = textwrap.dedent(
+                """
+                import json
+                import os
+                from pathlib import Path
+
+                evidence_dir = Path(os.environ["AFK_WORKER_RESULT"]).parent
+                log_dir = evidence_dir / "logs"
+                log_dir.mkdir(parents=True, exist_ok=True)
+                (log_dir / "validation.log").write_text(
+                    "error: migrations table is missing required column\\n",
+                    encoding="utf-8",
+                )
+                Path(os.environ["AFK_WORKER_RESULT"]).write_text(
+                    json.dumps(
+                        {
+                            "profile": "tier3-harness",
+                            "status": "fail",
+                            "summary": "failed_validation",
+                            "steps": [
+                                {
+                                    "name": "tier3_harness",
+                                    "status": "fail",
+                                    "category": "validation_failed",
+                                    "reason": "command exited with status 1",
+                                    "command": "scripts/validate.sh tier3-harness",
+                                    "exitCode": 1,
+                                }
+                            ],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                """
+            ).strip()
+
+            completed = run_afk(
+                "run-step",
+                "validate",
+                "--profile",
+                "tier3-harness",
+                "--input",
+                json.dumps(
+                    {
+                        "checkout": {
+                            "status": "prepared",
+                            "checkout_path": str(checkout),
+                            "review_branch": "afk/validate",
+                            "requested_ref": "main",
+                            "start_commit": start_commit,
+                        },
+                        "worker": {
+                            "type": "local-command",
+                            "command": [sys.executable, "-c", worker_code],
+                        },
+                    }
+                ),
+                "--ledger",
+                str(ledger),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            worker_result = json.loads((run_dir / "worker-result.json").read_text(encoding="utf-8"))
+            actionable = worker_result["result"]["normalized"]["actionable_failures"]
+
+            self.assertEqual(
+                actionable[0]["log_path"],
+                str(run_dir / "validation-evidence" / "logs" / "validation.log"),
+            )
+            self.assertIn("migrations table", actionable[0]["excerpt"])
+
+    def test_validate_prefers_specific_evidence_log_over_generic_validation_log(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            checkout = temp_path / "checkout"
+            start_commit = init_checkout(checkout)
+            ledger = temp_path / "ledger"
+            worker_code = textwrap.dedent(
+                """
+                import json
+                import os
+                import sys
+                from pathlib import Path
+
+                evidence_dir = Path(os.environ["AFK_WORKER_RESULT"]).parent
+                log_dir = evidence_dir / "logs"
+                log_dir.mkdir(parents=True, exist_ok=True)
+                (log_dir / "validation.log").write_text("failed_validation\\n", encoding="utf-8")
+                (log_dir / "stack.log").write_text(
+                    "permission denied while rebinding AkkStack code symlink\\n",
+                    encoding="utf-8",
+                )
+                Path(os.environ["AFK_WORKER_RESULT"]).write_text(
+                    json.dumps({"status": "failed", "summary": "failed_validation"}),
+                    encoding="utf-8",
+                )
+                sys.exit(1)
+                """
+            ).strip()
+
+            completed = run_afk(
+                "run-step",
+                "validate",
+                "--profile",
+                "tier3-harness",
+                "--input",
+                json.dumps(
+                    {
+                        "checkout": {
+                            "status": "prepared",
+                            "checkout_path": str(checkout),
+                            "review_branch": "afk/validate",
+                            "requested_ref": "main",
+                            "start_commit": start_commit,
+                        },
+                        "worker": {
+                            "type": "local-command",
+                            "command": [sys.executable, "-c", worker_code],
+                        },
+                    }
+                ),
+                "--ledger",
+                str(ledger),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            worker_result = json.loads((run_dir / "worker-result.json").read_text(encoding="utf-8"))
+            actionable = worker_result["result"]["normalized"]["actionable_failures"]
+
+            self.assertEqual(
+                actionable[0]["log_path"],
+                str(run_dir / "validation-evidence" / "logs" / "stack.log"),
+            )
+            self.assertIn("permission denied", actionable[0]["excerpt"])
+
+    def test_validate_uses_protocol_evidence_artifact_when_worker_result_is_missing(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            checkout = temp_path / "checkout"
+            start_commit = init_checkout(checkout)
+            ledger = temp_path / "ledger"
+
+            completed = run_afk(
+                "run-step",
+                "validate",
+                "--profile",
+                "tier3-harness",
+                "--input",
+                json.dumps(
+                    {
+                        "checkout": {
+                            "status": "prepared",
+                            "checkout_path": str(checkout),
+                            "review_branch": "afk/validate",
+                            "requested_ref": "main",
+                            "start_commit": start_commit,
+                        },
+                        "worker": {
+                            "type": "local-command",
+                            "command": [sys.executable, "-c", "raise SystemExit(0)"],
+                        },
+                    }
+                ),
+                "--ledger",
+                str(ledger),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            worker_result = json.loads((run_dir / "worker-result.json").read_text(encoding="utf-8"))
+            evidence_result = json.loads(
+                (run_dir / "validation-evidence" / "result.json").read_text(encoding="utf-8")
+            )
+            actionable = worker_result["result"]["normalized"]["actionable_failures"]
+
+            self.assertEqual(worker_result["result"]["normalized"]["status"], "failed_missing_result")
+            self.assertEqual(evidence_result["status"], "failed_missing_result")
+            self.assertEqual(evidence_result["classification"], "missing_worker_result")
+            self.assertEqual(
+                actionable[0]["log_path"],
+                str(run_dir / "validation-evidence" / "result.json"),
+            )
+            self.assertIn("worker result file was not produced", actionable[0]["excerpt"])
+
     def test_validate_includes_compact_excerpt_with_non_generic_worker_summary(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
