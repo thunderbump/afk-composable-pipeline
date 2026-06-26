@@ -11,6 +11,7 @@ from afk.redaction import redact_text, redact_url
 
 
 SCHEMA_VERSION = 1
+GIT_COMMIT_PATTERN = re.compile(r"^[0-9a-fA-F]{4,40}$")
 
 
 class GitCommandError(RuntimeError):
@@ -88,8 +89,13 @@ def prepare_checkout(
             checkout_path.parent.mkdir(parents=True, exist_ok=True)
             git(["clone", repo_url, str(checkout_path)])
 
-        git(["fetch", "origin", requested_ref], cwd=checkout_path)
-        target_commit = git(["rev-parse", "FETCH_HEAD"], cwd=checkout_path)
+        try:
+            git(["fetch", "origin", requested_ref], cwd=checkout_path)
+            target_commit = git(["rev-parse", "FETCH_HEAD"], cwd=checkout_path)
+        except GitCommandError:
+            target_commit = resolve_requested_commit(checkout_path, requested_ref)
+            if not target_commit:
+                raise
         branch_commit = local_branch_commit(checkout_path, review_branch)
         if branch_commit and branch_commit != target_commit:
             return failure_result(
@@ -255,6 +261,29 @@ def review_branch_allowed(branch: str) -> bool:
         if component.endswith(".lock"):
             return False
     return True
+
+
+def resolve_requested_commit(checkout_path: Path, requested_ref: str) -> str:
+    if not GIT_COMMIT_PATTERN.fullmatch(requested_ref):
+        return ""
+    try:
+        candidates = [
+            line.strip()
+            for line in git(["rev-parse", f"--disambiguate={requested_ref}"], cwd=checkout_path).splitlines()
+            if line.strip()
+        ]
+    except GitCommandError:
+        return ""
+    commit_candidates = []
+    for candidate in candidates:
+        try:
+            if git(["cat-file", "-t", candidate], cwd=checkout_path) == "commit":
+                commit_candidates.append(candidate)
+        except GitCommandError:
+            continue
+    if len(commit_candidates) != 1:
+        return ""
+    return commit_candidates[0]
 
 
 def dirty_tree(path: Path) -> dict[str, Any]:

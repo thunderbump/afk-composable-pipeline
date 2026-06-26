@@ -688,6 +688,155 @@ class PrepareCheckoutCliTest(unittest.TestCase):
             self.assertIn("review_branch already exists", failed["message"])
             self.assertNotEqual(failed["branch_commit"], failed["target_commit"])
 
+    def test_prepare_checkout_reuses_existing_review_branch_for_local_requested_commit(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repo, _start_commit, _submodule_sha = create_repo_with_submodule(temp_path)
+            checkout_path = temp_path / "checkout"
+            ledger = temp_path / "ledger"
+            payload = {
+                "repo_url": str(repo),
+                "base_ref": "main",
+                "checkout_root": str(temp_path),
+                "checkout_path": str(checkout_path),
+                "review_branch": "afk/test-review",
+            }
+
+            first_run = run_afk(
+                "run-step",
+                "prepare-checkout",
+                "--input",
+                json.dumps(payload),
+                "--ledger",
+                str(ledger),
+                env_overrides={"GIT_ALLOW_PROTOCOL": "file"},
+            )
+            self.assertEqual(first_run.returncode, 0, first_run.stderr)
+            commit_file(checkout_path, "local.txt", "local work\n", "local review work")
+            implemented_commit = git(checkout_path, "rev-parse", "HEAD")
+
+            second_run = run_afk(
+                "run-step",
+                "prepare-checkout",
+                "--input",
+                json.dumps({**payload, "requested_ref": implemented_commit}),
+                "--ledger",
+                str(ledger),
+                env_overrides={"GIT_ALLOW_PROTOCOL": "file"},
+            )
+
+            self.assertEqual(second_run.returncode, 0, second_run.stderr)
+            summary = json.loads(second_run.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+            prepared = result["output"]
+            self.assertEqual(prepared["status"], "prepared")
+            self.assertEqual(prepared["requested_ref"], implemented_commit)
+            self.assertEqual(prepared["start_commit"], implemented_commit)
+
+    def test_prepare_checkout_reuses_existing_review_branch_for_short_local_commit_prefix(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repo, _start_commit, _submodule_sha = create_repo_with_submodule(temp_path)
+            checkout_path = temp_path / "checkout"
+            ledger = temp_path / "ledger"
+            payload = {
+                "repo_url": str(repo),
+                "base_ref": "main",
+                "checkout_root": str(temp_path),
+                "checkout_path": str(checkout_path),
+                "review_branch": "afk/test-review",
+            }
+
+            first_run = run_afk(
+                "run-step",
+                "prepare-checkout",
+                "--input",
+                json.dumps(payload),
+                "--ledger",
+                str(ledger),
+                env_overrides={"GIT_ALLOW_PROTOCOL": "file"},
+            )
+            self.assertEqual(first_run.returncode, 0, first_run.stderr)
+            commit_file(checkout_path, "local.txt", "local work\n", "local review work")
+            implemented_commit = git(checkout_path, "rev-parse", "HEAD")
+
+            second_run = run_afk(
+                "run-step",
+                "prepare-checkout",
+                "--input",
+                json.dumps({**payload, "requested_ref": implemented_commit[:6]}),
+                "--ledger",
+                str(ledger),
+                env_overrides={"GIT_ALLOW_PROTOCOL": "file"},
+            )
+
+            self.assertEqual(second_run.returncode, 0, second_run.stderr)
+            summary = json.loads(second_run.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+            prepared = result["output"]
+            self.assertEqual(prepared["status"], "prepared")
+            self.assertEqual(prepared["start_commit"], implemented_commit)
+
+    def test_prepare_checkout_fetches_hex_named_remote_branch_instead_of_local_short_sha(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repo, _start_commit, _submodule_sha = create_repo_with_submodule(temp_path)
+            checkout_path = temp_path / "checkout"
+            ledger = temp_path / "ledger"
+            payload = {
+                "repo_url": str(repo),
+                "base_ref": "main",
+                "checkout_root": str(temp_path),
+                "checkout_path": str(checkout_path),
+                "review_branch": "afk/initial",
+            }
+
+            first_run = run_afk(
+                "run-step",
+                "prepare-checkout",
+                "--input",
+                json.dumps(payload),
+                "--ledger",
+                str(ledger),
+                env_overrides={"GIT_ALLOW_PROTOCOL": "file"},
+            )
+            self.assertEqual(first_run.returncode, 0, first_run.stderr)
+
+            commit_file(checkout_path, "local.txt", "local branch\n", "local hex branch")
+            local_hex_commit = git(checkout_path, "rev-parse", "HEAD")
+            hex_branch_name = local_hex_commit[:4]
+
+            commit_file(repo, "remote.txt", "remote branch\n", "remote hex branch")
+            remote_hex_commit = git(repo, "rev-parse", "HEAD")
+            git(repo, "branch", hex_branch_name, remote_hex_commit)
+
+            second_run = run_afk(
+                "run-step",
+                "prepare-checkout",
+                "--input",
+                json.dumps(
+                    {
+                        **payload,
+                        "requested_ref": hex_branch_name,
+                        "review_branch": "afk/test-review",
+                    }
+                ),
+                "--ledger",
+                str(ledger),
+                env_overrides={"GIT_ALLOW_PROTOCOL": "file"},
+            )
+
+            self.assertEqual(second_run.returncode, 0, second_run.stderr)
+            summary = json.loads(second_run.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+            prepared = result["output"]
+            self.assertEqual(prepared["status"], "prepared")
+            self.assertEqual(prepared["start_commit"], remote_hex_commit)
+            self.assertNotEqual(prepared["start_commit"], local_hex_commit)
+
     def test_prepare_checkout_redacts_credential_repo_url_from_artifacts(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)

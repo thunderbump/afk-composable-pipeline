@@ -256,6 +256,19 @@ def composed_step_input(
     input_data = dict(step_spec["input"])
     if step_name == "prepare-checkout":
         input_data["review_branch"] = normalized["review_branch"]
+        checkout = state.get("checkout")
+        if isinstance(checkout, dict):
+            current_checkout_path = string_field(checkout, "checkout_path")
+            next_checkout_path = string_field(input_data, "checkout_path")
+            requested_ref = string_field(checkout, "start_commit") or string_field(checkout, "requested_ref")
+            has_explicit_requested_ref = bool(string_field(input_data, "requested_ref") or string_field(input_data, "ref"))
+            if (
+                requested_ref
+                and current_checkout_path
+                and current_checkout_path == next_checkout_path
+                and not has_explicit_requested_ref
+            ):
+                input_data["requested_ref"] = requested_ref
     elif step_name == "implement":
         input_data["work_selection"] = {"schema_version": SCHEMA_VERSION, "selected_work": state["selected_work"]}
         if state.get("checkout") is not None:
@@ -341,8 +354,12 @@ def update_state_from_step(
         if previous_identity and current_selected_work_identity(state) != previous_identity:
             reset_cycle_state_for_new_selection(state)
     elif step_name == "prepare-checkout":
-        state["checkout"] = output
+        if output.get("status") == "prepared" or state.get("checkout") is None:
+            state["checkout"] = output
         append_checkout_attempt(state, output)
+        if output.get("status") == "prepared" and implemented_after_commit(state):
+            state["validations"] = []
+            state["review"] = None
     elif step_name == "implement":
         state["implementation"] = output
         state["checkout"] = checkout_after_implementation(state.get("checkout"), output)
@@ -398,6 +415,8 @@ def terminal_stop_reason(step_spec: dict[str, Any], state: dict[str, Any]) -> st
     if review_passed(state):
         return f"workstream already reached terminal review state before {step_name}; no further workstream steps are allowed"
     if step_name in {"select-work", "prepare-checkout", "implement"} and has_current_validated_evidence(state):
+        if step_name == "prepare-checkout" and review_failed(state):
+            return ""
         if step_name == "select-work" and select_work_proves_different_item(step_spec.get("input"), state):
             return ""
         return (
@@ -545,6 +564,8 @@ def blocking_reason_for_step(
     }.get(step_name)
     if step_name == "validate" and status != expected and validation_failure_allows_retry_follow_up(remaining_steps):
         return ""
+    if step_name == "review" and status != expected and review_failure_allows_retry_follow_up(remaining_steps):
+        return ""
     if expected and status != expected:
         return f"{step_name} did not reach {expected}: {status or 'missing status'}"
     return ""
@@ -603,6 +624,11 @@ def validation_checkout_commit(validation: dict[str, Any]) -> str:
 def review_checkout_commit(review: dict[str, Any]) -> str:
     checkout = review.get("checkout") if isinstance(review.get("checkout"), dict) else {}
     return string_field(checkout, "start_commit") or ""
+
+
+def review_failed(state: dict[str, Any]) -> bool:
+    review = state.get("review")
+    return isinstance(review, dict) and review.get("status") not in {"", "passed"}
 
 
 def publish_terminal_pr(
@@ -1159,6 +1185,18 @@ def latest_retry_attempt(state: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def previous_failure_class_for_retry(state: dict[str, Any]) -> str:
+    review = state.get("review") if isinstance(state.get("review"), dict) else {}
+    review_status = string_field(review, "status")
+    if review_status and review_status != "passed":
+        return review_status
+    validations = state.get("validations")
+    if isinstance(validations, list) and validations:
+        latest_validation = validations[-1]
+        if isinstance(latest_validation, dict):
+            output = latest_validation.get("output") if isinstance(latest_validation.get("output"), dict) else {}
+            validation_status = string_field(output, "status")
+            if validation_status and validation_status != "validated":
+                return validation_status
     latest = latest_checkout_attempt(state)
     if latest is None:
         return ""
@@ -1197,6 +1235,18 @@ def validation_failure_allows_retry_follow_up(remaining_steps: list[dict[str, An
         if name in {"prepare-checkout", "select-work"}:
             return True
         if name in {"review", "validate"}:
+            return False
+    return False
+
+
+def review_failure_allows_retry_follow_up(remaining_steps: list[dict[str, Any]]) -> bool:
+    for step in remaining_steps:
+        if not isinstance(step, dict):
+            continue
+        name = step.get("name")
+        if name == "prepare-checkout":
+            return True
+        if name in {"select-work", "implement"}:
             return False
     return False
 
