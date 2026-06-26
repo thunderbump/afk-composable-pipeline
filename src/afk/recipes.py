@@ -20,12 +20,16 @@ def generate_workstream_recipe(
     checkout_root: Path,
     checkout_path: Path,
     validation_profile: str,
+    agent: dict[str, Any] | None = None,
+    publisher: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if url_has_secret_material(project_contract.repo_url):
         raise ValueError("project contract repo_url must not contain embedded credentials or query parameters")
 
     review_branch = f"afk/{branch_slug(workstream_id)}"
     required_labels = list(project_contract.beads_labels)
+    implement_agent = agent if agent is not None else default_recipe_agent()
+    recipe_publisher = publisher if publisher is not None else {"enabled": False}
     return {
         "schema_version": SCHEMA_VERSION,
         "workstream_id": workstream_id,
@@ -64,11 +68,7 @@ def generate_workstream_recipe(
                 "input": {
                     "guardrails": ["stay within the prepared checkout", "do not write secrets"],
                     "validation": {"profile": validation_profile, "commands": []},
-                    "agent": {
-                        "type": "fake-pi-command",
-                        "command": ["python3", "-c", default_agent_code()],
-                        "result_path": "agent-result.json",
-                    },
+                    "agent": implement_agent,
                 },
             },
             {
@@ -96,7 +96,7 @@ def generate_workstream_recipe(
                 },
             },
         ],
-        "publisher": {"enabled": False},
+        "publisher": recipe_publisher,
     }
 
 
@@ -129,6 +129,104 @@ def default_agent_code() -> str:
         "subprocess.run(['git','commit','-m','afk generated recipe evidence'], check=True)\n"
         "Path('agent-result.json').write_text(json.dumps({'status':'completed','summary':'generated recipe stub implementation'}), encoding='utf-8')\n"
     )
+
+
+def default_recipe_agent() -> dict[str, Any]:
+    return {
+        "type": "fake-pi-command",
+        "command": ["python3", "-c", default_agent_code()],
+        "result_path": "agent-result.json",
+    }
+
+
+def validate_recipe_agent_command(value: Any) -> list[str]:
+    if not isinstance(value, list) or not value:
+        raise ValueError("agent.command must be a non-empty JSON array of strings")
+    command: list[str] = []
+    for item in value:
+        if not isinstance(item, str) or not item.strip():
+            raise ValueError("agent.command must be a non-empty JSON array of strings")
+        command.append(item)
+    return command
+
+
+def validate_recipe_absolute_dir(
+    value: str | None,
+    field: str,
+    *,
+    checkout_path: Path,
+) -> str:
+    if value is None or not value.strip():
+        raise ValueError(f"{field} is required")
+    path = Path(value)
+    if not path.is_absolute():
+        raise ValueError(f"{field} must be absolute")
+    if not path.is_dir():
+        raise ValueError(f"{field} must be an existing directory")
+    if path_is_equal_to_or_inside(path, checkout_path):
+        raise ValueError(f"{field} must be outside checkout")
+    return str(path)
+
+
+def real_local_recipe_agent(
+    *,
+    command: list[str],
+    codex_home: str,
+    config_home: str,
+    pi_config_home: str,
+    checkout_path: Path,
+    timeout_seconds: int | None = None,
+) -> dict[str, Any]:
+    agent: dict[str, Any] = {
+        "type": "real-agent-command",
+        "command": validate_recipe_agent_command(command),
+        "result_path": "agent-result.json",
+        "codex_home": validate_recipe_absolute_dir(codex_home, "agent.codex_home", checkout_path=checkout_path),
+        "config_home": validate_recipe_absolute_dir(config_home, "agent.config_home", checkout_path=checkout_path),
+        "env": {
+            "PI_CONFIG_HOME": validate_recipe_absolute_dir(
+                pi_config_home,
+                "agent.env.PI_CONFIG_HOME",
+                checkout_path=checkout_path,
+            )
+        },
+    }
+    if timeout_seconds is not None:
+        agent["timeout_seconds"] = timeout_seconds
+    return agent
+
+
+def create_recipe_publisher(
+    *,
+    review_branch: str,
+    repo: str,
+    base: str,
+    gh_config_dir: str,
+    checkout_path: Path,
+) -> dict[str, Any]:
+    if not isinstance(repo, str) or not repo.strip():
+        raise ValueError("publisher.repo is required")
+    if not isinstance(base, str) or not base.strip():
+        raise ValueError("publisher.base is required for create")
+    config_dir = validate_recipe_absolute_dir(
+        gh_config_dir,
+        "publisher.gh.auth.config_dir",
+        checkout_path=checkout_path,
+    )
+    return {
+        "enabled": True,
+        "mode": "create",
+        "repo": repo.strip(),
+        "base": base.strip(),
+        "head": review_branch,
+        "gh": {"auth": {"config_dir": config_dir}},
+    }
+
+
+def path_is_equal_to_or_inside(path: Path, parent: Path) -> bool:
+    path_resolved = path.resolve(strict=False)
+    parent_resolved = parent.resolve(strict=False)
+    return path_resolved == parent_resolved or parent_resolved in path_resolved.parents
 
 
 def default_worker_code() -> str:

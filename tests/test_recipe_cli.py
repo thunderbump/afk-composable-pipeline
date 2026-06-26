@@ -163,6 +163,95 @@ class GenerateRecipeCliTest(unittest.TestCase):
             self.assertEqual(recipe["steps"][3]["input"]["validation"]["profile"], "tier1")
             self.assertEqual(recipe["publisher"], {"enabled": False})
 
+    def test_generate_recipe_writes_real_local_agent_and_enabled_publisher_when_requested(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            contracts_dir = temp_path / "contracts"
+            repo = temp_path / "repo-src"
+            output = temp_path / "recipe.json"
+            ledger = temp_path / "ledger"
+            beads_workspace = temp_path / "central-beads"
+            checkout_root = temp_path / "checkouts"
+            checkout_path = checkout_root / "demo"
+            codex_home = temp_path / "codex-home"
+            config_home = temp_path / "xdg-config"
+            pi_config_home = temp_path / "pi-config"
+            gh_config_dir = temp_path / "gh-config"
+            contracts_dir.mkdir()
+            init_repo(repo)
+            write_contract(contracts_dir / "demo.json", project_slug="demo", repo_url=str(repo))
+            beads_workspace.mkdir()
+            codex_home.mkdir()
+            config_home.mkdir()
+            pi_config_home.mkdir()
+            gh_config_dir.mkdir()
+
+            completed = run_afk(
+                "generate-recipe",
+                "--workstream-id",
+                "central-anh.6",
+                "--project",
+                "demo",
+                "--contracts-dir",
+                str(contracts_dir),
+                "--ledger",
+                str(ledger),
+                "--beads-workspace",
+                str(beads_workspace),
+                "--checkout-root",
+                str(checkout_root),
+                "--checkout-path",
+                str(checkout_path),
+                "--validation-profile",
+                "tier1",
+                "--agent-mode",
+                "real-local",
+                "--agent-command-json",
+                json.dumps(["codex", "exec", "implement"]),
+                "--agent-codex-home",
+                str(codex_home),
+                "--agent-config-home",
+                str(config_home),
+                "--agent-pi-config-home",
+                str(pi_config_home),
+                "--agent-timeout-seconds",
+                "600",
+                "--publisher-mode",
+                "create",
+                "--publisher-repo",
+                "thunderbump/beads",
+                "--publisher-base",
+                "main",
+                "--publisher-gh-config-dir",
+                str(gh_config_dir),
+                "--output",
+                str(output),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            recipe = json.loads(output.read_text(encoding="utf-8"))
+
+            implement_input = recipe["steps"][2]["input"]
+            self.assertEqual(implement_input["agent"]["type"], "real-agent-command")
+            self.assertEqual(implement_input["agent"]["command"], ["codex", "exec", "implement"])
+            self.assertEqual(implement_input["agent"]["result_path"], "agent-result.json")
+            self.assertEqual(implement_input["agent"]["timeout_seconds"], 600)
+            self.assertEqual(implement_input["agent"]["codex_home"], str(codex_home))
+            self.assertEqual(implement_input["agent"]["config_home"], str(config_home))
+            self.assertEqual(implement_input["agent"]["env"], {"PI_CONFIG_HOME": str(pi_config_home)})
+
+            self.assertEqual(
+                recipe["publisher"],
+                {
+                    "enabled": True,
+                    "mode": "create",
+                    "repo": "thunderbump/beads",
+                    "base": "main",
+                    "head": "afk/central-anh-6",
+                    "gh": {"auth": {"config_dir": str(gh_config_dir)}},
+                },
+            )
+
     def test_generate_recipe_rejects_relative_checkout_paths_without_writing_recipe(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
@@ -248,6 +337,87 @@ class GenerateRecipeCliTest(unittest.TestCase):
             self.assertNotEqual(completed.returncode, 0, completed.stdout)
             self.assertIn("checkout_path must be inside checkout_root", completed.stderr)
             self.assertFalse(output.exists())
+
+    def test_generate_recipe_rejects_real_local_paths_inside_checkout_without_writing_recipe(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            contracts_dir = temp_path / "contracts"
+            repo = temp_path / "repo-src"
+            output = temp_path / "recipe.json"
+            ledger = temp_path / "ledger"
+            beads_workspace = temp_path / "central-beads"
+            checkout_root = temp_path / "checkouts"
+            checkout_path = checkout_root / "demo"
+            contracts_dir.mkdir()
+            init_repo(repo)
+            write_contract(contracts_dir / "demo.json", project_slug="demo", repo_url=str(repo))
+            beads_workspace.mkdir()
+            checkout_path.mkdir(parents=True)
+
+            cases = [
+                ("agent-codex-home", checkout_path / "codex-home", "agent.codex_home must be outside checkout"),
+                ("agent-config-home", checkout_path / "xdg-config", "agent.config_home must be outside checkout"),
+                (
+                    "agent-pi-config-home",
+                    checkout_path / "pi-config",
+                    "agent.env.PI_CONFIG_HOME must be outside checkout",
+                ),
+                (
+                    "publisher-gh-config-dir",
+                    checkout_path / "gh-config",
+                    "publisher.gh.auth.config_dir must be outside checkout",
+                ),
+            ]
+            for option_name, invalid_path, expected_error in cases:
+                with self.subTest(option=option_name):
+                    (temp_path / "codex-home").mkdir(exist_ok=True)
+                    (temp_path / "xdg-config").mkdir(exist_ok=True)
+                    (temp_path / "pi-config").mkdir(exist_ok=True)
+                    (temp_path / "gh-config").mkdir(exist_ok=True)
+                    invalid_path.mkdir(parents=True, exist_ok=True)
+                    completed = run_afk(
+                        "generate-recipe",
+                        "--workstream-id",
+                        "central-anh.6",
+                        "--project",
+                        "demo",
+                        "--contracts-dir",
+                        str(contracts_dir),
+                        "--ledger",
+                        str(ledger),
+                        "--beads-workspace",
+                        str(beads_workspace),
+                        "--checkout-root",
+                        str(checkout_root),
+                        "--checkout-path",
+                        str(checkout_path),
+                        "--validation-profile",
+                        "tier1",
+                        "--agent-mode",
+                        "real-local",
+                        "--agent-command-json",
+                        json.dumps(["codex", "exec", "implement"]),
+                        "--agent-codex-home",
+                        str(invalid_path if option_name == "agent-codex-home" else temp_path / "codex-home"),
+                        "--agent-config-home",
+                        str(invalid_path if option_name == "agent-config-home" else temp_path / "xdg-config"),
+                        "--agent-pi-config-home",
+                        str(invalid_path if option_name == "agent-pi-config-home" else temp_path / "pi-config"),
+                        "--publisher-mode",
+                        "create",
+                        "--publisher-repo",
+                        "thunderbump/beads",
+                        "--publisher-base",
+                        "main",
+                        "--publisher-gh-config-dir",
+                        str(invalid_path if option_name == "publisher-gh-config-dir" else temp_path / "gh-config"),
+                        "--output",
+                        str(output),
+                    )
+
+                    self.assertNotEqual(completed.returncode, 0, completed.stdout)
+                    self.assertIn(expected_error, completed.stderr)
+                    self.assertFalse(output.exists())
 
     def test_generate_recipe_rejects_credential_repo_url_without_writing_recipe(self):
         with tempfile.TemporaryDirectory() as temp_dir:

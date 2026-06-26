@@ -11,7 +11,13 @@ from afk.checkouts import checkout_path_error
 from afk.contracts import ContractError, ProjectContract, load_project_contract
 from afk.jsonutil import canonical_json, sha256_json
 from afk.redaction import redact_artifact_value
-from afk.recipes import generate_workstream_recipe, write_recipe
+from afk.recipes import (
+    branch_slug,
+    create_recipe_publisher,
+    generate_workstream_recipe,
+    real_local_recipe_agent,
+    write_recipe,
+)
 from afk.registry import (
     StepContext,
     StepRegistry,
@@ -139,6 +145,15 @@ def main(argv: list[str] | None = None) -> int:
         if path_error is not None:
             parser.error(path_error)
         try:
+            recipe_agent = recipe_agent_from_args(args, checkout_path=Path(args.checkout_path))
+            recipe_publisher = recipe_publisher_from_args(
+                args,
+                review_branch=f"afk/{branch_slug(args.workstream_id)}",
+                checkout_path=Path(args.checkout_path),
+            )
+        except ValueError as exc:
+            parser.error(str(exc))
+        try:
             recipe = generate_workstream_recipe(
                 workstream_id=args.workstream_id,
                 project_contract=project_contract,
@@ -146,6 +161,8 @@ def main(argv: list[str] | None = None) -> int:
                 checkout_root=Path(args.checkout_root),
                 checkout_path=Path(args.checkout_path),
                 validation_profile=args.validation_profile,
+                agent=recipe_agent,
+                publisher=recipe_publisher,
             )
         except ValueError as exc:
             parser.error(str(exc))
@@ -213,9 +230,80 @@ def build_parser() -> argparse.ArgumentParser:
     generate_recipe_parser.add_argument("--checkout-root", required=True, help="Explicit checkout root mount")
     generate_recipe_parser.add_argument("--checkout-path", required=True, help="Explicit checkout path under checkout root")
     generate_recipe_parser.add_argument("--validation-profile", required=True, help="Project validation profile name")
+    generate_recipe_parser.add_argument(
+        "--agent-mode",
+        choices=("fake", "real-local"),
+        default="fake",
+        help="Implementation adapter mode to embed in the generated recipe",
+    )
+    generate_recipe_parser.add_argument(
+        "--agent-command-json",
+        help="JSON array command for real-local agent mode",
+    )
+    generate_recipe_parser.add_argument("--agent-codex-home", help="Absolute mounted codex home for real-local mode")
+    generate_recipe_parser.add_argument("--agent-config-home", help="Absolute mounted config home for real-local mode")
+    generate_recipe_parser.add_argument(
+        "--agent-pi-config-home",
+        help="Absolute mounted PI_CONFIG_HOME directory for real-local mode",
+    )
+    generate_recipe_parser.add_argument(
+        "--agent-timeout-seconds",
+        type=int,
+        help="Optional real-local agent timeout in seconds",
+    )
+    generate_recipe_parser.add_argument(
+        "--publisher-mode",
+        choices=("disabled", "create"),
+        default="disabled",
+        help="Terminal publisher mode to embed in the generated recipe",
+    )
+    generate_recipe_parser.add_argument("--publisher-repo", help="owner/repo for publisher create mode")
+    generate_recipe_parser.add_argument("--publisher-base", help="Base branch for publisher create mode")
+    generate_recipe_parser.add_argument(
+        "--publisher-gh-config-dir",
+        help="Absolute mounted gh config dir for publisher create mode",
+    )
     generate_recipe_parser.add_argument("--output", required=True, help="Path to write the JSON recipe")
 
     return parser
+
+
+def recipe_agent_from_args(args: argparse.Namespace, *, checkout_path: Path) -> dict[str, Any] | None:
+    if args.agent_mode == "fake":
+        return None
+    try:
+        command = json.loads(args.agent_command_json)
+    except TypeError:
+        raise ValueError("--agent-command-json is required when --agent-mode=real-local") from None
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"--agent-command-json must be valid JSON: {exc.msg}") from exc
+    if args.agent_timeout_seconds is not None and args.agent_timeout_seconds <= 0:
+        raise ValueError("--agent-timeout-seconds must be greater than zero")
+    return real_local_recipe_agent(
+        command=command,
+        codex_home=args.agent_codex_home,
+        config_home=args.agent_config_home,
+        pi_config_home=args.agent_pi_config_home,
+        checkout_path=checkout_path,
+        timeout_seconds=args.agent_timeout_seconds,
+    )
+
+
+def recipe_publisher_from_args(
+    args: argparse.Namespace,
+    *,
+    review_branch: str,
+    checkout_path: Path,
+) -> dict[str, Any] | None:
+    if args.publisher_mode == "disabled":
+        return None
+    return create_recipe_publisher(
+        review_branch=review_branch,
+        repo=args.publisher_repo,
+        base=args.publisher_base,
+        gh_config_dir=args.publisher_gh_config_dir,
+        checkout_path=checkout_path,
+    )
 
 
 def run_step(
