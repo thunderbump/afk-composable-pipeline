@@ -619,6 +619,7 @@ def run_agent_command(
         capsule_path = temp_path / "job-capsule.json"
         capsule_path.write_text(canonical_json(capsule) + "\n", encoding="utf-8")
         env = minimal_agent_environment(temp_path, config_home=agent.get("config_home") or "")
+        add_git_identity_fallback(env, checkout_path)
         env.update(agent.get("env") or {})
         if agent.get("codex_home"):
             env["CODEX_HOME"] = agent["codex_home"]
@@ -675,6 +676,38 @@ def minimal_agent_environment(temp_path: Path, *, config_home: str = "") -> dict
         xdg_config_home.mkdir()
         env["XDG_CONFIG_HOME"] = str(xdg_config_home)
     return env
+
+
+def add_git_identity_fallback(env: dict[str, str], checkout_path: Path) -> None:
+    for key in ("GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL"):
+        if key in env and not env[key]:
+            env.pop(key)
+    if env.get("GIT_AUTHOR_NAME") and env.get("GIT_AUTHOR_EMAIL"):
+        env["GIT_COMMITTER_NAME"] = env.get("GIT_COMMITTER_NAME") or env["GIT_AUTHOR_NAME"]
+        env["GIT_COMMITTER_EMAIL"] = env.get("GIT_COMMITTER_EMAIL") or env["GIT_AUTHOR_EMAIL"]
+        return
+    if git_config_value(checkout_path, "user.name") and git_config_value(checkout_path, "user.email"):
+        return
+    env["GIT_AUTHOR_NAME"] = env.get("GIT_AUTHOR_NAME") or "AFK Pipeline"
+    env["GIT_AUTHOR_EMAIL"] = env.get("GIT_AUTHOR_EMAIL") or "afk-pipeline@example.invalid"
+    env["GIT_COMMITTER_NAME"] = env.get("GIT_COMMITTER_NAME") or env["GIT_AUTHOR_NAME"]
+    env["GIT_COMMITTER_EMAIL"] = env.get("GIT_COMMITTER_EMAIL") or env["GIT_AUTHOR_EMAIL"]
+
+
+def git_config_value(checkout_path: Path, key: str) -> str:
+    try:
+        completed = subprocess.run(
+            ["git", "config", "--get", key],
+            cwd=checkout_path,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+    except OSError:
+        return ""
+    if completed.returncode != 0:
+        return ""
+    return completed.stdout.strip()
 
 
 def remove_existing_agent_result(agent_result_path: Path, checkout_path: Path) -> dict[str, Any]:
