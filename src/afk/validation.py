@@ -185,8 +185,16 @@ def normalize_request(input_data: Any, *, project_contract: Any, run_id: str) ->
     checkout = normalize_checkout(input_data.get("checkout"))
     if checkout["status"] != "valid":
         return invalid_request(checkout["message"])
+    default_project_worker_requested = (
+        input_data.get("worker") is None and getattr(project_contract, "project_slug", None) == "bump-eqemu"
+    )
 
-    validation = normalize_validation(input_data.get("validation", {}), project_contract)
+    validation = normalize_validation(
+        input_data.get("validation", {}),
+        project_contract,
+        checkout=checkout["checkout"],
+        allow_external_worker_config=default_project_worker_requested,
+    )
     if validation["status"] != "valid":
         return invalid_request(validation["message"])
 
@@ -207,7 +215,10 @@ def normalize_request(input_data: Any, *, project_contract: Any, run_id: str) ->
         "project_repo_url": getattr(project_contract, "repo_url", ""),
         "checkout": checkout["checkout"],
         "validation": validation["validation"],
-        "worker": worker["worker"],
+        "worker": {
+            **worker["worker"],
+            "env": dict(validation["validation"].get("adapter_env", {})),
+        },
     }
 
 
@@ -247,7 +258,13 @@ def normalize_checkout(checkout: Any) -> dict[str, Any]:
     }
 
 
-def normalize_validation(validation: Any, project_contract: Any) -> dict[str, Any]:
+def normalize_validation(
+    validation: Any,
+    project_contract: Any,
+    *,
+    checkout: dict[str, Any],
+    allow_external_worker_config: bool = False,
+) -> dict[str, Any]:
     if not isinstance(validation, dict):
         return {"status": "invalid", "message": "validation must be an object"}
     profile = string_field(validation, "profile")
@@ -270,17 +287,87 @@ def normalize_validation(validation: Any, project_contract: Any) -> dict[str, An
     timeout_seconds = validation.get("timeoutSeconds", validation.get("timeout_seconds", 120))
     if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float)) or timeout_seconds <= 0:
         return {"status": "invalid", "message": "validation.timeout_seconds must be a positive number"}
+    external_worker = normalize_external_worker_config(
+        validation,
+        checkout=checkout,
+        allow_external_worker_config=allow_external_worker_config,
+    )
+    if external_worker["status"] != "valid":
+        return {"status": "invalid", "message": external_worker["message"]}
+    profile_request.update(external_worker["worker_request"])
     return {
         "status": "valid",
         "validation": {
             "requested_profile": profile,
             "worker_profile": worker_profile,
             "worker_request": profile_request,
+            "adapter_env": external_worker["adapter_env"],
             "available_profiles": available_profiles,
             "dry_run": dry_run,
             "timeout_seconds": float(timeout_seconds),
         },
     }
+
+
+def normalize_external_worker_config(
+    validation: dict[str, Any],
+    *,
+    checkout: dict[str, Any],
+    allow_external_worker_config: bool,
+) -> dict[str, Any]:
+    checkout_path = Path(checkout["path"])
+    worker_request: dict[str, Any] = {}
+    adapter_env: dict[str, str] = {}
+
+    worker_home = string_field(validation, "worker_home") or string_field(validation, "workerHome")
+    stack = validation.get("stack")
+    if (worker_home or stack is not None) and not allow_external_worker_config:
+        return {
+            "status": "invalid",
+            "message": "validation.worker_home and validation.stack are only supported for the default project worker",
+        }
+    if worker_home:
+        validated = validate_external_path(
+            worker_home,
+            field="validation.worker_home",
+            checkout_path=checkout_path,
+        )
+        if validated["status"] != "valid":
+            return validated
+        worker_request["worker_home"] = validated["path"]
+        adapter_env["VALIDATION_WORKER_HOME"] = validated["path"]
+
+    if stack is not None:
+        if not isinstance(stack, dict):
+            return {"status": "invalid", "message": "validation.stack must be an object"}
+        stack_path = string_field(stack, "path")
+        if not stack_path:
+            return {"status": "invalid", "message": "validation.stack.path is required"}
+        validated = validate_external_path(
+            stack_path,
+            field="validation.stack.path",
+            checkout_path=checkout_path,
+        )
+        if validated["status"] != "valid":
+            return validated
+        role = string_field(stack, "role") or "validation"
+        worker_request["stack"] = {"role": role, "path": validated["path"]}
+        adapter_env["AKKSTACK_DIR"] = validated["path"]
+
+    return {
+        "status": "valid",
+        "worker_request": worker_request,
+        "adapter_env": adapter_env,
+    }
+
+
+def validate_external_path(value: str, *, field: str, checkout_path: Path) -> dict[str, Any]:
+    path = Path(value)
+    if not path.is_absolute():
+        return {"status": "invalid", "message": f"{field} must be absolute"}
+    if path_is_equal_to_or_inside(path, checkout_path):
+        return {"status": "invalid", "message": f"{field} must be outside checkout"}
+    return {"status": "valid", "path": str(path)}
 
 
 def normalize_worker(
@@ -415,6 +502,7 @@ def run_command_adapter(
     env["AFK_WORKER_RESULT"] = str(result_path)
     env["AFK_WORKER_EVIDENCE_DIR"] = str(evidence_dir)
     env["AFK_VALIDATION_PROFILE"] = profile
+    env.update(worker.get("env", {}))
     if worker["type"] == "remote-command":
         env["AFK_WORKER_REMOTE_HOST"] = worker["host"]
     command = render_command(
@@ -499,6 +587,12 @@ def minimal_worker_environment(temp_path: Path) -> dict[str, str]:
     env["HOME"] = str(home_path)
     env["XDG_CONFIG_HOME"] = str(xdg_config_home)
     return env
+
+
+def path_is_equal_to_or_inside(path: Path, parent: Path) -> bool:
+    path_resolved = path.resolve(strict=False)
+    parent_resolved = parent.resolve(strict=False)
+    return path_resolved == parent_resolved or parent_resolved in path_resolved.parents
 
 
 def read_worker_payload(path: Path, *, fallback_path: Path | None = None) -> dict[str, Any]:

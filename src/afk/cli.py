@@ -326,11 +326,18 @@ def recipe_validation_input_from_args(args: argparse.Namespace, *, project_contr
             "--validation-mode=project-worker requires a project contract with a default validation worker"
         )
     timeout_seconds = 3600 if timeout_seconds is None else timeout_seconds
+    checkout_root = Path(args.checkout_root)
+    checkout_path = Path(args.checkout_path)
     return {
         "validation": {
             "profile": args.validation_profile,
             "dry_run": False,
             "timeout_seconds": timeout_seconds,
+            "worker_home": str(checkout_root / ".validation-worker" / checkout_path.name),
+            "stack": {
+                "role": "validation",
+                "path": str(checkout_path.parent / "bump-akk-stack-validation"),
+            },
         }
     }
 
