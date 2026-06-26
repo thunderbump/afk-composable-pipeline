@@ -63,15 +63,6 @@ def prepare_checkout(
                     request,
                     dirty=False,
                 )
-            dirty = dirty_tree(checkout_path)
-            if dirty["dirty"]:
-                return failure_result(
-                    "failed_dirty_checkout",
-                    "existing checkout has uncommitted changes; commit, stash, or remove it before reuse",
-                    request,
-                    dirty=True,
-                    dirty_status=dirty["status_lines"],
-                )
             origin_url = git(["remote", "get-url", "origin"], cwd=checkout_path)
             if not repo_urls_match(origin_url, repo_url):
                 return failure_result(
@@ -81,6 +72,18 @@ def prepare_checkout(
                     dirty=False,
                     origin_url=origin_url,
                 )
+            dirty = dirty_tree(checkout_path)
+            if dirty["dirty"]:
+                if clean_reserved_checkout_artifacts(checkout_path, dirty["status_lines"]):
+                    dirty = dirty_tree(checkout_path)
+                if dirty["dirty"]:
+                    return failure_result(
+                        "failed_dirty_checkout",
+                        "existing checkout has uncommitted changes; commit, stash, or remove it before reuse",
+                        request,
+                        dirty=True,
+                        dirty_status=dirty["status_lines"],
+                    )
         else:
             checkout_path.parent.mkdir(parents=True, exist_ok=True)
             git(["clone", repo_url, str(checkout_path)])
@@ -258,6 +261,16 @@ def dirty_tree(path: Path) -> dict[str, Any]:
     status = git(["status", "--porcelain=v1", "--untracked-files=all"], cwd=path)
     status_lines = [line for line in status.splitlines() if line]
     return {"dirty": bool(status_lines), "status_lines": status_lines}
+
+
+def clean_reserved_checkout_artifacts(checkout_path: Path, status_lines: list[str]) -> bool:
+    if status_lines != ["?? agent-result.json"]:
+        return False
+    result_path = checkout_path / "agent-result.json"
+    if not result_path.is_file() or result_path.is_symlink():
+        return False
+    result_path.unlink()
+    return True
 
 
 def submodule_records(checkout_path: Path) -> list[dict[str, str]]:

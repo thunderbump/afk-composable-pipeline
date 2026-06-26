@@ -92,6 +92,26 @@ def relative_gitdir_path(submodule_checkout):
     return (submodule_checkout / gitdir_text[len(prefix) :]).resolve()
 
 
+def selected_work():
+    return {
+        "source_id": "fixture",
+        "source_type": "fixture",
+        "external_id": "central-fzq",
+        "url": "https://tracker.example/central-fzq",
+        "title": "Clean stale agent result artifacts after failed real-agent runs",
+        "status": "open",
+        "labels": ["project:afk-composable-pipeline", "afk:ready"],
+        "parent": "central",
+        "workstream": "central-fzq",
+        "acceptance_criteria": ["Failed implement retry does not block prepare-checkout."],
+        "dependencies": [],
+        "blockers": [],
+        "dependency_status": "clear",
+        "afk": {"ready": True},
+        "raw": {"fixture": {"id": "central-fzq"}},
+    }
+
+
 class PrepareCheckoutCliTest(unittest.TestCase):
     def test_prepare_checkout_creates_real_clone_with_local_submodule_gitdir(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -204,6 +224,197 @@ class PrepareCheckoutCliTest(unittest.TestCase):
             self.assertEqual(failed["dirty"], True)
             self.assertIn("commit, stash, or remove", failed["message"])
             self.assertIn("M README.md", failed["dirty_status"])
+
+    def test_prepare_checkout_cleans_stale_agent_result_before_reuse(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repo, _start_commit, _submodule_sha = create_repo_with_submodule(temp_path)
+            checkout_path = temp_path / "checkout"
+            ledger = temp_path / "ledger"
+            payload = {
+                "repo_url": str(repo),
+                "base_ref": "main",
+                "checkout_root": str(temp_path),
+                "checkout_path": str(checkout_path),
+                "review_branch": "afk/test-review",
+            }
+
+            first_run = run_afk(
+                "run-step",
+                "prepare-checkout",
+                "--input",
+                json.dumps(payload),
+                "--ledger",
+                str(ledger),
+                env_overrides={"GIT_ALLOW_PROTOCOL": "file"},
+            )
+            self.assertEqual(first_run.returncode, 0, first_run.stderr)
+            (checkout_path / "agent-result.json").write_text(
+                json.dumps({"status": "failed", "summary": "stale adapter result"}),
+                encoding="utf-8",
+            )
+
+            second_run = run_afk(
+                "run-step",
+                "prepare-checkout",
+                "--input",
+                json.dumps(payload),
+                "--ledger",
+                str(ledger),
+                env_overrides={"GIT_ALLOW_PROTOCOL": "file"},
+            )
+
+            self.assertEqual(second_run.returncode, 0, second_run.stderr)
+            summary = json.loads(second_run.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+            prepared = result["output"]
+            self.assertEqual(prepared["status"], "prepared")
+            self.assertEqual(prepared["dirty"], False)
+            self.assertFalse((checkout_path / "agent-result.json").exists())
+
+    def test_prepare_checkout_retries_after_failed_implement_preserving_ledger_result(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repo, _start_commit, _submodule_sha = create_repo_with_submodule(temp_path)
+            checkout_path = temp_path / "checkout"
+            ledger = temp_path / "ledger"
+            payload = {
+                "repo_url": str(repo),
+                "base_ref": "main",
+                "checkout_root": str(temp_path),
+                "checkout_path": str(checkout_path),
+                "review_branch": "afk/test-review",
+            }
+
+            first_prepare = run_afk(
+                "run-step",
+                "prepare-checkout",
+                "--input",
+                json.dumps(payload),
+                "--ledger",
+                str(ledger),
+                env_overrides={"GIT_ALLOW_PROTOCOL": "file"},
+            )
+            self.assertEqual(first_prepare.returncode, 0, first_prepare.stderr)
+            prepare_summary = json.loads(first_prepare.stdout)
+            prepare_run_dir = ledger / "runs" / prepare_summary["run_id"]
+            prepared = json.loads((prepare_run_dir / "step-result.json").read_text(encoding="utf-8"))["output"]
+            agent_code = (
+                "from pathlib import Path; "
+                "Path('agent-result.json').write_text("
+                "'{\"status\":\"failed\",\"summary\":\"adapter failed before implementation\"}', "
+                "encoding='utf-8'); "
+                "raise SystemExit(7)"
+            )
+
+            implement = run_afk(
+                "run-step",
+                "implement",
+                "--input",
+                json.dumps(
+                    {
+                        "work_selection": {"schema_version": 1, "selected_work": [selected_work()]},
+                        "checkout": {
+                            "status": "prepared",
+                            "checkout_path": str(checkout_path),
+                            "review_branch": "afk/test-review",
+                            "requested_ref": "main",
+                            "start_commit": prepared["start_commit"],
+                        },
+                        "guardrails": [],
+                        "validation": {"profile": "tier1", "commands": []},
+                        "agent": {
+                            "type": "fake-pi-command",
+                            "command": [sys.executable, "-c", agent_code],
+                            "result_path": "agent-result.json",
+                        },
+                    }
+                ),
+                "--ledger",
+                str(ledger),
+            )
+            self.assertEqual(implement.returncode, 0, implement.stderr)
+            implement_summary = json.loads(implement.stdout)
+            implement_run_dir = ledger / "runs" / implement_summary["run_id"]
+            implement_result = json.loads((implement_run_dir / "step-result.json").read_text(encoding="utf-8"))
+            ledger_agent_result = implement_run_dir / "agent-result.json"
+            checkout_agent_result = checkout_path / "agent-result.json"
+
+            self.assertEqual(implement_result["output"]["status"], "failed_runtime")
+            self.assertTrue(ledger_agent_result.exists())
+            self.assertTrue(checkout_agent_result.exists())
+            self.assertIn("adapter failed before implementation", checkout_agent_result.read_text(encoding="utf-8"))
+
+            second_prepare = run_afk(
+                "run-step",
+                "prepare-checkout",
+                "--input",
+                json.dumps(payload),
+                "--ledger",
+                str(ledger),
+                env_overrides={"GIT_ALLOW_PROTOCOL": "file"},
+            )
+
+            self.assertEqual(second_prepare.returncode, 0, second_prepare.stderr)
+            retry_summary = json.loads(second_prepare.stdout)
+            retry_run_dir = ledger / "runs" / retry_summary["run_id"]
+            retry_result = json.loads((retry_run_dir / "step-result.json").read_text(encoding="utf-8"))
+            self.assertEqual(retry_result["output"]["status"], "prepared")
+            self.assertEqual(retry_result["output"]["dirty"], False)
+            self.assertFalse(checkout_agent_result.exists())
+            self.assertTrue(ledger_agent_result.exists())
+            preserved = json.loads(ledger_agent_result.read_text(encoding="utf-8"))
+            self.assertEqual(preserved["result"]["status"], "failed_runtime")
+
+    def test_prepare_checkout_preserves_dirty_evidence_when_agent_result_is_not_sole_dirty_file(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repo, _start_commit, _submodule_sha = create_repo_with_submodule(temp_path)
+            checkout_path = temp_path / "checkout"
+            ledger = temp_path / "ledger"
+            payload = {
+                "repo_url": str(repo),
+                "base_ref": "main",
+                "checkout_root": str(temp_path),
+                "checkout_path": str(checkout_path),
+                "review_branch": "afk/test-review",
+            }
+
+            first_run = run_afk(
+                "run-step",
+                "prepare-checkout",
+                "--input",
+                json.dumps(payload),
+                "--ledger",
+                str(ledger),
+                env_overrides={"GIT_ALLOW_PROTOCOL": "file"},
+            )
+            self.assertEqual(first_run.returncode, 0, first_run.stderr)
+            (checkout_path / "agent-result.json").write_text(
+                json.dumps({"status": "failed", "summary": "stale adapter result"}),
+                encoding="utf-8",
+            )
+            (checkout_path / "dirty.txt").write_text("dirty target change\n", encoding="utf-8")
+
+            second_run = run_afk(
+                "run-step",
+                "prepare-checkout",
+                "--input",
+                json.dumps(payload),
+                "--ledger",
+                str(ledger),
+                env_overrides={"GIT_ALLOW_PROTOCOL": "file"},
+            )
+
+            self.assertEqual(second_run.returncode, 0, second_run.stderr)
+            summary = json.loads(second_run.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+            failed = result["output"]
+            self.assertEqual(failed["status"], "failed_dirty_checkout")
+            self.assertEqual(failed["dirty_status"], ["?? agent-result.json", "?? dirty.txt"])
+            self.assertTrue((checkout_path / "agent-result.json").exists())
 
     def test_prepare_checkout_can_publish_requested_review_branch(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -374,6 +585,63 @@ class PrepareCheckoutCliTest(unittest.TestCase):
             self.assertEqual(failed["status"], "failed_repo_mismatch")
             self.assertEqual(failed["repo_url"], str(repo_b))
             self.assertEqual(failed["origin_url"], str(repo_a))
+
+    def test_prepare_checkout_does_not_clean_agent_result_before_repo_match(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repo_a, _start_a, _submodule_a = create_repo_with_submodule(temp_path / "a")
+            repo_b, _start_b, _submodule_b = create_repo_with_submodule(temp_path / "b")
+            checkout_path = temp_path / "checkout"
+            ledger = temp_path / "ledger"
+
+            first_run = run_afk(
+                "run-step",
+                "prepare-checkout",
+                "--input",
+                json.dumps(
+                    {
+                        "repo_url": str(repo_a),
+                        "base_ref": "main",
+                        "checkout_root": str(temp_path),
+                        "checkout_path": str(checkout_path),
+                        "review_branch": "afk/test-review-a",
+                    }
+                ),
+                "--ledger",
+                str(ledger),
+                env_overrides={"GIT_ALLOW_PROTOCOL": "file"},
+            )
+            self.assertEqual(first_run.returncode, 0, first_run.stderr)
+            (checkout_path / "agent-result.json").write_text(
+                json.dumps({"status": "failed", "summary": "stale adapter result"}),
+                encoding="utf-8",
+            )
+
+            second_run = run_afk(
+                "run-step",
+                "prepare-checkout",
+                "--input",
+                json.dumps(
+                    {
+                        "repo_url": str(repo_b),
+                        "base_ref": "main",
+                        "checkout_root": str(temp_path),
+                        "checkout_path": str(checkout_path),
+                        "review_branch": "afk/test-review-b",
+                    }
+                ),
+                "--ledger",
+                str(ledger),
+                env_overrides={"GIT_ALLOW_PROTOCOL": "file"},
+            )
+
+            self.assertEqual(second_run.returncode, 0, second_run.stderr)
+            summary = json.loads(second_run.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+            failed = result["output"]
+            self.assertEqual(failed["status"], "failed_repo_mismatch")
+            self.assertTrue((checkout_path / "agent-result.json").exists())
 
     def test_prepare_checkout_refuses_to_reset_existing_review_branch(self):
         with tempfile.TemporaryDirectory() as temp_dir:
