@@ -329,7 +329,195 @@ class ValidateCliTest(unittest.TestCase):
             self.assertEqual(result["output"]["status"], "failed_invalid_payload")
             self.assertEqual(
                 result["output"]["message"],
-                "validation.worker_home and validation.stack are only supported for the default project worker",
+                "validation.worker_home and validation.stack are only supported for the default project worker "
+                "or explicit local-command validation workers",
+            )
+
+    def test_validate_reports_invalid_worker_type_before_external_config_gate(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            checkout = temp_path / "checkout"
+            start_commit = init_checkout(checkout)
+            ledger = temp_path / "ledger"
+
+            completed = run_afk(
+                "run-step",
+                "validate",
+                "--profile",
+                "tier3-harness",
+                "--project",
+                "bump-eqemu",
+                "--input",
+                json.dumps(
+                    {
+                        "checkout": {
+                            "status": "prepared",
+                            "repo_url": "git@github.com:thunderbump/bump-EQEmu.git",
+                            "checkout_path": str(checkout),
+                            "review_branch": "afk/validate",
+                            "requested_ref": "main",
+                            "start_commit": start_commit,
+                        },
+                        "validation": {
+                            "worker_home": str(temp_path / "validation-worker-home"),
+                            "stack": {"role": "validation", "path": str(temp_path / "bump-akk-stack-validation")},
+                        },
+                        "worker": {
+                            "type": "bogus-worker",
+                            "command": [sys.executable, "-c", "raise SystemExit('worker should not run')"],
+                        },
+                    }
+                ),
+                "--ledger",
+                str(ledger),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(result["output"]["status"], "failed_invalid_payload")
+            self.assertEqual(result["output"]["message"], "worker.type must be local-command or remote-command")
+
+    def test_validate_custom_local_worker_receives_external_worker_home_and_stack(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            checkout = temp_path / "checkout"
+            worker_home = temp_path / "validation-worker-home"
+            stack_dir = temp_path / "bump-akk-stack-validation"
+            start_commit = init_checkout(checkout)
+            ledger = temp_path / "ledger"
+            worker_code = textwrap.dedent(
+                """
+                import json
+                import os
+                from pathlib import Path
+
+                request = json.loads(Path(os.environ["AFK_WORKER_REQUEST"]).read_text(encoding="utf-8"))
+                assert request["worker_home"] == os.environ["VALIDATION_WORKER_HOME"], request
+                assert request["stack"] == {
+                    "role": "validation",
+                    "path": os.environ["AKKSTACK_DIR"],
+                }, request
+                Path(os.environ["AFK_WORKER_RESULT"]).write_text(
+                    json.dumps(
+                        {
+                            "profile": request["profile"],
+                            "status": "pass",
+                            "failureCount": 0,
+                            "metadata": {
+                                "workerHome": request["worker_home"],
+                                "stack": request["stack"],
+                            },
+                            "steps": [],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                """
+            ).strip()
+
+            completed = run_afk(
+                "run-step",
+                "validate",
+                "--profile",
+                "tier3-harness",
+                "--project",
+                "bump-eqemu",
+                "--input",
+                json.dumps(
+                    {
+                        "checkout": {
+                            "status": "prepared",
+                            "repo_url": "git@github.com:thunderbump/bump-EQEmu.git",
+                            "checkout_path": str(checkout),
+                            "review_branch": "afk/validate",
+                            "requested_ref": "main",
+                            "start_commit": start_commit,
+                        },
+                        "validation": {
+                            "worker_home": str(worker_home),
+                            "stack": {"role": "validation", "path": str(stack_dir)},
+                        },
+                        "worker": {
+                            "type": "local-command",
+                            "command": [sys.executable, "-c", worker_code],
+                        },
+                    }
+                ),
+                "--ledger",
+                str(ledger),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+            worker_request = json.loads((run_dir / "worker-request.json").read_text(encoding="utf-8"))
+            worker_result = json.loads((run_dir / "worker-result.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(result["output"]["status"], "validated")
+            self.assertEqual(worker_request["worker_home"], str(worker_home))
+            self.assertEqual(worker_request["stack"], {"role": "validation", "path": str(stack_dir)})
+            self.assertEqual(
+                worker_result["result"]["raw"]["metadata"],
+                {
+                    "workerHome": str(worker_home),
+                    "stack": {"role": "validation", "path": str(stack_dir)},
+                },
+            )
+
+    def test_validate_rejects_checkout_internal_external_stack_for_custom_local_worker(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            checkout = temp_path / "checkout"
+            start_commit = init_checkout(checkout)
+            ledger = temp_path / "ledger"
+
+            completed = run_afk(
+                "run-step",
+                "validate",
+                "--profile",
+                "tier3-harness",
+                "--project",
+                "bump-eqemu",
+                "--input",
+                json.dumps(
+                    {
+                        "checkout": {
+                            "status": "prepared",
+                            "repo_url": "git@github.com:thunderbump/bump-EQEmu.git",
+                            "checkout_path": str(checkout),
+                            "review_branch": "afk/validate",
+                            "requested_ref": "main",
+                            "start_commit": start_commit,
+                        },
+                        "validation": {
+                            "stack": {
+                                "role": "validation",
+                                "path": str(checkout / "bump-akk-stack-validation"),
+                            }
+                        },
+                        "worker": {
+                            "type": "local-command",
+                            "command": [sys.executable, "-c", "raise SystemExit('worker should not run')"],
+                        },
+                    }
+                ),
+                "--ledger",
+                str(ledger),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(result["output"]["status"], "failed_invalid_payload")
+            self.assertEqual(
+                result["output"]["message"],
+                "validation.stack.path must be outside checkout",
             )
 
     def test_validate_classifies_missing_worker_result_separately(self):
