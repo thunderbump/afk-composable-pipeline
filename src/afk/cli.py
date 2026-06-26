@@ -146,7 +146,7 @@ def main(argv: list[str] | None = None) -> int:
         if path_error is not None:
             parser.error(path_error)
         try:
-            validation_input = recipe_validation_input_from_args(args)
+            validation_input = recipe_validation_input_from_args(args, project_contract=project_contract)
             recipe_agent = recipe_agent_from_args(args, checkout_path=Path(args.checkout_path))
             recipe_publisher = recipe_publisher_from_args(
                 args,
@@ -303,7 +303,7 @@ def recipe_agent_from_args(args: argparse.Namespace, *, checkout_path: Path) -> 
     )
 
 
-def recipe_validation_input_from_args(args: argparse.Namespace) -> dict[str, Any]:
+def recipe_validation_input_from_args(args: argparse.Namespace, *, project_contract: ProjectContract) -> dict[str, Any]:
     timeout_seconds = args.validation_timeout_seconds
     if timeout_seconds is not None and timeout_seconds <= 0:
         raise ValueError("--validation-timeout-seconds must be greater than 0")
@@ -321,6 +321,10 @@ def recipe_validation_input_from_args(args: argparse.Namespace) -> dict[str, Any
                 "timeout_seconds": timeout_seconds,
             },
         }
+    if not project_contract_has_default_worker(project_contract):
+        raise ValueError(
+            "--validation-mode=project-worker requires a project contract with a default validation worker"
+        )
     timeout_seconds = 3600 if timeout_seconds is None else timeout_seconds
     return {
         "validation": {
@@ -329,6 +333,10 @@ def recipe_validation_input_from_args(args: argparse.Namespace) -> dict[str, Any
             "timeout_seconds": timeout_seconds,
         }
     }
+
+
+def project_contract_has_default_worker(project_contract: ProjectContract) -> bool:
+    return project_contract.project_slug == "bump-eqemu"
 
 
 def recipe_publisher_from_args(

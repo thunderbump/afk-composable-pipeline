@@ -256,6 +256,51 @@ class GenerateRecipeCliTest(unittest.TestCase):
     def test_generate_recipe_writes_project_worker_validation_when_requested(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
+            output = temp_path / "recipe.json"
+            ledger = temp_path / "ledger"
+            beads_workspace = temp_path / "central-beads"
+            checkout_root = temp_path / "checkouts"
+            checkout_path = checkout_root / "demo"
+            beads_workspace.mkdir()
+
+            completed = run_afk(
+                "generate-recipe",
+                "--workstream-id",
+                "central-anh.6",
+                "--project",
+                "bump-eqemu",
+                "--contracts-dir",
+                "project-contracts",
+                "--ledger",
+                str(ledger),
+                "--beads-workspace",
+                str(beads_workspace),
+                "--checkout-root",
+                str(checkout_root),
+                "--checkout-path",
+                str(checkout_path),
+                "--validation-profile",
+                "tier1",
+                "--validation-mode",
+                "project-worker",
+                "--output",
+                str(output),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            recipe = json.loads(output.read_text(encoding="utf-8"))
+
+            validate_step = recipe["steps"][3]
+            self.assertEqual(validate_step["profile"], "tier1")
+            self.assertEqual(
+                validate_step["input"]["validation"],
+                {"profile": "tier1", "dry_run": False, "timeout_seconds": 3600},
+            )
+            self.assertNotIn("worker", validate_step["input"])
+
+    def test_generate_recipe_rejects_project_worker_without_default_worker_contract(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
             contracts_dir = temp_path / "contracts"
             repo = temp_path / "repo-src"
             output = temp_path / "recipe.json"
@@ -292,16 +337,12 @@ class GenerateRecipeCliTest(unittest.TestCase):
                 str(output),
             )
 
-            self.assertEqual(completed.returncode, 0, completed.stderr)
-            recipe = json.loads(output.read_text(encoding="utf-8"))
-
-            validate_step = recipe["steps"][3]
-            self.assertEqual(validate_step["profile"], "tier1")
-            self.assertEqual(
-                validate_step["input"]["validation"],
-                {"profile": "tier1", "dry_run": False, "timeout_seconds": 3600},
+            self.assertNotEqual(completed.returncode, 0, completed.stdout)
+            self.assertIn(
+                "--validation-mode=project-worker requires a project contract with a default validation worker",
+                completed.stderr,
             )
-            self.assertNotIn("worker", validate_step["input"])
+            self.assertFalse(output.exists())
 
     def test_generate_recipe_rejects_non_positive_validation_timeout_without_writing_recipe(self):
         with tempfile.TemporaryDirectory() as temp_dir:
