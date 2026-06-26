@@ -566,6 +566,248 @@ class ImplementCliTest(unittest.TestCase):
             self.assertNotIn(wrapper_secret, artifact_text)
             self.assertNotIn("ambient-openai-secret", artifact_text)
 
+    def test_implement_runs_real_agent_with_secret_refs_in_job_capsule_without_resolving_values(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            checkout = temp_path / "checkout"
+            start_commit = init_checkout(checkout)
+            ledger = temp_path / "ledger"
+            codex_home = temp_path / "codex-home"
+            pi_config_home = temp_path / "pi-config"
+            config_home = temp_path / "xdg-config-explicit"
+            codex_home.mkdir()
+            pi_config_home.mkdir()
+            config_home.mkdir()
+            secret_refs = {
+                "primary": {
+                    "secretRef": {
+                        "provider": "runner-local-files",
+                        "name": "codex-auth",
+                        "key": "openai_api_key",
+                    }
+                },
+                "secondary": {
+                    "secretRef": {
+                        "provider": "runner-local-files",
+                        "name": "pi-session",
+                        "key": "refresh_token",
+                    }
+                },
+            }
+            agent_observation = temp_path / "agent-observation.json"
+            agent_code = textwrap.dedent(
+                f"""
+                import json
+                import os
+                import subprocess
+                from pathlib import Path
+
+                capsule = json.loads(Path(os.environ["AFK_JOB_CAPSULE"]).read_text(encoding="utf-8"))
+                observation = {{
+                    "secret_refs": capsule["agent_mounts"]["secret_refs"],
+                    "ambient_openai_key": os.environ.get("OPENAI_API_KEY", "missing"),
+                }}
+                Path({str(agent_observation)!r}).write_text(json.dumps(observation), encoding="utf-8")
+                Path("implemented.txt").write_text("secret refs contract\\n", encoding="utf-8")
+                subprocess.run(["git", "add", "implemented.txt"], check=True)
+                subprocess.run(["git", "commit", "-m", "secret refs contract"], check=True)
+                Path(os.environ["AFK_AGENT_RESULT_PATH"]).write_text(
+                    json.dumps({{"status": "completed", "summary": "secret refs contract implemented"}}),
+                    encoding="utf-8",
+                )
+                """
+            ).strip()
+
+            completed = run_afk(
+                "run-step",
+                "implement",
+                "--input",
+                json.dumps(
+                    {
+                        "work_selection": {"schema_version": 1, "selected_work": [selected_work()]},
+                        "checkout": {
+                            "status": "prepared",
+                            "checkout_path": str(checkout),
+                            "review_branch": "afk/test-work",
+                            "requested_ref": "main",
+                            "start_commit": start_commit,
+                        },
+                        "guardrails": ["stay within checkout"],
+                        "validation": {"profile": "tier1", "commands": []},
+                        "agent": {
+                            "type": "real-agent-command",
+                            "command": [sys.executable, "-c", agent_code],
+                            "result_path": "agent-result.json",
+                            "timeout_seconds": 10,
+                            "codex_home": str(codex_home),
+                            "config_home": str(config_home),
+                            "env": {"PI_CONFIG_HOME": str(pi_config_home)},
+                            "secret_refs": secret_refs,
+                        },
+                    }
+                ),
+                "--ledger",
+                str(ledger),
+                env_overrides={
+                    "OPENAI_API_KEY": "ambient-openai-secret",
+                    "GIT_AUTHOR_NAME": "AFK Test",
+                    "GIT_AUTHOR_EMAIL": "afk-test@example.test",
+                    "GIT_COMMITTER_NAME": "AFK Test",
+                    "GIT_COMMITTER_EMAIL": "afk-test@example.test",
+                },
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+            observation = json.loads(agent_observation.read_text(encoding="utf-8"))
+            job_capsule = json.loads((run_dir / "job-capsule.json").read_text(encoding="utf-8"))
+            artifact_text = "\n".join(
+                path.read_text(encoding="utf-8")
+                for path in run_dir.iterdir()
+                if path.is_file()
+            )
+
+            self.assertEqual(result["output"]["status"], "implemented")
+            self.assertEqual(result["output"]["summary"], "secret refs contract implemented")
+            self.assertEqual(observation["secret_refs"], secret_refs)
+            self.assertEqual(observation["ambient_openai_key"], "missing")
+            self.assertEqual(job_capsule["capsule"]["agent_mounts"]["secret_refs"], secret_refs)
+            self.assertNotIn("ambient-openai-secret", artifact_text)
+
+    def test_implement_rejects_invalid_secret_ref_shapes_and_plaintext_fields(self):
+        cases = [
+            (
+                "secret_refs_not_object",
+                [],
+                "agent.secret_refs must be an object",
+            ),
+            (
+                "logical_name_secret_like",
+                {"openai_token": {"secretRef": {"provider": "vault", "name": "codex-auth", "key": "primary"}}},
+                "agent.secret_refs.openai_token must use a non-secret logical name",
+            ),
+            (
+                "entry_not_object",
+                {"primary": "vault://codex-auth/primary"},
+                "agent.secret_refs.primary must be an object containing only secretRef",
+            ),
+            (
+                "plaintext_value_field",
+                {
+                    "primary": {
+                        "secretRef": {"provider": "vault", "name": "codex-auth", "key": "primary"},
+                        "value": "ghp_secret_value_1234567890",
+                    }
+                },
+                "agent.secret_refs.primary must not include plaintext secret fields",
+            ),
+            (
+                "secret_ref_not_object",
+                {"primary": {"secretRef": "vault://codex-auth/primary"}},
+                "agent.secret_refs.primary.secretRef must be an object",
+            ),
+            (
+                "secret_ref_missing_key",
+                {"primary": {"secretRef": {"provider": "vault", "name": "codex-auth"}}},
+                "agent.secret_refs.primary.secretRef.key is required",
+            ),
+            (
+                "secret_ref_non_string_field",
+                {"primary": {"secretRef": {"provider": "vault", "name": "codex-auth", "key": 7}}},
+                "agent.secret_refs.primary.secretRef.key must be a non-empty string",
+            ),
+            (
+                "secret_ref_extra_field",
+                {
+                    "primary": {
+                        "secretRef": {
+                            "provider": "vault",
+                            "name": "codex-auth",
+                            "key": "primary",
+                            "value": "ghp_secret_value_1234567890",
+                        }
+                    }
+                },
+                "agent.secret_refs.primary.secretRef must only contain provider, name, and key",
+            ),
+            (
+                "secret_ref_secret_like_provider",
+                {"primary": {"secretRef": {"provider": "ghp_secret_provider_1234567890", "name": "codex-auth", "key": "primary"}}},
+                "agent.secret_refs.primary.secretRef.provider must not include a secret-looking value",
+            ),
+            (
+                "secret_ref_secret_like_name",
+                {"primary": {"secretRef": {"provider": "vault", "name": "github_pat_secret_name_1234567890", "key": "primary"}}},
+                "agent.secret_refs.primary.secretRef.name must not include a secret-looking value",
+            ),
+            (
+                "secret_ref_secret_like_key",
+                {"primary": {"secretRef": {"provider": "vault", "name": "codex-auth", "key": "ghp_secret_key_1234567890"}}},
+                "agent.secret_refs.primary.secretRef.key must not include a secret-looking value",
+            ),
+        ]
+        for case_name, secret_refs, expected_message in cases:
+            with self.subTest(case_name=case_name):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    temp_path = Path(temp_dir)
+                    checkout = temp_path / "checkout"
+                    start_commit = init_checkout(checkout)
+                    ledger = temp_path / "ledger"
+                    codex_home = temp_path / "codex-home"
+                    config_home = temp_path / "xdg-config"
+                    pi_config_home = temp_path / "pi-config"
+                    codex_home.mkdir()
+                    config_home.mkdir()
+                    pi_config_home.mkdir()
+
+                    completed = run_afk(
+                        "run-step",
+                        "implement",
+                        "--input",
+                        json.dumps(
+                            {
+                                "work_selection": {"schema_version": 1, "selected_work": [selected_work()]},
+                                "checkout": {
+                                    "status": "prepared",
+                                    "checkout_path": str(checkout),
+                                    "review_branch": "afk/test-work",
+                                    "requested_ref": "main",
+                                    "start_commit": start_commit,
+                                },
+                                "guardrails": [],
+                                "validation": {"profile": "tier1", "commands": []},
+                                "agent": {
+                                    "type": "real-agent-command",
+                                    "command": [sys.executable, "-c", "print('should not run')"],
+                                    "result_path": "agent-result.json",
+                                    "codex_home": str(codex_home),
+                                    "config_home": str(config_home),
+                                    "env": {"PI_CONFIG_HOME": str(pi_config_home)},
+                                    "secret_refs": secret_refs,
+                                },
+                            }
+                        ),
+                        "--ledger",
+                        str(ledger),
+                    )
+
+                    self.assertEqual(completed.returncode, 0, completed.stderr)
+                    summary = json.loads(completed.stdout)
+                    run_dir = ledger / "runs" / summary["run_id"]
+                    result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+                    artifact_text = "\n".join(
+                        path.read_text(encoding="utf-8")
+                        for path in run_dir.iterdir()
+                        if path.is_file()
+                    )
+
+                    self.assertEqual(result["output"]["status"], "failed_invalid_payload")
+                    self.assertEqual(result["output"]["message"], expected_message)
+                    self.assertNotIn("should not run", (run_dir / "stdout.log").read_text(encoding="utf-8"))
+                    self.assertNotIn("ghp_secret_value_1234567890", artifact_text)
+
     def test_implement_redacts_runtime_wrapper_secret_leaks_from_logs_and_artifacts(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)

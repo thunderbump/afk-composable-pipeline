@@ -426,9 +426,110 @@ at runtime, run the real CLI, and exit without echoing secrets. Direct
 secret-bearing `agent.env` values such as `OPENAI_API_KEY=...` and flags like
 `--token`, `--auth-file`, or `--api-key` remain rejected.
 
-This contract is interim. Replace `agent.wrapper_secret_files` with
-secrets-manager-backed secret references once AFK has a first-class secret
-reference contract and runner integration.
+### Canonical Secret References
+
+The canonical remote-runner secret reference shape now exists for recipe and
+job-capsule metadata. AFK accepts references only; it does not resolve secret
+values, call a provider, or persist secret material in ledger artifacts.
+
+Recipe/job-capsule shape:
+
+```json
+{
+  "agent": {
+    "type": "real-agent-command",
+    "command": ["/runner/bin/pi-wrapper"],
+    "result_path": "agent-result.json",
+    "codex_home": "/work/mounts/codex-home",
+    "config_home": "/work/mounts/xdg-config",
+    "env": {
+      "PI_CONFIG_HOME": "/work/mounts/pi-config"
+    },
+    "secret_refs": {
+      "primary": {
+        "secretRef": {
+          "provider": "runner-local-files",
+          "name": "codex-auth",
+          "key": "openai_api_key"
+        }
+      }
+    }
+  }
+}
+```
+
+Contract rules:
+
+- `agent.secret_refs` must be an object keyed by non-secret logical names such
+  as `primary`, `secondary`, or `codex`.
+- Each entry must be exactly `{ "secretRef": { "provider": "...", "name": "...",
+  "key": "..." } }`.
+- `secretRef.provider`, `secretRef.name`, and `secretRef.key` must be non-empty
+  strings.
+- `secretRef.provider`, `secretRef.name`, and `secretRef.key` must be reference
+  identifiers, not token-shaped or otherwise secret-looking values.
+- Plaintext fields such as `value`, `token`, `api_key`, or ad hoc inline secret
+  payloads are rejected from this contract.
+- AFK copies validated references into `job-capsule.json` under
+  `capsule.agent_mounts.secret_refs` unchanged and does not add them to the
+  adapter environment.
+
+Minimal resolver-provider contract for a future runner integration:
+
+Resolver input:
+
+```json
+{
+  "provider": "runner-local-files",
+  "name": "codex-auth",
+  "key": "openai_api_key"
+}
+```
+
+Resolver result:
+
+```json
+{
+  "status": "resolved",
+  "provider": "runner-local-files",
+  "name": "codex-auth",
+  "key": "openai_api_key",
+  "materialization": {
+    "kind": "file-path | env-var | opaque-handle",
+    "locator": "<runner-local reference>"
+  }
+}
+```
+
+Failure shape:
+
+```json
+{
+  "status": "error",
+  "provider": "runner-local-files",
+  "name": "codex-auth",
+  "key": "openai_api_key",
+  "code": "not_found | access_denied | invalid_reference | unavailable",
+  "message": "<non-secret diagnostic>"
+}
+```
+
+Resolver outputs are runner-internal. AFK should receive only the safe
+reference metadata above or a later sanitized materialization contract, never a
+raw token value in recipes, ledgers, PR bodies, or Beads comments.
+
+Until resolver integration exists, the current runner auth inputs remain
+path-only mounts:
+
+- `agent.codex_home`
+- `agent.config_home`
+- `agent.env.PI_CONFIG_HOME`
+- `publisher.gh.auth.config_dir`
+- `agent.wrapper_secret_files`
+
+Those fields continue to carry absolute runner-local paths only. They are not
+aliases for `secret_refs`, and AFK still rejects direct secret-bearing
+`agent.env` values and credential flags.
 
 ## Ledger Artifacts
 
