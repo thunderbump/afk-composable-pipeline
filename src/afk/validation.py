@@ -188,23 +188,38 @@ def normalize_request(input_data: Any, *, project_contract: Any, run_id: str) ->
         input_data.get("worker") is None and getattr(project_contract, "project_slug", None) == "bump-eqemu"
     )
 
-    validation = normalize_validation(
+    validation_without_external_config = normalize_validation(
         input_data.get("validation", {}),
         project_contract,
         checkout=checkout["checkout"],
-        allow_external_worker_config=default_project_worker_requested,
+        allow_external_worker_config=False,
+        defer_external_worker_config=True,
     )
-    if validation["status"] != "valid":
-        return invalid_request(validation["message"])
+    if validation_without_external_config["status"] != "valid":
+        return invalid_request(validation_without_external_config["message"])
 
     worker = normalize_worker(
         input_data.get("worker"),
         checkout["checkout"],
         project_contract,
-        default_timeout_seconds=validation["validation"]["timeout_seconds"],
+        default_timeout_seconds=validation_without_external_config["validation"]["timeout_seconds"],
     )
     if worker["status"] != "valid":
         return invalid_request(worker["message"])
+    explicit_local_command_worker_requested = (
+        not worker["worker"].get("default_project_worker") and worker["worker"]["type"] == "local-command"
+    )
+
+    validation = normalize_validation(
+        input_data.get("validation", {}),
+        project_contract,
+        checkout=checkout["checkout"],
+        allow_external_worker_config=(
+            default_project_worker_requested or explicit_local_command_worker_requested
+        ),
+    )
+    if validation["status"] != "valid":
+        return invalid_request(validation["message"])
 
     return {
         "schema_version": SCHEMA_VERSION,
@@ -263,6 +278,7 @@ def normalize_validation(
     *,
     checkout: dict[str, Any],
     allow_external_worker_config: bool = False,
+    defer_external_worker_config: bool = False,
 ) -> dict[str, Any]:
     if not isinstance(validation, dict):
         return {"status": "invalid", "message": "validation must be an object"}
@@ -290,6 +306,7 @@ def normalize_validation(
         validation,
         checkout=checkout,
         allow_external_worker_config=allow_external_worker_config,
+        defer_external_worker_config=defer_external_worker_config,
     )
     if external_worker["status"] != "valid":
         return {"status": "invalid", "message": external_worker["message"]}
@@ -313,6 +330,7 @@ def normalize_external_worker_config(
     *,
     checkout: dict[str, Any],
     allow_external_worker_config: bool,
+    defer_external_worker_config: bool = False,
 ) -> dict[str, Any]:
     checkout_path = Path(checkout["path"])
     worker_request: dict[str, Any] = {}
@@ -321,9 +339,14 @@ def normalize_external_worker_config(
     worker_home = string_field(validation, "worker_home") or string_field(validation, "workerHome")
     stack = validation.get("stack")
     if (worker_home or stack is not None) and not allow_external_worker_config:
+        if defer_external_worker_config:
+            return {"status": "valid", "worker_request": {}, "adapter_env": {}}
         return {
             "status": "invalid",
-            "message": "validation.worker_home and validation.stack are only supported for the default project worker",
+            "message": (
+                "validation.worker_home and validation.stack are only supported for the default project worker "
+                "or explicit local-command validation workers"
+            ),
         }
     if worker_home:
         validated = validate_external_path(
