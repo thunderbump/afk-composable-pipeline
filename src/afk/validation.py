@@ -203,6 +203,8 @@ def normalize_request(input_data: Any, *, project_contract: Any, run_id: str) ->
         "schema_version": SCHEMA_VERSION,
         "status": "valid",
         "run_id": run_id,
+        "project_slug": getattr(project_contract, "project_slug", ""),
+        "project_repo_url": getattr(project_contract, "repo_url", ""),
         "checkout": checkout["checkout"],
         "validation": validation["validation"],
         "worker": worker["worker"],
@@ -288,7 +290,9 @@ def normalize_worker(
     *,
     default_timeout_seconds: float | None = None,
 ) -> dict[str, Any]:
+    default_project_worker = False
     if worker is None and getattr(project_contract, "project_slug", None) == "bump-eqemu":
+        default_project_worker = True
         worker = {
             "type": "local-command",
             "command": [
@@ -329,6 +333,7 @@ def normalize_worker(
             "host": host,
             "command": list(command),
             "timeout_seconds": float(timeout_seconds),
+            "default_project_worker": default_project_worker,
         },
     }
 
@@ -336,6 +341,40 @@ def normalize_worker(
 def build_worker_request(request: dict[str, Any], run_dir: Path) -> dict[str, Any]:
     checkout = request["checkout"]
     validation = request["validation"]
+    if request["worker"].get("default_project_worker") and request.get("project_slug") == "bump-eqemu":
+        repo = checkout["path"]
+        ref = checkout["requested_ref"] or checkout["start_commit"]
+        worker_request = {
+            "project": request["project_slug"],
+            "repo": repo,
+            "ref": ref,
+            "commit": checkout["start_commit"],
+            "profile": validation["worker_profile"],
+            "run_id": request["run_id"],
+            "evidence_dir": str(run_dir / "validation-evidence"),
+            "timeout_seconds": int(validation["timeout_seconds"]),
+            "lock_wait_seconds": 30,
+        }
+        if validation["dry_run"]:
+            worker_request["dryRun"] = True
+        for key, value in validation["worker_request"].items():
+            if key not in {
+                "project",
+                "repo",
+                "ref",
+                "commit",
+                "profile",
+                "run_id",
+                "evidence_dir",
+                "evidenceDir",
+                "timeout_seconds",
+                "timeoutSeconds",
+                "lock_wait_seconds",
+                "lockWaitSeconds",
+                "dryRun",
+            }:
+                worker_request[key] = value
+        return worker_request
     if request["worker"]["type"] == "remote-command":
         repo = {
             "url": checkout["repo_url"],

@@ -1981,10 +1981,31 @@ class ValidateCliTest(unittest.TestCase):
                     from pathlib import Path
 
                     request = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+                    assert request["project"] == "bump-eqemu", request
+                    assert request["repo"] == str(Path.cwd()), request
+                    assert request["ref"] == "main", request
+                    assert request["profile"] == "tier3-harness", request
+                    assert request["run_id"], request
+                    assert request["timeout_seconds"] == 120, request
+                    assert request["lock_wait_seconds"] == 30, request
+                    assert "timeoutSeconds" not in request, request
+                    assert not isinstance(request["repo"], dict), request
                     evidence_dir = Path(request["evidence_dir"])
                     evidence_dir.mkdir(parents=True, exist_ok=True)
                     (evidence_dir / "result.json").write_text(
-                        json.dumps({"profile": request["profile"], "status": "pass", "steps": []}),
+                        json.dumps(
+                            {
+                                "profile": request["profile"],
+                                "status": "pass",
+                                "repo": request["repo"],
+                                "checkout": {
+                                    "requestedRef": request["ref"],
+                                    "requestedCommit": request["commit"],
+                                    "resolvedCommit": request["commit"],
+                                },
+                                "steps": [],
+                            }
+                        ),
                         encoding="utf-8",
                     )
                     print("default validation worker " + request["profile"])
@@ -2027,11 +2048,21 @@ class ValidateCliTest(unittest.TestCase):
             summary = json.loads(completed.stdout)
             run_dir = ledger / "runs" / summary["run_id"]
             result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+            worker_request = json.loads((run_dir / "worker-request.json").read_text(encoding="utf-8"))
             worker_result = json.loads((run_dir / "worker-result.json").read_text(encoding="utf-8"))
             evidence_result = run_dir / "validation-evidence" / "result.json"
             worker_output = run_dir / "validation-evidence" / "worker-output.json"
 
             self.assertEqual(result["output"]["status"], "validated")
+            self.assertEqual(worker_request["project"], "bump-eqemu")
+            self.assertEqual(worker_request["repo"], str(checkout))
+            self.assertEqual(worker_request["ref"], "main")
+            self.assertEqual(worker_request["commit"], start_commit)
+            self.assertEqual(worker_request["run_id"], summary["run_id"])
+            self.assertEqual(worker_request["timeout_seconds"], 120)
+            self.assertEqual(worker_request["lock_wait_seconds"], 30)
+            self.assertNotIn("timeoutSeconds", worker_request)
+            self.assertNotIsInstance(worker_request["repo"], dict)
             self.assertEqual(worker_result["result"]["raw"]["profile"], "tier3-harness")
             self.assertTrue(worker_output.is_file())
             self.assertEqual(evidence_result.read_text(encoding="utf-8"), worker_output.read_text(encoding="utf-8"))
