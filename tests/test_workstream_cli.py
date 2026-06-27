@@ -16,6 +16,8 @@ from afk.workstream import (  # noqa: E402
     WorkstreamLedger,
     composed_step_input,
     pr_body_markdown,
+    current_selected_work_selection_identity,
+    selected_work_records,
     select_work_proves_different_item,
     update_state_from_step,
 )
@@ -267,6 +269,176 @@ class WorkstreamCliTest(unittest.TestCase):
 
         self.assertTrue(select_work_proves_different_item(input_data, state))
 
+    def test_select_work_target_ids_do_not_prove_different_item_when_any_current_item_overlaps(self):
+        state = {
+            "selected_work": [
+                selected_fixture_item("central-lve.9"),
+                selected_fixture_item("central-lve.10", "Follow-up terminal publisher hardening"),
+            ]
+        }
+        input_data = {"target_ids": ["central-lve.10"]}
+
+        self.assertFalse(select_work_proves_different_item(input_data, state))
+
+    def test_select_work_source_qualified_target_ids_can_prove_same_external_id_is_different(self):
+        state = {
+            "selected_work": [
+                {
+                    **selected_fixture_item("123"),
+                    "source_id": "beads",
+                    "source_type": "beads",
+                    "url": "",
+                }
+            ]
+        }
+        input_data = {"target_ids": ["github_issues:github:123"]}
+
+        self.assertTrue(select_work_proves_different_item(input_data, state))
+
+    def test_multi_item_selection_identity_is_order_independent(self):
+        first = selected_fixture_item("central-lve.9")
+        second = selected_fixture_item("central-lve.10", "Follow-up terminal publisher hardening")
+
+        self.assertEqual(
+            current_selected_work_selection_identity({"selected_work": [first, second]}),
+            current_selected_work_selection_identity({"selected_work": [second, first]}),
+        )
+
+    def test_review_step_input_carries_combined_selected_work_for_multi_item_review(self):
+        second_item = selected_fixture_item(
+            "central-lve.10",
+            "Follow-up terminal publisher hardening",
+        )
+        state = {
+            "selected_work": [selected_fixture_item("central-lve.9"), second_item],
+            "checkout": {
+                "status": "prepared",
+                "checkout_path": "/tmp/checkout",
+                "start_commit": "abc123",
+            },
+            "implementation": {
+                "status": "implemented",
+                "git": {"after_commit": "def456"},
+            },
+            "validations": [],
+        }
+
+        review_input = composed_step_input(
+            {"name": "review", "input": {"reviewer": {"type": "fake-reviewer-command"}}},
+            {
+                "workstream_id": "central-lve.9",
+                "parent": "central-lve",
+                "review_branch": "afk/workstream-terminal-pr",
+            },
+            state,
+            Path("/tmp/ledger"),
+        )
+
+        self.assertEqual(review_input["work_item"]["external_id"], "central-lve.9")
+        self.assertEqual(
+            [item["external_id"] for item in review_input["work_selection"]["selected_work"]],
+            ["central-lve.9", "central-lve.10"],
+        )
+
+    def test_selected_work_records_mark_unreviewed_items_not_processed_in_partial_multi_item_result(self):
+        selected_work = [
+            selected_fixture_item("central-lve.9"),
+            selected_fixture_item("central-lve.10", "Follow-up terminal publisher hardening"),
+        ]
+        state = {
+            "selected_work": selected_work,
+            "implementation": {"status": "implemented", "git": {"after_commit": "def456"}},
+            "implementation_selection": selected_work,
+            "implementation_result_path": "runs/implement/step-result.json",
+            "validations": [
+                {
+                    "output": {
+                        "status": "validated",
+                        "checkout": {"start_commit": "def456"},
+                    },
+                    "step_result_path": "/tmp/ledger/runs/validate/step-result.json",
+                    "worker_result_path": "/tmp/ledger/runs/validate/worker-result.json",
+                }
+            ],
+            "review": {"status": "passed", "checkout": {"start_commit": "def456"}},
+            "review_selection": [selected_work[0]],
+            "review_result_path": "runs/review/step-result.json",
+        }
+
+        self.assertEqual(
+            [item["result"] for item in selected_work_records(state)],
+            ["passed", "not_processed"],
+        )
+
+    def test_selected_work_records_do_not_match_evidence_across_sources_with_same_external_id(self):
+        beads_item = {
+            **selected_fixture_item("123"),
+            "source_id": "beads",
+            "source_type": "beads",
+            "url": "",
+        }
+        github_item = {
+            **selected_fixture_item("123"),
+            "source_id": "github",
+            "source_type": "github_issues",
+            "url": "",
+        }
+        state = {
+            "selected_work": [beads_item, github_item],
+            "implementation": {"status": "implemented", "git": {"after_commit": "def456"}},
+            "implementation_selection": [github_item],
+            "implementation_result_path": "runs/implement/step-result.json",
+            "validations": [
+                {
+                    "output": {"status": "validated", "checkout": {"start_commit": "def456"}},
+                    "step_result_path": "/tmp/ledger/runs/validate/step-result.json",
+                    "worker_result_path": "/tmp/ledger/runs/validate/worker-result.json",
+                }
+            ],
+            "review": {"status": "passed", "checkout": {"start_commit": "def456"}},
+            "review_selection": [github_item],
+            "review_result_path": "runs/review/step-result.json",
+        }
+
+        self.assertEqual(
+            [item["result"] for item in selected_work_records(state)],
+            ["not_processed", "passed"],
+        )
+
+    def test_review_step_input_does_not_expand_legacy_implementation_to_full_selection(self):
+        first = selected_fixture_item("central-lve.9")
+        second = selected_fixture_item("central-lve.10", "Follow-up terminal publisher hardening")
+        state = {
+            "selected_work": [first, second],
+            "checkout": {
+                "status": "prepared",
+                "checkout_path": "/tmp/checkout",
+                "start_commit": "abc123",
+            },
+            "implementation": {
+                "status": "implemented",
+                "work_item": first,
+                "git": {"after_commit": "def456"},
+            },
+            "validations": [],
+        }
+
+        review_input = composed_step_input(
+            {"name": "review", "input": {"reviewer": {"type": "fake-reviewer-command"}}},
+            {
+                "workstream_id": "central-lve.9",
+                "parent": "central-lve",
+                "review_branch": "afk/workstream-terminal-pr",
+            },
+            state,
+            Path("/tmp/ledger"),
+        )
+
+        self.assertEqual(
+            [item["external_id"] for item in review_input["work_selection"]["selected_work"]],
+            ["central-lve.9"],
+        )
+
     def test_workstream_composes_steps_and_creates_one_terminal_pr_from_ledger_evidence(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
@@ -388,7 +560,7 @@ sys.exit(0)
                         "title": "Compose workstream recipe and terminal PR publisher",
                         "source_id": "fixture",
                         "source_type": "fixture",
-                        "result": "awaiting-review",
+                        "result": "passed",
                     }
                 ],
             )
@@ -501,7 +673,7 @@ raise SystemExit(9)
             self.assertTrue(result["tracker"]["close_source_item"])
             self.assertEqual(result["tracker"]["merge_commit"], "deadbeef")
             self.assertEqual(result["tracker"]["pr_url"], "https://github.example/pr/123")
-            self.assertEqual([item["result"] for item in result["selected_work"]], ["closed"])
+            self.assertEqual([item["result"] for item in result["selected_work"]], ["passed"])
             tracker_result = json.loads((ledger / summary["result_path"]).parent.joinpath("tracker-result.json").read_text(encoding="utf-8"))
             self.assertEqual(tracker_result["merge_commit"], "deadbeef")
             self.assertEqual(tracker_result["pr_url"], "https://github.example/pr/123")
@@ -569,7 +741,7 @@ raise SystemExit(9)
             self.assertTrue(result["tracker"]["close_source_item"])
             self.assertEqual(result["tracker"]["close_reason"], "Superseded by follow-up PR")
             self.assertEqual(result["tracker"]["pr_url"], "https://github.example/pr/123")
-            self.assertEqual([item["result"] for item in result["selected_work"]], ["closed"])
+            self.assertEqual([item["result"] for item in result["selected_work"]], ["passed"])
 
     def test_workstream_accepts_empty_tracker_terminal_decision_as_unset(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1211,7 +1383,7 @@ Path({str(fake_calls)!r}).write_text("gh should not run\\n", encoding="utf-8")
                 [step["name"] for step in result["steps"]],
                 ["select-work", "prepare-checkout", "implement", "validate"],
             )
-            self.assertEqual(result["selected_work"][0]["result"], "validated")
+            self.assertEqual(result["selected_work"][0]["result"], "blocked")
             self.assertFalse(reviewer_invoked.exists())
             self.assertFalse(fake_calls.exists())
 
@@ -1476,7 +1648,7 @@ Path({str(fake_calls)!r}).write_text("gh should not run\\n", encoding="utf-8")
                 ],
             )
             self.assertEqual(result["selected_work"][0]["external_id"], "central-lve.10")
-            self.assertEqual(result["selected_work"][0]["result"], "implemented")
+            self.assertEqual(result["selected_work"][0]["result"], "blocked")
             self.assertTrue((second_checkout / "implemented-second.txt").exists())
             self.assertFalse(fake_calls.exists())
 
@@ -2784,11 +2956,128 @@ Path({str(fake_calls)!r}).write_text("gh should not run\\n", encoding="utf-8")
             self.assertFalse(blocked_checkout.exists())
             self.assertFalse(fake_calls.exists())
 
-    def test_workstream_blocks_multi_item_selection_before_implementation(self):
+    def test_workstream_supports_multi_item_selection_with_combined_review_evidence(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
             repo = temp_path / "repo-src"
             checkout = temp_path / "checkout"
+            ledger = temp_path / "ledger"
+            fake_calls = temp_path / "fake-calls.jsonl"
+            init_repo(repo)
+            fake_git = temp_path / "publisher-git"
+            fake_gh = temp_path / "publisher-gh"
+            write_executable(
+                fake_git,
+                f"""#!{sys.executable}
+import json
+import os
+import sys
+from pathlib import Path
+
+Path({str(fake_calls)!r}).open("a", encoding="utf-8").write(
+    json.dumps({{"tool": "git", "cwd": os.getcwd(), "argv": sys.argv[1:]}}) + "\\n"
+)
+""",
+            )
+            write_executable(
+                fake_gh,
+                f"""#!{sys.executable}
+import json
+import sys
+from pathlib import Path
+
+record = {{"tool": "gh", "argv": sys.argv[1:]}}
+if "--body-file" in sys.argv:
+    body_file = sys.argv[sys.argv.index("--body-file") + 1]
+    record["body"] = Path(body_file).read_text(encoding="utf-8")
+Path({str(fake_calls)!r}).open("a", encoding="utf-8").write(json.dumps(record) + "\\n")
+if sys.argv[1:4] == ["auth", "status", "--hostname"]:
+    sys.exit(0)
+print("https://github.example/pr/789")
+sys.exit(0)
+""",
+            )
+            second_item = {
+                **selected_fixture_item(),
+                "external_id": "central-lve.10",
+                "url": "https://tracker.example/central-lve.10",
+                "title": "Follow-up terminal publisher hardening",
+            }
+            recipe = successful_recipe(temp_path, repo, checkout, fake_git, fake_gh)
+            recipe["steps"][0]["input"]["sources"][0]["items"] = [
+                selected_fixture_item(),
+                second_item,
+            ]
+            combined_agent_code = textwrap.dedent(
+                """
+                import json
+                import os
+                import subprocess
+                from pathlib import Path
+
+                capsule = json.loads(Path(os.environ["AFK_JOB_CAPSULE"]).read_text(encoding="utf-8"))
+                selected = [item["external_id"] for item in capsule["work_selection"]["selected_work"]]
+                assert selected == ["central-lve.9", "central-lve.10"]
+                Path("implemented.txt").write_text("\\n".join(selected) + "\\n", encoding="utf-8")
+                subprocess.run(["git", "add", "implemented.txt"], check=True)
+                subprocess.run(["git", "commit", "-m", "implement selected work"], check=True)
+                Path("agent-result.json").write_text(
+                    json.dumps({"status": "completed", "summary": "implemented selected work"}),
+                    encoding="utf-8",
+                )
+                """
+            ).strip()
+            recipe["steps"][2]["input"]["agent"]["command"] = [sys.executable, "-c", combined_agent_code]
+            completed = run_afk(
+                "run-workstream",
+                "--workstream-id",
+                "central-lve.9",
+                "--input",
+                json.dumps(recipe),
+                "--ledger",
+                str(ledger),
+                env_overrides={
+                    "GIT_ALLOW_PROTOCOL": "file",
+                    "GIT_AUTHOR_NAME": "AFK Test",
+                    "GIT_AUTHOR_EMAIL": "afk-test@example.test",
+                    "GIT_COMMITTER_NAME": "AFK Test",
+                    "GIT_COMMITTER_EMAIL": "afk-test@example.test",
+                },
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            result = json.loads((ledger / summary["result_path"]).read_text(encoding="utf-8"))
+            calls = [
+                json.loads(line)
+                for line in fake_calls.read_text(encoding="utf-8").splitlines()
+            ]
+            pr_call = next(call for call in calls if call["tool"] == "gh" and call["argv"][0:2] == ["pr", "create"])
+            body = pr_call["body"]
+
+            self.assertEqual(summary["status"], "published")
+            self.assertEqual(result["publication"]["status"], "published")
+            self.assertEqual(
+                [step["name"] for step in result["steps"]],
+                ["select-work", "prepare-checkout", "implement", "validate", "review"],
+            )
+            self.assertEqual(
+                [item["external_id"] for item in result["selected_work"]],
+                ["central-lve.9", "central-lve.10"],
+            )
+            self.assertEqual([item["result"] for item in result["selected_work"]], ["passed", "passed"])
+            self.assertIn("central-lve.9 - Compose workstream recipe and terminal PR publisher (passed)", body)
+            self.assertIn("central-lve.10 - Follow-up terminal publisher hardening (passed)", body)
+            self.assertIn("implementation: runs/", body)
+            self.assertIn("validation: runs/", body)
+            self.assertIn("review: runs/", body)
+
+    def test_workstream_does_not_reuse_multi_item_validation_after_new_selection_and_implementation(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repo = temp_path / "repo-src"
+            checkout = temp_path / "checkout"
+            second_checkout = temp_path / "checkout-two"
             ledger = temp_path / "ledger"
             fake_calls = temp_path / "fake-calls.jsonl"
             init_repo(repo)
@@ -2808,16 +3097,65 @@ from pathlib import Path
 Path({str(fake_calls)!r}).write_text("gh should not run\\n", encoding="utf-8")
 """,
             )
-            second_item = {
-                **selected_fixture_item(),
-                "external_id": "central-lve.10",
-                "url": "https://tracker.example/central-lve.10",
-                "title": "Follow-up terminal publisher hardening",
-            }
+            third_item = selected_fixture_item("central-lve.11", "Tracker comments for terminal PR handoff")
+            fourth_item = selected_fixture_item("central-lve.12", "Review artifact links for combined work")
+            second_agent_code = textwrap.dedent(
+                """
+                import json
+                import subprocess
+                from pathlib import Path
+
+                Path("implemented-second.txt").write_text("central-lve.11\\ncentral-lve.12\\n", encoding="utf-8")
+                subprocess.run(["git", "add", "implemented-second.txt"], check=True)
+                subprocess.run(["git", "commit", "-m", "implement central-lve.11 and central-lve.12"], check=True)
+                Path("agent-result.json").write_text(
+                    json.dumps({"status": "completed", "summary": "implemented second multi-item selection"}),
+                    encoding="utf-8",
+                )
+                """
+            ).strip()
             recipe = successful_recipe(temp_path, repo, checkout, fake_git, fake_gh)
+            recipe["publisher"] = {"enabled": False}
             recipe["steps"][0]["input"]["sources"][0]["items"] = [
                 selected_fixture_item(),
-                second_item,
+                selected_fixture_item("central-lve.10", "Follow-up terminal publisher hardening"),
+            ]
+            recipe["steps"] = recipe["steps"][:4] + [
+                {
+                    "name": "select-work",
+                    "input": {
+                        "target_ids": ["central-lve.11", "central-lve.12"],
+                        "required_labels": ["afk:ready"],
+                        "sources": [
+                            {
+                                "type": "fixture",
+                                "id": "fixture",
+                                "items": [third_item, fourth_item],
+                            }
+                        ],
+                    },
+                },
+                {
+                    "name": "prepare-checkout",
+                    "input": {
+                        "repo_url": str(repo),
+                        "base_ref": "main",
+                        "checkout_root": str(temp_path),
+                        "checkout_path": str(second_checkout),
+                    },
+                },
+                {
+                    "name": "implement",
+                    "input": {
+                        "guardrails": ["stay within checkout"],
+                        "validation": {"profile": "tier1", "commands": []},
+                        "agent": {
+                            "type": "fake-pi-command",
+                            "command": [sys.executable, "-c", second_agent_code],
+                            "result_path": "agent-result.json",
+                        },
+                    },
+                },
             ]
 
             completed = run_afk(
@@ -2843,17 +3181,26 @@ Path({str(fake_calls)!r}).write_text("gh should not run\\n", encoding="utf-8")
 
             self.assertEqual(summary["status"], "blocked")
             self.assertEqual(result["publication"]["status"], "blocked")
-            self.assertIn("single selected work item", result["publication"]["reason"])
+            self.assertEqual(result["publication"]["reason"], "required final validation evidence is missing")
             self.assertEqual(
                 [step["name"] for step in result["steps"]],
-                ["select-work", "prepare-checkout"],
+                [
+                    "select-work",
+                    "prepare-checkout",
+                    "implement",
+                    "validate",
+                    "select-work",
+                    "prepare-checkout",
+                    "implement",
+                ],
             )
             self.assertEqual(
                 [item["external_id"] for item in result["selected_work"]],
-                ["central-lve.9", "central-lve.10"],
+                ["central-lve.11", "central-lve.12"],
             )
-            self.assertEqual([item["result"] for item in result["selected_work"]], ["selected", "selected"])
+            self.assertEqual([item["result"] for item in result["selected_work"]], ["blocked", "blocked"])
             self.assertNotIn("passed", [item["result"] for item in result["selected_work"]])
+            self.assertTrue((second_checkout / "implemented-second.txt").exists())
             self.assertFalse(fake_calls.exists())
 
     def test_workstream_update_mode_edits_existing_terminal_pr(self):

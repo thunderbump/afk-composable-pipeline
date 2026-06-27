@@ -134,6 +134,9 @@ def normalize_request(input_data: Any, *, run_id: str) -> dict[str, Any]:
     work_item = normalize_work_item(input_data.get("work_item"))
     if work_item["status"] != "valid":
         return invalid_request(work_item["message"])
+    work_selection = normalize_work_selection(input_data.get("work_selection"), work_item["work_item"])
+    if work_selection["status"] != "valid":
+        return invalid_request(work_selection["message"])
 
     checkout = normalize_checkout(input_data.get("checkout"))
     if checkout["status"] != "valid":
@@ -167,6 +170,7 @@ def normalize_request(input_data: Any, *, run_id: str) -> dict[str, Any]:
         "status": "valid",
         "run_id": run_id,
         "work_item": work_item["work_item"],
+        "work_selection": work_selection["work_selection"],
         "checkout": checkout["checkout"],
         "implementation": implementation["implementation"],
         "validation": validation["validation"],
@@ -221,6 +225,32 @@ def normalize_work_item(work_item: Any) -> dict[str, Any]:
         "afk": dict(work_item.get("afk") or {}) if isinstance(work_item.get("afk") or {}, dict) else {},
     }
     return {"status": "valid", "work_item": redact_artifact_value(normalized)}
+
+
+def normalize_work_selection(work_selection: Any, fallback_work_item: dict[str, Any]) -> dict[str, Any]:
+    if work_selection is None:
+        return {
+            "status": "valid",
+            "work_selection": {"schema_version": SCHEMA_VERSION, "selected_work": [fallback_work_item]},
+        }
+    if not isinstance(work_selection, dict):
+        return {"status": "invalid", "message": "work_selection must be an object"}
+    selected_work = work_selection.get("selected_work")
+    if not isinstance(selected_work, list) or not selected_work:
+        return {"status": "invalid", "message": "work_selection.selected_work must be a non-empty list"}
+    normalized_items = []
+    for item in selected_work:
+        normalized = normalize_work_item(item)
+        if normalized["status"] != "valid":
+            return normalized
+        normalized_items.append(normalized["work_item"])
+    return {
+        "status": "valid",
+        "work_selection": {
+            "schema_version": SCHEMA_VERSION,
+            "selected_work": redact_artifact_value(normalized_items),
+        },
+    }
 
 
 def normalize_checkout(checkout: Any) -> dict[str, Any]:
@@ -534,6 +564,7 @@ def build_evidence_pack(request: dict[str, Any]) -> dict[str, Any]:
         "schema_version": SCHEMA_VERSION,
         "run_id": request["run_id"],
         "work_item": request["work_item"],
+        "work_selection": request["work_selection"],
         "acceptance_criteria": request["work_item"]["acceptance_criteria"],
         "checkout": request["checkout"],
         "implementation": request["implementation"],
@@ -859,6 +890,7 @@ def review_output(
         "classification": reviewer_result["classification"],
         "summary": reviewer_result["summary"],
         "work_item": request["work_item"],
+        "work_selection": request["work_selection"],
         "checkout": request["checkout"],
         "implementation": request["implementation"],
         "validation": request["validation"],
