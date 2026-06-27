@@ -172,7 +172,11 @@ def normalize_request(input_data: Any, *, project_contract: Any, run_id: str) ->
     if not isinstance(input_data, dict):
         return invalid_request("request must be an object")
 
-    work_item = selected_work_item(input_data.get("work_selection"), input_data.get("work_index", 0))
+    work_scope = string_field(input_data, "work_scope") or "item"
+    if work_scope == "selection":
+        work_item = selected_work_item_for_selection(input_data.get("work_selection"))
+    else:
+        work_item = selected_work_item(input_data.get("work_selection"), input_data.get("work_index", 0))
     if work_item["status"] != "valid":
         return invalid_request(work_item["message"])
 
@@ -196,6 +200,7 @@ def normalize_request(input_data: Any, *, project_contract: Any, run_id: str) ->
         "schema_version": SCHEMA_VERSION,
         "status": "valid",
         "work_item": work_item["work_item"],
+        "selected_work": work_item["selected_work"],
         "checkout": checkout["checkout"],
         "guardrails": guardrails["items"],
         "validation": validation["validation"],
@@ -264,7 +269,56 @@ def selected_work_item(work_selection: Any, work_index: Any) -> dict[str, Any]:
         "dependency_status": string_field(work_item, "dependency_status") or "",
         "afk": dict(work_item.get("afk") or {}) if isinstance(work_item.get("afk") or {}, dict) else {},
     }
-    return {"status": "valid", "work_item": redact_artifact_value(normalized)}
+    redacted = redact_artifact_value(normalized)
+    return {"status": "valid", "work_item": redacted, "selected_work": [redacted]}
+
+
+def selected_work_item_for_selection(work_selection: Any) -> dict[str, Any]:
+    if not isinstance(work_selection, dict):
+        return {"status": "invalid", "message": "work_selection must be an object"}
+    selected_work = work_selection.get("selected_work")
+    if not isinstance(selected_work, list) or not selected_work:
+        return {"status": "invalid", "message": "work_selection.selected_work must be a non-empty list"}
+    normalized_items = []
+    for index in range(len(selected_work)):
+        item = selected_work_item(work_selection, index)
+        if item["status"] != "valid":
+            return item
+        normalized_items.append(item["work_item"])
+    combined = combined_selected_work_item(normalized_items)
+    return {
+        "status": "valid",
+        "work_item": redact_artifact_value(combined),
+        "selected_work": redact_artifact_value(normalized_items),
+    }
+
+
+def combined_selected_work_item(selected_work: list[dict[str, Any]]) -> dict[str, Any]:
+    external_ids = [string_field(item, "external_id") or "" for item in selected_work]
+    source_types = sorted({string_field(item, "source_type") or "" for item in selected_work})
+    source_ids = sorted({string_field(item, "source_id") or "" for item in selected_work})
+    acceptance_criteria = []
+    for item in selected_work:
+        item_id = string_field(item, "external_id") or "selected item"
+        for criterion in item.get("acceptance_criteria", []):
+            if isinstance(criterion, str):
+                acceptance_criteria.append(f"{item_id}: {criterion}")
+    return {
+        "source_id": ",".join(source_ids),
+        "source_type": ",".join(source_types),
+        "external_id": ",".join(external_ids),
+        "url": "",
+        "title": f"Combined selected work ({len(selected_work)} items)",
+        "status": "",
+        "labels": sorted({label for item in selected_work for label in item.get("labels", []) if isinstance(label, str)}),
+        "parent": selected_work[0].get("parent"),
+        "workstream": selected_work[0].get("workstream"),
+        "acceptance_criteria": acceptance_criteria,
+        "dependencies": [],
+        "blockers": [],
+        "dependency_status": "",
+        "afk": {"combined_selection": True},
+    }
 
 
 def normalize_checkout(checkout: Any) -> dict[str, Any]:
@@ -670,6 +724,7 @@ def build_job_capsule(request: dict[str, Any], *, run_id: str) -> dict[str, Any]
         "schema_version": SCHEMA_VERSION,
         "run_id": run_id,
         "work_item": request["work_item"],
+        "work_selection": {"schema_version": SCHEMA_VERSION, "selected_work": request["selected_work"]},
         "acceptance_criteria": request["work_item"]["acceptance_criteria"],
         "checkout": request["checkout"],
         "agent_mounts": agent_mounts,
@@ -990,6 +1045,7 @@ def implement_output(
         "classification": agent_result["classification"],
         "summary": agent_result["summary"],
         "work_item": capsule["work_item"],
+        "work_selection": capsule["work_selection"],
         "checkout": capsule["checkout"],
         "git": metadata,
         "agent_result": agent_result,

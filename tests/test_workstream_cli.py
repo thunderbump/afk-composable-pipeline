@@ -16,6 +16,7 @@ from afk.workstream import (  # noqa: E402
     WorkstreamLedger,
     composed_step_input,
     pr_body_markdown,
+    current_selected_work_selection_identity,
     selected_work_records,
     select_work_proves_different_item,
     update_state_from_step,
@@ -268,6 +269,26 @@ class WorkstreamCliTest(unittest.TestCase):
 
         self.assertTrue(select_work_proves_different_item(input_data, state))
 
+    def test_select_work_target_ids_do_not_prove_different_item_when_any_current_item_overlaps(self):
+        state = {
+            "selected_work": [
+                selected_fixture_item("central-lve.9"),
+                selected_fixture_item("central-lve.10", "Follow-up terminal publisher hardening"),
+            ]
+        }
+        input_data = {"target_ids": ["central-lve.10"]}
+
+        self.assertFalse(select_work_proves_different_item(input_data, state))
+
+    def test_multi_item_selection_identity_is_order_independent(self):
+        first = selected_fixture_item("central-lve.9")
+        second = selected_fixture_item("central-lve.10", "Follow-up terminal publisher hardening")
+
+        self.assertEqual(
+            current_selected_work_selection_identity({"selected_work": [first, second]}),
+            current_selected_work_selection_identity({"selected_work": [second, first]}),
+        )
+
     def test_review_step_input_carries_combined_selected_work_for_multi_item_review(self):
         second_item = selected_fixture_item(
             "central-lve.10",
@@ -332,6 +353,41 @@ class WorkstreamCliTest(unittest.TestCase):
         self.assertEqual(
             [item["result"] for item in selected_work_records(state)],
             ["passed", "not_processed"],
+        )
+
+    def test_selected_work_records_do_not_match_evidence_across_sources_with_same_external_id(self):
+        beads_item = {
+            **selected_fixture_item("123"),
+            "source_id": "beads",
+            "source_type": "beads",
+            "url": "",
+        }
+        github_item = {
+            **selected_fixture_item("123"),
+            "source_id": "github",
+            "source_type": "github_issues",
+            "url": "",
+        }
+        state = {
+            "selected_work": [beads_item, github_item],
+            "implementation": {"status": "implemented", "git": {"after_commit": "def456"}},
+            "implementation_selection": [github_item],
+            "implementation_result_path": "runs/implement/step-result.json",
+            "validations": [
+                {
+                    "output": {"status": "validated", "checkout": {"start_commit": "def456"}},
+                    "step_result_path": "/tmp/ledger/runs/validate/step-result.json",
+                    "worker_result_path": "/tmp/ledger/runs/validate/worker-result.json",
+                }
+            ],
+            "review": {"status": "passed", "checkout": {"start_commit": "def456"}},
+            "review_selection": [github_item],
+            "review_result_path": "runs/review/step-result.json",
+        }
+
+        self.assertEqual(
+            [item["result"] for item in selected_work_records(state)],
+            ["not_processed", "passed"],
         )
 
     def test_workstream_composes_steps_and_creates_one_terminal_pr_from_ledger_evidence(self):
@@ -2903,6 +2959,26 @@ sys.exit(0)
                 selected_fixture_item(),
                 second_item,
             ]
+            combined_agent_code = textwrap.dedent(
+                """
+                import json
+                import os
+                import subprocess
+                from pathlib import Path
+
+                capsule = json.loads(Path(os.environ["AFK_JOB_CAPSULE"]).read_text(encoding="utf-8"))
+                selected = [item["external_id"] for item in capsule["work_selection"]["selected_work"]]
+                assert selected == ["central-lve.9", "central-lve.10"]
+                Path("implemented.txt").write_text("\\n".join(selected) + "\\n", encoding="utf-8")
+                subprocess.run(["git", "add", "implemented.txt"], check=True)
+                subprocess.run(["git", "commit", "-m", "implement selected work"], check=True)
+                Path("agent-result.json").write_text(
+                    json.dumps({"status": "completed", "summary": "implemented selected work"}),
+                    encoding="utf-8",
+                )
+                """
+            ).strip()
+            recipe["steps"][2]["input"]["agent"]["command"] = [sys.executable, "-c", combined_agent_code]
             completed = run_afk(
                 "run-workstream",
                 "--workstream-id",

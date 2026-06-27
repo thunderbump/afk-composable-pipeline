@@ -485,18 +485,10 @@ def implementation_work_selection(implementation: dict[str, Any], state: dict[st
 
 
 def current_selected_work_selection_identity(state: dict[str, Any]) -> str:
-    selected_work = state.get("selected_work")
-    if not isinstance(selected_work, list) or not selected_work:
+    identities = selected_work_identity_set(state.get("selected_work"))
+    if not identities:
         return ""
-    identities = []
-    for item in selected_work:
-        if not isinstance(item, dict):
-            return ""
-        identity = work_item_identity(item)
-        if not identity:
-            return ""
-        identities.append(identity)
-    return "|".join(identities)
+    return "|".join(sorted(identities))
 
 
 def current_selected_work_identity(state: dict[str, Any]) -> str:
@@ -510,25 +502,43 @@ def current_selected_work_identity(state: dict[str, Any]) -> str:
 
 
 def work_item_identity(item: dict[str, Any]) -> str:
-    return string_field(item, "url") or string_field(item, "external_id") or ""
+    source_id = string_field(item, "source_id") or ""
+    source_type = string_field(item, "source_type") or ""
+    external_id = string_field(item, "external_id") or ""
+    if source_id and source_type and external_id:
+        return f"{source_type}:{source_id}:{external_id}"
+    return string_field(item, "url") or external_id
+
+
+def work_item_aliases(item: dict[str, Any]) -> set[str]:
+    aliases = set()
+    identity = work_item_identity(item)
+    if identity:
+        aliases.add(identity)
+    url = string_field(item, "url")
+    if url:
+        aliases.add(url)
+    external_id = string_field(item, "external_id")
+    if external_id:
+        aliases.add(external_id)
+    return aliases
 
 
 def select_work_proves_different_item(input_data: Any, state: dict[str, Any]) -> bool:
-    current_identity = current_selected_work_identity(state)
-    current_external_id = current_selected_work_external_id(state)
-    if not current_identity and not current_external_id:
+    current_aliases = selected_work_aliases(state.get("selected_work"))
+    if not current_aliases:
         return False
     if not isinstance(input_data, dict):
         return False
 
     target_ids = input_data.get("target_ids")
     if isinstance(target_ids, list) and target_ids and all(isinstance(item, str) and item.strip() for item in target_ids):
-        return current_external_id not in {item.strip() for item in target_ids}
+        return current_aliases.isdisjoint({item.strip() for item in target_ids})
 
     candidate_identities = select_work_candidate_identities(input_data)
     if not candidate_identities:
         return False
-    return current_identity not in candidate_identities and current_external_id not in candidate_identities
+    return current_aliases.isdisjoint(candidate_identities)
 
 
 def current_selected_work_external_id(state: dict[str, Any]) -> str:
@@ -557,15 +567,39 @@ def select_work_candidate_identities(input_data: dict[str, Any]) -> set[str]:
         for item in items:
             if not isinstance(item, dict):
                 return set()
-            identity = work_item_identity(item)
-            external_id = string_field(item, "external_id")
-            if not identity and not external_id:
+            aliases = work_item_aliases(item)
+            if not aliases:
                 return set()
-            if identity:
-                identities.add(identity)
-            if external_id:
-                identities.add(external_id)
+            identities.update(aliases)
     return identities
+
+
+def selected_work_identity_set(selected_work: Any) -> set[str]:
+    if not isinstance(selected_work, list) or not selected_work:
+        return set()
+    identities = set()
+    for item in selected_work:
+        if not isinstance(item, dict):
+            return set()
+        identity = work_item_identity(item)
+        if not identity:
+            return set()
+        identities.add(identity)
+    return identities
+
+
+def selected_work_aliases(selected_work: Any) -> set[str]:
+    if not isinstance(selected_work, list) or not selected_work:
+        return set()
+    aliases = set()
+    for item in selected_work:
+        if not isinstance(item, dict):
+            return set()
+        item_aliases = work_item_aliases(item)
+        if not item_aliases:
+            return set()
+        aliases.update(item_aliases)
+    return aliases
 
 
 def reset_cycle_state_for_new_selection(state: dict[str, Any]) -> None:
@@ -1463,19 +1497,14 @@ def incomplete_selected_work_ids(state: dict[str, Any]) -> list[str]:
 
 def work_item_in_selection(item: dict[str, Any], selection: Any) -> bool:
     item_identity = work_item_identity(item)
-    item_external_id = string_field(item, "external_id") or ""
-    if not item_identity and not item_external_id:
+    if not item_identity:
         return False
     if not isinstance(selection, list):
         return False
     for candidate in selection:
         if not isinstance(candidate, dict):
             continue
-        candidate_identity = work_item_identity(candidate)
-        candidate_external_id = string_field(candidate, "external_id") or ""
-        if item_identity and candidate_identity == item_identity:
-            return True
-        if item_external_id and candidate_external_id == item_external_id:
+        if work_item_identity(candidate) == item_identity:
             return True
     return False
 

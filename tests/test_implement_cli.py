@@ -2907,6 +2907,76 @@ class ImplementCliTest(unittest.TestCase):
                     self.assertEqual(work_item["external_id"], external_id)
                     self.assertNotIn("raw", work_item)
 
+    def test_implement_selection_scope_carries_all_selected_items_in_job_capsule_and_output(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            checkout = temp_path / "checkout"
+            start_commit = init_checkout(checkout)
+            ledger = temp_path / "ledger"
+            agent_code = textwrap.dedent(
+                """
+                import json
+                import os
+                from pathlib import Path
+
+                capsule = json.loads(Path(os.environ["AFK_JOB_CAPSULE"]).read_text(encoding="utf-8"))
+                assert [item["external_id"] for item in capsule["work_selection"]["selected_work"]] == [
+                    "central-lve.5",
+                    "central-lve.6",
+                ]
+                Path("implemented.txt").write_text(capsule["work_item"]["external_id"], encoding="utf-8")
+                Path("agent-result.json").write_text(
+                    json.dumps({"status": "completed", "summary": "combined work"}),
+                    encoding="utf-8",
+                )
+                """
+            ).strip()
+
+            completed = run_afk(
+                "run-step",
+                "implement",
+                "--input",
+                json.dumps(
+                    {
+                        "work_scope": "selection",
+                        "work_selection": {
+                            "schema_version": 1,
+                            "selected_work": [
+                                selected_work("fixture", "central-lve.5"),
+                                selected_work("fixture", "central-lve.6"),
+                            ],
+                        },
+                        "checkout": {
+                            "status": "prepared",
+                            "checkout_path": str(checkout),
+                            "review_branch": "afk/test-work",
+                            "requested_ref": "main",
+                            "start_commit": start_commit,
+                        },
+                        "guardrails": [],
+                        "validation": {"profile": "tier1", "commands": []},
+                        "agent": {
+                            "type": "fake-pi-command",
+                            "command": [sys.executable, "-c", agent_code],
+                            "result_path": "agent-result.json",
+                        },
+                    }
+                ),
+                "--ledger",
+                str(ledger),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            result = json.loads((ledger / "runs" / summary["run_id"] / "step-result.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(result["output"]["status"], "implemented")
+            self.assertEqual(result["output"]["work_item"]["external_id"], "central-lve.5,central-lve.6")
+            self.assertEqual(
+                [item["external_id"] for item in result["output"]["work_selection"]["selected_work"]],
+                ["central-lve.5", "central-lve.6"],
+            )
+
     def test_implement_does_not_persist_pi_credentials_from_rejected_agent_config(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
