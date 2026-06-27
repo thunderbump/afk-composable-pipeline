@@ -86,8 +86,12 @@ def run_workstream(
         "checkout": None,
         "checkout_attempts": [],
         "implementation": None,
+        "implementation_selection": [],
+        "implementation_result_path": "",
         "validations": [],
         "review": None,
+        "review_selection": [],
+        "review_result_path": "",
         "cleanup": {"status": "unknown", "resources": []},
         "blocked_reason": "",
         "stop_reason": "",
@@ -157,12 +161,12 @@ def run_workstream(
                     normalized=normalized,
                     state=state,
                     steps=steps,
-                    selected_work=selected_work_records(state, review_status(state)),
+                    selected_work=selected_work_records(state),
                     ledger=ledger,
                 )
             status = workstream_status_from_publication(publication)
     tracker = tracker_record(normalized, state, publication)
-    selected_work = selected_work_records(state, tracker_selected_work_status(state, publication, tracker))
+    selected_work = selected_work_records(state)
 
     result_payload = {
         "schema_version": SCHEMA_VERSION,
@@ -271,6 +275,8 @@ def composed_step_input(
                 input_data["requested_ref"] = requested_ref
     elif step_name == "implement":
         input_data["work_selection"] = {"schema_version": SCHEMA_VERSION, "selected_work": state["selected_work"]}
+        if selected_work_count(state) > 1 and "work_index" not in input_data and "work_scope" not in input_data:
+            input_data["work_scope"] = "selection"
         if state.get("checkout") is not None:
             input_data["checkout"] = state["checkout"]
         else:
@@ -286,7 +292,9 @@ def composed_step_input(
             input_data["validation"] = {**validation, "profile": profile}
     elif step_name == "review":
         if state["selected_work"]:
-            input_data["work_item"] = state["selected_work"][0]
+            implementation = state.get("implementation") if isinstance(state.get("implementation"), dict) else {}
+            input_data["work_item"] = implementation.get("work_item") or state["selected_work"][0]
+            input_data["work_selection"] = implementation_work_selection(implementation, state)
         if state.get("checkout") is not None:
             input_data["checkout"] = state["checkout"]
         if state.get("implementation") is not None:
@@ -348,10 +356,10 @@ def update_state_from_step(
 ) -> None:
     output = result.output if isinstance(result.output, dict) else {}
     if step_name == "select-work":
-        previous_identity = current_selected_work_identity(state)
+        previous_identity = current_selected_work_selection_identity(state)
         selected = output.get("selected_work")
         state["selected_work"] = list(selected) if isinstance(selected, list) else []
-        if previous_identity and current_selected_work_identity(state) != previous_identity:
+        if previous_identity and current_selected_work_selection_identity(state) != previous_identity:
             reset_cycle_state_for_new_selection(state)
     elif step_name == "prepare-checkout":
         if output.get("status") == "prepared" or state.get("checkout") is None:
@@ -360,18 +368,25 @@ def update_state_from_step(
         if output.get("status") == "prepared" and implemented_after_commit(state):
             state["validations"] = []
             state["review"] = None
+            state["review_selection"] = []
+            state["review_result_path"] = ""
     elif step_name == "implement":
         state["implementation"] = output
+        state["implementation_selection"] = output_selected_work(output, state)
+        state["implementation_result_path"] = f"runs/{result.run_id}/step-result.json"
         state["checkout"] = checkout_after_implementation(state.get("checkout"), output)
         update_checkout_attempt_after_implementation(state, output)
+        state["review"] = None
+        state["review_selection"] = []
+        state["review_result_path"] = ""
         if output.get("status") == "implemented":
             state["validations"] = []
-            state["review"] = None
     elif step_name == "validate":
         state["validations"].append(
             {
                 "run_id": result.run_id,
                 "output": output,
+                "selected_work": snapshot_work_selection(state.get("implementation_selection")),
                 "step_result_path": str((ledger_dir / "runs" / result.run_id / "step-result.json").resolve(strict=False)),
                 "worker_result_path": str((ledger_dir / "runs" / result.run_id / "worker-result.json").resolve(strict=False)),
             }
@@ -379,6 +394,8 @@ def update_state_from_step(
         update_checkout_attempt_after_validation(state, output)
     elif step_name == "review":
         state["review"] = output
+        state["review_selection"] = output_selected_work(output, state)
+        state["review_result_path"] = f"runs/{result.run_id}/step-result.json"
         cleanup = output.get("cleanup")
         if isinstance(cleanup, dict):
             state["cleanup"] = cleanup
@@ -389,8 +406,6 @@ def workflow_order_blocking_reason(
     state: dict[str, Any],
     retry_policy: dict[str, int],
 ) -> str:
-    if step_name in {"implement", "review"} and selected_work_count(state) > 1:
-        return "MVP supports a single selected work item; narrow the selection and rerun"
     if step_name == "prepare-checkout":
         retry_block = retry_prepare_checkout_blocking_reason(state, retry_policy)
         if retry_block:
@@ -435,6 +450,50 @@ def next_allowed_command_for_terminal_stop(state: dict[str, Any], normalized: di
 def selected_work_count(state: dict[str, Any]) -> int:
     selected_work = state.get("selected_work")
     return len(selected_work) if isinstance(selected_work, list) else 0
+
+
+def snapshot_work_selection(selected_work: Any) -> list[dict[str, Any]]:
+    if not isinstance(selected_work, list):
+        return []
+    return [dict(item) for item in selected_work if isinstance(item, dict)]
+
+
+def snapshot_selected_work(state: dict[str, Any]) -> list[dict[str, Any]]:
+    return snapshot_work_selection(state.get("selected_work"))
+
+
+def output_selected_work(output: dict[str, Any], state: dict[str, Any]) -> list[dict[str, Any]]:
+    work_selection = output.get("work_selection") if isinstance(output.get("work_selection"), dict) else {}
+    selected_work = work_selection.get("selected_work")
+    if isinstance(selected_work, list) and selected_work:
+        return snapshot_work_selection(selected_work)
+    work_item = output.get("work_item")
+    if isinstance(work_item, dict):
+        return [dict(work_item)]
+    return snapshot_selected_work(state)
+
+
+def implementation_work_selection(implementation: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
+    work_selection = implementation.get("work_selection") if isinstance(implementation.get("work_selection"), dict) else {}
+    selected_work = work_selection.get("selected_work")
+    if isinstance(selected_work, list) and selected_work:
+        return {"schema_version": SCHEMA_VERSION, "selected_work": snapshot_work_selection(selected_work)}
+    return {"schema_version": SCHEMA_VERSION, "selected_work": snapshot_selected_work(state)}
+
+
+def current_selected_work_selection_identity(state: dict[str, Any]) -> str:
+    selected_work = state.get("selected_work")
+    if not isinstance(selected_work, list) or not selected_work:
+        return ""
+    identities = []
+    for item in selected_work:
+        if not isinstance(item, dict):
+            return ""
+        identity = work_item_identity(item)
+        if not identity:
+            return ""
+        identities.append(identity)
+    return "|".join(identities)
 
 
 def current_selected_work_identity(state: dict[str, Any]) -> str:
@@ -510,8 +569,12 @@ def reset_cycle_state_for_new_selection(state: dict[str, Any]) -> None:
     state["checkout"] = None
     state["checkout_attempts"] = []
     state["implementation"] = None
+    state["implementation_selection"] = []
+    state["implementation_result_path"] = ""
     state["validations"] = []
     state["review"] = None
+    state["review_selection"] = []
+    state["review_result_path"] = ""
     state["cleanup"] = {"status": "unknown", "resources": []}
 
 
@@ -612,6 +675,9 @@ def publication_gate_reason(state: dict[str, Any]) -> str:
         return f"final review did not pass: {review.get('status') or 'missing status'}"
     if implemented_commit and review_checkout_commit(review) != implemented_commit:
         return "final review evidence is stale for implemented HEAD"
+    incomplete = incomplete_selected_work_ids(state)
+    if incomplete:
+        return "selected work items lack passed implementation, validation, and review evidence: " + ", ".join(incomplete)
     return ""
 
 
@@ -1007,6 +1073,9 @@ def pr_body_markdown(
             f"- {pr_body_value(item['external_id'])} - "
             f"{pr_body_value(item['title'])} ({pr_body_value(item['result'])})"
         )
+        artifact_lines = selected_work_artifact_lines_for_body(item, state)
+        for artifact_line in artifact_lines:
+            lines.append(f"  - {pr_body_value(artifact_line)}")
     lines.extend(["", "## Changed files", ""])
     if changed_files:
         lines.extend(f"- {pr_body_value(path)}" for path in changed_files)
@@ -1336,7 +1405,7 @@ def pr_body_value(value: Any) -> str:
     return redact_text(str(value))
 
 
-def selected_work_records(state: dict[str, Any], result_status: str) -> list[dict[str, str]]:
+def selected_work_records(state: dict[str, Any]) -> list[dict[str, str]]:
     records = []
     for item in state["selected_work"]:
         if not isinstance(item, dict):
@@ -1347,10 +1416,117 @@ def selected_work_records(state: dict[str, Any], result_status: str) -> list[dic
                 "title": redact_text(str(item.get("title") or "")),
                 "source_id": redact_text(str(item.get("source_id") or "")),
                 "source_type": redact_text(str(item.get("source_type") or "")),
-                "result": redact_text(result_status),
+                "result": redact_text(selected_work_result(item, state)),
             }
         )
     return records
+
+
+def selected_work_result(item: dict[str, Any], state: dict[str, Any]) -> str:
+    implementation = state.get("implementation") if isinstance(state.get("implementation"), dict) else {}
+    implementation_status = string_field(implementation, "status") or ""
+    implementation_selection = state.get("implementation_selection")
+    item_in_implementation = work_item_in_selection(item, implementation_selection)
+    current_validations = current_validation_records(state)
+    latest_validation = current_validations[-1] if current_validations else None
+    current_review = current_review_record(state)
+    review = state.get("review") if isinstance(state.get("review"), dict) else {}
+
+    if item_in_implementation:
+        if implementation_status and implementation_status != "implemented":
+            return "failed"
+        if current_review is not None:
+            if work_item_in_selection(item, state.get("review_selection")):
+                return "passed" if review.get("status") == "passed" and has_current_validated_evidence(state) else "failed"
+            return "not_processed"
+        if latest_validation is not None and latest_validation["output"].get("status") != "validated":
+            return "failed"
+        return "blocked"
+
+    if implementation_status or current_validations or current_review is not None:
+        return "not_processed"
+    return "blocked"
+
+
+def incomplete_selected_work_ids(state: dict[str, Any]) -> list[str]:
+    ids = []
+    for item in state.get("selected_work", []):
+        if not isinstance(item, dict):
+            continue
+        if selected_work_result(item, state) != "passed":
+            ids.append(redact_text(string_field(item, "external_id") or "selected item"))
+    return ids
+
+
+def work_item_in_selection(item: dict[str, Any], selection: Any) -> bool:
+    item_identity = work_item_identity(item)
+    item_external_id = string_field(item, "external_id") or ""
+    if not item_identity and not item_external_id:
+        return False
+    if not isinstance(selection, list):
+        return False
+    for candidate in selection:
+        if not isinstance(candidate, dict):
+            continue
+        candidate_identity = work_item_identity(candidate)
+        candidate_external_id = string_field(candidate, "external_id") or ""
+        if item_identity and candidate_identity == item_identity:
+            return True
+        if item_external_id and candidate_external_id == item_external_id:
+            return True
+    return False
+
+
+def current_validation_records(state: dict[str, Any]) -> list[dict[str, Any]]:
+    implemented_commit = implemented_after_commit(state)
+    validations = state.get("validations")
+    if not implemented_commit or not isinstance(validations, list):
+        return []
+    return [
+        validation
+        for validation in validations
+        if isinstance(validation, dict) and validation_checkout_commit(validation) == implemented_commit
+    ]
+
+
+def current_review_record(state: dict[str, Any]) -> dict[str, Any] | None:
+    implemented_commit = implemented_after_commit(state)
+    review = state.get("review")
+    if not implemented_commit or not isinstance(review, dict):
+        return None
+    if review_checkout_commit(review) != implemented_commit:
+        return None
+    return review
+
+
+def selected_work_artifact_lines_for_body(item: dict[str, Any], state: dict[str, Any]) -> list[str]:
+    lines = []
+    if work_item_in_selection(item, state.get("implementation_selection")):
+        implementation_path = string_field(state, "implementation_result_path") or ""
+        if implementation_path:
+            lines.append(f"implementation: {ledger_relative_path(implementation_path)}")
+    validation_paths = selected_work_validation_paths(item, state)
+    if validation_paths:
+        lines.append(f"validation: {'; '.join(validation_paths)}")
+    if work_item_in_selection(item, state.get("review_selection")):
+        review_path = string_field(state, "review_result_path") or ""
+        if review_path:
+            lines.append(f"review: {ledger_relative_path(review_path)}")
+    return lines
+
+
+def selected_work_validation_paths(item: dict[str, Any], state: dict[str, Any]) -> list[str]:
+    if not work_item_in_selection(item, state.get("implementation_selection")):
+        return []
+    refs = []
+    for validation in current_validation_records(state):
+        step_path = ledger_relative_path(string_field(validation, "step_result_path") or "")
+        worker_path = ledger_relative_path(string_field(validation, "worker_result_path") or "")
+        if step_path:
+            refs.append(step_path)
+        if worker_path:
+            refs.append(worker_path)
+    return refs
 
 
 def tracker_selected_work_status(
