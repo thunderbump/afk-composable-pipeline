@@ -467,10 +467,13 @@ def output_selected_work(output: dict[str, Any], state: dict[str, Any]) -> list[
     selected_work = work_selection.get("selected_work")
     if isinstance(selected_work, list) and selected_work:
         return snapshot_work_selection(selected_work)
+    state_selection = snapshot_selected_work(state)
+    if state_selection:
+        return state_selection
     work_item = output.get("work_item")
     if isinstance(work_item, dict):
         return [dict(work_item)]
-    return snapshot_selected_work(state)
+    return []
 
 
 def implementation_work_selection(implementation: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
