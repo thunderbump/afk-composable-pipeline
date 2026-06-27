@@ -173,6 +173,8 @@ def normalize_request(input_data: Any, *, project_contract: Any, run_id: str) ->
         return invalid_request("request must be an object")
 
     work_scope = string_field(input_data, "work_scope") or "item"
+    if work_scope not in {"item", "selection"}:
+        return invalid_request("work_scope must be item or selection")
     if work_scope == "selection":
         work_item = selected_work_item_for_selection(input_data.get("work_selection"))
     else:

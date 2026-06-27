@@ -481,6 +481,9 @@ def implementation_work_selection(implementation: dict[str, Any], state: dict[st
     selected_work = work_selection.get("selected_work")
     if isinstance(selected_work, list) and selected_work:
         return {"schema_version": SCHEMA_VERSION, "selected_work": snapshot_work_selection(selected_work)}
+    work_item = implementation.get("work_item")
+    if isinstance(work_item, dict):
+        return {"schema_version": SCHEMA_VERSION, "selected_work": [dict(work_item)]}
     return {"schema_version": SCHEMA_VERSION, "selected_work": snapshot_selected_work(state)}
 
 

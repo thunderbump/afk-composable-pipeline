@@ -2977,6 +2977,49 @@ class ImplementCliTest(unittest.TestCase):
                 ["central-lve.5", "central-lve.6"],
             )
 
+    def test_implement_rejects_unknown_work_scope(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            checkout = temp_path / "checkout"
+            start_commit = init_checkout(checkout)
+            ledger = temp_path / "ledger"
+
+            completed = run_afk(
+                "run-step",
+                "implement",
+                "--input",
+                json.dumps(
+                    {
+                        "work_scope": "selected",
+                        "work_selection": {"schema_version": 1, "selected_work": [selected_work()]},
+                        "checkout": {
+                            "status": "prepared",
+                            "checkout_path": str(checkout),
+                            "review_branch": "afk/test-work",
+                            "requested_ref": "main",
+                            "start_commit": start_commit,
+                        },
+                        "guardrails": [],
+                        "validation": {"profile": "tier1", "commands": []},
+                        "agent": {
+                            "type": "fake-pi-command",
+                            "command": [sys.executable, "-c", "raise SystemExit('agent should not run')"],
+                            "result_path": "agent-result.json",
+                        },
+                    }
+                ),
+                "--ledger",
+                str(ledger),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            result = json.loads((ledger / "runs" / summary["run_id"] / "step-result.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(summary["status"], "failed")
+            self.assertEqual(result["output"]["status"], "failed_invalid_payload")
+            self.assertEqual(result["output"]["message"], "work_scope must be item or selection")
+
     def test_implement_does_not_persist_pi_credentials_from_rejected_agent_config(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)

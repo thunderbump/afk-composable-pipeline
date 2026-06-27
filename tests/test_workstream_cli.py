@@ -280,6 +280,21 @@ class WorkstreamCliTest(unittest.TestCase):
 
         self.assertFalse(select_work_proves_different_item(input_data, state))
 
+    def test_select_work_source_qualified_target_ids_can_prove_same_external_id_is_different(self):
+        state = {
+            "selected_work": [
+                {
+                    **selected_fixture_item("123"),
+                    "source_id": "beads",
+                    "source_type": "beads",
+                    "url": "",
+                }
+            ]
+        }
+        input_data = {"target_ids": ["github_issues:github:123"]}
+
+        self.assertTrue(select_work_proves_different_item(input_data, state))
+
     def test_multi_item_selection_identity_is_order_independent(self):
         first = selected_fixture_item("central-lve.9")
         second = selected_fixture_item("central-lve.10", "Follow-up terminal publisher hardening")
@@ -388,6 +403,40 @@ class WorkstreamCliTest(unittest.TestCase):
         self.assertEqual(
             [item["result"] for item in selected_work_records(state)],
             ["not_processed", "passed"],
+        )
+
+    def test_review_step_input_does_not_expand_legacy_implementation_to_full_selection(self):
+        first = selected_fixture_item("central-lve.9")
+        second = selected_fixture_item("central-lve.10", "Follow-up terminal publisher hardening")
+        state = {
+            "selected_work": [first, second],
+            "checkout": {
+                "status": "prepared",
+                "checkout_path": "/tmp/checkout",
+                "start_commit": "abc123",
+            },
+            "implementation": {
+                "status": "implemented",
+                "work_item": first,
+                "git": {"after_commit": "def456"},
+            },
+            "validations": [],
+        }
+
+        review_input = composed_step_input(
+            {"name": "review", "input": {"reviewer": {"type": "fake-reviewer-command"}}},
+            {
+                "workstream_id": "central-lve.9",
+                "parent": "central-lve",
+                "review_branch": "afk/workstream-terminal-pr",
+            },
+            state,
+            Path("/tmp/ledger"),
+        )
+
+        self.assertEqual(
+            [item["external_id"] for item in review_input["work_selection"]["selected_work"]],
+            ["central-lve.9"],
         )
 
     def test_workstream_composes_steps_and_creates_one_terminal_pr_from_ledger_evidence(self):
