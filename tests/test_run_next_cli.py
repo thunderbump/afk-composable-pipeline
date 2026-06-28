@@ -167,6 +167,69 @@ raise SystemExit(9)
                 ["skipped_no_auth", "skipped_no_auth"],
             )
 
+    def test_run_next_targets_afk_composable_pipeline_with_first_party_contract(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            fake_bin = temp_path / "bin"
+            beads_workspace = temp_path / "beads"
+            checkout_root = temp_path / "checkouts"
+            checkout_path = checkout_root / "afk-composable-pipeline"
+            beads_workspace.mkdir()
+            fake_bin.mkdir()
+            write_executable(
+                fake_bin / "gh",
+                f"""#!{sys.executable}
+import sys
+
+if sys.argv[1:3] == ["auth", "status"]:
+    sys.exit(1)
+raise SystemExit(9)
+""",
+            )
+            write_executable(
+                fake_bin / "bd",
+                f"""#!{sys.executable}
+raise SystemExit(9)
+""",
+            )
+
+            completed = run_afk(
+                "run-next",
+                "--project",
+                "afk-composable-pipeline",
+                "--contracts-dir",
+                "project-contracts",
+                "--beads-workspace",
+                str(beads_workspace),
+                "--checkout-root",
+                str(checkout_root),
+                "--checkout-path",
+                str(checkout_path),
+                "--validation-profile",
+                "tier1",
+                "--ledger",
+                str(temp_path / "ledger"),
+                env={"GH_TOKEN": None, "GITHUB_TOKEN": None, "PATH": str(fake_bin)},
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            payload = json.loads(completed.stdout)
+
+            self.assertEqual(payload["project"], "afk-composable-pipeline")
+            self.assertEqual(
+                payload["selection_request"]["required_labels"],
+                ["project:afk-composable-pipeline", "ready-for-agent"],
+            )
+            self.assertEqual(
+                payload["selection_request"]["sources"][0]["labels"],
+                ["project:afk-composable-pipeline", "ready-for-agent"],
+            )
+            self.assertEqual(
+                payload["selection_request"]["sources"][1]["repo"],
+                "thunderbump/afk-composable-pipeline",
+            )
+            self.assertEqual(payload["selection_result"]["selected_work"], [])
+
     def test_deterministic_selector_prefers_beads_then_stable_ids(self):
         candidates = [
             {

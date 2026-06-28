@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "project_slug": "afk-composable-pipeline",
+  "repo_url": "git@github.com:thunderbump/afk-composable-pipeline.git",
+  "base_branch": "main",
+  "beads_labels": ["project:afk-composable-pipeline"],
+  "validation_profiles": [
+    "preflight",
+    "tier1",
+    "tier2-readonly",
+    "tier3-harness",
+    "tier1-tier3-harness"
+  ],
+  "validation_profile_requests": {
+    "preflight": {
+      "profile": "preflight"
+    },
+    "tier1": {
+      "profile": "safe"
+    },
+    "tier2-readonly": {
+      "profile": "safe"
+    },
+    "tier3-harness": {
+      "profile": "tier3-harness"
+    },
+    "tier1-tier3-harness": {
+      "profile": "tier1-tier3-harness"
+    }
+  },
+  "artifact_retention": {
+    "ledger_days": 30,
+    "log_days": 30
+  },
+  "pr_target": {
+    "remote": "origin",
+    "branch": "main"
+  }
+}

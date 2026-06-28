@@ -55,6 +55,23 @@ class NoopCliTest(unittest.TestCase):
             "tier1-tier3-harness",
         )
 
+    def test_afk_composable_pipeline_contract_supports_self_dogfood(self):
+        contract = load_project_contract(
+            "afk-composable-pipeline",
+            ROOT / "project-contracts",
+            cwd=ROOT,
+        )
+
+        self.assertEqual(
+            contract.repo_url,
+            "git@github.com:thunderbump/afk-composable-pipeline.git",
+        )
+        self.assertEqual(contract.base_branch, "main")
+        self.assertEqual(contract.beads_labels, ("project:afk-composable-pipeline",))
+        self.assertEqual(contract.pr_target, {"remote": "origin", "branch": "main"})
+        self.assertEqual(contract.validation_profile_requests["tier1"]["profile"], "safe")
+        self.assertEqual(contract.identity.path, "project-contracts/afk-composable-pipeline.json")
+
     def test_unknown_step_is_rejected_with_registry_error(self):
         input_json = (FIXTURES / "noop-input.json").read_text(encoding="utf-8")
 

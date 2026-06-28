@@ -363,6 +363,18 @@ PYTHONPATH=src python3 -m afk run-next \
   --validation-profile tier1
 ```
 
+To preview this pipeline repo against its own first-party contract, switch the
+project and checkout path:
+
+```sh
+PYTHONPATH=src python3 -m afk run-next \
+  --project afk-composable-pipeline \
+  --contracts-dir project-contracts \
+  --checkout-root /work \
+  --checkout-path /work/afk-composable-pipeline \
+  --validation-profile tier1
+```
+
 `run-next` builds a project-scoped `select-work` request from the contract
 labels plus the observed `ready-for-agent` tag, tries both Beads and GitHub
 Issues sources when the contract can name a GitHub repo, and chooses a stable
