@@ -170,6 +170,12 @@ The recipe schema is intentionally small:
   optional note-path lists under `notes.personal_work` and `notes.spikes`.
   Keep retrospective note paths free of secrets; AFK redacts sensitive-looking
   values before writing ledger outputs.
+- `retrospective_follow_up` is optional top-level configuration for creating or
+  recording Beads after the deterministic retrospective is built. By default
+  AFK stays in recommendation-only mode. When enabled, it runs a local or fake
+  command against a redacted request and records the normalized result under
+  `pipeline_retrospective.follow_up.creation` without changing publication or
+  tracker status.
 - `tracker.terminal_decision` is optional. Leave it unset while a PR is open or
   under review. Set `{"status":"merged","merge_commit":"<sha>","pr_url":"<url>"}`
   only after the PR merges, or
@@ -570,6 +576,10 @@ ledger/
       pipeline-retrospective.json
       pr-body.md
       publication-result.json
+      retrospective-follow-up-request.json
+      retrospective-follow-up-result.json
+      retrospective-follow-up-stderr.log
+      retrospective-follow-up-stdout.log
       retrospective.json
       tracker-result.json
       workstream-result.json
@@ -614,7 +624,12 @@ recorded.
 `pipeline-retrospective.json` records deterministic pipeline feedback for every
 completed workstream run. It summarizes retrospective health, publication and
 tracker status, derived signals, and recommended follow-up without changing the
-functional publication or tracker outcome.
+functional publication or tracker outcome. `pipeline_retrospective.follow_up`
+contains Beads-shaped `recommended` entries with `kind`, `summary`, `labels`,
+and stable redacted `fingerprint` values, plus any `created` Beads and a
+`creation` record describing recommendation-only mode or an optional creator
+adapter run. The legacy `recommended_follow_up` list is preserved for
+compatibility.
 An optional top-level `retrospective_judge` recipe block can add a disabled-by-
 default post-pass that runs a local command against a redacted evidence pack
 built from the deterministic pipeline retrospective, tracker/publication
@@ -622,6 +637,12 @@ summary, selected work, cleanup state, and redacted terminal retrospective
 evidence. Judge findings are recorded under `pipeline_retrospective.judge` and
 may add retrospective signals, but they do not change the functional
 publication or tracker status.
+When `retrospective_follow_up.enabled` is true, AFK writes a redacted
+`retrospective-follow-up-request.json`, runs the configured local or fake
+command in a minimal environment, and records the normalized outcome in
+`retrospective-follow-up-result.json` plus stdout/stderr logs. Command failures
+are kept inside `pipeline_retrospective.follow_up.creation` and do not alter
+the functional publication or tracker result.
 `retrospective.json`, when present, stores the user-supplied terminal
 retrospective evidence separately from the derived pipeline retrospective.
 `review_cycles` evidence, when supplied, is included in both

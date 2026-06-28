@@ -82,6 +82,26 @@ class _RetrospectiveJudgeError(RuntimeError):
         self.timed_out = timed_out
 
 
+class _RetrospectiveFollowUpError(RuntimeError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        command: list[str],
+        returncode: int | None,
+        stdout: str = "",
+        stderr: str = "",
+        timed_out: bool = False,
+    ):
+        super().__init__(message)
+        self.message = message
+        self.command = command
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+        self.timed_out = timed_out
+
+
 def run_workstream(
     recipe: Any,
     *,
@@ -213,6 +233,18 @@ def run_workstream(
         retrospective_judge,
         normalized=normalized,
     )
+    retrospective_follow_up_creation = _run_retrospective_follow_up(
+        normalized=normalized,
+        state=state,
+        publication=publication,
+        tracker=tracker,
+        pipeline_retrospective=pipeline_retrospective,
+        ledger=ledger,
+    )
+    pipeline_retrospective = _apply_retrospective_follow_up_creation(
+        pipeline_retrospective,
+        retrospective_follow_up_creation,
+    )
 
     ledger.write_json("publication-result.json", publication)
     ledger.write_json("tracker-result.json", tracker)
@@ -292,6 +324,7 @@ def normalize_recipe(
     tracker = normalize_tracker_config(recipe.get("tracker"))
     review_cycles = normalize_review_cycles(recipe.get("review_cycles"))
     retrospective = normalize_retrospective(recipe.get("retrospective"))
+    retrospective_follow_up = normalize_retrospective_follow_up_config(recipe.get("retrospective_follow_up"))
     retrospective_judge = normalize_retrospective_judge(recipe.get("retrospective_judge"))
     validate_retrospective_terminal_decision(retrospective, tracker)
     return {
@@ -305,6 +338,7 @@ def normalize_recipe(
         "tracker": tracker,
         "review_cycles": review_cycles,
         "retrospective": retrospective,
+        "retrospective_follow_up": retrospective_follow_up,
         "retrospective_judge": retrospective_judge,
     }
 
@@ -1896,7 +1930,7 @@ def pipeline_retrospective_record(
         + _blocked_retrospective_signals(publication)
         + _cleanup_retrospective_signals(state)
     )
-    follow_up = _retrospective_follow_up(signals, normalized)
+    follow_up = _retrospective_follow_up_record(signals, normalized)
     return {
         "schema_version": SCHEMA_VERSION,
         "status": workstream_status_from_publication(publication),
@@ -1904,7 +1938,8 @@ def pipeline_retrospective_record(
         "publication_status": redact_text(str(publication.get("status") or "")),
         "tracker_status": redact_text(str(tracker.get("status") or "")),
         "signals": signals,
-        "recommended_follow_up": follow_up,
+        "recommended_follow_up": _legacy_recommended_follow_up(follow_up["recommended"]),
+        "follow_up": follow_up,
         "judge": _disabled_retrospective_judge_record(),
     }
 
@@ -1932,7 +1967,9 @@ def _apply_retrospective_judge(
         signals.extend(judge_signals)
     record["signals"] = signals
     record["health"] = _retrospective_health(signals)
-    record["recommended_follow_up"] = _retrospective_follow_up(signals, normalized)
+    follow_up = _retrospective_follow_up_record(signals, normalized)
+    record["recommended_follow_up"] = _legacy_recommended_follow_up(follow_up["recommended"])
+    record["follow_up"] = follow_up
     record["judge"] = judge
     return record
 
@@ -2316,6 +2353,409 @@ def _write_retrospective_judge_result(path: Path, run_id: str, judge_result: dic
     )
 
 
+def _run_retrospective_follow_up(
+    *,
+    normalized: dict[str, Any],
+    state: dict[str, Any],
+    publication: dict[str, Any],
+    tracker: dict[str, Any],
+    pipeline_retrospective: dict[str, Any],
+    ledger: "WorkstreamLedger",
+) -> dict[str, Any]:
+    follow_up_config = normalized.get("retrospective_follow_up") if isinstance(normalized, dict) else {}
+    if not isinstance(follow_up_config, dict) or not follow_up_config.get("enabled"):
+        return _disabled_retrospective_follow_up_creation_record()
+    follow_up = (
+        pipeline_retrospective.get("follow_up") if isinstance(pipeline_retrospective.get("follow_up"), dict) else {}
+    )
+    recommended = follow_up.get("recommended") if isinstance(follow_up.get("recommended"), list) else []
+    existing_created = follow_up.get("created") if isinstance(follow_up.get("created"), list) else []
+    if not recommended:
+        return {
+            "enabled": True,
+            "status": "skipped",
+            "classification": "no_recommendations",
+            "summary": "No retrospective follow-up recommendations required.",
+            "created": [],
+        }
+    request = _build_retrospective_follow_up_request(
+        normalized=normalized,
+        publication=publication,
+        tracker=tracker,
+        pipeline_retrospective=pipeline_retrospective,
+        recommended=recommended,
+        created=existing_created,
+        run_id=ledger.run_id,
+    )
+    request_path = ledger.path / "retrospective-follow-up-request.json"
+    result_path = ledger.path / "retrospective-follow-up-result.json"
+    stdout_path = ledger.path / "retrospective-follow-up-stdout.log"
+    stderr_path = ledger.path / "retrospective-follow-up-stderr.log"
+    ledger.write_json("retrospective-follow-up-request.json", request)
+    checkout_path = checkout_path_from_state(state)
+    try:
+        adapter_result, raw_payload = _run_retrospective_follow_up_command(
+            follow_up_config,
+            checkout_path=checkout_path,
+            request_path=request_path,
+            result_path=result_path,
+        )
+        raw = _read_retrospective_follow_up_payload(raw_payload)
+        if raw["status"] != "valid":
+            normalized_result = _normalized_retrospective_follow_up_result(
+                enabled=True,
+                status="failed_protocol",
+                classification="protocol_failure",
+                summary=raw["message"],
+                created=[],
+                adapter=_retrospective_follow_up_adapter_record(
+                    follow_up_config,
+                    adapter_result["returncode"],
+                    False,
+                ),
+                stdout=adapter_result["stdout"],
+                stderr=adapter_result["stderr"],
+                request_path=request_path,
+                result_path=result_path,
+                stdout_path=stdout_path,
+                stderr_path=stderr_path,
+            )
+            _write_retrospective_follow_up_result(result_path, ledger.run_id, normalized_result)
+            return normalized_result
+        normalized_result = _normalize_retrospective_follow_up_payload(
+            raw["payload"],
+            recommended=recommended,
+            adapter=_retrospective_follow_up_adapter_record(
+                follow_up_config,
+                adapter_result["returncode"],
+                False,
+            ),
+            stdout=adapter_result["stdout"],
+            stderr=adapter_result["stderr"],
+            request_path=request_path,
+            result_path=result_path,
+            stdout_path=stdout_path,
+            stderr_path=stderr_path,
+        )
+        _write_retrospective_follow_up_result(result_path, ledger.run_id, normalized_result)
+        return normalized_result
+    except _RetrospectiveFollowUpError as exc:
+        normalized_result = _normalized_retrospective_follow_up_result(
+            enabled=True,
+            status="failed",
+            classification="creation_adapter_failure",
+            summary=exc.message,
+            created=[],
+            adapter=_retrospective_follow_up_adapter_record(follow_up_config, exc.returncode, exc.timed_out),
+            stdout=exc.stdout,
+            stderr=exc.stderr,
+            request_path=request_path,
+            result_path=result_path,
+            stdout_path=stdout_path,
+            stderr_path=stderr_path,
+        )
+        _write_retrospective_follow_up_result(result_path, ledger.run_id, normalized_result)
+        return normalized_result
+
+
+def _apply_retrospective_follow_up_creation(
+    pipeline_retrospective: dict[str, Any],
+    creation: dict[str, Any],
+) -> dict[str, Any]:
+    record = dict(pipeline_retrospective)
+    follow_up = dict(record.get("follow_up")) if isinstance(record.get("follow_up"), dict) else {}
+    recommended = follow_up.get("recommended") if isinstance(follow_up.get("recommended"), list) else []
+    existing_created = follow_up.get("created") if isinstance(follow_up.get("created"), list) else []
+    created = creation.get("created") if isinstance(creation.get("created"), list) else []
+    follow_up["recommended"] = recommended
+    follow_up["created"] = _merge_retrospective_created_follow_up(existing_created, created)
+    follow_up["creation"] = _retrospective_follow_up_creation_public_record(creation)
+    record["follow_up"] = follow_up
+    record["recommended_follow_up"] = _legacy_recommended_follow_up(recommended)
+    return record
+
+
+def _build_retrospective_follow_up_request(
+    *,
+    normalized: dict[str, Any],
+    publication: dict[str, Any],
+    tracker: dict[str, Any],
+    pipeline_retrospective: dict[str, Any],
+    recommended: list[dict[str, Any]],
+    created: list[dict[str, Any]],
+    run_id: str,
+) -> dict[str, Any]:
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "run_id": run_id,
+        "step": "retrospective-follow-up",
+        "artifact_type": "retrospective-follow-up-request",
+        "workstream": {
+            "workstream_id": normalized["workstream_id"],
+            "parent": normalized["parent"],
+            "review_branch": normalized["review_branch"],
+            "status": workstream_status_from_publication(publication),
+        },
+        "retrospective": redact_retrospective(normalized.get("retrospective")),
+        "publication": {
+            "status": redact_text(str(publication.get("status") or "")),
+            "reason": redact_text(str(publication.get("reason") or "")),
+            "url": redact_text(str(publication.get("url") or "")),
+        },
+        "tracker": {
+            "status": redact_text(str(tracker.get("status") or "")),
+            "comment": redact_text(str(tracker.get("comment") or "")),
+            "close_source_item": bool(tracker.get("close_source_item")),
+            "close_reason": redact_text(str(tracker.get("close_reason") or "")),
+            "pr_url": redact_text(str(tracker.get("pr_url") or "")),
+            "merge_commit": redact_text(str(tracker.get("merge_commit") or "")),
+        },
+        "pipeline_retrospective": pipeline_retrospective,
+        "follow_up": {
+            "recommended": redact_artifact_value(recommended),
+            "created": redact_artifact_value(created),
+        },
+        "expected_result_schema": {
+            "status": "created|recorded|skipped|failed",
+            "summary": "string",
+            "created": "list[object]",
+        },
+    }
+
+
+def _run_retrospective_follow_up_command(
+    follow_up_config: dict[str, Any],
+    *,
+    checkout_path: Path,
+    request_path: Path,
+    result_path: Path,
+) -> tuple[dict[str, Any], str | None]:
+    with tempfile.TemporaryDirectory(prefix="afk-retrospective-follow-up-") as temp_dir:
+        temp_path = Path(temp_dir)
+        env = _minimal_retrospective_judge_environment(temp_path)
+        env["AFK_RETROSPECTIVE_FOLLOW_UP_REQUEST"] = str(request_path)
+        env["AFK_RETROSPECTIVE_FOLLOW_UP_RESULT"] = str(result_path)
+        command = _render_retrospective_judge_command(
+            follow_up_config["command"],
+            request_path=request_path,
+            result_path=result_path,
+        )
+        try:
+            completed = subprocess.run(
+                command,
+                cwd=checkout_path,
+                env=env,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                capture_output=True,
+                check=False,
+                timeout=follow_up_config["timeout_seconds"],
+            )
+        except OSError as exc:
+            raise _RetrospectiveFollowUpError(
+                str(exc),
+                command=command,
+                returncode=None,
+                stderr=str(exc),
+            ) from exc
+        except subprocess.TimeoutExpired as exc:
+            stdout = exc.stdout if isinstance(exc.stdout, str) else ""
+            stderr = exc.stderr if isinstance(exc.stderr, str) else ""
+            raise _RetrospectiveFollowUpError(
+                "retrospective follow-up command timed out",
+                command=command,
+                returncode=None,
+                stdout=stdout,
+                stderr=stderr or "retrospective follow-up command timed out",
+                timed_out=True,
+            ) from exc
+        raw_payload = result_path.read_text(encoding="utf-8", errors="replace") if result_path.exists() else None
+    if completed.returncode != 0:
+        raise _RetrospectiveFollowUpError(
+            "retrospective follow-up command failed",
+            command=command,
+            returncode=completed.returncode,
+            stdout=completed.stdout,
+            stderr=completed.stderr,
+        )
+    return {
+        "returncode": completed.returncode,
+        "stdout": completed.stdout,
+        "stderr": completed.stderr,
+    }, raw_payload
+
+
+def _read_retrospective_follow_up_payload(raw: str | None) -> dict[str, Any]:
+    if raw is None:
+        return {"status": "missing", "message": "retrospective follow-up result file was not produced"}
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return {"status": "invalid", "message": "retrospective follow-up result file is not valid JSON"}
+    if not isinstance(payload, dict):
+        return {"status": "invalid", "message": "retrospective follow-up result file must contain an object"}
+    return {"status": "valid", "payload": redact_artifact_value(payload)}
+
+
+def _normalize_retrospective_follow_up_payload(
+    payload: dict[str, Any],
+    *,
+    recommended: list[dict[str, Any]],
+    adapter: dict[str, Any],
+    stdout: str,
+    stderr: str,
+    request_path: Path,
+    result_path: Path,
+    stdout_path: Path,
+    stderr_path: Path,
+) -> dict[str, Any]:
+    raw_status = string_field(payload, "status") or ""
+    if raw_status in {"create", "created"}:
+        status = "created"
+        classification = "success_created"
+    elif raw_status in {"record", "recorded"}:
+        status = "recorded"
+        classification = "success_recorded"
+    elif raw_status in {"skip", "skipped", "noop"}:
+        status = "skipped"
+        classification = "skipped"
+    elif raw_status in {"fail", "failed"}:
+        status = "failed"
+        classification = "creation_failure"
+    else:
+        status = "failed_protocol"
+        classification = "protocol_failure"
+    return _normalized_retrospective_follow_up_result(
+        enabled=True,
+        status=status,
+        classification=classification,
+        summary=string_field(payload, "summary") or status,
+        created=_normalize_retrospective_follow_up_created(
+            payload.get("created"),
+            recommended=recommended,
+        ),
+        adapter=adapter,
+        stdout=stdout,
+        stderr=stderr,
+        request_path=request_path,
+        result_path=result_path,
+        stdout_path=stdout_path,
+        stderr_path=stderr_path,
+    )
+
+
+def _normalize_retrospective_follow_up_created(
+    items: Any,
+    *,
+    recommended: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    if not isinstance(items, list):
+        return []
+    recommended_by_fingerprint = {
+        string_field(item, "fingerprint") or "": item
+        for item in recommended
+        if isinstance(item, dict) and string_field(item, "fingerprint")
+    }
+    normalized_items = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        fingerprint = string_field(item, "fingerprint") or ""
+        matched = recommended_by_fingerprint.get(fingerprint, {})
+        kind = string_field(item, "kind") or string_field(matched, "kind") or "created-follow-up"
+        summary = string_field(item, "summary") or string_field(matched, "summary") or ""
+        labels = item.get("labels") if item.get("labels") is not None else matched.get("labels")
+        normalized_item = _retrospective_created_follow_up_item(
+            {
+                "id": string_field(item, "id") or "",
+                "summary": summary,
+                "labels": labels,
+            },
+            kind=kind,
+        )
+        if normalized_item is None:
+            continue
+        if fingerprint:
+            normalized_item["fingerprint"] = fingerprint
+        normalized_items.append(normalized_item)
+    return _merge_retrospective_created_follow_up([], normalized_items)
+
+
+def _normalized_retrospective_follow_up_result(
+    *,
+    enabled: bool,
+    status: str,
+    classification: str,
+    summary: str,
+    created: list[dict[str, Any]],
+    adapter: dict[str, Any] | None = None,
+    stdout: str = "",
+    stderr: str = "",
+    request_path: Path | None = None,
+    result_path: Path | None = None,
+    stdout_path: Path | None = None,
+    stderr_path: Path | None = None,
+) -> dict[str, Any]:
+    normalized_result = {
+        "enabled": enabled,
+        "status": status,
+        "classification": classification,
+        "summary": redact_text(summary),
+        "created": redact_artifact_value(created),
+    }
+    if adapter is not None:
+        normalized_result["adapter"] = adapter
+    if stdout_path is not None and stderr_path is not None:
+        stdout_path.write_text(redact_text(stdout), encoding="utf-8")
+        stderr_path.write_text(redact_text(stderr), encoding="utf-8")
+    if request_path is not None and result_path is not None and stdout_path is not None and stderr_path is not None:
+        normalized_result["evidence"] = {
+            "request_path": request_path.name,
+            "result_path": result_path.name,
+            "stdout_path": stdout_path.name,
+            "stderr_path": stderr_path.name,
+        }
+    return normalized_result
+
+
+def _retrospective_follow_up_adapter_record(
+    follow_up_config: dict[str, Any],
+    returncode: int | None,
+    timed_out: bool,
+) -> dict[str, Any]:
+    return {
+        "type": follow_up_config["type"],
+        "command": redact_artifact_value({"command": follow_up_config["command"]})["command"],
+        "returncode": returncode,
+        "timed_out": timed_out,
+    }
+
+
+def _retrospective_follow_up_creation_public_record(creation: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: value
+        for key, value in creation.items()
+        if key != "created"
+    }
+
+
+def _write_retrospective_follow_up_result(path: Path, run_id: str, creation: dict[str, Any]) -> None:
+    path.write_text(
+        canonical_json(
+            {
+                "schema_version": SCHEMA_VERSION,
+                "run_id": run_id,
+                "step": "retrospective-follow-up",
+                "artifact_type": "retrospective-follow-up-result",
+                "result": redact_artifact_value(creation),
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
 def _validation_retrospective_signals(state: dict[str, Any]) -> list[dict[str, Any]]:
     validations = state.get("validations")
     if not isinstance(validations, list):
@@ -2425,29 +2865,32 @@ def _cleanup_retrospective_signals(state: dict[str, Any]) -> list[dict[str, Any]
     ]
 
 
-def _retrospective_follow_up(signals: list[dict[str, Any]], normalized: dict[str, Any] | None) -> list[dict[str, Any]]:
-    follow_up = []
+def _retrospective_follow_up_record(signals: list[dict[str, Any]], normalized: dict[str, Any] | None) -> dict[str, Any]:
+    recommended = []
+    created = []
+    recommended_fingerprints: set[str] = set()
+    created_fingerprints: set[str] = set()
     created_summaries: set[str] = set()
     has_created_follow_up = False
     if normalized is not None:
         retrospective = normalized.get("retrospective") if isinstance(normalized, dict) else {}
         configured = retrospective.get("follow_up") if isinstance(retrospective, dict) else {}
-        recommended = configured.get("recommended") if isinstance(configured, dict) else []
-        if isinstance(recommended, list):
-            for item in recommended:
+        configured_recommended = configured.get("recommended") if isinstance(configured, dict) else []
+        if isinstance(configured_recommended, list):
+            for item in configured_recommended:
                 if not isinstance(item, dict):
                     continue
-                summary = string_field(item, "summary") or ""
-                labels = item.get("labels")
-                follow_up.append(
-                    {
-                        "summary": redact_text(summary),
-                        "labels": _retrospective_follow_up_labels(labels),
-                    }
+                recommendation = _retrospective_follow_up_item(
+                    kind="configured-recommendation",
+                    summary=string_field(item, "summary") or "",
+                    labels=item.get("labels"),
                 )
-        created = configured.get("created") if isinstance(configured, dict) else []
-        if isinstance(created, list):
-            for item in created:
+                if recommendation and recommendation["fingerprint"] not in recommended_fingerprints:
+                    recommended.append(recommendation)
+                    recommended_fingerprints.add(recommendation["fingerprint"])
+        configured_created = configured.get("created") if isinstance(configured, dict) else []
+        if isinstance(configured_created, list):
+            for item in configured_created:
                 if not isinstance(item, dict):
                     continue
                 if string_field(item, "id") or string_field(item, "summary"):
@@ -2455,51 +2898,163 @@ def _retrospective_follow_up(signals: list[dict[str, Any]], normalized: dict[str
                 created_summary = redact_text(string_field(item, "summary") or "")
                 if created_summary:
                     created_summaries.add(created_summary)
+                created_item = _retrospective_created_follow_up_item(item, kind="configured-created")
+                if created_item:
+                    created.append(created_item)
+                    if string_field(created_item, "fingerprint"):
+                        created_fingerprints.add(created_item["fingerprint"])
     for signal in signals:
         kind = string_field(signal, "kind") or ""
         follow_up_item = _follow_up_for_signal(kind)
         if (
             follow_up_item
-            and follow_up_item not in follow_up
+            and follow_up_item["fingerprint"] not in recommended_fingerprints
             and not has_created_follow_up
             and string_field(follow_up_item, "summary") not in created_summaries
+            and follow_up_item["fingerprint"] not in created_fingerprints
         ):
-            follow_up.append(follow_up_item)
-    return follow_up
+            recommended.append(follow_up_item)
+            recommended_fingerprints.add(follow_up_item["fingerprint"])
+    return {
+        "recommended": recommended,
+        "created": created,
+        "creation": _disabled_retrospective_follow_up_creation_record(),
+    }
+
+
+def _legacy_recommended_follow_up(recommended: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    legacy = []
+    for item in recommended:
+        if not isinstance(item, dict):
+            continue
+        legacy.append(
+            {
+                "summary": redact_text(string_field(item, "summary") or ""),
+                "labels": _retrospective_follow_up_labels(item.get("labels")),
+            }
+        )
+    return legacy
+
+
+def _disabled_retrospective_follow_up_creation_record() -> dict[str, Any]:
+    return {
+        "enabled": False,
+        "status": "recommendation-only",
+    }
+
+
+def _retrospective_follow_up_item(kind: str, summary: str, labels: Any) -> dict[str, Any] | None:
+    redacted_summary = redact_text(summary)
+    normalized_labels = _retrospective_follow_up_labels(labels)
+    if not kind and not redacted_summary and not normalized_labels:
+        return None
+    return {
+        "kind": kind,
+        "summary": redacted_summary,
+        "labels": normalized_labels,
+        "fingerprint": _retrospective_follow_up_fingerprint(kind, redacted_summary, normalized_labels),
+    }
+
+
+def _retrospective_created_follow_up_item(item: dict[str, Any], *, kind: str) -> dict[str, Any] | None:
+    item_id = redact_text(string_field(item, "id") or "")
+    summary = string_field(item, "summary") or ""
+    labels = item.get("labels")
+    normalized = _retrospective_follow_up_item(kind, summary, labels)
+    if normalized is None and not item_id:
+        return None
+    created_item = dict(normalized or {"kind": kind, "summary": "", "labels": []})
+    if item_id:
+        created_item["id"] = item_id
+    if not created_item.get("fingerprint") and (created_item["summary"] or created_item["labels"]):
+        created_item["fingerprint"] = _retrospective_follow_up_fingerprint(
+            created_item["kind"],
+            created_item["summary"],
+            created_item["labels"],
+        )
+    return created_item
+
+
+def _merge_retrospective_created_follow_up(
+    existing: list[dict[str, Any]],
+    new: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    merged = []
+    seen: set[str] = set()
+    for item in list(existing) + list(new):
+        if not isinstance(item, dict):
+            continue
+        fingerprint = string_field(item, "fingerprint") or ""
+        item_id = string_field(item, "id") or ""
+        summary = string_field(item, "summary") or ""
+        key = (
+            f"fingerprint:{fingerprint}"
+            if fingerprint
+            else f"id:{item_id}"
+            if item_id
+            else f"summary:{summary}:{canonical_json(item.get('labels', []))}"
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(item)
+    return merged
 
 
 def _retrospective_follow_up_labels(labels: Any) -> list[str]:
-    if not isinstance(labels, list):
-        return []
-    return [redact_text(str(label)) for label in labels if isinstance(label, str) and label]
+    normalized_labels: list[str] = []
+    if isinstance(labels, list):
+        for label in labels:
+            if isinstance(label, str) and label:
+                redacted_label = redact_text(label)
+                if redacted_label not in normalized_labels:
+                    normalized_labels.append(redacted_label)
+    if "project:afk-composable-pipeline" not in normalized_labels:
+        normalized_labels.append("project:afk-composable-pipeline")
+    return normalized_labels
+
+
+def _retrospective_follow_up_fingerprint(kind: str, summary: str, labels: list[str]) -> str:
+    return "retro-follow-up:" + sha256_json(
+        {
+            "kind": kind,
+            "summary": summary,
+            "labels": sorted(set(labels)),
+        }
+    )[:12]
 
 
 def _follow_up_for_signal(kind: str) -> dict[str, Any] | None:
     if kind == "missing-tool-or-config":
-        return {
-            "summary": "Fix the missing tool or configuration in validation evidence before rerunning the workstream.",
-            "labels": ["afk:follow-up", "area:validation"],
-        }
+        return _retrospective_follow_up_item(
+            kind=kind,
+            summary="Fix the missing tool or configuration in validation evidence before rerunning the workstream.",
+            labels=["afk:follow-up", "area:validation"],
+        )
     if kind == "publisher-auth":
-        return {
-            "summary": "Repair GitHub publisher authentication evidence before rerunning terminal publication.",
-            "labels": ["afk:follow-up", "area:publication"],
-        }
+        return _retrospective_follow_up_item(
+            kind=kind,
+            summary="Repair GitHub publisher authentication evidence before rerunning terminal publication.",
+            labels=["afk:follow-up", "area:publication"],
+        )
     if kind in {"publisher-failure", "retry-or-blocked"}:
-        return {
-            "summary": "Address the blocked publication or retry evidence before rerunning the workstream.",
-            "labels": ["afk:follow-up", "area:workstream"],
-        }
+        return _retrospective_follow_up_item(
+            kind=kind,
+            summary="Address the blocked publication or retry evidence before rerunning the workstream.",
+            labels=["afk:follow-up", "area:workstream"],
+        )
     if kind == "dirty-cleanup":
-        return {
-            "summary": "Clean up leftover workstream resources before starting another retry or publication attempt.",
-            "labels": ["afk:follow-up", "area:cleanup"],
-        }
+        return _retrospective_follow_up_item(
+            kind=kind,
+            summary="Clean up leftover workstream resources before starting another retry or publication attempt.",
+            labels=["afk:follow-up", "area:cleanup"],
+        )
     if kind == "retrospective-judge":
-        return {
-            "summary": "Review and address retrospective judge findings before treating the run as complete.",
-            "labels": ["afk:follow-up", "area:workstream"],
-        }
+        return _retrospective_follow_up_item(
+            kind=kind,
+            summary="Review and address retrospective judge findings before treating the run as complete.",
+            labels=["afk:follow-up", "area:workstream"],
+        )
     return None
 
 
@@ -2769,6 +3324,51 @@ def normalize_retrospective_judge(retrospective_judge: Any) -> dict[str, Any]:
     }
 
 
+def normalize_retrospective_follow_up_config(retrospective_follow_up: Any) -> dict[str, Any]:
+    if retrospective_follow_up is None:
+        return {"enabled": False}
+    if not isinstance(retrospective_follow_up, dict):
+        raise WorkstreamError("retrospective_follow_up must be an object")
+    unsupported = [
+        key
+        for key in retrospective_follow_up
+        if key not in {"enabled", "type", "command", "timeout_seconds", "timeoutSeconds"}
+    ]
+    if unsupported:
+        raise WorkstreamError("retrospective_follow_up only supports enabled, type, command, timeout_seconds")
+    enabled = retrospective_follow_up.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise WorkstreamError("retrospective_follow_up.enabled must be a boolean")
+    if not enabled:
+        return {"enabled": False}
+    follow_up_type = string_field(retrospective_follow_up, "type") or "local-command"
+    if follow_up_type not in {"local-command", "fake-follow-up-command"}:
+        raise WorkstreamError("retrospective_follow_up.type must be local-command or fake-follow-up-command")
+    for forbidden_key in ("credentials_path", "auth_file", "token", "api_key", "env"):
+        if forbidden_key in retrospective_follow_up:
+            raise WorkstreamError(f"retrospective_follow_up.{forbidden_key} is not supported")
+    command = retrospective_follow_up.get("command")
+    if not _is_string_list(command):
+        raise WorkstreamError("retrospective_follow_up.command must be a list of strings")
+    if not command:
+        raise WorkstreamError("retrospective_follow_up.command must not be empty")
+    command_secret_error = _command_secret_error_message(command, field_name="retrospective_follow_up.command")
+    if command_secret_error:
+        raise WorkstreamError(command_secret_error)
+    timeout_seconds = retrospective_follow_up.get(
+        "timeout_seconds",
+        retrospective_follow_up.get("timeoutSeconds", 120),
+    )
+    if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float)) or timeout_seconds <= 0:
+        raise WorkstreamError("retrospective_follow_up.timeout_seconds must be a positive number")
+    return {
+        "enabled": True,
+        "type": follow_up_type,
+        "command": list(command),
+        "timeout_seconds": float(timeout_seconds),
+    }
+
+
 def validate_retrospective_terminal_decision(retrospective: dict[str, Any], tracker: dict[str, Any]) -> None:
     if not retrospective:
         return
@@ -2912,6 +3512,14 @@ def workstream_artifacts(ledger: "WorkstreamLedger") -> dict[str, str]:
         artifacts["retrospective_judge_stdout"] = "retrospective-judge-stdout.log"
     if (ledger.path / "retrospective-judge-stderr.log").is_file():
         artifacts["retrospective_judge_stderr"] = "retrospective-judge-stderr.log"
+    if (ledger.path / "retrospective-follow-up-request.json").is_file():
+        artifacts["retrospective_follow_up_request"] = "retrospective-follow-up-request.json"
+    if (ledger.path / "retrospective-follow-up-result.json").is_file():
+        artifacts["retrospective_follow_up_result"] = "retrospective-follow-up-result.json"
+    if (ledger.path / "retrospective-follow-up-stdout.log").is_file():
+        artifacts["retrospective_follow_up_stdout"] = "retrospective-follow-up-stdout.log"
+    if (ledger.path / "retrospective-follow-up-stderr.log").is_file():
+        artifacts["retrospective_follow_up_stderr"] = "retrospective-follow-up-stderr.log"
     return artifacts
 
 

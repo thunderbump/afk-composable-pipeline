@@ -8,6 +8,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from afk.workstream import (  # noqa: E402
     WorkstreamError,
+    normalize_retrospective_follow_up_config,
     normalize_retrospective_judge,
     pipeline_retrospective_record,
     tracker_record,
@@ -92,6 +93,16 @@ def retrospective_tracker(status="awaiting-review"):
 
 
 class WorkstreamStatusMappingTest(unittest.TestCase):
+    def test_normalize_retrospective_follow_up_config_rejects_empty_command(self):
+        with self.assertRaisesRegex(WorkstreamError, "command must not be empty"):
+            normalize_retrospective_follow_up_config(
+                {
+                    "enabled": True,
+                    "type": "fake-follow-up-command",
+                    "command": [],
+                }
+            )
+
     def test_normalize_retrospective_judge_rejects_empty_command(self):
         with self.assertRaisesRegex(WorkstreamError, "command must not be empty"):
             normalize_retrospective_judge(
@@ -130,6 +141,13 @@ class WorkstreamStatusMappingTest(unittest.TestCase):
                 "status": "disabled",
             },
         )
+        self.assertEqual(
+            record["follow_up"]["creation"],
+            {
+                "enabled": False,
+                "status": "recommendation-only",
+            },
+        )
 
     def test_pipeline_retrospective_record_reports_clean_published_run_without_signals(self):
         record = pipeline_retrospective_record(
@@ -144,6 +162,8 @@ class WorkstreamStatusMappingTest(unittest.TestCase):
         self.assertEqual(record["tracker_status"], "awaiting-review")
         self.assertEqual(record["signals"], [])
         self.assertEqual(record["recommended_follow_up"], [])
+        self.assertEqual(record["follow_up"]["recommended"], [])
+        self.assertEqual(record["follow_up"]["created"], [])
 
     def test_pipeline_retrospective_record_surfaces_missing_tool_validation_signal(self):
         state = retrospective_state()
@@ -194,13 +214,22 @@ class WorkstreamStatusMappingTest(unittest.TestCase):
             [
                 {
                     "summary": "Fix the missing tool or configuration in validation evidence before rerunning the workstream.",
-                    "labels": ["afk:follow-up", "area:validation"],
+                    "labels": ["afk:follow-up", "area:validation", "project:afk-composable-pipeline"],
                 },
                 {
                     "summary": "Address the blocked publication or retry evidence before rerunning the workstream.",
-                    "labels": ["afk:follow-up", "area:workstream"],
+                    "labels": ["afk:follow-up", "area:workstream", "project:afk-composable-pipeline"],
                 }
             ],
+        )
+        self.assertEqual(
+            record["follow_up"]["recommended"][0],
+            {
+                "kind": "missing-tool-or-config",
+                "summary": "Fix the missing tool or configuration in validation evidence before rerunning the workstream.",
+                "labels": ["afk:follow-up", "area:validation", "project:afk-composable-pipeline"],
+                "fingerprint": "retro-follow-up:1e06832771a4",
+            },
         )
 
     def test_pipeline_retrospective_record_surfaces_blocked_reason_without_retry_keyword(self):
@@ -315,7 +344,7 @@ class WorkstreamStatusMappingTest(unittest.TestCase):
             [
                 {
                     "summary": "Repair GitHub publisher authentication evidence before rerunning terminal publication.",
-                    "labels": ["afk:follow-up", "area:publication"],
+                    "labels": ["afk:follow-up", "area:publication", "project:afk-composable-pipeline"],
                 }
             ],
         )
@@ -360,11 +389,11 @@ class WorkstreamStatusMappingTest(unittest.TestCase):
             [
                 {
                     "summary": "Address the blocked publication or retry evidence before rerunning the workstream.",
-                    "labels": ["afk:follow-up", "area:workstream"],
+                    "labels": ["afk:follow-up", "area:workstream", "project:afk-composable-pipeline"],
                 },
                 {
                     "summary": "Clean up leftover workstream resources before starting another retry or publication attempt.",
-                    "labels": ["afk:follow-up", "area:cleanup"],
+                    "labels": ["afk:follow-up", "area:cleanup", "project:afk-composable-pipeline"],
                 },
             ],
         )
