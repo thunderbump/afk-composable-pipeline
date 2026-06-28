@@ -572,6 +572,27 @@ sys.exit(0)
             self.assertEqual(result["tracker"]["pr_url"], "https://github.example/pr/123")
             self.assertIn("keep the source Beads item open", result["tracker"]["comment"])
             self.assertEqual(result["artifacts"]["tracker"], "tracker-result.json")
+            self.assertEqual(result["artifacts"]["pipeline_retrospective"], "pipeline-retrospective.json")
+            self.assertEqual(
+                result["pipeline_retrospective"],
+                {
+                    "schema_version": 1,
+                    "status": "published",
+                    "health": "healthy",
+                    "publication_status": "published",
+                    "tracker_status": "awaiting-review",
+                    "signals": [],
+                    "recommended_follow_up": [],
+                },
+            )
+            self.assertEqual(
+                json.loads(
+                    (ledger / "workstreams" / summary["run_id"] / "pipeline-retrospective.json").read_text(
+                        encoding="utf-8"
+                    )
+                ),
+                result["pipeline_retrospective"],
+            )
 
             git_calls = [call for call in calls if call["tool"] == "git"]
             gh_calls = [call for call in calls if call["tool"] == "gh"]
@@ -782,6 +803,8 @@ raise SystemExit(9)
 
             self.assertEqual(result["retrospective"], tracker["retrospective"])
             self.assertEqual(result["tracker"]["retrospective"], tracker["retrospective"])
+            self.assertEqual(result["artifacts"]["retrospective"], "retrospective.json")
+            self.assertEqual(result["artifacts"]["pipeline_retrospective"], "pipeline-retrospective.json")
             self.assertIn("[REDACTED]", result["retrospective"]["summary"])
             self.assertIn("[REDACTED]", result["retrospective"]["validation"][1])
             self.assertEqual(
@@ -795,6 +818,19 @@ raise SystemExit(9)
             self.assertEqual(
                 result["retrospective"]["notes"]["spikes"],
                 ["~/Documents/rmd/Ceremonies/Personal Work/spikes/2026-06-27-retrospective.md"],
+            )
+            self.assertEqual(result["pipeline_retrospective"]["status"], "closed")
+            self.assertEqual(result["pipeline_retrospective"]["health"], "healthy")
+            self.assertEqual(result["pipeline_retrospective"]["publication_status"], "tracker-closed")
+            self.assertEqual(result["pipeline_retrospective"]["tracker_status"], "closed")
+            self.assertEqual(result["pipeline_retrospective"]["signals"], [])
+            self.assertEqual(
+                json.loads((result_path.parent / "retrospective.json").read_text(encoding="utf-8")),
+                result["retrospective"],
+            )
+            self.assertEqual(
+                json.loads((result_path.parent / "pipeline-retrospective.json").read_text(encoding="utf-8")),
+                result["pipeline_retrospective"],
             )
 
     def test_workstream_terminal_no_merge_decision_closes_tracker_without_republishing(self):
@@ -893,6 +929,8 @@ raise SystemExit(9)
             self.assertEqual([item["result"] for item in result["selected_work"]], ["passed"])
             self.assertEqual(result["retrospective"], tracker["retrospective"])
             self.assertEqual(result["tracker"]["retrospective"], tracker["retrospective"])
+            self.assertEqual(result["artifacts"]["retrospective"], "retrospective.json")
+            self.assertEqual(result["artifacts"]["pipeline_retrospective"], "pipeline-retrospective.json")
             self.assertIn("[REDACTED]", result["retrospective"]["summary"])
             self.assertEqual(
                 result["retrospective"]["follow_up"]["recommended"][0]["labels"],
@@ -901,6 +939,19 @@ raise SystemExit(9)
             self.assertEqual(
                 result["retrospective"]["notes"]["spikes"],
                 ["~/Documents/rmd/Ceremonies/Personal Work/spikes/2026-06-27-no-merge.md"],
+            )
+            self.assertEqual(result["pipeline_retrospective"]["status"], "closed")
+            self.assertEqual(result["pipeline_retrospective"]["health"], "healthy")
+            self.assertEqual(result["pipeline_retrospective"]["publication_status"], "tracker-closed")
+            self.assertEqual(result["pipeline_retrospective"]["tracker_status"], "closed")
+            self.assertEqual(result["pipeline_retrospective"]["signals"], [])
+            self.assertEqual(
+                json.loads((result_path.parent / "retrospective.json").read_text(encoding="utf-8")),
+                result["retrospective"],
+            )
+            self.assertEqual(
+                json.loads((result_path.parent / "pipeline-retrospective.json").read_text(encoding="utf-8")),
+                result["pipeline_retrospective"],
             )
 
     def test_workstream_terminal_merge_decision_stays_open_when_review_feedback_is_unresolved(self):
@@ -2371,22 +2422,10 @@ Path({str(fake_calls)!r}).write_text("gh should not run\\n", encoding="utf-8")
             recipe = successful_recipe(temp_path, repo, checkout, fake_git, fake_gh)
             failing_worker_code = textwrap.dedent(
                 """
-                import json
-                import os
-                from pathlib import Path
+                import sys
 
-                request = json.loads(Path(os.environ["AFK_WORKER_REQUEST"]).read_text(encoding="utf-8"))
-                Path(os.environ["AFK_WORKER_RESULT"]).write_text(
-                    json.dumps(
-                        {
-                            "profile": request["profile"],
-                            "status": "fail",
-                            "summary": "unit tests failed",
-                            "steps": [{"name": "unit", "status": "fail"}],
-                        }
-                    ),
-                    encoding="utf-8",
-                )
+                print("python3.13: command not found")
+                sys.exit(127)
                 """
             ).strip()
             recipe["steps"][3]["input"]["worker"]["command"] = [sys.executable, "-c", failing_worker_code]
@@ -2668,6 +2707,22 @@ sys.exit(0)
                 )
                 """
             ).strip()
+            retry_agent_code = textwrap.dedent(
+                """
+                import json
+                import subprocess
+                from pathlib import Path
+
+                Path("retry-implementation.txt").write_text("retry implementation\\n", encoding="utf-8")
+                subprocess.run(["git", "add", "retry-implementation.txt"], check=True)
+                subprocess.run(["git", "commit", "-m", "retry implementation"], check=True)
+                Path("retry-dirty.txt").write_text("left dirty on purpose\\n", encoding="utf-8")
+                Path("agent-result.json").write_text(
+                    json.dumps({"status": "completed", "summary": "retry implementation left cleanup evidence"}),
+                    encoding="utf-8",
+                )
+                """
+            ).strip()
             recipe = successful_recipe(temp_path, repo, checkout, fake_git, fake_gh)
             recipe["retry_policy"] = {"max_retries": 1}
             recipe["steps"][3]["input"]["worker"]["command"] = [sys.executable, "-c", failing_worker_code]
@@ -2679,6 +2734,18 @@ sys.exit(0)
                         "base_ref": "main",
                         "checkout_root": str(temp_path),
                         "checkout_path": str(checkout),
+                    },
+                },
+                {
+                    "name": "implement",
+                    "input": {
+                        "guardrails": ["stay within checkout"],
+                        "validation": {"profile": "tier1", "commands": []},
+                        "agent": {
+                            "type": "fake-pi-command",
+                            "command": [sys.executable, "-c", retry_agent_code],
+                            "result_path": "agent-result.json",
+                        },
                     },
                 },
                 {
@@ -2727,38 +2794,60 @@ sys.exit(0)
                     "implement",
                     "validate",
                     "prepare-checkout",
+                    "implement",
                     "validate",
                     "review",
                 ],
             )
-            implemented_commit = result["steps"][2]["result_path"]
             first_validate = json.loads(
                 (ledger / result["steps"][3]["result_path"]).read_text(encoding="utf-8")
             )["output"]
             retried_checkout = json.loads(
                 (ledger / result["steps"][4]["result_path"]).read_text(encoding="utf-8")
             )["output"]
-            second_validate = json.loads(
+            retry_implementation = json.loads(
                 (ledger / result["steps"][5]["result_path"]).read_text(encoding="utf-8")
             )["output"]
-            review_result = json.loads(
+            second_validate = json.loads(
                 (ledger / result["steps"][6]["result_path"]).read_text(encoding="utf-8")
+            )["output"]
+            review_result = json.loads(
+                (ledger / result["steps"][7]["result_path"]).read_text(encoding="utf-8")
             )["output"]
 
             self.assertEqual(first_validate["status"], "failed_validation")
             self.assertEqual(retried_checkout["status"], "prepared")
+            self.assertEqual(retry_implementation["status"], "implemented")
+            self.assertTrue(retry_implementation["git"]["dirty"])
             self.assertEqual(second_validate["status"], "validated")
             self.assertEqual(review_result["status"], "passed")
             self.assertEqual(
-                retried_checkout["start_commit"],
+                retry_implementation["git"]["after_commit"],
                 second_validate["checkout"]["start_commit"],
             )
             self.assertEqual(
-                retried_checkout["requested_ref"],
+                retry_implementation["git"]["after_commit"],
                 second_validate["checkout"]["requested_ref"],
             )
             self.assertEqual(result["publication"]["status"], "published")
             self.assertEqual(result["publication"]["url"], "https://github.example/pr/123")
+            self.assertEqual(result["tracker"]["status"], "awaiting-review")
+            self.assertEqual(result["cleanup"]["status"], "dirty_retry_checkouts")
+            self.assertEqual(result["pipeline_retrospective"]["status"], "published")
+            self.assertEqual(result["pipeline_retrospective"]["health"], "warning")
+            self.assertEqual(result["pipeline_retrospective"]["publication_status"], "published")
+            self.assertEqual(result["pipeline_retrospective"]["tracker_status"], "awaiting-review")
+            self.assertEqual(
+                result["pipeline_retrospective"]["signals"][0]["kind"],
+                "dirty-cleanup",
+            )
+            self.assertEqual(result["pipeline_retrospective"]["signals"][0]["severity"], "warning")
+            self.assertEqual(
+                json.loads((ledger / "workstreams" / summary["run_id"] / "pipeline-retrospective.json").read_text(
+                    encoding="utf-8"
+                )),
+                result["pipeline_retrospective"],
+            )
 
     def test_workstream_retry_respects_explicit_prepare_requested_ref_for_same_checkout_path(self):
         state = {
@@ -4191,8 +4280,31 @@ Path({str(fake_calls)!r}).open("a", encoding="utf-8").write("gh should not run\\
             self.assertEqual(result["publication"]["returncode"], 9)
             self.assertIn("git command failed", result["publication"]["reason"])
             self.assertIn("push rejected", result["publication"]["stderr_excerpt"])
+            self.assertEqual(result["pipeline_retrospective"]["status"], "failed-needs-human")
+            self.assertEqual(result["pipeline_retrospective"]["health"], "failing")
+            self.assertEqual(result["pipeline_retrospective"]["publication_status"], "failed-needs-human")
+            self.assertEqual(result["pipeline_retrospective"]["tracker_status"], "validated")
+            self.assertEqual(result["pipeline_retrospective"]["signals"][0]["kind"], "publisher-failure")
+            self.assertEqual(
+                result["pipeline_retrospective"]["recommended_follow_up"],
+                [
+                    {
+                        "summary": "Address the blocked publication or retry evidence before rerunning the workstream.",
+                        "labels": ["afk:follow-up", "area:workstream"],
+                    }
+                ],
+            )
+            self.assertEqual(result["tracker"]["status"], "validated")
             self.assertEqual(result["cleanup"], {"status": "clean", "resources": []})
             self.assertIn("afk run-workstream", result["retry"])
+            self.assertEqual(
+                json.loads(
+                    (ledger / "workstreams" / summary["run_id"] / "pipeline-retrospective.json").read_text(
+                        encoding="utf-8"
+                    )
+                ),
+                result["pipeline_retrospective"],
+            )
             self.assertEqual([call["tool"] for call in calls], ["gh", "git"])
             self.assertEqual(calls[0]["argv"][0:3], ["auth", "status", "--hostname"])
 

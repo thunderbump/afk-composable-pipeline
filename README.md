@@ -567,8 +567,11 @@ ledger/
   workstreams/
     <workstream-run-id>/
       command.json
+      pipeline-retrospective.json
       pr-body.md
       publication-result.json
+      retrospective.json
+      tracker-result.json
       workstream-result.json
 ```
 
@@ -608,6 +611,12 @@ checkouts.
 it is ready to close, the PR URL when one was opened, any carried-forward review
 findings, and the merge commit or explicit no-merge close reason when one is
 recorded.
+`pipeline-retrospective.json` records deterministic pipeline feedback for every
+completed workstream run. It summarizes retrospective health, publication and
+tracker status, derived signals, and recommended follow-up without changing the
+functional publication or tracker outcome.
+`retrospective.json`, when present, stores the user-supplied terminal
+retrospective evidence separately from the derived pipeline retrospective.
 `review_cycles` evidence, when supplied, is included in both
 `workstream-result.json` and `tracker-result.json`. Open or response-required
 cycle findings keep the tracker state at `review-findings-open` until the
@@ -618,7 +627,8 @@ until merge or no-merge. AFK only treats a response object as addressed when
 its `status` is `addressed` or `findings-addressed`; a non-empty response
 string is the freeform addressed evidence path.
 `retrospective` evidence, when supplied, is also included in both
-`workstream-result.json` and `tracker-result.json`. Use
+`workstream-result.json` and `tracker-result.json`, while
+`pipeline_retrospective` is always included in `workstream-result.json`. Use
 `notes.personal_work` for concise daily work summaries kept under
 `~/Documents/rmd/Ceremonies/Personal Work/work/YYYY-MM-DD-personal.md`. Use
 `notes.spikes` for investigation or audit notes that should be preserved under

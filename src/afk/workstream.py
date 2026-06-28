@@ -175,7 +175,13 @@ def run_workstream(
             status = workstream_status_from_publication(publication)
     tracker = tracker_record(normalized, state, publication)
     selected_work = selected_work_records(state)
+    pipeline_retrospective = pipeline_retrospective_record(state, publication, tracker, normalized)
 
+    ledger.write_json("publication-result.json", publication)
+    ledger.write_json("tracker-result.json", tracker)
+    if normalized["retrospective"]:
+        ledger.write_json("retrospective.json", redact_retrospective(normalized["retrospective"]))
+    ledger.write_json("pipeline-retrospective.json", pipeline_retrospective)
     result_payload = {
         "schema_version": SCHEMA_VERSION,
         "run_id": run_id,
@@ -195,10 +201,9 @@ def run_workstream(
         "next_allowed_command": publication.get("next_allowed_command", ""),
         "publication": publication,
         "tracker": tracker,
+        "pipeline_retrospective": pipeline_retrospective,
         "artifacts": workstream_artifacts(ledger),
     }
-    ledger.write_json("publication-result.json", publication)
-    ledger.write_json("tracker-result.json", tracker)
     ledger.write_json("workstream-result.json", result_payload)
     return WorkstreamResult(
         run_id=run_id,
@@ -2399,9 +2404,12 @@ def workstream_artifacts(ledger: "WorkstreamLedger") -> dict[str, str]:
         "command": "command.json",
         "publication": "publication-result.json",
         "tracker": "tracker-result.json",
+        "pipeline_retrospective": "pipeline-retrospective.json",
     }
     if (ledger.path / "pr-body.md").is_file():
         artifacts["pr_body"] = "pr-body.md"
+    if (ledger.path / "retrospective.json").is_file():
+        artifacts["retrospective"] = "retrospective.json"
     return artifacts
 
 
