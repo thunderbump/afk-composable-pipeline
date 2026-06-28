@@ -20,6 +20,10 @@ from afk.recipes import (
     write_recipe,
 )
 from afk.run_next import run_next
+from afk.pi_workers import (
+    PONYTAIL_EXTENSION_SOURCE,
+    build_pi_real_worker_agent,
+)
 from afk.registry import (
     StepContext,
     StepRegistry,
@@ -203,6 +207,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.execute and not args.ledger:
             parser.error("--ledger is required when --execute is set")
         try:
+            recipe_agent = recipe_agent_from_args(args, checkout_path=Path(args.checkout_path))
             workstream_runner = None
             if args.execute:
                 from afk.workstream import run_workstream
@@ -219,6 +224,7 @@ def main(argv: list[str] | None = None) -> int:
                 checkout_root=Path(args.checkout_root),
                 checkout_path=Path(args.checkout_path),
                 validation_profile=args.validation_profile,
+                agent=recipe_agent,
                 ready_tag=args.ready_tag,
                 selector_mode=args.selector_mode,
                 selector_model=args.selector_model,
@@ -301,27 +307,7 @@ def build_parser() -> argparse.ArgumentParser:
             "Overrides the default host sibling contract when checkout_root is a nested mount."
         ),
     )
-    generate_recipe_parser.add_argument(
-        "--agent-mode",
-        choices=("fake", "real-local"),
-        default="fake",
-        help="Implementation adapter mode to embed in the generated recipe",
-    )
-    generate_recipe_parser.add_argument(
-        "--agent-command-json",
-        help="JSON array command for real-local agent mode",
-    )
-    generate_recipe_parser.add_argument("--agent-codex-home", help="Absolute mounted codex home for real-local mode")
-    generate_recipe_parser.add_argument("--agent-config-home", help="Absolute mounted config home for real-local mode")
-    generate_recipe_parser.add_argument(
-        "--agent-pi-config-home",
-        help="Absolute mounted PI_CONFIG_HOME directory for real-local mode",
-    )
-    generate_recipe_parser.add_argument(
-        "--agent-timeout-seconds",
-        type=int,
-        help="Optional real-local agent timeout in seconds",
-    )
+    add_implementation_agent_flags(generate_recipe_parser)
     generate_recipe_parser.add_argument(
         "--publisher-mode",
         choices=("disabled", "create"),
@@ -379,29 +365,123 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Run the selected recipe through run-workstream after selection",
     )
+    add_implementation_agent_flags(run_next_parser)
 
     return parser
+
+
+def add_implementation_agent_flags(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--agent-mode",
+        choices=("fake", "real-local", "pi"),
+        default="fake",
+        help="Implementation adapter mode to embed in the generated recipe",
+    )
+    parser.add_argument(
+        "--agent-command-json",
+        help="JSON array command for real-local agent mode",
+    )
+    parser.add_argument(
+        "--agent-codex-home",
+        help="Absolute mounted codex home for real-local and pi modes",
+    )
+    parser.add_argument(
+        "--agent-config-home",
+        help="Absolute mounted config home for real-local and pi modes",
+    )
+    parser.add_argument(
+        "--agent-pi-config-home",
+        help="Absolute mounted PI_CONFIG_HOME directory for real-local and pi modes",
+    )
+    parser.add_argument(
+        "--agent-timeout-seconds",
+        type=int,
+        help="Optional real-local and pi agent timeout in seconds",
+    )
+    parser.add_argument("--agent-pi-bin", default="pi", help="Pi binary for pi mode")
+    parser.add_argument(
+        "--agent-pi-provider",
+        default="openai-codex",
+        help="Pi provider for pi mode",
+    )
+    parser.add_argument(
+        "--agent-pi-model",
+        default="gpt-5.4-mini",
+        help="Pi model for pi mode (gpt-5.4 or lower)",
+    )
+    parser.add_argument("--agent-pi-thinking", help="Optional Pi thinking level")
+    parser.add_argument(
+        "--agent-ponytail",
+        action="store_true",
+        help="Enable the default ponytail extension in pi mode",
+    )
+    parser.add_argument(
+        "--agent-ponytail-extension",
+        help="Ponytail extension package name for pi mode",
+    )
+    parser.add_argument(
+        "--agent-ponytail-extension-source",
+        help="Ponytail extension source string for pi mode",
+    )
+    parser.add_argument(
+        "--agent-wrapper-secret-file",
+        help="Path to wrapper secret file for pi mode",
+    )
 
 
 def recipe_agent_from_args(args: argparse.Namespace, *, checkout_path: Path) -> dict[str, Any] | None:
     if args.agent_mode == "fake":
         return None
     try:
-        command = json.loads(args.agent_command_json)
+        if args.agent_mode == "real-local":
+            command = json.loads(args.agent_command_json)
+        else:
+            command = None
     except TypeError:
         raise ValueError("--agent-command-json is required when --agent-mode=real-local") from None
     except json.JSONDecodeError as exc:
         raise ValueError(f"--agent-command-json must be valid JSON: {exc.msg}") from exc
+
     if args.agent_timeout_seconds is not None and args.agent_timeout_seconds <= 0:
         raise ValueError("--agent-timeout-seconds must be greater than zero")
-    return real_local_recipe_agent(
-        command=command,
-        codex_home=args.agent_codex_home,
-        config_home=args.agent_config_home,
-        pi_config_home=args.agent_pi_config_home,
-        checkout_path=checkout_path,
-        timeout_seconds=args.agent_timeout_seconds,
-    )
+
+    if args.agent_mode == "real-local":
+        return real_local_recipe_agent(
+            command=command,
+            codex_home=args.agent_codex_home,
+            config_home=args.agent_config_home,
+            pi_config_home=args.agent_pi_config_home,
+            checkout_path=checkout_path,
+            timeout_seconds=args.agent_timeout_seconds,
+        )
+    if args.agent_mode == "pi":
+        ponytail_extension = None
+        ponytail_extension_source = None
+        if args.agent_ponytail:
+            if args.agent_ponytail_extension is not None or args.agent_ponytail_extension_source is not None:
+                raise ValueError("--agent-ponytail cannot be combined with explicit ponytail extension values")
+            ponytail_extension_source = PONYTAIL_EXTENSION_SOURCE
+        else:
+            ponytail_extension = args.agent_ponytail_extension
+            ponytail_extension_source = args.agent_ponytail_extension_source
+            if ponytail_extension is not None and ponytail_extension_source is not None:
+                raise ValueError("Specify ponytail-extension or ponytail-extension-source, not both")
+
+        return build_pi_real_worker_agent(
+            pi_bin=args.agent_pi_bin,
+            provider=args.agent_pi_provider,
+            model=args.agent_pi_model,
+            codex_home=args.agent_codex_home,
+            config_home=args.agent_config_home,
+            pi_config_home=args.agent_pi_config_home,
+            checkout_path=checkout_path,
+            thinking=args.agent_pi_thinking,
+            ponytail_extension=ponytail_extension,
+            ponytail_extension_source=ponytail_extension_source,
+            wrapper_secret_file=args.agent_wrapper_secret_file,
+            timeout_seconds=args.agent_timeout_seconds,
+        )
+    raise ValueError(f"Unsupported --agent-mode: {args.agent_mode}")
 
 
 def recipe_validation_input_from_args(args: argparse.Namespace, *, project_contract: ProjectContract) -> dict[str, Any]:

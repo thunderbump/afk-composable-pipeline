@@ -562,3 +562,171 @@ else:
                 [source["type"] for source in payload["recipe"]["steps"][0]["input"]["sources"]],
                 ["beads", "github_issues"],
             )
+
+    def test_run_next_emits_pi_recipe_when_requested(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            fake_bin = temp_path / "bin"
+            beads_workspace = temp_path / "beads"
+            beads_workspace.mkdir()
+            checkout_root = temp_path / "checkouts"
+            checkout_path = checkout_root / "bump-EQEmu"
+            secret_dir = beads_workspace / "secrets"
+            secret_dir.mkdir(parents=True)
+            secret_dir.joinpath("dolt_beads_password.txt").write_text("beads-secret", encoding="utf-8")
+            codex_home = temp_path / "codex-home"
+            config_home = temp_path / "xdg-config"
+            pi_config_home = temp_path / "pi-config"
+            wrapper_secret = temp_path / "agent-wrapper-secret.txt"
+            codex_home.mkdir()
+            config_home.mkdir()
+            pi_config_home.mkdir()
+            wrapper_secret.write_text("agent-secret\n", encoding="utf-8")
+            fake_bin.mkdir()
+            write_executable(
+                fake_bin / "gh",
+                f"""#!{sys.executable}
+import sys
+
+if sys.argv[1:3] == ["auth", "status"]:
+    sys.exit(1)
+raise SystemExit(9)
+""",
+            )
+            write_executable(
+                fake_bin / "bd",
+                f"""#!{sys.executable}
+import json
+import sys
+
+if sys.argv[1:2] == ["list"]:
+    print(json.dumps([{{"id": "central-next.1"}}]))
+elif sys.argv[1:3] == ["show", "central-next.1"]:
+    print(json.dumps({{
+        "id": "central-next.1",
+        "title": "Autonomous next item",
+        "status": "open",
+        "labels": ["project:bump-eqemu", "ready-for-agent"],
+        "metadata": {{"afk.ready": True, "workstream": "central-next"}},
+        "acceptance_criteria": ["ready to run"],
+        "dependencies": [],
+    }}))
+else:
+    raise SystemExit(9)
+""",
+            )
+
+            completed = run_afk(
+                "run-next",
+                "--project",
+                "bump-eqemu",
+                "--contracts-dir",
+                "project-contracts",
+                "--beads-workspace",
+                str(beads_workspace),
+                "--checkout-root",
+                str(checkout_root),
+                "--checkout-path",
+                str(checkout_path),
+                "--validation-profile",
+                "tier1",
+                "--agent-mode",
+                "pi",
+                "--agent-pi-bin",
+                "/opt/pi/bin/pi",
+                "--agent-pi-provider",
+                "openai-codex",
+                "--agent-pi-model",
+                "gpt-5.4-mini",
+                "--agent-ponytail",
+                "--agent-wrapper-secret-file",
+                str(wrapper_secret),
+                "--agent-codex-home",
+                str(codex_home),
+                "--agent-config-home",
+                str(config_home),
+                "--agent-pi-config-home",
+                str(pi_config_home),
+                env={"GH_TOKEN": None, "GITHUB_TOKEN": None, "PATH": str(fake_bin)},
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            payload = json.loads(completed.stdout)
+
+            implement = payload["recipe"]["steps"][2]["input"]["agent"]
+            self.assertEqual(implement["type"], "real-agent-command")
+            self.assertEqual(
+                implement["command"],
+                [
+                    "/opt/pi/bin/pi",
+                    "-p",
+                    "{prompt}",
+                    "--provider",
+                    "openai-codex",
+                    "--model",
+                    "gpt-5.4-mini",
+                    "--extension",
+                    "git:github.com/DietrichGebert/ponytail",
+                ],
+            )
+            self.assertEqual(implement["wrapper_secret_files"], {"primary": str(wrapper_secret)})
+            self.assertNotIn("agent-secret", json.dumps(payload["recipe"]))
+
+    def test_run_next_rejects_disallowed_pi_model(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            fake_bin = temp_path / "bin"
+            beads_workspace = temp_path / "beads"
+            checkout_root = temp_path / "checkouts"
+            checkout_path = checkout_root / "bump-EQEmu"
+            codex_home = temp_path / "codex-home"
+            config_home = temp_path / "xdg-config"
+            pi_config_home = temp_path / "pi-config"
+            codex_home.mkdir()
+            config_home.mkdir()
+            pi_config_home.mkdir()
+            fake_bin.mkdir()
+            write_executable(
+                fake_bin / "gh",
+                f"""#!{sys.executable}
+import sys
+sys.exit(1)
+""",
+            )
+            write_executable(
+                fake_bin / "bd",
+                f"""#!{sys.executable}
+import sys
+sys.exit(0)
+""",
+            )
+
+            completed = run_afk(
+                "run-next",
+                "--project",
+                "bump-eqemu",
+                "--contracts-dir",
+                "project-contracts",
+                "--beads-workspace",
+                str(beads_workspace),
+                "--checkout-root",
+                str(checkout_root),
+                "--checkout-path",
+                str(checkout_path),
+                "--validation-profile",
+                "tier1",
+                "--agent-mode",
+                "pi",
+                "--agent-pi-model",
+                "gpt-5.9",
+                "--agent-codex-home",
+                str(codex_home),
+                "--agent-config-home",
+                str(config_home),
+                "--agent-pi-config-home",
+                str(pi_config_home),
+                env={"GH_TOKEN": None, "GITHUB_TOKEN": None, "PATH": str(fake_bin)},
+            )
+
+            self.assertNotEqual(completed.returncode, 0, completed.stdout)
+            self.assertIn("Pi worker model must be gpt-5.4 or lower", completed.stderr)
