@@ -38,6 +38,54 @@ def write_executable(path: Path, contents: str) -> None:
 
 
 class RunNextCliTest(unittest.TestCase):
+    def test_run_next_requires_explicit_beads_workspace_flag(self):
+        completed = run_afk(
+            "run-next",
+            "--project",
+            "bump-eqemu",
+            "--contracts-dir",
+            "project-contracts",
+            "--checkout-root",
+            "/tmp/checkouts",
+            "--checkout-path",
+            "/tmp/checkouts/bump-EQEmu",
+            "--validation-profile",
+            "tier1",
+            "--ledger",
+            "/tmp/ledger",
+        )
+
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("the following arguments are required: --beads-workspace", completed.stderr)
+
+    def test_run_next_rejects_missing_beads_workspace_path(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            missing_workspace = temp_path / "missing-beads"
+            checkout_root = temp_path / "checkouts"
+            checkout_path = checkout_root / "bump-EQEmu"
+
+            completed = run_afk(
+                "run-next",
+                "--project",
+                "bump-eqemu",
+                "--contracts-dir",
+                "project-contracts",
+                "--beads-workspace",
+                str(missing_workspace),
+                "--checkout-root",
+                str(checkout_root),
+                "--checkout-path",
+                str(checkout_path),
+                "--validation-profile",
+                "tier1",
+                "--ledger",
+                str(temp_path / "ledger"),
+            )
+
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("beads workspace is not available", completed.stderr)
+
     def test_run_next_builds_project_scoped_selection_request_and_handles_no_candidates(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
@@ -254,21 +302,24 @@ raise SystemExit(9)
         original_select_work = run_next.__globals__["select_work"]
         original_generate_recipe = run_next.__globals__["generate_workstream_recipe"]
         try:
-            run_next.__globals__["select_work"] = lambda request, project_contract=None: selection_result
-            run_next.__globals__["generate_workstream_recipe"] = lambda **kwargs: recipe
-            payload = run_next(
-                project_contract=contract,
-                beads_workspace=ROOT / "project-contracts",
-                checkout_root=ROOT / "project-contracts",
-                checkout_path=ROOT / "project-contracts",
-                validation_profile="tier1",
-                selector_mode="deterministic",
-                selector_model=None,
-                selector_choice_json=None,
-                execute=True,
-                ledger_dir=ROOT / "project-contracts",
-                workstream_runner=fake_workstream_runner,
-            )
+            with tempfile.TemporaryDirectory() as temp_dir:
+                beads_workspace = Path(temp_dir) / "beads"
+                beads_workspace.mkdir()
+                run_next.__globals__["select_work"] = lambda request, project_contract=None: selection_result
+                run_next.__globals__["generate_workstream_recipe"] = lambda **kwargs: recipe
+                payload = run_next(
+                    project_contract=contract,
+                    beads_workspace=beads_workspace,
+                    checkout_root=ROOT / "project-contracts",
+                    checkout_path=ROOT / "project-contracts",
+                    validation_profile="tier1",
+                    selector_mode="deterministic",
+                    selector_model=None,
+                    selector_choice_json=None,
+                    execute=True,
+                    ledger_dir=ROOT / "project-contracts",
+                    workstream_runner=fake_workstream_runner,
+                )
         finally:
             run_next.__globals__["select_work"] = original_select_work
             run_next.__globals__["generate_workstream_recipe"] = original_generate_recipe
@@ -297,23 +348,26 @@ raise SystemExit(9)
         original_select_work = run_next.__globals__["select_work"]
         original_generate_recipe = run_next.__globals__["generate_workstream_recipe"]
         try:
-            run_next.__globals__["select_work"] = lambda request, project_contract=None: selection_result
-            run_next.__globals__["generate_workstream_recipe"] = lambda **kwargs: (_ for _ in ()).throw(
-                AssertionError("recipe generation should not run without a selected candidate")
-            )
-            payload = run_next(
-                project_contract=contract,
-                beads_workspace=ROOT / "project-contracts",
-                checkout_root=ROOT / "project-contracts",
-                checkout_path=ROOT / "project-contracts",
-                validation_profile="tier1",
-                selector_mode="deterministic",
-                selector_model=None,
-                selector_choice_json=None,
-                execute=True,
-                ledger_dir=ROOT / "project-contracts",
-                workstream_runner=fake_workstream_runner,
-            )
+            with tempfile.TemporaryDirectory() as temp_dir:
+                beads_workspace = Path(temp_dir) / "beads"
+                beads_workspace.mkdir()
+                run_next.__globals__["select_work"] = lambda request, project_contract=None: selection_result
+                run_next.__globals__["generate_workstream_recipe"] = lambda **kwargs: (_ for _ in ()).throw(
+                    AssertionError("recipe generation should not run without a selected candidate")
+                )
+                payload = run_next(
+                    project_contract=contract,
+                    beads_workspace=beads_workspace,
+                    checkout_root=ROOT / "project-contracts",
+                    checkout_path=ROOT / "project-contracts",
+                    validation_profile="tier1",
+                    selector_mode="deterministic",
+                    selector_model=None,
+                    selector_choice_json=None,
+                    execute=True,
+                    ledger_dir=ROOT / "project-contracts",
+                    workstream_runner=fake_workstream_runner,
+                )
         finally:
             run_next.__globals__["select_work"] = original_select_work
             run_next.__globals__["generate_workstream_recipe"] = original_generate_recipe

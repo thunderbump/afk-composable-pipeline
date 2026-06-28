@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import tempfile
@@ -14,7 +15,6 @@ from afk.work_sources import select_work
 
 
 READY_TAG = "ready-for-agent"
-DEFAULT_BEADS_WORKSPACE = Path("/home/bump/Projects/beads")
 ALLOWED_SELECTOR_MODELS = {"gpt-5.3-codex-spark", "gpt-5.4-mini"}
 SELECTOR_TIMEOUT_SECONDS = 60
 
@@ -22,7 +22,7 @@ SELECTOR_TIMEOUT_SECONDS = 60
 def run_next(
     *,
     project_contract: ProjectContract,
-    beads_workspace: Path | None = None,
+    beads_workspace: Path,
     checkout_root: Path,
     checkout_path: Path,
     validation_profile: str,
@@ -34,7 +34,7 @@ def run_next(
     ledger_dir: Path | None = None,
     workstream_runner: Callable[..., Any] | None = None,
 ) -> dict[str, Any]:
-    workspace = beads_workspace or DEFAULT_BEADS_WORKSPACE
+    workspace = validate_beads_workspace(beads_workspace)
     selection_request = build_selection_request(
         project_contract,
         beads_workspace=workspace,
@@ -79,6 +79,18 @@ def run_next(
         "recipe": recipe,
         "workstream_result": workstream_result,
     }
+
+
+def validate_beads_workspace(beads_workspace: Path) -> Path:
+    try:
+        resolved_workspace = beads_workspace.resolve(strict=True)
+    except OSError as exc:
+        raise ValueError(f"beads workspace is not available: {beads_workspace}") from exc
+    if not resolved_workspace.is_dir():
+        raise ValueError(f"beads workspace is not available: {beads_workspace}")
+    if not os.access(resolved_workspace, os.R_OK | os.X_OK):
+        raise ValueError(f"beads workspace is not readable: {beads_workspace}")
+    return resolved_workspace
 
 
 def build_selection_request(

@@ -215,7 +215,7 @@ def main(argv: list[str] | None = None) -> int:
                 )
             payload = run_next(
                 project_contract=project_contract,
-                beads_workspace=Path(args.beads_workspace) if args.beads_workspace else None,
+                beads_workspace=Path(args.beads_workspace),
                 checkout_root=Path(args.checkout_root),
                 checkout_path=Path(args.checkout_path),
                 validation_profile=args.validation_profile,
@@ -348,7 +348,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run_next_parser.add_argument(
         "--beads-workspace",
-        default=str(Path("/home/bump/Projects/beads")),
+        required=True,
         help="Absolute mounted central Beads workspace",
     )
     run_next_parser.add_argument("--checkout-root", required=True, help="Explicit checkout root mount")
