@@ -5,7 +5,7 @@ import json
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from afk.checkouts import checkout_path_error
 from afk.contracts import ContractError, ProjectContract, load_project_contract
@@ -215,6 +215,10 @@ def main(argv: list[str] | None = None) -> int:
             recipe_agent = recipe_agent_from_args(args, checkout_path=Path(args.checkout_path))
             reviewer = recipe_reviewer_from_args(args)
             retrospective_judge = recipe_retrospective_judge_from_args(args)
+            recipe_publisher_factory = recipe_publisher_factory_from_args(
+                args,
+                checkout_path=Path(args.checkout_path),
+            )
             workstream_runner = None
             if args.execute:
                 from afk.workstream import run_workstream
@@ -234,6 +238,7 @@ def main(argv: list[str] | None = None) -> int:
                 agent=recipe_agent,
                 reviewer=reviewer,
                 retrospective_judge=retrospective_judge,
+                publisher_factory=recipe_publisher_factory,
                 ready_tag=args.ready_tag,
                 selector_mode=args.selector_mode,
                 selector_model=args.selector_model,
@@ -319,18 +324,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_implementation_agent_flags(generate_recipe_parser)
     add_reviewer_flags(generate_recipe_parser)
     add_retrospective_judge_flags(generate_recipe_parser)
-    generate_recipe_parser.add_argument(
-        "--publisher-mode",
-        choices=("disabled", "create"),
-        default="disabled",
-        help="Terminal publisher mode to embed in the generated recipe",
-    )
-    generate_recipe_parser.add_argument("--publisher-repo", help="owner/repo for publisher create mode")
-    generate_recipe_parser.add_argument("--publisher-base", help="Base branch for publisher create mode")
-    generate_recipe_parser.add_argument(
-        "--publisher-gh-config-dir",
-        help="Absolute mounted gh config dir for publisher create mode",
-    )
+    add_publisher_flags(generate_recipe_parser)
     generate_recipe_parser.add_argument("--output", required=True, help="Path to write the JSON recipe")
 
     run_next_parser = subcommands.add_parser(
@@ -379,6 +373,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_implementation_agent_flags(run_next_parser)
     add_reviewer_flags(run_next_parser)
     add_retrospective_judge_flags(run_next_parser)
+    add_publisher_flags(run_next_parser)
 
     return parser
 
@@ -517,6 +512,21 @@ def add_retrospective_judge_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--retrospective-judge-ponytail-extension-source",
         help="Retrospective judge ponytail extension source string for pi mode",
+    )
+
+
+def add_publisher_flags(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--publisher-mode",
+        choices=("disabled", "create"),
+        default="disabled",
+        help="Terminal publisher mode to embed in the generated recipe",
+    )
+    parser.add_argument("--publisher-repo", help="owner/repo for publisher create mode")
+    parser.add_argument("--publisher-base", help="Base branch for publisher create mode")
+    parser.add_argument(
+        "--publisher-gh-config-dir",
+        help="Absolute mounted gh config dir for publisher create mode",
     )
 
 
@@ -731,6 +741,26 @@ def recipe_publisher_from_args(
         gh_config_dir=args.publisher_gh_config_dir,
         checkout_path=checkout_path,
     )
+
+
+def recipe_publisher_factory_from_args(
+    args: argparse.Namespace,
+    *,
+    checkout_path: Path,
+) -> Callable[[str], dict[str, Any] | None] | None:
+    if args.publisher_mode == "disabled":
+        return None
+    if args.publisher_mode != "create":
+        raise ValueError(f"Unsupported --publisher-mode: {args.publisher_mode}")
+
+    def _factory(workstream_id: str) -> dict[str, Any] | None:
+        return recipe_publisher_from_args(
+            args,
+            review_branch=f"afk/{branch_slug(workstream_id)}",
+            checkout_path=checkout_path,
+        )
+
+    return _factory
 
 
 def run_step(

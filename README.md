@@ -371,6 +371,61 @@ practical source there for now. The command still includes the GitHub source
 when the contract repo points at GitHub, and it will skip cleanly when auth is
 not available.
 
+`run-next` defaults to preview mode. It writes the generated recipe to stdout and
+does not execute it unless `--execute` is set. For a safe dogfood run, validate
+the preview payload in CI or locally first, then add `--execute` in a controlled
+runner.
+
+When using `--agent-mode pi`, `--reviewer-mode pi`, and `--retrospective-judge-mode
+pi`, all worker model flags are validated with the same cap:
+`gpt-5.4` or lower. Examples in this repo use `gpt-5.4-mini` for lightweight
+and `gpt-5.4` for conservative judge/reviewer workloads.
+
+`--agent-ponytail`, `--reviewer-ponytail`, and
+`--retrospective-judge-ponytail` all map to the same bundled extension source
+`git:github.com/DietrichGebert/ponytail`; explicit `--*-ponytail-extension`
+or `--*-ponytail-extension-source` values are accepted when the corresponding
+`--*ponytail` shortcut is not used.
+
+Publisher mode uses absolute mount paths only. Use `--publisher-mode create`,
+`--publisher-repo`, `--publisher-base`, and `--publisher-gh-config-dir` to
+generate publishable recipes; do not pass raw tokens, use a mounted
+`GH_CONFIG_DIR` path. `GH_TOKEN` and `GITHUB_TOKEN` are intentionally ignored by
+publisher execution for auth safety.
+
+### No-op and Doc-Card Dogfood
+
+The pipeline has a docs-safe dogfood path:
+
+1. Run no-op to verify the CLI and ledger path end-to-end:
+
+   ```sh
+   PYTHONPATH=src python3 -m afk run-step noop \
+     --input '{"message":"dogfood no-op"}' \
+     --ledger ledger
+   ```
+
+2. For docs-only runs, include or update the doc-card marker in the PR body
+   (`AFK_SUCCESS_DOGFOOD`) and keep `run-next`/`run-workstream` paths in
+   inspect mode (preview only), or execute only when intentionally running the
+   real dogfood command path.
+
+   ```md
+   <!-- AFK_SUCCESS_DOGFOOD: central-afk-pr.16 -->
+   ```
+
+This keeps docs-only work from accidentally publishing while still exercising the
+`run-next` recipe and schema shape.
+
+For `bump-eqemu`, keep these caveats in mind:
+
+- selector fallback prefers Beads over GitHub Issues; GitHub Issues can be shown as
+  `skipped_unconfigured` when issue listing is unavailable.
+- contract selection requires `project-contracts` metadata and absolute
+  checkouts/mounts that exist at runtime.
+- model commands and publisher actions require explicit auth mounts prepared before
+  `--execute`.
+
 ### Real Agent Container Contract
 
 For container/remote execution with `agent.type: real-agent-command`, AFK validates

@@ -29,6 +29,7 @@ def run_next(
     agent: dict[str, Any] | None = None,
     reviewer: dict[str, Any] | None = None,
     retrospective_judge: dict[str, Any] | None = None,
+    publisher_factory: Callable[[str], dict[str, Any] | None] | None = None,
     ready_tag: str = READY_TAG,
     selector_mode: str = "deterministic",
     selector_model: str | None = None,
@@ -63,6 +64,7 @@ def run_next(
             agent=agent,
             reviewer=reviewer,
             retrospective_judge=retrospective_judge,
+            publisher=publisher_factory(chosen["external_id"]) if publisher_factory is not None else None,
             sources=selection_request["sources"],
             required_labels=selection_request["required_labels"],
         )
