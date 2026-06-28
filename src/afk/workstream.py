@@ -2370,14 +2370,10 @@ def _run_retrospective_follow_up(
     )
     recommended = follow_up.get("recommended") if isinstance(follow_up.get("recommended"), list) else []
     existing_created = follow_up.get("created") if isinstance(follow_up.get("created"), list) else []
-    if not recommended:
-        return {
-            "enabled": True,
-            "status": "skipped",
-            "classification": "no_recommendations",
-            "summary": "No retrospective follow-up recommendations required.",
-            "created": [],
-        }
+    request_path = ledger.path / "retrospective-follow-up-request.json"
+    result_path = ledger.path / "retrospective-follow-up-result.json"
+    stdout_path = ledger.path / "retrospective-follow-up-stdout.log"
+    stderr_path = ledger.path / "retrospective-follow-up-stderr.log"
     request = _build_retrospective_follow_up_request(
         normalized=normalized,
         publication=publication,
@@ -2387,11 +2383,22 @@ def _run_retrospective_follow_up(
         created=existing_created,
         run_id=ledger.run_id,
     )
-    request_path = ledger.path / "retrospective-follow-up-request.json"
-    result_path = ledger.path / "retrospective-follow-up-result.json"
-    stdout_path = ledger.path / "retrospective-follow-up-stdout.log"
-    stderr_path = ledger.path / "retrospective-follow-up-stderr.log"
     ledger.write_json("retrospective-follow-up-request.json", request)
+    if not recommended:
+        normalized_result = _normalized_retrospective_follow_up_result(
+            enabled=True,
+            status="skipped",
+            classification="no_recommendations",
+            summary="No retrospective follow-up recommendations required.",
+            created=[],
+            adapter=_retrospective_follow_up_adapter_record(follow_up_config, None, False),
+            request_path=request_path,
+            result_path=result_path,
+            stdout_path=stdout_path,
+            stderr_path=stderr_path,
+        )
+        _write_retrospective_follow_up_result(result_path, ledger.run_id, normalized_result)
+        return normalized_result
     checkout_path = checkout_path_from_state(state)
     try:
         adapter_result, raw_payload = _run_retrospective_follow_up_command(
@@ -2657,15 +2664,26 @@ def _normalize_retrospective_follow_up_created(
         for item in recommended
         if isinstance(item, dict) and string_field(item, "fingerprint")
     }
+    recommended_by_identity = {
+        _retrospective_follow_up_identity(
+            string_field(item, "summary") or "",
+            _retrospective_follow_up_labels(item.get("labels")),
+        ): item
+        for item in recommended
+        if isinstance(item, dict)
+    }
     normalized_items = []
     for item in items:
         if not isinstance(item, dict):
             continue
         fingerprint = string_field(item, "fingerprint") or ""
-        matched = recommended_by_fingerprint.get(fingerprint, {})
+        summary = string_field(item, "summary") or ""
+        labels = item.get("labels")
+        identity = _retrospective_follow_up_identity(redact_text(summary), _retrospective_follow_up_labels(labels))
+        matched = recommended_by_fingerprint.get(fingerprint) or recommended_by_identity.get(identity) or {}
         kind = string_field(item, "kind") or string_field(matched, "kind") or "created-follow-up"
-        summary = string_field(item, "summary") or string_field(matched, "summary") or ""
-        labels = item.get("labels") if item.get("labels") is not None else matched.get("labels")
+        summary = summary or string_field(matched, "summary") or ""
+        labels = labels if labels is not None else matched.get("labels")
         normalized_item = _retrospective_created_follow_up_item(
             {
                 "id": string_field(item, "id") or "",
@@ -2678,6 +2696,8 @@ def _normalize_retrospective_follow_up_created(
             continue
         if fingerprint:
             normalized_item["fingerprint"] = fingerprint
+        elif string_field(matched, "fingerprint"):
+            normalized_item["fingerprint"] = matched["fingerprint"]
         normalized_items.append(normalized_item)
     return _merge_retrospective_created_follow_up([], normalized_items)
 
@@ -2869,9 +2889,10 @@ def _retrospective_follow_up_record(signals: list[dict[str, Any]], normalized: d
     recommended = []
     created = []
     recommended_fingerprints: set[str] = set()
+    recommended_identities: set[str] = set()
     created_fingerprints: set[str] = set()
+    created_identities: set[str] = set()
     created_summaries: set[str] = set()
-    has_created_follow_up = False
     if normalized is not None:
         retrospective = normalized.get("retrospective") if isinstance(normalized, dict) else {}
         configured = retrospective.get("follow_up") if isinstance(retrospective, dict) else {}
@@ -2885,36 +2906,42 @@ def _retrospective_follow_up_record(signals: list[dict[str, Any]], normalized: d
                     summary=string_field(item, "summary") or "",
                     labels=item.get("labels"),
                 )
-                if recommendation and recommendation["fingerprint"] not in recommended_fingerprints:
+                if (
+                    recommendation
+                    and recommendation["fingerprint"] not in recommended_fingerprints
+                    and _retrospective_follow_up_identity_for_item(recommendation) not in recommended_identities
+                ):
                     recommended.append(recommendation)
                     recommended_fingerprints.add(recommendation["fingerprint"])
+                    recommended_identities.add(_retrospective_follow_up_identity_for_item(recommendation))
         configured_created = configured.get("created") if isinstance(configured, dict) else []
         if isinstance(configured_created, list):
             for item in configured_created:
                 if not isinstance(item, dict):
                     continue
-                if string_field(item, "id") or string_field(item, "summary"):
-                    has_created_follow_up = True
-                created_summary = redact_text(string_field(item, "summary") or "")
-                if created_summary:
-                    created_summaries.add(created_summary)
                 created_item = _retrospective_created_follow_up_item(item, kind="configured-created")
                 if created_item:
                     created.append(created_item)
                     if string_field(created_item, "fingerprint"):
                         created_fingerprints.add(created_item["fingerprint"])
+                    created_identities.add(_retrospective_follow_up_identity_for_item(created_item))
+                    created_summary = string_field(created_item, "summary")
+                    if created_summary:
+                        created_summaries.add(created_summary)
     for signal in signals:
         kind = string_field(signal, "kind") or ""
         follow_up_item = _follow_up_for_signal(kind)
         if (
             follow_up_item
             and follow_up_item["fingerprint"] not in recommended_fingerprints
-            and not has_created_follow_up
-            and string_field(follow_up_item, "summary") not in created_summaries
             and follow_up_item["fingerprint"] not in created_fingerprints
+            and _retrospective_follow_up_identity_for_item(follow_up_item) not in recommended_identities
+            and _retrospective_follow_up_identity_for_item(follow_up_item) not in created_identities
+            and string_field(follow_up_item, "summary") not in created_summaries
         ):
             recommended.append(follow_up_item)
             recommended_fingerprints.add(follow_up_item["fingerprint"])
+            recommended_identities.add(_retrospective_follow_up_identity_for_item(follow_up_item))
     return {
         "recommended": recommended,
         "created": created,
@@ -3022,6 +3049,22 @@ def _retrospective_follow_up_fingerprint(kind: str, summary: str, labels: list[s
             "labels": sorted(set(labels)),
         }
     )[:12]
+
+
+def _retrospective_follow_up_identity(summary: str, labels: list[str]) -> str:
+    return sha256_json(
+        {
+            "summary": summary,
+            "labels": sorted(set(labels)),
+        }
+    )
+
+
+def _retrospective_follow_up_identity_for_item(item: dict[str, Any]) -> str:
+    return _retrospective_follow_up_identity(
+        string_field(item, "summary") or "",
+        _retrospective_follow_up_labels(item.get("labels")),
+    )
 
 
 def _follow_up_for_signal(kind: str) -> dict[str, Any] | None:

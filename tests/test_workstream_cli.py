@@ -1228,7 +1228,6 @@ raise SystemExit(9)
                                     {{
                                         "id": "central-4x9.44",
                                         "kind": recommended[0]["kind"],
-                                        "fingerprint": recommended[0]["fingerprint"],
                                         "summary": recommended[0]["summary"],
                                         "labels": recommended[0]["labels"],
                                     }}
@@ -1280,6 +1279,10 @@ raise SystemExit(9)
             self.assertEqual(
                 result["pipeline_retrospective"]["follow_up"]["created"][0]["id"],
                 "central-4x9.44",
+            )
+            self.assertEqual(
+                result["pipeline_retrospective"]["follow_up"]["created"][0]["fingerprint"],
+                result["pipeline_retrospective"]["follow_up"]["recommended"][0]["fingerprint"],
             )
             self.assertEqual(result["artifacts"]["retrospective_follow_up_request"], "retrospective-follow-up-request.json")
             self.assertEqual(result["artifacts"]["retrospective_follow_up_result"], "retrospective-follow-up-result.json")
@@ -1362,6 +1365,72 @@ raise SystemExit(9)
             self.assertEqual(result["pipeline_retrospective"]["follow_up"]["creation"]["enabled"], True)
             self.assertEqual(result["pipeline_retrospective"]["follow_up"]["creation"]["status"], "failed")
             self.assertEqual(result["pipeline_retrospective"]["follow_up"]["creation"]["adapter"]["returncode"], 7)
+            self.assertEqual(result["artifacts"]["retrospective_follow_up_result"], "retrospective-follow-up-result.json")
+            self.assertEqual(result["artifacts"]["retrospective_follow_up_stdout"], "retrospective-follow-up-stdout.log")
+            self.assertEqual(result["artifacts"]["retrospective_follow_up_stderr"], "retrospective-follow-up-stderr.log")
+
+    def test_workstream_records_enabled_retrospective_follow_up_skip_artifacts_without_recommendations(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repo = temp_path / "repo-src"
+            checkout = temp_path / "checkout"
+            ledger = temp_path / "ledger"
+            creator_ran = temp_path / "creator-ran.txt"
+            init_repo(repo)
+            fake_git = temp_path / "publisher-git"
+            fake_gh = temp_path / "publisher-gh"
+            write_executable(
+                fake_git,
+                f"""#!{sys.executable}
+raise SystemExit(9)
+""",
+            )
+            write_executable(
+                fake_gh,
+                f"""#!{sys.executable}
+raise SystemExit(9)
+""",
+            )
+            recipe = merged_recipe_with_retrospective(temp_path, repo, checkout, fake_git, fake_gh)
+            recipe["retrospective_follow_up"] = {
+                "enabled": True,
+                "type": "local-command",
+                "command": [
+                    sys.executable,
+                    "-c",
+                    f"from pathlib import Path; Path({str(creator_ran)!r}).write_text('ran', encoding='utf-8')",
+                ],
+                "timeout_seconds": 10,
+            }
+
+            completed = run_afk(
+                "run-workstream",
+                "--workstream-id",
+                "central-lve.9",
+                "--input",
+                json.dumps(recipe),
+                "--ledger",
+                str(ledger),
+                env_overrides={
+                    "GIT_ALLOW_PROTOCOL": "file",
+                    "GIT_AUTHOR_NAME": "AFK Test",
+                    "GIT_AUTHOR_EMAIL": "afk-test@example.test",
+                    "GIT_COMMITTER_NAME": "AFK Test",
+                    "GIT_COMMITTER_EMAIL": "afk-test@example.test",
+                },
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertFalse(creator_ran.exists())
+            summary = json.loads(completed.stdout)
+            result = json.loads((ledger / summary["result_path"]).read_text(encoding="utf-8"))
+            creation = result["pipeline_retrospective"]["follow_up"]["creation"]
+
+            self.assertEqual(result["status"], "closed")
+            self.assertEqual(creation["enabled"], True)
+            self.assertEqual(creation["status"], "skipped")
+            self.assertEqual(creation["classification"], "no_recommendations")
+            self.assertEqual(result["artifacts"]["retrospective_follow_up_request"], "retrospective-follow-up-request.json")
             self.assertEqual(result["artifacts"]["retrospective_follow_up_result"], "retrospective-follow-up-result.json")
             self.assertEqual(result["artifacts"]["retrospective_follow_up_stdout"], "retrospective-follow-up-stdout.log")
             self.assertEqual(result["artifacts"]["retrospective_follow_up_stderr"], "retrospective-follow-up-stderr.log")

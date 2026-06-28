@@ -424,6 +424,32 @@ class WorkstreamStatusMappingTest(unittest.TestCase):
         )
         self.assertIn("[REDACTED]", record["recommended_follow_up"][0]["summary"])
 
+    def test_pipeline_retrospective_record_deduplicates_configured_and_signal_follow_up(self):
+        record = pipeline_retrospective_record(
+            retrospective_state(),
+            {
+                "status": "failed-needs-human",
+                "reason": "gh auth status failed",
+            },
+            retrospective_tracker("validated"),
+            normalized={
+                "retrospective": {
+                    "follow_up": {
+                        "recommended": [
+                            {
+                                "summary": "Repair GitHub publisher authentication evidence before rerunning terminal publication.",
+                                "labels": ["afk:follow-up", "area:publication"],
+                            }
+                        ]
+                    }
+                }
+            },
+        )
+
+        self.assertEqual(record["health"], "failing")
+        self.assertEqual(len(record["follow_up"]["recommended"]), 1)
+        self.assertEqual(len(record["recommended_follow_up"]), 1)
+
     def test_pipeline_retrospective_record_does_not_recommend_created_follow_up_again(self):
         record = pipeline_retrospective_record(
             retrospective_state(),
@@ -450,7 +476,7 @@ class WorkstreamStatusMappingTest(unittest.TestCase):
         self.assertEqual(record["signals"][0]["kind"], "publisher-auth")
         self.assertEqual(record["recommended_follow_up"], [])
 
-    def test_pipeline_retrospective_record_does_not_recommend_when_created_follow_up_has_only_id(self):
+    def test_pipeline_retrospective_record_recommends_when_created_follow_up_has_only_id(self):
         record = pipeline_retrospective_record(
             retrospective_state(),
             {
@@ -473,7 +499,15 @@ class WorkstreamStatusMappingTest(unittest.TestCase):
 
         self.assertEqual(record["health"], "failing")
         self.assertEqual(record["signals"][0]["kind"], "publisher-auth")
-        self.assertEqual(record["recommended_follow_up"], [])
+        self.assertEqual(
+            record["recommended_follow_up"],
+            [
+                {
+                    "summary": "Repair GitHub publisher authentication evidence before rerunning terminal publication.",
+                    "labels": ["afk:follow-up", "area:publication", "project:afk-composable-pipeline"],
+                }
+            ],
+        )
 
     def test_workstream_status_from_publication_explicit_terminal_states(self):
         self.assertEqual(
