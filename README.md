@@ -167,7 +167,10 @@ The recipe schema is intentionally small:
   only after the PR merges, or
   `{"status":"no-merge","reason":"<why>","pr_url":"<url>"}` when the branch is
   intentionally not going to merge and the source Beads item should close with
-  that reason. `pr_url` is optional but should be provided when known.
+  that reason. `pr_url` is required for merged/no-merge terminal decisions. When
+  unresolved `review_cycles` findings still require a response, add
+  `review_feedback_status: "resolved"` or `"waived"` before AFK will emit
+  close guidance for a terminal merge/no-merge decision.
 - `steps` is an ordered list of existing step names: `select-work`,
   `prepare-checkout`, `implement`, `validate`, and `review`. Each step has an
   explicit `input` object, plus optional `profile` for `validate`.
@@ -590,9 +593,9 @@ terminal PR publication status, and tracker-close guidance. Dirty retry
 checkouts are surfaced through `cleanup.resources` with path, branch, commit,
 and status so failed retry attempts stay visible without spawning more sibling
 checkouts.
-`publication-result.json` records one of five explicit terminal states:
-`blocked`, `validated-unpublished`, `failed-needs-human`, `published`, or
-`tracker-closed`.
+`publication-result.json` records one of six explicit terminal states:
+`blocked`, `validated-unpublished`, `failed-needs-human`, `published`,
+`tracker-close-blocked`, or `tracker-closed`.
 `tracker-result.json` records whether the source Beads item stays open, whether
 it is ready to close, the PR URL when one was opened, any carried-forward review
 findings, and the merge commit or explicit no-merge close reason when one is
@@ -600,10 +603,12 @@ recorded.
 `review_cycles` evidence, when supplied, is included in both
 `workstream-result.json` and `tracker-result.json`. Open or response-required
 cycle findings keep the tracker state at `review-findings-open` until the
-relevant review record carries addressed evidence. AFK only treats a response
-object as addressed when its `status` is `addressed` or
-`findings-addressed`; a non-empty response string is the freeform addressed
-evidence path.
+relevant review record carries addressed evidence. Once review cycle evidence is
+present and all response-required findings are addressed, the tracker state
+advances to `review-feedback-addressed` and still keeps the source item open
+until merge or no-merge. AFK only treats a response object as addressed when
+its `status` is `addressed` or `findings-addressed`; a non-empty response
+string is the freeform addressed evidence path.
 Step-level outputs may still use other status strings; specifically,
 `prepare-checkout` uses `publication.status == "skipped_disabled"` when
 the checkout publisher path is intentionally disabled.
@@ -621,6 +626,9 @@ immediately eligible for PR publication on a follow-up rerun.
 `published` means the PR exists but the source Beads item is still
 `awaiting-review`; it stays open until the PR merges or
 `tracker.terminal_decision.status == "no-merge"` is recorded.
+`tracker-close-blocked` means a terminal merge/no-merge decision was recorded,
+but unresolved review feedback still requires `review_feedback_status:
+"resolved"` or `"waived"` before AFK can close the source item.
 `tracker-closed` means a terminal merge or no-merge decision was recorded, so
 AFK skipped publisher commands and emitted tracker close guidance instead.
 `pr-body.md` is written before terminal PR commands run, so fake/offline
