@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
 from afk.contracts import ProjectContract
 from afk.jsonutil import canonical_json, sha256_json
@@ -17,6 +18,9 @@ from afk.registry import StepResult
 
 SCHEMA_VERSION = 1
 KNOWN_WORKSTREAM_STEPS = {"select-work", "prepare-checkout", "implement", "validate", "review"}
+REVIEW_CYCLE_STATUSES = {"passed", "findings-open", "findings-addressed", "request-changes"}
+REVIEW_CYCLE_OPEN_STATUSES = {"findings-open", "request-changes"}
+REVIEW_CYCLE_RESPONSE_STATUSES = {"addressed", "findings-addressed"}
 
 
 @dataclass(frozen=True)
@@ -175,6 +179,7 @@ def run_workstream(
         "parent": normalized["parent"],
         "review_branch": normalized["review_branch"],
         "status": status,
+        "review_cycles": redact_review_cycles(normalized["review_cycles"]),
         "steps": steps,
         "selected_work": selected_work,
         "cleanup": state["cleanup"],
@@ -238,6 +243,7 @@ def normalize_recipe(
     publisher = recipe.get("publisher", {"enabled": False})
     retry_policy = normalize_retry_policy(recipe.get("retry_policy"))
     tracker = normalize_tracker_config(recipe.get("tracker"))
+    review_cycles = normalize_review_cycles(recipe.get("review_cycles"))
     return {
         "schema_version": SCHEMA_VERSION,
         "workstream_id": resolved_workstream_id,
@@ -247,6 +253,7 @@ def normalize_recipe(
         "publisher": publisher,
         "retry_policy": retry_policy,
         "tracker": tracker,
+        "review_cycles": review_cycles,
     }
 
 
@@ -1647,6 +1654,7 @@ def tracker_record(
         "review_status": string_field(review, "status") or "",
         "review_summary": string_field(review, "summary") or "",
         "review_findings": tracker_review_findings(review),
+        "review_cycles": redact_review_cycles(normalized.get("review_cycles") or []),
         "terminal_decision": redact_artifact_value(decision),
     }
     decision_status = decision.get("status")
@@ -1664,6 +1672,12 @@ def tracker_record(
         record["close_reason"] = redact_text(decision["reason"])
         record["comment"] = "A terminal no-merge decision was recorded; close the source Beads item with this reason."
         record["pr_url"] = redact_text(decision.get("pr_url") or "")
+        return record
+    if review_cycles_require_response(normalized.get("review_cycles")):
+        record["status"] = "review-findings-open"
+        record["comment"] = "PR review cycles contain response-required review findings; keep the source Beads item open."
+        if publication.get("status") == "published":
+            record["pr_url"] = redact_text(str(publication.get("url") or ""))
         return record
     if publication.get("status") == "published":
         record["status"] = "awaiting-review"
@@ -1697,6 +1711,214 @@ def tracker_review_findings(review: dict[str, Any]) -> list[Any]:
     if not isinstance(findings, list):
         return []
     return redact_artifact_value(findings)
+
+
+def redact_review_cycles(review_cycles: Any) -> list[Any]:
+    if not isinstance(review_cycles, list):
+        return []
+    return [redact_review_cycle(cycle) for cycle in review_cycles]
+
+
+def redact_review_cycle(cycle: Any) -> Any:
+    if not isinstance(cycle, dict):
+        return redact_artifact_value(cycle)
+    redacted = redact_artifact_value(cycle)
+    reviews = cycle.get("reviews")
+    if not isinstance(reviews, list):
+        return redacted
+    redacted["reviews"] = [
+        redact_review_cycle_review(review, redacted_review)
+        for review, redacted_review in zip(reviews, redacted.get("reviews", []))
+    ]
+    return redacted
+
+
+def redact_review_cycle_review(review: Any, redacted_review: Any) -> Any:
+    if not isinstance(review, dict) or not isinstance(redacted_review, dict):
+        return redacted_review
+    pr_comment_url = review.get("pr_comment_url")
+    if isinstance(pr_comment_url, str) and pr_comment_url:
+        redacted_review["pr_comment_url"] = redact_review_cycle_pr_comment_url(pr_comment_url)
+    return redacted_review
+
+
+def redact_review_cycle_pr_comment_url(value: str) -> str:
+    parsed = urlsplit(value)
+    if not parsed.scheme or not parsed.netloc:
+        return redact_text(value)
+    host = parsed.hostname or ""
+    if parsed.port is not None:
+        host = f"{host}:{parsed.port}"
+    elif not parsed.username and not parsed.password:
+        host = parsed.netloc
+    fragment = parsed.fragment if review_cycle_fragment_is_safe(parsed.fragment) else ""
+    return urlunsplit((parsed.scheme, host, parsed.path, "", fragment))
+
+
+def review_cycle_fragment_is_safe(fragment: str) -> bool:
+    if not fragment:
+        return False
+    if redact_text(fragment) != fragment:
+        return False
+    fragment_keys = [key for key, _ in parse_qsl(fragment, keep_blank_values=True)]
+    return not any(is_secret_key(key) for key in fragment_keys)
+
+
+def normalize_review_cycles(review_cycles: Any) -> list[dict[str, Any]]:
+    if review_cycles is None:
+        return []
+    if not isinstance(review_cycles, list):
+        raise WorkstreamError("review_cycles must be a list")
+    normalized = []
+    for cycle_index, cycle in enumerate(review_cycles):
+        if not isinstance(cycle, dict):
+            raise WorkstreamError(f"review_cycles[{cycle_index}] must be an object")
+        cycle_number = cycle.get("cycle", cycle_index + 1)
+        if isinstance(cycle_number, bool) or not isinstance(cycle_number, int) or cycle_number <= 0:
+            raise WorkstreamError(f"review_cycles[{cycle_index}].cycle must be a positive integer")
+        status = normalize_review_cycle_optional_string(
+            cycle,
+            "status",
+            f"review_cycles[{cycle_index}].status must be a string",
+        )
+        validate_review_cycle_status(
+            status,
+            f"review_cycles[{cycle_index}].status must be one of: {', '.join(sorted(REVIEW_CYCLE_STATUSES))}",
+        )
+        reviews = cycle.get("reviews")
+        if not isinstance(reviews, list):
+            raise WorkstreamError(f"review_cycles[{cycle_index}].reviews must be a list")
+        normalized_reviews = []
+        for review_index, review in enumerate(reviews):
+            if not isinstance(review, dict):
+                raise WorkstreamError(f"review_cycles[{cycle_index}].reviews[{review_index}] must be an object")
+            normalized_review = {
+                "role": normalize_review_cycle_required_string(
+                    review,
+                    "role",
+                    f"review_cycles[{cycle_index}].reviews[{review_index}].role is required",
+                    f"review_cycles[{cycle_index}].reviews[{review_index}].role must be a string",
+                ),
+                "status": normalize_review_cycle_required_string(
+                    review,
+                    "status",
+                    f"review_cycles[{cycle_index}].reviews[{review_index}].status is required",
+                    f"review_cycles[{cycle_index}].reviews[{review_index}].status must be a string",
+                ),
+                "summary": normalize_review_cycle_required_string(
+                    review,
+                    "summary",
+                    f"review_cycles[{cycle_index}].reviews[{review_index}].summary is required",
+                    f"review_cycles[{cycle_index}].reviews[{review_index}].summary must be a string",
+                ),
+                "requires_response": normalize_review_cycle_boolean(
+                    review,
+                    "requires_response",
+                    f"review_cycles[{cycle_index}].reviews[{review_index}].requires_response must be a boolean",
+                ),
+            }
+            validate_review_cycle_status(
+                normalized_review["status"],
+                "review_cycles"
+                f"[{cycle_index}].reviews[{review_index}].status must be one of: "
+                f"{', '.join(sorted(REVIEW_CYCLE_STATUSES))}",
+            )
+            pr_comment_url = normalize_review_cycle_optional_string(
+                review,
+                "pr_comment_url",
+                f"review_cycles[{cycle_index}].reviews[{review_index}].pr_comment_url must be a string",
+            )
+            if pr_comment_url:
+                normalized_review["pr_comment_url"] = pr_comment_url
+            if "response" in review:
+                response = review["response"]
+                if not isinstance(response, (str, dict)):
+                    raise WorkstreamError(
+                        f"review_cycles[{cycle_index}].reviews[{review_index}].response must be a string or object"
+                    )
+                normalized_review["response"] = normalize_review_cycle_response(
+                    response,
+                    cycle_index=cycle_index,
+                    review_index=review_index,
+                )
+            normalized_reviews.append(normalized_review)
+        normalized.append({"cycle": cycle_number, "status": status, "reviews": normalized_reviews})
+    return normalized
+
+
+def review_cycles_require_response(review_cycles: Any) -> bool:
+    if not isinstance(review_cycles, list):
+        return False
+    for cycle in review_cycles:
+        if not isinstance(cycle, dict):
+            continue
+        cycle_status = string_field(cycle, "status") or ""
+        reviews = cycle.get("reviews")
+        if not isinstance(reviews, list):
+            continue
+        for review in reviews:
+            if not isinstance(review, dict):
+                continue
+            review_status = string_field(review, "status") or ""
+            requires_response = bool(review.get("requires_response"))
+            response = review.get("response")
+            response_is_addressed = review_cycle_response_is_addressed(response)
+            if requires_response and not response_is_addressed:
+                return True
+            if review_cycle_status_requires_response(cycle_status) or review_cycle_status_requires_response(
+                review_status
+            ):
+                if not response_is_addressed:
+                    return True
+    return False
+
+
+def validate_review_cycle_status(status: str, error_message: str) -> None:
+    if status and status not in REVIEW_CYCLE_STATUSES:
+        raise WorkstreamError(error_message)
+
+
+def normalize_review_cycle_response(
+    response: str | dict[str, Any],
+    *,
+    cycle_index: int,
+    review_index: int,
+) -> str | dict[str, Any]:
+    if isinstance(response, str):
+        return response.strip()
+    normalized = dict(response)
+    status = normalize_review_cycle_required_string(
+        normalized,
+        "status",
+        f"review_cycles[{cycle_index}].reviews[{review_index}].response.status is required",
+        f"review_cycles[{cycle_index}].reviews[{review_index}].response.status must be a string",
+    )
+    if status not in REVIEW_CYCLE_RESPONSE_STATUSES:
+        allowed = ", ".join(sorted(REVIEW_CYCLE_RESPONSE_STATUSES))
+        raise WorkstreamError(
+            f"review_cycles[{cycle_index}].reviews[{review_index}].response.status must be one of: {allowed}"
+        )
+    normalized["status"] = status
+    summary = normalized.get("summary")
+    if summary is not None and not isinstance(summary, str):
+        raise WorkstreamError(
+            f"review_cycles[{cycle_index}].reviews[{review_index}].response.summary must be a string"
+        )
+    if isinstance(summary, str):
+        normalized["summary"] = summary.strip()
+    return normalized
+
+
+def review_cycle_status_requires_response(status: str) -> bool:
+    return status in REVIEW_CYCLE_OPEN_STATUSES
+
+
+def review_cycle_response_is_addressed(response: Any) -> bool:
+    if isinstance(response, str):
+        return bool(response.strip())
+    if not isinstance(response, dict):
+        return False
+    return (string_field(response, "status") or "") in REVIEW_CYCLE_RESPONSE_STATUSES
 
 
 def blocked_publication(reason: str, normalized: dict[str, Any], run_id: str) -> dict[str, Any]:
@@ -1902,6 +2124,41 @@ def string_field(input_data: dict[str, Any], key: str) -> str | None:
     if isinstance(value, str) and value.strip():
         return value.strip()
     return None
+
+
+def normalize_review_cycle_optional_string(input_data: dict[str, Any], key: str, error_message: str) -> str:
+    value = input_data.get(key)
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise WorkstreamError(error_message)
+    return value.strip()
+
+
+def normalize_review_cycle_required_string(
+    input_data: dict[str, Any],
+    key: str,
+    missing_message: str,
+    invalid_message: str,
+) -> str:
+    value = input_data.get(key)
+    if value is None:
+        raise WorkstreamError(missing_message)
+    if not isinstance(value, str):
+        raise WorkstreamError(invalid_message)
+    stripped = value.strip()
+    if not stripped:
+        raise WorkstreamError(missing_message)
+    return stripped
+
+
+def normalize_review_cycle_boolean(input_data: dict[str, Any], key: str, error_message: str) -> bool:
+    value = input_data.get(key)
+    if value is None:
+        return False
+    if not isinstance(value, bool):
+        raise WorkstreamError(error_message)
+    return value
 
 
 def path_is_equal_to_or_inside(path: Path, parent: Path) -> bool:

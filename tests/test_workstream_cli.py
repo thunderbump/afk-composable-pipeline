@@ -4146,3 +4146,306 @@ Path({str(fake_calls)!r}).write_text("gh should not run\\n", encoding="utf-8")
             self.assertIn("publisher.head must match review_branch", result["publication"]["reason"])
             self.assertEqual(result["cleanup"], {"status": "clean", "resources": []})
             self.assertFalse(fake_calls.exists())
+
+    def test_workstream_includes_normalized_review_cycles_in_result_and_tracker(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repo = temp_path / "repo-src"
+            checkout = temp_path / "checkout"
+            ledger = temp_path / "ledger"
+            fake_calls = temp_path / "fake-calls.jsonl"
+            init_repo(repo)
+            fake_git = temp_path / "publisher-git"
+            fake_gh = temp_path / "publisher-gh"
+            write_executable(
+                fake_git,
+                f"""#!{sys.executable}
+import json
+import sys
+from pathlib import Path
+Path({str(fake_calls)!r}).open("a", encoding="utf-8").write(json.dumps({{"tool": "git", "argv": sys.argv[1:]}}) + "\\n")
+sys.exit(0)
+""",
+            )
+            write_executable(
+                fake_gh,
+                f"""#!{sys.executable}
+import json
+import sys
+from pathlib import Path
+Path({str(fake_calls)!r}).open("a", encoding="utf-8").write(json.dumps({{"tool": "gh", "argv": sys.argv[1:]}}) + "\\n")
+if sys.argv[1:4] == ["auth", "status", "--hostname"]:
+    sys.exit(0)
+print("https://github.example/pr/123")
+sys.exit(0)
+""",
+            )
+            recipe = successful_recipe(temp_path, repo, checkout, fake_git, fake_gh)
+            recipe["review_cycles"] = [
+                {
+                    "status": "passed",
+                    "reviews": [
+                        {
+                            "role": "correctness",
+                            "status": "passed",
+                            "summary": "Matches the bead acceptance criteria.",
+                            "pr_comment_url": "https://github.example/pr/123#issuecomment-1",
+                        },
+                        {
+                            "role": "bug-risk",
+                            "status": "passed",
+                            "summary": "No regression risk found.",
+                            "pr_comment_url": "https://github.example/pr/123#issuecomment-2",
+                        },
+                    ],
+                }
+            ]
+
+            completed = run_afk(
+                "run-workstream",
+                "--workstream-id",
+                "central-lve.9",
+                "--input",
+                json.dumps(recipe),
+                "--ledger",
+                str(ledger),
+                env_overrides={
+                    "GIT_ALLOW_PROTOCOL": "file",
+                    "GIT_AUTHOR_NAME": "AFK Test",
+                    "GIT_AUTHOR_EMAIL": "afk-test@example.test",
+                    "GIT_COMMITTER_NAME": "AFK Test",
+                    "GIT_COMMITTER_EMAIL": "afk-test@example.test",
+                },
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            result_path = ledger / summary["result_path"]
+            result = json.loads(result_path.read_text(encoding="utf-8"))
+            tracker = json.loads((result_path.parent / "tracker-result.json").read_text(encoding="utf-8"))
+
+            expected_cycles = [
+                {
+                    "cycle": 1,
+                    "status": "passed",
+                    "reviews": [
+                        {
+                            "role": "correctness",
+                            "status": "passed",
+                            "summary": "Matches the bead acceptance criteria.",
+                            "pr_comment_url": "https://github.example/pr/123#issuecomment-1",
+                            "requires_response": False,
+                        },
+                        {
+                            "role": "bug-risk",
+                            "status": "passed",
+                            "summary": "No regression risk found.",
+                            "pr_comment_url": "https://github.example/pr/123#issuecomment-2",
+                            "requires_response": False,
+                        },
+                    ],
+                }
+            ]
+
+            self.assertEqual(result["review_cycles"], expected_cycles)
+            self.assertEqual(result["tracker"]["review_cycles"], expected_cycles)
+            self.assertEqual(tracker["review_cycles"], expected_cycles)
+
+    def test_workstream_surfaces_open_and_addressed_review_cycles_without_overwriting_prior_cycles(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repo = temp_path / "repo-src"
+            checkout = temp_path / "checkout"
+            ledger = temp_path / "ledger"
+            fake_calls = temp_path / "fake-calls.jsonl"
+            init_repo(repo)
+            fake_git = temp_path / "publisher-git"
+            fake_gh = temp_path / "publisher-gh"
+            write_executable(
+                fake_git,
+                f"""#!{sys.executable}
+import json
+import sys
+from pathlib import Path
+Path({str(fake_calls)!r}).open("a", encoding="utf-8").write(json.dumps({{"tool": "git", "argv": sys.argv[1:]}}) + "\\n")
+sys.exit(0)
+""",
+            )
+            write_executable(
+                fake_gh,
+                f"""#!{sys.executable}
+import json
+import sys
+from pathlib import Path
+Path({str(fake_calls)!r}).open("a", encoding="utf-8").write(json.dumps({{"tool": "gh", "argv": sys.argv[1:]}}) + "\\n")
+if sys.argv[1:4] == ["auth", "status", "--hostname"]:
+    sys.exit(0)
+print("https://github.example/pr/123")
+sys.exit(0)
+""",
+            )
+            recipe = successful_recipe(temp_path, repo, checkout, fake_git, fake_gh)
+            recipe["review_cycles"] = [
+                {
+                    "status": "findings-open",
+                    "reviews": [
+                        {
+                            "role": "correctness",
+                            "status": "findings-open",
+                            "summary": "Needs follow-up before merge ghp_open_review_secret_1234567890",
+                            "pr_comment_url": "https://github.example/pr/123?token=ghp_open_review_secret_1234567890#issuecomment-10",
+                            "requires_response": True,
+                        }
+                    ],
+                },
+                {
+                    "cycle": 2,
+                    "status": "findings-addressed",
+                    "reviews": [
+                        {
+                            "role": "bug-risk",
+                            "status": "findings-addressed",
+                            "summary": "Addressed in follow-up.",
+                            "pr_comment_url": "https://github.example/pr/123?token=ghp_addressed_review_secret_1234567890#issuecomment-11",
+                            "requires_response": True,
+                            "response": {
+                                "status": "addressed",
+                                "summary": "Patched via github_pat_response_secret_12345678901234567890",
+                            },
+                        }
+                    ],
+                },
+            ]
+
+            completed = run_afk(
+                "run-workstream",
+                "--workstream-id",
+                "central-lve.9",
+                "--input",
+                json.dumps(recipe),
+                "--ledger",
+                str(ledger),
+                env_overrides={
+                    "GIT_ALLOW_PROTOCOL": "file",
+                    "GIT_AUTHOR_NAME": "AFK Test",
+                    "GIT_AUTHOR_EMAIL": "afk-test@example.test",
+                    "GIT_COMMITTER_NAME": "AFK Test",
+                    "GIT_COMMITTER_EMAIL": "afk-test@example.test",
+                },
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            result_path = ledger / summary["result_path"]
+            result = json.loads(result_path.read_text(encoding="utf-8"))
+            tracker = json.loads((result_path.parent / "tracker-result.json").read_text(encoding="utf-8"))
+
+            self.assertEqual([cycle["cycle"] for cycle in result["review_cycles"]], [1, 2])
+            self.assertEqual(result["review_cycles"][0]["status"], "findings-open")
+            self.assertEqual(result["review_cycles"][1]["status"], "findings-addressed")
+            self.assertEqual(result["review_cycles"][0]["reviews"][0]["requires_response"], True)
+            self.assertNotIn("response", result["review_cycles"][0]["reviews"][0])
+            self.assertEqual(
+                result["review_cycles"][1]["reviews"][0]["response"],
+                {
+                    "status": "addressed",
+                    "summary": "Patched via [REDACTED]",
+                },
+            )
+            self.assertEqual(
+                result["review_cycles"][0]["reviews"][0]["pr_comment_url"],
+                "https://github.example/pr/123#issuecomment-10",
+            )
+            self.assertEqual(
+                result["review_cycles"][1]["reviews"][0]["pr_comment_url"],
+                "https://github.example/pr/123#issuecomment-11",
+            )
+            self.assertIn("[REDACTED]", result["review_cycles"][0]["reviews"][0]["summary"])
+            self.assertEqual(result["tracker"]["review_cycles"], result["review_cycles"])
+            self.assertEqual(tracker["review_cycles"], result["review_cycles"])
+            self.assertEqual(result["tracker"]["status"], "review-findings-open")
+            self.assertEqual(tracker["status"], "review-findings-open")
+            self.assertIn("response-required review findings", result["tracker"]["comment"])
+
+    def test_workstream_rejects_malformed_review_cycles(self):
+        cases = [
+            (
+                "top_level_not_list",
+                {"cycle": 1},
+                "review_cycles must be a list",
+            ),
+            (
+                "reviews_not_list",
+                [{"status": "passed", "reviews": "wrong"}],
+                "review_cycles[0].reviews must be a list",
+            ),
+            (
+                "review_role_missing",
+                [{"status": "passed", "reviews": [{"status": "passed", "summary": "Reviewed"}]}],
+                "review_cycles[0].reviews[0].role is required",
+            ),
+            (
+                "cycle_status_invalid",
+                [{"status": "wip", "reviews": [{"role": "correctness", "status": "passed", "summary": "Reviewed"}]}],
+                "review_cycles[0].status must be one of: findings-addressed, findings-open, passed, request-changes",
+            ),
+            (
+                "review_status_invalid",
+                [{"status": "passed", "reviews": [{"role": "correctness", "status": "wip", "summary": "Reviewed"}]}],
+                "review_cycles[0].reviews[0].status must be one of: findings-addressed, findings-open, passed, request-changes",
+            ),
+            (
+                "response_status_invalid",
+                [
+                    {
+                        "status": "request-changes",
+                        "reviews": [
+                            {
+                                "role": "correctness",
+                                "status": "request-changes",
+                                "summary": "Needs a follow-up.",
+                                "response": {"status": "wip", "summary": "Investigating"},
+                            }
+                        ],
+                    }
+                ],
+                "review_cycles[0].reviews[0].response.status must be one of: addressed, findings-addressed",
+            ),
+        ]
+        for case_name, review_cycles, expected_message in cases:
+            with self.subTest(case_name=case_name):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    temp_path = Path(temp_dir)
+                    repo = temp_path / "repo-src"
+                    checkout = temp_path / "checkout"
+                    ledger = temp_path / "ledger"
+                    fake_git = temp_path / "publisher-git"
+                    fake_gh = temp_path / "publisher-gh"
+                    init_repo(repo)
+                    write_executable(
+                        fake_git,
+                        f"""#!{sys.executable}
+raise SystemExit(0)
+""",
+                    )
+                    write_executable(
+                        fake_gh,
+                        f"""#!{sys.executable}
+raise SystemExit(0)
+""",
+                    )
+                    recipe = successful_recipe(temp_path, repo, checkout, fake_git, fake_gh)
+                    recipe["review_cycles"] = review_cycles
+
+                    completed = run_afk(
+                        "run-workstream",
+                        "--workstream-id",
+                        "central-lve.9",
+                        "--input",
+                        json.dumps(recipe),
+                        "--ledger",
+                        str(ledger),
+                    )
+
+                    self.assertNotEqual(completed.returncode, 0)
+                    self.assertIn(expected_message, completed.stderr)

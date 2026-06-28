@@ -153,6 +153,15 @@ The recipe schema is intentionally small:
   values.
 - `retry_policy.max_retries` is optional and defaults to `0`. It bounds how many
   same-item retry checkout cycles may start after a failed validation.
+- `review_cycles` is optional evidence for PR review passes after publication.
+  Each cycle records reviewer roles such as `correctness` and `bug-risk`,
+  review status, summary, optional PR comment URL, whether a response is
+  required, and optional response evidence. Accepted cycle/review statuses are
+  `passed`, `findings-open`, `request-changes`, and `findings-addressed`.
+  Response objects must carry `status: "addressed"` or
+  `status: "findings-addressed"`; a non-empty response string is also accepted
+  as freeform addressed evidence. Repeated cycles are preserved so findings
+  from earlier passes are not overwritten.
 - `tracker.terminal_decision` is optional. Leave it unset while a PR is open or
   under review. Set `{"status":"merged","merge_commit":"<sha>","pr_url":"<url>"}`
   only after the PR merges, or
@@ -588,6 +597,13 @@ checkouts.
 it is ready to close, the PR URL when one was opened, any carried-forward review
 findings, and the merge commit or explicit no-merge close reason when one is
 recorded.
+`review_cycles` evidence, when supplied, is included in both
+`workstream-result.json` and `tracker-result.json`. Open or response-required
+cycle findings keep the tracker state at `review-findings-open` until the
+relevant review record carries addressed evidence. AFK only treats a response
+object as addressed when its `status` is `addressed` or
+`findings-addressed`; a non-empty response string is the freeform addressed
+evidence path.
 Step-level outputs may still use other status strings; specifically,
 `prepare-checkout` uses `publication.status == "skipped_disabled"` when
 the checkout publisher path is intentionally disabled.
