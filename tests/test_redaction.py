@@ -181,6 +181,19 @@ class RedactionTest(unittest.TestCase):
         self.assertTrue(is_secret_value("https://example.invalid/api?token=hidden"))
         self.assertTrue(is_secret_value("https://example.invalid/api#access_token=hidden"))
 
+    def test_secret_value_detection_rejects_common_provider_token_shapes(self):
+        fake_token_values = [
+            "sk-proj-fakeFakeFakeFakeFakeFakeFakeFakeFakeFakeFakeFake",
+            "sk-ant-fakeFakeFakeFakeFakeFakeFakeFakeFakeFakeFakeFake",
+            "AIzaFakeFakeFakeFakeFakeFakeFakeFakeFakeFakeFake",
+        ]
+
+        for fake_token in fake_token_values:
+            with self.subTest(fake_token=fake_token[:7]):
+                self.assertTrue(is_secret_value(fake_token))
+                self.assertEqual(redact_text(f"token={fake_token}"), "token=[REDACTED]")
+                self.assertEqual(redact_text(f"prefix {fake_token} suffix"), "prefix [REDACTED] suffix")
+
     def test_artifact_redaction_still_removes_safe_url_query_strings(self):
         self.assertEqual(
             redact_text("service=https://example.invalid/api?mode=test#section"),

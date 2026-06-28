@@ -1775,6 +1775,152 @@ class ImplementCliTest(unittest.TestCase):
                     self.assertEqual(result["output"]["message"], expected_message)
                     self.assertNotIn("should not run", (run_dir / "stdout.log").read_text(encoding="utf-8"))
 
+    def test_implement_validates_pi_coding_agent_dir_as_external_existing_directory(self):
+        invalid_cases = [
+            ("relative", ".pi-coding-agent", "agent.env.PI_CODING_AGENT_DIR must be an absolute path outside checkout"),
+            ("missing", "missing-pi-coding-agent", "agent.env.PI_CODING_AGENT_DIR must be an existing directory"),
+            ("inside_checkout", "checkout/.pi-coding-agent", "agent.env.PI_CODING_AGENT_DIR must be outside checkout"),
+        ]
+        for case_name, path_kind, expected_message in invalid_cases:
+            with self.subTest(case=case_name):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    temp_path = Path(temp_dir)
+                    checkout = temp_path / "checkout"
+                    start_commit = init_checkout(checkout)
+                    ledger = temp_path / "ledger"
+                    codex_home = temp_path / "codex-home"
+                    config_home = temp_path / "xdg-config"
+                    pi_config_home = temp_path / "pi-config"
+                    checkout_pi_coding_agent_dir = checkout / ".pi-coding-agent"
+                    codex_home.mkdir()
+                    config_home.mkdir()
+                    pi_config_home.mkdir()
+                    checkout_pi_coding_agent_dir.mkdir()
+                    pi_coding_agent_dir = {
+                        "relative": ".pi-coding-agent",
+                        "missing": str(temp_path / "missing-pi-coding-agent"),
+                        "inside_checkout": str(checkout_pi_coding_agent_dir),
+                    }[case_name]
+
+                    completed = run_afk(
+                        "run-step",
+                        "implement",
+                        "--input",
+                        json.dumps(
+                            {
+                                "work_selection": {"schema_version": 1, "selected_work": [selected_work()]},
+                                "checkout": {
+                                    "status": "prepared",
+                                    "checkout_path": str(checkout),
+                                    "review_branch": "afk/test-work",
+                                    "requested_ref": "main",
+                                    "start_commit": start_commit,
+                                },
+                                "guardrails": [],
+                                "validation": {"profile": "tier1", "commands": []},
+                                "agent": {
+                                    "type": "real-agent-command",
+                                    "command": [sys.executable, "-c", "print('should not run')"],
+                                    "result_path": "agent-result.json",
+                                    "codex_home": str(codex_home),
+                                    "config_home": str(config_home),
+                                    "env": {
+                                        "PI_CONFIG_HOME": str(pi_config_home),
+                                        "PI_CODING_AGENT_DIR": pi_coding_agent_dir,
+                                    },
+                                },
+                            }
+                        ),
+                        "--ledger",
+                        str(ledger),
+                    )
+
+                    self.assertEqual(completed.returncode, 0, completed.stderr)
+                    summary = json.loads(completed.stdout)
+                    run_dir = ledger / "runs" / summary["run_id"]
+                    result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+
+                    self.assertEqual(result["output"]["status"], "failed_invalid_payload")
+                    self.assertEqual(result["output"]["message"], expected_message)
+                    self.assertNotIn("should not run", (run_dir / "stdout.log").read_text(encoding="utf-8"))
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            checkout = temp_path / "checkout"
+            start_commit = init_checkout(checkout)
+            ledger = temp_path / "ledger"
+            codex_home = temp_path / "codex-home"
+            config_home = temp_path / "xdg-config"
+            pi_config_home = temp_path / "pi-config"
+            pi_coding_agent_dir = temp_path / "pi-coding-agent"
+            observation_path = temp_path / "agent-observation.json"
+            codex_home.mkdir()
+            config_home.mkdir()
+            pi_config_home.mkdir()
+            pi_coding_agent_dir.mkdir()
+            agent_code = textwrap.dedent(
+                f"""
+                import json
+                import os
+                import subprocess
+                from pathlib import Path
+
+                Path({str(observation_path)!r}).write_text(
+                    json.dumps({{"pi_coding_agent_dir": os.environ.get("PI_CODING_AGENT_DIR")}}),
+                    encoding="utf-8",
+                )
+                Path("pi-coding-agent-dir.txt").write_text("accepted\\n", encoding="utf-8")
+                subprocess.run(["git", "add", "pi-coding-agent-dir.txt"], check=True)
+                subprocess.run(["git", "commit", "-m", "accept pi coding agent dir"], check=True)
+                Path("agent-result.json").write_text(
+                    json.dumps({{"status": "completed", "summary": "accepted pi coding agent dir"}}),
+                    encoding="utf-8",
+                )
+                """
+            ).strip()
+
+            completed = run_afk(
+                "run-step",
+                "implement",
+                "--input",
+                json.dumps(
+                    {
+                        "work_selection": {"schema_version": 1, "selected_work": [selected_work()]},
+                        "checkout": {
+                            "status": "prepared",
+                            "checkout_path": str(checkout),
+                            "review_branch": "afk/test-work",
+                            "requested_ref": "main",
+                            "start_commit": start_commit,
+                        },
+                        "guardrails": [],
+                        "validation": {"profile": "tier1", "commands": []},
+                        "agent": {
+                            "type": "real-agent-command",
+                            "command": [sys.executable, "-c", agent_code],
+                            "result_path": "agent-result.json",
+                            "codex_home": str(codex_home),
+                            "config_home": str(config_home),
+                            "env": {
+                                "PI_CONFIG_HOME": str(pi_config_home),
+                                "PI_CODING_AGENT_DIR": str(pi_coding_agent_dir),
+                            },
+                        },
+                    }
+                ),
+                "--ledger",
+                str(ledger),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+            observation = json.loads(observation_path.read_text(encoding="utf-8"))
+
+            self.assertEqual(result["output"]["status"], "implemented")
+            self.assertEqual(observation["pi_coding_agent_dir"], str(pi_coding_agent_dir))
+
     def test_implement_rejects_real_agent_command_required_auth_mount_url_value(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)

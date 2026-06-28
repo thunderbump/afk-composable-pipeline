@@ -402,6 +402,10 @@ def add_implementation_agent_flags(parser: argparse.ArgumentParser) -> None:
         help="Absolute mounted PI_CONFIG_HOME directory for real-local and pi modes",
     )
     parser.add_argument(
+        "--agent-pi-coding-agent-dir",
+        help="Absolute mounted PI_CODING_AGENT_DIR directory for pi mode Codex subscription auth",
+    )
+    parser.add_argument(
         "--agent-timeout-seconds",
         type=int,
         help="Optional real-local and pi agent timeout in seconds",
@@ -575,6 +579,7 @@ def recipe_agent_from_args(args: argparse.Namespace, *, checkout_path: Path) -> 
             codex_home=args.agent_codex_home,
             config_home=args.agent_config_home,
             pi_config_home=args.agent_pi_config_home,
+            pi_coding_agent_dir=args.agent_pi_coding_agent_dir,
             checkout_path=checkout_path,
             thinking=args.agent_pi_thinking,
             ponytail_extension=ponytail_extension,

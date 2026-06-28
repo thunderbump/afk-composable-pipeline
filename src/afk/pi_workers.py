@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 
 from afk.implement import agent_command_secret_error, normalize_wrapper_secret_files, path_is_equal_to_or_inside
+from afk.redaction import is_secret_value
 
 
 PI_PROMPT_PLACEHOLDER = "{prompt}"
@@ -23,6 +24,7 @@ def build_pi_real_worker_agent(
     codex_home: str,
     config_home: str,
     pi_config_home: str,
+    pi_coding_agent_dir: str | None = None,
     checkout_path: Path,
     prompt_placeholder: str = PI_PROMPT_PLACEHOLDER,
     thinking: str | None = None,
@@ -31,9 +33,10 @@ def build_pi_real_worker_agent(
     wrapper_secret_file: str | None = None,
     timeout_seconds: int | None = None,
 ) -> dict[str, Any]:
+    provider_name = require_non_empty(provider, "provider")
     command = build_pi_print_command(
         pi_bin=pi_bin,
-        provider=provider,
+        provider=provider_name,
         model=model,
         prompt_placeholder=prompt_placeholder,
         thinking=thinking,
@@ -54,6 +57,14 @@ def build_pi_real_worker_agent(
             )
         },
     }
+    if pi_coding_agent_dir is not None:
+        agent["env"]["PI_CODING_AGENT_DIR"] = validate_absolute_dir(
+            pi_coding_agent_dir,
+            "agent.env.PI_CODING_AGENT_DIR",
+            checkout_path=checkout_path,
+        )
+    elif provider_name == "openai-codex":
+        raise ValueError("--agent-pi-coding-agent-dir is required when --agent-pi-provider=openai-codex")
     if wrapper_secret_file is not None:
         wrapper_secret_files = normalize_wrapper_secret_files(
             {"primary": wrapper_secret_file},
@@ -125,6 +136,8 @@ def normalize_ponytail_extension(
 
 def validate_absolute_dir(value: str, field: str, *, checkout_path: Path) -> str:
     path_value = require_non_empty(value, field)
+    if is_secret_value(path_value):
+        raise ValueError(f"{field} must not include a secret-looking value")
     path = Path(path_value)
     if not path.is_absolute():
         raise ValueError(f"{field} must be absolute")

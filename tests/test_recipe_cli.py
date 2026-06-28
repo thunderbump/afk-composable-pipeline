@@ -279,6 +279,7 @@ class GenerateRecipeCliTest(unittest.TestCase):
             codex_home = temp_path / "codex-home"
             config_home = temp_path / "xdg-config"
             pi_config_home = temp_path / "pi-config"
+            pi_coding_agent_dir = temp_path / "pi-coding-agent"
             wrapper_secret = temp_path / "agent-wrapper-secret.txt"
             contracts_dir.mkdir()
             init_repo(repo)
@@ -287,6 +288,7 @@ class GenerateRecipeCliTest(unittest.TestCase):
             codex_home.mkdir()
             config_home.mkdir()
             pi_config_home.mkdir()
+            pi_coding_agent_dir.mkdir()
             wrapper_secret.write_text("super-secret-token\n", encoding="utf-8")
 
             completed = run_afk(
@@ -326,6 +328,8 @@ class GenerateRecipeCliTest(unittest.TestCase):
                 str(config_home),
                 "--agent-pi-config-home",
                 str(pi_config_home),
+                "--agent-pi-coding-agent-dir",
+                str(pi_coding_agent_dir),
                 "--agent-timeout-seconds",
                 "120",
                 "--output",
@@ -357,10 +361,220 @@ class GenerateRecipeCliTest(unittest.TestCase):
             self.assertEqual(implement_input["agent"]["timeout_seconds"], 120)
             self.assertEqual(implement_input["agent"]["codex_home"], str(codex_home))
             self.assertEqual(implement_input["agent"]["config_home"], str(config_home))
-            self.assertEqual(implement_input["agent"]["env"], {"PI_CONFIG_HOME": str(pi_config_home)})
+            self.assertEqual(
+                implement_input["agent"]["env"],
+                {
+                    "PI_CONFIG_HOME": str(pi_config_home),
+                    "PI_CODING_AGENT_DIR": str(pi_coding_agent_dir),
+                },
+            )
             self.assertEqual(implement_input["agent"]["wrapper_secret_files"], {"primary": str(wrapper_secret)})
             recipe_text = output.read_text(encoding="utf-8")
             self.assertNotIn("super-secret-token", recipe_text)
+
+    def test_generate_recipe_writes_pi_coding_agent_dir_for_codex_subscription_auth(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            contracts_dir = temp_path / "contracts"
+            repo = temp_path / "repo-src"
+            output = temp_path / "recipe.json"
+            ledger = temp_path / "ledger"
+            beads_workspace = temp_path / "central-beads"
+            checkout_root = temp_path / "checkouts"
+            checkout_path = checkout_root / "demo"
+            codex_home = temp_path / "codex-home"
+            config_home = temp_path / "xdg-config"
+            pi_config_home = temp_path / "pi-config"
+            pi_coding_agent_dir = temp_path / "pi-coding-agent"
+            wrapper_secret = temp_path / "agent-wrapper-secret.txt"
+            contracts_dir.mkdir()
+            init_repo(repo)
+            write_contract(contracts_dir / "demo.json", project_slug="demo", repo_url=str(repo))
+            beads_workspace.mkdir()
+            codex_home.mkdir()
+            config_home.mkdir()
+            pi_config_home.mkdir()
+            pi_coding_agent_dir.mkdir()
+            wrapper_secret.write_text("super-secret-token\n", encoding="utf-8")
+
+            completed = run_afk(
+                "generate-recipe",
+                "--workstream-id",
+                "central-6ue",
+                "--project",
+                "demo",
+                "--contracts-dir",
+                str(contracts_dir),
+                "--ledger",
+                str(ledger),
+                "--beads-workspace",
+                str(beads_workspace),
+                "--checkout-root",
+                str(checkout_root),
+                "--checkout-path",
+                str(checkout_path),
+                "--validation-profile",
+                "tier1",
+                "--agent-mode",
+                "pi",
+                "--agent-pi-provider",
+                "openai-codex",
+                "--agent-pi-model",
+                "gpt-5.4-mini",
+                "--agent-codex-home",
+                str(codex_home),
+                "--agent-config-home",
+                str(config_home),
+                "--agent-pi-config-home",
+                str(pi_config_home),
+                "--agent-pi-coding-agent-dir",
+                str(pi_coding_agent_dir),
+                "--agent-wrapper-secret-file",
+                str(wrapper_secret),
+                "--output",
+                str(output),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            recipe = json.loads(output.read_text(encoding="utf-8"))
+            agent = recipe["steps"][2]["input"]["agent"]
+
+            self.assertEqual(
+                agent["env"],
+                {
+                    "PI_CONFIG_HOME": str(pi_config_home),
+                    "PI_CODING_AGENT_DIR": str(pi_coding_agent_dir),
+                },
+            )
+            self.assertEqual(
+                agent["command"],
+                ["pi", "-p", "{prompt}", "--provider", "openai-codex", "--model", "gpt-5.4-mini"],
+            )
+            recipe_text = output.read_text(encoding="utf-8")
+            self.assertNotIn("super-secret-token", recipe_text)
+            self.assertNotIn("OPENAI_API_KEY", recipe_text)
+            self.assertNotIn("--api-key", recipe_text)
+
+    def test_generate_recipe_requires_pi_coding_agent_dir_for_openai_codex_pi_agent(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            contracts_dir = temp_path / "contracts"
+            repo = temp_path / "repo-src"
+            output = temp_path / "recipe.json"
+            ledger = temp_path / "ledger"
+            beads_workspace = temp_path / "central-beads"
+            checkout_root = temp_path / "checkouts"
+            checkout_path = checkout_root / "demo"
+            codex_home = temp_path / "codex-home"
+            config_home = temp_path / "xdg-config"
+            pi_config_home = temp_path / "pi-config"
+            contracts_dir.mkdir()
+            init_repo(repo)
+            write_contract(contracts_dir / "demo.json", project_slug="demo", repo_url=str(repo))
+            beads_workspace.mkdir()
+            codex_home.mkdir()
+            config_home.mkdir()
+            pi_config_home.mkdir()
+
+            completed = run_afk(
+                "generate-recipe",
+                "--workstream-id",
+                "central-6ue",
+                "--project",
+                "demo",
+                "--contracts-dir",
+                str(contracts_dir),
+                "--ledger",
+                str(ledger),
+                "--beads-workspace",
+                str(beads_workspace),
+                "--checkout-root",
+                str(checkout_root),
+                "--checkout-path",
+                str(checkout_path),
+                "--validation-profile",
+                "tier1",
+                "--agent-mode",
+                "pi",
+                "--agent-pi-provider",
+                "openai-codex",
+                "--agent-pi-model",
+                "gpt-5.4-mini",
+                "--agent-codex-home",
+                str(codex_home),
+                "--agent-config-home",
+                str(config_home),
+                "--agent-pi-config-home",
+                str(pi_config_home),
+                "--output",
+                str(output),
+            )
+
+            self.assertNotEqual(completed.returncode, 0, completed.stdout)
+            self.assertIn("--agent-pi-coding-agent-dir is required when --agent-pi-provider=openai-codex", completed.stderr)
+            self.assertFalse(output.exists())
+
+    def test_generate_recipe_rejects_secret_literal_pi_coding_agent_dir_without_writing_recipe(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            contracts_dir = temp_path / "contracts"
+            repo = temp_path / "repo-src"
+            output = temp_path / "recipe.json"
+            ledger = temp_path / "ledger"
+            beads_workspace = temp_path / "central-beads"
+            checkout_root = temp_path / "checkouts"
+            checkout_path = checkout_root / "demo"
+            codex_home = temp_path / "codex-home"
+            config_home = temp_path / "xdg-config"
+            pi_config_home = temp_path / "pi-config"
+            secret_literal = "ghp_secret_literal_1234567890"
+            pi_coding_agent_dir = temp_path / secret_literal
+            contracts_dir.mkdir()
+            init_repo(repo)
+            write_contract(contracts_dir / "demo.json", project_slug="demo", repo_url=str(repo))
+            beads_workspace.mkdir()
+            codex_home.mkdir()
+            config_home.mkdir()
+            pi_config_home.mkdir()
+            pi_coding_agent_dir.mkdir()
+
+            completed = run_afk(
+                "generate-recipe",
+                "--workstream-id",
+                "central-6ue",
+                "--project",
+                "demo",
+                "--contracts-dir",
+                str(contracts_dir),
+                "--ledger",
+                str(ledger),
+                "--beads-workspace",
+                str(beads_workspace),
+                "--checkout-root",
+                str(checkout_root),
+                "--checkout-path",
+                str(checkout_path),
+                "--validation-profile",
+                "tier1",
+                "--agent-mode",
+                "pi",
+                "--agent-codex-home",
+                str(codex_home),
+                "--agent-config-home",
+                str(config_home),
+                "--agent-pi-config-home",
+                str(pi_config_home),
+                "--agent-pi-coding-agent-dir",
+                str(pi_coding_agent_dir),
+                "--output",
+                str(output),
+            )
+
+            self.assertNotEqual(completed.returncode, 0, completed.stdout)
+            self.assertIn("agent.env.PI_CODING_AGENT_DIR must not include a secret-looking value", completed.stderr)
+            self.assertNotIn(secret_literal, completed.stderr)
+            self.assertNotIn(secret_literal, completed.stdout)
+            self.assertFalse(output.exists())
 
     def test_generate_recipe_rejects_pi_agent_disallowed_model(self):
         with tempfile.TemporaryDirectory() as temp_dir:

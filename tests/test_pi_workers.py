@@ -17,12 +17,14 @@ class PiWorkersTest(unittest.TestCase):
             codex_home = temp_path / "codex-home"
             config_home = temp_path / "xdg-config"
             pi_config_home = temp_path / "pi-config"
+            pi_coding_agent_dir = temp_path / "pi-coding-agent"
             api_key_file = temp_path / "pi-api-key.txt"
 
             checkout_path.mkdir()
             codex_home.mkdir()
             config_home.mkdir()
             pi_config_home.mkdir()
+            pi_coding_agent_dir.mkdir()
             api_key_file.write_text("secret\n", encoding="utf-8")
 
             agent = build_pi_real_worker_agent(
@@ -34,6 +36,7 @@ class PiWorkersTest(unittest.TestCase):
                 codex_home=str(codex_home),
                 config_home=str(config_home),
                 pi_config_home=str(pi_config_home),
+                pi_coding_agent_dir=str(pi_coding_agent_dir),
                 checkout_path=checkout_path,
                 wrapper_secret_file=str(api_key_file),
             )
@@ -58,7 +61,13 @@ class PiWorkersTest(unittest.TestCase):
             self.assertEqual(agent["result_path"], "agent-result.json")
             self.assertEqual(agent["codex_home"], str(codex_home))
             self.assertEqual(agent["config_home"], str(config_home))
-            self.assertEqual(agent["env"], {"PI_CONFIG_HOME": str(pi_config_home)})
+            self.assertEqual(
+                agent["env"],
+                {
+                    "PI_CONFIG_HOME": str(pi_config_home),
+                    "PI_CODING_AGENT_DIR": str(pi_coding_agent_dir),
+                },
+            )
             self.assertEqual(agent["wrapper_secret_files"], {"primary": str(api_key_file)})
 
     def test_build_pi_real_worker_agent_rejects_models_above_gpt_5_4(self):
@@ -92,11 +101,13 @@ class PiWorkersTest(unittest.TestCase):
             codex_home = temp_path / "codex-home"
             config_home = temp_path / "xdg-config"
             pi_config_home = temp_path / "pi-config"
+            pi_coding_agent_dir = temp_path / "pi-coding-agent"
 
             checkout_path.mkdir()
             codex_home.mkdir()
             config_home.mkdir()
             pi_config_home.mkdir()
+            pi_coding_agent_dir.mkdir()
 
             agent = build_pi_real_worker_agent(
                 pi_bin="/opt/pi/bin/pi",
@@ -105,6 +116,7 @@ class PiWorkersTest(unittest.TestCase):
                 codex_home=str(codex_home),
                 config_home=str(config_home),
                 pi_config_home=str(pi_config_home),
+                pi_coding_agent_dir=str(pi_coding_agent_dir),
                 checkout_path=checkout_path,
                 ponytail_extension_source=PONYTAIL_EXTENSION_SOURCE,
             )
