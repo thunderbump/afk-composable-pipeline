@@ -1282,10 +1282,6 @@ raise SystemExit(9)
                 "central-4x9.44",
             )
             self.assertEqual(len(result["pipeline_retrospective"]["follow_up"]["created"]), 1)
-            self.assertEqual(
-                result["pipeline_retrospective"]["follow_up"]["created"][0]["fingerprint"],
-                result["pipeline_retrospective"]["follow_up"]["recommended"][0]["fingerprint"],
-            )
             self.assertEqual(result["artifacts"]["retrospective_follow_up_request"], "retrospective-follow-up-request.json")
             self.assertEqual(result["artifacts"]["retrospective_follow_up_result"], "retrospective-follow-up-result.json")
             self.assertEqual(result["artifacts"]["retrospective_follow_up_stdout"], "retrospective-follow-up-stdout.log")
@@ -1294,6 +1290,11 @@ raise SystemExit(9)
             request = json.loads((run_dir / "retrospective-follow-up-request.json").read_text(encoding="utf-8"))
             creation_result = json.loads((run_dir / "retrospective-follow-up-result.json").read_text(encoding="utf-8"))
             self.assertEqual(len(request["follow_up"]["recommended"]), 1)
+            self.assertEqual(result["pipeline_retrospective"]["follow_up"]["recommended"], [])
+            self.assertEqual(
+                result["pipeline_retrospective"]["follow_up"]["created"][0]["fingerprint"],
+                request["follow_up"]["recommended"][0]["fingerprint"],
+            )
             self.assertEqual(
                 creation_result["result"]["created"],
                 result["pipeline_retrospective"]["follow_up"]["created"],

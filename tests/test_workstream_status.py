@@ -609,6 +609,54 @@ class WorkstreamStatusMappingTest(unittest.TestCase):
         self.assertEqual(record["follow_up"]["created"][0]["id"], "central-4x9.99")
         self.assertEqual(record["follow_up"]["created"][0]["summary"], "Document follow-up creation.")
 
+    def test_pipeline_retrospective_record_ignores_blank_configured_follow_up_entries(self):
+        record = pipeline_retrospective_record(
+            retrospective_state(),
+            {"status": "published", "url": "https://github.example/pr/17"},
+            retrospective_tracker(),
+            normalized={
+                "retrospective": {
+                    "follow_up": {
+                        "recommended": [{}],
+                        "created": [{}],
+                    }
+                }
+            },
+        )
+
+        self.assertEqual(record["follow_up"]["recommended"], [])
+        self.assertEqual(record["follow_up"]["created"], [])
+
+    def test_pipeline_retrospective_record_removes_recommended_follow_up_already_created(self):
+        record = pipeline_retrospective_record(
+            retrospective_state(),
+            {"status": "published", "url": "https://github.example/pr/17"},
+            retrospective_tracker(),
+            normalized={
+                "retrospective": {
+                    "follow_up": {
+                        "recommended": [
+                            {
+                                "summary": "Document follow-up creation.",
+                                "labels": ["area:retro"],
+                            }
+                        ],
+                        "created": [
+                            {
+                                "id": "central-4x9.99",
+                                "summary": "Document follow-up creation.",
+                                "labels": ["area:retro"],
+                            }
+                        ],
+                    }
+                }
+            },
+        )
+
+        self.assertEqual(record["follow_up"]["recommended"], [])
+        self.assertEqual(record["recommended_follow_up"], [])
+        self.assertEqual(len(record["follow_up"]["created"]), 1)
+
     def test_pipeline_retrospective_record_merges_fingerprint_only_and_id_created_follow_up(self):
         record = pipeline_retrospective_record(
             retrospective_state(),

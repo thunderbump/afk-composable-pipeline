@@ -2474,11 +2474,11 @@ def _apply_retrospective_follow_up_creation(
     recommended = follow_up.get("recommended") if isinstance(follow_up.get("recommended"), list) else []
     existing_created = follow_up.get("created") if isinstance(follow_up.get("created"), list) else []
     created = creation.get("created") if isinstance(creation.get("created"), list) else []
-    follow_up["recommended"] = recommended
     follow_up["created"] = _merge_retrospective_created_follow_up(existing_created, created)
+    follow_up["recommended"] = _retrospective_uncreated_recommendations(recommended, follow_up["created"])
     follow_up["creation"] = _retrospective_follow_up_creation_public_record(creation)
     record["follow_up"] = follow_up
-    record["recommended_follow_up"] = _legacy_recommended_follow_up(recommended)
+    record["recommended_follow_up"] = _legacy_recommended_follow_up(follow_up["recommended"])
     return record
 
 
@@ -2710,8 +2710,6 @@ def _normalize_retrospective_follow_up_created(
             continue
         if string_field(matched, "fingerprint"):
             normalized_item["fingerprint"] = matched["fingerprint"]
-        elif fingerprint:
-            normalized_item["fingerprint"] = fingerprint
         normalized_items.append(normalized_item)
     return _merge_retrospective_created_follow_up([], normalized_items)
 
@@ -2951,9 +2949,10 @@ def _retrospective_follow_up_record(signals: list[dict[str, Any]], normalized: d
             recommended.append(follow_up_item)
             recommended_fingerprints.add(follow_up_item["fingerprint"])
             recommended_identities.add(_retrospective_follow_up_identity_for_item(follow_up_item))
+    created = _merge_retrospective_created_follow_up([], created)
     return {
-        "recommended": recommended,
-        "created": _merge_retrospective_created_follow_up([], created),
+        "recommended": _retrospective_uncreated_recommendations(recommended, created),
+        "created": created,
         "creation": _disabled_retrospective_follow_up_creation_record(),
     }
 
@@ -2982,7 +2981,7 @@ def _disabled_retrospective_follow_up_creation_record() -> dict[str, Any]:
 def _retrospective_follow_up_item(kind: str, summary: str, labels: Any) -> dict[str, Any] | None:
     redacted_summary = redact_text(summary)
     normalized_labels = _retrospective_follow_up_labels(labels)
-    if not kind and not redacted_summary and not normalized_labels:
+    if not redacted_summary:
         return None
     return {
         "kind": kind,
@@ -3059,7 +3058,7 @@ def _retrospective_created_follow_up_seen_map(items: list[dict[str, Any]]) -> di
 
 def _merge_retrospective_created_follow_up_item(existing: dict[str, Any], new: dict[str, Any]) -> dict[str, Any]:
     merged = dict(existing)
-    for key in ("kind", "summary", "fingerprint"):
+    for key in ("kind", "summary"):
         if string_field(new, key):
             merged[key] = new[key]
     if string_field(new, "id"):
@@ -3067,7 +3066,29 @@ def _merge_retrospective_created_follow_up_item(existing: dict[str, Any], new: d
     new_labels = new.get("labels")
     if isinstance(new_labels, list) and new_labels:
         merged["labels"] = new_labels
+    if string_field(merged, "summary"):
+        merged["fingerprint"] = _retrospective_follow_up_fingerprint(
+            string_field(merged, "kind") or "created-follow-up",
+            string_field(merged, "summary") or "",
+            _retrospective_follow_up_labels(merged.get("labels")),
+        )
     return merged
+
+
+def _retrospective_uncreated_recommendations(
+    recommended: list[dict[str, Any]],
+    created: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    created_aliases = set()
+    for item in created:
+        if isinstance(item, dict):
+            created_aliases.update(_retrospective_created_follow_up_aliases(item))
+    return [
+        item
+        for item in recommended
+        if isinstance(item, dict)
+        and not any(alias in created_aliases for alias in _retrospective_created_follow_up_aliases(item))
+    ]
 
 
 def _retrospective_follow_up_labels(labels: Any) -> list[str]:
