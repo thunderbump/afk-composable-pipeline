@@ -33,9 +33,10 @@ def build_pi_real_worker_agent(
     wrapper_secret_file: str | None = None,
     timeout_seconds: int | None = None,
 ) -> dict[str, Any]:
+    provider_name = require_non_empty(provider, "provider")
     command = build_pi_print_command(
         pi_bin=pi_bin,
-        provider=provider,
+        provider=provider_name,
         model=model,
         prompt_placeholder=prompt_placeholder,
         thinking=thinking,
@@ -62,6 +63,8 @@ def build_pi_real_worker_agent(
             "agent.env.PI_CODING_AGENT_DIR",
             checkout_path=checkout_path,
         )
+    elif provider_name == "openai-codex":
+        raise ValueError("--agent-pi-coding-agent-dir is required when --agent-pi-provider=openai-codex")
     if wrapper_secret_file is not None:
         wrapper_secret_files = normalize_wrapper_secret_files(
             {"primary": wrapper_secret_file},

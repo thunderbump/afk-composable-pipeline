@@ -518,12 +518,14 @@ def unsafe_agent_env_path(
 
 
 def is_config_state_env_key(key: str) -> bool:
+    if key.upper() == "PI_CODING_AGENT_DIR":
+        return True
     components = key_components(key)
     return any(component in {"cache", "config", "home", "path", "session", "state"} for component in components)
 
 
 def path_is_required_existing_directory_mount(key: str) -> bool:
-    return key.upper() in {"PI_CONFIG_HOME"}
+    return key.upper() in {"PI_CONFIG_HOME", "PI_CODING_AGENT_DIR"}
 
 
 def normalize_absolute_dir(

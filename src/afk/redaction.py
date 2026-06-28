@@ -29,7 +29,10 @@ SECRET_TOKEN_VALUE_PATTERN = re.compile(
     r"\b("
     r"gh[pousr]_[A-Za-z0-9_]{8,}|"
     r"github_pat_[A-Za-z0-9_]{20,}|"
-    r"AKIA[0-9A-Z]{16}"
+    r"AKIA[0-9A-Z]{16}|"
+    r"sk-proj-[A-Za-z0-9_-]{20,}|"
+    r"sk-ant-[A-Za-z0-9_-]{20,}|"
+    r"AIza[A-Za-z0-9_-]{20,}"
     r")\b"
 )
 MIN_EXACT_SECRET_LENGTH = 4

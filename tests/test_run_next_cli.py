@@ -394,6 +394,7 @@ raise SystemExit(9)
                 codex_home = temp_path / "codex-home"
                 config_home = temp_path / "xdg-config"
                 pi_config_home = temp_path / "pi-config"
+                pi_coding_agent_dir = temp_path / "pi-coding-agent"
                 wrapper_secret = temp_path / "agent-wrapper-secret.txt"
                 beads_workspace.mkdir()
                 checkout_root.mkdir(parents=True)
@@ -402,6 +403,7 @@ raise SystemExit(9)
                 codex_home.mkdir()
                 config_home.mkdir()
                 pi_config_home.mkdir()
+                pi_coding_agent_dir.mkdir()
                 wrapper_secret.write_text(agent_secret + "\n", encoding="utf-8")
 
                 pi_agent = build_pi_real_worker_agent(
@@ -411,6 +413,7 @@ raise SystemExit(9)
                     codex_home=str(codex_home),
                     config_home=str(config_home),
                     pi_config_home=str(pi_config_home),
+                    pi_coding_agent_dir=str(pi_coding_agent_dir),
                     checkout_path=checkout_path,
                     ponytail_extension_source=PONYTAIL_EXTENSION_SOURCE,
                     wrapper_secret_file=str(wrapper_secret),
@@ -707,10 +710,12 @@ else:
             codex_home = temp_path / "codex-home"
             config_home = temp_path / "xdg-config"
             pi_config_home = temp_path / "pi-config"
+            pi_coding_agent_dir = temp_path / "pi-coding-agent"
             wrapper_secret = temp_path / "agent-wrapper-secret.txt"
             codex_home.mkdir()
             config_home.mkdir()
             pi_config_home.mkdir()
+            pi_coding_agent_dir.mkdir()
             wrapper_secret.write_text("agent-secret\n", encoding="utf-8")
             fake_bin.mkdir()
             write_executable(
@@ -777,6 +782,8 @@ else:
                 str(config_home),
                 "--agent-pi-config-home",
                 str(pi_config_home),
+                "--agent-pi-coding-agent-dir",
+                str(pi_coding_agent_dir),
                 env={"GH_TOKEN": None, "GITHUB_TOKEN": None, "PATH": str(fake_bin)},
             )
 
@@ -800,6 +807,13 @@ else:
                 ],
             )
             self.assertEqual(implement["wrapper_secret_files"], {"primary": str(wrapper_secret)})
+            self.assertEqual(
+                implement["env"],
+                {
+                    "PI_CONFIG_HOME": str(pi_config_home),
+                    "PI_CODING_AGENT_DIR": str(pi_coding_agent_dir),
+                },
+            )
             self.assertNotIn("agent-secret", json.dumps(payload["recipe"]))
 
     def test_run_next_rejects_disallowed_pi_model(self):
@@ -1088,11 +1102,13 @@ print(json.dumps({{"schema_version":1,"source_statuses":[],"selected_work":[],"s
             codex_home = temp_path / "codex-home"
             config_home = temp_path / "xdg-config"
             pi_config_home = temp_path / "pi-config"
+            pi_coding_agent_dir = temp_path / "pi-coding-agent"
             wrapper_secret = temp_path / "agent-wrapper-secret.txt"
             gh_config_dir = temp_path / "gh-config"
             codex_home.mkdir()
             config_home.mkdir()
             pi_config_home.mkdir()
+            pi_coding_agent_dir.mkdir()
             gh_config_dir.mkdir()
             wrapper_secret.write_text("agent-secret\n", encoding="utf-8")
             write_executable(
@@ -1147,6 +1163,8 @@ raise SystemExit(1)
                 str(config_home),
                 "--agent-pi-config-home",
                 str(pi_config_home),
+                "--agent-pi-coding-agent-dir",
+                str(pi_coding_agent_dir),
                 "--reviewer-mode",
                 "pi",
                 "--reviewer-pi-bin",
@@ -1212,6 +1230,13 @@ raise SystemExit(1)
                 ],
             )
             self.assertEqual(implement["wrapper_secret_files"], {"primary": str(wrapper_secret)})
+            self.assertEqual(
+                implement["env"],
+                {
+                    "PI_CONFIG_HOME": str(pi_config_home),
+                    "PI_CODING_AGENT_DIR": str(pi_coding_agent_dir),
+                },
+            )
 
             review_input = payload["recipe"]["steps"][4]["input"]["reviewer"]
             self.assertEqual(
