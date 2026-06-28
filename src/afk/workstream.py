@@ -2267,10 +2267,8 @@ def _normalized_retrospective_judge_result(
     stdout_path: Path,
     stderr_path: Path,
 ) -> dict[str, Any]:
-    if stdout:
-        stdout_path.write_text(redact_text(stdout), encoding="utf-8")
-    if stderr:
-        stderr_path.write_text(redact_text(stderr), encoding="utf-8")
+    stdout_path.write_text(redact_text(stdout), encoding="utf-8")
+    stderr_path.write_text(redact_text(stderr), encoding="utf-8")
     return {
         "enabled": enabled,
         "status": status,
@@ -2908,6 +2906,10 @@ def workstream_artifacts(ledger: "WorkstreamLedger") -> dict[str, str]:
         artifacts["retrospective_judge_request"] = "retrospective-judge-request.json"
     if (ledger.path / "retrospective-judge-result.json").is_file():
         artifacts["retrospective_judge_result"] = "retrospective-judge-result.json"
+    if (ledger.path / "retrospective-judge-stdout.log").is_file():
+        artifacts["retrospective_judge_stdout"] = "retrospective-judge-stdout.log"
+    if (ledger.path / "retrospective-judge-stderr.log").is_file():
+        artifacts["retrospective_judge_stderr"] = "retrospective-judge-stderr.log"
     return artifacts
 
 

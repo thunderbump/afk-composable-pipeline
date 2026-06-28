@@ -1001,14 +1001,19 @@ raise SystemExit(9)
             self.assertEqual(result["artifacts"]["retrospective_judge_evidence"], "retrospective-judge-evidence.json")
             self.assertEqual(result["artifacts"]["retrospective_judge_request"], "retrospective-judge-request.json")
             self.assertEqual(result["artifacts"]["retrospective_judge_result"], "retrospective-judge-result.json")
-            evidence = json.loads((ledger / "workstreams" / summary["run_id"] / "retrospective-judge-evidence.json").read_text(
+            self.assertEqual(result["artifacts"]["retrospective_judge_stdout"], "retrospective-judge-stdout.log")
+            self.assertEqual(result["artifacts"]["retrospective_judge_stderr"], "retrospective-judge-stderr.log")
+            run_dir = ledger / "workstreams" / summary["run_id"]
+            evidence = json.loads((run_dir / "retrospective-judge-evidence.json").read_text(
                 encoding="utf-8"
             ))
-            judge_result = json.loads((ledger / "workstreams" / summary["run_id"] / "retrospective-judge-result.json").read_text(
+            judge_result = json.loads((run_dir / "retrospective-judge-result.json").read_text(
                 encoding="utf-8"
             ))
             self.assertEqual(evidence["redaction"]["raw_logs_included"], False)
             self.assertEqual(judge_result["result"], result["pipeline_retrospective"]["judge"])
+            for path_name in result["pipeline_retrospective"]["judge"]["evidence"].values():
+                self.assertTrue((run_dir / path_name).is_file(), path_name)
 
     def test_workstream_records_retrospective_judge_failure_without_changing_publication_or_tracker(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1078,6 +1083,11 @@ raise SystemExit(9)
             self.assertEqual(result["pipeline_retrospective"]["signals"][0]["kind"], "retrospective-judge")
             self.assertEqual(result["pipeline_retrospective"]["signals"][0]["severity"], "error")
             self.assertEqual(result["artifacts"]["retrospective_judge_result"], "retrospective-judge-result.json")
+            self.assertEqual(result["artifacts"]["retrospective_judge_stdout"], "retrospective-judge-stdout.log")
+            self.assertEqual(result["artifacts"]["retrospective_judge_stderr"], "retrospective-judge-stderr.log")
+            run_dir = ledger / "workstreams" / summary["run_id"]
+            for path_name in result["pipeline_retrospective"]["signals"][0]["evidence_paths"]:
+                self.assertTrue((run_dir / path_name).is_file(), path_name)
 
     def test_workstream_terminal_no_merge_decision_closes_tracker_without_republishing(self):
         with tempfile.TemporaryDirectory() as temp_dir:
