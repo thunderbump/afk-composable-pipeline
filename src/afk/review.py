@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -81,6 +82,7 @@ def review(input_data: Any, *, run_id: str, run_dir: Path | None) -> dict[str, A
         adapter_result, raw_result = run_fake_reviewer_command(
             request["reviewer"],
             checkout_path=Path(request["checkout"]["path"]),
+            reviewer_request=reviewer_request,
             request_path=run_dir / "reviewer-request.json",
         )
     except ReviewerRuntimeError as exc:
@@ -677,6 +679,7 @@ def run_fake_reviewer_command(
     reviewer: dict[str, Any],
     *,
     checkout_path: Path,
+    reviewer_request: dict[str, Any],
     request_path: Path,
 ) -> tuple[dict[str, Any], str | None]:
     with tempfile.TemporaryDirectory() as temp_dir:
@@ -685,7 +688,12 @@ def run_fake_reviewer_command(
         env = minimal_reviewer_environment(temp_path)
         env["AFK_REVIEWER_REQUEST"] = str(request_path)
         env["AFK_REVIEWER_RESULT"] = str(result_path)
-        command = render_command(reviewer["command"], request_path=request_path, result_path=result_path)
+        command = render_command(
+            reviewer["command"],
+            reviewer_request=reviewer_request,
+            request_path=request_path,
+            result_path=result_path,
+        )
         try:
             completed = subprocess.run(
                 command,
@@ -723,17 +731,22 @@ def run_fake_reviewer_command(
     }, raw_payload
 
 
-def render_command(command: list[str], *, request_path: Path, result_path: Path) -> list[str]:
+def render_command(
+    command: list[str],
+    *,
+    reviewer_request: dict[str, Any],
+    request_path: Path,
+    result_path: Path,
+) -> list[str]:
     replacements = {
+        "{prompt}": canonical_json(reviewer_request),
         "{request_path}": str(request_path),
         "{result_path}": str(result_path),
     }
+    pattern = re.compile("|".join(sorted((re.escape(token) for token in replacements), key=len, reverse=True)))
     rendered = []
     for part in command:
-        item = part
-        for marker, value in replacements.items():
-            item = item.replace(marker, value)
-        rendered.append(item)
+        rendered.append(pattern.sub(lambda match: replacements[match.group(0)], part))
     return rendered
 
 
