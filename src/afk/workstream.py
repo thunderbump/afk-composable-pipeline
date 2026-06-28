@@ -1840,6 +1840,258 @@ def tracker_review_findings(review: dict[str, Any]) -> list[Any]:
     return redact_artifact_value(findings)
 
 
+def pipeline_retrospective_record(
+    state: dict[str, Any],
+    publication: dict[str, Any],
+    tracker: dict[str, Any],
+    normalized: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    signals = (
+        _validation_retrospective_signals(state)
+        + _publication_retrospective_signals(publication)
+        + _blocked_retrospective_signals(publication)
+        + _cleanup_retrospective_signals(state)
+    )
+    follow_up = _retrospective_follow_up(signals, normalized)
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "status": workstream_status_from_publication(publication),
+        "health": _retrospective_health(signals),
+        "publication_status": redact_text(str(publication.get("status") or "")),
+        "tracker_status": redact_text(str(tracker.get("status") or "")),
+        "signals": signals,
+        "recommended_follow_up": follow_up,
+    }
+
+
+def _validation_retrospective_signals(state: dict[str, Any]) -> list[dict[str, Any]]:
+    validations = state.get("validations")
+    if not isinstance(validations, list):
+        return []
+    signals = []
+    for validation in validations:
+        if not isinstance(validation, dict):
+            continue
+        output = validation.get("output") if isinstance(validation.get("output"), dict) else {}
+        actionable_failures = output.get("actionable_failures")
+        if output.get("status") == "validated" or not isinstance(actionable_failures, list):
+            continue
+        for failure in actionable_failures:
+            if not isinstance(failure, dict):
+                continue
+            summary = _retrospective_missing_tool_or_config_summary(
+                string_field(failure, "excerpt") or string_field(failure, "reason") or string_field(output, "summary") or ""
+            )
+            if not summary:
+                continue
+            signals.append(
+                {
+                    "kind": "missing-tool-or-config",
+                    "severity": "error",
+                    "summary": summary,
+                    "evidence_paths": _retrospective_evidence_paths(
+                        string_field(failure, "log_path") or "",
+                        string_field(validation, "step_result_path") or "",
+                        string_field(validation, "worker_result_path") or "",
+                    ),
+                }
+            )
+    return signals
+
+
+def _publication_retrospective_signals(publication: dict[str, Any]) -> list[dict[str, Any]]:
+    reason = string_field(publication, "reason") or ""
+    if not reason:
+        return []
+    redacted_reason = redact_text(reason)
+    signals = []
+    if publication.get("status") == "failed-needs-human":
+        if _publisher_auth_failure_reason(reason):
+            signals.append(
+                {
+                    "kind": "publisher-auth",
+                    "severity": "error",
+                    "summary": redacted_reason,
+                    "evidence_paths": [],
+                }
+            )
+        elif _retrospective_missing_tool_or_config_summary(reason):
+            signals.append(
+                {
+                    "kind": "missing-tool-or-config",
+                    "severity": "error",
+                    "summary": redacted_reason,
+                    "evidence_paths": [],
+                }
+            )
+        else:
+            signals.append(
+                {
+                    "kind": "publisher-failure",
+                    "severity": "error",
+                    "summary": redacted_reason,
+                    "evidence_paths": [],
+                }
+            )
+    return signals
+
+
+def _blocked_retrospective_signals(publication: dict[str, Any]) -> list[dict[str, Any]]:
+    reason = string_field(publication, "reason") or ""
+    if publication.get("status") != "blocked" or not reason:
+        return []
+    return [
+        {
+            "kind": "retry-or-blocked",
+            "severity": "error",
+            "summary": redact_text(reason),
+            "evidence_paths": [],
+        }
+    ]
+
+
+def _cleanup_retrospective_signals(state: dict[str, Any]) -> list[dict[str, Any]]:
+    cleanup = state.get("cleanup")
+    if not isinstance(cleanup, dict):
+        return []
+    resources = cleanup.get("resources")
+    if cleanup.get("status") == "clean" or not isinstance(resources, list) or not resources:
+        return []
+    return [
+        {
+            "kind": "dirty-cleanup",
+            "severity": "warning",
+            "summary": redact_text(f"Cleanup left resources behind: {cleanup.get('status') or 'unknown'}"),
+            "evidence_paths": _retrospective_evidence_paths(
+                *[
+                    string_field(resource, "path") or ""
+                    for resource in resources
+                    if isinstance(resource, dict)
+                ]
+            ),
+        }
+    ]
+
+
+def _retrospective_follow_up(signals: list[dict[str, Any]], normalized: dict[str, Any] | None) -> list[dict[str, Any]]:
+    follow_up = []
+    created_summaries: set[str] = set()
+    has_created_follow_up = False
+    if normalized is not None:
+        retrospective = normalized.get("retrospective") if isinstance(normalized, dict) else {}
+        configured = retrospective.get("follow_up") if isinstance(retrospective, dict) else {}
+        recommended = configured.get("recommended") if isinstance(configured, dict) else []
+        if isinstance(recommended, list):
+            for item in recommended:
+                if not isinstance(item, dict):
+                    continue
+                summary = string_field(item, "summary") or ""
+                labels = item.get("labels")
+                follow_up.append(
+                    {
+                        "summary": redact_text(summary),
+                        "labels": _retrospective_follow_up_labels(labels),
+                    }
+                )
+        created = configured.get("created") if isinstance(configured, dict) else []
+        if isinstance(created, list):
+            for item in created:
+                if not isinstance(item, dict):
+                    continue
+                if string_field(item, "id") or string_field(item, "summary"):
+                    has_created_follow_up = True
+                created_summary = redact_text(string_field(item, "summary") or "")
+                if created_summary:
+                    created_summaries.add(created_summary)
+    for signal in signals:
+        kind = string_field(signal, "kind") or ""
+        follow_up_item = _follow_up_for_signal(kind)
+        if (
+            follow_up_item
+            and follow_up_item not in follow_up
+            and not has_created_follow_up
+            and string_field(follow_up_item, "summary") not in created_summaries
+        ):
+            follow_up.append(follow_up_item)
+    return follow_up
+
+
+def _retrospective_follow_up_labels(labels: Any) -> list[str]:
+    if not isinstance(labels, list):
+        return []
+    return [redact_text(str(label)) for label in labels if isinstance(label, str) and label]
+
+
+def _follow_up_for_signal(kind: str) -> dict[str, Any] | None:
+    if kind == "missing-tool-or-config":
+        return {
+            "summary": "Fix the missing tool or configuration in validation evidence before rerunning the workstream.",
+            "labels": ["afk:follow-up", "area:validation"],
+        }
+    if kind == "publisher-auth":
+        return {
+            "summary": "Repair GitHub publisher authentication evidence before rerunning terminal publication.",
+            "labels": ["afk:follow-up", "area:publication"],
+        }
+    if kind in {"publisher-failure", "retry-or-blocked"}:
+        return {
+            "summary": "Address the blocked publication or retry evidence before rerunning the workstream.",
+            "labels": ["afk:follow-up", "area:workstream"],
+        }
+    if kind == "dirty-cleanup":
+        return {
+            "summary": "Clean up leftover workstream resources before starting another retry or publication attempt.",
+            "labels": ["afk:follow-up", "area:cleanup"],
+        }
+    return None
+
+
+def _retrospective_health(signals: list[dict[str, Any]]) -> str:
+    severities = {string_field(signal, "severity") or "" for signal in signals if isinstance(signal, dict)}
+    if "error" in severities:
+        return "failing"
+    if "warning" in severities:
+        return "warning"
+    return "healthy"
+
+
+def _retrospective_missing_tool_or_config_summary(text: str) -> str:
+    if not _retrospective_text_has_missing_tool_or_config(text):
+        return ""
+    return redact_text(text)
+
+
+def _retrospective_text_has_missing_tool_or_config(text: str) -> bool:
+    lowered = text.lower()
+    return any(
+        marker in lowered
+        for marker in (
+            "command not found",
+            "executable file not found",
+            "config_dir",
+            "not installed",
+            "missing tool",
+            "missing config",
+        )
+    )
+
+
+def _publisher_auth_failure_reason(reason: str) -> bool:
+    lowered = reason.lower()
+    return "gh auth status failed" in lowered or "authentication failed" in lowered
+
+
+def _retrospective_evidence_paths(*paths: str) -> list[str]:
+    evidence = []
+    for path in paths:
+        if not path:
+            continue
+        redacted = redact_text(path)
+        if redacted not in evidence:
+            evidence.append(redacted)
+    return evidence
+
+
 def redact_review_cycles(review_cycles: Any) -> list[Any]:
     if not isinstance(review_cycles, list):
         return []

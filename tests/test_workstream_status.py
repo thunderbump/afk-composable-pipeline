@@ -6,7 +6,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from afk.workstream import tracker_record, workstream_status_from_publication  # noqa: E402
+from afk.workstream import (  # noqa: E402
+    pipeline_retrospective_record,
+    tracker_record,
+    workstream_status_from_publication,
+)
 
 
 def tracker_state(*, terminal_decision=None):
@@ -42,7 +46,365 @@ def tracker_state(*, terminal_decision=None):
     }
 
 
+def retrospective_state():
+    return {
+        "selected_work": [{"external_id": "central-afk-pr.17", "title": "Delay tracker closure"}],
+        "implementation": {
+            "status": "implemented",
+            "git": {"after_commit": "abc123"},
+        },
+        "implementation_selection": [{"external_id": "central-afk-pr.17"}],
+        "implementation_result_path": "/tmp/ledger/runs/impl/step-result.json",
+        "validations": [
+            {
+                "output": {
+                    "status": "validated",
+                    "checkout": {"start_commit": "abc123"},
+                    "validation": {"requested_profile": "tier1"},
+                },
+                "step_result_path": "/tmp/ledger/runs/validate/step-result.json",
+                "worker_result_path": "/tmp/ledger/runs/validate/worker-result.json",
+            }
+        ],
+        "review": {
+            "status": "passed",
+            "summary": "ready for human review",
+            "checkout": {"start_commit": "abc123"},
+            "reviewer_result": {"findings": []},
+        },
+        "review_selection": [{"external_id": "central-afk-pr.17"}],
+        "review_result_path": "runs/review/step-result.json",
+        "cleanup": {"status": "clean", "resources": []},
+    }
+
+
+def retrospective_tracker(status="awaiting-review"):
+    return {
+        "status": status,
+        "close_source_item": False,
+        "close_reason": "",
+        "comment": "",
+        "pr_url": "https://github.example/pr/17",
+        "merge_commit": "",
+    }
+
+
 class WorkstreamStatusMappingTest(unittest.TestCase):
+    def test_pipeline_retrospective_record_reports_clean_published_run_without_signals(self):
+        record = pipeline_retrospective_record(
+            retrospective_state(),
+            {"status": "published", "url": "https://github.example/pr/17"},
+            retrospective_tracker(),
+        )
+
+        self.assertEqual(record["status"], "published")
+        self.assertEqual(record["health"], "healthy")
+        self.assertEqual(record["publication_status"], "published")
+        self.assertEqual(record["tracker_status"], "awaiting-review")
+        self.assertEqual(record["signals"], [])
+        self.assertEqual(record["recommended_follow_up"], [])
+
+    def test_pipeline_retrospective_record_surfaces_missing_tool_validation_signal(self):
+        state = retrospective_state()
+        state["validations"] = [
+            {
+                "output": {
+                    "status": "failed_validation",
+                    "summary": "failed_validation",
+                    "actionable_failures": [
+                        {
+                            "category": "validation",
+                            "reason": "python3.13: command not found",
+                            "log_path": "/tmp/ledger/runs/validate/stdout.log",
+                            "excerpt": "python3.13: command not found token=ghp_validation_secret_1234567890",
+                        }
+                    ],
+                    "checkout": {"start_commit": "abc123"},
+                    "validation": {"requested_profile": "tier1"},
+                },
+                "step_result_path": "/tmp/ledger/runs/validate/step-result.json",
+                "worker_result_path": "/tmp/ledger/runs/validate/worker-result.json",
+            }
+        ]
+        record = pipeline_retrospective_record(
+            state,
+            {"status": "blocked", "reason": "required final validation evidence did not pass: tier1"},
+            retrospective_tracker("selected"),
+        )
+
+        self.assertEqual(record["health"], "failing")
+        self.assertEqual(
+            [signal["kind"] for signal in record["signals"]],
+            ["missing-tool-or-config", "retry-or-blocked"],
+        )
+        self.assertEqual(record["signals"][0]["severity"], "error")
+        self.assertIn("python3.13: command not found", record["signals"][0]["summary"])
+        self.assertIn("[REDACTED]", record["signals"][0]["summary"])
+        self.assertEqual(
+            record["signals"][0]["evidence_paths"],
+            [
+                "/tmp/ledger/runs/validate/stdout.log",
+                "/tmp/ledger/runs/validate/step-result.json",
+                "/tmp/ledger/runs/validate/worker-result.json",
+            ],
+        )
+        self.assertEqual(
+            record["recommended_follow_up"],
+            [
+                {
+                    "summary": "Fix the missing tool or configuration in validation evidence before rerunning the workstream.",
+                    "labels": ["afk:follow-up", "area:validation"],
+                },
+                {
+                    "summary": "Address the blocked publication or retry evidence before rerunning the workstream.",
+                    "labels": ["afk:follow-up", "area:workstream"],
+                }
+            ],
+        )
+
+    def test_pipeline_retrospective_record_surfaces_blocked_reason_without_retry_keyword(self):
+        record = pipeline_retrospective_record(
+            retrospective_state(),
+            {"status": "blocked", "reason": "required final validation evidence is missing"},
+            retrospective_tracker("selected"),
+        )
+
+        self.assertEqual(record["status"], "blocked")
+        self.assertEqual(record["health"], "failing")
+        self.assertEqual(record["signals"][0]["kind"], "retry-or-blocked")
+        self.assertEqual(record["signals"][0]["severity"], "error")
+        self.assertIn("required final validation evidence is missing", record["signals"][0]["summary"])
+
+    def test_pipeline_retrospective_record_does_not_treat_schema_errors_as_missing_config(self):
+        state = retrospective_state()
+        state["validations"] = [
+            {
+                "output": {
+                    "status": "failed_validation",
+                    "summary": "validation.required_artifacts must be a non-empty list",
+                    "actionable_failures": [
+                        {
+                            "category": "validation",
+                            "reason": "validation.required_artifacts must be a non-empty list",
+                        }
+                    ],
+                    "checkout": {"start_commit": "abc123"},
+                    "validation": {"requested_profile": "tier1"},
+                },
+                "step_result_path": "/tmp/ledger/runs/validate/step-result.json",
+                "worker_result_path": "/tmp/ledger/runs/validate/worker-result.json",
+            }
+        ]
+
+        record = pipeline_retrospective_record(
+            state,
+            {"status": "published", "url": "https://github.example/pr/17"},
+            retrospective_tracker(),
+        )
+
+        self.assertEqual(record["health"], "healthy")
+        self.assertEqual(record["signals"], [])
+        self.assertEqual(record["recommended_follow_up"], [])
+
+    def test_pipeline_retrospective_record_does_not_treat_app_no_such_file_text_as_missing_config(self):
+        state = retrospective_state()
+        state["validations"] = [
+            {
+                "output": {
+                    "status": "failed_validation",
+                    "summary": "AssertionError: expected app to report 'No such file or directory'",
+                    "actionable_failures": [
+                        {
+                            "category": "validation",
+                            "reason": "AssertionError: expected app to report 'No such file or directory'",
+                        }
+                    ],
+                    "checkout": {"start_commit": "abc123"},
+                    "validation": {"requested_profile": "tier1"},
+                },
+                "step_result_path": "/tmp/ledger/runs/validate/step-result.json",
+                "worker_result_path": "/tmp/ledger/runs/validate/worker-result.json",
+            }
+        ]
+
+        record = pipeline_retrospective_record(
+            state,
+            {"status": "published", "url": "https://github.example/pr/17"},
+            retrospective_tracker(),
+        )
+
+        self.assertEqual(record["health"], "healthy")
+        self.assertEqual(record["signals"], [])
+        self.assertEqual(record["recommended_follow_up"], [])
+
+    def test_pipeline_retrospective_record_reads_missing_config_signal_from_publication_reason(self):
+        record = pipeline_retrospective_record(
+            retrospective_state(),
+            {
+                "status": "failed-needs-human",
+                "reason": "publisher.gh.auth.config_dir must be outside checkout token=ghp_publication_secret_1234567890",
+            },
+            retrospective_tracker("validated"),
+        )
+
+        self.assertEqual(record["health"], "failing")
+        self.assertEqual(record["signals"][0]["kind"], "missing-tool-or-config")
+        self.assertEqual(record["signals"][0]["severity"], "error")
+        self.assertIn("publisher.gh.auth.config_dir must be outside checkout", record["signals"][0]["summary"])
+        self.assertIn("[REDACTED]", record["signals"][0]["summary"])
+        self.assertEqual(record["signals"][0]["evidence_paths"], [])
+
+    def test_pipeline_retrospective_record_surfaces_publisher_auth_failure(self):
+        record = pipeline_retrospective_record(
+            retrospective_state(),
+            {
+                "status": "failed-needs-human",
+                "reason": "gh auth status failed token=ghp_auth_secret_1234567890",
+            },
+            retrospective_tracker("validated"),
+        )
+
+        self.assertEqual(record["health"], "failing")
+        self.assertEqual(record["signals"][0]["kind"], "publisher-auth")
+        self.assertEqual(record["signals"][0]["severity"], "error")
+        self.assertIn("gh auth status failed", record["signals"][0]["summary"])
+        self.assertIn("[REDACTED]", record["signals"][0]["summary"])
+        self.assertEqual(
+            record["recommended_follow_up"],
+            [
+                {
+                    "summary": "Repair GitHub publisher authentication evidence before rerunning terminal publication.",
+                    "labels": ["afk:follow-up", "area:publication"],
+                }
+            ],
+        )
+
+    def test_pipeline_retrospective_record_surfaces_retry_block_and_dirty_cleanup(self):
+        state = retrospective_state()
+        state["cleanup"] = {
+            "status": "dirty_retry_checkouts",
+            "resources": [
+                {
+                    "kind": "retry_checkout",
+                    "path": "/tmp/ledger/retries/checkout-2",
+                    "branch": "afk/central-afk-pr.17",
+                    "commit": "abc123",
+                    "status": "dirty",
+                }
+            ],
+        }
+        record = pipeline_retrospective_record(
+            state,
+            {
+                "status": "blocked",
+                "reason": "retry checkout blocked: prior retry checkout is dirty and still needs cleanup",
+            },
+            retrospective_tracker("implemented"),
+        )
+
+        self.assertEqual(record["status"], "blocked")
+        self.assertEqual(record["health"], "failing")
+        self.assertEqual(
+            [signal["kind"] for signal in record["signals"]],
+            ["retry-or-blocked", "dirty-cleanup"],
+        )
+        self.assertEqual(record["signals"][0]["severity"], "error")
+        self.assertEqual(record["signals"][1]["severity"], "warning")
+        self.assertEqual(
+            record["signals"][1]["evidence_paths"],
+            ["/tmp/ledger/retries/checkout-2"],
+        )
+        self.assertEqual(
+            record["recommended_follow_up"],
+            [
+                {
+                    "summary": "Address the blocked publication or retry evidence before rerunning the workstream.",
+                    "labels": ["afk:follow-up", "area:workstream"],
+                },
+                {
+                    "summary": "Clean up leftover workstream resources before starting another retry or publication attempt.",
+                    "labels": ["afk:follow-up", "area:cleanup"],
+                },
+            ],
+        )
+
+    def test_pipeline_retrospective_record_includes_redacted_configured_follow_up(self):
+        record = pipeline_retrospective_record(
+            retrospective_state(),
+            {"status": "published", "url": "https://github.example/pr/17"},
+            retrospective_tracker(),
+            normalized={
+                "retrospective": {
+                    "follow_up": {
+                        "recommended": [
+                            {
+                                "summary": "Capture token=ghp_follow_up_secret_1234567890 remediation notes.",
+                                "labels": ["project:afk-composable-pipeline"],
+                            }
+                        ]
+                    }
+                }
+            },
+        )
+
+        self.assertEqual(record["health"], "healthy")
+        self.assertEqual(
+            record["recommended_follow_up"][0]["labels"],
+            ["project:afk-composable-pipeline"],
+        )
+        self.assertIn("[REDACTED]", record["recommended_follow_up"][0]["summary"])
+
+    def test_pipeline_retrospective_record_does_not_recommend_created_follow_up_again(self):
+        record = pipeline_retrospective_record(
+            retrospective_state(),
+            {
+                "status": "failed-needs-human",
+                "reason": "gh auth status failed",
+            },
+            retrospective_tracker("validated"),
+            normalized={
+                "retrospective": {
+                    "follow_up": {
+                        "created": [
+                            {
+                                "summary": "Repair GitHub publisher authentication evidence before rerunning terminal publication.",
+                                "labels": ["project:afk-composable-pipeline"],
+                            }
+                        ]
+                    }
+                }
+            },
+        )
+
+        self.assertEqual(record["health"], "failing")
+        self.assertEqual(record["signals"][0]["kind"], "publisher-auth")
+        self.assertEqual(record["recommended_follow_up"], [])
+
+    def test_pipeline_retrospective_record_does_not_recommend_when_created_follow_up_has_only_id(self):
+        record = pipeline_retrospective_record(
+            retrospective_state(),
+            {
+                "status": "failed-needs-human",
+                "reason": "gh auth status failed",
+            },
+            retrospective_tracker("validated"),
+            normalized={
+                "retrospective": {
+                    "follow_up": {
+                        "created": [
+                            {
+                                "id": "central-4x9.99",
+                            }
+                        ]
+                    }
+                }
+            },
+        )
+
+        self.assertEqual(record["health"], "failing")
+        self.assertEqual(record["signals"][0]["kind"], "publisher-auth")
+        self.assertEqual(record["recommended_follow_up"], [])
+
     def test_workstream_status_from_publication_explicit_terminal_states(self):
         self.assertEqual(
             workstream_status_from_publication({"status": "published"}),
