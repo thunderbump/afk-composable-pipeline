@@ -2031,7 +2031,7 @@ def _run_retrospective_judge(
     ledger.write_json("retrospective-judge-request.json", request)
     checkout_path = checkout_path_from_state(state)
     try:
-        adapter_result, raw_payload = _run_retrospective_judge_command(
+        adapter_result, raw_payload, raw_payload_source = _run_retrospective_judge_command(
             judge,
             checkout_path=checkout_path,
             request=request,
@@ -2039,7 +2039,7 @@ def _run_retrospective_judge(
             request_path=request_path,
             result_path=result_path,
         )
-        raw = _read_retrospective_judge_payload(raw_payload)
+        raw = _read_retrospective_judge_payload(raw_payload, source=raw_payload_source)
         if raw["status"] != "valid":
             normalized_result = _normalized_retrospective_judge_result(
                 enabled=True,
@@ -2156,7 +2156,7 @@ def _run_retrospective_judge_command(
     request_prompt: dict[str, Any],
     request_path: Path,
     result_path: Path,
-) -> tuple[dict[str, Any], str | None]:
+) -> tuple[dict[str, Any], str | None, str]:
     with tempfile.TemporaryDirectory(prefix="afk-retrospective-judge-") as temp_dir:
         temp_path = Path(temp_dir)
         env = _minimal_retrospective_judge_environment(temp_path)
@@ -2199,6 +2199,7 @@ def _run_retrospective_judge_command(
                 timed_out=True,
             ) from exc
         raw_payload = result_path.read_text(encoding="utf-8", errors="replace") if result_path.exists() else None
+        raw_payload_source = "file" if raw_payload is not None else "stdout"
     if completed.returncode != 0:
         raise _RetrospectiveJudgeError(
             "retrospective judge command failed",
@@ -2207,11 +2208,14 @@ def _run_retrospective_judge_command(
             stdout=completed.stdout,
             stderr=completed.stderr,
         )
+    if raw_payload is None and completed.stdout.strip():
+        raw_payload = completed.stdout
+        raw_payload_source = "stdout"
     return {
         "returncode": completed.returncode,
         "stdout": completed.stdout,
         "stderr": completed.stderr,
-    }, raw_payload
+    }, raw_payload, raw_payload_source
 
 
 def _render_retrospective_judge_command(
@@ -2320,15 +2324,15 @@ def _minimal_retrospective_judge_environment(temp_path: Path) -> dict[str, str]:
     return env
 
 
-def _read_retrospective_judge_payload(raw: str | None) -> dict[str, Any]:
+def _read_retrospective_judge_payload(raw: str | None, *, source: str) -> dict[str, Any]:
     if raw is None:
-        return {"status": "missing", "message": "retrospective judge result file was not produced"}
+        return {"status": "missing", "message": "retrospective judge result payload was not produced"}
     try:
         payload = json.loads(raw)
     except json.JSONDecodeError:
-        return {"status": "invalid", "message": "retrospective judge result file is not valid JSON"}
+        return {"status": "invalid", "message": f"retrospective judge result {source} is not valid JSON"}
     if not isinstance(payload, dict):
-        return {"status": "invalid", "message": "retrospective judge result file must contain an object"}
+        return {"status": "invalid", "message": f"retrospective judge result {source} must contain an object"}
     return {"status": "valid", "payload": redact_artifact_value(payload)}
 
 
