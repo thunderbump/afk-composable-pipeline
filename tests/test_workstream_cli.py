@@ -1110,6 +1110,258 @@ raise SystemExit(9)
             self.assertNotIn("ghp_secret_merge_retrospective_1234567890", stdout_log)
             self.assertNotIn("ghp_secret_judge_1234567890", stdout_log)
 
+    def test_workstream_accepts_retrospective_judge_json_from_stdout_when_result_file_is_absent(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repo = temp_path / "repo-src"
+            checkout = temp_path / "checkout"
+            ledger = temp_path / "ledger"
+            init_repo(repo)
+            fake_git = temp_path / "publisher-git"
+            fake_gh = temp_path / "publisher-gh"
+            write_executable(
+                fake_git,
+                f"""#!{sys.executable}
+import json
+import sys
+from pathlib import Path
+Path({str(temp_path / "fake-git-calls.jsonl")!r}).write_text(json.dumps(sys.argv[1:]) + "\\n", encoding="utf-8")
+""",
+            )
+            write_executable(
+                fake_gh,
+                f"""#!{sys.executable}
+import sys
+if sys.argv[1:4] == ["auth", "status", "--hostname"]:
+    raise SystemExit(0)
+if sys.argv[1:3] == ["pr", "create"]:
+    print("https://github.example/pr/123")
+    raise SystemExit(0)
+raise SystemExit(9)
+""",
+            )
+            recipe = successful_recipe(temp_path, repo, checkout, fake_git, fake_gh)
+            recipe["retrospective_judge"] = {
+                "enabled": True,
+                "type": "local-command",
+                "command": [
+                    sys.executable,
+                    "-c",
+                    textwrap.dedent(
+                        """
+                        import json
+                        print(json.dumps({
+                            "status": "fail",
+                            "summary": "implementation timed out before publication",
+                            "findings": [
+                                {
+                                    "scope": "pipeline_retrospective",
+                                    "severity": "error",
+                                    "summary": "implement did not reach implemented",
+                                    "evidence": ["implement failed_runtime"],
+                                    "next_action": "rerun with a longer implementation timeout",
+                                }
+                            ],
+                        }))
+                        """
+                    ),
+                ],
+                "timeout_seconds": 10,
+            }
+
+            completed = run_afk(
+                "run-workstream",
+                "--workstream-id",
+                "central-lve.9",
+                "--input",
+                json.dumps(recipe),
+                "--ledger",
+                str(ledger),
+                env_overrides={
+                    "GIT_ALLOW_PROTOCOL": "file",
+                    "GIT_AUTHOR_NAME": "AFK Test",
+                    "GIT_AUTHOR_EMAIL": "afk-test@example.test",
+                    "GIT_COMMITTER_NAME": "AFK Test",
+                    "GIT_COMMITTER_EMAIL": "afk-test@example.test",
+                },
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            result = json.loads((ledger / summary["result_path"]).read_text(encoding="utf-8"))
+            run_dir = ledger / "workstreams" / summary["run_id"]
+
+            self.assertEqual(result["status"], "published")
+            self.assertEqual(result["pipeline_retrospective"]["judge"]["status"], "failed")
+            self.assertEqual(
+                result["pipeline_retrospective"]["judge"]["summary"],
+                "implementation timed out before publication",
+            )
+            self.assertEqual(
+                result["pipeline_retrospective"]["judge"]["findings"][0]["next_action"],
+                "rerun with a longer implementation timeout",
+            )
+            judge_result = json.loads((run_dir / "retrospective-judge-result.json").read_text(encoding="utf-8"))
+            self.assertEqual(judge_result["result"], result["pipeline_retrospective"]["judge"])
+            self.assertIn(
+                "implementation timed out before publication",
+                (run_dir / "retrospective-judge-stdout.log").read_text(encoding="utf-8"),
+            )
+
+    def test_workstream_reports_invalid_retrospective_judge_stdout_as_protocol_failure(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repo = temp_path / "repo-src"
+            checkout = temp_path / "checkout"
+            ledger = temp_path / "ledger"
+            init_repo(repo)
+            fake_git = temp_path / "publisher-git"
+            fake_gh = temp_path / "publisher-gh"
+            write_executable(
+                fake_git,
+                f"""#!{sys.executable}
+import json
+import sys
+from pathlib import Path
+Path({str(temp_path / "fake-git-calls.jsonl")!r}).write_text(json.dumps(sys.argv[1:]) + "\\n", encoding="utf-8")
+""",
+            )
+            write_executable(
+                fake_gh,
+                f"""#!{sys.executable}
+import sys
+if sys.argv[1:4] == ["auth", "status", "--hostname"]:
+    raise SystemExit(0)
+if sys.argv[1:3] == ["pr", "create"]:
+    print("https://github.example/pr/123")
+    raise SystemExit(0)
+raise SystemExit(9)
+""",
+            )
+            recipe = successful_recipe(temp_path, repo, checkout, fake_git, fake_gh)
+            recipe["retrospective_judge"] = {
+                "enabled": True,
+                "type": "local-command",
+                "command": [sys.executable, "-c", "print('progress log before result')"],
+                "timeout_seconds": 10,
+            }
+
+            completed = run_afk(
+                "run-workstream",
+                "--workstream-id",
+                "central-lve.9",
+                "--input",
+                json.dumps(recipe),
+                "--ledger",
+                str(ledger),
+                env_overrides={
+                    "GIT_ALLOW_PROTOCOL": "file",
+                    "GIT_AUTHOR_NAME": "AFK Test",
+                    "GIT_AUTHOR_EMAIL": "afk-test@example.test",
+                    "GIT_COMMITTER_NAME": "AFK Test",
+                    "GIT_COMMITTER_EMAIL": "afk-test@example.test",
+                },
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            result = json.loads((ledger / summary["result_path"]).read_text(encoding="utf-8"))
+            run_dir = ledger / "workstreams" / summary["run_id"]
+
+            self.assertEqual(result["status"], "published")
+            self.assertEqual(result["pipeline_retrospective"]["judge"]["status"], "failed_protocol")
+            self.assertEqual(
+                result["pipeline_retrospective"]["judge"]["summary"],
+                "retrospective judge result stdout is not valid JSON",
+            )
+            self.assertIn(
+                "progress log before result",
+                (run_dir / "retrospective-judge-stdout.log").read_text(encoding="utf-8"),
+            )
+
+    def test_workstream_prefers_retrospective_judge_result_file_over_stdout(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repo = temp_path / "repo-src"
+            checkout = temp_path / "checkout"
+            ledger = temp_path / "ledger"
+            init_repo(repo)
+            fake_git = temp_path / "publisher-git"
+            fake_gh = temp_path / "publisher-gh"
+            write_executable(
+                fake_git,
+                f"""#!{sys.executable}
+import json
+import sys
+from pathlib import Path
+Path({str(temp_path / "fake-git-calls.jsonl")!r}).write_text(json.dumps(sys.argv[1:]) + "\\n", encoding="utf-8")
+""",
+            )
+            write_executable(
+                fake_gh,
+                f"""#!{sys.executable}
+import sys
+if sys.argv[1:4] == ["auth", "status", "--hostname"]:
+    raise SystemExit(0)
+if sys.argv[1:3] == ["pr", "create"]:
+    print("https://github.example/pr/123")
+    raise SystemExit(0)
+raise SystemExit(9)
+""",
+            )
+            recipe = successful_recipe(temp_path, repo, checkout, fake_git, fake_gh)
+            recipe["retrospective_judge"] = {
+                "enabled": True,
+                "type": "local-command",
+                "command": [
+                    sys.executable,
+                    "-c",
+                    textwrap.dedent(
+                        """
+                        import json
+                        import os
+                        from pathlib import Path
+                        Path(os.environ["AFK_RETROSPECTIVE_JUDGE_RESULT"]).write_text(
+                            json.dumps({"status": "pass", "summary": "file result wins"}),
+                            encoding="utf-8",
+                        )
+                        print("stdout should not be parsed")
+                        """
+                    ),
+                ],
+                "timeout_seconds": 10,
+            }
+
+            completed = run_afk(
+                "run-workstream",
+                "--workstream-id",
+                "central-lve.9",
+                "--input",
+                json.dumps(recipe),
+                "--ledger",
+                str(ledger),
+                env_overrides={
+                    "GIT_ALLOW_PROTOCOL": "file",
+                    "GIT_AUTHOR_NAME": "AFK Test",
+                    "GIT_AUTHOR_EMAIL": "afk-test@example.test",
+                    "GIT_COMMITTER_NAME": "AFK Test",
+                    "GIT_COMMITTER_EMAIL": "afk-test@example.test",
+                },
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            result = json.loads((ledger / summary["result_path"]).read_text(encoding="utf-8"))
+            run_dir = ledger / "workstreams" / summary["run_id"]
+
+            self.assertEqual(result["status"], "published")
+            self.assertEqual(result["pipeline_retrospective"]["judge"]["status"], "passed")
+            self.assertEqual(result["pipeline_retrospective"]["judge"]["summary"], "file result wins")
+            self.assertIn(
+                "stdout should not be parsed",
+                (run_dir / "retrospective-judge-stdout.log").read_text(encoding="utf-8"),
+            )
+
     def test_workstream_preserves_retrospective_judge_prompt_placeholders(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
