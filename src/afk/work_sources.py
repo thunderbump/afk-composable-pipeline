@@ -404,12 +404,11 @@ def run_github_issue_list(command: list[str]) -> Any:
 def github_issue_list_failure_status_and_message(stdout: str, stderr: str) -> tuple[str, str]:
     normalized = f"{stdout}\n{stderr}".lower()
     disabled_markers = (
-        "repository has disabled issues",
-        "has disabled issues",
-        "issues are disabled",
-        "issues disabled",
+        r"repository has disabled issues",
+        r"issues are disabled",
+        r"issues have been disabled",
     )
-    if any(marker in normalized for marker in disabled_markers):
+    if any(re.search(marker, normalized, flags=re.IGNORECASE) for marker in disabled_markers):
         return "skipped_unconfigured", "GitHub Issues are disabled for this repository"
     return "skipped_unreachable", "gh issue list failed"
 

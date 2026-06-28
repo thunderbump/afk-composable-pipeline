@@ -271,7 +271,7 @@ import sys
 if sys.argv[1:3] == ["auth", "status"]:
     sys.exit(0)
 if sys.argv[1:3] == ["issue", "list"]:
-    print("issue query failed because a disabled flag was not recognized", file=sys.stderr)
+    print("issue query failed because the issues disabled flag was not recognized", file=sys.stderr)
     sys.exit(1)
 raise SystemExit(9)
 """,
