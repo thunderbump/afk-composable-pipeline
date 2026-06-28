@@ -23,6 +23,7 @@ from afk.run_next import run_next
 from afk.pi_workers import (
     PONYTAIL_EXTENSION_SOURCE,
     build_pi_real_worker_agent,
+    build_pi_print_command,
 )
 from afk.registry import (
     StepContext,
@@ -153,6 +154,8 @@ def main(argv: list[str] | None = None) -> int:
         try:
             validation_input = recipe_validation_input_from_args(args, project_contract=project_contract)
             recipe_agent = recipe_agent_from_args(args, checkout_path=Path(args.checkout_path))
+            reviewer = recipe_reviewer_from_args(args)
+            retrospective_judge = recipe_retrospective_judge_from_args(args)
             recipe_publisher = recipe_publisher_from_args(
                 args,
                 review_branch=f"afk/{branch_slug(args.workstream_id)}",
@@ -170,6 +173,8 @@ def main(argv: list[str] | None = None) -> int:
                 validation_profile=args.validation_profile,
                 validation_input=validation_input,
                 agent=recipe_agent,
+                reviewer=reviewer,
+                retrospective_judge=retrospective_judge,
                 publisher=recipe_publisher,
             )
         except ValueError as exc:
@@ -208,6 +213,8 @@ def main(argv: list[str] | None = None) -> int:
             parser.error("--ledger is required when --execute is set")
         try:
             recipe_agent = recipe_agent_from_args(args, checkout_path=Path(args.checkout_path))
+            reviewer = recipe_reviewer_from_args(args)
+            retrospective_judge = recipe_retrospective_judge_from_args(args)
             workstream_runner = None
             if args.execute:
                 from afk.workstream import run_workstream
@@ -225,6 +232,8 @@ def main(argv: list[str] | None = None) -> int:
                 checkout_path=Path(args.checkout_path),
                 validation_profile=args.validation_profile,
                 agent=recipe_agent,
+                reviewer=reviewer,
+                retrospective_judge=retrospective_judge,
                 ready_tag=args.ready_tag,
                 selector_mode=args.selector_mode,
                 selector_model=args.selector_model,
@@ -308,6 +317,8 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     add_implementation_agent_flags(generate_recipe_parser)
+    add_reviewer_flags(generate_recipe_parser)
+    add_retrospective_judge_flags(generate_recipe_parser)
     generate_recipe_parser.add_argument(
         "--publisher-mode",
         choices=("disabled", "create"),
@@ -366,6 +377,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run the selected recipe through run-workstream after selection",
     )
     add_implementation_agent_flags(run_next_parser)
+    add_reviewer_flags(run_next_parser)
+    add_retrospective_judge_flags(run_next_parser)
 
     return parser
 
@@ -429,6 +442,84 @@ def add_implementation_agent_flags(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def add_reviewer_flags(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--reviewer-mode",
+        choices=("fake", "pi"),
+        default="fake",
+        help="Reviewer mode to embed in the generated recipe",
+    )
+    parser.add_argument("--reviewer-timeout-seconds", type=int, help="Optional reviewer timeout in seconds")
+    parser.add_argument("--reviewer-pi-bin", default="pi", help="Reviewer Pi binary for pi mode")
+    parser.add_argument(
+        "--reviewer-pi-provider",
+        default="openai-codex",
+        help="Reviewer Pi provider for pi mode",
+    )
+    parser.add_argument(
+        "--reviewer-pi-model",
+        default="gpt-5.4-mini",
+        help="Reviewer Pi model for pi mode (gpt-5.4 or lower)",
+    )
+    parser.add_argument("--reviewer-pi-thinking", help="Optional reviewer Pi thinking level")
+    parser.add_argument(
+        "--reviewer-ponytail",
+        action="store_true",
+        help="Enable default ponytail extension for reviewer pi mode",
+    )
+    parser.add_argument("--reviewer-ponytail-extension", help="Reviewer ponytail extension package name for pi mode")
+    parser.add_argument(
+        "--reviewer-ponytail-extension-source",
+        help="Reviewer ponytail extension source string for pi mode",
+    )
+
+
+def add_retrospective_judge_flags(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--retrospective-judge-mode",
+        choices=("disabled", "pi"),
+        default="disabled",
+        help="Retrospective judge mode to embed in generated recipe",
+    )
+    parser.add_argument(
+        "--retrospective-judge-timeout-seconds",
+        type=int,
+        help="Optional retrospective judge timeout in seconds",
+    )
+    parser.add_argument(
+        "--retrospective-judge-pi-bin",
+        default="pi",
+        help="Retrospective judge Pi binary for pi mode",
+    )
+    parser.add_argument(
+        "--retrospective-judge-pi-provider",
+        default="openai-codex",
+        help="Retrospective judge Pi provider for pi mode",
+    )
+    parser.add_argument(
+        "--retrospective-judge-pi-model",
+        default="gpt-5.4-mini",
+        help="Retrospective judge Pi model for pi mode (gpt-5.4 or lower)",
+    )
+    parser.add_argument(
+        "--retrospective-judge-pi-thinking",
+        help="Optional retrospective judge Pi thinking level",
+    )
+    parser.add_argument(
+        "--retrospective-judge-ponytail",
+        action="store_true",
+        help="Enable default ponytail extension for retrospective judge pi mode",
+    )
+    parser.add_argument(
+        "--retrospective-judge-ponytail-extension",
+        help="Retrospective judge ponytail extension package name for pi mode",
+    )
+    parser.add_argument(
+        "--retrospective-judge-ponytail-extension-source",
+        help="Retrospective judge ponytail extension source string for pi mode",
+    )
+
+
 def recipe_agent_from_args(args: argparse.Namespace, *, checkout_path: Path) -> dict[str, Any] | None:
     if args.agent_mode == "fake":
         return None
@@ -482,6 +573,83 @@ def recipe_agent_from_args(args: argparse.Namespace, *, checkout_path: Path) -> 
             timeout_seconds=args.agent_timeout_seconds,
         )
     raise ValueError(f"Unsupported --agent-mode: {args.agent_mode}")
+
+
+def recipe_reviewer_from_args(args: argparse.Namespace) -> dict[str, Any] | None:
+    if args.reviewer_mode == "fake":
+        return None
+    if args.reviewer_mode == "pi":
+        if args.reviewer_ponytail and (
+            args.reviewer_ponytail_extension is not None
+            or args.reviewer_ponytail_extension_source is not None
+        ):
+            raise ValueError("--reviewer-ponytail cannot be combined with explicit ponytail extension values")
+        ponytail_extension = None
+        ponytail_extension_source = None
+        if args.reviewer_ponytail:
+            ponytail_extension_source = PONYTAIL_EXTENSION_SOURCE
+        else:
+            ponytail_extension = args.reviewer_ponytail_extension
+            ponytail_extension_source = args.reviewer_ponytail_extension_source
+            if ponytail_extension is not None and ponytail_extension_source is not None:
+                raise ValueError("Specify ponytail-extension or ponytail-extension-source, not both")
+        command = build_pi_print_command(
+            pi_bin=args.reviewer_pi_bin,
+            provider=args.reviewer_pi_provider,
+            model=args.reviewer_pi_model,
+            thinking=args.reviewer_pi_thinking,
+            ponytail_extension=ponytail_extension,
+            ponytail_extension_source=ponytail_extension_source,
+        )
+        reviewer_timeout = 30 if args.reviewer_timeout_seconds is None else args.reviewer_timeout_seconds
+        if reviewer_timeout <= 0:
+            raise ValueError("--reviewer-timeout-seconds must be greater than zero")
+        return {
+            "type": "fake-reviewer-command",
+            "command": command,
+            "timeout_seconds": reviewer_timeout,
+        }
+    raise ValueError(f"Unsupported --reviewer-mode: {args.reviewer_mode}")
+
+
+def recipe_retrospective_judge_from_args(args: argparse.Namespace) -> dict[str, Any] | None:
+    if args.retrospective_judge_mode == "disabled":
+        return None
+    if args.retrospective_judge_mode == "pi":
+        if args.retrospective_judge_ponytail and (
+            args.retrospective_judge_ponytail_extension is not None
+            or args.retrospective_judge_ponytail_extension_source is not None
+        ):
+            raise ValueError(
+                "--retrospective-judge-ponytail cannot be combined with explicit ponytail extension values"
+            )
+        ponytail_extension = None
+        ponytail_extension_source = None
+        if args.retrospective_judge_ponytail:
+            ponytail_extension_source = PONYTAIL_EXTENSION_SOURCE
+        else:
+            ponytail_extension = args.retrospective_judge_ponytail_extension
+            ponytail_extension_source = args.retrospective_judge_ponytail_extension_source
+            if ponytail_extension is not None and ponytail_extension_source is not None:
+                raise ValueError("Specify ponytail-extension or ponytail-extension-source, not both")
+        command = build_pi_print_command(
+            pi_bin=args.retrospective_judge_pi_bin,
+            provider=args.retrospective_judge_pi_provider,
+            model=args.retrospective_judge_pi_model,
+            thinking=args.retrospective_judge_pi_thinking,
+            ponytail_extension=ponytail_extension,
+            ponytail_extension_source=ponytail_extension_source,
+        )
+        judge_timeout = 120 if args.retrospective_judge_timeout_seconds is None else args.retrospective_judge_timeout_seconds
+        if judge_timeout <= 0:
+            raise ValueError("--retrospective-judge-timeout-seconds must be greater than zero")
+        return {
+            "enabled": True,
+            "type": "local-command",
+            "command": command,
+            "timeout_seconds": judge_timeout,
+        }
+    raise ValueError(f"Unsupported --retrospective-judge-mode: {args.retrospective_judge_mode}")
 
 
 def recipe_validation_input_from_args(args: argparse.Namespace, *, project_contract: ProjectContract) -> dict[str, Any]:

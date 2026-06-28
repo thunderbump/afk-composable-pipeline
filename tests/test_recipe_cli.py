@@ -6,6 +6,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from afk.pi_workers import PONYTAIL_EXTENSION_SOURCE, build_pi_print_command
+
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -169,6 +171,10 @@ class GenerateRecipeCliTest(unittest.TestCase):
             self.assertEqual(recipe["steps"][3]["profile"], "tier1")
             self.assertEqual(recipe["steps"][3]["input"]["validation"]["profile"], "tier1")
             self.assertEqual(recipe["publisher"], {"enabled": False})
+            reviewer = recipe["steps"][4]["input"]["reviewer"]
+            self.assertEqual(reviewer["type"], "fake-reviewer-command")
+            self.assertEqual(reviewer["timeout_seconds"], 30)
+            self.assertNotIn("retrospective_judge", recipe)
 
     def test_generate_recipe_writes_real_local_agent_and_enabled_publisher_when_requested(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -405,6 +411,224 @@ class GenerateRecipeCliTest(unittest.TestCase):
                 str(config_home),
                 "--agent-pi-config-home",
                 str(pi_config_home),
+                "--output",
+                str(output),
+            )
+
+            self.assertNotEqual(completed.returncode, 0, completed.stdout)
+            self.assertIn("Pi worker model must be gpt-5.4 or lower", completed.stderr)
+            self.assertFalse(output.exists())
+
+    def test_generate_recipe_writes_pi_reviewer_and_pi_retrospective_judge_modes(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            contracts_dir = temp_path / "contracts"
+            repo = temp_path / "repo-src"
+            output = temp_path / "recipe.json"
+            ledger = temp_path / "ledger"
+            beads_workspace = temp_path / "central-beads"
+            checkout_root = temp_path / "checkouts"
+            checkout_path = checkout_root / "demo"
+            codex_home = temp_path / "codex-home"
+            config_home = temp_path / "xdg-config"
+            pi_config_home = temp_path / "pi-config"
+            contracts_dir.mkdir()
+            init_repo(repo)
+            write_contract(contracts_dir / "demo.json", project_slug="demo", repo_url=str(repo))
+            beads_workspace.mkdir()
+            codex_home.mkdir()
+            config_home.mkdir()
+            pi_config_home.mkdir()
+
+            reviewer_mode = "pi"
+            reviewer_pi_bin = "/opt/pi/bin/pi"
+            reviewer_pi_model = "gpt-5.4-mini"
+            reviewer_ponytail = PONYTAIL_EXTENSION_SOURCE
+            reviewer_timeout = 90
+            judge_pi_model = "gpt-5.4"
+            judge_timeout = 130
+            completed = run_afk(
+                "generate-recipe",
+                "--workstream-id",
+                "central-anh.6",
+                "--project",
+                "demo",
+                "--contracts-dir",
+                str(contracts_dir),
+                "--ledger",
+                str(ledger),
+                "--beads-workspace",
+                str(beads_workspace),
+                "--checkout-root",
+                str(checkout_root),
+                "--checkout-path",
+                str(checkout_path),
+                "--validation-profile",
+                "tier1",
+                "--agent-mode",
+                "fake",
+                "--reviewer-mode",
+                reviewer_mode,
+                "--reviewer-pi-bin",
+                reviewer_pi_bin,
+                "--reviewer-pi-provider",
+                "openai-codex",
+                "--reviewer-pi-model",
+                reviewer_pi_model,
+                "--reviewer-timeout-seconds",
+                str(reviewer_timeout),
+                "--reviewer-ponytail-extension-source",
+                reviewer_ponytail,
+                "--retrospective-judge-mode",
+                "pi",
+                "--retrospective-judge-pi-bin",
+                reviewer_pi_bin,
+                "--retrospective-judge-pi-provider",
+                "openai-codex",
+                "--retrospective-judge-pi-model",
+                judge_pi_model,
+                "--retrospective-judge-timeout-seconds",
+                str(judge_timeout),
+                "--retrospective-judge-ponytail-extension-source",
+                reviewer_ponytail,
+                "--output",
+                str(output),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            recipe = json.loads(output.read_text(encoding="utf-8"))
+            reviewer = recipe["steps"][4]["input"]["reviewer"]
+            self.assertEqual(reviewer["type"], "fake-reviewer-command")
+            self.assertEqual(
+                reviewer["command"],
+                build_pi_print_command(
+                    pi_bin=reviewer_pi_bin,
+                    provider="openai-codex",
+                    model=reviewer_pi_model,
+                    ponytail_extension_source=reviewer_ponytail,
+                ),
+            )
+            self.assertEqual(reviewer["timeout_seconds"], reviewer_timeout)
+            retrospective_judge = recipe["retrospective_judge"]
+            self.assertEqual(retrospective_judge["enabled"], True)
+            self.assertEqual(
+                retrospective_judge["command"],
+                build_pi_print_command(
+                    pi_bin=reviewer_pi_bin,
+                    provider="openai-codex",
+                    model=judge_pi_model,
+                    ponytail_extension_source=reviewer_ponytail,
+                ),
+            )
+            self.assertEqual(retrospective_judge["type"], "local-command")
+            self.assertEqual(retrospective_judge["timeout_seconds"], judge_timeout)
+
+    def test_generate_recipe_rejects_disallowed_pi_reviewer_model(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            contracts_dir = temp_path / "contracts"
+            repo = temp_path / "repo-src"
+            output = temp_path / "recipe.json"
+            ledger = temp_path / "ledger"
+            beads_workspace = temp_path / "central-beads"
+            checkout_root = temp_path / "checkouts"
+            checkout_path = checkout_root / "demo"
+            codex_home = temp_path / "codex-home"
+            config_home = temp_path / "xdg-config"
+            pi_config_home = temp_path / "pi-config"
+            contracts_dir.mkdir()
+            init_repo(repo)
+            write_contract(contracts_dir / "demo.json", project_slug="demo", repo_url=str(repo))
+            beads_workspace.mkdir()
+            codex_home.mkdir()
+            config_home.mkdir()
+            pi_config_home.mkdir()
+
+            completed = run_afk(
+                "generate-recipe",
+                "--workstream-id",
+                "central-anh.6",
+                "--project",
+                "demo",
+                "--contracts-dir",
+                str(contracts_dir),
+                "--ledger",
+                str(ledger),
+                "--beads-workspace",
+                str(beads_workspace),
+                "--checkout-root",
+                str(checkout_root),
+                "--checkout-path",
+                str(checkout_path),
+                "--validation-profile",
+                "tier1",
+                "--reviewer-mode",
+                "pi",
+                "--reviewer-pi-model",
+                "gpt-6.0",
+                "--agent-mode",
+                "fake",
+                "--reviewer-pi-bin",
+                "/opt/pi/bin/pi",
+                "--reviewer-pi-provider",
+                "openai-codex",
+                "--agent-codex-home",
+                str(codex_home),
+                "--agent-config-home",
+                str(config_home),
+                "--agent-pi-config-home",
+                str(pi_config_home),
+                "--output",
+                str(output),
+            )
+
+            self.assertNotEqual(completed.returncode, 0, completed.stdout)
+            self.assertIn("Pi worker model must be gpt-5.4 or lower", completed.stderr)
+            self.assertFalse(output.exists())
+
+    def test_generate_recipe_rejects_disallowed_pi_retrospective_judge_model(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            contracts_dir = temp_path / "contracts"
+            repo = temp_path / "repo-src"
+            output = temp_path / "recipe.json"
+            ledger = temp_path / "ledger"
+            beads_workspace = temp_path / "central-beads"
+            checkout_root = temp_path / "checkouts"
+            checkout_path = checkout_root / "demo"
+            codex_home = temp_path / "codex-home"
+            config_home = temp_path / "xdg-config"
+            pi_config_home = temp_path / "pi-config"
+            contracts_dir.mkdir()
+            init_repo(repo)
+            write_contract(contracts_dir / "demo.json", project_slug="demo", repo_url=str(repo))
+            beads_workspace.mkdir()
+            codex_home.mkdir()
+            config_home.mkdir()
+            pi_config_home.mkdir()
+
+            completed = run_afk(
+                "generate-recipe",
+                "--workstream-id",
+                "central-anh.6",
+                "--project",
+                "demo",
+                "--contracts-dir",
+                str(contracts_dir),
+                "--ledger",
+                str(ledger),
+                "--beads-workspace",
+                str(beads_workspace),
+                "--checkout-root",
+                str(checkout_root),
+                "--checkout-path",
+                str(checkout_path),
+                "--validation-profile",
+                "tier1",
+                "--retrospective-judge-mode",
+                "pi",
+                "--retrospective-judge-pi-model",
+                "gpt-6.0",
                 "--output",
                 str(output),
             )

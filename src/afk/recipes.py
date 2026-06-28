@@ -23,6 +23,8 @@ def generate_workstream_recipe(
     validation_profile: str,
     validation_input: dict[str, Any] | None = None,
     agent: dict[str, Any] | None = None,
+    reviewer: dict[str, Any] | None = None,
+    retrospective_judge: dict[str, Any] | None = None,
     publisher: dict[str, Any] | None = None,
     sources: list[dict[str, Any]] | None = None,
     required_labels: list[str] | None = None,
@@ -35,7 +37,9 @@ def generate_workstream_recipe(
     implement_agent = agent if agent is not None else default_recipe_agent()
     validate_step_input = validation_input if validation_input is not None else default_validation_input(validation_profile)
     recipe_publisher = publisher if publisher is not None else {"enabled": False}
-    return {
+    recipe_reviewer = reviewer if reviewer is not None else default_reviewer_config()
+
+    recipe: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "workstream_id": workstream_id,
         "parent": parent_from_workstream_id(workstream_id),
@@ -88,16 +92,17 @@ def generate_workstream_recipe(
                 "input": {
                     "guardrails": [{"name": "no secrets", "status": "pass"}],
                     "cleanup": {"status": "clean", "resources": []},
-                    "reviewer": {
-                        "type": "fake-reviewer-command",
-                        "command": ["python3", "-c", default_reviewer_code()],
-                        "timeout_seconds": 30,
-                    },
+                    "reviewer": recipe_reviewer,
                 },
             },
         ],
         "publisher": recipe_publisher,
     }
+
+    if retrospective_judge is not None:
+        recipe["retrospective_judge"] = retrospective_judge
+
+    return recipe
 
 
 def write_recipe(path: Path, recipe: dict[str, Any]) -> None:
@@ -235,6 +240,14 @@ def create_recipe_publisher(
         "head": review_branch,
         "git": {"push": True, "remote": "origin"},
         "gh": {"auth": {"config_dir": config_dir}},
+    }
+
+
+def default_reviewer_config() -> dict[str, Any]:
+    return {
+        "type": "fake-reviewer-command",
+        "command": ["python3", "-c", default_reviewer_code()],
+        "timeout_seconds": 30,
     }
 
 
