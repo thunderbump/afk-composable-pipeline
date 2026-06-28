@@ -25,12 +25,13 @@ def generate_workstream_recipe(
     agent: dict[str, Any] | None = None,
     publisher: dict[str, Any] | None = None,
     sources: list[dict[str, Any]] | None = None,
+    required_labels: list[str] | None = None,
 ) -> dict[str, Any]:
     if url_has_secret_material(project_contract.repo_url):
         raise ValueError("project contract repo_url must not contain embedded credentials or query parameters")
 
     review_branch = f"afk/{branch_slug(workstream_id)}"
-    required_labels = list(project_contract.beads_labels)
+    recipe_required_labels = required_labels if required_labels is not None else list(project_contract.beads_labels)
     implement_agent = agent if agent is not None else default_recipe_agent()
     validate_step_input = validation_input if validation_input is not None else default_validation_input(validation_profile)
     recipe_publisher = publisher if publisher is not None else {"enabled": False}
@@ -44,7 +45,7 @@ def generate_workstream_recipe(
                 "name": "select-work",
                 "input": {
                     "target_ids": [workstream_id],
-                    "required_labels": required_labels,
+                    "required_labels": recipe_required_labels,
                     "allowed_statuses": ["open", "in_progress"],
                     "sources": sources
                     if sources is not None
@@ -54,7 +55,7 @@ def generate_workstream_recipe(
                             "id": "central-beads",
                             "workspace": str(beads_workspace),
                             "workspace_kind": "central",
-                            "labels": required_labels,
+                            "labels": recipe_required_labels,
                             "status": "open",
                         }
                     ],

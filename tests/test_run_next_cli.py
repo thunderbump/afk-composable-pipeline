@@ -9,7 +9,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from afk.run_next import choose_candidate, selector_result
+from afk.run_next import choose_candidate, github_repo_from_repo_url, selector_result
 
 
 def run_afk(*args, env=None):
@@ -166,6 +166,56 @@ raise SystemExit(9)
                 selector_choice_json=None,
             )
 
+    def test_model_selector_invokes_allowed_codex_model(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fake_bin = Path(temp_dir) / "bin"
+            fake_bin.mkdir()
+            write_executable(
+                fake_bin / "codex",
+                f"""#!{sys.executable}
+import json
+import sys
+from pathlib import Path
+
+args = sys.argv[1:]
+assert args[:1] == ["exec"], args
+assert args[args.index("--model") + 1] == "gpt-5.4-mini", args
+output_path = Path(args[args.index("--output-last-message") + 1])
+output_path.write_text(json.dumps({{"external_id": "thunderbump/bump-EQEmu#9", "rationale": "best fit"}}), encoding="utf-8")
+""",
+            )
+            old_path = os.environ.get("PATH", "")
+            os.environ["PATH"] = str(fake_bin)
+            try:
+                candidates = [
+                    {
+                        "source_id": "central-beads",
+                        "source_type": "beads",
+                        "external_id": "central-aaa.1",
+                        "workstream": "central-aaa",
+                        "title": "Earlier bead",
+                    },
+                    {
+                        "source_id": "github",
+                        "source_type": "github_issues",
+                        "external_id": "thunderbump/bump-EQEmu#9",
+                        "workstream": "central-zzz",
+                        "title": "Model choice",
+                    },
+                ]
+
+                chosen = choose_candidate(
+                    candidates,
+                    selector_mode="model",
+                    selector_model="gpt-5.4-mini",
+                    selector_choice_json=None,
+                )
+            finally:
+                os.environ["PATH"] = old_path
+
+        self.assertEqual(chosen["external_id"], "thunderbump/bump-EQEmu#9")
+        self.assertEqual(chosen["selector_rationale"], "best fit")
+
     def test_model_selector_falls_back_when_choice_json_is_invalid(self):
         candidates = [
             {
@@ -192,6 +242,26 @@ raise SystemExit(9)
         )
 
         self.assertEqual(chosen["external_id"], "central-aaa.1")
+
+    def test_selector_rejects_unknown_mode(self):
+        with self.assertRaisesRegex(ValueError, "selector mode must be deterministic or model"):
+            choose_candidate(
+                [],
+                selector_mode="typo",
+                selector_model=None,
+                selector_choice_json=None,
+            )
+
+    def test_github_repo_parser_ignores_non_github_urls(self):
+        self.assertEqual(
+            github_repo_from_repo_url("git@github.com:thunderbump/bump-EQEmu.git"),
+            "thunderbump/bump-EQEmu",
+        )
+        self.assertEqual(
+            github_repo_from_repo_url("https://github.com/thunderbump/afk-composable-pipeline.git"),
+            "thunderbump/afk-composable-pipeline",
+        )
+        self.assertIsNone(github_repo_from_repo_url("https://example.com/thunderbump/not-github.git"))
 
     def test_run_next_emits_recipe_for_selected_beads_candidate(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -261,6 +331,10 @@ else:
             self.assertIsNotNone(payload["recipe"])
             self.assertEqual(payload["recipe"]["workstream_id"], "central-next.1")
             self.assertEqual(payload["recipe"]["steps"][0]["input"]["target_ids"], ["central-next.1"])
+            self.assertEqual(
+                payload["recipe"]["steps"][0]["input"]["required_labels"],
+                ["project:bump-eqemu", "ready-for-agent"],
+            )
             self.assertEqual(
                 [source["type"] for source in payload["recipe"]["steps"][0]["input"]["sources"]],
                 ["beads", "github_issues"],

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import shutil
+import subprocess
+import tempfile
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -13,6 +16,7 @@ from afk.work_sources import select_work
 READY_TAG = "ready-for-agent"
 DEFAULT_BEADS_WORKSPACE = Path("/home/bump/Projects/beads")
 ALLOWED_SELECTOR_MODELS = {"gpt-5.3-codex-spark", "gpt-5.4-mini"}
+SELECTOR_TIMEOUT_SECONDS = 60
 
 
 def run_next(
@@ -50,6 +54,7 @@ def run_next(
             checkout_path=checkout_path,
             validation_profile=validation_profile,
             sources=selection_request["sources"],
+            required_labels=selection_request["required_labels"],
         )
     return {
         "command": "run-next",
@@ -102,12 +107,16 @@ def choose_candidate(
     selector_model: str | None,
     selector_choice_json: str | None,
 ) -> dict[str, Any] | None:
+    if selector_mode not in {"deterministic", "model"}:
+        raise ValueError("selector mode must be deterministic or model")
     if selector_mode == "model":
         validate_selector_model(selector_model)
     if not candidates:
         return None
     if selector_mode == "model":
         model_choice = parse_selector_choice(selector_model, selector_choice_json, candidates)
+        if model_choice is None and selector_choice_json is None:
+            model_choice = invoke_codex_selector(selector_model, candidates)
         if model_choice is not None:
             return model_choice
     return deterministic_candidate(candidates)
@@ -185,10 +194,67 @@ def parse_selector_choice(
     return None
 
 
+def invoke_codex_selector(selector_model: str | None, candidates: list[dict[str, Any]]) -> dict[str, Any] | None:
+    validate_selector_model(selector_model)
+    if shutil.which("codex") is None:
+        return None
+    prompt = selector_prompt(candidates)
+    try:
+        with tempfile.TemporaryDirectory(prefix="afk-selector-") as temp_dir:
+            output_path = Path(temp_dir) / "selector-result.json"
+            completed = subprocess.run(
+                [
+                    "codex",
+                    "exec",
+                    "--model",
+                    str(selector_model),
+                    "--sandbox",
+                    "read-only",
+                    "--ephemeral",
+                    "--ignore-rules",
+                    "--output-last-message",
+                    str(output_path),
+                    prompt,
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=SELECTOR_TIMEOUT_SECONDS,
+            )
+            if completed.returncode != 0 or not output_path.is_file():
+                return None
+            return parse_selector_choice(selector_model, output_path.read_text(encoding="utf-8"), candidates)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def selector_prompt(candidates: list[dict[str, Any]]) -> str:
+    selector_candidates = [
+        {
+            "source_id": candidate.get("source_id"),
+            "source_type": candidate.get("source_type"),
+            "external_id": candidate.get("external_id"),
+            "title": candidate.get("title"),
+            "labels": candidate.get("labels", []),
+            "workstream": candidate.get("workstream"),
+            "acceptance_criteria": candidate.get("acceptance_criteria", []),
+        }
+        for candidate in candidates
+    ]
+    return (
+        "Choose one ready, unblocked work item from this JSON array. "
+        "Return only JSON with keys external_id and rationale. "
+        "Do not use tools.\n\n"
+        + json.dumps({"candidates": selector_candidates}, sort_keys=True)
+    )
+
+
 def github_repo_from_repo_url(repo_url: str) -> str | None:
     parsed = urlsplit(repo_url)
     path = ""
     if parsed.scheme in {"http", "https", "ssh"}:
+        if parsed.hostname != "github.com":
+            return None
         path = parsed.path
     elif repo_url.startswith("git@github.com:"):
         path = repo_url.split("git@github.com:", 1)[1]

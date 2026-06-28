@@ -361,8 +361,10 @@ labels plus the observed `ready-for-agent` tag, tries both Beads and GitHub
 Issues sources when the contract can name a GitHub repo, and chooses a stable
 default candidate from the valid results. The selection envelope records the
 request, source statuses, chosen id/source, and the emitted recipe preview.
-The selector accepts only the lightweight model names `gpt-5.3-codex-spark`
-and `gpt-5.4-mini` when model mode is enabled.
+With `--selector-mode model`, the command invokes `codex exec` and accepts only
+the lightweight model names `gpt-5.3-codex-spark` and `gpt-5.4-mini`; if the
+model call fails or returns an invalid choice, it falls back to deterministic
+selection.
 
 For `bump-eqemu`, GitHub Issues are effectively disabled, so Beads are the
 practical source there for now. The command still includes the GitHub source
