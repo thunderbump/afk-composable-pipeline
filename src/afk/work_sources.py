@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -392,7 +393,7 @@ def run_github_issue_list(command: list[str]) -> Any:
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise SourceLoadError("skipped_unreachable", "gh issue list failed") from exc
     if completed.returncode != 0:
-        status, message = github_issue_list_failure_status_and_message(completed.stderr)
+        status, message = github_issue_list_failure_status_and_message(completed.stdout, completed.stderr)
         raise SourceLoadError(status, message)
     try:
         return json.loads(completed.stdout)
@@ -400,9 +401,15 @@ def run_github_issue_list(command: list[str]) -> Any:
         raise SourceLoadError("failed_invalid_payload", "gh issue list failed") from exc
 
 
-def github_issue_list_failure_status_and_message(stderr: str) -> tuple[str, str]:
-    normalized = stderr.lower()
-    if "issue" in normalized and "disabled" in normalized:
+def github_issue_list_failure_status_and_message(stdout: str, stderr: str) -> tuple[str, str]:
+    normalized = f"{stdout}\n{stderr}".lower()
+    disabled_markers = (
+        "repository has disabled issues",
+        "has disabled issues",
+        "issues are disabled",
+        "issues disabled",
+    )
+    if any(marker in normalized for marker in disabled_markers):
         return "skipped_unconfigured", "GitHub Issues are disabled for this repository"
     return "skipped_unreachable", "gh issue list failed"
 
@@ -749,10 +756,9 @@ def extract_acceptance_criteria(value: Any) -> list[str]:
     criteria = []
     for line in value.splitlines():
         stripped = line.strip()
-        for prefix in ("- [ ] ", "- [x] ", "- "):
-            if stripped.lower().startswith(prefix):
-                criteria.append(stripped[len(prefix) :].strip())
-                break
+        criterion = strip_acceptance_marker(stripped)
+        if criterion:
+            criteria.append(criterion)
     return criteria
 
 
@@ -770,11 +776,20 @@ def extract_acceptance_criteria_from_markdown_section(value: str) -> list[str] |
             break
         if not stripped:
             continue
-        for prefix in ("- [ ] ", "- [x] ", "- "):
-            if stripped.lower().startswith(prefix):
-                criteria.append(stripped[len(prefix) :].strip())
-                break
+        criterion = strip_acceptance_marker(stripped) or stripped
+        criteria.append(criterion)
     return criteria if in_section else None
+
+
+def strip_acceptance_marker(value: str) -> str:
+    lowered = value.lower()
+    for prefix in ("- [ ] ", "- [x] ", "* [ ] ", "* [x] ", "- ", "* "):
+        if lowered.startswith(prefix):
+            return value[len(prefix) :].strip()
+    numbered = re.match(r"^\d+[.)]\s+(?P<criterion>.+)$", value)
+    if numbered:
+        return numbered.group("criterion").strip()
+    return ""
 
 
 def is_acceptance_criteria_heading(value: str) -> bool:
@@ -806,13 +821,12 @@ def bounded_issue_description(issue: dict[str, Any], *, max_chars: int = 240) ->
 
 
 def find_acceptance_criteria_section_index(value: str) -> int | None:
-    lower_value = value.lower()
-    for marker in ("\n## acceptance criteria", "\n### acceptance criteria", "\nacceptance criteria"):
-        marker_index = lower_value.find(marker)
-        if marker_index != -1:
-            return marker_index + 1
-    if is_acceptance_criteria_heading(lower_value.strip()):
-        return 0
+    offset = 0
+    for line in value.splitlines(keepends=True):
+        stripped = line.strip()
+        if stripped.startswith("#") and is_acceptance_criteria_heading(stripped):
+            return offset
+        offset += len(line)
     return None
 
 
@@ -820,7 +834,17 @@ def extract_beads_acceptance_criteria(issue: dict[str, Any]) -> list[str]:
     criteria = extract_acceptance_criteria(issue.get("acceptance_criteria"))
     if criteria:
         return criteria
+    criteria = extract_plain_acceptance_criteria_field(issue.get("acceptance_criteria"))
+    if criteria:
+        return criteria
     return extract_acceptance_criteria(issue.get("description") or issue.get("body"))
+
+
+def extract_plain_acceptance_criteria_field(value: Any) -> list[str]:
+    if not isinstance(value, str):
+        return []
+    normalized = value.replace("\\r\\n", "\n").replace("\\n", "\n")
+    return [line.strip() for line in normalized.splitlines() if line.strip()]
 
 
 def label_value(labels: list[str], prefix: str) -> str | None:

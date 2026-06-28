@@ -209,7 +209,7 @@ import sys
 if sys.argv[1:3] == ["auth", "status"]:
     sys.exit(0)
 if sys.argv[1:3] == ["issue", "list"]:
-    print("issues are disabled for this repository", file=sys.stderr)
+    print("the 'example/repo' repository has disabled issues", file=sys.stderr)
     sys.exit(1)
 if len(sys.argv) >= 3 and sys.argv[1] == "api":
     raise SystemExit("issue dependency lookup should not run when list fails")
@@ -257,6 +257,54 @@ raise SystemExit(9)
                     }
                 ],
             )
+
+    def test_github_issue_list_failure_with_disabled_words_is_not_overclassified(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            fake_bin = temp_path / "bin"
+            fake_bin.mkdir()
+            write_executable(
+                fake_bin / "gh",
+                f"""#!{sys.executable}
+import sys
+
+if sys.argv[1:3] == ["auth", "status"]:
+    sys.exit(0)
+if sys.argv[1:3] == ["issue", "list"]:
+    print("issue query failed because a disabled flag was not recognized", file=sys.stderr)
+    sys.exit(1)
+raise SystemExit(9)
+""",
+            )
+            request = {
+                "sources": [
+                    {
+                        "type": "github_issues",
+                        "id": "github",
+                        "repo": "example/repo",
+                        "labels": ["afk:ready"],
+                        "query": "label:afk:ready is:open",
+                    }
+                ],
+            }
+            ledger = temp_path / "ledger"
+            completed = run_afk(
+                "run-step",
+                "select-work",
+                "--input",
+                json.dumps(request),
+                "--ledger",
+                str(ledger),
+                env={"GH_TOKEN": "fake-token", "PATH": str(fake_bin)},
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(result["output"]["source_statuses"][0]["status"], "skipped_unreachable")
+            self.assertEqual(result["output"]["source_statuses"][0]["message"], "gh issue list failed")
 
     def test_invalid_fixture_payload_records_source_failure(self):
         request = {"sources": [{"type": "fixture", "id": "fixture", "items": {"not": "a list"}}]}
@@ -1094,7 +1142,7 @@ elif len(sys.argv) > 2 and sys.argv[1] == "show" and sys.argv[2] == "central-lve
             "title": "Rank work from Beads metadata",
             "priority": 2,
             "issue_type": "task",
-            "description": "Implement the selector context.\\n\\nUseful background for selection.\\n\\n## Acceptance criteria\\n- [ ] Carry priority into run-next\\n- [ ] Parse acceptance criteria from description\\n- [ ] Keep the excerpt bounded\\n\\nMore notes that should not be in the excerpt.",
+            "description": "Implement the selector context.\\n\\nUseful background for selection.\\n\\n## Acceptance criteria\\n- [ ] Carry priority into run-next\\n* Parse acceptance criteria from description\\n1. Keep the excerpt bounded\\nPlain criteria line\\n\\nMore notes that should remain criteria until the next heading.\\n\\n## Later notes\\nNot criteria.",
             "status": "open",
             "labels": ["project:afk-composable-pipeline", "afk:ready"],
             "parent": "central-lve",
@@ -1149,6 +1197,88 @@ else:
                     "Carry priority into run-next",
                     "Parse acceptance criteria from description",
                     "Keep the excerpt bounded",
+                    "Plain criteria line",
+                    "More notes that should remain criteria until the next heading.",
+                ],
+            )
+
+    def test_beads_source_extracts_plain_line_acceptance_criteria_field(self):
+        secret = "beads-secret-value"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            fake_bin = temp_path / "bin"
+            workspace = temp_path / "beads"
+            (workspace / "secrets").mkdir(parents=True)
+            (workspace / "secrets" / "dolt_beads_password.txt").write_text(secret, encoding="utf-8")
+            fake_bin.mkdir()
+            write_executable(
+                fake_bin / "bd",
+                f"""#!{sys.executable}
+import json
+import os
+import sys
+
+if os.environ.get("BEADS_DOLT_PASSWORD") != "{secret}":
+    sys.exit(8)
+
+if len(sys.argv) > 1 and sys.argv[1] == "list":
+    print(json.dumps([{{"id": "central-plain"}}]))
+elif len(sys.argv) > 2 and sys.argv[1] == "show" and sys.argv[2] == "central-plain":
+    print(json.dumps([
+        {{
+            "id": "central-plain",
+            "title": "Plain criteria",
+            "priority": 2,
+            "issue_type": "bug",
+            "description": "Short context.",
+            "acceptance_criteria": "Documents the current behavior.\\\\nProtects the emergency path.\\\\nIncludes deterministic coverage.",
+            "status": "open",
+            "labels": ["project:afk-composable-pipeline", "afk:ready"],
+            "metadata": {{"workstream": "central-plain", "afk.ready": True}},
+            "dependencies": [],
+        }}
+    ]))
+else:
+    print("unexpected bd args: " + " ".join(sys.argv[1:]), file=sys.stderr)
+    sys.exit(9)
+""",
+            )
+
+            request = {
+                "required_labels": ["project:afk-composable-pipeline", "afk:ready"],
+                "required_metadata": ["acceptance_criteria"],
+                "sources": [
+                    {
+                        "type": "beads",
+                        "id": "central-beads",
+                        "workspace": str(workspace),
+                        "workspace_kind": "mounted",
+                        "labels": ["project:afk-composable-pipeline", "afk:ready"],
+                    }
+                ],
+            }
+            ledger = temp_path / "ledger"
+            completed = run_afk(
+                "run-step",
+                "select-work",
+                "--input",
+                json.dumps(request),
+                "--ledger",
+                str(ledger),
+                env={"PATH": str(fake_bin)},
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(
+                result["output"]["selected_work"][0]["acceptance_criteria"],
+                [
+                    "Documents the current behavior.",
+                    "Protects the emergency path.",
+                    "Includes deterministic coverage.",
                 ],
             )
 
