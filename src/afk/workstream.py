@@ -21,6 +21,7 @@ KNOWN_WORKSTREAM_STEPS = {"select-work", "prepare-checkout", "implement", "valid
 REVIEW_CYCLE_STATUSES = {"passed", "findings-open", "findings-addressed", "request-changes"}
 REVIEW_CYCLE_OPEN_STATUSES = {"findings-open", "request-changes"}
 REVIEW_CYCLE_RESPONSE_STATUSES = {"addressed", "findings-addressed"}
+TERMINAL_REVIEW_FEEDBACK_STATUSES = {"resolved", "waived"}
 
 
 @dataclass(frozen=True)
@@ -158,7 +159,10 @@ def run_workstream(
             status = publication["status"]
         else:
             if tracker_terminal_decision_present(normalized):
-                publication = tracker_terminal_decision_publication()
+                if tracker_terminal_decision_allows_close(normalized):
+                    publication = tracker_terminal_decision_publication()
+                else:
+                    publication = tracker_close_blocked_publication()
             else:
                 publication = publish_terminal_pr(
                     normalized["publisher"],
@@ -1199,7 +1203,15 @@ def normalize_retry_policy(retry_policy: Any) -> dict[str, int]:
 
 def normalize_tracker_config(tracker: Any) -> dict[str, Any]:
     if tracker is None:
-        return {"terminal_decision": {"status": "", "merge_commit": "", "reason": ""}}
+        return {
+            "terminal_decision": {
+                "status": "",
+                "merge_commit": "",
+                "reason": "",
+                "pr_url": "",
+                "review_feedback_status": "",
+            }
+        }
     if not isinstance(tracker, dict):
         raise WorkstreamError("tracker must be an object")
     unsupported = [key for key in tracker if key != "terminal_decision"]
@@ -1210,29 +1222,47 @@ def normalize_tracker_config(tracker: Any) -> dict[str, Any]:
 
 def normalize_tracker_terminal_decision(decision: Any) -> dict[str, str]:
     if decision is None:
-        return {"status": "", "merge_commit": "", "reason": "", "pr_url": ""}
+        return {"status": "", "merge_commit": "", "reason": "", "pr_url": "", "review_feedback_status": ""}
     if not isinstance(decision, dict):
         raise WorkstreamError("tracker.terminal_decision must be an object")
-    unsupported = [key for key in decision if key not in {"status", "merge_commit", "reason", "pr_url"}]
+    unsupported = [
+        key for key in decision if key not in {"status", "merge_commit", "reason", "pr_url", "review_feedback_status"}
+    ]
     if unsupported:
-        raise WorkstreamError("tracker.terminal_decision only supports status, merge_commit, reason, pr_url")
+        raise WorkstreamError(
+            "tracker.terminal_decision only supports status, merge_commit, reason, pr_url, review_feedback_status"
+        )
     status = string_field(decision, "status") or ""
     merge_commit = string_field(decision, "merge_commit") or ""
     reason = string_field(decision, "reason") or ""
     pr_url = string_field(decision, "pr_url") or ""
-    if not status and not merge_commit and not reason and not pr_url:
-        return {"status": "", "merge_commit": "", "reason": "", "pr_url": ""}
+    review_feedback_status = string_field(decision, "review_feedback_status") or ""
+    if not status and not merge_commit and not reason and not pr_url and not review_feedback_status:
+        return {"status": "", "merge_commit": "", "reason": "", "pr_url": "", "review_feedback_status": ""}
     if status not in {"merged", "no-merge"}:
         raise WorkstreamError("tracker.terminal_decision.status must be merged or no-merge")
     if status == "merged" and not merge_commit:
         raise WorkstreamError("tracker.terminal_decision.merge_commit is required for merged")
+    if status == "merged" and not pr_url:
+        raise WorkstreamError("tracker.terminal_decision.pr_url is required for merged")
     if status == "no-merge" and not reason:
         raise WorkstreamError("tracker.terminal_decision.reason is required for no-merge")
+    if status == "no-merge" and not pr_url:
+        raise WorkstreamError("tracker.terminal_decision.pr_url is required for no-merge")
+    if review_feedback_status and review_feedback_status not in TERMINAL_REVIEW_FEEDBACK_STATUSES:
+        allowed = ", ".join(sorted(TERMINAL_REVIEW_FEEDBACK_STATUSES))
+        raise WorkstreamError(f"tracker.terminal_decision.review_feedback_status must be one of: {allowed}")
     if status == "merged":
         reason = ""
     if status == "no-merge":
         merge_commit = ""
-    return {"status": status, "merge_commit": merge_commit, "reason": reason, "pr_url": pr_url}
+    return {
+        "status": status,
+        "merge_commit": merge_commit,
+        "reason": reason,
+        "pr_url": pr_url,
+        "review_feedback_status": review_feedback_status,
+    }
 
 
 def append_checkout_attempt(state: dict[str, Any], checkout: dict[str, Any]) -> None:
@@ -1578,6 +1608,8 @@ def tracker_selected_work_status(
 ) -> str:
     if tracker.get("close_source_item"):
         return "closed"
+    if publication.get("status") == "tracker-close-blocked":
+        return "awaiting-review"
     if publication.get("status") == "published":
         return "awaiting-review"
     if publication.get("status") == "validated-unpublished":
@@ -1624,6 +1656,29 @@ def tracker_terminal_decision_present(normalized: dict[str, Any]) -> bool:
     return bool(isinstance(decision, dict) and decision.get("status"))
 
 
+def tracker_terminal_decision_allows_close(normalized: dict[str, Any]) -> bool:
+    decision = normalized.get("tracker", {}).get("terminal_decision", {})
+    if not isinstance(decision, dict) or not decision.get("status"):
+        return False
+    if not review_cycles_require_response(normalized.get("review_cycles")):
+        return True
+    return terminal_review_feedback_status(decision) in TERMINAL_REVIEW_FEEDBACK_STATUSES
+
+
+def tracker_close_blocked_publication() -> dict[str, Any]:
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "status": "tracker-close-blocked",
+        "enabled": False,
+        "reason": (
+            "terminal tracker decision recorded, but unresolved review feedback still requires an explicit "
+            "review_feedback_status of resolved or waived before the source item can close"
+        ),
+        "next_allowed_command": "none",
+        "retry": "",
+    }
+
+
 def tracker_terminal_decision_publication() -> dict[str, Any]:
     return {
         "schema_version": SCHEMA_VERSION,
@@ -1635,12 +1690,46 @@ def tracker_terminal_decision_publication() -> dict[str, Any]:
     }
 
 
+def terminal_review_feedback_status(decision: dict[str, Any]) -> str:
+    return string_field(decision, "review_feedback_status") or ""
+
+
+def merged_close_reason(decision: dict[str, Any]) -> str:
+    merge_commit = redact_text(decision["merge_commit"])
+    return f"merged via {merge_commit}"
+
+
+def no_merge_close_reason(decision: dict[str, Any]) -> str:
+    return redact_text(decision["reason"])
+
+
+def terminal_decision_comment(
+    decision_status: str,
+    review_feedback_status: str,
+    review_feedback_requires_response: bool,
+) -> str:
+    if decision_status == "merged":
+        base = "PR merged; close the source Beads item with the recorded merge commit."
+    else:
+        base = "A terminal no-merge decision was recorded; close the source Beads item with this reason."
+    if not review_feedback_requires_response:
+        return base
+    if review_feedback_status == "resolved":
+        return f"{base} Review feedback was explicitly resolved before closure."
+    if review_feedback_status == "waived":
+        return f"{base} Review feedback was explicitly waived before closure."
+    return base
+
+
 def tracker_record(
     normalized: dict[str, Any],
     state: dict[str, Any],
     publication: dict[str, Any],
 ) -> dict[str, Any]:
     decision = normalized["tracker"]["terminal_decision"]
+    decision_pr_url = redact_text(decision.get("pr_url") or "")
+    decision_review_feedback_status = terminal_review_feedback_status(decision)
+    review_feedback_requires_response = review_cycles_require_response(normalized.get("review_cycles"))
     review = state.get("review") if isinstance(state.get("review"), dict) else {}
     record = {
         "schema_version": SCHEMA_VERSION,
@@ -1659,23 +1748,56 @@ def tracker_record(
     }
     decision_status = decision.get("status")
     if decision_status == "merged":
+        if review_feedback_requires_response and not decision_review_feedback_status:
+            record["status"] = "review-findings-open"
+            record["comment"] = (
+                "PR review cycles still require a response; the terminal decision is recorded, but keep the "
+                "source Beads item open until review_feedback_status is set to resolved or waived."
+            )
+            record["pr_url"] = decision_pr_url
+            return record
         record["status"] = "closed"
         record["close_source_item"] = True
-        record["close_reason"] = f"merged via {decision['merge_commit']}"
-        record["comment"] = "PR merged; close the source Beads item with the recorded merge commit."
+        record["close_reason"] = merged_close_reason(decision)
+        record["comment"] = terminal_decision_comment(
+            "merged",
+            decision_review_feedback_status,
+            review_feedback_requires_response,
+        )
         record["merge_commit"] = redact_text(decision["merge_commit"])
-        record["pr_url"] = redact_text(decision.get("pr_url") or "")
+        record["pr_url"] = decision_pr_url
         return record
     if decision_status == "no-merge":
+        if review_feedback_requires_response and not decision_review_feedback_status:
+            record["status"] = "review-findings-open"
+            record["comment"] = (
+                "PR review cycles still require a response; the terminal no-merge decision is recorded, but keep "
+                "the source Beads item open until review_feedback_status is set to resolved or waived."
+            )
+            record["pr_url"] = decision_pr_url
+            return record
         record["status"] = "closed"
         record["close_source_item"] = True
-        record["close_reason"] = redact_text(decision["reason"])
-        record["comment"] = "A terminal no-merge decision was recorded; close the source Beads item with this reason."
-        record["pr_url"] = redact_text(decision.get("pr_url") or "")
+        record["close_reason"] = no_merge_close_reason(decision)
+        record["comment"] = terminal_decision_comment(
+            "no-merge",
+            decision_review_feedback_status,
+            review_feedback_requires_response,
+        )
+        record["pr_url"] = decision_pr_url
         return record
-    if review_cycles_require_response(normalized.get("review_cycles")):
+    if review_feedback_requires_response:
         record["status"] = "review-findings-open"
         record["comment"] = "PR review cycles contain response-required review findings; keep the source Beads item open."
+        if publication.get("status") == "published":
+            record["pr_url"] = redact_text(str(publication.get("url") or ""))
+        return record
+    if normalized.get("review_cycles"):
+        record["status"] = "review-feedback-addressed"
+        record["comment"] = (
+            "PR review cycle evidence is present and all response-required findings are addressed; keep the source "
+            "Beads item open until merge or an explicit no-merge decision."
+        )
         if publication.get("status") == "published":
             record["pr_url"] = redact_text(str(publication.get("url") or ""))
         return record
@@ -1949,6 +2071,8 @@ def workstream_status_from_publication(publication: dict[str, Any]) -> str:
         return "published"
     if publication["status"] == "validated-unpublished":
         return "validated-unpublished"
+    if publication["status"] == "tracker-close-blocked":
+        return "review-findings-open"
     if publication["status"] == "tracker-closed":
         return "closed"
     if publication["status"] == "blocked":

@@ -30,7 +30,14 @@ def tracker_state(*, terminal_decision=None):
             "reviewer_result": {"findings": []},
         },
         "tracker": {
-            "terminal_decision": terminal_decision or {"status": "", "merge_commit": "", "reason": ""}
+            "terminal_decision": terminal_decision
+            or {
+                "status": "",
+                "merge_commit": "",
+                "reason": "",
+                "pr_url": "",
+                "review_feedback_status": "",
+            }
         },
     }
 
@@ -46,6 +53,10 @@ class WorkstreamStatusMappingTest(unittest.TestCase):
                 {"status": "validated-unpublished"},
             ),
             "validated-unpublished",
+        )
+        self.assertEqual(
+            workstream_status_from_publication({"status": "tracker-close-blocked"}),
+            "review-findings-open",
         )
         self.assertEqual(
             workstream_status_from_publication({"status": "blocked"}),
@@ -89,6 +100,7 @@ class WorkstreamStatusMappingTest(unittest.TestCase):
                         "merge_commit": "deadbeef",
                         "reason": "",
                         "pr_url": "https://github.example/pr/17",
+                        "review_feedback_status": "",
                     }
                 },
             },
@@ -98,6 +110,7 @@ class WorkstreamStatusMappingTest(unittest.TestCase):
                     "merge_commit": "deadbeef",
                     "reason": "",
                     "pr_url": "https://github.example/pr/17",
+                    "review_feedback_status": "",
                 }
             ),
             {"status": "published", "url": "https://github.example/pr/17"},
@@ -119,6 +132,7 @@ class WorkstreamStatusMappingTest(unittest.TestCase):
                         "merge_commit": "",
                         "reason": "Superseded by follow-up PR",
                         "pr_url": "https://github.example/pr/17",
+                        "review_feedback_status": "",
                     }
                 },
             },
@@ -128,6 +142,7 @@ class WorkstreamStatusMappingTest(unittest.TestCase):
                     "merge_commit": "",
                     "reason": "Superseded by follow-up PR",
                     "pr_url": "https://github.example/pr/17",
+                    "review_feedback_status": "",
                 }
             ),
             {"status": "published", "url": "https://github.example/pr/17"},
@@ -135,7 +150,10 @@ class WorkstreamStatusMappingTest(unittest.TestCase):
 
         self.assertEqual(record["status"], "closed")
         self.assertTrue(record["close_source_item"])
-        self.assertEqual(record["close_reason"], "Superseded by follow-up PR")
+        self.assertEqual(
+            record["close_reason"],
+            "Superseded by follow-up PR",
+        )
         self.assertEqual(record["pr_url"], "https://github.example/pr/17")
 
     def test_tracker_record_surfaces_open_review_cycle_findings(self):
@@ -218,5 +236,152 @@ class WorkstreamStatusMappingTest(unittest.TestCase):
             {"status": "validated-unpublished"},
         )
 
-        self.assertEqual(record["status"], "validated")
+        self.assertEqual(record["status"], "review-feedback-addressed")
         self.assertNotIn("response-required review findings", record["comment"])
+
+    def test_tracker_record_keeps_terminal_merge_open_until_feedback_resolution_is_recorded(self):
+        review_cycles = [
+            {
+                "cycle": 1,
+                "status": "request-changes",
+                "reviews": [
+                    {
+                        "role": "correctness",
+                        "status": "request-changes",
+                        "summary": "Please fix the tracker semantics.",
+                        "requires_response": True,
+                    }
+                ],
+            }
+        ]
+        record = tracker_record(
+            {
+                "workstream_id": "central-afk-pr.17",
+                "tracker": {
+                    "terminal_decision": {
+                        "status": "merged",
+                        "merge_commit": "deadbeef",
+                        "reason": "",
+                        "pr_url": "https://github.example/pr/17",
+                        "review_feedback_status": "",
+                    }
+                },
+                "review_cycles": review_cycles,
+            },
+            tracker_state(),
+            {"status": "tracker-closed"},
+        )
+
+        self.assertEqual(record["status"], "review-findings-open")
+        self.assertFalse(record["close_source_item"])
+        self.assertEqual(record["pr_url"], "https://github.example/pr/17")
+        self.assertIn("terminal decision is recorded", record["comment"])
+
+    def test_tracker_record_closes_terminal_merge_when_feedback_is_explicitly_resolved(self):
+        review_cycles = [
+            {
+                "cycle": 1,
+                "status": "request-changes",
+                "reviews": [
+                    {
+                        "role": "correctness",
+                        "status": "request-changes",
+                        "summary": "Please fix the tracker semantics.",
+                        "requires_response": True,
+                    }
+                ],
+            }
+        ]
+        record = tracker_record(
+            {
+                "workstream_id": "central-afk-pr.17",
+                "tracker": {
+                    "terminal_decision": {
+                        "status": "merged",
+                        "merge_commit": "deadbeef",
+                        "reason": "",
+                        "pr_url": "https://github.example/pr/17",
+                        "review_feedback_status": "resolved",
+                    }
+                },
+                "review_cycles": review_cycles,
+            },
+            tracker_state(),
+            {"status": "tracker-closed"},
+        )
+
+        self.assertEqual(record["status"], "closed")
+        self.assertTrue(record["close_source_item"])
+        self.assertEqual(
+            record["close_reason"],
+            "merged via deadbeef",
+        )
+        self.assertIn("resolved before closure", record["comment"])
+
+    def test_tracker_record_ignores_feedback_resolution_text_when_no_review_cycles_require_response(self):
+        record = tracker_record(
+            {
+                "workstream_id": "central-afk-pr.17",
+                "tracker": {
+                    "terminal_decision": {
+                        "status": "merged",
+                        "merge_commit": "deadbeef",
+                        "reason": "",
+                        "pr_url": "https://github.example/pr/17",
+                        "review_feedback_status": "resolved",
+                    }
+                },
+                "review_cycles": [],
+            },
+            tracker_state(),
+            {"status": "tracker-closed"},
+        )
+
+        self.assertEqual(record["status"], "closed")
+        self.assertTrue(record["close_source_item"])
+        self.assertEqual(record["close_reason"], "merged via deadbeef")
+        self.assertEqual(
+            record["comment"],
+            "PR merged; close the source Beads item with the recorded merge commit.",
+        )
+
+    def test_tracker_record_closes_terminal_no_merge_when_feedback_is_explicitly_waived(self):
+        review_cycles = [
+            {
+                "cycle": 1,
+                "status": "findings-open",
+                "reviews": [
+                    {
+                        "role": "bug-risk",
+                        "status": "findings-open",
+                        "summary": "One follow-up remains.",
+                        "requires_response": True,
+                    }
+                ],
+            }
+        ]
+        record = tracker_record(
+            {
+                "workstream_id": "central-afk-pr.17",
+                "tracker": {
+                    "terminal_decision": {
+                        "status": "no-merge",
+                        "merge_commit": "",
+                        "reason": "Superseded by follow-up PR",
+                        "pr_url": "https://github.example/pr/17",
+                        "review_feedback_status": "waived",
+                    }
+                },
+                "review_cycles": review_cycles,
+            },
+            tracker_state(),
+            {"status": "tracker-closed"},
+        )
+
+        self.assertEqual(record["status"], "closed")
+        self.assertTrue(record["close_source_item"])
+        self.assertEqual(
+            record["close_reason"],
+            "Superseded by follow-up PR",
+        )
+        self.assertIn("waived before closure", record["comment"])
