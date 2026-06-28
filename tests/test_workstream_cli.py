@@ -678,6 +678,125 @@ raise SystemExit(9)
             self.assertEqual(tracker_result["merge_commit"], "deadbeef")
             self.assertEqual(tracker_result["pr_url"], "https://github.example/pr/123")
 
+    def test_workstream_includes_redacted_retrospective_for_terminal_merge_decision(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repo = temp_path / "repo-src"
+            checkout = temp_path / "checkout"
+            ledger = temp_path / "ledger"
+            fake_calls = temp_path / "fake-calls.jsonl"
+            init_repo(repo)
+            fake_git = temp_path / "publisher-git"
+            fake_gh = temp_path / "publisher-gh"
+            write_executable(
+                fake_git,
+                f"""#!{sys.executable}
+from pathlib import Path
+Path({str(fake_calls)!r}).write_text("publisher git should not run\\n", encoding="utf-8")
+raise SystemExit(9)
+""",
+            )
+            write_executable(
+                fake_gh,
+                f"""#!{sys.executable}
+from pathlib import Path
+Path({str(fake_calls)!r}).write_text("publisher gh should not run\\n", encoding="utf-8")
+raise SystemExit(9)
+""",
+            )
+            recipe = successful_recipe(temp_path, repo, checkout, fake_git, fake_gh)
+            recipe["tracker"] = {
+                "terminal_decision": {
+                    "status": "merged",
+                    "merge_commit": "deadbeef",
+                    "pr_url": "https://github.example/pr/123",
+                }
+            }
+            recipe["retrospective"] = {
+                "summary": "Merged after validating token=ghp_secret_merge_retrospective_1234567890 cleanup.",
+                "changes": [
+                    "Added top-level retrospective evidence to workstream outputs.",
+                    "Recorded tracker close guidance for merged workstreams.",
+                ],
+                "validation": [
+                    "tier1 validation passed for commit deadbeef.",
+                    "Manual check kept password=super-secret-value out of the ledger.",
+                ],
+                "review": [
+                    "Correctness and bug-risk reviews passed with no open findings.",
+                ],
+                "unresolved_risks": [
+                    "No further merge blockers remain.",
+                ],
+                "process_findings": [
+                    "Retrospective evidence should be added after the terminal merge decision lands.",
+                ],
+                "follow_up": {
+                    "recommended": [
+                        {
+                            "id": "central-3x6.5",
+                            "summary": "Track follow-up automation for retrospective prompts.",
+                            "labels": ["project:afk-composable-pipeline", "afk:ready"],
+                        }
+                    ],
+                    "created": [
+                        {
+                            "id": "central-3x6.6",
+                            "summary": "Document retrospective note locations.",
+                            "labels": ["project:afk-composable-pipeline"],
+                        }
+                    ],
+                },
+                "notes": {
+                    "personal_work": [
+                        "~/Documents/rmd/Ceremonies/Personal Work/work/2026-06-27-personal.md",
+                    ],
+                    "spikes": [
+                        "~/Documents/rmd/Ceremonies/Personal Work/spikes/2026-06-27-retrospective.md",
+                    ],
+                },
+            }
+
+            completed = run_afk(
+                "run-workstream",
+                "--workstream-id",
+                "central-lve.9",
+                "--input",
+                json.dumps(recipe),
+                "--ledger",
+                str(ledger),
+                env_overrides={
+                    "GIT_ALLOW_PROTOCOL": "file",
+                    "GIT_AUTHOR_NAME": "AFK Test",
+                    "GIT_AUTHOR_EMAIL": "afk-test@example.test",
+                    "GIT_COMMITTER_NAME": "AFK Test",
+                    "GIT_COMMITTER_EMAIL": "afk-test@example.test",
+                },
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            result_path = ledger / summary["result_path"]
+            result = json.loads(result_path.read_text(encoding="utf-8"))
+            tracker = json.loads((result_path.parent / "tracker-result.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(result["retrospective"], tracker["retrospective"])
+            self.assertEqual(result["tracker"]["retrospective"], tracker["retrospective"])
+            self.assertIn("[REDACTED]", result["retrospective"]["summary"])
+            self.assertIn("[REDACTED]", result["retrospective"]["validation"][1])
+            self.assertEqual(
+                result["retrospective"]["follow_up"]["recommended"][0]["labels"],
+                ["project:afk-composable-pipeline", "afk:ready"],
+            )
+            self.assertEqual(
+                result["retrospective"]["notes"]["personal_work"],
+                ["~/Documents/rmd/Ceremonies/Personal Work/work/2026-06-27-personal.md"],
+            )
+            self.assertEqual(
+                result["retrospective"]["notes"]["spikes"],
+                ["~/Documents/rmd/Ceremonies/Personal Work/spikes/2026-06-27-retrospective.md"],
+            )
+
     def test_workstream_terminal_no_merge_decision_closes_tracker_without_republishing(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
@@ -712,6 +831,31 @@ raise SystemExit(9)
                     "pr_url": "https://github.example/pr/123",
                 }
             }
+            recipe["retrospective"] = {
+                "summary": "No-merge after reviewing token=ghp_no_merge_cli_secret_1234567890 supersession.",
+                "changes": ["Recorded why this PR will not merge."],
+                "validation": ["Validation stayed green before the no-merge decision."],
+                "review": ["Review passed; superseding work made the branch unnecessary."],
+                "unresolved_risks": ["Superseding work still needs follow-up tracking."],
+                "process_findings": ["No-merge decisions should still leave retrospective evidence."],
+                "follow_up": {
+                    "recommended": [
+                        {
+                            "id": "central-3x6.8",
+                            "summary": "Track the superseding PR.",
+                            "labels": ["project:afk-composable-pipeline"],
+                        }
+                    ],
+                },
+                "notes": {
+                    "personal_work": [
+                        "~/Documents/rmd/Ceremonies/Personal Work/work/2026-06-27-personal.md",
+                    ],
+                    "spikes": [
+                        "~/Documents/rmd/Ceremonies/Personal Work/spikes/2026-06-27-no-merge.md",
+                    ],
+                },
+            }
 
             completed = run_afk(
                 "run-workstream",
@@ -732,7 +876,9 @@ raise SystemExit(9)
 
             self.assertEqual(completed.returncode, 0, completed.stderr)
             summary = json.loads(completed.stdout)
-            result = json.loads((ledger / summary["result_path"]).read_text(encoding="utf-8"))
+            result_path = ledger / summary["result_path"]
+            result = json.loads(result_path.read_text(encoding="utf-8"))
+            tracker = json.loads((result_path.parent / "tracker-result.json").read_text(encoding="utf-8"))
 
             self.assertFalse(fake_calls.exists())
             self.assertEqual(summary["status"], "closed")
@@ -745,6 +891,17 @@ raise SystemExit(9)
             )
             self.assertEqual(result["tracker"]["pr_url"], "https://github.example/pr/123")
             self.assertEqual([item["result"] for item in result["selected_work"]], ["passed"])
+            self.assertEqual(result["retrospective"], tracker["retrospective"])
+            self.assertEqual(result["tracker"]["retrospective"], tracker["retrospective"])
+            self.assertIn("[REDACTED]", result["retrospective"]["summary"])
+            self.assertEqual(
+                result["retrospective"]["follow_up"]["recommended"][0]["labels"],
+                ["project:afk-composable-pipeline"],
+            )
+            self.assertEqual(
+                result["retrospective"]["notes"]["spikes"],
+                ["~/Documents/rmd/Ceremonies/Personal Work/spikes/2026-06-27-no-merge.md"],
+            )
 
     def test_workstream_terminal_merge_decision_stays_open_when_review_feedback_is_unresolved(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -4778,3 +4935,45 @@ raise SystemExit(0)
 
                     self.assertNotEqual(completed.returncode, 0)
                     self.assertIn(expected_message, completed.stderr)
+
+    def test_workstream_rejects_retrospective_without_terminal_decision(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repo = temp_path / "repo-src"
+            checkout = temp_path / "checkout"
+            ledger = temp_path / "ledger"
+            fake_git = temp_path / "publisher-git"
+            fake_gh = temp_path / "publisher-gh"
+            init_repo(repo)
+            write_executable(
+                fake_git,
+                f"""#!{sys.executable}
+raise SystemExit(0)
+""",
+            )
+            write_executable(
+                fake_gh,
+                f"""#!{sys.executable}
+raise SystemExit(0)
+""",
+            )
+            recipe = successful_recipe(temp_path, repo, checkout, fake_git, fake_gh)
+            recipe["retrospective"] = {
+                "summary": "Draft retrospective before the PR closes.",
+            }
+
+            completed = run_afk(
+                "run-workstream",
+                "--workstream-id",
+                "central-lve.9",
+                "--input",
+                json.dumps(recipe),
+                "--ledger",
+                str(ledger),
+            )
+
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn(
+                "retrospective requires tracker.terminal_decision.status to be merged or no-merge",
+                completed.stderr,
+            )

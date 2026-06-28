@@ -184,6 +184,7 @@ def run_workstream(
         "review_branch": normalized["review_branch"],
         "status": status,
         "review_cycles": redact_review_cycles(normalized["review_cycles"]),
+        "retrospective": redact_retrospective(normalized["retrospective"]),
         "steps": steps,
         "selected_work": selected_work,
         "cleanup": state["cleanup"],
@@ -248,6 +249,8 @@ def normalize_recipe(
     retry_policy = normalize_retry_policy(recipe.get("retry_policy"))
     tracker = normalize_tracker_config(recipe.get("tracker"))
     review_cycles = normalize_review_cycles(recipe.get("review_cycles"))
+    retrospective = normalize_retrospective(recipe.get("retrospective"))
+    validate_retrospective_terminal_decision(retrospective, tracker)
     return {
         "schema_version": SCHEMA_VERSION,
         "workstream_id": resolved_workstream_id,
@@ -258,6 +261,7 @@ def normalize_recipe(
         "retry_policy": retry_policy,
         "tracker": tracker,
         "review_cycles": review_cycles,
+        "retrospective": retrospective,
     }
 
 
@@ -1744,6 +1748,7 @@ def tracker_record(
         "review_summary": string_field(review, "summary") or "",
         "review_findings": tracker_review_findings(review),
         "review_cycles": redact_review_cycles(normalized.get("review_cycles") or []),
+        "retrospective": redact_retrospective(normalized.get("retrospective")),
         "terminal_decision": redact_artifact_value(decision),
     }
     decision_status = decision.get("status")
@@ -1839,6 +1844,12 @@ def redact_review_cycles(review_cycles: Any) -> list[Any]:
     if not isinstance(review_cycles, list):
         return []
     return [redact_review_cycle(cycle) for cycle in review_cycles]
+
+
+def redact_retrospective(retrospective: Any) -> dict[str, Any]:
+    if not isinstance(retrospective, dict):
+        return {}
+    return redact_artifact_value(retrospective)
 
 
 def redact_review_cycle(cycle: Any) -> Any:
@@ -1966,6 +1977,56 @@ def normalize_review_cycles(review_cycles: Any) -> list[dict[str, Any]]:
             normalized_reviews.append(normalized_review)
         normalized.append({"cycle": cycle_number, "status": status, "reviews": normalized_reviews})
     return normalized
+
+
+def normalize_retrospective(retrospective: Any) -> dict[str, Any]:
+    if retrospective is None:
+        return {}
+    if not isinstance(retrospective, dict):
+        raise WorkstreamError("retrospective must be an object")
+    unsupported = [
+        key
+        for key in retrospective
+        if key not in {"summary", "changes", "validation", "review", "unresolved_risks", "process_findings", "follow_up", "notes"}
+    ]
+    if unsupported:
+        raise WorkstreamError(
+            "retrospective only supports summary, changes, validation, review, unresolved_risks, "
+            "process_findings, follow_up, notes"
+        )
+    normalized: dict[str, Any] = {}
+    summary = normalize_retrospective_optional_string(
+        retrospective,
+        "summary",
+        "retrospective.summary must be a string",
+    )
+    if summary:
+        normalized["summary"] = summary
+    for key in ("changes", "validation", "review", "unresolved_risks", "process_findings"):
+        values = normalize_retrospective_string_list(
+            retrospective,
+            key,
+            f"retrospective.{key} must be a list",
+            f"retrospective.{key} entries must be strings",
+        )
+        if values:
+            normalized[key] = values
+    follow_up = normalize_retrospective_follow_up(retrospective.get("follow_up"))
+    if follow_up:
+        normalized["follow_up"] = follow_up
+    notes = normalize_retrospective_notes(retrospective.get("notes"))
+    if notes:
+        normalized["notes"] = notes
+    return normalized
+
+
+def validate_retrospective_terminal_decision(retrospective: dict[str, Any], tracker: dict[str, Any]) -> None:
+    if not retrospective:
+        return
+    decision = tracker.get("terminal_decision") if isinstance(tracker, dict) else {}
+    if isinstance(decision, dict) and decision.get("status") in {"merged", "no-merge"}:
+        return
+    raise WorkstreamError("retrospective requires tracker.terminal_decision.status to be merged or no-merge")
 
 
 def review_cycles_require_response(review_cycles: Any) -> bool:
@@ -2257,6 +2318,121 @@ def normalize_review_cycle_optional_string(input_data: dict[str, Any], key: str,
     if not isinstance(value, str):
         raise WorkstreamError(error_message)
     return value.strip()
+
+
+def normalize_retrospective_optional_string(input_data: dict[str, Any], key: str, error_message: str) -> str:
+    value = input_data.get(key)
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise WorkstreamError(error_message)
+    return value.strip()
+
+
+def normalize_retrospective_string_list(
+    input_data: dict[str, Any],
+    key: str,
+    invalid_message: str,
+    item_message: str,
+) -> list[str]:
+    value = input_data.get(key)
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise WorkstreamError(invalid_message)
+    normalized = []
+    for item in value:
+        if not isinstance(item, str):
+            raise WorkstreamError(item_message)
+        stripped = item.strip()
+        if stripped:
+            normalized.append(stripped)
+    return normalized
+
+
+def normalize_retrospective_follow_up(follow_up: Any) -> dict[str, list[dict[str, Any]]]:
+    if follow_up is None:
+        return {}
+    if not isinstance(follow_up, dict):
+        raise WorkstreamError("retrospective.follow_up must be an object")
+    unsupported = [key for key in follow_up if key not in {"recommended", "created"}]
+    if unsupported:
+        raise WorkstreamError("retrospective.follow_up only supports recommended and created")
+    normalized: dict[str, list[dict[str, Any]]] = {}
+    for key in ("recommended", "created"):
+        items = follow_up.get(key)
+        if items is None:
+            continue
+        if not isinstance(items, list):
+            raise WorkstreamError(f"retrospective.follow_up.{key} must be a list")
+        normalized_items = []
+        for index, item in enumerate(items):
+            if not isinstance(item, dict):
+                raise WorkstreamError(f"retrospective.follow_up.{key}[{index}] must be an object")
+            unsupported_item_keys = [field for field in item if field not in {"id", "summary", "labels"}]
+            if unsupported_item_keys:
+                raise WorkstreamError(
+                    f"retrospective.follow_up.{key}[{index}] only supports id, summary, labels"
+                )
+            normalized_item: dict[str, Any] = {}
+            item_id = normalize_retrospective_optional_string(
+                item,
+                "id",
+                f"retrospective.follow_up.{key}[{index}].id must be a string",
+            )
+            if item_id:
+                normalized_item["id"] = item_id
+            summary = normalize_retrospective_optional_string(
+                item,
+                "summary",
+                f"retrospective.follow_up.{key}[{index}].summary must be a string",
+            )
+            if summary:
+                normalized_item["summary"] = summary
+            labels = item.get("labels")
+            if labels is not None:
+                if not isinstance(labels, list):
+                    raise WorkstreamError(f"retrospective.follow_up.{key}[{index}].labels must be a list")
+                normalized_labels = []
+                for label in labels:
+                    if not isinstance(label, str):
+                        raise WorkstreamError(
+                            f"retrospective.follow_up.{key}[{index}].labels entries must be strings"
+                        )
+                    stripped_label = label.strip()
+                    if stripped_label:
+                        normalized_labels.append(stripped_label)
+                if normalized_labels:
+                    normalized_item["labels"] = normalized_labels
+            normalized_items.append(normalized_item)
+        normalized[key] = normalized_items
+    return normalized
+
+
+def normalize_retrospective_notes(notes: Any) -> dict[str, list[str]]:
+    if notes is None:
+        return {}
+    if not isinstance(notes, dict):
+        raise WorkstreamError("retrospective.notes must be an object")
+    unsupported = [key for key in notes if key not in {"personal_work", "spikes"}]
+    if unsupported:
+        raise WorkstreamError("retrospective.notes only supports personal_work and spikes")
+    normalized: dict[str, list[str]] = {}
+    for key in ("personal_work", "spikes"):
+        values = notes.get(key)
+        if values is None:
+            continue
+        if not isinstance(values, list):
+            raise WorkstreamError(f"retrospective.notes.{key} must be a list")
+        normalized_values = []
+        for value in values:
+            if not isinstance(value, str):
+                raise WorkstreamError(f"retrospective.notes.{key} entries must be strings")
+            stripped = value.strip()
+            if stripped:
+                normalized_values.append(stripped)
+        normalized[key] = normalized_values
+    return normalized
 
 
 def normalize_review_cycle_required_string(
