@@ -358,10 +358,29 @@ Discover the next project item and emit an inspectable recipe in one step:
 PYTHONPATH=src python3 -m afk run-next \
   --project bump-eqemu \
   --contracts-dir project-contracts \
+  --beads-workspace /home/bump/Projects/beads \
   --checkout-root /work \
   --checkout-path /work/bump-EQEmu \
   --validation-profile tier1
 ```
+
+To preview this pipeline repo against its own first-party contract, switch the
+project and checkout path:
+
+```sh
+PYTHONPATH=src python3 -m afk run-next \
+  --project afk-composable-pipeline \
+  --contracts-dir project-contracts \
+  --beads-workspace /home/bump/Projects/beads \
+  --checkout-root /work \
+  --checkout-path /work/afk-composable-pipeline \
+  --validation-profile tier1
+```
+
+`--beads-workspace` must point at the central Beads workspace, not a
+project-local `.beads/` directory. In a containerized runner, mount the central
+workspace explicitly, for example `/home/bump/Projects/beads:/work/mounts/beads`,
+and pass `--beads-workspace /work/mounts/beads`.
 
 `run-next` builds a project-scoped `select-work` request from the contract
 labels plus the observed `ready-for-agent` tag, tries both Beads and GitHub
