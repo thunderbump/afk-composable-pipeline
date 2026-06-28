@@ -7,6 +7,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from afk.workstream import (  # noqa: E402
+    WorkstreamError,
+    normalize_retrospective_judge,
     pipeline_retrospective_record,
     tracker_record,
     workstream_status_from_publication,
@@ -90,6 +92,20 @@ def retrospective_tracker(status="awaiting-review"):
 
 
 class WorkstreamStatusMappingTest(unittest.TestCase):
+    def test_normalize_retrospective_judge_rejects_secret_literals_in_command(self):
+        with self.assertRaisesRegex(WorkstreamError, "secret-looking values"):
+            normalize_retrospective_judge(
+                {
+                    "enabled": True,
+                    "type": "fake-judge-command",
+                    "command": [
+                        sys.executable,
+                        "-c",
+                        "print('Bearer abc123secretXYZ')",
+                    ],
+                }
+            )
+
     def test_pipeline_retrospective_record_marks_judge_disabled_by_default(self):
         record = pipeline_retrospective_record(
             retrospective_state(),

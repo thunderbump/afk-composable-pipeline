@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import tempfile
 import uuid
@@ -13,7 +14,7 @@ from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
 from afk.contracts import ProjectContract
 from afk.jsonutil import canonical_json, sha256_json
-from afk.redaction import is_secret_command_flag, is_secret_key, redact_artifact_value, redact_text
+from afk.redaction import is_secret_command_flag, is_secret_key, is_secret_value, redact_artifact_value, redact_text
 from afk.registry import StepResult
 
 
@@ -23,6 +24,7 @@ REVIEW_CYCLE_STATUSES = {"passed", "findings-open", "findings-addressed", "reque
 REVIEW_CYCLE_OPEN_STATUSES = {"findings-open", "request-changes"}
 REVIEW_CYCLE_RESPONSE_STATUSES = {"addressed", "findings-addressed"}
 TERMINAL_REVIEW_FEEDBACK_STATUSES = {"resolved", "waived"}
+COMMAND_BEARER_SECRET_PATTERN = re.compile(r"\bBearer\s+[A-Za-z0-9._~+/=-]{12,}", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -2180,6 +2182,7 @@ def _minimal_retrospective_judge_environment(temp_path: Path) -> dict[str, str]:
         "PATH",
         "LANG",
         "LC_ALL",
+        "PYTHONPATH",
         "GIT_AUTHOR_NAME",
         "GIT_AUTHOR_EMAIL",
         "GIT_COMMITTER_NAME",
@@ -3073,6 +3076,8 @@ def _command_secret_error_message(command: list[str], *, field_name: str) -> str
         if is_secret_command_flag(part):
             flag = part.strip().split("=", 1)[0].lower()
             return f"{field_name} must not include credential flag {flag}"
+        if is_secret_value(part) or COMMAND_BEARER_SECRET_PATTERN.search(part):
+            return f"{field_name} must not include secret-looking values"
     return None
 
 

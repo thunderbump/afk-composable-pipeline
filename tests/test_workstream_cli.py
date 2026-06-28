@@ -916,6 +916,9 @@ raise SystemExit(9)
             init_repo(repo)
             fake_git = temp_path / "publisher-git"
             fake_gh = temp_path / "publisher-gh"
+            judge_src = temp_path / "judge-src"
+            judge_src.mkdir()
+            judge_module = judge_src / "fake_retrospective_judge.py"
             write_executable(
                 fake_git,
                 f"""#!{sys.executable}
@@ -929,38 +932,42 @@ raise SystemExit(9)
 """,
             )
             recipe = merged_recipe_with_retrospective(temp_path, repo, checkout, fake_git, fake_gh)
-            judge_code = textwrap.dedent(
-                f"""
-                import json
-                import os
-                from pathlib import Path
+            judge_module.write_text(
+                textwrap.dedent(
+                    f"""
+                    import json
+                    import os
+                    from pathlib import Path
 
-                def contains_key(value, target):
-                    if isinstance(value, dict):
-                        return target in value or any(contains_key(item, target) for item in value.values())
-                    if isinstance(value, list):
-                        return any(contains_key(item, target) for item in value)
-                    return False
+                    def contains_key(value, target):
+                        if isinstance(value, dict):
+                            return target in value or any(contains_key(item, target) for item in value.values())
+                        if isinstance(value, list):
+                            return any(contains_key(item, target) for item in value)
+                        return False
 
-                request = json.loads(Path(os.environ["AFK_RETROSPECTIVE_JUDGE_REQUEST"]).read_text(encoding="utf-8"))
-                evidence_pack = request["evidence_pack"]
-                assert "[REDACTED]" in evidence_pack["retrospective"]["summary"]
-                assert "[REDACTED]" in evidence_pack["retrospective"]["validation"][0]
-                assert "ghp_secret_merge_retrospective_1234567890" not in json.dumps(evidence_pack)
-                assert "super-secret-value" not in json.dumps(evidence_pack)
-                assert not contains_key(evidence_pack, "stdout_excerpt")
-                assert not contains_key(evidence_pack, "stderr_excerpt")
-                Path({str(judge_requests)!r}).write_text(json.dumps(request), encoding="utf-8")
-                Path(os.environ["AFK_RETROSPECTIVE_JUDGE_RESULT"]).write_text(
-                    json.dumps({{"status": "pass", "summary": "judge accepted token=ghp_judge_secret_1234567890"}}),
-                    encoding="utf-8",
-                )
-                """
-            ).strip()
+                    request = json.loads(Path(os.environ["AFK_RETROSPECTIVE_JUDGE_REQUEST"]).read_text(encoding="utf-8"))
+                    evidence_pack = request["evidence_pack"]
+                    assert "[REDACTED]" in evidence_pack["retrospective"]["summary"]
+                    assert "[REDACTED]" in evidence_pack["retrospective"]["validation"][0]
+                    assert "ghp_secret_merge_retrospective_1234567890" not in json.dumps(evidence_pack)
+                    assert "super-secret-value" not in json.dumps(evidence_pack)
+                    assert not contains_key(evidence_pack, "stdout_excerpt")
+                    assert not contains_key(evidence_pack, "stderr_excerpt")
+                    Path({str(judge_requests)!r}).write_text(json.dumps(request), encoding="utf-8")
+                    Path(os.environ["AFK_RETROSPECTIVE_JUDGE_RESULT"]).write_text(
+                        json.dumps({{"status": "pass", "summary": "judge accepted token=ghp_judge_secret_1234567890"}}),
+                        encoding="utf-8",
+                    )
+                    """
+                ).strip()
+                + "\n",
+                encoding="utf-8",
+            )
             recipe["retrospective_judge"] = {
                 "enabled": True,
-                "type": "local-command",
-                "command": [sys.executable, "-c", judge_code],
+                "type": "fake-judge-command",
+                "command": [sys.executable, "-m", "fake_retrospective_judge"],
                 "timeout_seconds": 10,
             }
 
@@ -978,6 +985,7 @@ raise SystemExit(9)
                     "GIT_AUTHOR_EMAIL": "afk-test@example.test",
                     "GIT_COMMITTER_NAME": "AFK Test",
                     "GIT_COMMITTER_EMAIL": "afk-test@example.test",
+                    "PYTHONPATH": f"{judge_src}{os.pathsep}{ROOT / 'src'}",
                 },
             )
 
