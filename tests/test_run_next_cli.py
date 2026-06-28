@@ -1331,3 +1331,62 @@ raise SystemExit(9)
 
                     self.assertNotEqual(completed.returncode, 0, completed.stdout)
                     self.assertIn(expected_error, completed.stderr)
+
+    def test_run_next_rejects_publisher_create_without_required_arguments_before_selection_when_no_candidates(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            fake_bin = temp_path / "bin"
+            beads_workspace = temp_path / "beads"
+            checkout_root = temp_path / "checkouts"
+            checkout_path = checkout_root / "bump-EQEmu"
+            gh_config_dir = temp_path / "gh-config"
+            fake_bin.mkdir()
+            checkout_root.mkdir()
+            beads_workspace.mkdir()
+
+            write_executable(
+                fake_bin / "gh",
+                f"""#!{sys.executable}
+import sys
+if sys.argv[1:3] == ['auth', 'status']:
+    sys.exit(1)
+raise SystemExit(9)
+""",
+            )
+            write_executable(
+                fake_bin / "bd",
+                "#!%s\n"
+                "import json\n"
+                "import sys\n"
+                "if sys.argv[1:2] == ['list']:\n"
+                "    print(json.dumps({'schema_version':1,'source_statuses':[],'selected_work':[],'skipped_candidates':[]}))\n"
+                "    sys.exit(0)\n"
+                "raise SystemExit(9)\n" % sys.executable,
+            )
+
+            completed = run_afk(
+                "run-next",
+                "--project",
+                "bump-eqemu",
+                "--contracts-dir",
+                "project-contracts",
+                "--beads-workspace",
+                str(beads_workspace),
+                "--checkout-root",
+                str(checkout_root),
+                "--checkout-path",
+                str(checkout_path),
+                "--validation-profile",
+                "tier1",
+                "--publisher-mode",
+                "create",
+                "--publisher-repo",
+                "thunderbump/beads",
+                "--publisher-gh-config-dir",
+                str(gh_config_dir),
+                env={"GH_TOKEN": None, "GITHUB_TOKEN": None, "PATH": str(fake_bin)},
+            )
+
+            self.assertNotEqual(completed.returncode, 0, completed.stdout)
+            self.assertIn("publisher.base is required for create", completed.stderr)
+            self.assertEqual(completed.stdout, "")

@@ -752,6 +752,12 @@ def recipe_publisher_factory_from_args(
         return None
     if args.publisher_mode != "create":
         raise ValueError(f"Unsupported --publisher-mode: {args.publisher_mode}")
+    # Fail fast so run-next validates misconfiguration before selection work runs.
+    recipe_publisher_from_args(
+        args,
+        review_branch="afk/dry-run",
+        checkout_path=checkout_path,
+    )
 
     def _factory(workstream_id: str) -> dict[str, Any] | None:
         return recipe_publisher_from_args(
