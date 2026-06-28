@@ -725,6 +725,14 @@ def build_job_capsule(request: dict[str, Any], *, run_id: str) -> dict[str, Any]
     secret_refs = request["agent"].get("secret_refs", {})
     if secret_refs:
         agent_mounts["secret_refs"] = secret_refs
+    commit_required = request["agent"].get("type") == "real-agent-command"
+    instructions = [
+        "Write a JSON object matching expected_result_schema to AFK_AGENT_RESULT_PATH before exiting.",
+        "Use status=completed only when acceptance criteria are satisfied.",
+        "Use status=target_failed with failures when the requested work cannot be completed.",
+    ]
+    if commit_required:
+        instructions.append("Commit successful code changes on the review branch before exiting.")
     return {
         "schema_version": SCHEMA_VERSION,
         "run_id": run_id,
@@ -740,6 +748,13 @@ def build_job_capsule(request: dict[str, Any], *, run_id: str) -> dict[str, Any]
             "summary": "string",
             "notes": "list[string]",
             "failures": "list[object]",
+        },
+        "completion_contract": {
+            "result_path": request["agent"]["result_path"],
+            "result_path_env": "AFK_AGENT_RESULT_PATH",
+            "write_result_file_before_exit": True,
+            "commit_required_for_success": commit_required,
+            "instructions": instructions,
         },
     }
 

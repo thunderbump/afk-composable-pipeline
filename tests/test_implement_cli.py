@@ -311,6 +311,20 @@ class ImplementCliTest(unittest.TestCase):
             self.assertEqual(job_capsule["capsule"]["validation"]["profile"], "tier1")
             self.assertEqual(job_capsule["capsule"]["checkout"]["path"], str(checkout))
             self.assertEqual(job_capsule["capsule"]["checkout"]["start_commit"], start_commit)
+            self.assertEqual(
+                job_capsule["capsule"]["completion_contract"],
+                {
+                    "result_path": "agent-result.json",
+                    "result_path_env": "AFK_AGENT_RESULT_PATH",
+                    "write_result_file_before_exit": True,
+                    "commit_required_for_success": False,
+                    "instructions": [
+                        "Write a JSON object matching expected_result_schema to AFK_AGENT_RESULT_PATH before exiting.",
+                        "Use status=completed only when acceptance criteria are satisfied.",
+                        "Use status=target_failed with failures when the requested work cannot be completed.",
+                    ],
+                },
+            )
             self.assertEqual(agent_result["artifact_type"], "agent-result")
             self.assertEqual(agent_result["result"]["status"], "implemented")
             self.assertEqual(agent_result["result"]["classification"], "success")
@@ -432,6 +446,11 @@ class ImplementCliTest(unittest.TestCase):
             self.assertEqual(result["output"]["classification"], "success")
             self.assertEqual(result["output"]["summary"], "real adapter smoke implemented")
             self.assertEqual(agent_result["result"]["adapter"]["type"], "real-agent-command")
+            self.assertEqual(job_capsule["capsule"]["completion_contract"]["commit_required_for_success"], True)
+            self.assertIn(
+                "Commit successful code changes on the review branch before exiting.",
+                job_capsule["capsule"]["completion_contract"]["instructions"],
+            )
             self.assertEqual(result["output"]["git"]["changed_files"], ["implemented.txt"])
             self.assertEqual(result["output"]["git"]["dirty"], False)
             self.assertEqual(observation["cwd"], str(checkout))
