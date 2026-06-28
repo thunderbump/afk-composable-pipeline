@@ -609,6 +609,35 @@ class WorkstreamStatusMappingTest(unittest.TestCase):
         self.assertEqual(record["follow_up"]["created"][0]["id"], "central-4x9.99")
         self.assertEqual(record["follow_up"]["created"][0]["summary"], "Document follow-up creation.")
 
+    def test_pipeline_retrospective_record_merges_fingerprint_only_and_id_created_follow_up(self):
+        record = pipeline_retrospective_record(
+            retrospective_state(),
+            {"status": "published", "url": "https://github.example/pr/17"},
+            retrospective_tracker(),
+            normalized={
+                "retrospective": {
+                    "follow_up": {
+                        "created": [
+                            {
+                                "summary": "Document follow-up creation.",
+                                "labels": ["area:retro"],
+                                "fingerprint": "retro-follow-up:123",
+                            },
+                            {
+                                "id": "central-4x9.99",
+                                "summary": "Document follow-up creation.",
+                                "labels": ["area:retro"],
+                            },
+                        ]
+                    }
+                }
+            },
+        )
+
+        self.assertEqual(len(record["follow_up"]["created"]), 1)
+        self.assertEqual(record["follow_up"]["created"][0]["id"], "central-4x9.99")
+        self.assertTrue(record["follow_up"]["created"][0]["fingerprint"].startswith("retro-follow-up:"))
+
     def test_workstream_status_from_publication_explicit_terminal_states(self):
         self.assertEqual(
             workstream_status_from_publication({"status": "published"}),

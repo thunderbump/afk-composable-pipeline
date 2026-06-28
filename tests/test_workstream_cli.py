@@ -1229,6 +1229,7 @@ raise SystemExit(9)
                                     {{
                                         "id": "central-4x9.44",
                                         "kind": recommended[0]["kind"],
+                                        "fingerprint": "retro-follow-up:stale",
                                         "summary": recommended[0]["summary"],
                                     }}
                                 ],

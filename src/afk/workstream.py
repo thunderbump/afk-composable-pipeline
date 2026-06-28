@@ -2708,10 +2708,10 @@ def _normalize_retrospective_follow_up_created(
         )
         if normalized_item is None:
             continue
-        if fingerprint:
-            normalized_item["fingerprint"] = fingerprint
-        elif string_field(matched, "fingerprint"):
+        if string_field(matched, "fingerprint"):
             normalized_item["fingerprint"] = matched["fingerprint"]
+        elif fingerprint:
+            normalized_item["fingerprint"] = fingerprint
         normalized_items.append(normalized_item)
     return _merge_retrospective_created_follow_up([], normalized_items)
 
@@ -3020,16 +3020,41 @@ def _merge_retrospective_created_follow_up(
     for item in list(existing) + list(new):
         if not isinstance(item, dict):
             continue
-        fingerprint = string_field(item, "fingerprint") or ""
-        item_id = string_field(item, "id") or ""
-        summary = string_field(item, "summary") or ""
-        key = f"id:{item_id}" if item_id else f"fingerprint:{fingerprint}" if fingerprint else f"summary:{summary}:{canonical_json(item.get('labels', []))}"
-        if key in seen:
-            merged[seen[key]] = _merge_retrospective_created_follow_up_item(merged[seen[key]], item)
+        aliases = _retrospective_created_follow_up_aliases(item)
+        matched_indexes = [seen[alias] for alias in aliases if alias in seen]
+        if matched_indexes:
+            index = min(matched_indexes)
+            merged[index] = _merge_retrospective_created_follow_up_item(merged[index], item)
+            for duplicate_index in sorted(set(matched_indexes) - {index}, reverse=True):
+                merged[index] = _merge_retrospective_created_follow_up_item(merged[index], merged[duplicate_index])
+                del merged[duplicate_index]
+                seen = _retrospective_created_follow_up_seen_map(merged)
+            seen.update({alias: index for alias in _retrospective_created_follow_up_aliases(merged[index])})
             continue
-        seen[key] = len(merged)
         merged.append(dict(item))
+        seen.update({alias: len(merged) - 1 for alias in aliases})
     return merged
+
+
+def _retrospective_created_follow_up_aliases(item: dict[str, Any]) -> list[str]:
+    aliases = []
+    item_id = string_field(item, "id") or ""
+    fingerprint = string_field(item, "fingerprint") or ""
+    summary = string_field(item, "summary") or ""
+    if item_id:
+        aliases.append(f"id:{item_id}")
+    if fingerprint:
+        aliases.append(f"fingerprint:{fingerprint}")
+    if summary:
+        aliases.append(f"identity:{_retrospective_follow_up_identity_for_item(item)}")
+    return aliases
+
+
+def _retrospective_created_follow_up_seen_map(items: list[dict[str, Any]]) -> dict[str, int]:
+    seen: dict[str, int] = {}
+    for index, item in enumerate(items):
+        seen.update({alias: index for alias in _retrospective_created_follow_up_aliases(item)})
+    return seen
 
 
 def _merge_retrospective_created_follow_up_item(existing: dict[str, Any], new: dict[str, Any]) -> dict[str, Any]:
