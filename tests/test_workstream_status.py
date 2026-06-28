@@ -92,6 +92,16 @@ def retrospective_tracker(status="awaiting-review"):
 
 
 class WorkstreamStatusMappingTest(unittest.TestCase):
+    def test_normalize_retrospective_judge_rejects_empty_command(self):
+        with self.assertRaisesRegex(WorkstreamError, "command must not be empty"):
+            normalize_retrospective_judge(
+                {
+                    "enabled": True,
+                    "type": "fake-judge-command",
+                    "command": [],
+                }
+            )
+
     def test_normalize_retrospective_judge_rejects_secret_literals_in_command(self):
         with self.assertRaisesRegex(WorkstreamError, "secret-looking values"):
             normalize_retrospective_judge(

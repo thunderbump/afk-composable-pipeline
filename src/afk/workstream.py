@@ -2753,6 +2753,8 @@ def normalize_retrospective_judge(retrospective_judge: Any) -> dict[str, Any]:
     command = retrospective_judge.get("command")
     if not _is_string_list(command):
         raise WorkstreamError("retrospective_judge.command must be a list of strings")
+    if not command:
+        raise WorkstreamError("retrospective_judge.command must not be empty")
     command_secret_error = _command_secret_error_message(command, field_name="retrospective_judge.command")
     if command_secret_error:
         raise WorkstreamError(command_secret_error)
