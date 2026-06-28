@@ -222,15 +222,16 @@ class WorkstreamStatusMappingTest(unittest.TestCase):
                 }
             ],
         )
+        self.assertEqual(record["follow_up"]["recommended"][0]["kind"], "missing-tool-or-config")
         self.assertEqual(
-            record["follow_up"]["recommended"][0],
-            {
-                "kind": "missing-tool-or-config",
-                "summary": "Fix the missing tool or configuration in validation evidence before rerunning the workstream.",
-                "labels": ["afk:follow-up", "area:validation", "project:afk-composable-pipeline"],
-                "fingerprint": "retro-follow-up:1e06832771a4",
-            },
+            record["follow_up"]["recommended"][0]["summary"],
+            "Fix the missing tool or configuration in validation evidence before rerunning the workstream.",
         )
+        self.assertEqual(
+            record["follow_up"]["recommended"][0]["labels"],
+            ["afk:follow-up", "area:validation", "project:afk-composable-pipeline"],
+        )
+        self.assertTrue(record["follow_up"]["recommended"][0]["fingerprint"].startswith("retro-follow-up:"))
 
     def test_pipeline_retrospective_record_surfaces_blocked_reason_without_retry_keyword(self):
         record = pipeline_retrospective_record(
@@ -449,6 +450,27 @@ class WorkstreamStatusMappingTest(unittest.TestCase):
         self.assertEqual(record["health"], "failing")
         self.assertEqual(len(record["follow_up"]["recommended"]), 1)
         self.assertEqual(len(record["recommended_follow_up"]), 1)
+        configured_record = pipeline_retrospective_record(
+            retrospective_state(),
+            {"status": "published", "url": "https://github.example/pr/17"},
+            retrospective_tracker(),
+            normalized={
+                "retrospective": {
+                    "follow_up": {
+                        "recommended": [
+                            {
+                                "summary": "Repair GitHub publisher authentication evidence before rerunning terminal publication.",
+                                "labels": ["afk:follow-up", "area:publication"],
+                            }
+                        ]
+                    }
+                }
+            },
+        )
+        self.assertEqual(
+            record["follow_up"]["recommended"][0]["fingerprint"],
+            configured_record["follow_up"]["recommended"][0]["fingerprint"],
+        )
 
     def test_pipeline_retrospective_record_does_not_recommend_created_follow_up_again(self):
         record = pipeline_retrospective_record(
@@ -464,7 +486,7 @@ class WorkstreamStatusMappingTest(unittest.TestCase):
                         "created": [
                             {
                                 "summary": "Repair GitHub publisher authentication evidence before rerunning terminal publication.",
-                                "labels": ["project:afk-composable-pipeline"],
+                                "labels": ["afk:follow-up", "area:publication"],
                             }
                         ]
                     }
@@ -475,6 +497,32 @@ class WorkstreamStatusMappingTest(unittest.TestCase):
         self.assertEqual(record["health"], "failing")
         self.assertEqual(record["signals"][0]["kind"], "publisher-auth")
         self.assertEqual(record["recommended_follow_up"], [])
+
+    def test_pipeline_retrospective_record_recommends_when_created_follow_up_summary_has_different_labels(self):
+        record = pipeline_retrospective_record(
+            retrospective_state(),
+            {
+                "status": "failed-needs-human",
+                "reason": "gh auth status failed",
+            },
+            retrospective_tracker("validated"),
+            normalized={
+                "retrospective": {
+                    "follow_up": {
+                        "created": [
+                            {
+                                "summary": "Repair GitHub publisher authentication evidence before rerunning terminal publication.",
+                                "labels": ["project:other"],
+                            }
+                        ]
+                    }
+                }
+            },
+        )
+
+        self.assertEqual(record["health"], "failing")
+        self.assertEqual(record["signals"][0]["kind"], "publisher-auth")
+        self.assertEqual(len(record["recommended_follow_up"]), 1)
 
     def test_pipeline_retrospective_record_recommends_when_created_follow_up_has_only_id(self):
         record = pipeline_retrospective_record(

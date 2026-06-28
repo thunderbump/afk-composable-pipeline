@@ -2567,8 +2567,8 @@ def _run_retrospective_follow_up_command(
                 stderr=str(exc),
             ) from exc
         except subprocess.TimeoutExpired as exc:
-            stdout = exc.stdout if isinstance(exc.stdout, str) else ""
-            stderr = exc.stderr if isinstance(exc.stderr, str) else ""
+            stdout = _subprocess_output_text(exc.stdout)
+            stderr = _subprocess_output_text(exc.stderr)
             raise _RetrospectiveFollowUpError(
                 "retrospective follow-up command timed out",
                 command=command,
@@ -2892,7 +2892,6 @@ def _retrospective_follow_up_record(signals: list[dict[str, Any]], normalized: d
     recommended_identities: set[str] = set()
     created_fingerprints: set[str] = set()
     created_identities: set[str] = set()
-    created_summaries: set[str] = set()
     if normalized is not None:
         retrospective = normalized.get("retrospective") if isinstance(normalized, dict) else {}
         configured = retrospective.get("follow_up") if isinstance(retrospective, dict) else {}
@@ -2925,9 +2924,6 @@ def _retrospective_follow_up_record(signals: list[dict[str, Any]], normalized: d
                     if string_field(created_item, "fingerprint"):
                         created_fingerprints.add(created_item["fingerprint"])
                     created_identities.add(_retrospective_follow_up_identity_for_item(created_item))
-                    created_summary = string_field(created_item, "summary")
-                    if created_summary:
-                        created_summaries.add(created_summary)
     for signal in signals:
         kind = string_field(signal, "kind") or ""
         follow_up_item = _follow_up_for_signal(kind)
@@ -2937,7 +2933,6 @@ def _retrospective_follow_up_record(signals: list[dict[str, Any]], normalized: d
             and follow_up_item["fingerprint"] not in created_fingerprints
             and _retrospective_follow_up_identity_for_item(follow_up_item) not in recommended_identities
             and _retrospective_follow_up_identity_for_item(follow_up_item) not in created_identities
-            and string_field(follow_up_item, "summary") not in created_summaries
         ):
             recommended.append(follow_up_item)
             recommended_fingerprints.add(follow_up_item["fingerprint"])
@@ -3007,24 +3002,32 @@ def _merge_retrospective_created_follow_up(
     new: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     merged = []
-    seen: set[str] = set()
+    seen: dict[str, int] = {}
     for item in list(existing) + list(new):
         if not isinstance(item, dict):
             continue
         fingerprint = string_field(item, "fingerprint") or ""
         item_id = string_field(item, "id") or ""
         summary = string_field(item, "summary") or ""
-        key = (
-            f"fingerprint:{fingerprint}"
-            if fingerprint
-            else f"id:{item_id}"
-            if item_id
-            else f"summary:{summary}:{canonical_json(item.get('labels', []))}"
-        )
+        key = f"id:{item_id}" if item_id else f"fingerprint:{fingerprint}" if fingerprint else f"summary:{summary}:{canonical_json(item.get('labels', []))}"
         if key in seen:
+            merged[seen[key]] = _merge_retrospective_created_follow_up_item(merged[seen[key]], item)
             continue
-        seen.add(key)
-        merged.append(item)
+        seen[key] = len(merged)
+        merged.append(dict(item))
+    return merged
+
+
+def _merge_retrospective_created_follow_up_item(existing: dict[str, Any], new: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(existing)
+    for key in ("kind", "summary", "fingerprint"):
+        if string_field(new, key):
+            merged[key] = new[key]
+    if string_field(new, "id"):
+        merged["id"] = new["id"]
+    new_labels = new.get("labels")
+    if isinstance(new_labels, list) and new_labels:
+        merged["labels"] = new_labels
     return merged
 
 
@@ -3044,7 +3047,6 @@ def _retrospective_follow_up_labels(labels: Any) -> list[str]:
 def _retrospective_follow_up_fingerprint(kind: str, summary: str, labels: list[str]) -> str:
     return "retro-follow-up:" + sha256_json(
         {
-            "kind": kind,
             "summary": summary,
             "labels": sorted(set(labels)),
         }
@@ -3065,6 +3067,14 @@ def _retrospective_follow_up_identity_for_item(item: dict[str, Any]) -> str:
         string_field(item, "summary") or "",
         _retrospective_follow_up_labels(item.get("labels")),
     )
+
+
+def _subprocess_output_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return ""
 
 
 def _follow_up_for_signal(kind: str) -> dict[str, Any] | None:

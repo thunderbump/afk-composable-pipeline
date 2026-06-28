@@ -1204,7 +1204,8 @@ raise SystemExit(9)
                         "summary": "Capture token=ghp_follow_up_secret_9999999999 remediation notes.",
                         "labels": ["area:retro"],
                     },
-                ]
+                ],
+                "created": [{"id": "central-4x9.44"}],
             }
             creator_module.write_text(
                 textwrap.dedent(
@@ -1280,6 +1281,7 @@ raise SystemExit(9)
                 result["pipeline_retrospective"]["follow_up"]["created"][0]["id"],
                 "central-4x9.44",
             )
+            self.assertEqual(len(result["pipeline_retrospective"]["follow_up"]["created"]), 1)
             self.assertEqual(
                 result["pipeline_retrospective"]["follow_up"]["created"][0]["fingerprint"],
                 result["pipeline_retrospective"]["follow_up"]["recommended"][0]["fingerprint"],
@@ -1368,6 +1370,74 @@ raise SystemExit(9)
             self.assertEqual(result["artifacts"]["retrospective_follow_up_result"], "retrospective-follow-up-result.json")
             self.assertEqual(result["artifacts"]["retrospective_follow_up_stdout"], "retrospective-follow-up-stdout.log")
             self.assertEqual(result["artifacts"]["retrospective_follow_up_stderr"], "retrospective-follow-up-stderr.log")
+
+    def test_workstream_records_retrospective_follow_up_timeout_output(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repo = temp_path / "repo-src"
+            checkout = temp_path / "checkout"
+            ledger = temp_path / "ledger"
+            init_repo(repo)
+            fake_git = temp_path / "publisher-git"
+            fake_gh = temp_path / "publisher-gh"
+            write_executable(
+                fake_git,
+                f"""#!{sys.executable}
+raise SystemExit(9)
+""",
+            )
+            write_executable(
+                fake_gh,
+                f"""#!{sys.executable}
+raise SystemExit(9)
+""",
+            )
+            timeout_code = "import sys, time; sys.stdout.buffer.write(b'before-timeout-\\xff'); sys.stdout.flush(); time.sleep(2)"
+            recipe = merged_recipe_with_retrospective(temp_path, repo, checkout, fake_git, fake_gh)
+            recipe["retrospective"]["follow_up"] = {
+                "recommended": [
+                    {
+                        "summary": "Document retrospective follow-up capture.",
+                        "labels": ["area:retro"],
+                    }
+                ]
+            }
+            recipe["retrospective_follow_up"] = {
+                "enabled": True,
+                "type": "local-command",
+                "command": [sys.executable, "-c", timeout_code],
+                "timeout_seconds": 0.1,
+            }
+
+            completed = run_afk(
+                "run-workstream",
+                "--workstream-id",
+                "central-lve.9",
+                "--input",
+                json.dumps(recipe),
+                "--ledger",
+                str(ledger),
+                env_overrides={
+                    "GIT_ALLOW_PROTOCOL": "file",
+                    "GIT_AUTHOR_NAME": "AFK Test",
+                    "GIT_AUTHOR_EMAIL": "afk-test@example.test",
+                    "GIT_COMMITTER_NAME": "AFK Test",
+                    "GIT_COMMITTER_EMAIL": "afk-test@example.test",
+                },
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            result = json.loads((ledger / summary["result_path"]).read_text(encoding="utf-8"))
+            run_dir = ledger / "workstreams" / summary["run_id"]
+
+            self.assertEqual(result["status"], "closed")
+            self.assertEqual(result["pipeline_retrospective"]["follow_up"]["creation"]["status"], "failed")
+            self.assertEqual(result["pipeline_retrospective"]["follow_up"]["creation"]["adapter"]["timed_out"], True)
+            self.assertIn(
+                "before-timeout-",
+                (run_dir / "retrospective-follow-up-stdout.log").read_text(encoding="utf-8"),
+            )
 
     def test_workstream_records_enabled_retrospective_follow_up_skip_artifacts_without_recommendations(self):
         with tempfile.TemporaryDirectory() as temp_dir:
