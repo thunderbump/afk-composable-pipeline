@@ -2672,6 +2672,20 @@ def _normalize_retrospective_follow_up_created(
         for item in recommended
         if isinstance(item, dict)
     }
+    recommended_by_summary: dict[str, dict[str, Any]] = {}
+    ambiguous_summaries: set[str] = set()
+    for item in recommended:
+        if not isinstance(item, dict):
+            continue
+        summary_key = string_field(item, "summary") or ""
+        if not summary_key:
+            continue
+        if summary_key in recommended_by_summary:
+            ambiguous_summaries.add(summary_key)
+            continue
+        recommended_by_summary[summary_key] = item
+    for summary_key in ambiguous_summaries:
+        recommended_by_summary.pop(summary_key, None)
     normalized_items = []
     for item in items:
         if not isinstance(item, dict):
@@ -2680,7 +2694,7 @@ def _normalize_retrospective_follow_up_created(
         summary = string_field(item, "summary") or ""
         labels = item.get("labels")
         identity = _retrospective_follow_up_identity(redact_text(summary), _retrospective_follow_up_labels(labels))
-        matched = recommended_by_fingerprint.get(fingerprint) or recommended_by_identity.get(identity) or {}
+        matched = recommended_by_fingerprint.get(fingerprint) or recommended_by_identity.get(identity) or recommended_by_summary.get(redact_text(summary)) or {}
         kind = string_field(item, "kind") or string_field(matched, "kind") or "created-follow-up"
         summary = summary or string_field(matched, "summary") or ""
         labels = labels if labels is not None else matched.get("labels")
@@ -2939,7 +2953,7 @@ def _retrospective_follow_up_record(signals: list[dict[str, Any]], normalized: d
             recommended_identities.add(_retrospective_follow_up_identity_for_item(follow_up_item))
     return {
         "recommended": recommended,
-        "created": created,
+        "created": _merge_retrospective_created_follow_up([], created),
         "creation": _disabled_retrospective_follow_up_creation_record(),
     }
 
@@ -3382,6 +3396,9 @@ def normalize_retrospective_follow_up_config(retrospective_follow_up: Any) -> di
         return {"enabled": False}
     if not isinstance(retrospective_follow_up, dict):
         raise WorkstreamError("retrospective_follow_up must be an object")
+    for forbidden_key in ("credentials_path", "auth_file", "token", "api_key", "env"):
+        if forbidden_key in retrospective_follow_up:
+            raise WorkstreamError(f"retrospective_follow_up.{forbidden_key} is not supported")
     unsupported = [
         key
         for key in retrospective_follow_up
@@ -3397,9 +3414,6 @@ def normalize_retrospective_follow_up_config(retrospective_follow_up: Any) -> di
     follow_up_type = string_field(retrospective_follow_up, "type") or "local-command"
     if follow_up_type not in {"local-command", "fake-follow-up-command"}:
         raise WorkstreamError("retrospective_follow_up.type must be local-command or fake-follow-up-command")
-    for forbidden_key in ("credentials_path", "auth_file", "token", "api_key", "env"):
-        if forbidden_key in retrospective_follow_up:
-            raise WorkstreamError(f"retrospective_follow_up.{forbidden_key} is not supported")
     command = retrospective_follow_up.get("command")
     if not _is_string_list(command):
         raise WorkstreamError("retrospective_follow_up.command must be a list of strings")

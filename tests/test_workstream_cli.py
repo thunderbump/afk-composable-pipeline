@@ -1230,7 +1230,6 @@ raise SystemExit(9)
                                         "id": "central-4x9.44",
                                         "kind": recommended[0]["kind"],
                                         "summary": recommended[0]["summary"],
-                                        "labels": recommended[0]["labels"],
                                     }}
                                 ],
                             }}

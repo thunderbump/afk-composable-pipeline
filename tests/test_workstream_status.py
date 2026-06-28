@@ -103,6 +103,31 @@ class WorkstreamStatusMappingTest(unittest.TestCase):
                 }
             )
 
+    def test_normalize_retrospective_follow_up_config_rejects_secret_literals_in_command(self):
+        with self.assertRaisesRegex(WorkstreamError, "secret-looking values"):
+            normalize_retrospective_follow_up_config(
+                {
+                    "enabled": True,
+                    "type": "fake-follow-up-command",
+                    "command": [
+                        sys.executable,
+                        "-c",
+                        "print('Bearer abc123secretXYZ')",
+                    ],
+                }
+            )
+
+    def test_normalize_retrospective_follow_up_config_rejects_auth_env_keys(self):
+        with self.assertRaisesRegex(WorkstreamError, "retrospective_follow_up.env is not supported"):
+            normalize_retrospective_follow_up_config(
+                {
+                    "enabled": True,
+                    "type": "fake-follow-up-command",
+                    "command": [sys.executable, "-c", "print('ok')"],
+                    "env": {"GH_TOKEN": "ghp_secret_1234567890"},
+                }
+            )
+
     def test_normalize_retrospective_judge_rejects_empty_command(self):
         with self.assertRaisesRegex(WorkstreamError, "command must not be empty"):
             normalize_retrospective_judge(
@@ -556,6 +581,33 @@ class WorkstreamStatusMappingTest(unittest.TestCase):
                 }
             ],
         )
+
+    def test_pipeline_retrospective_record_deduplicates_configured_created_follow_up(self):
+        record = pipeline_retrospective_record(
+            retrospective_state(),
+            {"status": "published", "url": "https://github.example/pr/17"},
+            retrospective_tracker(),
+            normalized={
+                "retrospective": {
+                    "follow_up": {
+                        "created": [
+                            {
+                                "id": "central-4x9.99",
+                            },
+                            {
+                                "id": "central-4x9.99",
+                                "summary": "Document follow-up creation.",
+                                "labels": ["area:retro"],
+                            },
+                        ]
+                    }
+                }
+            },
+        )
+
+        self.assertEqual(len(record["follow_up"]["created"]), 1)
+        self.assertEqual(record["follow_up"]["created"][0]["id"], "central-4x9.99")
+        self.assertEqual(record["follow_up"]["created"][0]["summary"], "Document follow-up creation.")
 
     def test_workstream_status_from_publication_explicit_terminal_states(self):
         self.assertEqual(
