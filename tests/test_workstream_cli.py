@@ -1020,6 +1020,96 @@ raise SystemExit(9)
             for path_name in result["pipeline_retrospective"]["judge"]["evidence"].values():
                 self.assertTrue((run_dir / path_name).is_file(), path_name)
 
+    def test_workstream_substitutes_prompt_for_retrospective_judge_local_command(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repo = temp_path / "repo-src"
+            checkout = temp_path / "checkout"
+            ledger = temp_path / "ledger"
+            judge_secret = "ghp_secret_judge_1234567890"
+            init_repo(repo)
+            fake_git = temp_path / "publisher-git"
+            fake_gh = temp_path / "publisher-gh"
+            write_executable(
+                fake_git,
+                f"""#!{sys.executable}
+raise SystemExit(9)
+""",
+            )
+            write_executable(
+                fake_gh,
+                f"""#!{sys.executable}
+raise SystemExit(9)
+""",
+            )
+            recipe = merged_recipe_with_retrospective(temp_path, repo, checkout, fake_git, fake_gh)
+            recipe["retrospective"]["summary"] = f"Merged after validating token={judge_secret} cleanup."
+            recipe["retrospective_judge"] = {
+                "enabled": True,
+                "type": "local-command",
+                "command": [
+                    sys.executable,
+                    "-c",
+                    textwrap.dedent(
+                        f"""
+                        import json
+                        import os
+                        import sys
+                        from pathlib import Path
+
+                        prompt = sys.argv[1]
+                        request_path_arg = sys.argv[2]
+                        result_path_arg = sys.argv[3]
+                        request = json.loads(prompt)
+                        if request["artifact_type"] != "retrospective-judge-request":
+                            raise SystemExit("unexpected judge request payload")
+                        Path(request_path_arg).write_text(json.dumps(request), encoding="utf-8")
+                        print(request["evidence_pack"]["retrospective"]["summary"])
+                        print(request_path_arg)
+                        print(result_path_arg)
+                        Path(os.environ["AFK_RETROSPECTIVE_JUDGE_RESULT"]).write_text(
+                            json.dumps({{"status": "pass", "summary": "judge accepted review prompt"}}),
+                            encoding="utf-8",
+                        )
+                        """
+                    ).strip(),
+                    "{prompt}",
+                    "{request_path}",
+                    "{result_path}",
+                ],
+                "timeout_seconds": 10,
+            }
+
+            completed = run_afk(
+                "run-workstream",
+                "--workstream-id",
+                "central-lve.9",
+                "--input",
+                json.dumps(recipe),
+                "--ledger",
+                str(ledger),
+                env_overrides={
+                    "GIT_ALLOW_PROTOCOL": "file",
+                    "GIT_AUTHOR_NAME": "AFK Test",
+                    "GIT_AUTHOR_EMAIL": "afk-test@example.test",
+                    "GIT_COMMITTER_NAME": "AFK Test",
+                    "GIT_COMMITTER_EMAIL": "afk-test@example.test",
+                },
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            result = json.loads((ledger / summary["result_path"]).read_text(encoding="utf-8"))
+            run_dir = ledger / "workstreams" / summary["run_id"]
+            judge_request = json.loads((run_dir / "retrospective-judge-request.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(judge_request["artifact_type"], "retrospective-judge-request")
+            self.assertEqual(result["pipeline_retrospective"]["judge"]["status"], "passed")
+            stdout_log = (run_dir / "retrospective-judge-stdout.log").read_text(encoding="utf-8")
+            self.assertIn("[REDACTED]", stdout_log)
+            self.assertNotIn("ghp_secret_merge_retrospective_1234567890", stdout_log)
+            self.assertNotIn("ghp_secret_judge_1234567890", stdout_log)
+
     def test_workstream_records_retrospective_judge_failure_without_changing_publication_or_tracker(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)

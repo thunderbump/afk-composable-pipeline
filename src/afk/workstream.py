@@ -25,6 +25,7 @@ REVIEW_CYCLE_OPEN_STATUSES = {"findings-open", "request-changes"}
 REVIEW_CYCLE_RESPONSE_STATUSES = {"addressed", "findings-addressed"}
 TERMINAL_REVIEW_FEEDBACK_STATUSES = {"resolved", "waived"}
 COMMAND_BEARER_SECRET_PATTERN = re.compile(r"\bBearer\s+[A-Za-z0-9._~+/=-]{12,}", re.IGNORECASE)
+PI_JUDGE_PROMPT_PLACEHOLDER = "{prompt}"
 
 
 @dataclass(frozen=True)
@@ -2030,6 +2031,7 @@ def _run_retrospective_judge(
         adapter_result, raw_payload = _run_retrospective_judge_command(
             judge,
             checkout_path=checkout_path,
+            request=request,
             request_path=request_path,
             result_path=result_path,
         )
@@ -2146,6 +2148,7 @@ def _run_retrospective_judge_command(
     judge: dict[str, Any],
     *,
     checkout_path: Path,
+    request: dict[str, Any],
     request_path: Path,
     result_path: Path,
 ) -> tuple[dict[str, Any], str | None]:
@@ -2154,7 +2157,12 @@ def _run_retrospective_judge_command(
         env = _minimal_retrospective_judge_environment(temp_path)
         env["AFK_RETROSPECTIVE_JUDGE_REQUEST"] = str(request_path)
         env["AFK_RETROSPECTIVE_JUDGE_RESULT"] = str(result_path)
-        command = _render_retrospective_judge_command(judge["command"], request_path=request_path, result_path=result_path)
+        command = _render_retrospective_judge_command(
+            judge["command"],
+            judge_prompt=canonical_json(request),
+            request_path=request_path,
+            result_path=result_path,
+        )
         try:
             completed = subprocess.run(
                 command,
@@ -2201,8 +2209,15 @@ def _run_retrospective_judge_command(
     }, raw_payload
 
 
-def _render_retrospective_judge_command(command: list[str], *, request_path: Path, result_path: Path) -> list[str]:
+def _render_retrospective_judge_command(
+    command: list[str],
+    *,
+    judge_prompt: str,
+    request_path: Path,
+    result_path: Path,
+) -> list[str]:
     replacements = {
+        PI_JUDGE_PROMPT_PLACEHOLDER: judge_prompt,
         "{request_path}": str(request_path),
         "{result_path}": str(result_path),
     }
@@ -2544,6 +2559,7 @@ def _run_retrospective_follow_up_command(
         env["AFK_RETROSPECTIVE_FOLLOW_UP_RESULT"] = str(result_path)
         command = _render_retrospective_judge_command(
             follow_up_config["command"],
+            judge_prompt="",
             request_path=request_path,
             result_path=result_path,
         )

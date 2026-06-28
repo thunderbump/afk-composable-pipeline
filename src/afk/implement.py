@@ -25,6 +25,7 @@ SCHEMA_VERSION = 1
 WRAPPER_SECRET_FILE_NAME_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9_-]*$")
 SECRET_REF_LOGICAL_NAME_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9_-]*$")
 MIN_RUNTIME_SECRET_LENGTH = 4
+PI_JOB_PROMPT_PLACEHOLDER = "{prompt}"
 
 
 class AgentRuntimeError(RuntimeError):
@@ -757,9 +758,10 @@ def run_agent_command(
             env["CODEX_HOME"] = agent["codex_home"]
         env["AFK_JOB_CAPSULE"] = str(capsule_path)
         env["AFK_AGENT_RESULT_PATH"] = agent["result_path"]
+        command = _render_agent_command(agent["command"], prompt=canonical_json(capsule))
         try:
             completed = subprocess.run(
-                agent["command"],
+                command,
                 cwd=checkout_path,
                 env=env,
                 text=True,
@@ -778,18 +780,25 @@ def run_agent_command(
                 stderr=stderr or "agent command timed out",
                 returncode=None,
             ) from exc
-    if completed.returncode != 0:
-        raise AgentRuntimeError(
-            "agent command failed",
-            stdout=completed.stdout,
-            stderr=completed.stderr,
-            returncode=completed.returncode,
-        )
+        if completed.returncode != 0:
+            raise AgentRuntimeError(
+                "agent command failed",
+                stdout=completed.stdout,
+                stderr=completed.stderr,
+                returncode=completed.returncode,
+            )
     return {
         "returncode": completed.returncode,
         "stdout": completed.stdout,
         "stderr": completed.stderr,
     }
+
+
+def _render_agent_command(command: list[str], *, prompt: str) -> list[str]:
+    rendered: list[str] = []
+    for part in command:
+        rendered.append(part.replace(PI_JOB_PROMPT_PLACEHOLDER, prompt))
+    return rendered
 
 
 def minimal_agent_environment(temp_path: Path, *, config_home: str = "") -> dict[str, str]:
