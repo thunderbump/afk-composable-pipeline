@@ -2621,6 +2621,564 @@ class ImplementCliTest(unittest.TestCase):
             self.assertEqual(agent_result["result"]["adapter"]["returncode"], 0)
             self.assertIn("no result produced", agent_result["result"]["evidence"]["stdout_excerpt"])
 
+    def test_implement_recovers_missing_real_agent_result_when_stdout_and_clean_commit_exist(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            checkout = temp_path / "checkout"
+            start_commit = init_checkout(checkout)
+            ledger = temp_path / "ledger"
+            codex_home = temp_path / "codex-home"
+            config_home = temp_path / "config-home"
+            pi_config_home = temp_path / "pi-config"
+            codex_home.mkdir()
+            config_home.mkdir()
+            pi_config_home.mkdir()
+            agent_code = textwrap.dedent(
+                """
+                import subprocess
+                from pathlib import Path
+
+                Path("implemented.txt").write_text("implemented from stdout\\n", encoding="utf-8")
+                subprocess.run(["git", "add", "implemented.txt"], check=True)
+                subprocess.run(["git", "commit", "-m", "implement from stdout"], check=True)
+                print("Implemented in commit.")
+                print("Validation: smoke passed.")
+                """
+            ).strip()
+
+            completed = run_afk(
+                "run-step",
+                "implement",
+                "--input",
+                json.dumps(
+                    {
+                        "work_selection": {"schema_version": 1, "selected_work": [selected_work()]},
+                        "checkout": {
+                            "status": "prepared",
+                            "checkout_path": str(checkout),
+                            "review_branch": "afk/test-work",
+                            "requested_ref": "main",
+                            "start_commit": start_commit,
+                        },
+                        "guardrails": [],
+                        "validation": {"profile": "tier1", "commands": []},
+                        "agent": {
+                            "type": "real-agent-command",
+                            "command": [sys.executable, "-c", agent_code],
+                            "result_path": "agent-result.json",
+                            "timeout_seconds": 10,
+                            "codex_home": str(codex_home),
+                            "config_home": str(config_home),
+                            "env": {"PI_CONFIG_HOME": str(pi_config_home)},
+                        },
+                    }
+                ),
+                "--ledger",
+                str(ledger),
+                env_overrides={
+                    "GIT_AUTHOR_NAME": "AFK Test",
+                    "GIT_AUTHOR_EMAIL": "afk-test@example.test",
+                    "GIT_COMMITTER_NAME": "AFK Test",
+                    "GIT_COMMITTER_EMAIL": "afk-test@example.test",
+                },
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+            agent_result = json.loads((run_dir / "agent-result.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(result["output"]["status"], "implemented")
+            self.assertEqual(result["output"]["classification"], "success")
+            self.assertEqual(result["output"]["summary"], "Implemented in commit.")
+            self.assertEqual(result["output"]["git"]["dirty"], False)
+            self.assertEqual(result["output"]["git"]["changed_files"], ["implemented.txt"])
+            self.assertEqual(agent_result["result"]["status"], "implemented")
+            self.assertIn("agent-result.json missing", agent_result["result"]["notes"][0])
+            self.assertIn("Validation: smoke passed.", agent_result["result"]["evidence"]["stdout_excerpt"])
+
+    def test_implement_does_not_recover_missing_real_agent_result_with_dirty_checkout(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            checkout = temp_path / "checkout"
+            start_commit = init_checkout(checkout)
+            ledger = temp_path / "ledger"
+            codex_home = temp_path / "codex-home"
+            config_home = temp_path / "config-home"
+            pi_config_home = temp_path / "pi-config"
+            codex_home.mkdir()
+            config_home.mkdir()
+            pi_config_home.mkdir()
+            agent_code = "from pathlib import Path; Path('dirty.txt').write_text('dirty\\n', encoding='utf-8'); print('Implemented')"
+
+            completed = run_afk(
+                "run-step",
+                "implement",
+                "--input",
+                json.dumps(
+                    {
+                        "work_selection": {"schema_version": 1, "selected_work": [selected_work()]},
+                        "checkout": {
+                            "status": "prepared",
+                            "checkout_path": str(checkout),
+                            "review_branch": "afk/test-work",
+                            "requested_ref": "main",
+                            "start_commit": start_commit,
+                        },
+                        "guardrails": [],
+                        "validation": {"profile": "tier1", "commands": []},
+                        "agent": {
+                            "type": "real-agent-command",
+                            "command": [sys.executable, "-c", agent_code],
+                            "result_path": "agent-result.json",
+                            "timeout_seconds": 10,
+                            "codex_home": str(codex_home),
+                            "config_home": str(config_home),
+                            "env": {"PI_CONFIG_HOME": str(pi_config_home)},
+                        },
+                    }
+                ),
+                "--ledger",
+                str(ledger),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+            agent_result = json.loads((run_dir / "agent-result.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(result["output"]["status"], "failed_protocol")
+            self.assertEqual(result["output"]["summary"], "agent result file was not produced")
+            self.assertEqual(result["output"]["git"]["dirty"], True)
+            self.assertEqual(result["output"]["git"]["commits"], [])
+            self.assertEqual(agent_result["result"]["failures"][0]["message"], "agent result file was not produced")
+
+    def test_implement_does_not_recover_missing_real_agent_result_without_success_signal(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            checkout = temp_path / "checkout"
+            start_commit = init_checkout(checkout)
+            ledger = temp_path / "ledger"
+            codex_home = temp_path / "codex-home"
+            config_home = temp_path / "config-home"
+            pi_config_home = temp_path / "pi-config"
+            codex_home.mkdir()
+            config_home.mkdir()
+            pi_config_home.mkdir()
+            agent_code = textwrap.dedent(
+                """
+                import subprocess
+                from pathlib import Path
+
+                Path("implemented.txt").write_text("ambiguous output\\n", encoding="utf-8")
+                subprocess.run(["git", "add", "implemented.txt"], check=True)
+                subprocess.run(["git", "commit", "-m", "ambiguous missing result"], check=True)
+                print("ERROR: something went wrong")
+                """
+            ).strip()
+
+            completed = run_afk(
+                "run-step",
+                "implement",
+                "--input",
+                json.dumps(
+                    {
+                        "work_selection": {"schema_version": 1, "selected_work": [selected_work()]},
+                        "checkout": {
+                            "status": "prepared",
+                            "checkout_path": str(checkout),
+                            "review_branch": "afk/test-work",
+                            "requested_ref": "main",
+                            "start_commit": start_commit,
+                        },
+                        "guardrails": [],
+                        "validation": {"profile": "tier1", "commands": []},
+                        "agent": {
+                            "type": "real-agent-command",
+                            "command": [sys.executable, "-c", agent_code],
+                            "result_path": "agent-result.json",
+                            "timeout_seconds": 10,
+                            "codex_home": str(codex_home),
+                            "config_home": str(config_home),
+                            "env": {"PI_CONFIG_HOME": str(pi_config_home)},
+                        },
+                    }
+                ),
+                "--ledger",
+                str(ledger),
+                env_overrides={
+                    "GIT_AUTHOR_NAME": "AFK Test",
+                    "GIT_AUTHOR_EMAIL": "afk-test@example.test",
+                    "GIT_COMMITTER_NAME": "AFK Test",
+                    "GIT_COMMITTER_EMAIL": "afk-test@example.test",
+                },
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+            agent_result = json.loads((run_dir / "agent-result.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(result["output"]["status"], "failed_protocol")
+            self.assertEqual(result["output"]["summary"], "agent result file was not produced")
+            self.assertEqual(result["output"]["git"]["dirty"], False)
+            self.assertEqual(result["output"]["git"]["changed_files"], ["implemented.txt"])
+            self.assertIn("ERROR: something went wrong", agent_result["result"]["evidence"]["stdout_excerpt"])
+
+    def test_implement_recovered_stdout_summary_preserves_bracketed_human_line(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            checkout = temp_path / "checkout"
+            start_commit = init_checkout(checkout)
+            ledger = temp_path / "ledger"
+            codex_home = temp_path / "codex-home"
+            config_home = temp_path / "config-home"
+            pi_config_home = temp_path / "pi-config"
+            codex_home.mkdir()
+            config_home.mkdir()
+            pi_config_home.mkdir()
+            agent_code = textwrap.dedent(
+                """
+                import subprocess
+                from pathlib import Path
+
+                Path("implemented.txt").write_text("bracketed summary\\n", encoding="utf-8")
+                subprocess.run(["git", "add", "implemented.txt"], check=True)
+                subprocess.run(["git", "commit", "-m", "bracketed summary"], check=True)
+                print("[done] all good")
+                print("Implemented.")
+                print("Validation: smoke passed.")
+                """
+            ).strip()
+
+            completed = run_afk(
+                "run-step",
+                "implement",
+                "--input",
+                json.dumps(
+                    {
+                        "work_selection": {"schema_version": 1, "selected_work": [selected_work()]},
+                        "checkout": {
+                            "status": "prepared",
+                            "checkout_path": str(checkout),
+                            "review_branch": "afk/test-work",
+                            "requested_ref": "main",
+                            "start_commit": start_commit,
+                        },
+                        "guardrails": [],
+                        "validation": {"profile": "tier1", "commands": []},
+                        "agent": {
+                            "type": "real-agent-command",
+                            "command": [sys.executable, "-c", agent_code],
+                            "result_path": "agent-result.json",
+                            "timeout_seconds": 10,
+                            "codex_home": str(codex_home),
+                            "config_home": str(config_home),
+                            "env": {"PI_CONFIG_HOME": str(pi_config_home)},
+                        },
+                    }
+                ),
+                "--ledger",
+                str(ledger),
+                env_overrides={
+                    "GIT_AUTHOR_NAME": "AFK Test",
+                    "GIT_AUTHOR_EMAIL": "afk-test@example.test",
+                    "GIT_COMMITTER_NAME": "AFK Test",
+                    "GIT_COMMITTER_EMAIL": "afk-test@example.test",
+                },
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(result["output"]["status"], "implemented")
+            self.assertEqual(result["output"]["summary"], "[done] all good")
+
+    def test_implement_does_not_recover_missing_real_agent_result_with_negated_success_word(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            checkout = temp_path / "checkout"
+            start_commit = init_checkout(checkout)
+            ledger = temp_path / "ledger"
+            codex_home = temp_path / "codex-home"
+            config_home = temp_path / "config-home"
+            pi_config_home = temp_path / "pi-config"
+            codex_home.mkdir()
+            config_home.mkdir()
+            pi_config_home.mkdir()
+            agent_code = textwrap.dedent(
+                """
+                import subprocess
+                from pathlib import Path
+
+                Path("implemented.txt").write_text("negated output\\n", encoding="utf-8")
+                subprocess.run(["git", "add", "implemented.txt"], check=True)
+                subprocess.run(["git", "commit", "-m", "negated output"], check=True)
+                print("not implemented yet")
+                """
+            ).strip()
+
+            completed = run_afk(
+                "run-step",
+                "implement",
+                "--input",
+                json.dumps(
+                    {
+                        "work_selection": {"schema_version": 1, "selected_work": [selected_work()]},
+                        "checkout": {
+                            "status": "prepared",
+                            "checkout_path": str(checkout),
+                            "review_branch": "afk/test-work",
+                            "requested_ref": "main",
+                            "start_commit": start_commit,
+                        },
+                        "guardrails": [],
+                        "validation": {"profile": "tier1", "commands": []},
+                        "agent": {
+                            "type": "real-agent-command",
+                            "command": [sys.executable, "-c", agent_code],
+                            "result_path": "agent-result.json",
+                            "timeout_seconds": 10,
+                            "codex_home": str(codex_home),
+                            "config_home": str(config_home),
+                            "env": {"PI_CONFIG_HOME": str(pi_config_home)},
+                        },
+                    }
+                ),
+                "--ledger",
+                str(ledger),
+                env_overrides={
+                    "GIT_AUTHOR_NAME": "AFK Test",
+                    "GIT_AUTHOR_EMAIL": "afk-test@example.test",
+                    "GIT_COMMITTER_NAME": "AFK Test",
+                    "GIT_COMMITTER_EMAIL": "afk-test@example.test",
+                },
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(result["output"]["status"], "failed_protocol")
+            self.assertEqual(result["output"]["summary"], "agent result file was not produced")
+
+    def test_implement_recovers_missing_real_agent_result_with_successful_test_summary(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            checkout = temp_path / "checkout"
+            start_commit = init_checkout(checkout)
+            ledger = temp_path / "ledger"
+            codex_home = temp_path / "codex-home"
+            config_home = temp_path / "config-home"
+            pi_config_home = temp_path / "pi-config"
+            codex_home.mkdir()
+            config_home.mkdir()
+            pi_config_home.mkdir()
+            agent_code = textwrap.dedent(
+                """
+                import subprocess
+                from pathlib import Path
+
+                Path("implemented.txt").write_text("test summary\\n", encoding="utf-8")
+                subprocess.run(["git", "add", "implemented.txt"], check=True)
+                subprocess.run(["git", "commit", "-m", "test summary"], check=True)
+                print("Implemented.")
+                print("12 passed, 0 failed")
+                """
+            ).strip()
+
+            completed = run_afk(
+                "run-step",
+                "implement",
+                "--input",
+                json.dumps(
+                    {
+                        "work_selection": {"schema_version": 1, "selected_work": [selected_work()]},
+                        "checkout": {
+                            "status": "prepared",
+                            "checkout_path": str(checkout),
+                            "review_branch": "afk/test-work",
+                            "requested_ref": "main",
+                            "start_commit": start_commit,
+                        },
+                        "guardrails": [],
+                        "validation": {"profile": "tier1", "commands": []},
+                        "agent": {
+                            "type": "real-agent-command",
+                            "command": [sys.executable, "-c", agent_code],
+                            "result_path": "agent-result.json",
+                            "timeout_seconds": 10,
+                            "codex_home": str(codex_home),
+                            "config_home": str(config_home),
+                            "env": {"PI_CONFIG_HOME": str(pi_config_home)},
+                        },
+                    }
+                ),
+                "--ledger",
+                str(ledger),
+                env_overrides={
+                    "GIT_AUTHOR_NAME": "AFK Test",
+                    "GIT_AUTHOR_EMAIL": "afk-test@example.test",
+                    "GIT_COMMITTER_NAME": "AFK Test",
+                    "GIT_COMMITTER_EMAIL": "afk-test@example.test",
+                },
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(result["output"]["status"], "implemented")
+            self.assertEqual(result["output"]["summary"], "Implemented.")
+
+    def test_implement_recovers_missing_real_agent_result_with_common_done_signal(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            checkout = temp_path / "checkout"
+            start_commit = init_checkout(checkout)
+            ledger = temp_path / "ledger"
+            codex_home = temp_path / "codex-home"
+            config_home = temp_path / "config-home"
+            pi_config_home = temp_path / "pi-config"
+            codex_home.mkdir()
+            config_home.mkdir()
+            pi_config_home.mkdir()
+            agent_code = textwrap.dedent(
+                """
+                import subprocess
+                from pathlib import Path
+
+                Path("implemented.txt").write_text("done signal\\n", encoding="utf-8")
+                subprocess.run(["git", "add", "implemented.txt"], check=True)
+                subprocess.run(["git", "commit", "-m", "done signal"], check=True)
+                print("Done.")
+                print("All changes committed.")
+                """
+            ).strip()
+
+            completed = run_afk(
+                "run-step",
+                "implement",
+                "--input",
+                json.dumps(
+                    {
+                        "work_selection": {"schema_version": 1, "selected_work": [selected_work()]},
+                        "checkout": {
+                            "status": "prepared",
+                            "checkout_path": str(checkout),
+                            "review_branch": "afk/test-work",
+                            "requested_ref": "main",
+                            "start_commit": start_commit,
+                        },
+                        "guardrails": [],
+                        "validation": {"profile": "tier1", "commands": []},
+                        "agent": {
+                            "type": "real-agent-command",
+                            "command": [sys.executable, "-c", agent_code],
+                            "result_path": "agent-result.json",
+                            "timeout_seconds": 10,
+                            "codex_home": str(codex_home),
+                            "config_home": str(config_home),
+                            "env": {"PI_CONFIG_HOME": str(pi_config_home)},
+                        },
+                    }
+                ),
+                "--ledger",
+                str(ledger),
+                env_overrides={
+                    "GIT_AUTHOR_NAME": "AFK Test",
+                    "GIT_AUTHOR_EMAIL": "afk-test@example.test",
+                    "GIT_COMMITTER_NAME": "AFK Test",
+                    "GIT_COMMITTER_EMAIL": "afk-test@example.test",
+                },
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(result["output"]["status"], "implemented")
+            self.assertEqual(result["output"]["summary"], "Done.")
+
+    def test_implement_recovered_stdout_summary_skips_git_status_chatter(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            checkout = temp_path / "checkout"
+            start_commit = init_checkout(checkout)
+            ledger = temp_path / "ledger"
+            codex_home = temp_path / "codex-home"
+            config_home = temp_path / "config-home"
+            pi_config_home = temp_path / "pi-config"
+            codex_home.mkdir()
+            config_home.mkdir()
+            pi_config_home.mkdir()
+            agent_code = textwrap.dedent(
+                """
+                import subprocess
+                from pathlib import Path
+
+                Path("implemented.txt").write_text("git chatter\\n", encoding="utf-8")
+                subprocess.run(["git", "add", "implemented.txt"], check=True)
+                subprocess.run(["git", "commit", "-m", "git chatter"], check=True)
+                print("On branch afk/test-work")
+                print("Your branch is up to date with 'origin/main'.")
+                print("Implemented.")
+                """
+            ).strip()
+
+            completed = run_afk(
+                "run-step",
+                "implement",
+                "--input",
+                json.dumps(
+                    {
+                        "work_selection": {"schema_version": 1, "selected_work": [selected_work()]},
+                        "checkout": {
+                            "status": "prepared",
+                            "checkout_path": str(checkout),
+                            "review_branch": "afk/test-work",
+                            "requested_ref": "main",
+                            "start_commit": start_commit,
+                        },
+                        "guardrails": [],
+                        "validation": {"profile": "tier1", "commands": []},
+                        "agent": {
+                            "type": "real-agent-command",
+                            "command": [sys.executable, "-c", agent_code],
+                            "result_path": "agent-result.json",
+                            "timeout_seconds": 10,
+                            "codex_home": str(codex_home),
+                            "config_home": str(config_home),
+                            "env": {"PI_CONFIG_HOME": str(pi_config_home)},
+                        },
+                    }
+                ),
+                "--ledger",
+                str(ledger),
+                env_overrides={
+                    "GIT_AUTHOR_NAME": "AFK Test",
+                    "GIT_AUTHOR_EMAIL": "afk-test@example.test",
+                    "GIT_COMMITTER_NAME": "AFK Test",
+                    "GIT_COMMITTER_EMAIL": "afk-test@example.test",
+                },
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(result["output"]["status"], "implemented")
+            self.assertEqual(result["output"]["summary"], "Implemented.")
+
     def test_implement_does_not_expose_ambient_secrets_to_adapter(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
