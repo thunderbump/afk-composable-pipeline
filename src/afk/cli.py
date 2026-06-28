@@ -19,6 +19,7 @@ from afk.recipes import (
     real_local_recipe_agent,
     write_recipe,
 )
+from afk.run_next import run_next
 from afk.registry import (
     StepContext,
     StepRegistry,
@@ -182,6 +183,40 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
 
+    if args.command == "run-next":
+        try:
+            project_contract = load_project_contract(
+                args.project,
+                Path(args.contracts_dir),
+                cwd=Path.cwd(),
+            )
+        except ContractError as exc:
+            parser.error(str(exc))
+        if args.validation_profile not in project_contract.validation_profiles:
+            parser.error(
+                f"--validation-profile must be declared by project {project_contract.project_slug}: "
+                f"{', '.join(project_contract.validation_profiles)}"
+            )
+        path_error = checkout_path_error(args.checkout_root, args.checkout_path)
+        if path_error is not None:
+            parser.error(path_error)
+        try:
+            payload = run_next(
+                project_contract=project_contract,
+                beads_workspace=Path(args.beads_workspace) if args.beads_workspace else None,
+                checkout_root=Path(args.checkout_root),
+                checkout_path=Path(args.checkout_path),
+                validation_profile=args.validation_profile,
+                ready_tag=args.ready_tag,
+                selector_mode=args.selector_mode,
+                selector_model=args.selector_model,
+                selector_choice_json=args.selector_choice_json,
+            )
+        except ValueError as exc:
+            parser.error(str(exc))
+        print(canonical_json(payload))
+        return 0
+
     parser.print_help()
     return 1
 
@@ -285,6 +320,45 @@ def build_parser() -> argparse.ArgumentParser:
         help="Absolute mounted gh config dir for publisher create mode",
     )
     generate_recipe_parser.add_argument("--output", required=True, help="Path to write the JSON recipe")
+
+    run_next_parser = subcommands.add_parser(
+        "run-next",
+        help="Discover the next project item and emit an inspectable run-workstream recipe",
+    )
+    run_next_parser.add_argument("--project", required=True, help="Project slug for contract resolution")
+    run_next_parser.add_argument(
+        "--contracts-dir",
+        default="project-contracts",
+        help="Directory containing project contract JSON files",
+    )
+    run_next_parser.add_argument(
+        "--beads-workspace",
+        default=str(Path("/home/bump/Projects/beads")),
+        help="Absolute mounted central Beads workspace",
+    )
+    run_next_parser.add_argument("--checkout-root", required=True, help="Explicit checkout root mount")
+    run_next_parser.add_argument("--checkout-path", required=True, help="Explicit checkout path under checkout root")
+    run_next_parser.add_argument("--validation-profile", required=True, help="Project validation profile name")
+    run_next_parser.add_argument(
+        "--ready-tag",
+        default="ready-for-agent",
+        help="Ready tag required on issues considered for autonomous selection",
+    )
+    run_next_parser.add_argument(
+        "--selector-mode",
+        choices=("deterministic", "model"),
+        default="deterministic",
+        help="Selector policy for choosing among valid candidates",
+    )
+    run_next_parser.add_argument(
+        "--selector-model",
+        help="Optional lightweight selector model name",
+    )
+    run_next_parser.add_argument(
+        "--selector-choice-json",
+        help="Optional JSON selector choice payload for model mode",
+    )
+    run_next_parser.add_argument("--ledger", help="Optional ledger directory for downstream execution")
 
     return parser
 

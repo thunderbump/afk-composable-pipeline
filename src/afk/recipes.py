@@ -24,6 +24,7 @@ def generate_workstream_recipe(
     validation_input: dict[str, Any] | None = None,
     agent: dict[str, Any] | None = None,
     publisher: dict[str, Any] | None = None,
+    sources: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     if url_has_secret_material(project_contract.repo_url):
         raise ValueError("project contract repo_url must not contain embedded credentials or query parameters")
@@ -45,7 +46,9 @@ def generate_workstream_recipe(
                     "target_ids": [workstream_id],
                     "required_labels": required_labels,
                     "allowed_statuses": ["open", "in_progress"],
-                    "sources": [
+                    "sources": sources
+                    if sources is not None
+                    else [
                         {
                             "type": "beads",
                             "id": "central-beads",
