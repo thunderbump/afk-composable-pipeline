@@ -26,6 +26,7 @@ def run_next(
     checkout_root: Path,
     checkout_path: Path,
     validation_profile: str,
+    agent: dict[str, Any] | None = None,
     ready_tag: str = READY_TAG,
     selector_mode: str = "deterministic",
     selector_model: str | None = None,
@@ -57,6 +58,7 @@ def run_next(
             checkout_root=checkout_root,
             checkout_path=checkout_path,
             validation_profile=validation_profile,
+            agent=agent,
             sources=selection_request["sources"],
             required_labels=selection_request["required_labels"],
         )
