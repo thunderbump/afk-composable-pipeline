@@ -162,6 +162,14 @@ The recipe schema is intentionally small:
   `status: "findings-addressed"`; a non-empty response string is also accepted
   as freeform addressed evidence. Repeated cycles are preserved so findings
   from earlier passes are not overwritten.
+- `retrospective` is optional terminal evidence for a merged or explicit
+  `no-merge` tracker decision. It carries a concise summary plus optional
+  `changes`, `validation`, `review`, `unresolved_risks`, and
+  `process_findings` string lists, optional `follow_up.recommended` /
+  `follow_up.created` Beads references (`id`, `summary`, `labels`), and
+  optional note-path lists under `notes.personal_work` and `notes.spikes`.
+  Keep retrospective note paths free of secrets; AFK redacts sensitive-looking
+  values before writing ledger outputs.
 - `tracker.terminal_decision` is optional. Leave it unset while a PR is open or
   under review. Set `{"status":"merged","merge_commit":"<sha>","pr_url":"<url>"}`
   only after the PR merges, or
@@ -609,6 +617,13 @@ advances to `review-feedback-addressed` and still keeps the source item open
 until merge or no-merge. AFK only treats a response object as addressed when
 its `status` is `addressed` or `findings-addressed`; a non-empty response
 string is the freeform addressed evidence path.
+`retrospective` evidence, when supplied, is also included in both
+`workstream-result.json` and `tracker-result.json`. Use
+`notes.personal_work` for concise daily work summaries kept under
+`~/Documents/rmd/Ceremonies/Personal Work/work/YYYY-MM-DD-personal.md`. Use
+`notes.spikes` for investigation or audit notes that should be preserved under
+`~/Documents/rmd/Ceremonies/Personal Work/spikes/`. Do not record secrets in
+either path or note content.
 Step-level outputs may still use other status strings; specifically,
 `prepare-checkout` uses `publication.status == "skipped_disabled"` when
 the checkout publisher path is intentionally disabled.

@@ -385,3 +385,65 @@ class WorkstreamStatusMappingTest(unittest.TestCase):
             "Superseded by follow-up PR",
         )
         self.assertIn("waived before closure", record["comment"])
+
+    def test_tracker_record_includes_redacted_retrospective_for_terminal_no_merge(self):
+        record = tracker_record(
+            {
+                "workstream_id": "central-afk-pr.17",
+                "tracker": {
+                    "terminal_decision": {
+                        "status": "no-merge",
+                        "merge_commit": "",
+                        "reason": "Superseded by follow-up PR",
+                        "pr_url": "https://github.example/pr/17",
+                        "review_feedback_status": "",
+                    }
+                },
+                "review_cycles": [],
+                "retrospective": {
+                    "summary": "No-merge after token=ghp_no_merge_retrospective_secret_1234567890 follow-up.",
+                    "changes": ["Documented why the branch will not merge."],
+                    "validation": ["Validation remained green before the no-merge decision."],
+                    "review": ["Final review passed; publication was intentionally skipped."],
+                    "unresolved_risks": ["Follow-up work still needs manual tracking."],
+                    "process_findings": ["Terminal no-merge decisions still need retrospective evidence."],
+                    "follow_up": {
+                        "recommended": [
+                            {
+                                "id": "central-3x6.7",
+                                "summary": "Track the superseding workstream.",
+                                "labels": ["project:afk-composable-pipeline"],
+                            }
+                        ],
+                        "created": [],
+                    },
+                    "notes": {
+                        "personal_work": [
+                            "~/Documents/rmd/Ceremonies/Personal Work/work/2026-06-27-personal.md",
+                        ],
+                        "spikes": [],
+                    },
+                },
+            },
+            tracker_state(
+                terminal_decision={
+                    "status": "no-merge",
+                    "merge_commit": "",
+                    "reason": "Superseded by follow-up PR",
+                    "pr_url": "https://github.example/pr/17",
+                    "review_feedback_status": "",
+                }
+            ),
+            {"status": "tracker-closed"},
+        )
+
+        self.assertEqual(record["status"], "closed")
+        self.assertIn("[REDACTED]", record["retrospective"]["summary"])
+        self.assertEqual(
+            record["retrospective"]["follow_up"]["recommended"][0]["labels"],
+            ["project:afk-composable-pipeline"],
+        )
+        self.assertEqual(
+            record["retrospective"]["notes"]["personal_work"],
+            ["~/Documents/rmd/Ceremonies/Personal Work/work/2026-06-27-personal.md"],
+        )
