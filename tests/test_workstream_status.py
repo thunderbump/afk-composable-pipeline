@@ -90,6 +90,21 @@ def retrospective_tracker(status="awaiting-review"):
 
 
 class WorkstreamStatusMappingTest(unittest.TestCase):
+    def test_pipeline_retrospective_record_marks_judge_disabled_by_default(self):
+        record = pipeline_retrospective_record(
+            retrospective_state(),
+            {"status": "published", "url": "https://github.example/pr/17"},
+            retrospective_tracker(),
+        )
+
+        self.assertEqual(
+            record["judge"],
+            {
+                "enabled": False,
+                "status": "disabled",
+            },
+        )
+
     def test_pipeline_retrospective_record_reports_clean_published_run_without_signals(self):
         record = pipeline_retrospective_record(
             retrospective_state(),
