@@ -2124,6 +2124,8 @@ def _run_retrospective_judge_command(
                 cwd=checkout_path,
                 env=env,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 capture_output=True,
                 check=False,
                 timeout=judge["timeout_seconds"],
@@ -2146,7 +2148,7 @@ def _run_retrospective_judge_command(
                 stderr=stderr or "retrospective judge command timed out",
                 timed_out=True,
             ) from exc
-        raw_payload = result_path.read_text(encoding="utf-8") if result_path.exists() else None
+        raw_payload = result_path.read_text(encoding="utf-8", errors="replace") if result_path.exists() else None
     if completed.returncode != 0:
         raise _RetrospectiveJudgeError(
             "retrospective judge command failed",
