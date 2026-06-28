@@ -329,6 +329,13 @@ validation profile, local fake implementation/validation/review adapters, and
 when real worker/publisher credentials are intentionally available; the
 generator does not invent credentials.
 
+For a real Pi implementation worker using Codex subscription auth, pass
+`--agent-mode pi` with the usual `--agent-codex-home`, `--agent-config-home`,
+and legacy `--agent-pi-config-home` mounts, plus
+`--agent-pi-coding-agent-dir /path/outside/checkout`. The generated recipe will
+emit `PI_CODING_AGENT_DIR` for Pi's agent auth lookup and will not emit
+`--api-key`, `OPENAI_API_KEY`, or token values.
+
 For `--validation-mode project-worker`, the generator embeds the worker host
 contract into `steps[].input.validation`. By default that keeps
 `validation.worker_home` under `checkout_root/.validation-worker/<checkout-name>`
@@ -435,8 +442,8 @@ auth/config mounts up front and stores only their paths in the job capsule.
 |---|---|---|---|---|
 | Codex config dir | `agent.codex_home` | `CODEX_HOME` | required | absolute existing directory outside checkout; runner should provision `auth.json` when Codex auth is needed |
 | shared config state | `agent.config_home` | `XDG_CONFIG_HOME` | required | absolute existing directory outside checkout |
-| Pi config | `agent.env.PI_CONFIG_HOME` | `PI_CONFIG_HOME` | required | absolute existing directory outside checkout |
-| Pi coding agent dir | `agent.env.PI_CODING_AGENT_DIR` | `PI_CODING_AGENT_DIR` | recommended | absolute path outside checkout |
+| Pi config | `agent.env.PI_CONFIG_HOME` | `PI_CONFIG_HOME` | required legacy/config-state mount | absolute existing directory outside checkout; not used by Pi for Codex subscription provider auth |
+| Pi coding agent dir | `agent.env.PI_CODING_AGENT_DIR` | `PI_CODING_AGENT_DIR` | required for Pi `openai-codex` subscription auth | absolute existing directory outside checkout; provision Pi `auth.json` here with command/reference-based auth, not token literals |
 | Pi session state dir | `agent.env.PI_CODING_AGENT_SESSION_DIR` | `PI_CODING_AGENT_SESSION_DIR` | recommended | absolute path outside checkout |
 | wrapped secrets | `agent.wrapper_secret_files.<name>` | `AFK_JOB_CAPSULE -> capsule.agent_mounts.wrapper_secret_files` | optional | absolute existing files outside checkout, path-only values, non-secret logical keys |
 
@@ -446,9 +453,19 @@ the adapter.
 
 AFK currently validates the required mount directories and records
 `codex_home`, `config_home`, `pi_config_home`, and wrapper secret file paths in
-the job capsule. Additional Pi path env such as `PI_CODING_AGENT_DIR` and
-`PI_CODING_AGENT_SESSION_DIR` is passed through to the adapter environment after
-path validation, but is not yet copied into `capsule.agent_mounts`.
+the job capsule. `PI_CODING_AGENT_DIR` and `PI_CODING_AGENT_SESSION_DIR` are
+passed through to the adapter environment after path validation.
+
+For Pi workers using `--provider openai-codex`, use
+`--agent-pi-coding-agent-dir /path/outside/checkout` so generated recipes set
+`agent.env.PI_CODING_AGENT_DIR`. That directory should be provisioned outside
+git with Pi's agent auth config, for example an `auth.json` that uses Pi's
+`api_key` command/reference mechanism to resolve Codex subscription credentials
+at runtime. Do not put resolved API keys, tokens, or `--api-key` values in AFK
+recipe JSON, shell recipes, Beads comments, or logs. `PI_CONFIG_HOME` is kept for
+compatibility with older Pi/config state, but setting only `PI_CONFIG_HOME` is
+not a supported Codex subscription auth injection path and can still fail with
+`No API key for provider: openai-codex`.
 
 AFK forwards wrapper secret file paths only; it never forwards secret values in
 `agent.env` or command args. Wrapper-side consumers read mounted files and export
