@@ -25,6 +25,9 @@ REVIEW_CYCLE_OPEN_STATUSES = {"findings-open", "request-changes"}
 REVIEW_CYCLE_RESPONSE_STATUSES = {"addressed", "findings-addressed"}
 TERMINAL_REVIEW_FEEDBACK_STATUSES = {"resolved", "waived"}
 COMMAND_BEARER_SECRET_PATTERN = re.compile(r"\bBearer\s+[A-Za-z0-9._~+/=-]{12,}", re.IGNORECASE)
+PI_JUDGE_PROMPT_PLACEHOLDER = "{prompt}"
+PI_JUDGE_REQUEST_PATH_PLACEHOLDER = "{request_path}"
+PI_JUDGE_RESULT_PATH_PLACEHOLDER = "{result_path}"
 
 
 @dataclass(frozen=True)
@@ -2019,6 +2022,7 @@ def _run_retrospective_judge(
         pipeline_retrospective=pipeline_retrospective,
     )
     request = _build_retrospective_judge_request(evidence_pack, run_id=ledger.run_id)
+    request_prompt = _retrospective_judge_prompt_request(request)
     request_path = ledger.path / "retrospective-judge-request.json"
     result_path = ledger.path / "retrospective-judge-result.json"
     stdout_path = ledger.path / "retrospective-judge-stdout.log"
@@ -2030,6 +2034,8 @@ def _run_retrospective_judge(
         adapter_result, raw_payload = _run_retrospective_judge_command(
             judge,
             checkout_path=checkout_path,
+            request=request,
+            request_prompt=request_prompt,
             request_path=request_path,
             result_path=result_path,
         )
@@ -2099,7 +2105,7 @@ def _build_retrospective_judge_evidence_pack(
             "review_branch": normalized["review_branch"],
             "status": workstream_status_from_publication(publication),
         },
-        "selected_work": selected_work,
+        "selected_work": _retrospective_judge_prompt_selected_work(selected_work),
         "retrospective": redact_retrospective(normalized.get("retrospective")),
         "publication": {
             "status": redact_text(str(publication.get("status") or "")),
@@ -2146,6 +2152,8 @@ def _run_retrospective_judge_command(
     judge: dict[str, Any],
     *,
     checkout_path: Path,
+    request: dict[str, Any],
+    request_prompt: dict[str, Any],
     request_path: Path,
     result_path: Path,
 ) -> tuple[dict[str, Any], str | None]:
@@ -2154,7 +2162,12 @@ def _run_retrospective_judge_command(
         env = _minimal_retrospective_judge_environment(temp_path)
         env["AFK_RETROSPECTIVE_JUDGE_REQUEST"] = str(request_path)
         env["AFK_RETROSPECTIVE_JUDGE_RESULT"] = str(result_path)
-        command = _render_retrospective_judge_command(judge["command"], request_path=request_path, result_path=result_path)
+        command = _render_retrospective_judge_command(
+            judge["command"],
+            judge_prompt=canonical_json(request_prompt),
+            request_path=request_path,
+            result_path=result_path,
+        )
         try:
             completed = subprocess.run(
                 command,
@@ -2201,18 +2214,86 @@ def _run_retrospective_judge_command(
     }, raw_payload
 
 
-def _render_retrospective_judge_command(command: list[str], *, request_path: Path, result_path: Path) -> list[str]:
-    replacements = {
-        "{request_path}": str(request_path),
-        "{result_path}": str(result_path),
-    }
-    rendered = []
+def _render_retrospective_judge_command(
+    command: list[str],
+    *,
+    judge_prompt: str,
+    request_path: Path,
+    result_path: Path,
+) -> list[str]:
+    rendered = _render_retrospective_command(
+        command,
+        {
+            PI_JUDGE_REQUEST_PATH_PLACEHOLDER: str(request_path),
+            PI_JUDGE_RESULT_PATH_PLACEHOLDER: str(result_path),
+        },
+    )
+    return [
+        judge_prompt if part == PI_JUDGE_PROMPT_PLACEHOLDER else part for part in rendered
+    ]
+
+
+def _render_retrospective_follow_up_command(
+    command: list[str],
+    *,
+    request_path: Path,
+    result_path: Path,
+) -> list[str]:
+    return _render_retrospective_command(
+        command,
+        {
+            PI_JUDGE_REQUEST_PATH_PLACEHOLDER: str(request_path),
+            PI_JUDGE_RESULT_PATH_PLACEHOLDER: str(result_path),
+        },
+    )
+
+
+def _render_retrospective_command(
+    command: list[str],
+    replacements: dict[str, str],
+) -> list[str]:
+    if not replacements:
+        return list(command)
+    pattern = re.compile(
+        "|".join(sorted((re.escape(token) for token in replacements), key=len, reverse=True))
+    )
+
+    def replace_placeholder(match: re.Match[str]) -> str:
+        return replacements[match.group(0)]
+
+    rendered: list[str] = []
     for part in command:
-        item = part
-        for marker, value in replacements.items():
-            item = item.replace(marker, value)
-        rendered.append(item)
+        rendered.append(pattern.sub(replace_placeholder, part))
     return rendered
+
+
+def _retrospective_judge_prompt_request(request: dict[str, Any]) -> dict[str, Any]:
+    evidence_pack = request.get("evidence_pack")
+    if not isinstance(evidence_pack, dict):
+        return request
+    selected_work = evidence_pack.get("selected_work")
+    if not isinstance(selected_work, list):
+        return request
+    sanitized = dict(request)
+    sanitized_evidence_pack = dict(evidence_pack)
+    sanitized_evidence_pack["selected_work"] = _retrospective_judge_prompt_selected_work(selected_work)
+    sanitized["evidence_pack"] = sanitized_evidence_pack
+    return sanitized
+
+
+def _retrospective_judge_prompt_selected_work(selected_work: list[Any]) -> list[dict[str, str]]:
+    records: list[dict[str, str]] = []
+    for item in selected_work:
+        if not isinstance(item, dict):
+            continue
+        records.append(
+            {
+                "external_id": str(item.get("external_id") or ""),
+                "source_id": str(item.get("source_id") or ""),
+                "source_type": str(item.get("source_type") or ""),
+            }
+        )
+    return records
 
 
 def _minimal_retrospective_judge_environment(temp_path: Path) -> dict[str, str]:
@@ -2542,7 +2623,7 @@ def _run_retrospective_follow_up_command(
         env = _minimal_retrospective_judge_environment(temp_path)
         env["AFK_RETROSPECTIVE_FOLLOW_UP_REQUEST"] = str(request_path)
         env["AFK_RETROSPECTIVE_FOLLOW_UP_RESULT"] = str(result_path)
-        command = _render_retrospective_judge_command(
+        command = _render_retrospective_follow_up_command(
             follow_up_config["command"],
             request_path=request_path,
             result_path=result_path,

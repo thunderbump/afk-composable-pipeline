@@ -458,6 +458,182 @@ class ImplementCliTest(unittest.TestCase):
             self.assertNotIn("ambient-pi-secret", artifact_text)
             self.assertNotIn("ambient-openai-secret", artifact_text)
 
+    def test_implement_substitutes_job_prompt_for_real_agent_command(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            checkout = temp_path / "checkout"
+            start_commit = init_checkout(checkout)
+            ledger = temp_path / "ledger"
+            codex_home = temp_path / "codex-home"
+            pi_config_home = temp_path / "pi-config"
+            config_home = temp_path / "xdg-config-explicit"
+            codex_home.mkdir()
+            pi_config_home.mkdir()
+            config_home.mkdir()
+            agent_code = temp_path / "real_agent.py"
+            agent_code.write_text(
+                textwrap.dedent(
+                    """
+                    import json
+                    import os
+                    import subprocess
+                    import sys
+                    from pathlib import Path
+
+                    prompt = sys.argv[1]
+                    if prompt == "{prompt}":
+                        raise SystemExit("real prompt was not rendered")
+                    request = json.loads(prompt)
+                    if request["work_item"]["external_id"] != "central-lve.5":
+                        raise SystemExit("unexpected work item in rendered prompt")
+                    Path("agent-prompt.json").write_text(prompt, encoding="utf-8")
+                    Path("implemented.txt").write_text("real adapter with prompt", encoding="utf-8")
+                    subprocess.run(["git", "add", "implemented.txt"], check=True)
+                    subprocess.run(["git", "commit", "-m", "real adapter prompt smoke"], check=True)
+                    Path(os.environ["AFK_AGENT_RESULT_PATH"]).write_text(
+                        json.dumps({"status": "completed", "summary": "real adapter rendered prompt"}),
+                        encoding="utf-8",
+                    )
+                    """
+                ).strip(),
+                encoding="utf-8",
+            )
+
+            completed = run_afk(
+                "run-step",
+                "implement",
+                "--input",
+                json.dumps(
+                    {
+                        "work_selection": {"schema_version": 1, "selected_work": [selected_work()]},
+                        "checkout": {
+                            "status": "prepared",
+                            "checkout_path": str(checkout),
+                            "review_branch": "afk/test-work",
+                            "requested_ref": "main",
+                            "start_commit": start_commit,
+                        },
+                        "guardrails": [],
+                        "validation": {"profile": "tier1", "commands": []},
+                        "agent": {
+                            "type": "real-agent-command",
+                            "command": [sys.executable, str(agent_code), "{prompt}"],
+                            "result_path": "agent-result.json",
+                            "timeout_seconds": 10,
+                            "codex_home": str(codex_home),
+                            "config_home": str(config_home),
+                            "env": {"PI_CONFIG_HOME": str(pi_config_home)},
+                        },
+                    }
+                ),
+                "--ledger",
+                str(ledger),
+                env_overrides={
+                    "GIT_AUTHOR_NAME": "AFK Test",
+                    "GIT_AUTHOR_EMAIL": "afk-test@example.test",
+                    "GIT_COMMITTER_NAME": "AFK Test",
+                    "GIT_COMMITTER_EMAIL": "afk-test@example.test",
+                },
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+            agent_result = json.loads((run_dir / "agent-result.json").read_text(encoding="utf-8"))
+            rendered_prompt = json.loads((checkout / "agent-prompt.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(result["output"]["status"], "implemented")
+            self.assertEqual(result["output"]["summary"], "real adapter rendered prompt")
+            self.assertEqual(agent_result["result"]["adapter"]["type"], "real-agent-command")
+            self.assertEqual(rendered_prompt["work_item"]["external_id"], "central-lve.5")
+            self.assertNotIn("{prompt}", json.dumps(rendered_prompt))
+
+    def test_implement_preserves_secret_redaction_for_rendered_real_agent_prompt(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            checkout = temp_path / "checkout"
+            start_commit = init_checkout(checkout)
+            ledger = temp_path / "ledger"
+            codex_home = temp_path / "codex-home"
+            pi_config_home = temp_path / "pi-config"
+            config_home = temp_path / "xdg-config-explicit"
+            codex_home.mkdir()
+            pi_config_home.mkdir()
+            config_home.mkdir()
+            secret = "ghp_secret_prompt_1234567890"
+            agent_code = temp_path / "real_agent_redaction.py"
+            agent_code.write_text(
+                textwrap.dedent(
+                    """
+                    import json
+                    import os
+                    import subprocess
+                    import sys
+                    from pathlib import Path
+
+                    prompt = sys.argv[1]
+                    request = json.loads(prompt)
+                    print(request["work_item"]["acceptance_criteria"][0])
+                    Path("implemented.txt").write_text("real adapter redaction smoke", encoding="utf-8")
+                    subprocess.run(["git", "add", "implemented.txt"], check=True)
+                    subprocess.run(["git", "commit", "-m", "real adapter redaction smoke"], check=True)
+                    Path(os.environ["AFK_AGENT_RESULT_PATH"]).write_text(
+                        json.dumps({"status": "completed", "summary": "real adapter redaction smoke"}),
+                        encoding="utf-8",
+                    )
+                    """
+                ).strip(),
+                encoding="utf-8",
+            )
+
+            work_item = selected_work()
+            work_item["acceptance_criteria"] = [f"validate token={secret} handling"]
+
+            completed = run_afk(
+                "run-step",
+                "implement",
+                "--input",
+                json.dumps(
+                    {
+                        "work_selection": {"schema_version": 1, "selected_work": [work_item]},
+                        "checkout": {
+                            "status": "prepared",
+                            "checkout_path": str(checkout),
+                            "review_branch": "afk/test-work",
+                            "requested_ref": "main",
+                            "start_commit": start_commit,
+                        },
+                        "guardrails": [],
+                        "validation": {"profile": "tier1", "commands": []},
+                        "agent": {
+                            "type": "real-agent-command",
+                            "command": [sys.executable, str(agent_code), "{prompt}"],
+                            "result_path": "agent-result.json",
+                            "timeout_seconds": 10,
+                            "codex_home": str(codex_home),
+                            "config_home": str(config_home),
+                            "env": {"PI_CONFIG_HOME": str(pi_config_home)},
+                        },
+                    }
+                ),
+                "--ledger",
+                str(ledger),
+                env_overrides={
+                    "GIT_AUTHOR_NAME": "AFK Test",
+                    "GIT_AUTHOR_EMAIL": "afk-test@example.test",
+                    "GIT_COMMITTER_NAME": "AFK Test",
+                    "GIT_COMMITTER_EMAIL": "afk-test@example.test",
+                },
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            stdout_log = (run_dir / "stdout.log").read_text(encoding="utf-8")
+            self.assertIn("[REDACTED]", stdout_log)
+            self.assertNotIn(secret, stdout_log)
+
     def test_implement_runs_real_agent_wrapper_with_runner_local_secret_file_contract(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
