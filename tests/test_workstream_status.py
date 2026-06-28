@@ -137,3 +137,86 @@ class WorkstreamStatusMappingTest(unittest.TestCase):
         self.assertTrue(record["close_source_item"])
         self.assertEqual(record["close_reason"], "Superseded by follow-up PR")
         self.assertEqual(record["pr_url"], "https://github.example/pr/17")
+
+    def test_tracker_record_surfaces_open_review_cycle_findings(self):
+        record = tracker_record(
+            {
+                "workstream_id": "central-afk-pr.17",
+                "tracker": {"terminal_decision": {"status": "", "merge_commit": "", "reason": ""}},
+                "review_cycles": [
+                    {
+                        "cycle": 1,
+                        "status": "findings-open",
+                        "reviews": [
+                            {
+                                "role": "correctness",
+                                "status": "findings-open",
+                                "summary": "Needs response",
+                                "requires_response": True,
+                            }
+                        ],
+                    }
+                ],
+            },
+            tracker_state(),
+            {"status": "validated-unpublished"},
+        )
+
+        self.assertEqual(record["status"], "review-findings-open")
+        self.assertIn("response-required review findings", record["comment"])
+
+    def test_tracker_record_keeps_request_changes_open_until_response_is_addressed(self):
+        record = tracker_record(
+            {
+                "workstream_id": "central-afk-pr.17",
+                "tracker": {"terminal_decision": {"status": "", "merge_commit": "", "reason": ""}},
+                "review_cycles": [
+                    {
+                        "cycle": 1,
+                        "status": "request-changes",
+                        "reviews": [
+                            {
+                                "role": "correctness",
+                                "status": "request-changes",
+                                "summary": "Please fix the tracker semantics.",
+                                "requires_response": True,
+                                "response": {"status": "wip", "summary": "Investigating"},
+                            }
+                        ],
+                    }
+                ],
+            },
+            tracker_state(),
+            {"status": "validated-unpublished"},
+        )
+
+        self.assertEqual(record["status"], "review-findings-open")
+        self.assertIn("response-required review findings", record["comment"])
+
+    def test_tracker_record_accepts_freeform_response_string_as_addressed_evidence(self):
+        record = tracker_record(
+            {
+                "workstream_id": "central-afk-pr.17",
+                "tracker": {"terminal_decision": {"status": "", "merge_commit": "", "reason": ""}},
+                "review_cycles": [
+                    {
+                        "cycle": 1,
+                        "status": "request-changes",
+                        "reviews": [
+                            {
+                                "role": "correctness",
+                                "status": "request-changes",
+                                "summary": "Please fix the tracker semantics.",
+                                "requires_response": True,
+                                "response": "Patched in follow-up commit abc123.",
+                            }
+                        ],
+                    }
+                ],
+            },
+            tracker_state(),
+            {"status": "validated-unpublished"},
+        )
+
+        self.assertEqual(record["status"], "validated")
+        self.assertNotIn("response-required review findings", record["comment"])
