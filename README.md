@@ -615,6 +615,13 @@ recorded.
 completed workstream run. It summarizes retrospective health, publication and
 tracker status, derived signals, and recommended follow-up without changing the
 functional publication or tracker outcome.
+An optional top-level `retrospective_judge` recipe block can add a disabled-by-
+default post-pass that runs a local command against a redacted evidence pack
+built from the deterministic pipeline retrospective, tracker/publication
+summary, selected work, cleanup state, and redacted terminal retrospective
+evidence. Judge findings are recorded under `pipeline_retrospective.judge` and
+may add retrospective signals, but they do not change the functional
+publication or tracker status.
 `retrospective.json`, when present, stores the user-supplied terminal
 retrospective evidence separately from the derived pipeline retrospective.
 `review_cycles` evidence, when supplied, is included in both

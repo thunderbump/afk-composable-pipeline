@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import os
+import re
 import subprocess
 import tempfile
 import uuid
@@ -12,7 +14,7 @@ from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
 from afk.contracts import ProjectContract
 from afk.jsonutil import canonical_json, sha256_json
-from afk.redaction import is_secret_key, redact_artifact_value, redact_text
+from afk.redaction import is_secret_command_flag, is_secret_key, is_secret_value, redact_artifact_value, redact_text
 from afk.registry import StepResult
 
 
@@ -22,6 +24,7 @@ REVIEW_CYCLE_STATUSES = {"passed", "findings-open", "findings-addressed", "reque
 REVIEW_CYCLE_OPEN_STATUSES = {"findings-open", "request-changes"}
 REVIEW_CYCLE_RESPONSE_STATUSES = {"addressed", "findings-addressed"}
 TERMINAL_REVIEW_FEEDBACK_STATUSES = {"resolved", "waived"}
+COMMAND_BEARER_SECRET_PATTERN = re.compile(r"\bBearer\s+[A-Za-z0-9._~+/=-]{12,}", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -57,6 +60,26 @@ class PublisherError(RuntimeError):
         self.returncode = returncode
         self.stdout = stdout
         self.stderr = stderr
+
+
+class _RetrospectiveJudgeError(RuntimeError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        command: list[str],
+        returncode: int | None,
+        stdout: str = "",
+        stderr: str = "",
+        timed_out: bool = False,
+    ):
+        super().__init__(message)
+        self.message = message
+        self.command = command
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+        self.timed_out = timed_out
 
 
 def run_workstream(
@@ -176,6 +199,20 @@ def run_workstream(
     tracker = tracker_record(normalized, state, publication)
     selected_work = selected_work_records(state)
     pipeline_retrospective = pipeline_retrospective_record(state, publication, tracker, normalized)
+    retrospective_judge = _run_retrospective_judge(
+        normalized=normalized,
+        state=state,
+        publication=publication,
+        tracker=tracker,
+        selected_work=selected_work,
+        pipeline_retrospective=pipeline_retrospective,
+        ledger=ledger,
+    )
+    pipeline_retrospective = _apply_retrospective_judge(
+        pipeline_retrospective,
+        retrospective_judge,
+        normalized=normalized,
+    )
 
     ledger.write_json("publication-result.json", publication)
     ledger.write_json("tracker-result.json", tracker)
@@ -255,6 +292,7 @@ def normalize_recipe(
     tracker = normalize_tracker_config(recipe.get("tracker"))
     review_cycles = normalize_review_cycles(recipe.get("review_cycles"))
     retrospective = normalize_retrospective(recipe.get("retrospective"))
+    retrospective_judge = normalize_retrospective_judge(recipe.get("retrospective_judge"))
     validate_retrospective_terminal_decision(retrospective, tracker)
     return {
         "schema_version": SCHEMA_VERSION,
@@ -267,6 +305,7 @@ def normalize_recipe(
         "tracker": tracker,
         "review_cycles": review_cycles,
         "retrospective": retrospective,
+        "retrospective_judge": retrospective_judge,
     }
 
 
@@ -1866,7 +1905,415 @@ def pipeline_retrospective_record(
         "tracker_status": redact_text(str(tracker.get("status") or "")),
         "signals": signals,
         "recommended_follow_up": follow_up,
+        "judge": _disabled_retrospective_judge_record(),
     }
+
+
+def _disabled_retrospective_judge_record() -> dict[str, Any]:
+    return {
+        "enabled": False,
+        "status": "disabled",
+    }
+
+
+def _apply_retrospective_judge(
+    pipeline_retrospective: dict[str, Any],
+    judge: dict[str, Any],
+    *,
+    normalized: dict[str, Any] | None,
+) -> dict[str, Any]:
+    record = dict(pipeline_retrospective)
+    if not judge:
+        record["judge"] = _disabled_retrospective_judge_record()
+        return record
+    signals = list(record.get("signals", [])) if isinstance(record.get("signals"), list) else []
+    judge_signals = _retrospective_judge_signals(judge)
+    if judge_signals:
+        signals.extend(judge_signals)
+    record["signals"] = signals
+    record["health"] = _retrospective_health(signals)
+    record["recommended_follow_up"] = _retrospective_follow_up(signals, normalized)
+    record["judge"] = judge
+    return record
+
+
+def _retrospective_judge_signals(judge: dict[str, Any]) -> list[dict[str, Any]]:
+    if not isinstance(judge, dict) or not judge.get("enabled"):
+        return []
+    status = string_field(judge, "status") or ""
+    if status == "passed":
+        return []
+    severity = "warning" if status == "warning" else "error"
+    evidence = judge.get("evidence") if isinstance(judge.get("evidence"), dict) else {}
+    return [
+        {
+            "kind": "retrospective-judge",
+            "severity": severity,
+            "summary": redact_text(string_field(judge, "summary") or status or "retrospective judge reported an issue"),
+            "evidence_paths": _retrospective_evidence_paths(
+                string_field(evidence, "request_path") or "",
+                string_field(evidence, "result_path") or "",
+                string_field(evidence, "stdout_path") or "",
+                string_field(evidence, "stderr_path") or "",
+            ),
+        }
+    ]
+
+
+def _run_retrospective_judge(
+    *,
+    normalized: dict[str, Any],
+    state: dict[str, Any],
+    publication: dict[str, Any],
+    tracker: dict[str, Any],
+    selected_work: list[dict[str, Any]],
+    pipeline_retrospective: dict[str, Any],
+    ledger: "WorkstreamLedger",
+) -> dict[str, Any]:
+    judge = normalized.get("retrospective_judge") if isinstance(normalized, dict) else {}
+    if not isinstance(judge, dict) or not judge.get("enabled"):
+        return _disabled_retrospective_judge_record()
+    evidence_pack = _build_retrospective_judge_evidence_pack(
+        normalized=normalized,
+        state=state,
+        publication=publication,
+        tracker=tracker,
+        selected_work=selected_work,
+        pipeline_retrospective=pipeline_retrospective,
+    )
+    request = _build_retrospective_judge_request(evidence_pack, run_id=ledger.run_id)
+    request_path = ledger.path / "retrospective-judge-request.json"
+    result_path = ledger.path / "retrospective-judge-result.json"
+    stdout_path = ledger.path / "retrospective-judge-stdout.log"
+    stderr_path = ledger.path / "retrospective-judge-stderr.log"
+    ledger.write_json("retrospective-judge-evidence.json", evidence_pack)
+    ledger.write_json("retrospective-judge-request.json", request)
+    checkout_path = checkout_path_from_state(state)
+    try:
+        adapter_result, raw_payload = _run_retrospective_judge_command(
+            judge,
+            checkout_path=checkout_path,
+            request_path=request_path,
+            result_path=result_path,
+        )
+        raw = _read_retrospective_judge_payload(raw_payload)
+        if raw["status"] != "valid":
+            normalized_result = _normalized_retrospective_judge_result(
+                enabled=True,
+                status="failed_protocol",
+                classification="protocol_failure",
+                summary=raw["message"],
+                findings=[],
+                adapter=_retrospective_judge_adapter_record(judge, adapter_result["returncode"], False),
+                stdout=adapter_result["stdout"],
+                stderr=adapter_result["stderr"],
+                request_path=request_path,
+                result_path=result_path,
+                stdout_path=stdout_path,
+                stderr_path=stderr_path,
+            )
+            _write_retrospective_judge_result(result_path, ledger.run_id, normalized_result)
+            return normalized_result
+        normalized_result = _normalize_retrospective_judge_payload(
+            raw["payload"],
+            adapter=_retrospective_judge_adapter_record(judge, adapter_result["returncode"], False),
+            stdout=adapter_result["stdout"],
+            stderr=adapter_result["stderr"],
+            request_path=request_path,
+            result_path=result_path,
+            stdout_path=stdout_path,
+            stderr_path=stderr_path,
+        )
+        _write_retrospective_judge_result(result_path, ledger.run_id, normalized_result)
+        return normalized_result
+    except _RetrospectiveJudgeError as exc:
+        normalized_result = _normalized_retrospective_judge_result(
+            enabled=True,
+            status="failed",
+            classification="judge_adapter_failure",
+            summary=exc.message,
+            findings=[],
+            adapter=_retrospective_judge_adapter_record(judge, exc.returncode, exc.timed_out),
+            stdout=exc.stdout,
+            stderr=exc.stderr,
+            request_path=request_path,
+            result_path=result_path,
+            stdout_path=stdout_path,
+            stderr_path=stderr_path,
+        )
+        _write_retrospective_judge_result(result_path, ledger.run_id, normalized_result)
+        return normalized_result
+
+
+def _build_retrospective_judge_evidence_pack(
+    *,
+    normalized: dict[str, Any],
+    state: dict[str, Any],
+    publication: dict[str, Any],
+    tracker: dict[str, Any],
+    selected_work: list[dict[str, Any]],
+    pipeline_retrospective: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "workstream": {
+            "workstream_id": normalized["workstream_id"],
+            "parent": normalized["parent"],
+            "review_branch": normalized["review_branch"],
+            "status": workstream_status_from_publication(publication),
+        },
+        "selected_work": selected_work,
+        "retrospective": redact_retrospective(normalized.get("retrospective")),
+        "publication": {
+            "status": redact_text(str(publication.get("status") or "")),
+            "reason": redact_text(str(publication.get("reason") or "")),
+            "url": redact_text(str(publication.get("url") or "")),
+        },
+        "tracker": {
+            "status": redact_text(str(tracker.get("status") or "")),
+            "comment": redact_text(str(tracker.get("comment") or "")),
+            "close_source_item": bool(tracker.get("close_source_item")),
+            "close_reason": redact_text(str(tracker.get("close_reason") or "")),
+            "pr_url": redact_text(str(tracker.get("pr_url") or "")),
+            "merge_commit": redact_text(str(tracker.get("merge_commit") or "")),
+            "review_findings": redact_artifact_value(tracker.get("review_findings", [])),
+        },
+        "cleanup": redact_artifact_value(state.get("cleanup", {})),
+        "pipeline_retrospective": pipeline_retrospective,
+        "redaction": {
+            "applied": True,
+            "artifact_values": "redact_artifact_value",
+            "text": "redact_text",
+            "secret_placeholder": "[REDACTED]",
+            "raw_logs_included": False,
+        },
+    }
+
+
+def _build_retrospective_judge_request(evidence_pack: dict[str, Any], *, run_id: str) -> dict[str, Any]:
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "run_id": run_id,
+        "step": "retrospective-judge",
+        "artifact_type": "retrospective-judge-request",
+        "evidence_pack": evidence_pack,
+        "expected_result_schema": {
+            "status": "pass|warn|fail",
+            "summary": "string",
+            "findings": "list[object]",
+        },
+    }
+
+
+def _run_retrospective_judge_command(
+    judge: dict[str, Any],
+    *,
+    checkout_path: Path,
+    request_path: Path,
+    result_path: Path,
+) -> tuple[dict[str, Any], str | None]:
+    with tempfile.TemporaryDirectory(prefix="afk-retrospective-judge-") as temp_dir:
+        temp_path = Path(temp_dir)
+        env = _minimal_retrospective_judge_environment(temp_path)
+        env["AFK_RETROSPECTIVE_JUDGE_REQUEST"] = str(request_path)
+        env["AFK_RETROSPECTIVE_JUDGE_RESULT"] = str(result_path)
+        command = _render_retrospective_judge_command(judge["command"], request_path=request_path, result_path=result_path)
+        try:
+            completed = subprocess.run(
+                command,
+                cwd=checkout_path,
+                env=env,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                capture_output=True,
+                check=False,
+                timeout=judge["timeout_seconds"],
+            )
+        except OSError as exc:
+            raise _RetrospectiveJudgeError(
+                str(exc),
+                command=command,
+                returncode=None,
+                stderr=str(exc),
+            ) from exc
+        except subprocess.TimeoutExpired as exc:
+            stdout = exc.stdout if isinstance(exc.stdout, str) else ""
+            stderr = exc.stderr if isinstance(exc.stderr, str) else ""
+            raise _RetrospectiveJudgeError(
+                "retrospective judge command timed out",
+                command=command,
+                returncode=None,
+                stdout=stdout,
+                stderr=stderr or "retrospective judge command timed out",
+                timed_out=True,
+            ) from exc
+        raw_payload = result_path.read_text(encoding="utf-8", errors="replace") if result_path.exists() else None
+    if completed.returncode != 0:
+        raise _RetrospectiveJudgeError(
+            "retrospective judge command failed",
+            command=command,
+            returncode=completed.returncode,
+            stdout=completed.stdout,
+            stderr=completed.stderr,
+        )
+    return {
+        "returncode": completed.returncode,
+        "stdout": completed.stdout,
+        "stderr": completed.stderr,
+    }, raw_payload
+
+
+def _render_retrospective_judge_command(command: list[str], *, request_path: Path, result_path: Path) -> list[str]:
+    replacements = {
+        "{request_path}": str(request_path),
+        "{result_path}": str(result_path),
+    }
+    rendered = []
+    for part in command:
+        item = part
+        for marker, value in replacements.items():
+            item = item.replace(marker, value)
+        rendered.append(item)
+    return rendered
+
+
+def _minimal_retrospective_judge_environment(temp_path: Path) -> dict[str, str]:
+    env: dict[str, str] = {}
+    for key in (
+        "PATH",
+        "LANG",
+        "LC_ALL",
+        "PYTHONPATH",
+        "GIT_AUTHOR_NAME",
+        "GIT_AUTHOR_EMAIL",
+        "GIT_COMMITTER_NAME",
+        "GIT_COMMITTER_EMAIL",
+    ):
+        value = os.environ.get(key)
+        if value is not None:
+            env[key] = value
+    home_path = temp_path / "home"
+    xdg_config_home = temp_path / "xdg-config"
+    home_path.mkdir()
+    xdg_config_home.mkdir()
+    env["HOME"] = str(home_path)
+    env["XDG_CONFIG_HOME"] = str(xdg_config_home)
+    return env
+
+
+def _read_retrospective_judge_payload(raw: str | None) -> dict[str, Any]:
+    if raw is None:
+        return {"status": "missing", "message": "retrospective judge result file was not produced"}
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return {"status": "invalid", "message": "retrospective judge result file is not valid JSON"}
+    if not isinstance(payload, dict):
+        return {"status": "invalid", "message": "retrospective judge result file must contain an object"}
+    return {"status": "valid", "payload": redact_artifact_value(payload)}
+
+
+def _normalize_retrospective_judge_payload(
+    payload: dict[str, Any],
+    *,
+    adapter: dict[str, Any],
+    stdout: str,
+    stderr: str,
+    request_path: Path,
+    result_path: Path,
+    stdout_path: Path,
+    stderr_path: Path,
+) -> dict[str, Any]:
+    raw_status = string_field(payload, "status") or ""
+    if raw_status in {"pass", "passed", "success", "succeeded"}:
+        status = "passed"
+        classification = "success"
+    elif raw_status in {"warn", "warning"}:
+        status = "warning"
+        classification = "judge_warning"
+    elif raw_status in {"fail", "failed"}:
+        status = "failed"
+        classification = "judge_failure"
+    else:
+        status = "failed_protocol"
+        classification = "protocol_failure"
+    return _normalized_retrospective_judge_result(
+        enabled=True,
+        status=status,
+        classification=classification,
+        summary=string_field(payload, "summary") or status,
+        findings=payload.get("findings") if isinstance(payload.get("findings"), list) else [],
+        adapter=adapter,
+        stdout=stdout,
+        stderr=stderr,
+        request_path=request_path,
+        result_path=result_path,
+        stdout_path=stdout_path,
+        stderr_path=stderr_path,
+    )
+
+
+def _normalized_retrospective_judge_result(
+    *,
+    enabled: bool,
+    status: str,
+    classification: str,
+    summary: str,
+    findings: list[Any],
+    adapter: dict[str, Any],
+    stdout: str,
+    stderr: str,
+    request_path: Path,
+    result_path: Path,
+    stdout_path: Path,
+    stderr_path: Path,
+) -> dict[str, Any]:
+    stdout_path.write_text(redact_text(stdout), encoding="utf-8")
+    stderr_path.write_text(redact_text(stderr), encoding="utf-8")
+    return {
+        "enabled": enabled,
+        "status": status,
+        "classification": classification,
+        "summary": redact_text(summary),
+        "findings": redact_artifact_value(findings),
+        "adapter": adapter,
+        "evidence": {
+            "request_path": request_path.name,
+            "result_path": result_path.name,
+            "stdout_path": stdout_path.name,
+            "stderr_path": stderr_path.name,
+        },
+    }
+
+
+def _retrospective_judge_adapter_record(
+    judge: dict[str, Any],
+    returncode: int | None,
+    timed_out: bool,
+) -> dict[str, Any]:
+    return {
+        "type": judge["type"],
+        "command": redact_artifact_value({"command": judge["command"]})["command"],
+        "returncode": returncode,
+        "timed_out": timed_out,
+    }
+
+
+def _write_retrospective_judge_result(path: Path, run_id: str, judge_result: dict[str, Any]) -> None:
+    path.write_text(
+        canonical_json(
+            {
+                "schema_version": SCHEMA_VERSION,
+                "run_id": run_id,
+                "step": "retrospective-judge",
+                "artifact_type": "retrospective-judge-result",
+                "result": redact_artifact_value(judge_result),
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
 
 
 def _validation_retrospective_signals(state: dict[str, Any]) -> list[dict[str, Any]]:
@@ -2047,6 +2494,11 @@ def _follow_up_for_signal(kind: str) -> dict[str, Any] | None:
         return {
             "summary": "Clean up leftover workstream resources before starting another retry or publication attempt.",
             "labels": ["afk:follow-up", "area:cleanup"],
+        }
+    if kind == "retrospective-judge":
+        return {
+            "summary": "Review and address retrospective judge findings before treating the run as complete.",
+            "labels": ["afk:follow-up", "area:workstream"],
         }
     return None
 
@@ -2277,6 +2729,46 @@ def normalize_retrospective(retrospective: Any) -> dict[str, Any]:
     return normalized
 
 
+def normalize_retrospective_judge(retrospective_judge: Any) -> dict[str, Any]:
+    if retrospective_judge is None:
+        return {"enabled": False}
+    if not isinstance(retrospective_judge, dict):
+        raise WorkstreamError("retrospective_judge must be an object")
+    unsupported = [
+        key for key in retrospective_judge if key not in {"enabled", "type", "command", "timeout_seconds", "timeoutSeconds"}
+    ]
+    if unsupported:
+        raise WorkstreamError("retrospective_judge only supports enabled, type, command, timeout_seconds")
+    enabled = retrospective_judge.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise WorkstreamError("retrospective_judge.enabled must be a boolean")
+    if not enabled:
+        return {"enabled": False}
+    judge_type = string_field(retrospective_judge, "type") or "local-command"
+    if judge_type not in {"local-command", "fake-judge-command"}:
+        raise WorkstreamError("retrospective_judge.type must be local-command or fake-judge-command")
+    for forbidden_key in ("credentials_path", "auth_file", "token", "api_key", "env"):
+        if forbidden_key in retrospective_judge:
+            raise WorkstreamError(f"retrospective_judge.{forbidden_key} is not supported")
+    command = retrospective_judge.get("command")
+    if not _is_string_list(command):
+        raise WorkstreamError("retrospective_judge.command must be a list of strings")
+    if not command:
+        raise WorkstreamError("retrospective_judge.command must not be empty")
+    command_secret_error = _command_secret_error_message(command, field_name="retrospective_judge.command")
+    if command_secret_error:
+        raise WorkstreamError(command_secret_error)
+    timeout_seconds = retrospective_judge.get("timeout_seconds", retrospective_judge.get("timeoutSeconds", 120))
+    if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float)) or timeout_seconds <= 0:
+        raise WorkstreamError("retrospective_judge.timeout_seconds must be a positive number")
+    return {
+        "enabled": True,
+        "type": judge_type,
+        "command": list(command),
+        "timeout_seconds": float(timeout_seconds),
+    }
+
+
 def validate_retrospective_terminal_decision(retrospective: dict[str, Any], tracker: dict[str, Any]) -> None:
     if not retrospective:
         return
@@ -2410,6 +2902,16 @@ def workstream_artifacts(ledger: "WorkstreamLedger") -> dict[str, str]:
         artifacts["pr_body"] = "pr-body.md"
     if (ledger.path / "retrospective.json").is_file():
         artifacts["retrospective"] = "retrospective.json"
+    if (ledger.path / "retrospective-judge-evidence.json").is_file():
+        artifacts["retrospective_judge_evidence"] = "retrospective-judge-evidence.json"
+    if (ledger.path / "retrospective-judge-request.json").is_file():
+        artifacts["retrospective_judge_request"] = "retrospective-judge-request.json"
+    if (ledger.path / "retrospective-judge-result.json").is_file():
+        artifacts["retrospective_judge_result"] = "retrospective-judge-result.json"
+    if (ledger.path / "retrospective-judge-stdout.log").is_file():
+        artifacts["retrospective_judge_stdout"] = "retrospective-judge-stdout.log"
+    if (ledger.path / "retrospective-judge-stderr.log").is_file():
+        artifacts["retrospective_judge_stderr"] = "retrospective-judge-stderr.log"
     return artifacts
 
 
@@ -2568,6 +3070,20 @@ def string_field(input_data: dict[str, Any], key: str) -> str | None:
     value = input_data.get(key)
     if isinstance(value, str) and value.strip():
         return value.strip()
+    return None
+
+
+def _is_string_list(value: Any) -> bool:
+    return isinstance(value, list) and all(isinstance(item, str) for item in value)
+
+
+def _command_secret_error_message(command: list[str], *, field_name: str) -> str | None:
+    for part in command:
+        if is_secret_command_flag(part):
+            flag = part.strip().split("=", 1)[0].lower()
+            return f"{field_name} must not include credential flag {flag}"
+        if is_secret_value(part) or COMMAND_BEARER_SECRET_PATTERN.search(part):
+            return f"{field_name} must not include secret-looking values"
     return None
 
 
