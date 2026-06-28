@@ -200,7 +200,19 @@ def main(argv: list[str] | None = None) -> int:
         path_error = checkout_path_error(args.checkout_root, args.checkout_path)
         if path_error is not None:
             parser.error(path_error)
+        if args.execute and not args.ledger:
+            parser.error("--ledger is required when --execute is set")
         try:
+            workstream_runner = None
+            if args.execute:
+                from afk.workstream import run_workstream
+
+                workstream_runner = lambda recipe, *, ledger_dir, project_contract: run_workstream(
+                    recipe,
+                    ledger_dir=ledger_dir,
+                    step_runner=run_step,
+                    project_contract=project_contract,
+                )
             payload = run_next(
                 project_contract=project_contract,
                 beads_workspace=Path(args.beads_workspace) if args.beads_workspace else None,
@@ -211,6 +223,9 @@ def main(argv: list[str] | None = None) -> int:
                 selector_mode=args.selector_mode,
                 selector_model=args.selector_model,
                 selector_choice_json=args.selector_choice_json,
+                execute=args.execute,
+                ledger_dir=Path(args.ledger) if args.ledger else None,
+                workstream_runner=workstream_runner,
             )
         except ValueError as exc:
             parser.error(str(exc))
@@ -359,6 +374,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional JSON selector choice payload for model mode",
     )
     run_next_parser.add_argument("--ledger", help="Optional ledger directory for downstream execution")
+    run_next_parser.add_argument(
+        "--execute",
+        action="store_true",
+        help="Run the selected recipe through run-workstream after selection",
+    )
 
     return parser
 

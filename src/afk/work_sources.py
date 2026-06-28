@@ -363,11 +363,7 @@ def load_github_issues(source: dict[str, Any]) -> list[dict[str, Any]]:
     if source.get("query"):
         command.extend(["--search", str(source["query"])])
 
-    issues = run_json_command(
-        command,
-        status_on_failure="skipped_unreachable",
-        message_on_failure="gh issue list failed",
-    )
+    issues = run_github_issue_list(command)
     if not isinstance(issues, list):
         raise SourceLoadError("failed_invalid_payload", "gh issue list returned invalid JSON payload")
 
@@ -382,6 +378,33 @@ def load_github_issues(source: dict[str, Any]) -> list[dict[str, Any]]:
             normalize_github_issue(str(source.get("id") or "github"), source, issue, dependencies)
         )
     return normalized
+
+
+def run_github_issue_list(command: list[str]) -> Any:
+    try:
+        completed = subprocess.run(
+            command,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=60,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise SourceLoadError("skipped_unreachable", "gh issue list failed") from exc
+    if completed.returncode != 0:
+        status, message = github_issue_list_failure_status_and_message(completed.stderr)
+        raise SourceLoadError(status, message)
+    try:
+        return json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise SourceLoadError("failed_invalid_payload", "gh issue list failed") from exc
+
+
+def github_issue_list_failure_status_and_message(stderr: str) -> tuple[str, str]:
+    normalized = stderr.lower()
+    if "issue" in normalized and "disabled" in normalized:
+        return "skipped_unconfigured", "GitHub Issues are disabled for this repository"
+    return "skipped_unreachable", "gh issue list failed"
 
 
 def load_github_dependencies(repo: str, issue_number: Any) -> list[dict[str, str]]:
@@ -603,7 +626,9 @@ def normalize_beads_issue(source_id: str, source: dict[str, Any], issue: dict[st
         raise SourceLoadError("failed_invalid_payload", "bd show returned issue without stable id")
     metadata = issue.get("metadata") if isinstance(issue.get("metadata"), dict) else {}
     labels = [str(label) for label in issue.get("labels") or []]
-    return {
+    normalized: dict[str, Any] = {
+        "source_id": source_id,
+        "source_type": "beads",
         "external_id": issue_id.strip(),
         "url": beads_issue_url(source, issue),
         "title": str(issue.get("title") or ""),
@@ -611,12 +636,22 @@ def normalize_beads_issue(source_id: str, source: dict[str, Any], issue: dict[st
         "labels": labels,
         "parent": issue.get("parent"),
         "workstream": metadata.get("workstream") or label_value(labels, "workstream:"),
-        "acceptance_criteria": extract_acceptance_criteria(issue.get("acceptance_criteria")),
+        "acceptance_criteria": extract_beads_acceptance_criteria(issue),
         "dependencies": beads_dependencies(issue.get("dependencies") or []),
         "blockers": [],
         "afk": beads_afk_metadata(metadata, labels),
         "raw": {"beads": {"id": issue_id.strip()}},
     }
+    description = bounded_issue_description(issue)
+    if description:
+        normalized["description"] = description
+    priority = issue.get("priority")
+    if priority is not None:
+        normalized["priority"] = priority
+    issue_type = issue.get("issue_type")
+    if issue_type:
+        normalized["issue_type"] = str(issue_type)
+    return normalized
 
 
 def beads_issue_url(source: dict[str, Any], issue: dict[str, Any]) -> str:
@@ -708,6 +743,9 @@ def extract_acceptance_criteria(value: Any) -> list[str]:
         return [item for item in value if isinstance(item, str) and item]
     if not isinstance(value, str):
         return []
+    section_criteria = extract_acceptance_criteria_from_markdown_section(value)
+    if section_criteria is not None:
+        return section_criteria
     criteria = []
     for line in value.splitlines():
         stripped = line.strip()
@@ -716,6 +754,73 @@ def extract_acceptance_criteria(value: Any) -> list[str]:
                 criteria.append(stripped[len(prefix) :].strip())
                 break
     return criteria
+
+
+def extract_acceptance_criteria_from_markdown_section(value: str) -> list[str] | None:
+    lines = value.splitlines()
+    in_section = False
+    criteria: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if not in_section:
+            if is_acceptance_criteria_heading(stripped):
+                in_section = True
+            continue
+        if is_markdown_heading(stripped) and not is_acceptance_criteria_heading(stripped):
+            break
+        if not stripped:
+            continue
+        for prefix in ("- [ ] ", "- [x] ", "- "):
+            if stripped.lower().startswith(prefix):
+                criteria.append(stripped[len(prefix) :].strip())
+                break
+    return criteria if in_section else None
+
+
+def is_acceptance_criteria_heading(value: str) -> bool:
+    normalized = value.lower().lstrip("#").strip()
+    return normalized in {"acceptance criteria", "acceptance criteria:"}
+
+
+def is_markdown_heading(value: str) -> bool:
+    return value.startswith("#")
+
+
+def bounded_issue_description(issue: dict[str, Any], *, max_chars: int = 240) -> str:
+    raw_value = issue.get("description")
+    if not isinstance(raw_value, str) or not raw_value.strip():
+        raw_value = issue.get("body")
+    if not isinstance(raw_value, str) or not raw_value.strip():
+        return ""
+    text = raw_value.strip()
+    section_index = find_acceptance_criteria_section_index(text)
+    if section_index is not None:
+        text = text[:section_index].rstrip()
+    paragraphs = [paragraph.strip() for paragraph in text.split("\n\n") if paragraph.strip()]
+    if not paragraphs:
+        return ""
+    excerpt = "\n\n".join(paragraphs[:2]).strip()
+    if len(excerpt) <= max_chars:
+        return excerpt
+    return excerpt[: max_chars - 1].rstrip() + "…"
+
+
+def find_acceptance_criteria_section_index(value: str) -> int | None:
+    lower_value = value.lower()
+    for marker in ("\n## acceptance criteria", "\n### acceptance criteria", "\nacceptance criteria"):
+        marker_index = lower_value.find(marker)
+        if marker_index != -1:
+            return marker_index + 1
+    if is_acceptance_criteria_heading(lower_value.strip()):
+        return 0
+    return None
+
+
+def extract_beads_acceptance_criteria(issue: dict[str, Any]) -> list[str]:
+    criteria = extract_acceptance_criteria(issue.get("acceptance_criteria"))
+    if criteria:
+        return criteria
+    return extract_acceptance_criteria(issue.get("description") or issue.get("body"))
 
 
 def label_value(labels: list[str], prefix: str) -> str | None:
@@ -787,7 +892,7 @@ def normalize_candidate(source_id: str, source_type: str, raw_item: Any) -> dict
     item = raw_item if isinstance(raw_item, dict) else {}
     dependencies = normalize_relations(item.get("dependencies") or [])
     blockers = normalize_relations(item.get("blockers") or [])
-    return {
+    candidate: dict[str, Any] = {
         "source_id": source_id,
         "source_type": source_type,
         "external_id": identity_value(item, "external_id") or identity_value(item, "id") or "",
@@ -804,6 +909,13 @@ def normalize_candidate(source_id: str, source_type: str, raw_item: Any) -> dict
         "afk": dict(item.get("afk") or {}),
         "raw": dict(item.get("raw") or {}),
     }
+    if "description" in item and isinstance(item["description"], str) and item["description"].strip():
+        candidate["description"] = item["description"].strip()
+    if "priority" in item and item["priority"] is not None:
+        candidate["priority"] = item["priority"]
+    if "issue_type" in item and item["issue_type"]:
+        candidate["issue_type"] = str(item["issue_type"])
+    return candidate
 
 
 def identity_value(item: dict[str, Any], key: str) -> str | None:

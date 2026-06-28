@@ -196,6 +196,68 @@ sys.exit(9)
                 ],
             )
 
+    def test_github_issues_disabled_is_classified_as_unconfigured(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            fake_bin = temp_path / "bin"
+            fake_bin.mkdir()
+            write_executable(
+                fake_bin / "gh",
+                f"""#!{sys.executable}
+import sys
+
+if sys.argv[1:3] == ["auth", "status"]:
+    sys.exit(0)
+if sys.argv[1:3] == ["issue", "list"]:
+    print("issues are disabled for this repository", file=sys.stderr)
+    sys.exit(1)
+if len(sys.argv) >= 3 and sys.argv[1] == "api":
+    raise SystemExit("issue dependency lookup should not run when list fails")
+raise SystemExit(9)
+""",
+            )
+            request = {
+                "sources": [
+                    {
+                        "type": "github_issues",
+                        "id": "github",
+                        "repo": "example/repo",
+                        "labels": ["afk:ready"],
+                        "query": "label:afk:ready is:open",
+                    }
+                ],
+            }
+            ledger = temp_path / "ledger"
+            completed = run_afk(
+                "run-step",
+                "select-work",
+                "--input",
+                json.dumps(request),
+                "--ledger",
+                str(ledger),
+                env={"GH_TOKEN": "fake-token", "PATH": str(fake_bin)},
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(result["output"]["selected_work"], [])
+            self.assertEqual(
+                result["output"]["source_statuses"],
+                [
+                    {
+                        "source_id": "github",
+                        "source_type": "github_issues",
+                        "status": "skipped_unconfigured",
+                        "candidate_count": 0,
+                        "selected_count": 0,
+                        "message": "GitHub Issues are disabled for this repository",
+                    }
+                ],
+            )
+
     def test_invalid_fixture_payload_records_source_failure(self):
         request = {"sources": [{"type": "fixture", "id": "fixture", "items": {"not": "a list"}}]}
 
@@ -983,6 +1045,7 @@ else:
                     "labels": ["project:afk-composable-pipeline", "afk:ready"],
                     "parent": "central-lve",
                     "workstream": "central-lve",
+                    "description": "body",
                     "acceptance_criteria": ["Beads item is normalized"],
                     "dependencies": [{"id": "central-lve.3", "status": "closed", "type": "blocks"}],
                     "blockers": [],
@@ -1002,6 +1065,92 @@ else:
                 ]
             )
             self.assertNotIn(secret, artifact_text)
+
+    def test_beads_source_extracts_description_criteria_and_priority(self):
+        secret = "beads-secret-value"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            fake_bin = temp_path / "bin"
+            workspace = temp_path / "beads"
+            (workspace / "secrets").mkdir(parents=True)
+            (workspace / "secrets" / "dolt_beads_password.txt").write_text(secret, encoding="utf-8")
+            fake_bin.mkdir()
+            write_executable(
+                fake_bin / "bd",
+                f"""#!{sys.executable}
+import json
+import os
+import sys
+
+if os.environ.get("BEADS_DOLT_PASSWORD") != "{secret}":
+    sys.exit(8)
+
+if len(sys.argv) > 1 and sys.argv[1] == "list":
+    print(json.dumps([{{"id": "central-lve.11"}}]))
+elif len(sys.argv) > 2 and sys.argv[1] == "show" and sys.argv[2] == "central-lve.11":
+    print(json.dumps([
+        {{
+            "id": "central-lve.11",
+            "title": "Rank work from Beads metadata",
+            "priority": 2,
+            "issue_type": "task",
+            "description": "Implement the selector context.\\n\\nUseful background for selection.\\n\\n## Acceptance criteria\\n- [ ] Carry priority into run-next\\n- [ ] Parse acceptance criteria from description\\n- [ ] Keep the excerpt bounded\\n\\nMore notes that should not be in the excerpt.",
+            "status": "open",
+            "labels": ["project:afk-composable-pipeline", "afk:ready"],
+            "parent": "central-lve",
+            "metadata": {{"workstream": "central-lve", "afk.ready": True}},
+            "dependencies": [],
+        }}
+    ]))
+else:
+    print("unexpected bd args: " + " ".join(sys.argv[1:]), file=sys.stderr)
+    sys.exit(9)
+""",
+            )
+
+            request = {
+                "required_labels": ["project:afk-composable-pipeline", "afk:ready"],
+                "required_metadata": ["workstream", "acceptance_criteria", "afk.ready"],
+                "sources": [
+                    {
+                        "type": "beads",
+                        "id": "central-beads",
+                        "workspace": str(workspace),
+                        "workspace_kind": "mounted",
+                        "labels": ["project:afk-composable-pipeline", "afk:ready"],
+                    }
+                ],
+            }
+            ledger = temp_path / "ledger"
+            completed = run_afk(
+                "run-step",
+                "select-work",
+                "--input",
+                json.dumps(request),
+                "--ledger",
+                str(ledger),
+                env={"PATH": str(fake_bin)},
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(result["output"]["selected_work"][0]["priority"], 2)
+            self.assertEqual(result["output"]["selected_work"][0]["issue_type"], "task")
+            self.assertEqual(
+                result["output"]["selected_work"][0]["description"],
+                "Implement the selector context.\n\nUseful background for selection.",
+            )
+            self.assertEqual(
+                result["output"]["selected_work"][0]["acceptance_criteria"],
+                [
+                    "Carry priority into run-next",
+                    "Parse acceptance criteria from description",
+                    "Keep the excerpt bounded",
+                ],
+            )
 
     def test_beads_source_fetches_target_ids_directly_before_list_filters_can_drop_them(self):
         secret = "beads-secret-value"

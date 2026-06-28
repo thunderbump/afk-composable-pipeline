@@ -5,7 +5,7 @@ import shutil
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urlsplit
 
 from afk.contracts import ProjectContract
@@ -30,6 +30,9 @@ def run_next(
     selector_mode: str = "deterministic",
     selector_model: str | None = None,
     selector_choice_json: str | None = None,
+    execute: bool = False,
+    ledger_dir: Path | None = None,
+    workstream_runner: Callable[..., Any] | None = None,
 ) -> dict[str, Any]:
     workspace = beads_workspace or DEFAULT_BEADS_WORKSPACE
     selection_request = build_selection_request(
@@ -45,6 +48,7 @@ def run_next(
         selector_choice_json=selector_choice_json,
     )
     recipe = None
+    workstream_result = None
     if chosen is not None:
         recipe = generate_workstream_recipe(
             workstream_id=chosen["external_id"],
@@ -56,6 +60,16 @@ def run_next(
             sources=selection_request["sources"],
             required_labels=selection_request["required_labels"],
         )
+        if execute:
+            if ledger_dir is None:
+                raise ValueError("--ledger is required when --execute is set")
+            if workstream_runner is None:
+                raise ValueError("workstream_runner is required when --execute is set")
+            workstream_result = normalize_workstream_result(
+                workstream_runner(recipe, ledger_dir=ledger_dir, project_contract=project_contract)
+            )
+    elif execute and ledger_dir is None:
+        raise ValueError("--ledger is required when --execute is set")
     return {
         "command": "run-next",
         "project": project_contract.project_slug,
@@ -63,6 +77,7 @@ def run_next(
         "selection_result": selection_result,
         "selector": selector_result(chosen, selector_mode=selector_mode, selector_model=selector_model),
         "recipe": recipe,
+        "workstream_result": workstream_result,
     }
 
 
@@ -155,14 +170,30 @@ def deterministic_candidate(candidates: list[dict[str, Any]]) -> dict[str, Any]:
     return sorted(candidates, key=candidate_sort_key)[0]
 
 
-def candidate_sort_key(candidate: dict[str, Any]) -> tuple[int, str, str, str]:
+def candidate_sort_key(candidate: dict[str, Any]) -> tuple[int, tuple[int, int], str, str]:
     source_type_priority = 0 if candidate.get("source_type") == "beads" else 1
+    priority_sort_key = candidate_priority_sort_key(candidate)
     return (
         source_type_priority,
-        str(candidate.get("workstream") or ""),
+        priority_sort_key,
         str(candidate.get("external_id") or ""),
         str(candidate.get("title") or ""),
     )
+
+
+def candidate_priority_sort_key(candidate: dict[str, Any]) -> tuple[int, int]:
+    if candidate.get("source_type") != "beads":
+        return (1, 0)
+    priority = candidate.get("priority")
+    if isinstance(priority, bool):
+        priority = None
+    if isinstance(priority, int):
+        return (0, priority)
+    if isinstance(priority, str):
+        stripped = priority.strip()
+        if stripped.isdigit():
+            return (0, int(stripped))
+    return (1, 0)
 
 
 def parse_selector_choice(
@@ -235,8 +266,11 @@ def selector_prompt(candidates: list[dict[str, Any]]) -> str:
             "source_type": candidate.get("source_type"),
             "external_id": candidate.get("external_id"),
             "title": candidate.get("title"),
+            "priority": candidate.get("priority"),
+            "issue_type": candidate.get("issue_type"),
             "labels": candidate.get("labels", []),
             "workstream": candidate.get("workstream"),
+            "description": candidate.get("description"),
             "acceptance_criteria": candidate.get("acceptance_criteria", []),
         }
         for candidate in candidates
@@ -247,6 +281,19 @@ def selector_prompt(candidates: list[dict[str, Any]]) -> str:
         "Do not use tools.\n\n"
         + json.dumps({"candidates": selector_candidates}, sort_keys=True)
     )
+
+
+def normalize_workstream_result(result: Any) -> dict[str, Any] | None:
+    if result is None:
+        return None
+    if isinstance(result, dict):
+        return dict(result)
+    fields = ("run_id", "workstream_id", "parent", "status", "result_path", "publication_status")
+    if all(hasattr(result, field) for field in fields):
+        return {field: getattr(result, field) for field in fields}
+    if hasattr(result, "__dict__"):
+        return dict(result.__dict__)
+    return {"result": result}
 
 
 def github_repo_from_repo_url(repo_url: str) -> str | None:
