@@ -345,6 +345,32 @@ Unreachable or unauthenticated Beads workspaces block the workstream at
 selection and leave actionable `source_statuses` such as `skipped_unreachable`
 or `skipped_no_auth`.
 
+Discover the next project item and emit an inspectable recipe in one step:
+
+```sh
+PYTHONPATH=src python3 -m afk run-next \
+  --project bump-eqemu \
+  --contracts-dir project-contracts \
+  --checkout-root /work \
+  --checkout-path /work/bump-EQEmu \
+  --validation-profile tier1
+```
+
+`run-next` builds a project-scoped `select-work` request from the contract
+labels plus the observed `ready-for-agent` tag, tries both Beads and GitHub
+Issues sources when the contract can name a GitHub repo, and chooses a stable
+default candidate from the valid results. The selection envelope records the
+request, source statuses, chosen id/source, and the emitted recipe preview.
+With `--selector-mode model`, the command invokes `codex exec` and accepts only
+the lightweight model names `gpt-5.3-codex-spark` and `gpt-5.4-mini`; if the
+model call fails or returns an invalid choice, it falls back to deterministic
+selection.
+
+For `bump-eqemu`, GitHub Issues are effectively disabled, so Beads are the
+practical source there for now. The command still includes the GitHub source
+when the contract repo points at GitHub, and it will skip cleanly when auth is
+not available.
+
 ### Real Agent Container Contract
 
 For container/remote execution with `agent.type: real-agent-command`, AFK validates
