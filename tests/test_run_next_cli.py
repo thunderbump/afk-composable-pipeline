@@ -10,6 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from afk.contracts import load_project_contract  # noqa: E402
+from afk.pi_workers import PONYTAIL_EXTENSION_SOURCE, build_pi_real_worker_agent  # noqa: E402
 from afk.run_next import choose_candidate, github_repo_from_repo_url, run_next, selector_prompt, selector_result
 
 
@@ -330,6 +331,124 @@ raise SystemExit(9)
         self.assertEqual(runner_calls[0][0], recipe)
         self.assertEqual(runner_calls[0][1], ROOT / "project-contracts")
         self.assertEqual(runner_calls[0][2], contract)
+
+    def test_run_next_execute_mode_with_pi_agent_passes_redacted_payload_to_runner(self):
+        contract = load_project_contract("bump-eqemu", ROOT / "project-contracts", cwd=ROOT)
+        selection_result = {
+            "schema_version": 1,
+            "source_statuses": [{"source_id": "central-beads", "source_type": "beads", "status": "selected"}],
+            "selected_work": [
+                {
+                    "source_id": "central-beads",
+                    "source_type": "beads",
+                    "external_id": "central-lve.11",
+                    "title": "Rank work from Beads metadata",
+                    "status": "open",
+                    "labels": ["project:bump-eqemu", "ready-for-agent"],
+                    "workstream": "central-lve",
+                    "acceptance_criteria": ["Carry priority into run-next"],
+                    "priority": 2,
+                    "issue_type": "task",
+                    "description": "Implement the selector context.",
+                    "dependencies": [],
+                    "blockers": [],
+                    "dependency_status": "clear",
+                    "afk": {"ready": True},
+                    "raw": {"beads": {"id": "central-lve.11"}},
+                }
+            ],
+            "skipped_candidates": [],
+        }
+        agent_secret = "agent-secret-value"
+        runner_calls: list[tuple[object, object, object]] = []
+
+        def fake_workstream_runner(recipe_input, *, ledger_dir, project_contract):
+            runner_calls.append((recipe_input, ledger_dir, project_contract))
+            return {
+                "run_id": "run-456",
+                "workstream_id": "central-lve.11",
+                "parent": "central-lve",
+                "status": "succeeded",
+                "result_path": "runs/run-456/workstream-result.json",
+                "publication_status": "published",
+            }
+
+        original_select_work = run_next.__globals__["select_work"]
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                temp_path = Path(temp_dir)
+                beads_workspace = temp_path / "beads"
+                checkout_root = temp_path / "checkouts"
+                checkout_path = checkout_root / "bump-EQEmu"
+                ledger_dir = temp_path / "ledger"
+                codex_home = temp_path / "codex-home"
+                config_home = temp_path / "xdg-config"
+                pi_config_home = temp_path / "pi-config"
+                wrapper_secret = temp_path / "agent-wrapper-secret.txt"
+                beads_workspace.mkdir()
+                checkout_root.mkdir(parents=True)
+                checkout_path.mkdir(parents=True)
+                ledger_dir.mkdir()
+                codex_home.mkdir()
+                config_home.mkdir()
+                pi_config_home.mkdir()
+                wrapper_secret.write_text(agent_secret + "\n", encoding="utf-8")
+
+                pi_agent = build_pi_real_worker_agent(
+                    pi_bin="/opt/pi/bin/pi",
+                    provider="openai-codex",
+                    model="gpt-5.4-mini",
+                    codex_home=str(codex_home),
+                    config_home=str(config_home),
+                    pi_config_home=str(pi_config_home),
+                    checkout_path=checkout_path,
+                    ponytail_extension_source=PONYTAIL_EXTENSION_SOURCE,
+                    wrapper_secret_file=str(wrapper_secret),
+                )
+
+                run_next.__globals__["select_work"] = lambda request, project_contract=None: selection_result
+                payload = run_next(
+                    project_contract=contract,
+                    beads_workspace=beads_workspace,
+                    checkout_root=checkout_root,
+                    checkout_path=checkout_path,
+                    validation_profile="tier1",
+                    selector_mode="deterministic",
+                    selector_model=None,
+                    selector_choice_json=None,
+                    agent=pi_agent,
+                    execute=True,
+                    ledger_dir=ledger_dir,
+                    workstream_runner=fake_workstream_runner,
+                )
+        finally:
+            run_next.__globals__["select_work"] = original_select_work
+
+        self.assertEqual(len(runner_calls), 1)
+        runner_payload, runner_ledger_dir, runner_contract = runner_calls[0]
+        implement_agent = next(step["input"]["agent"] for step in runner_payload["steps"] if step["name"] == "implement")
+
+        self.assertEqual(runner_ledger_dir, ledger_dir)
+        self.assertEqual(runner_contract, contract)
+        self.assertEqual(implement_agent["type"], "real-agent-command")
+        self.assertEqual(
+            implement_agent["command"],
+            [
+                "/opt/pi/bin/pi",
+                "-p",
+                "{prompt}",
+                "--provider",
+                "openai-codex",
+                "--model",
+                "gpt-5.4-mini",
+                "--extension",
+                PONYTAIL_EXTENSION_SOURCE,
+            ],
+        )
+        self.assertEqual(implement_agent["wrapper_secret_files"], {"primary": str(wrapper_secret)})
+        self.assertNotIn(agent_secret, json.dumps(runner_payload))
+        self.assertNotIn(agent_secret, json.dumps(payload["recipe"]))
+        self.assertNotIn(agent_secret, json.dumps(payload["workstream_result"]))
 
     def test_run_next_execute_mode_does_not_run_without_candidates(self):
         contract = load_project_contract("bump-eqemu", ROOT / "project-contracts", cwd=ROOT)
