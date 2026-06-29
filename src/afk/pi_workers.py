@@ -113,6 +113,32 @@ def build_pi_mount_config(
     return mount_config
 
 
+def build_provider_pi_mount_config(
+    *,
+    provider: str,
+    codex_home: str | None,
+    config_home: str | None,
+    pi_config_home: str | None,
+    pi_coding_agent_dir: str | None,
+    checkout_path: Path,
+    field_prefix: str,
+) -> dict[str, Any]:
+    provider_name = require_non_empty(provider, "provider")
+    if provider_name == "openai-codex":
+        require_non_empty(codex_home, f"{field_prefix}.codex_home")
+        require_non_empty(config_home, f"{field_prefix}.config_home")
+        require_non_empty(pi_config_home, f"{field_prefix}.env.PI_CONFIG_HOME")
+        require_non_empty(pi_coding_agent_dir, f"{field_prefix}.env.PI_CODING_AGENT_DIR")
+    return build_pi_mount_config(
+        codex_home=codex_home,
+        config_home=config_home,
+        pi_config_home=pi_config_home,
+        pi_coding_agent_dir=pi_coding_agent_dir,
+        checkout_path=checkout_path,
+        field_prefix=field_prefix,
+    )
+
+
 def build_pi_print_command(
     *,
     pi_bin: str,

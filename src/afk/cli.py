@@ -23,6 +23,7 @@ from afk.run_next import run_next
 from afk.pi_workers import (
     PONYTAIL_EXTENSION_SOURCE,
     build_pi_mount_config,
+    build_provider_pi_mount_config,
     build_pi_real_worker_agent,
     build_pi_print_command,
 )
@@ -624,7 +625,8 @@ def recipe_reviewer_from_args(args: argparse.Namespace, *, checkout_path: Path) 
             "type": "fake-reviewer-command",
             "command": command,
             "timeout_seconds": reviewer_timeout,
-            **build_pi_mount_config(
+            **build_provider_pi_mount_config(
+                provider=args.reviewer_pi_provider,
                 codex_home=args.agent_codex_home,
                 config_home=args.agent_config_home,
                 pi_config_home=args.agent_pi_config_home,
@@ -672,7 +674,8 @@ def recipe_retrospective_judge_from_args(args: argparse.Namespace, *, checkout_p
             "type": "local-command",
             "command": command,
             "timeout_seconds": judge_timeout,
-            **build_pi_mount_config(
+            **build_provider_pi_mount_config(
+                provider=args.retrospective_judge_pi_provider,
                 codex_home=args.agent_codex_home,
                 config_home=args.agent_config_home,
                 pi_config_home=args.agent_pi_config_home,

@@ -983,10 +983,18 @@ sys.exit(0)
             beads_workspace = temp_path / "beads"
             checkout_root = temp_path / "checkouts"
             checkout_path = checkout_root / "bump-EQEmu"
+            codex_home = temp_path / "codex-home"
+            config_home = temp_path / "xdg-config"
+            pi_config_home = temp_path / "pi-config"
+            pi_coding_agent_dir = temp_path / "pi-coding-agent"
             checkout_root.mkdir()
             checkout_path.mkdir()
             beads_workspace.mkdir()
             fake_bin.mkdir()
+            codex_home.mkdir()
+            config_home.mkdir()
+            pi_config_home.mkdir()
+            pi_coding_agent_dir.mkdir()
             secret_dir = beads_workspace / "secrets"
             secret_dir.mkdir(parents=True)
             secret_dir.joinpath("dolt_beads_password.txt").write_text("beads-secret", encoding="utf-8")
@@ -1044,6 +1052,14 @@ sys.exit(0)
                 "--reviewer-timeout-seconds",
                 "123",
                 "--reviewer-ponytail",
+                "--agent-codex-home",
+                str(codex_home),
+                "--agent-config-home",
+                str(config_home),
+                "--agent-pi-config-home",
+                str(pi_config_home),
+                "--agent-pi-coding-agent-dir",
+                str(pi_coding_agent_dir),
                 "--retrospective-judge-mode",
                 "pi",
                 "--retrospective-judge-pi-bin",
@@ -1072,6 +1088,15 @@ sys.exit(0)
                 ),
             )
             self.assertEqual(review_input["timeout_seconds"], 123)
+            self.assertEqual(review_input["codex_home"], str(codex_home))
+            self.assertEqual(review_input["config_home"], str(config_home))
+            self.assertEqual(
+                review_input["env"],
+                {
+                    "PI_CONFIG_HOME": str(pi_config_home),
+                    "PI_CODING_AGENT_DIR": str(pi_coding_agent_dir),
+                },
+            )
 
             retrospective_judge = payload["recipe"]["retrospective_judge"]
             self.assertEqual(
@@ -1085,6 +1110,15 @@ sys.exit(0)
             )
             self.assertEqual(retrospective_judge["timeout_seconds"], 321)
             self.assertEqual(retrospective_judge["type"], "local-command")
+            self.assertEqual(retrospective_judge["codex_home"], str(codex_home))
+            self.assertEqual(retrospective_judge["config_home"], str(config_home))
+            self.assertEqual(
+                retrospective_judge["env"],
+                {
+                    "PI_CONFIG_HOME": str(pi_config_home),
+                    "PI_CODING_AGENT_DIR": str(pi_coding_agent_dir),
+                },
+            )
 
     def test_run_next_rejects_disallowed_pi_reviewer_model(self):
         with tempfile.TemporaryDirectory() as temp_dir:
