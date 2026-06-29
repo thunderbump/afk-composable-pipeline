@@ -57,6 +57,7 @@ def validate(
         return request
     if run_dir is None:
         return invalid_request("run_dir is required")
+    run_dir = run_dir.resolve(strict=False)
 
     worker_request = build_worker_request(request, run_dir)
     request_path = run_dir / "worker-request.json"
