@@ -1,5 +1,6 @@
 import json
 import os
+import time
 import subprocess
 import sys
 import tempfile
@@ -1034,6 +1035,139 @@ class ValidateCliTest(unittest.TestCase):
             )
             self.assertIn(sys.executable, result["output"]["summary"])
             self.assertIn("worker command timed out", result["output"]["summary"])
+
+    def test_validate_reports_stopped_worker_process_before_timeout(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            checkout = temp_path / "checkout"
+            start_commit = init_checkout(checkout)
+            ledger = temp_path / "ledger"
+            worker_code = textwrap.dedent(
+                """
+                import os
+                import signal
+                import time
+
+                os.kill(os.getpid(), signal.SIGSTOP)
+                time.sleep(5)
+                """
+            ).strip()
+
+            started_at = time.monotonic()
+            completed = run_afk(
+                "run-step",
+                "validate",
+                "--profile",
+                "tier3-harness",
+                "--input",
+                json.dumps(
+                    {
+                        "checkout": {
+                            "status": "prepared",
+                            "checkout_path": str(checkout),
+                            "review_branch": "afk/validate",
+                            "requested_ref": "main",
+                            "start_commit": start_commit,
+                        },
+                        "worker": {
+                            "type": "local-command",
+                            "command": [sys.executable, "-c", worker_code],
+                            "timeout_seconds": 5,
+                        },
+                    }
+                ),
+                "--ledger",
+                str(ledger),
+            )
+            elapsed = time.monotonic() - started_at
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertLess(elapsed, 2, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+            worker_result = json.loads((run_dir / "worker-result.json").read_text(encoding="utf-8"))
+            evidence_result = json.loads(
+                (run_dir / "validation-evidence" / "result.json").read_text(encoding="utf-8")
+            )
+
+            self.assertEqual(result["output"]["status"], "failed_runtime")
+            self.assertEqual(result["output"]["classification"], "runtime_failure")
+            self.assertEqual(worker_result["result"]["normalized"]["classification"], "runtime_failure")
+            self.assertEqual(worker_result["result"]["normalized"]["actionable_failures"][0]["category"], "runtime")
+            self.assertEqual(evidence_result["status"], "failed_runtime")
+            self.assertEqual(evidence_result["classification"], "runtime_failure")
+            self.assertIn("stopped", worker_result["result"]["normalized"]["summary"])
+            self.assertIn("SIGCONT", worker_result["result"]["normalized"]["summary"])
+            self.assertIn("State:", evidence_result["summary"])
+
+    def test_validate_reports_stopped_worker_descendant_before_timeout(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            checkout = temp_path / "checkout"
+            start_commit = init_checkout(checkout)
+            ledger = temp_path / "ledger"
+            worker_code = textwrap.dedent(
+                """
+                import os
+                import signal
+                import subprocess
+                import sys
+                import time
+
+                child = subprocess.Popen(
+                    [sys.executable, "-c", "import os, signal, time; os.kill(os.getpid(), signal.SIGSTOP); time.sleep(5)"]
+                )
+                while child.poll() is None:
+                    time.sleep(0.05)
+                """
+            ).strip()
+
+            completed = run_afk(
+                "run-step",
+                "validate",
+                "--profile",
+                "tier3-harness",
+                "--input",
+                json.dumps(
+                    {
+                        "checkout": {
+                            "status": "prepared",
+                            "checkout_path": str(checkout),
+                            "review_branch": "afk/validate",
+                            "requested_ref": "main",
+                            "start_commit": start_commit,
+                        },
+                        "worker": {
+                            "type": "local-command",
+                            "command": [sys.executable, "-c", worker_code],
+                            "timeout_seconds": 5,
+                        },
+                    }
+                ),
+                "--ledger",
+                str(ledger),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+            worker_result = json.loads((run_dir / "worker-result.json").read_text(encoding="utf-8"))
+            evidence_result = json.loads(
+                (run_dir / "validation-evidence" / "result.json").read_text(encoding="utf-8")
+            )
+
+            self.assertEqual(result["output"]["status"], "failed_runtime")
+            self.assertEqual(result["output"]["classification"], "runtime_failure")
+            self.assertEqual(worker_result["result"]["normalized"]["adapter"]["timed_out"], False)
+            self.assertIn("State: T", worker_result["result"]["normalized"]["summary"])
+            self.assertGreaterEqual(
+                len(worker_result["result"]["normalized"]["adapter"]["stopped_processes"]),
+                1,
+            )
+            self.assertEqual(evidence_result["process_state"], "stopped")
+            self.assertEqual(evidence_result["remediation"].count("SIGCONT"), 1)
 
     def test_validate_sanitizes_worker_result_evidence_after_timeout(self):
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import os
 import re
+import signal
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +29,8 @@ class WorkerRuntimeError(RuntimeError):
         returncode: int | None = None,
         timed_out: bool = False,
         command: list[str] | None = None,
+        adapter_details: dict[str, Any] | None = None,
+        failure_artifact: dict[str, Any] | None = None,
     ):
         super().__init__(message)
         self.message = message
@@ -34,6 +39,8 @@ class WorkerRuntimeError(RuntimeError):
         self.returncode = returncode
         self.timed_out = timed_out
         self.command = list(command) if isinstance(command, list) else None
+        self.adapter_details = redact_artifact_value(adapter_details or {})
+        self.failure_artifact = redact_artifact_value(failure_artifact or {})
 
 
 def validate_step(context: Any) -> dict[str, Any]:
@@ -95,7 +102,11 @@ def validate(
                 summary=raw_payload["message"],
                 raw_result=None,
                 adapter=adapter_record(
-                    request["worker"], exc.returncode, exc.timed_out, command=exc.command
+                    request["worker"],
+                    exc.returncode,
+                    exc.timed_out,
+                    command=exc.command,
+                    details=exc.adapter_details,
                 ),
                 stdout=stdout,
                 stderr=stderr,
@@ -106,12 +117,27 @@ def validate(
             worker_result = {"raw": None, "normalized": normalized}
             write_worker_result(worker_result_path, run_id, worker_result)
             return validate_output(request, worker_request, worker_result)
+        if exc.failure_artifact:
+            sync_worker_failure_artifacts(
+                result_path,
+                evidence_result_path,
+                "failed_timeout" if exc.timed_out else "failed_runtime",
+                "timeout" if exc.timed_out else "runtime_failure",
+                exc.message,
+                details=exc.failure_artifact,
+            )
         normalized = normalized_worker_result(
             status="failed_timeout" if exc.timed_out else "failed_runtime",
             classification="timeout" if exc.timed_out else "runtime_failure",
             summary=exc.message,
             raw_result=None,
-            adapter=adapter_record(request["worker"], exc.returncode, exc.timed_out, command=exc.command),
+            adapter=adapter_record(
+                request["worker"],
+                exc.returncode,
+                exc.timed_out,
+                command=exc.command,
+                details=exc.adapter_details,
+            ),
             stdout=stdout,
             stderr=stderr,
             evidence_dir=evidence_dir,
@@ -535,6 +561,13 @@ def run_command_adapter(
         evidence_dir=evidence_dir,
         profile=profile,
     )
+    if worker["type"] == "local-command":
+        return run_local_command_adapter(
+            command,
+            cwd=checkout_path,
+            env=env,
+            timeout_seconds=worker["timeout_seconds"],
+        )
     try:
         completed = subprocess.run(
             command,
@@ -564,6 +597,239 @@ def run_command_adapter(
         "stdout": completed.stdout,
         "stderr": completed.stderr,
     }
+
+
+STOPPED_PROCESS_REMEDIATION = (
+    "Send SIGCONT to the worker process group to resume it for debugging, then fix PTY/job-control "
+    "behavior or the worker script before retrying validation."
+)
+
+
+def run_local_command_adapter(
+    command: list[str],
+    *,
+    cwd: Path,
+    env: dict[str, str],
+    timeout_seconds: float,
+) -> dict[str, Any]:
+    try:
+        process = subprocess.Popen(
+            command,
+            cwd=cwd,
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+    except OSError as exc:
+        raise WorkerRuntimeError(str(exc), stderr=str(exc), returncode=None, command=command) from exc
+
+    stdout_chunks: list[str] = []
+    stderr_chunks: list[str] = []
+    stdout_thread = stream_reader(process.stdout, stdout_chunks)
+    stderr_thread = stream_reader(process.stderr, stderr_chunks)
+    deadline = time.monotonic() + timeout_seconds
+
+    while True:
+        if process.poll() is not None:
+            break
+        stopped_processes = stopped_process_tree(process.pid)
+        if stopped_processes:
+            message = format_stopped_process_message(process.pid, stopped_processes)
+            terminate_process_group(process)
+            stdout, stderr = finalize_process_output(
+                process,
+                stdout_thread=stdout_thread,
+                stderr_thread=stderr_thread,
+                stdout_chunks=stdout_chunks,
+                stderr_chunks=stderr_chunks,
+            )
+            raise WorkerRuntimeError(
+                message,
+                stdout=stdout,
+                stderr=append_error_message(stderr, message),
+                returncode=None,
+                command=command,
+                adapter_details={"stopped_processes": stopped_processes},
+                failure_artifact={
+                    "process_state": "stopped",
+                    "stopped_processes": stopped_processes,
+                    "remediation": STOPPED_PROCESS_REMEDIATION,
+                },
+            )
+        if time.monotonic() >= deadline:
+            terminate_process_group(process)
+            stdout, stderr = finalize_process_output(
+                process,
+                stdout_thread=stdout_thread,
+                stderr_thread=stderr_thread,
+                stdout_chunks=stdout_chunks,
+                stderr_chunks=stderr_chunks,
+            )
+            raise WorkerRuntimeError(
+                "worker command timed out",
+                stdout=stdout,
+                stderr=stderr or "worker command timed out",
+                returncode=None,
+                timed_out=True,
+                command=command,
+            )
+        time.sleep(min(0.05, max(deadline - time.monotonic(), 0.0)))
+
+    stdout, stderr = finalize_process_output(
+        process,
+        stdout_thread=stdout_thread,
+        stderr_thread=stderr_thread,
+        stdout_chunks=stdout_chunks,
+        stderr_chunks=stderr_chunks,
+    )
+    return {
+        "command": command,
+        "returncode": process.returncode,
+        "stdout": stdout,
+        "stderr": stderr,
+    }
+
+
+def stream_reader(stream: Any, chunks: list[str]) -> threading.Thread:
+    def read_stream() -> None:
+        if stream is None:
+            return
+        try:
+            while True:
+                chunk = stream.read(4096)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+        finally:
+            stream.close()
+
+    thread = threading.Thread(target=read_stream, daemon=True)
+    thread.start()
+    return thread
+
+
+def finalize_process_output(
+    process: subprocess.Popen[str],
+    *,
+    stdout_thread: threading.Thread,
+    stderr_thread: threading.Thread,
+    stdout_chunks: list[str],
+    stderr_chunks: list[str],
+) -> tuple[str, str]:
+    try:
+        process.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        terminate_process_group(process)
+        process.wait(timeout=1)
+    stdout_thread.join(timeout=1)
+    stderr_thread.join(timeout=1)
+    return ("".join(stdout_chunks), "".join(stderr_chunks))
+
+
+def terminate_process_group(process: subprocess.Popen[str]) -> None:
+    if process.poll() is not None:
+        return
+    process_group = process.pid
+    for sig in (signal.SIGCONT, signal.SIGTERM):
+        try:
+            os.killpg(process_group, sig)
+        except ProcessLookupError:
+            return
+    try:
+        process.wait(timeout=0.2)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(process_group, signal.SIGKILL)
+    except ProcessLookupError:
+        return
+
+
+def stopped_process_tree(root_pid: int) -> list[dict[str, Any]]:
+    if sys.platform != "linux":
+        return []
+    pending = [root_pid]
+    seen: set[int] = set()
+    stopped: list[dict[str, Any]] = []
+    while pending:
+        pid = pending.pop(0)
+        if pid in seen:
+            continue
+        seen.add(pid)
+        status = read_proc_status(pid)
+        if status is None:
+            continue
+        pending.extend(proc_children(pid))
+        state_code = string_field(status, "state_code") or ""
+        if state_code in {"T", "t"}:
+            stopped.append(status)
+    return sorted(stopped, key=lambda item: int(item["pid"]))
+
+
+def proc_children(pid: int) -> list[int]:
+    children_path = Path(f"/proc/{pid}/task/{pid}/children")
+    try:
+        text = children_path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return []
+    children: list[int] = []
+    for item in text.split():
+        try:
+            children.append(int(item))
+        except ValueError:
+            continue
+    return children
+
+
+def read_proc_status(pid: int) -> dict[str, Any] | None:
+    status_path = Path(f"/proc/{pid}/status")
+    try:
+        lines = status_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    values: dict[str, str] = {}
+    for line in lines:
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        values[key] = value.strip()
+    state = values.get("State", "")
+    state_code = state[:1]
+    result: dict[str, Any] = {
+        "pid": pid,
+        "name": values.get("Name", ""),
+        "state": state,
+        "state_code": state_code,
+    }
+    ppid_text = values.get("PPid", "")
+    if ppid_text.isdigit():
+        result["ppid"] = int(ppid_text)
+    return result
+
+
+def format_stopped_process_message(root_pid: int, stopped_processes: list[dict[str, Any]]) -> str:
+    entries = [
+        f"pid {item['pid']} {item.get('name') or 'process'} State: {item.get('state') or '?'}"
+        for item in stopped_processes[:3]
+    ]
+    if len(stopped_processes) > 3:
+        entries.append(f"+{len(stopped_processes) - 3} more")
+    details = "; ".join(entries)
+    return (
+        f"worker process group stopped under pid {root_pid}: {details}. "
+        f"Remediation: {STOPPED_PROCESS_REMEDIATION}"
+    )
+
+
+def append_error_message(stderr: str, message: str) -> str:
+    if not stderr:
+        return message
+    if stderr.endswith("\n"):
+        return stderr + message
+    return stderr + "\n" + message
 
 
 def render_command(
@@ -720,6 +986,8 @@ def sync_worker_failure_artifacts(
     status: str,
     classification: str,
     message: str,
+    *,
+    details: dict[str, Any] | None = None,
 ) -> None:
     payload = {
         "schema_version": SCHEMA_VERSION,
@@ -727,6 +995,8 @@ def sync_worker_failure_artifacts(
         "classification": classification,
         "summary": message,
     }
+    if details:
+        payload.update(redact_artifact_value(details))
     replace_worker_result_evidence(worker_output_path, payload)
     replace_worker_result_evidence(evidence_result_path, payload)
 
@@ -840,6 +1110,7 @@ def adapter_record(
     timed_out: bool,
     *,
     command: list[str] | None = None,
+    details: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     adapter = {
         "type": worker["type"],
@@ -850,6 +1121,8 @@ def adapter_record(
         adapter["command"] = redact_artifact_value(command)
     if worker.get("host"):
         adapter["host"] = worker["host"]
+    if details:
+        adapter.update(redact_artifact_value(details))
     return adapter
 
 
