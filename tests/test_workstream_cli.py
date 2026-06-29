@@ -1,5 +1,6 @@
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -78,6 +79,36 @@ def init_repo(path):
 def write_executable(path, content):
     path.write_text(content, encoding="utf-8")
     path.chmod(0o755)
+
+
+def clone_repo(src, dest, *args):
+    completed = subprocess.run(
+        ["git", "clone", *args, str(src), str(dest)],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise AssertionError(
+            f"git clone {' '.join(args)} failed\nstdout:\n{completed.stdout}\nstderr:\n{completed.stderr}"
+        )
+
+
+def commit_file(repo, relative_path, content, message):
+    (repo / relative_path).write_text(content, encoding="utf-8")
+    git(repo, "add", relative_path)
+    git(repo, "commit", "-m", message)
+
+
+def init_remote_checkout(temp_path):
+    repo = temp_path / "repo-src"
+    remote = temp_path / "origin.git"
+    checkout = temp_path / "checkout"
+    init_repo(repo)
+    clone_repo(repo, remote, "--bare")
+    clone_repo(remote, checkout)
+    start_commit = git(checkout, "rev-parse", "HEAD")
+    return repo, remote, checkout, start_commit
 
 
 def selected_fixture_item(external_id="central-lve.9", title=None):
@@ -4386,6 +4417,317 @@ sys.exit(11)
             self.assertNotIn(str(mounted_gh_config), publication_text)
             self.assertNotIn("Retry: not required after successful publication", pr_body)
             self.assertIn("Retry: rerun the workstream if terminal publication fails", pr_body)
+
+    def test_publish_terminal_pr_retries_non_fast_forward_afk_review_branch_with_force_with_lease(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            runner = temp_path / "runner"
+            runner.mkdir()
+            _, _, checkout, start_commit = init_remote_checkout(temp_path)
+            ledger_arg = "relative-ledger"
+            fake_calls = temp_path / "fake-calls.jsonl"
+            mounted_gh_config = temp_path / "mounted-gh-config"
+            mounted_gh_config.mkdir()
+            real_git = shutil.which("git")
+            self.assertIsNotNone(real_git)
+
+            review_branch = "afk/workstream-terminal-pr"
+            commit_file(checkout, "prior.txt", "prior retry branch\n", "prior publication")
+            prior_remote_commit = git(checkout, "rev-parse", "HEAD")
+            git(checkout, "push", "origin", f"HEAD:refs/heads/{review_branch}")
+            git(checkout, "reset", "--hard", start_commit)
+            commit_file(checkout, "replacement.txt", "replacement retry branch\n", "replacement publication")
+            replacement_commit = git(checkout, "rev-parse", "HEAD")
+
+            fake_git = temp_path / "publisher-git"
+            fake_gh = temp_path / "publisher-gh"
+            write_executable(
+                fake_git,
+                f"""#!{sys.executable}
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+Path({str(fake_calls)!r}).open("a", encoding="utf-8").write(
+    json.dumps({{"tool": "git", "cwd": os.getcwd(), "argv": sys.argv[1:]}}) + "\\n"
+)
+completed = subprocess.run([{real_git!r}, *sys.argv[1:]], check=False)
+sys.exit(completed.returncode)
+""",
+            )
+            write_executable(
+                fake_gh,
+                f"""#!{sys.executable}
+import json
+import os
+import sys
+from pathlib import Path
+
+record = {{
+    "tool": "gh",
+    "cwd": os.getcwd(),
+    "argv": sys.argv[1:],
+    "gh_config_dir": os.environ.get("GH_CONFIG_DIR", ""),
+}}
+if "--body-file" in sys.argv:
+    body_file = sys.argv[sys.argv.index("--body-file") + 1]
+    record["body_path"] = body_file
+Path({str(fake_calls)!r}).open("a", encoding="utf-8").write(json.dumps(record) + "\\n")
+if sys.argv[1:4] == ["auth", "status", "--hostname"]:
+    sys.exit(0)
+if sys.argv[1:3] == ["pr", "create"]:
+    print("https://github.example/pr/456")
+    sys.exit(0)
+sys.exit(9)
+""",
+            )
+
+            normalized = {
+                "workstream_id": "central-lve.9",
+                "parent": "central-lve",
+                "review_branch": review_branch,
+            }
+            state = {
+                "checkout": {
+                    "status": "prepared",
+                    "checkout_path": str(checkout),
+                    "start_commit": start_commit,
+                },
+                "implementation": {
+                    "git": {
+                        "changed_files": ["replacement.txt"],
+                        "commits": [{"commit": replacement_commit, "subject": "replacement publication"}],
+                    }
+                },
+                "validations": [
+                    {
+                        "output": {
+                            "status": "validated",
+                            "summary": "validated",
+                            "worker_result": {
+                                "raw": {"status": "pass", "steps": [{"name": "unit", "status": "pass"}]},
+                                "normalized": {
+                                    "summary": "validated",
+                                    "adapter": {"command": [sys.executable, "-c", "print('ok')"]},
+                                },
+                            },
+                        },
+                        "step_result_path": "runs/validate/step-result.json",
+                        "worker_result_path": "runs/validate/worker-result.json",
+                    }
+                ],
+                "review": {"status": "passed", "summary": "ready for PR"},
+                "cleanup": {"status": "clean", "resources": []},
+                "implementation_selection": [],
+                "review_selection": [],
+            }
+            steps = [{"name": "validate", "result_path": "runs/validate/step-result.json"}]
+            selected_work = [{**selected_fixture_item(), "result": "passed"}]
+
+            old_cwd = Path.cwd()
+            try:
+                os.chdir(runner)
+                ledger = WorkstreamLedger(Path(ledger_arg), "publisher-non-fast-forward-retry")
+                ledger.prepare()
+                result = publish_terminal_pr(
+                    {
+                        "enabled": True,
+                        "mode": "create",
+                        "repo": "thunderbump/afk-composable-pipeline",
+                        "base": "main",
+                        "head": review_branch,
+                        "title": "central-lve.9: Compose workstream recipe and terminal PR publisher",
+                        "git": {"path": str(fake_git), "push": True, "remote": "origin"},
+                        "gh": {
+                            "path": str(fake_gh),
+                            "auth": {"config_dir": str(mounted_gh_config)},
+                        },
+                    },
+                    normalized=normalized,
+                    state=state,
+                    steps=steps,
+                    selected_work=selected_work,
+                    ledger=ledger,
+                )
+            finally:
+                os.chdir(old_cwd)
+
+            calls = [json.loads(line) for line in fake_calls.read_text(encoding="utf-8").splitlines()]
+            remote_commit = git(checkout, "rev-parse", f"refs/remotes/origin/{review_branch}")
+
+            self.assertEqual(result["status"], "published")
+            self.assertEqual(result["url"], "https://github.example/pr/456")
+            self.assertEqual(result["commands"]["git_push"], [str(fake_git), "push", "origin", f"HEAD:refs/heads/{review_branch}"])
+            self.assertEqual(
+                result["commands"]["git_push_retry"],
+                [
+                    str(fake_git),
+                    "push",
+                    f"--force-with-lease=refs/heads/{review_branch}:{prior_remote_commit}",
+                    "origin",
+                    f"HEAD:refs/heads/{review_branch}",
+                ],
+            )
+            self.assertEqual(result["git_push"]["retry_handling"], "force-with-lease-replaced")
+            self.assertEqual(result["git_push"]["base_commit"], start_commit)
+            self.assertEqual(result["git_push"]["lease_expected"], prior_remote_commit)
+            self.assertEqual(
+                [attempt["outcome"] for attempt in result["git_push"]["attempts"]],
+                ["non-fast-forward", "pushed"],
+            )
+            self.assertEqual(remote_commit, replacement_commit)
+            push_commands = [call["argv"] for call in calls if call["tool"] == "git" and call["argv"][0] == "push"]
+            self.assertEqual(
+                push_commands,
+                [
+                    ["push", "origin", f"HEAD:refs/heads/{review_branch}"],
+                    [
+                        "push",
+                        f"--force-with-lease=refs/heads/{review_branch}:{prior_remote_commit}",
+                        "origin",
+                        f"HEAD:refs/heads/{review_branch}",
+                    ],
+                ],
+            )
+
+    def test_publish_terminal_pr_does_not_force_non_afk_review_branch_on_non_fast_forward(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            runner = temp_path / "runner"
+            runner.mkdir()
+            _, _, checkout, start_commit = init_remote_checkout(temp_path)
+            ledger_arg = "relative-ledger"
+            fake_calls = temp_path / "fake-calls.jsonl"
+            mounted_gh_config = temp_path / "mounted-gh-config"
+            mounted_gh_config.mkdir()
+            real_git = shutil.which("git")
+            self.assertIsNotNone(real_git)
+
+            review_branch = "review/workstream-terminal-pr"
+            commit_file(checkout, "prior.txt", "prior retry branch\n", "prior publication")
+            prior_remote_commit = git(checkout, "rev-parse", "HEAD")
+            git(checkout, "push", "origin", f"HEAD:refs/heads/{review_branch}")
+            git(checkout, "reset", "--hard", start_commit)
+            commit_file(checkout, "replacement.txt", "replacement retry branch\n", "replacement publication")
+
+            fake_git = temp_path / "publisher-git"
+            fake_gh = temp_path / "publisher-gh"
+            write_executable(
+                fake_git,
+                f"""#!{sys.executable}
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+Path({str(fake_calls)!r}).open("a", encoding="utf-8").write(
+    json.dumps({{"tool": "git", "cwd": os.getcwd(), "argv": sys.argv[1:]}}) + "\\n"
+)
+completed = subprocess.run([{real_git!r}, *sys.argv[1:]], check=False)
+sys.exit(completed.returncode)
+""",
+            )
+            write_executable(
+                fake_gh,
+                f"""#!{sys.executable}
+import json
+import os
+import sys
+from pathlib import Path
+
+Path({str(fake_calls)!r}).open("a", encoding="utf-8").write(
+    json.dumps({{"tool": "gh", "cwd": os.getcwd(), "argv": sys.argv[1:]}}) + "\\n"
+)
+if sys.argv[1:4] == ["auth", "status", "--hostname"]:
+    sys.exit(0)
+print("gh should not create PR", file=sys.stderr)
+sys.exit(9)
+""",
+            )
+
+            normalized = {
+                "workstream_id": "central-lve.9",
+                "parent": "central-lve",
+                "review_branch": review_branch,
+            }
+            state = {
+                "checkout": {
+                    "status": "prepared",
+                    "checkout_path": str(checkout),
+                    "start_commit": start_commit,
+                },
+                "implementation": {
+                    "git": {
+                        "changed_files": ["replacement.txt"],
+                        "commits": [{"commit": "abc1234", "subject": "replacement publication"}],
+                    }
+                },
+                "validations": [
+                    {
+                        "output": {
+                            "status": "validated",
+                            "summary": "validated",
+                            "worker_result": {
+                                "raw": {"status": "pass", "steps": [{"name": "unit", "status": "pass"}]},
+                                "normalized": {
+                                    "summary": "validated",
+                                    "adapter": {"command": [sys.executable, "-c", "print('ok')"]},
+                                },
+                            },
+                        },
+                        "step_result_path": "runs/validate/step-result.json",
+                        "worker_result_path": "runs/validate/worker-result.json",
+                    }
+                ],
+                "review": {"status": "passed", "summary": "ready for PR"},
+                "cleanup": {"status": "clean", "resources": []},
+                "implementation_selection": [],
+                "review_selection": [],
+            }
+            steps = [{"name": "validate", "result_path": "runs/validate/step-result.json"}]
+            selected_work = [{**selected_fixture_item(), "result": "passed"}]
+
+            old_cwd = Path.cwd()
+            try:
+                os.chdir(runner)
+                ledger = WorkstreamLedger(Path(ledger_arg), "publisher-non-fast-forward-blocked")
+                ledger.prepare()
+                result = publish_terminal_pr(
+                    {
+                        "enabled": True,
+                        "mode": "create",
+                        "repo": "thunderbump/afk-composable-pipeline",
+                        "base": "main",
+                        "head": review_branch,
+                        "title": "central-lve.9: Compose workstream recipe and terminal PR publisher",
+                        "git": {"path": str(fake_git), "push": True, "remote": "origin"},
+                        "gh": {
+                            "path": str(fake_gh),
+                            "auth": {"config_dir": str(mounted_gh_config)},
+                        },
+                    },
+                    normalized=normalized,
+                    state=state,
+                    steps=steps,
+                    selected_work=selected_work,
+                    ledger=ledger,
+                )
+            finally:
+                os.chdir(old_cwd)
+
+            calls = [json.loads(line) for line in fake_calls.read_text(encoding="utf-8").splitlines()]
+            push_commands = [call["argv"] for call in calls if call["tool"] == "git" and call["argv"][0] == "push"]
+
+            self.assertEqual(result["status"], "failed-needs-human")
+            self.assertIn("non-fast-forward", result["reason"])
+            self.assertIn("afk/", result["reason"])
+            self.assertEqual(result["git_push"]["retry_handling"], "not-eligible")
+            self.assertEqual(result["git_push"]["lease_expected"], prior_remote_commit)
+            self.assertEqual([attempt["outcome"] for attempt in result["git_push"]["attempts"]], ["non-fast-forward"])
+            self.assertEqual(push_commands, [["push", "origin", f"HEAD:refs/heads/{review_branch}"]])
 
     def test_workstream_records_actionable_terminal_result_for_invalid_publisher_auth_config(self):
         cases = [

@@ -67,6 +67,7 @@ class PublisherError(RuntimeError):
         returncode: int | None,
         stdout: str = "",
         stderr: str = "",
+        details: dict[str, Any] | None = None,
     ):
         super().__init__(message)
         self.message = message
@@ -74,6 +75,7 @@ class PublisherError(RuntimeError):
         self.returncode = returncode
         self.stdout = stdout
         self.stderr = stderr
+        self.details = details or {}
 
 
 class _RetrospectiveJudgeError(RuntimeError):
@@ -1220,6 +1222,9 @@ def publish_terminal_pr(
     body = pr_body_markdown(normalized, state, steps, selected_work, ledger)
     ledger.write_text("pr-body.md", body)
     pr_body_path = (ledger.path / "pr-body.md").resolve(strict=False)
+    git_push_result: dict[str, Any] | None = None
+    git_push_command: list[str] = []
+    git_push_retry_command: list[str] = []
     try:
         run_publisher_command(
             [config["gh_path"], "auth", "status", "--hostname", "github.com"],
@@ -1229,12 +1234,16 @@ def publish_terminal_pr(
             message_on_failure="gh auth status failed",
         )
         if config["push"]:
-            run_publisher_command(
-                [config["git_path"], "push", config["remote"], f"HEAD:refs/heads/{config['head']}"],
-                cwd=checkout_path,
-                tool="git",
+            git_push = push_review_branch(
+                config,
+                normalized=normalized,
+                state=state,
+                checkout_path=checkout_path,
                 auth=auth,
             )
+            git_push_result = git_push["result"]
+            git_push_command = git_push["command"]
+            git_push_retry_command = git_push["retry_command"]
         if config["mode"] == "create":
             command = [
                 config["gh_path"],
@@ -1275,7 +1284,7 @@ def publish_terminal_pr(
             )
     except PublisherError as exc:
         return failed_publication(exc, normalized, auth=auth_artifact)
-    return {
+    result = {
         "schema_version": SCHEMA_VERSION,
         "status": "published",
         "enabled": True,
@@ -1287,14 +1296,263 @@ def publish_terminal_pr(
         "retry": "",
         "commands": {
             "gh": redact_artifact_value(command),
-            "git_push": (
-                redact_artifact_value([config["git_path"], "push", config["remote"], f"HEAD:refs/heads/{config['head']}"])
-                if config["push"]
-                else []
-            ),
+            "git_push": redact_artifact_value(git_push_command),
+            "git_push_retry": redact_artifact_value(git_push_retry_command),
         },
         "body_path": str(pr_body_path),
     }
+    if git_push_result is not None:
+        result["git_push"] = redact_artifact_value(git_push_result)
+    return result
+
+
+def push_review_branch(
+    config: dict[str, Any],
+    *,
+    normalized: dict[str, Any],
+    state: dict[str, Any],
+    checkout_path: Path,
+    auth: dict[str, Any],
+) -> dict[str, Any]:
+    push_ref = f"refs/heads/{config['head']}"
+    push_command = [config["git_path"], "push", config["remote"], f"HEAD:{push_ref}"]
+    git_push_result = {
+        "branch": config["head"],
+        "remote": config["remote"],
+        "retry_handling": "not-needed",
+        "lease_expected": "",
+        "base_commit": checkout_start_commit(state),
+        "attempts": [],
+    }
+    initial_error: PublisherError | None = None
+    try:
+        completed = run_publisher_command(
+            push_command,
+            cwd=checkout_path,
+            tool="git",
+            auth=auth,
+        )
+        git_push_result["attempts"].append(publisher_command_attempt(push_command, completed=completed, outcome="pushed"))
+        return {"command": push_command, "retry_command": [], "result": git_push_result}
+    except PublisherError as exc:
+        initial_error = exc
+        initial_outcome = "non-fast-forward" if publisher_error_is_non_fast_forward_push(exc) else "failed"
+        git_push_result["attempts"].append(publisher_command_attempt(push_command, error=exc, outcome=initial_outcome))
+        if not publisher_error_is_non_fast_forward_push(exc):
+            exc.details = {"git_push": git_push_result}
+            raise
+
+    retry_context = afk_review_branch_retry_context(
+        config,
+        normalized=normalized,
+        state=state,
+        checkout_path=checkout_path,
+        auth=auth,
+    )
+    git_push_result.update(
+        {
+            "lease_expected": retry_context["lease_expected"],
+            "base_commit": retry_context["base_commit"],
+            "local_head": retry_context["local_head"],
+            "merge_base": retry_context["merge_base"],
+        }
+    )
+    if not retry_context["eligible"]:
+        git_push_result["retry_handling"] = "not-eligible"
+        raise PublisherError(
+            f"git push rejected as non-fast-forward and AFK review-branch retry is not eligible: {retry_context['reason']}",
+            command=push_command,
+            returncode=initial_error.returncode if initial_error is not None else None,
+            stdout=initial_error.stdout if initial_error is not None else "",
+            stderr=initial_error.stderr if initial_error is not None else "",
+            details={"git_push": git_push_result},
+        )
+
+    retry_command = [
+        config["git_path"],
+        "push",
+        f"--force-with-lease={push_ref}:{retry_context['lease_expected']}",
+        config["remote"],
+        f"HEAD:{push_ref}",
+    ]
+    try:
+        completed = run_publisher_command(
+            retry_command,
+            cwd=checkout_path,
+            tool="git",
+            auth=auth,
+        )
+    except PublisherError as exc:
+        git_push_result["retry_handling"] = "force-with-lease-failed"
+        git_push_result["attempts"].append(publisher_command_attempt(retry_command, error=exc, outcome="force-with-lease-failed"))
+        raise PublisherError(
+            "git push rejected as non-fast-forward and AFK review-branch retry with --force-with-lease failed",
+            command=retry_command,
+            returncode=exc.returncode,
+            stdout=exc.stdout,
+            stderr=exc.stderr,
+            details={"git_push": git_push_result},
+        ) from exc
+
+    git_push_result["retry_handling"] = "force-with-lease-replaced"
+    git_push_result["attempts"].append(publisher_command_attempt(retry_command, completed=completed, outcome="pushed"))
+    return {"command": push_command, "retry_command": retry_command, "result": git_push_result}
+
+
+def publisher_command_attempt(
+    command: list[str],
+    *,
+    completed: subprocess.CompletedProcess[str] | None = None,
+    error: PublisherError | None = None,
+    outcome: str,
+) -> dict[str, Any]:
+    if completed is not None:
+        return {
+            "command": redact_artifact_value(command),
+            "returncode": completed.returncode,
+            "stdout_excerpt": redact_text(completed.stdout[-2000:]),
+            "stderr_excerpt": redact_text(completed.stderr[-2000:]),
+            "outcome": outcome,
+        }
+    if error is None:
+        raise ValueError("completed or error is required")
+    return {
+        "command": redact_artifact_value(command),
+        "returncode": error.returncode,
+        "stdout_excerpt": redact_text(error.stdout[-2000:]),
+        "stderr_excerpt": redact_text(error.stderr[-2000:]),
+        "outcome": outcome,
+    }
+
+
+def publisher_error_is_non_fast_forward_push(exc: PublisherError) -> bool:
+    text = f"{exc.message}\n{exc.stdout}\n{exc.stderr}".lower()
+    return "non-fast-forward" in text or ("[rejected]" in text and "fetch first" in text)
+
+
+def afk_review_branch_retry_context(
+    config: dict[str, Any],
+    *,
+    normalized: dict[str, Any],
+    state: dict[str, Any],
+    checkout_path: Path,
+    auth: dict[str, Any],
+) -> dict[str, Any]:
+    lease_expected = publisher_remote_branch_oid(config, checkout_path=checkout_path, auth=auth)
+    base_commit = publisher_resolved_commit(
+        config["git_path"],
+        checkout_start_commit(state),
+        checkout_path=checkout_path,
+        auth=auth,
+    )
+    local_head = publisher_resolved_commit(
+        config["git_path"],
+        "HEAD",
+        checkout_path=checkout_path,
+        auth=auth,
+    )
+    merge_base = publisher_merge_base(
+        config["git_path"],
+        local_head,
+        lease_expected,
+        checkout_path=checkout_path,
+        auth=auth,
+    )
+    if not config["head"].startswith("afk/"):
+        reason = "review branch retry is only allowed for afk/ branches"
+    elif config["head"] != normalized["review_branch"]:
+        reason = "publisher head does not match the normalized review branch"
+    elif not lease_expected:
+        reason = "remote review branch could not be resolved for retry"
+    elif not base_commit:
+        reason = "checkout start commit is required for retry safety"
+    elif not local_head:
+        reason = "local HEAD could not be resolved for retry safety"
+    elif merge_base != base_commit:
+        reason = "remote review branch does not match the checkout start commit"
+    else:
+        reason = ""
+    return {
+        "eligible": not reason,
+        "reason": reason,
+        "lease_expected": lease_expected,
+        "base_commit": base_commit,
+        "local_head": local_head,
+        "merge_base": merge_base,
+    }
+
+
+def checkout_start_commit(state: dict[str, Any]) -> str:
+    checkout = state.get("checkout")
+    if not isinstance(checkout, dict):
+        return ""
+    return string_field(checkout, "start_commit") or ""
+
+
+def publisher_remote_branch_oid(config: dict[str, Any], *, checkout_path: Path, auth: dict[str, Any]) -> str:
+    push_ref = f"refs/heads/{config['head']}"
+    completed = run_publisher_diagnostic_command(
+        [config["git_path"], "ls-remote", "--heads", config["remote"], push_ref],
+        cwd=checkout_path,
+        auth=auth,
+    )
+    if completed.returncode != 0 or not completed.stdout.strip():
+        return ""
+    return completed.stdout.strip().split()[0]
+
+
+def publisher_resolved_commit(git_path: str, ref: str, *, checkout_path: Path, auth: dict[str, Any]) -> str:
+    if not ref:
+        return ""
+    completed = run_publisher_diagnostic_command(
+        [git_path, "rev-parse", ref],
+        cwd=checkout_path,
+        auth=auth,
+    )
+    if completed.returncode != 0:
+        return ""
+    return completed.stdout.strip().splitlines()[-1] if completed.stdout.strip() else ""
+
+
+def publisher_merge_base(
+    git_path: str,
+    local_head: str,
+    remote_head: str,
+    *,
+    checkout_path: Path,
+    auth: dict[str, Any],
+) -> str:
+    if not local_head or not remote_head:
+        return ""
+    completed = run_publisher_diagnostic_command(
+        [git_path, "merge-base", local_head, remote_head],
+        cwd=checkout_path,
+        auth=auth,
+    )
+    if completed.returncode != 0:
+        return ""
+    return completed.stdout.strip().splitlines()[-1] if completed.stdout.strip() else ""
+
+
+def run_publisher_diagnostic_command(
+    command: list[str],
+    *,
+    cwd: Path,
+    auth: dict[str, Any],
+) -> subprocess.CompletedProcess[str]:
+    with tempfile.TemporaryDirectory(prefix="afk-publisher-") as temp_dir:
+        env = minimal_publisher_environment(Path(temp_dir), auth=auth)
+        try:
+            return subprocess.run(
+                command,
+                cwd=cwd,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+        except OSError as exc:
+            return subprocess.CompletedProcess(command, returncode=1, stdout="", stderr=str(exc))
 
 
 def successful_publisher_url(stdout: str) -> str:
@@ -4213,7 +4471,7 @@ def failed_publication(
     auth: dict[str, Any],
 ) -> dict[str, Any]:
     next_allowed_command = rerun_workstream_command(normalized)
-    return {
+    result = {
         "schema_version": SCHEMA_VERSION,
         "status": "failed-needs-human",
         "enabled": True,
@@ -4226,6 +4484,9 @@ def failed_publication(
         "next_allowed_command": next_allowed_command,
         "retry": retry_instructions(normalized, "latest", auth_hint=True),
     }
+    if exc.details:
+        result.update(redact_artifact_value(exc.details))
+    return result
 
 
 def failed_publication_config(
