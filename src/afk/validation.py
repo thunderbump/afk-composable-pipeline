@@ -91,18 +91,15 @@ def validate(
         stdout = redact_text(exc.stdout)
         stderr = redact_text(exc.stderr or exc.message)
         write_adapter_logs(stdout, stderr)
-        raw_payload = read_worker_payload(result_path, fallback_path=evidence_result_path)
-        if raw_payload["status"] == "valid":
-            sync_worker_payload_artifacts(result_path, evidence_result_path, raw_payload["payload"])
-        else:
-            sync_worker_failure_artifacts(
-                result_path,
-                evidence_result_path,
-                "failed_timeout" if exc.timed_out else "failed_runtime",
-                "timeout" if exc.timed_out else "runtime_failure",
-                exc.message,
-                details=exc.failure_artifact,
-            )
+        read_worker_payload(result_path, fallback_path=evidence_result_path)
+        sync_worker_failure_artifacts(
+            result_path,
+            evidence_result_path,
+            "failed_timeout" if exc.timed_out else "failed_runtime",
+            "timeout" if exc.timed_out else "runtime_failure",
+            exc.message,
+            details=exc.failure_artifact,
+        )
         normalized = normalized_worker_result(
             status="failed_timeout" if exc.timed_out else "failed_runtime",
             classification="timeout" if exc.timed_out else "runtime_failure",
@@ -550,7 +547,7 @@ def run_command_adapter(
             command,
             cwd=checkout_path,
             env=env,
-            text=True,
+            text=False,
             capture_output=True,
             check=False,
             timeout=worker["timeout_seconds"],
@@ -558,8 +555,8 @@ def run_command_adapter(
     except OSError as exc:
         raise WorkerRuntimeError(str(exc), stderr=str(exc), returncode=None, command=command) from exc
     except subprocess.TimeoutExpired as exc:
-        stdout = exc.stdout if isinstance(exc.stdout, str) else ""
-        stderr = exc.stderr if isinstance(exc.stderr, str) else ""
+        stdout = decode_adapter_output(exc.stdout)
+        stderr = decode_adapter_output(exc.stderr)
         raise WorkerRuntimeError(
             "worker command timed out",
             stdout=stdout,
@@ -571,8 +568,8 @@ def run_command_adapter(
     return {
         "command": command,
         "returncode": completed.returncode,
-        "stdout": completed.stdout,
-        "stderr": completed.stderr,
+        "stdout": decode_adapter_output(completed.stdout),
+        "stderr": decode_adapter_output(completed.stderr),
     }
 
 
@@ -595,7 +592,6 @@ def run_local_command_adapter(
             command,
             cwd=cwd,
             env=env,
-            text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             start_new_session=process_groups_available,
@@ -612,85 +608,51 @@ def run_local_command_adapter(
     while True:
         if process.poll() is not None:
             break
-        stopped_processes = stopped_process_tree(process.pid)
+        stopped_processes = stopped_worker_processes(process.pid, process_groups_available=process_groups_available)
         if stopped_processes:
-            message = format_stopped_process_message(process.pid, stopped_processes)
-            terminate_process_tree(process, process_groups_available=process_groups_available)
-            stdout, stderr, _ = finalize_process_output(
+            raise stopped_process_error(
                 process,
+                command=command,
                 stdout_thread=stdout_thread,
                 stderr_thread=stderr_thread,
                 stdout_chunks=stdout_chunks,
                 stderr_chunks=stderr_chunks,
-                output_timeout=1.0,
                 process_groups_available=process_groups_available,
-            )
-            raise WorkerRuntimeError(
-                message,
-                stdout=stdout,
-                stderr=append_error_message(stderr, message),
-                returncode=None,
-                command=command,
-                adapter_details={"stopped_processes": stopped_processes},
-                failure_artifact={
-                    "process_state": "stopped",
-                    "stopped_processes": stopped_processes,
-                    "remediation": STOPPED_PROCESS_REMEDIATION,
-                },
+                stopped_processes=stopped_processes,
             )
         if time.monotonic() >= deadline:
-            terminate_process_tree(process, process_groups_available=process_groups_available)
-            stdout, stderr, _ = finalize_process_output(
+            raise timeout_runtime_error(
                 process,
+                command=command,
                 stdout_thread=stdout_thread,
                 stderr_thread=stderr_thread,
                 stdout_chunks=stdout_chunks,
                 stderr_chunks=stderr_chunks,
-                output_timeout=1.0,
                 process_groups_available=process_groups_available,
-            )
-            raise WorkerRuntimeError(
-                "worker command timed out",
-                stdout=stdout,
-                stderr=stderr or "worker command timed out",
-                returncode=None,
-                timed_out=True,
-                command=command,
+                post_exit=False,
             )
         time.sleep(min(0.05, max(deadline - time.monotonic(), 0.0)))
 
-    stdout, stderr, drained = finalize_process_output(
-        process,
+    stdout, stderr, drained = drain_post_exit_output(
+        process=process,
+        command=command,
         stdout_thread=stdout_thread,
         stderr_thread=stderr_thread,
         stdout_chunks=stdout_chunks,
         stderr_chunks=stderr_chunks,
-        output_timeout=max(deadline - time.monotonic(), 0.0),
         process_groups_available=process_groups_available,
+        deadline=deadline,
     )
     if not drained:
-        message = "worker descendant kept stdout/stderr open after worker exit"
-        terminate_process_tree(process, process_groups_available=process_groups_available)
-        stdout, stderr, _ = finalize_process_output(
+        raise timeout_runtime_error(
             process,
+            command=command,
             stdout_thread=stdout_thread,
             stderr_thread=stderr_thread,
             stdout_chunks=stdout_chunks,
             stderr_chunks=stderr_chunks,
-            output_timeout=1.0,
             process_groups_available=process_groups_available,
-        )
-        raise WorkerRuntimeError(
-            message,
-            stdout=stdout,
-            stderr=append_error_message(stderr, message),
-            returncode=process.returncode,
-            command=command,
-            adapter_details={"process_state": "stdout_stderr_open_after_exit"},
-            failure_artifact={
-                "process_state": "stdout_stderr_open_after_exit",
-                "remediation": "Ensure worker descendants exit or close inherited stdout/stderr before the worker process exits.",
-            },
+            post_exit=True,
         )
     return {
         "command": command,
@@ -709,7 +671,7 @@ def stream_reader(stream: Any, chunks: list[str]) -> threading.Thread:
                 chunk = stream.read(4096)
                 if not chunk:
                     break
-                chunks.append(chunk)
+                chunks.append(decode_adapter_output(chunk))
         finally:
             stream.close()
 
@@ -762,6 +724,16 @@ def join_reader_threads(
 
 def supports_process_groups() -> bool:
     return os.name == "posix" and hasattr(os, "killpg")
+
+
+def decode_adapter_output(output: Any) -> str:
+    if output is None:
+        return ""
+    if isinstance(output, str):
+        return output
+    if isinstance(output, bytes):
+        return output.decode("utf-8", errors="replace")
+    return str(output)
 
 
 def terminate_process_tree(process: subprocess.Popen[str], *, process_groups_available: bool) -> None:
@@ -837,6 +809,65 @@ def stopped_process_tree(root_pid: int) -> list[dict[str, Any]]:
     return sorted(stopped, key=lambda item: int(item["pid"]))
 
 
+def stopped_process_group(process_group: int) -> list[dict[str, Any]]:
+    if sys.platform != "linux":
+        return []
+    stopped: list[dict[str, Any]] = []
+    for pid in process_group_members(process_group):
+        status = read_proc_status(pid)
+        if status is None:
+            continue
+        state_code = string_field(status, "state_code") or ""
+        if state_code in {"T", "t"}:
+            stopped.append(status)
+    return sorted(stopped, key=lambda item: int(item["pid"]))
+
+
+def stopped_worker_processes(root_pid: int, *, process_groups_available: bool) -> list[dict[str, Any]]:
+    stopped = {int(item["pid"]): item for item in stopped_process_tree(root_pid)}
+    if process_groups_available:
+        for item in stopped_process_group(root_pid):
+            stopped[int(item["pid"])] = item
+    return [stopped[pid] for pid in sorted(stopped)]
+
+
+def process_group_members(process_group: int) -> list[int]:
+    proc_root = Path("/proc")
+    try:
+        proc_entries = list(proc_root.iterdir())
+    except OSError:
+        return []
+    members: list[int] = []
+    for entry in proc_entries:
+        if not entry.name.isdigit():
+            continue
+        try:
+            pid = int(entry.name)
+        except ValueError:
+            continue
+        if proc_process_group(pid) == process_group:
+            members.append(pid)
+    return members
+
+
+def proc_process_group(pid: int) -> int | None:
+    stat_path = Path(f"/proc/{pid}/stat")
+    try:
+        raw = stat_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    closing = raw.rfind(")")
+    if closing == -1:
+        return None
+    fields = raw[closing + 2 :].split()
+    if len(fields) < 3:
+        return None
+    try:
+        return int(fields[2])
+    except ValueError:
+        return None
+
+
 def proc_children(pid: int) -> list[int]:
     children_path = Path(f"/proc/{pid}/task/{pid}/children")
     try:
@@ -890,6 +921,136 @@ def format_stopped_process_message(root_pid: int, stopped_processes: list[dict[s
         f"worker process group stopped under pid {root_pid}: {details}. "
         f"Remediation: {STOPPED_PROCESS_REMEDIATION}"
     )
+
+
+def descendant_stdio_failure_artifact(*, process_groups_available: bool) -> dict[str, Any]:
+    remediation = "Ensure worker descendants exit or close inherited stdout/stderr before the worker process exits."
+    artifact: dict[str, Any] = {
+        "process_state": "stdout_stderr_open_after_exit",
+        "remediation": remediation,
+    }
+    if not process_groups_available:
+        artifact["cleanup_scope"] = "best_effort"
+        artifact["remediation"] = (
+            remediation + " Process groups are unavailable, so descendant cleanup is best-effort only."
+        )
+    return artifact
+
+
+def stopped_process_error(
+    process: subprocess.Popen[Any],
+    *,
+    command: list[str],
+    stdout_thread: threading.Thread,
+    stderr_thread: threading.Thread,
+    stdout_chunks: list[str],
+    stderr_chunks: list[str],
+    process_groups_available: bool,
+    stopped_processes: list[dict[str, Any]],
+) -> WorkerRuntimeError:
+    message = format_stopped_process_message(process.pid, stopped_processes)
+    terminate_process_tree(process, process_groups_available=process_groups_available)
+    stdout, stderr, _ = finalize_process_output(
+        process,
+        stdout_thread=stdout_thread,
+        stderr_thread=stderr_thread,
+        stdout_chunks=stdout_chunks,
+        stderr_chunks=stderr_chunks,
+        output_timeout=1.0,
+        process_groups_available=process_groups_available,
+    )
+    return WorkerRuntimeError(
+        message,
+        stdout=stdout,
+        stderr=append_error_message(stderr, message),
+        returncode=process.returncode,
+        command=command,
+        adapter_details={"stopped_processes": stopped_processes},
+        failure_artifact={
+            "process_state": "stopped",
+            "stopped_processes": stopped_processes,
+            "remediation": STOPPED_PROCESS_REMEDIATION,
+        },
+    )
+
+
+def timeout_runtime_error(
+    process: subprocess.Popen[Any],
+    *,
+    command: list[str],
+    stdout_thread: threading.Thread,
+    stderr_thread: threading.Thread,
+    stdout_chunks: list[str],
+    stderr_chunks: list[str],
+    process_groups_available: bool,
+    post_exit: bool,
+) -> WorkerRuntimeError:
+    terminate_process_tree(process, process_groups_available=process_groups_available)
+    stdout, stderr, _ = finalize_process_output(
+        process,
+        stdout_thread=stdout_thread,
+        stderr_thread=stderr_thread,
+        stdout_chunks=stdout_chunks,
+        stderr_chunks=stderr_chunks,
+        output_timeout=1.0,
+        process_groups_available=process_groups_available,
+    )
+    failure_artifact = (
+        descendant_stdio_failure_artifact(process_groups_available=process_groups_available) if post_exit else None
+    )
+    return WorkerRuntimeError(
+        "worker command timed out",
+        stdout=stdout,
+        stderr=stderr or "worker command timed out",
+        returncode=process.returncode,
+        timed_out=True,
+        command=command,
+        adapter_details=(
+            {
+                "process_state": failure_artifact["process_state"],
+                **({"cleanup_scope": failure_artifact["cleanup_scope"]} if "cleanup_scope" in failure_artifact else {}),
+            }
+            if failure_artifact
+            else None
+        ),
+        failure_artifact=failure_artifact,
+    )
+
+
+def drain_post_exit_output(
+    *,
+    process: subprocess.Popen[Any],
+    command: list[str],
+    stdout_thread: threading.Thread,
+    stderr_thread: threading.Thread,
+    stdout_chunks: list[str],
+    stderr_chunks: list[str],
+    process_groups_available: bool,
+    deadline: float,
+) -> tuple[str, str, bool]:
+    while True:
+        remaining = max(deadline - time.monotonic(), 0.0)
+        stdout_done, stderr_done = join_reader_threads(
+            stdout_thread,
+            stderr_thread,
+            timeout=min(0.05, remaining) if remaining > 0 else 0.0,
+        )
+        if stdout_done and stderr_done:
+            return ("".join(stdout_chunks), "".join(stderr_chunks), True)
+        stopped_processes = stopped_worker_processes(process.pid, process_groups_available=process_groups_available)
+        if stopped_processes:
+            raise stopped_process_error(
+                process,
+                command=command,
+                stdout_thread=stdout_thread,
+                stderr_thread=stderr_thread,
+                stdout_chunks=stdout_chunks,
+                stderr_chunks=stderr_chunks,
+                process_groups_available=process_groups_available,
+                stopped_processes=stopped_processes,
+            )
+        if remaining <= 0:
+            return ("".join(stdout_chunks), "".join(stderr_chunks), False)
 
 
 def append_error_message(stderr: str, message: str) -> str:
