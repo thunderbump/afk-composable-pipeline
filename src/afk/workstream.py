@@ -1317,6 +1317,7 @@ def run_pr_update_command(
             raise
     pr_number = pr_number_for_rest_update(config["pr"], config=config, checkout_path=checkout_path, auth=auth)
     ledger.write_json("pr-update.json", {"title": config["title"], "body": body})
+    pr_update_path = (ledger.path / "pr-update.json").resolve(strict=False)
     fallback_command = [
         config["gh_path"],
         "api",
@@ -1324,7 +1325,7 @@ def run_pr_update_command(
         "PATCH",
         f"repos/{config['repo']}/pulls/{pr_number}",
         "--input",
-        str(ledger.path / "pr-update.json"),
+        str(pr_update_path),
         "--jq",
         ".html_url",
     ]
