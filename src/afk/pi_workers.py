@@ -34,6 +34,9 @@ def build_pi_real_worker_agent(
     timeout_seconds: int | None = None,
 ) -> dict[str, Any]:
     provider_name = require_non_empty(provider, "provider")
+    require_non_empty(codex_home, "agent.codex_home")
+    require_non_empty(config_home, "agent.config_home")
+    require_non_empty(pi_config_home, "agent.env.PI_CONFIG_HOME")
     command = build_pi_print_command(
         pi_bin=pi_bin,
         provider=provider_name,
@@ -195,16 +198,91 @@ def openai_codex_pi_mount_error(
     return f"{', '.join(missing)} {verb} required when {field_prefix}.command uses pi --provider openai-codex"
 
 
-def pi_command_provider(command: list[str]) -> str | None:
-    if not command or Path(command[0]).name != "pi":
+def non_openai_pi_mount_error(
+    *,
+    command: list[str],
+    codex_home: str | None,
+    config_home: str | None,
+    env: Mapping[str, str] | None,
+    field_prefix: str,
+) -> str | None:
+    provider = pi_command_provider(command)
+    if provider is None or provider == "openai-codex":
         return None
-    for index, part in enumerate(command[1:], start=1):
-        if part == "--provider" and index + 1 < len(command):
-            provider = command[index + 1].strip()
+    mounted_env = env or {}
+    mounted = []
+    if codex_home:
+        mounted.append(f"{field_prefix}.codex_home")
+    if config_home:
+        mounted.append(f"{field_prefix}.config_home")
+    if mounted_env.get("PI_CONFIG_HOME"):
+        mounted.append(f"{field_prefix}.env.PI_CONFIG_HOME")
+    if mounted_env.get("PI_CODING_AGENT_DIR"):
+        mounted.append(f"{field_prefix}.env.PI_CODING_AGENT_DIR")
+    if not mounted:
+        return None
+    verb = "is" if len(mounted) == 1 else "are"
+    return f"{', '.join(mounted)} {verb} only supported when {field_prefix}.command uses pi --provider openai-codex"
+
+
+def pi_command_provider(command: list[str]) -> str | None:
+    pi_args = pi_command_args(command)
+    if pi_args is None:
+        return None
+    for index, part in enumerate(pi_args):
+        if part == "--provider" and index + 1 < len(pi_args):
+            provider = pi_args[index + 1].strip()
             return provider or None
         if part.startswith("--provider="):
             provider = part.partition("=")[2].strip()
             return provider or None
+    return None
+
+
+def pi_command_args(command: list[str]) -> list[str] | None:
+    if not command:
+        return None
+    executable = Path(command[0]).name
+    if executable == "pi":
+        return command[1:]
+    if executable == "env":
+        return _env_wrapped_pi_args(command[1:])
+    if executable.startswith("python"):
+        return _python_module_pi_args(command[1:])
+    return None
+
+
+def _env_wrapped_pi_args(command: list[str]) -> list[str] | None:
+    index = 0
+    while index < len(command):
+        part = command[index]
+        if part == "--":
+            index += 1
+            break
+        if part in {"-C", "--chdir", "-S", "--split-string"} and index + 1 < len(command):
+            index += 2
+            continue
+        if part.startswith("-"):
+            index += 1
+            continue
+        if "=" in part:
+            index += 1
+            continue
+        break
+    return pi_command_args(command[index:])
+
+
+def _python_module_pi_args(command: list[str]) -> list[str] | None:
+    index = 0
+    while index < len(command):
+        part = command[index]
+        if part == "-m" and index + 1 < len(command):
+            if command[index + 1] != "pi":
+                return None
+            return command[index + 2 :]
+        if not part.startswith("-"):
+            return None
+        index += 1
     return None
 
 

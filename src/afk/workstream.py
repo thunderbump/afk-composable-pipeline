@@ -14,7 +14,7 @@ from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
 from afk.contracts import ProjectContract
 from afk.jsonutil import canonical_json, sha256_json
-from afk.pi_workers import openai_codex_pi_mount_error, validate_absolute_dir
+from afk.pi_workers import non_openai_pi_mount_error, openai_codex_pi_mount_error, validate_absolute_dir
 from afk.redaction import is_secret_command_flag, is_secret_key, is_secret_value, redact_artifact_value, redact_text
 from afk.registry import StepResult
 
@@ -3594,6 +3594,15 @@ def normalize_retrospective_judge(retrospective_judge: Any, *, checkout_path: Pa
     )
     if mount_error:
         raise WorkstreamError(mount_error)
+    mount_rejection = non_openai_pi_mount_error(
+        command=normalized["command"],
+        codex_home=normalized.get("codex_home"),
+        config_home=normalized.get("config_home"),
+        env=normalized.get("env"),
+        field_prefix="retrospective_judge",
+    )
+    if mount_rejection:
+        raise WorkstreamError(mount_rejection)
     return normalized
 
 

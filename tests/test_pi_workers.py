@@ -94,6 +94,46 @@ class PiWorkersTest(unittest.TestCase):
                     checkout_path=checkout_path,
                 )
 
+    def test_build_pi_real_worker_agent_requires_core_mount_directories(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            checkout_path = temp_path / "checkout"
+            codex_home = temp_path / "codex-home"
+            config_home = temp_path / "xdg-config"
+            pi_config_home = temp_path / "pi-config"
+            pi_coding_agent_dir = temp_path / "pi-coding-agent"
+
+            checkout_path.mkdir()
+            codex_home.mkdir()
+            config_home.mkdir()
+            pi_config_home.mkdir()
+            pi_coding_agent_dir.mkdir()
+
+            cases = [
+                ("codex_home", None, str(config_home), str(pi_config_home), "agent.codex_home is required"),
+                ("config_home", str(codex_home), None, str(pi_config_home), "agent.config_home is required"),
+                (
+                    "pi_config_home",
+                    str(codex_home),
+                    str(config_home),
+                    None,
+                    "agent.env.PI_CONFIG_HOME is required",
+                ),
+            ]
+            for _, raw_codex_home, raw_config_home, raw_pi_config_home, expected in cases:
+                with self.subTest(expected=expected):
+                    with self.assertRaisesRegex(ValueError, expected):
+                        build_pi_real_worker_agent(
+                            pi_bin="/opt/pi/bin/pi",
+                            provider="openai-codex",
+                            model="gpt-5.4-mini",
+                            codex_home=raw_codex_home,
+                            config_home=raw_config_home,
+                            pi_config_home=raw_pi_config_home,
+                            pi_coding_agent_dir=str(pi_coding_agent_dir),
+                            checkout_path=checkout_path,
+                        )
+
     def test_build_pi_real_worker_agent_supports_one_shot_ponytail_source(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)

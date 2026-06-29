@@ -516,6 +516,78 @@ class GenerateRecipeCliTest(unittest.TestCase):
             self.assertIn("--agent-pi-coding-agent-dir is required when --agent-pi-provider=openai-codex", completed.stderr)
             self.assertFalse(output.exists())
 
+    def test_generate_recipe_requires_core_mount_flags_for_pi_agent(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            contracts_dir = temp_path / "contracts"
+            repo = temp_path / "repo-src"
+            ledger = temp_path / "ledger"
+            beads_workspace = temp_path / "central-beads"
+            checkout_root = temp_path / "checkouts"
+            checkout_path = checkout_root / "demo"
+            codex_home = temp_path / "codex-home"
+            config_home = temp_path / "xdg-config"
+            pi_config_home = temp_path / "pi-config"
+            pi_coding_agent_dir = temp_path / "pi-coding-agent"
+            contracts_dir.mkdir()
+            init_repo(repo)
+            write_contract(contracts_dir / "demo.json", project_slug="demo", repo_url=str(repo))
+            beads_workspace.mkdir()
+            codex_home.mkdir()
+            config_home.mkdir()
+            pi_config_home.mkdir()
+            pi_coding_agent_dir.mkdir()
+
+            cases = [
+                ("--agent-codex-home", "agent.codex_home is required"),
+                ("--agent-config-home", "agent.config_home is required"),
+                ("--agent-pi-config-home", "agent.env.PI_CONFIG_HOME is required"),
+            ]
+            for missing_option, expected_error in cases:
+                with self.subTest(option=missing_option):
+                    output = temp_path / f"{missing_option.removeprefix('--')}.json"
+                    args = [
+                        "generate-recipe",
+                        "--workstream-id",
+                        "central-6ue",
+                        "--project",
+                        "demo",
+                        "--contracts-dir",
+                        str(contracts_dir),
+                        "--ledger",
+                        str(ledger),
+                        "--beads-workspace",
+                        str(beads_workspace),
+                        "--checkout-root",
+                        str(checkout_root),
+                        "--checkout-path",
+                        str(checkout_path),
+                        "--validation-profile",
+                        "tier1",
+                        "--agent-mode",
+                        "pi",
+                        "--agent-pi-provider",
+                        "openai-codex",
+                        "--agent-pi-model",
+                        "gpt-5.4-mini",
+                        "--agent-pi-coding-agent-dir",
+                        str(pi_coding_agent_dir),
+                        "--output",
+                        str(output),
+                    ]
+                    if missing_option != "--agent-codex-home":
+                        args.extend(["--agent-codex-home", str(codex_home)])
+                    if missing_option != "--agent-config-home":
+                        args.extend(["--agent-config-home", str(config_home)])
+                    if missing_option != "--agent-pi-config-home":
+                        args.extend(["--agent-pi-config-home", str(pi_config_home)])
+
+                    completed = run_afk(*args)
+
+                    self.assertNotEqual(completed.returncode, 0, completed.stdout)
+                    self.assertIn(expected_error, completed.stderr)
+                    self.assertFalse(output.exists())
+
     def test_generate_recipe_rejects_secret_literal_pi_coding_agent_dir_without_writing_recipe(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)

@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from afk.jsonutil import canonical_json
-from afk.pi_workers import openai_codex_pi_mount_error, validate_absolute_dir
+from afk.pi_workers import non_openai_pi_mount_error, openai_codex_pi_mount_error, validate_absolute_dir
 from afk.redaction import is_secret_command_flag, redact_artifact_value, redact_text
 
 
@@ -609,6 +609,15 @@ def normalize_reviewer(reviewer: Any, *, checkout_path: Path) -> dict[str, Any]:
     )
     if mount_error:
         return {"status": "invalid", "message": mount_error}
+    mount_rejection = non_openai_pi_mount_error(
+        command=normalized_reviewer["command"],
+        codex_home=normalized_reviewer.get("codex_home"),
+        config_home=normalized_reviewer.get("config_home"),
+        env=normalized_reviewer.get("env"),
+        field_prefix="reviewer",
+    )
+    if mount_rejection:
+        return {"status": "invalid", "message": mount_rejection}
     return {
         "status": "valid",
         "reviewer": normalized_reviewer,
