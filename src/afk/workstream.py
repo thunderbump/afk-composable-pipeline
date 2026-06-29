@@ -1078,6 +1078,7 @@ def checkout_after_implementation(checkout: Any, implementation: dict[str, Any])
     if not after_commit:
         return checkout
     updated = dict(checkout)
+    updated["base_commit"] = string_field(checkout, "base_commit") or string_field(checkout, "start_commit")
     updated["start_commit"] = after_commit
     updated["requested_ref"] = after_commit
     return updated
@@ -1333,7 +1334,9 @@ def push_review_branch(
         "remote": config["remote"],
         "retry_handling": "not-needed",
         "lease_expected": "",
-        "base_commit": checkout_start_commit(state),
+        "base_commit": checkout_base_commit(state),
+        "remote_tip": "",
+        "retry_reason": "",
         "attempts": [],
     }
     initial_error: PublisherError | None = None
@@ -1365,9 +1368,11 @@ def push_review_branch(
         {
             "lease_expected": retry_context["lease_expected"],
             "base_commit": retry_context["base_commit"],
+            "remote_tip": retry_context["remote_tip"],
             "local_head": retry_context["local_head"],
             "merge_base": retry_context["merge_base"],
             "owned_branch": retry_context["owned_branch"],
+            "retry_reason": retry_context["reason"],
         }
     )
     if not retry_context["eligible"]:
@@ -1452,10 +1457,10 @@ def afk_review_branch_retry_context(
     auth: dict[str, Any],
 ) -> dict[str, Any]:
     owned_branch = workstream_owned_afk_branch(normalized)
-    lease_expected = publisher_remote_branch_oid(config, checkout_path=checkout_path, auth=auth)
+    remote_tip = publisher_remote_branch_oid(config, checkout_path=checkout_path, auth=auth)
     base_commit = publisher_resolved_commit(
         config["git_path"],
-        checkout_start_commit(state),
+        checkout_base_commit(state),
         checkout_path=checkout_path,
         auth=auth,
     )
@@ -1468,7 +1473,21 @@ def afk_review_branch_retry_context(
     merge_base = publisher_merge_base(
         config["git_path"],
         local_head,
-        lease_expected,
+        remote_tip,
+        checkout_path=checkout_path,
+        auth=auth,
+    )
+    remote_descends_from_base = publisher_commit_descends_from(
+        config["git_path"],
+        remote_tip,
+        base_commit,
+        checkout_path=checkout_path,
+        auth=auth,
+    )
+    local_descends_from_base = publisher_commit_descends_from(
+        config["git_path"],
+        local_head,
+        base_commit,
         checkout_path=checkout_path,
         auth=auth,
     )
@@ -1480,20 +1499,34 @@ def afk_review_branch_retry_context(
         reason = "workstream id is required to prove AFK review-branch ownership"
     elif config["head"] != owned_branch:
         reason = f"review branch does not match the workstream-owned AFK branch {owned_branch}"
-    elif not lease_expected:
+    elif not remote_tip:
         reason = "remote review branch could not be resolved for retry"
     elif not base_commit:
         reason = "checkout start commit is required for retry safety"
     elif not local_head:
         reason = "local HEAD could not be resolved for retry safety"
-    elif merge_base != base_commit:
-        reason = "remote review branch does not match the checkout start commit"
+    elif not remote_descends_from_base:
+        reason = "remote review branch does not descend from the checkout start commit"
+    elif not local_descends_from_base:
+        reason = "local HEAD does not descend from the checkout start commit"
     else:
-        reason = ""
+        reason = "remote and local heads descend from the checkout start commit"
+    eligible = (
+        bool(remote_tip)
+        and bool(base_commit)
+        and bool(local_head)
+        and remote_descends_from_base
+        and local_descends_from_base
+        and config["head"].startswith("afk/")
+        and config["head"] == normalized["review_branch"]
+        and bool(owned_branch)
+        and config["head"] == owned_branch
+    )
     return {
-        "eligible": not reason,
+        "eligible": eligible,
         "reason": reason,
-        "lease_expected": lease_expected,
+        "lease_expected": remote_tip,
+        "remote_tip": remote_tip,
         "base_commit": base_commit,
         "local_head": local_head,
         "merge_base": merge_base,
@@ -1513,6 +1546,13 @@ def checkout_start_commit(state: dict[str, Any]) -> str:
     if not isinstance(checkout, dict):
         return ""
     return string_field(checkout, "start_commit") or ""
+
+
+def checkout_base_commit(state: dict[str, Any]) -> str:
+    checkout = state.get("checkout")
+    if not isinstance(checkout, dict):
+        return ""
+    return string_field(checkout, "base_commit") or string_field(checkout, "start_commit") or ""
 
 
 def publisher_remote_branch_oid(config: dict[str, Any], *, checkout_path: Path, auth: dict[str, Any]) -> str:
@@ -1558,6 +1598,24 @@ def publisher_merge_base(
     if completed.returncode != 0:
         return ""
     return completed.stdout.strip().splitlines()[-1] if completed.stdout.strip() else ""
+
+
+def publisher_commit_descends_from(
+    git_path: str,
+    commit: str,
+    ancestor: str,
+    *,
+    checkout_path: Path,
+    auth: dict[str, Any],
+) -> bool:
+    if not commit or not ancestor:
+        return False
+    completed = run_publisher_diagnostic_command(
+        [git_path, "merge-base", "--is-ancestor", ancestor, commit],
+        cwd=checkout_path,
+        auth=auth,
+    )
+    return completed.returncode == 0
 
 
 def run_publisher_diagnostic_command(

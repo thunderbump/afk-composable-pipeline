@@ -126,6 +126,7 @@ def prepare_checkout(
             "base_ref": base_ref,
             "requested_ref": requested_ref,
             "checkout_root": str(checkout_root),
+            "base_commit": start_commit,
             "start_commit": start_commit,
             "review_branch": review_branch,
             "checkout_path": str(checkout_path),
