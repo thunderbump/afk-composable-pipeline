@@ -1350,6 +1350,15 @@ raise SystemExit(1)
                 ),
             )
             self.assertEqual(review_input["timeout_seconds"], 111)
+            self.assertEqual(review_input["codex_home"], str(codex_home))
+            self.assertEqual(review_input["config_home"], str(config_home))
+            self.assertEqual(
+                review_input["env"],
+                {
+                    "PI_CONFIG_HOME": str(pi_config_home),
+                    "PI_CODING_AGENT_DIR": str(pi_coding_agent_dir),
+                },
+            )
 
             retrospective_judge = payload["recipe"]["retrospective_judge"]
             self.assertEqual(
@@ -1363,6 +1372,15 @@ raise SystemExit(1)
             )
             self.assertEqual(retrospective_judge["timeout_seconds"], 222)
             self.assertEqual(retrospective_judge["type"], "local-command")
+            self.assertEqual(retrospective_judge["codex_home"], str(codex_home))
+            self.assertEqual(retrospective_judge["config_home"], str(config_home))
+            self.assertEqual(
+                retrospective_judge["env"],
+                {
+                    "PI_CONFIG_HOME": str(pi_config_home),
+                    "PI_CODING_AGENT_DIR": str(pi_coding_agent_dir),
+                },
+            )
 
     def test_run_next_rejects_publisher_create_without_required_arguments(self):
         with tempfile.TemporaryDirectory() as temp_dir:

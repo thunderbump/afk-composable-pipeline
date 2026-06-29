@@ -337,6 +337,73 @@ class ReviewCliTest(unittest.TestCase):
             self.assertEqual(events[2]["artifacts"]["evidence_pack"], "evidence-pack.json")
             self.assertEqual(events[2]["artifacts"]["review_summary"], "review-summary.md")
 
+    def test_review_passes_pi_auth_mounts_through_to_reviewer_command(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            checkout = temp_path / "checkout"
+            start_commit = init_checkout(checkout)
+            head_commit = git(checkout, "rev-parse", "HEAD")
+            validation_step, validation_worker = write_validation_artifacts(temp_path / "validation-run")
+            ledger = temp_path / "ledger"
+            codex_home = temp_path / "codex-home"
+            config_home = temp_path / "xdg-config"
+            pi_config_home = temp_path / "pi-config"
+            pi_coding_agent_dir = temp_path / "pi-coding-agent"
+            codex_home.mkdir()
+            config_home.mkdir()
+            pi_config_home.mkdir()
+            pi_coding_agent_dir.mkdir()
+            reviewer_code = textwrap.dedent(
+                f"""
+                import json
+                import os
+                from pathlib import Path
+
+                assert os.environ["CODEX_HOME"] == {str(codex_home)!r}
+                assert os.environ["XDG_CONFIG_HOME"] == {str(config_home)!r}
+                assert os.environ["PI_CONFIG_HOME"] == {str(pi_config_home)!r}
+                assert os.environ["PI_CODING_AGENT_DIR"] == {str(pi_coding_agent_dir)!r}
+                Path(os.environ["AFK_REVIEWER_RESULT"]).write_text(
+                    json.dumps({{"status": "pass", "summary": "reviewer auth mounts available", "findings": []}}),
+                    encoding="utf-8",
+                )
+                """
+            ).strip()
+
+            input_payload = review_input(
+                checkout=checkout,
+                start_commit=start_commit,
+                head_commit=head_commit,
+                validation_step=validation_step,
+                validation_worker=validation_worker,
+                reviewer_code=reviewer_code,
+            )
+            input_payload["reviewer"].update(
+                {
+                    "codex_home": str(codex_home),
+                    "config_home": str(config_home),
+                    "env": {
+                        "PI_CONFIG_HOME": str(pi_config_home),
+                        "PI_CODING_AGENT_DIR": str(pi_coding_agent_dir),
+                    },
+                }
+            )
+
+            completed = run_afk(
+                "run-step",
+                "review",
+                "--input",
+                json.dumps(input_payload),
+                "--ledger",
+                str(ledger),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            result = json.loads((ledger / "runs" / summary["run_id"] / "step-result.json").read_text(encoding="utf-8"))
+            self.assertEqual(result["output"]["status"], "passed")
+            self.assertEqual(result["output"]["summary"], "reviewer auth mounts available")
+
     def test_review_substitutes_prompt_for_reviewer_command(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)

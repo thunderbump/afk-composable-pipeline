@@ -468,6 +468,7 @@ class GenerateRecipeCliTest(unittest.TestCase):
             codex_home = temp_path / "codex-home"
             config_home = temp_path / "xdg-config"
             pi_config_home = temp_path / "pi-config"
+            pi_coding_agent_dir = temp_path / "pi-coding-agent"
             contracts_dir.mkdir()
             init_repo(repo)
             write_contract(contracts_dir / "demo.json", project_slug="demo", repo_url=str(repo))
@@ -475,6 +476,7 @@ class GenerateRecipeCliTest(unittest.TestCase):
             codex_home.mkdir()
             config_home.mkdir()
             pi_config_home.mkdir()
+            pi_coding_agent_dir.mkdir()
 
             completed = run_afk(
                 "generate-recipe",
@@ -589,6 +591,7 @@ class GenerateRecipeCliTest(unittest.TestCase):
             codex_home = temp_path / "codex-home"
             config_home = temp_path / "xdg-config"
             pi_config_home = temp_path / "pi-config"
+            pi_coding_agent_dir = temp_path / "pi-coding-agent"
             contracts_dir.mkdir()
             init_repo(repo)
             write_contract(contracts_dir / "demo.json", project_slug="demo", repo_url=str(repo))
@@ -596,6 +599,7 @@ class GenerateRecipeCliTest(unittest.TestCase):
             codex_home.mkdir()
             config_home.mkdir()
             pi_config_home.mkdir()
+            pi_coding_agent_dir.mkdir()
 
             completed = run_afk(
                 "generate-recipe",
@@ -646,6 +650,7 @@ class GenerateRecipeCliTest(unittest.TestCase):
             codex_home = temp_path / "codex-home"
             config_home = temp_path / "xdg-config"
             pi_config_home = temp_path / "pi-config"
+            pi_coding_agent_dir = temp_path / "pi-coding-agent"
             contracts_dir.mkdir()
             init_repo(repo)
             write_contract(contracts_dir / "demo.json", project_slug="demo", repo_url=str(repo))
@@ -653,6 +658,7 @@ class GenerateRecipeCliTest(unittest.TestCase):
             codex_home.mkdir()
             config_home.mkdir()
             pi_config_home.mkdir()
+            pi_coding_agent_dir.mkdir()
 
             reviewer_mode = "pi"
             reviewer_pi_bin = "/opt/pi/bin/pi"
@@ -693,6 +699,14 @@ class GenerateRecipeCliTest(unittest.TestCase):
                 str(reviewer_timeout),
                 "--reviewer-ponytail-extension-source",
                 reviewer_ponytail,
+                "--agent-codex-home",
+                str(codex_home),
+                "--agent-config-home",
+                str(config_home),
+                "--agent-pi-config-home",
+                str(pi_config_home),
+                "--agent-pi-coding-agent-dir",
+                str(pi_coding_agent_dir),
                 "--retrospective-judge-mode",
                 "pi",
                 "--retrospective-judge-pi-bin",
@@ -723,6 +737,15 @@ class GenerateRecipeCliTest(unittest.TestCase):
                 ),
             )
             self.assertEqual(reviewer["timeout_seconds"], reviewer_timeout)
+            self.assertEqual(reviewer["codex_home"], str(codex_home))
+            self.assertEqual(reviewer["config_home"], str(config_home))
+            self.assertEqual(
+                reviewer["env"],
+                {
+                    "PI_CONFIG_HOME": str(pi_config_home),
+                    "PI_CODING_AGENT_DIR": str(pi_coding_agent_dir),
+                },
+            )
             retrospective_judge = recipe["retrospective_judge"]
             self.assertEqual(retrospective_judge["enabled"], True)
             self.assertEqual(
@@ -736,6 +759,15 @@ class GenerateRecipeCliTest(unittest.TestCase):
             )
             self.assertEqual(retrospective_judge["type"], "local-command")
             self.assertEqual(retrospective_judge["timeout_seconds"], judge_timeout)
+            self.assertEqual(retrospective_judge["codex_home"], str(codex_home))
+            self.assertEqual(retrospective_judge["config_home"], str(config_home))
+            self.assertEqual(
+                retrospective_judge["env"],
+                {
+                    "PI_CONFIG_HOME": str(pi_config_home),
+                    "PI_CODING_AGENT_DIR": str(pi_coding_agent_dir),
+                },
+            )
 
     def test_generate_recipe_rejects_disallowed_pi_reviewer_model(self):
         with tempfile.TemporaryDirectory() as temp_dir:

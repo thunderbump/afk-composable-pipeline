@@ -47,23 +47,16 @@ def build_pi_real_worker_agent(
         "type": "real-agent-command",
         "command": command,
         "result_path": PI_RESULT_PATH,
-        "codex_home": validate_absolute_dir(codex_home, "agent.codex_home", checkout_path=checkout_path),
-        "config_home": validate_absolute_dir(config_home, "agent.config_home", checkout_path=checkout_path),
-        "env": {
-            "PI_CONFIG_HOME": validate_absolute_dir(
-                pi_config_home,
-                "agent.env.PI_CONFIG_HOME",
-                checkout_path=checkout_path,
-            )
-        },
-    }
-    if pi_coding_agent_dir is not None:
-        agent["env"]["PI_CODING_AGENT_DIR"] = validate_absolute_dir(
-            pi_coding_agent_dir,
-            "agent.env.PI_CODING_AGENT_DIR",
+        **build_pi_mount_config(
+            codex_home=codex_home,
+            config_home=config_home,
+            pi_config_home=pi_config_home,
+            pi_coding_agent_dir=pi_coding_agent_dir,
             checkout_path=checkout_path,
-        )
-    elif provider_name == "openai-codex":
+            field_prefix="agent",
+        ),
+    }
+    if pi_coding_agent_dir is None and provider_name == "openai-codex":
         raise ValueError("--agent-pi-coding-agent-dir is required when --agent-pi-provider=openai-codex")
     if wrapper_secret_file is not None:
         wrapper_secret_files = normalize_wrapper_secret_files(
@@ -78,6 +71,46 @@ def build_pi_real_worker_agent(
             raise ValueError("agent.timeout_seconds must be positive")
         agent["timeout_seconds"] = timeout_seconds
     return agent
+
+
+def build_pi_mount_config(
+    *,
+    codex_home: str | None,
+    config_home: str | None,
+    pi_config_home: str | None,
+    pi_coding_agent_dir: str | None,
+    checkout_path: Path,
+    field_prefix: str,
+) -> dict[str, Any]:
+    mount_config: dict[str, Any] = {}
+    if codex_home is not None:
+        mount_config["codex_home"] = validate_absolute_dir(
+            codex_home,
+            f"{field_prefix}.codex_home",
+            checkout_path=checkout_path,
+        )
+    if config_home is not None:
+        mount_config["config_home"] = validate_absolute_dir(
+            config_home,
+            f"{field_prefix}.config_home",
+            checkout_path=checkout_path,
+        )
+    env: dict[str, str] = {}
+    if pi_config_home is not None:
+        env["PI_CONFIG_HOME"] = validate_absolute_dir(
+            pi_config_home,
+            f"{field_prefix}.env.PI_CONFIG_HOME",
+            checkout_path=checkout_path,
+        )
+    if pi_coding_agent_dir is not None:
+        env["PI_CODING_AGENT_DIR"] = validate_absolute_dir(
+            pi_coding_agent_dir,
+            f"{field_prefix}.env.PI_CODING_AGENT_DIR",
+            checkout_path=checkout_path,
+        )
+    if env:
+        mount_config["env"] = env
+    return mount_config
 
 
 def build_pi_print_command(

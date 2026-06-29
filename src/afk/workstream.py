@@ -14,6 +14,7 @@ from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
 from afk.contracts import ProjectContract
 from afk.jsonutil import canonical_json, sha256_json
+from afk.pi_workers import validate_absolute_dir
 from afk.redaction import is_secret_command_flag, is_secret_key, is_secret_value, redact_artifact_value, redact_text
 from afk.registry import StepResult
 
@@ -328,7 +329,10 @@ def normalize_recipe(
     review_cycles = normalize_review_cycles(recipe.get("review_cycles"))
     retrospective = normalize_retrospective(recipe.get("retrospective"))
     retrospective_follow_up = normalize_retrospective_follow_up_config(recipe.get("retrospective_follow_up"))
-    retrospective_judge = normalize_retrospective_judge(recipe.get("retrospective_judge"))
+    retrospective_judge = normalize_retrospective_judge(
+        recipe.get("retrospective_judge"),
+        checkout_path=recipe_checkout_path(normalized_steps),
+    )
     validate_retrospective_terminal_decision(retrospective, tracker)
     return {
         "schema_version": SCHEMA_VERSION,
@@ -404,6 +408,19 @@ def composed_step_input(
         }
         input_data.setdefault("cleanup", {"status": "clean", "resources": []})
     return input_data
+
+
+def recipe_checkout_path(steps: list[dict[str, Any]]) -> Path | None:
+    for step in steps:
+        if step.get("name") != "prepare-checkout":
+            continue
+        input_data = step.get("input")
+        if not isinstance(input_data, dict):
+            continue
+        checkout_path = string_field(input_data, "checkout_path")
+        if checkout_path:
+            return Path(checkout_path)
+    return None
 
 
 def equivalent_run_step_command(
@@ -2159,7 +2176,10 @@ def _run_retrospective_judge_command(
 ) -> tuple[dict[str, Any], str | None, str]:
     with tempfile.TemporaryDirectory(prefix="afk-retrospective-judge-") as temp_dir:
         temp_path = Path(temp_dir)
-        env = _minimal_retrospective_judge_environment(temp_path)
+        env = _minimal_retrospective_judge_environment(temp_path, config_home=judge.get("config_home") or "")
+        env.update(judge.get("env") or {})
+        if judge.get("codex_home"):
+            env["CODEX_HOME"] = judge["codex_home"]
         env["AFK_RETROSPECTIVE_JUDGE_REQUEST"] = str(request_path)
         env["AFK_RETROSPECTIVE_JUDGE_RESULT"] = str(result_path)
         command = _render_retrospective_judge_command(
@@ -2300,7 +2320,7 @@ def _retrospective_judge_prompt_selected_work(selected_work: list[Any]) -> list[
     return records
 
 
-def _minimal_retrospective_judge_environment(temp_path: Path) -> dict[str, str]:
+def _minimal_retrospective_judge_environment(temp_path: Path, *, config_home: str = "") -> dict[str, str]:
     env: dict[str, str] = {}
     for key in (
         "PATH",
@@ -2316,11 +2336,14 @@ def _minimal_retrospective_judge_environment(temp_path: Path) -> dict[str, str]:
         if value is not None:
             env[key] = value
     home_path = temp_path / "home"
-    xdg_config_home = temp_path / "xdg-config"
     home_path.mkdir()
-    xdg_config_home.mkdir()
     env["HOME"] = str(home_path)
-    env["XDG_CONFIG_HOME"] = str(xdg_config_home)
+    if config_home:
+        env["XDG_CONFIG_HOME"] = config_home
+    else:
+        xdg_config_home = temp_path / "xdg-config"
+        xdg_config_home.mkdir()
+        env["XDG_CONFIG_HOME"] = str(xdg_config_home)
     return env
 
 
@@ -3482,16 +3505,21 @@ def normalize_retrospective(retrospective: Any) -> dict[str, Any]:
     return normalized
 
 
-def normalize_retrospective_judge(retrospective_judge: Any) -> dict[str, Any]:
+def normalize_retrospective_judge(retrospective_judge: Any, *, checkout_path: Path | None = None) -> dict[str, Any]:
     if retrospective_judge is None:
         return {"enabled": False}
     if not isinstance(retrospective_judge, dict):
         raise WorkstreamError("retrospective_judge must be an object")
     unsupported = [
-        key for key in retrospective_judge if key not in {"enabled", "type", "command", "timeout_seconds", "timeoutSeconds"}
+        key
+        for key in retrospective_judge
+        if key
+        not in {"enabled", "type", "command", "timeout_seconds", "timeoutSeconds", "codex_home", "config_home", "env"}
     ]
     if unsupported:
-        raise WorkstreamError("retrospective_judge only supports enabled, type, command, timeout_seconds")
+        raise WorkstreamError(
+            "retrospective_judge only supports enabled, type, command, timeout_seconds, codex_home, config_home, env"
+        )
     enabled = retrospective_judge.get("enabled", False)
     if not isinstance(enabled, bool):
         raise WorkstreamError("retrospective_judge.enabled must be a boolean")
@@ -3500,7 +3528,7 @@ def normalize_retrospective_judge(retrospective_judge: Any) -> dict[str, Any]:
     judge_type = string_field(retrospective_judge, "type") or "local-command"
     if judge_type not in {"local-command", "fake-judge-command"}:
         raise WorkstreamError("retrospective_judge.type must be local-command or fake-judge-command")
-    for forbidden_key in ("credentials_path", "auth_file", "token", "api_key", "env"):
+    for forbidden_key in ("credentials_path", "auth_file", "token", "api_key"):
         if forbidden_key in retrospective_judge:
             raise WorkstreamError(f"retrospective_judge.{forbidden_key} is not supported")
     command = retrospective_judge.get("command")
@@ -3514,12 +3542,50 @@ def normalize_retrospective_judge(retrospective_judge: Any) -> dict[str, Any]:
     timeout_seconds = retrospective_judge.get("timeout_seconds", retrospective_judge.get("timeoutSeconds", 120))
     if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float)) or timeout_seconds <= 0:
         raise WorkstreamError("retrospective_judge.timeout_seconds must be a positive number")
-    return {
+    normalized = {
         "enabled": True,
         "type": judge_type,
         "command": list(command),
         "timeout_seconds": float(timeout_seconds),
     }
+    if checkout_path is None:
+        return normalized
+    for field_name in ("codex_home", "config_home"):
+        raw_value = retrospective_judge.get(field_name)
+        if raw_value is None:
+            continue
+        if not isinstance(raw_value, str) or not raw_value.strip():
+            raise WorkstreamError(f"retrospective_judge.{field_name} must be an absolute directory path")
+        try:
+            normalized[field_name] = validate_absolute_dir(
+                raw_value,
+                f"retrospective_judge.{field_name}",
+                checkout_path=checkout_path,
+            )
+        except ValueError as exc:
+            raise WorkstreamError(str(exc)) from exc
+    raw_env = retrospective_judge.get("env")
+    if raw_env is not None:
+        if not isinstance(raw_env, dict):
+            raise WorkstreamError("retrospective_judge.env must be an object")
+        normalized_env: dict[str, str] = {}
+        for key, value in raw_env.items():
+            if key not in {"PI_CONFIG_HOME", "PI_CODING_AGENT_DIR"}:
+                raise WorkstreamError(
+                    "retrospective_judge.env only supports PI_CONFIG_HOME and PI_CODING_AGENT_DIR"
+                )
+            if not isinstance(value, str) or not value.strip():
+                raise WorkstreamError(f"retrospective_judge.env.{key} must be an absolute directory path")
+            try:
+                normalized_env[key] = validate_absolute_dir(
+                    value,
+                    f"retrospective_judge.env.{key}",
+                    checkout_path=checkout_path,
+                )
+            except ValueError as exc:
+                raise WorkstreamError(str(exc)) from exc
+        normalized["env"] = normalized_env
+    return normalized
 
 
 def normalize_retrospective_follow_up_config(retrospective_follow_up: Any) -> dict[str, Any]:
