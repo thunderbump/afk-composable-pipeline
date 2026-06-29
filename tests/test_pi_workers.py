@@ -6,10 +6,35 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from afk.pi_workers import PONYTAIL_EXTENSION_SOURCE, PONYTAIL_PACKAGE_NAME, build_pi_real_worker_agent
+from afk.pi_workers import (
+    PONYTAIL_EXTENSION_SOURCE,
+    PONYTAIL_PACKAGE_NAME,
+    build_pi_real_worker_agent,
+    pi_command_provider,
+)
 
 
 class PiWorkersTest(unittest.TestCase):
+    def test_pi_command_provider_detects_openai_codex_through_env_unset_wrapper(self):
+        commands = [
+            ["/usr/bin/env", "-u", "FOO", "pi", "-p", "{prompt}", "--provider", "openai-codex", "--model", "gpt-5.4-mini"],
+            [
+                "/usr/bin/env",
+                "--unset",
+                "FOO",
+                "pi",
+                "-p",
+                "{prompt}",
+                "--provider=openai-codex",
+                "--model",
+                "gpt-5.4-mini",
+            ],
+        ]
+
+        for command in commands:
+            with self.subTest(command=command):
+                self.assertEqual(pi_command_provider(command), "openai-codex")
+
     def test_build_pi_real_worker_agent_returns_safe_real_agent_config(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)

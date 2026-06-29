@@ -494,6 +494,48 @@ class ReviewCliTest(unittest.TestCase):
                     self.assertIn("reviewer.codex_home", result["output"]["message"])
                     self.assertIn("pi --provider openai-codex", result["output"]["message"])
 
+    def test_review_rejects_shell_wrapped_openai_codex_pi_reviewer_without_required_mounts(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            checkout = temp_path / "checkout"
+            start_commit = init_checkout(checkout)
+            head_commit = git(checkout, "rev-parse", "HEAD")
+            validation_step, validation_worker = write_validation_artifacts(temp_path / "validation-run")
+            ledger = temp_path / "ledger"
+
+            input_payload = review_input(
+                checkout=checkout,
+                start_commit=start_commit,
+                head_commit=head_commit,
+                validation_step=validation_step,
+                validation_worker=validation_worker,
+                reviewer_code="raise SystemExit('reviewer should not run')",
+            )
+            input_payload["reviewer"] = {
+                "type": "fake-reviewer-command",
+                "command": ["bash", "-lc", "pi -p '{prompt}' --provider openai-codex --model gpt-5.4-mini"],
+                "timeout_seconds": 10,
+            }
+
+            completed = run_afk(
+                "run-step",
+                "review",
+                "--input",
+                json.dumps(input_payload),
+                "--ledger",
+                str(ledger),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(summary["status"], "failed")
+            self.assertEqual(result["output"]["status"], "failed_invalid_payload")
+            self.assertIn("reviewer.codex_home", result["output"]["message"])
+            self.assertIn("pi --provider openai-codex", result["output"]["message"])
+
     def test_review_rejects_non_openai_pi_reviewer_mounts_for_direct_entry_commands(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
@@ -555,6 +597,62 @@ class ReviewCliTest(unittest.TestCase):
                     self.assertEqual(result["output"]["status"], "failed_invalid_payload")
                     self.assertIn("reviewer.codex_home", result["output"]["message"])
                     self.assertIn("only supported when reviewer.command uses pi --provider openai-codex", result["output"]["message"])
+
+    def test_review_rejects_unknown_provider_pi_reviewer_mounts_for_direct_entry_commands(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            checkout = temp_path / "checkout"
+            start_commit = init_checkout(checkout)
+            head_commit = git(checkout, "rev-parse", "HEAD")
+            validation_step, validation_worker = write_validation_artifacts(temp_path / "validation-run")
+            ledger = temp_path / "ledger"
+            codex_home = temp_path / "codex-home"
+            config_home = temp_path / "xdg-config"
+            pi_config_home = temp_path / "pi-config"
+            pi_coding_agent_dir = temp_path / "pi-coding-agent"
+            codex_home.mkdir()
+            config_home.mkdir()
+            pi_config_home.mkdir()
+            pi_coding_agent_dir.mkdir()
+
+            input_payload = review_input(
+                checkout=checkout,
+                start_commit=start_commit,
+                head_commit=head_commit,
+                validation_step=validation_step,
+                validation_worker=validation_worker,
+                reviewer_code="raise SystemExit('reviewer should not run')",
+            )
+            input_payload["reviewer"] = {
+                "type": "fake-reviewer-command",
+                "command": ["pi", "-p", "{prompt}", "--model", "gpt-5.4-mini"],
+                "timeout_seconds": 10,
+                "codex_home": str(codex_home),
+                "config_home": str(config_home),
+                "env": {
+                    "PI_CONFIG_HOME": str(pi_config_home),
+                    "PI_CODING_AGENT_DIR": str(pi_coding_agent_dir),
+                },
+            }
+
+            completed = run_afk(
+                "run-step",
+                "review",
+                "--input",
+                json.dumps(input_payload),
+                "--ledger",
+                str(ledger),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(summary["status"], "failed")
+            self.assertEqual(result["output"]["status"], "failed_invalid_payload")
+            self.assertIn("reviewer.codex_home", result["output"]["message"])
+            self.assertIn("provider could not be determined", result["output"]["message"])
 
     def test_review_substitutes_prompt_for_reviewer_command(self):
         with tempfile.TemporaryDirectory() as temp_dir:

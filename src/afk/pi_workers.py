@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import shlex
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -206,8 +207,11 @@ def non_openai_pi_mount_error(
     env: Mapping[str, str] | None,
     field_prefix: str,
 ) -> str | None:
+    pi_args = pi_command_args(command)
+    if pi_args is None:
+        return None
     provider = pi_command_provider(command)
-    if provider is None or provider == "openai-codex":
+    if provider == "openai-codex":
         return None
     mounted_env = env or {}
     mounted = []
@@ -222,6 +226,11 @@ def non_openai_pi_mount_error(
     if not mounted:
         return None
     verb = "is" if len(mounted) == 1 else "are"
+    if provider is None:
+        return (
+            f"{', '.join(mounted)} {verb} only supported when {field_prefix}.command uses pi --provider openai-codex; "
+            "provider could not be determined"
+        )
     return f"{', '.join(mounted)} {verb} only supported when {field_prefix}.command uses pi --provider openai-codex"
 
 
@@ -247,6 +256,8 @@ def pi_command_args(command: list[str]) -> list[str] | None:
         return command[1:]
     if executable == "env":
         return _env_wrapped_pi_args(command[1:])
+    if executable in {"bash", "sh", "zsh"}:
+        return _shell_wrapped_pi_args(command[1:])
     if executable.startswith("python"):
         return _python_module_pi_args(command[1:])
     return None
@@ -260,6 +271,9 @@ def _env_wrapped_pi_args(command: list[str]) -> list[str] | None:
             index += 1
             break
         if part in {"-C", "--chdir", "-S", "--split-string"} and index + 1 < len(command):
+            index += 2
+            continue
+        if part in {"-u", "--unset"} and index + 1 < len(command):
             index += 2
             continue
         if part.startswith("-"):
@@ -284,6 +298,26 @@ def _python_module_pi_args(command: list[str]) -> list[str] | None:
             return None
         index += 1
     return None
+
+
+def _shell_wrapped_pi_args(command: list[str]) -> list[str] | None:
+    index = 0
+    while index < len(command):
+        part = command[index]
+        if part == "-c" and index + 1 < len(command):
+            return _parse_shell_command_args(command[index + 1])
+        if part.startswith("-") and not part.startswith("--") and "c" in part[1:] and index + 1 < len(command):
+            return _parse_shell_command_args(command[index + 1])
+        index += 1
+    return None
+
+
+def _parse_shell_command_args(command: str) -> list[str] | None:
+    try:
+        shell_args = shlex.split(command)
+    except ValueError:
+        return None
+    return pi_command_args(shell_args)
 
 
 def validate_model_cap(model: str) -> str:
