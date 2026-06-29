@@ -1411,6 +1411,80 @@ class ValidateCliTest(unittest.TestCase):
             self.assertIn("late child stdout", (run_dir / "stdout.log").read_text(encoding="utf-8"))
             self.assertIn("late child stderr", (run_dir / "stderr.log").read_text(encoding="utf-8"))
 
+    def test_validate_preserves_utf8_split_across_stream_read_boundaries(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            checkout = temp_path / "checkout"
+            start_commit = init_checkout(checkout)
+            ledger = temp_path / "ledger"
+            payload = ("a" * 4095) + "€" + "Z"
+            worker_code = textwrap.dedent(
+                f"""
+                import json
+                import os
+                import sys
+                from pathlib import Path
+
+                payload = {payload!r}.encode("utf-8")
+                sys.stdout.buffer.write(payload)
+                sys.stdout.buffer.flush()
+                sys.stderr.buffer.write(payload)
+                sys.stderr.buffer.flush()
+                Path(os.environ["AFK_WORKER_RESULT"]).write_text(
+                    json.dumps(
+                        {{
+                            "profile": "tier3-harness",
+                            "status": "pass",
+                            "summary": "wrote utf-8 payload across chunk boundary",
+                            "steps": [],
+                        }}
+                    ),
+                    encoding="utf-8",
+                )
+                """
+            ).strip()
+
+            completed = run_afk(
+                "run-step",
+                "validate",
+                "--profile",
+                "tier3-harness",
+                "--input",
+                json.dumps(
+                    {
+                        "checkout": {
+                            "status": "prepared",
+                            "checkout_path": str(checkout),
+                            "review_branch": "afk/validate",
+                            "requested_ref": "main",
+                            "start_commit": start_commit,
+                        },
+                        "worker": {
+                            "type": "local-command",
+                            "command": [sys.executable, "-c", worker_code],
+                        },
+                    }
+                ),
+                "--ledger",
+                str(ledger),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+            worker_result = json.loads((run_dir / "worker-result.json").read_text(encoding="utf-8"))
+            stdout_log = (run_dir / "stdout.log").read_text(encoding="utf-8")
+            stderr_log = (run_dir / "stderr.log").read_text(encoding="utf-8")
+
+            self.assertEqual(result["output"]["status"], "validated")
+            self.assertEqual(stdout_log, payload)
+            self.assertEqual(stderr_log, payload)
+            self.assertTrue(worker_result["result"]["normalized"]["evidence"]["stdout_excerpt"].endswith("€Z"))
+            self.assertTrue(worker_result["result"]["normalized"]["evidence"]["stderr_excerpt"].endswith("€Z"))
+            self.assertNotIn("\ufffd", stdout_log)
+            self.assertNotIn("\ufffd", stderr_log)
+
     def test_validate_sanitizes_worker_result_evidence_after_timeout(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
@@ -1655,6 +1729,92 @@ class ValidateCliTest(unittest.TestCase):
             self.assertEqual(evidence_result["status"], "failed_runtime")
             self.assertEqual(evidence_result["process_state"], "stopped")
             self.assertIn("SIGCONT", worker_result["result"]["normalized"]["adapter"]["remediation"])
+
+    @unittest.skipUnless(sys.platform == "linux", "stopped-process detection requires Linux /proc")
+    def test_validate_scans_owned_process_group_after_pipes_drain(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            checkout = temp_path / "checkout"
+            start_commit = init_checkout(checkout)
+            ledger = temp_path / "ledger"
+            child_code = textwrap.dedent(
+                """
+                import os
+                import signal
+                import time
+
+                os.close(1)
+                os.close(2)
+                os.kill(os.getpid(), signal.SIGSTOP)
+                time.sleep(5)
+                """
+            ).strip()
+            worker_code = textwrap.dedent(
+                f"""
+                import json
+                import os
+                import subprocess
+                import sys
+                from pathlib import Path
+
+                result_path = Path(os.environ["AFK_WORKER_RESULT"])
+                result_path.parent.mkdir(parents=True, exist_ok=True)
+                subprocess.Popen([sys.executable, "-c", {child_code!r}])
+                result_path.write_text(
+                    json.dumps(
+                        {{
+                            "profile": "tier3-harness",
+                            "status": "pass",
+                            "summary": "parent exited after spawning stopped child with closed stdio",
+                            "steps": [],
+                        }}
+                    ),
+                    encoding="utf-8",
+                )
+                """
+            ).strip()
+
+            completed = run_afk(
+                "run-step",
+                "validate",
+                "--profile",
+                "tier3-harness",
+                "--input",
+                json.dumps(
+                    {
+                        "checkout": {
+                            "status": "prepared",
+                            "checkout_path": str(checkout),
+                            "review_branch": "afk/validate",
+                            "requested_ref": "main",
+                            "start_commit": start_commit,
+                        },
+                        "worker": {
+                            "type": "local-command",
+                            "command": [sys.executable, "-c", worker_code],
+                            "timeout_seconds": 5,
+                        },
+                    }
+                ),
+                "--ledger",
+                str(ledger),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+            worker_result = json.loads((run_dir / "worker-result.json").read_text(encoding="utf-8"))
+            evidence_result = json.loads(
+                (run_dir / "validation-evidence" / "result.json").read_text(encoding="utf-8")
+            )
+
+            self.assertEqual(result["output"]["status"], "failed_runtime")
+            self.assertEqual(result["output"]["classification"], "runtime_failure")
+            self.assertEqual(worker_result["result"]["normalized"]["status"], "failed_runtime")
+            self.assertEqual(evidence_result["status"], "failed_runtime")
+            self.assertEqual(evidence_result["process_state"], "stopped")
+            self.assertIn("SIGCONT", worker_result["result"]["normalized"]["summary"])
 
     def test_validate_rejects_pass_result_when_adapter_exits_nonzero(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -3730,6 +3890,28 @@ class ValidateCliTest(unittest.TestCase):
         self.assertTrue(error.timed_out)
         self.assertEqual(error.failure_artifact["process_state"], "stdout_stderr_open_after_exit")
         self.assertIn("best-effort", error.failure_artifact["remediation"])
+
+    def test_stopped_process_message_limits_cleanup_scope_to_worker_process_group(self):
+        from afk import validation
+
+        message = validation.format_stopped_process_message(
+            1234,
+            [{"pid": 1234, "name": "python", "state": "T (stopped)"}],
+        )
+
+        self.assertIn("worker process group", message)
+        self.assertIn("setsid/setpgid", message)
+        self.assertIn("outside AFK's cleanup guarantee", message)
+
+    def test_descendant_stdio_failure_artifact_scopes_detached_cleanup_to_best_effort(self):
+        from afk import validation
+
+        artifact = validation.descendant_stdio_failure_artifact(process_groups_available=True)
+
+        self.assertEqual(artifact["process_state"], "stdout_stderr_open_after_exit")
+        self.assertIn("worker process group", artifact["remediation"])
+        self.assertIn("setsid/setpgid", artifact["remediation"])
+        self.assertIn("outside AFK's cleanup guarantee", artifact["remediation"])
 
 
 if __name__ == "__main__":

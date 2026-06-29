@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import codecs
 import os
 import re
 import signal
@@ -575,7 +576,9 @@ def run_command_adapter(
 
 STOPPED_PROCESS_REMEDIATION = (
     "Send SIGCONT to the worker process group to resume it for debugging, then fix PTY/job-control "
-    "behavior or the worker script before retrying validation."
+    "behavior or the worker script before retrying validation. AFK only inspects and cleans up the "
+    "worker process group it started; descendants that detach with setsid/setpgid are outside AFK's "
+    "cleanup guarantee."
 )
 
 
@@ -666,12 +669,21 @@ def stream_reader(stream: Any, chunks: list[str]) -> threading.Thread:
     def read_stream() -> None:
         if stream is None:
             return
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
         try:
             while True:
                 chunk = stream.read(4096)
                 if not chunk:
                     break
-                chunks.append(decode_adapter_output(chunk))
+                if isinstance(chunk, bytes):
+                    text = decoder.decode(chunk)
+                else:
+                    text = decode_adapter_output(chunk)
+                if text:
+                    chunks.append(text)
+            tail = decoder.decode(b"", final=True)
+            if tail:
+                chunks.append(tail)
         finally:
             stream.close()
 
@@ -924,7 +936,11 @@ def format_stopped_process_message(root_pid: int, stopped_processes: list[dict[s
 
 
 def descendant_stdio_failure_artifact(*, process_groups_available: bool) -> dict[str, Any]:
-    remediation = "Ensure worker descendants exit or close inherited stdout/stderr before the worker process exits."
+    remediation = (
+        "Ensure descendants in the worker process group exit or close inherited stdout/stderr before "
+        "the worker process exits. Descendants that detach with setsid/setpgid are outside AFK's "
+        "cleanup guarantee."
+    )
     artifact: dict[str, Any] = {
         "process_state": "stdout_stderr_open_after_exit",
         "remediation": remediation,
@@ -1035,8 +1051,6 @@ def drain_post_exit_output(
             stderr_thread,
             timeout=min(0.05, remaining) if remaining > 0 else 0.0,
         )
-        if stdout_done and stderr_done:
-            return ("".join(stdout_chunks), "".join(stderr_chunks), True)
         stopped_processes = stopped_worker_processes(process.pid, process_groups_available=process_groups_available)
         if stopped_processes:
             raise stopped_process_error(
@@ -1049,6 +1063,8 @@ def drain_post_exit_output(
                 process_groups_available=process_groups_available,
                 stopped_processes=stopped_processes,
             )
+        if stdout_done and stderr_done:
+            return ("".join(stdout_chunks), "".join(stderr_chunks), True)
         if remaining <= 0:
             return ("".join(stdout_chunks), "".join(stderr_chunks), False)
 
