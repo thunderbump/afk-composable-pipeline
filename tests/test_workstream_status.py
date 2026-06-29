@@ -835,7 +835,7 @@ class WorkstreamStatusMappingTest(unittest.TestCase):
                     "review_feedback_status": "",
                 }
             ),
-            {"status": "published", "url": "https://github.example/pr/17"},
+            {"status": "tracker-closed", "url": "https://github.example/pr/17"},
         )
 
         self.assertEqual(record["status"], "closed")
@@ -867,7 +867,7 @@ class WorkstreamStatusMappingTest(unittest.TestCase):
                     "review_feedback_status": "",
                 }
             ),
-            {"status": "published", "url": "https://github.example/pr/17"},
+            {"status": "tracker-closed", "url": "https://github.example/pr/17"},
         )
 
         self.assertEqual(record["status"], "closed")
