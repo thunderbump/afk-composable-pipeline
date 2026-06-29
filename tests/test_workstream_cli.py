@@ -15,22 +15,23 @@ from afk.registry import StepResult  # noqa: E402
 from afk.workstream import (  # noqa: E402
     WorkstreamLedger,
     composed_step_input,
-    pr_body_markdown,
     current_selected_work_selection_identity,
+    pr_body_markdown,
+    publish_terminal_pr,
     selected_work_records,
     select_work_proves_different_item,
     update_state_from_step,
 )
 
 
-def run_afk(*args, env_overrides=None):
+def run_afk(*args, env_overrides=None, cwd=None):
     env = os.environ.copy()
     env["PYTHONPATH"] = str(ROOT / "src")
     if env_overrides:
         env.update(env_overrides)
     return subprocess.run(
         [sys.executable, "-m", "afk", *args],
-        cwd=ROOT,
+        cwd=cwd or ROOT,
         env=env,
         text=True,
         capture_output=True,
@@ -4000,6 +4001,391 @@ sys.exit(0)
                 self.assertEqual(call["gh_token"], "")
                 self.assertEqual(call["github_token"], "")
                 self.assertNotEqual(call["home"], os.environ.get("HOME", ""))
+
+    def test_workstream_publisher_uses_absolute_pr_body_path_when_relative_ledger_runs_from_different_cwd(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            runner = temp_path / "runner"
+            runner.mkdir()
+            checkout = temp_path / "checkout"
+            ledger_arg = "relative-ledger"
+            fake_calls = temp_path / "fake-calls.jsonl"
+            mounted_gh_config = temp_path / "mounted-gh-config"
+            mounted_gh_config.mkdir()
+            checkout.mkdir()
+            fake_gh = temp_path / "publisher-gh"
+            write_executable(
+                fake_gh,
+                f"""#!{sys.executable}
+import json
+import os
+import sys
+from pathlib import Path
+
+record = {{
+    "tool": "gh",
+    "cwd": os.getcwd(),
+    "argv": sys.argv[1:],
+    "gh_config_dir": os.environ.get("GH_CONFIG_DIR", ""),
+}}
+if "--body-file" in sys.argv:
+    body_file = sys.argv[sys.argv.index("--body-file") + 1]
+    record["body_path"] = body_file
+    record["body"] = Path(body_file).read_text(encoding="utf-8")
+Path({str(fake_calls)!r}).open("a", encoding="utf-8").write(json.dumps(record) + "\\n")
+if sys.argv[1:4] == ["auth", "status", "--hostname"]:
+    sys.exit(0)
+print("https://github.example/pr/456")
+sys.exit(0)
+""",
+            )
+            normalized = {
+                "workstream_id": "central-lve.9",
+                "parent": "central-lve",
+                "review_branch": "afk/workstream-terminal-pr",
+            }
+            state = {
+                "checkout": {"status": "prepared", "checkout_path": str(checkout)},
+                "implementation": {
+                    "git": {
+                        "changed_files": ["implemented.txt"],
+                        "commits": [{"commit": "abc1234", "subject": "implement central-lve.9"}],
+                    }
+                },
+                "validations": [
+                    {
+                        "output": {
+                            "status": "validated",
+                            "summary": "validated",
+                            "worker_result": {
+                                "raw": {"status": "pass", "steps": [{"name": "unit", "status": "pass"}]},
+                                "normalized": {
+                                    "summary": "validated",
+                                    "adapter": {"command": [sys.executable, "-c", "print('ok')"]},
+                                },
+                            },
+                        },
+                        "step_result_path": "runs/validate/step-result.json",
+                        "worker_result_path": "runs/validate/worker-result.json",
+                    }
+                ],
+                "review": {"status": "passed", "summary": "ready for PR"},
+                "cleanup": {"status": "clean", "resources": []},
+                "implementation_selection": [],
+                "review_selection": [],
+            }
+            steps = [{"name": "validate", "result_path": "runs/validate/step-result.json"}]
+            selected_work = [{**selected_fixture_item(), "result": "passed"}]
+            old_cwd = Path.cwd()
+            try:
+                os.chdir(runner)
+                ledger = WorkstreamLedger(Path(ledger_arg), "publisher-success")
+                ledger.prepare()
+                result = publish_terminal_pr(
+                    {
+                        "enabled": True,
+                        "mode": "create",
+                        "repo": "thunderbump/afk-composable-pipeline",
+                        "base": "main",
+                        "head": "afk/workstream-terminal-pr",
+                        "title": "central-lve.9: Compose workstream recipe and terminal PR publisher",
+                        "gh": {
+                            "path": str(fake_gh),
+                            "auth": {"config_dir": str(mounted_gh_config)},
+                        },
+                    },
+                    normalized=normalized,
+                    state=state,
+                    steps=steps,
+                    selected_work=selected_work,
+                    ledger=ledger,
+                )
+            finally:
+                os.chdir(old_cwd)
+
+            publication_path = runner / ledger_arg / "workstreams" / ledger.run_id / "publication-result.json"
+            publication_text = json.dumps(result)
+            calls = [
+                json.loads(line)
+                for line in fake_calls.read_text(encoding="utf-8").splitlines()
+            ]
+
+            expected_body_path = (runner / ledger_arg / "workstreams" / ledger.run_id / "pr-body.md").resolve()
+            pr_call = next(call for call in calls if call["tool"] == "gh" and call["argv"][0:2] == ["pr", "create"])
+            command = result["commands"]["gh"]
+
+            self.assertEqual(result["status"], "published")
+            self.assertEqual(result["auth"]["path"], "[REDACTED]")
+            self.assertEqual(pr_call["cwd"], str(checkout))
+            self.assertEqual(pr_call["gh_config_dir"], str(mounted_gh_config))
+            self.assertEqual(Path(pr_call["body_path"]), expected_body_path)
+            self.assertTrue(Path(pr_call["body_path"]).is_absolute())
+            self.assertEqual(command[command.index("--body-file") + 1], str(expected_body_path))
+            self.assertIn(str(expected_body_path), publication_text)
+            self.assertNotIn(str(mounted_gh_config), publication_text)
+            self.assertTrue(publication_path.parent.joinpath("pr-body.md").is_file())
+
+    def test_workstream_update_fallback_uses_absolute_pr_update_path_when_relative_ledger_runs_from_different_cwd(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            runner = temp_path / "runner"
+            runner.mkdir()
+            checkout = temp_path / "checkout"
+            ledger_arg = "relative-ledger"
+            fake_calls = temp_path / "fake-calls.jsonl"
+            mounted_gh_config = temp_path / "mounted-gh-config"
+            mounted_gh_config.mkdir()
+            checkout.mkdir()
+            fake_gh = temp_path / "publisher-gh"
+            write_executable(
+                fake_gh,
+                f"""#!{sys.executable}
+import json
+import os
+import sys
+from pathlib import Path
+
+record = {{
+    "tool": "gh",
+    "cwd": os.getcwd(),
+    "argv": sys.argv[1:],
+    "gh_config_dir": os.environ.get("GH_CONFIG_DIR", ""),
+}}
+if "--body-file" in sys.argv:
+    body_file = sys.argv[sys.argv.index("--body-file") + 1]
+    record["body_path"] = body_file
+    record["body"] = Path(body_file).read_text(encoding="utf-8")
+if "--input" in sys.argv:
+    input_file = sys.argv[sys.argv.index("--input") + 1]
+    record["input_path"] = input_file
+    record["input"] = json.loads(Path(input_file).read_text(encoding="utf-8"))
+Path({str(fake_calls)!r}).open("a", encoding="utf-8").write(json.dumps(record) + "\\n")
+if sys.argv[1:4] == ["auth", "status", "--hostname"]:
+    sys.exit(0)
+if sys.argv[1:3] == ["pr", "edit"]:
+    print("GraphQL: Projects (classic) is deprecated", file=sys.stderr)
+    sys.exit(1)
+if sys.argv[1:4] == ["api", "--method", "PATCH"]:
+    print("https://github.example/pr/789")
+    sys.exit(0)
+sys.exit(0)
+""",
+            )
+            normalized = {
+                "workstream_id": "central-lve.9",
+                "parent": "central-lve",
+                "review_branch": "afk/workstream-terminal-pr",
+            }
+            state = {
+                "checkout": {"status": "prepared", "checkout_path": str(checkout)},
+                "implementation": {
+                    "git": {
+                        "changed_files": ["implemented.txt"],
+                        "commits": [{"commit": "abc1234", "subject": "implement central-lve.9"}],
+                    }
+                },
+                "validations": [
+                    {
+                        "output": {
+                            "status": "validated",
+                            "summary": "validated",
+                            "worker_result": {
+                                "raw": {"status": "pass", "steps": [{"name": "unit", "status": "pass"}]},
+                                "normalized": {
+                                    "summary": "validated",
+                                    "adapter": {"command": [sys.executable, "-c", "print('ok')"]},
+                                },
+                            },
+                        },
+                        "step_result_path": "runs/validate/step-result.json",
+                        "worker_result_path": "runs/validate/worker-result.json",
+                    }
+                ],
+                "review": {"status": "passed", "summary": "ready for PR"},
+                "cleanup": {"status": "clean", "resources": []},
+                "implementation_selection": [],
+                "review_selection": [],
+            }
+            steps = [{"name": "validate", "result_path": "runs/validate/step-result.json"}]
+            selected_work = [{**selected_fixture_item(), "result": "passed"}]
+            old_cwd = Path.cwd()
+            try:
+                os.chdir(runner)
+                ledger = WorkstreamLedger(Path(ledger_arg), "publisher-update-fallback")
+                ledger.prepare()
+                result = publish_terminal_pr(
+                    {
+                        "enabled": True,
+                        "mode": "update",
+                        "pr": "123",
+                        "repo": "thunderbump/afk-composable-pipeline",
+                        "head": "afk/workstream-terminal-pr",
+                        "title": "central-lve.9: Compose workstream recipe and terminal PR publisher",
+                        "gh": {
+                            "path": str(fake_gh),
+                            "auth": {"config_dir": str(mounted_gh_config)},
+                        },
+                    },
+                    normalized=normalized,
+                    state=state,
+                    steps=steps,
+                    selected_work=selected_work,
+                    ledger=ledger,
+                )
+            finally:
+                os.chdir(old_cwd)
+
+            publication_path = runner / ledger_arg / "workstreams" / ledger.run_id / "publication-result.json"
+            publication_text = json.dumps(result)
+            calls = [
+                json.loads(line)
+                for line in fake_calls.read_text(encoding="utf-8").splitlines()
+            ]
+
+            expected_input_path = (runner / ledger_arg / "workstreams" / ledger.run_id / "pr-update.json").resolve()
+            api_call = next(call for call in calls if call["tool"] == "gh" and call["argv"][0:3] == ["api", "--method", "PATCH"])
+            command = result["commands"]["gh"]
+
+            self.assertEqual(result["status"], "published")
+            self.assertEqual(result["auth"]["path"], "[REDACTED]")
+            self.assertEqual(api_call["cwd"], str(checkout))
+            self.assertEqual(api_call["gh_config_dir"], str(mounted_gh_config))
+            self.assertEqual(Path(api_call["input_path"]), expected_input_path)
+            self.assertTrue(Path(api_call["input_path"]).is_absolute())
+            self.assertEqual(
+                api_call["input"],
+                {
+                    "title": "central-lve.9: Compose workstream recipe and terminal PR publisher",
+                    "body": publication_path.parent.joinpath("pr-body.md").read_text(encoding="utf-8"),
+                },
+            )
+            self.assertEqual(command[command.index("--input") + 1], str(expected_input_path))
+            self.assertIn(str(expected_input_path), publication_text)
+            self.assertNotIn(str(mounted_gh_config), publication_text)
+            self.assertTrue(publication_path.parent.joinpath("pr-update.json").is_file())
+
+    def test_workstream_failed_publication_keeps_retry_guidance_neutral_in_pr_body(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            runner = temp_path / "runner"
+            runner.mkdir()
+            checkout = temp_path / "checkout"
+            ledger_arg = "relative-ledger"
+            fake_calls = temp_path / "fake-calls.jsonl"
+            mounted_gh_config = temp_path / "mounted-gh-config"
+            mounted_gh_config.mkdir()
+            checkout.mkdir()
+            fake_gh = temp_path / "publisher-gh"
+            write_executable(
+                fake_gh,
+                f"""#!{sys.executable}
+import json
+import os
+import sys
+from pathlib import Path
+
+record = {{
+    "tool": "gh",
+    "cwd": os.getcwd(),
+    "argv": sys.argv[1:],
+    "gh_config_dir": os.environ.get("GH_CONFIG_DIR", ""),
+}}
+if "--body-file" in sys.argv:
+    body_file = sys.argv[sys.argv.index("--body-file") + 1]
+    record["body_path"] = body_file
+    record["body"] = Path(body_file).read_text(encoding="utf-8")
+Path({str(fake_calls)!r}).open("a", encoding="utf-8").write(json.dumps(record) + "\\n")
+if sys.argv[1:4] == ["auth", "status", "--hostname"]:
+    sys.exit(0)
+print("publisher create failed", file=sys.stderr)
+sys.exit(11)
+""",
+            )
+            normalized = {
+                "workstream_id": "central-lve.9",
+                "parent": "central-lve",
+                "review_branch": "afk/workstream-terminal-pr",
+            }
+            state = {
+                "checkout": {"status": "prepared", "checkout_path": str(checkout)},
+                "implementation": {
+                    "git": {
+                        "changed_files": ["implemented.txt"],
+                        "commits": [{"commit": "abc1234", "subject": "implement central-lve.9"}],
+                    }
+                },
+                "validations": [
+                    {
+                        "output": {
+                            "status": "validated",
+                            "summary": "validated",
+                            "worker_result": {
+                                "raw": {"status": "pass", "steps": [{"name": "unit", "status": "pass"}]},
+                                "normalized": {
+                                    "summary": "validated",
+                                    "adapter": {"command": [sys.executable, "-c", "print('ok')"]},
+                                },
+                            },
+                        },
+                        "step_result_path": "runs/validate/step-result.json",
+                        "worker_result_path": "runs/validate/worker-result.json",
+                    }
+                ],
+                "review": {"status": "passed", "summary": "ready for PR"},
+                "cleanup": {"status": "clean", "resources": []},
+                "implementation_selection": [],
+                "review_selection": [],
+            }
+            steps = [{"name": "validate", "result_path": "runs/validate/step-result.json"}]
+            selected_work = [{**selected_fixture_item(), "result": "passed"}]
+            old_cwd = Path.cwd()
+            try:
+                os.chdir(runner)
+                ledger = WorkstreamLedger(Path(ledger_arg), "publisher-failure")
+                ledger.prepare()
+                result = publish_terminal_pr(
+                    {
+                        "enabled": True,
+                        "mode": "create",
+                        "repo": "thunderbump/afk-composable-pipeline",
+                        "base": "main",
+                        "head": "afk/workstream-terminal-pr",
+                        "title": "central-lve.9: Compose workstream recipe and terminal PR publisher",
+                        "gh": {
+                            "path": str(fake_gh),
+                            "auth": {"config_dir": str(mounted_gh_config)},
+                        },
+                    },
+                    normalized=normalized,
+                    state=state,
+                    steps=steps,
+                    selected_work=selected_work,
+                    ledger=ledger,
+                )
+            finally:
+                os.chdir(old_cwd)
+
+            workstream_dir = runner / ledger_arg / "workstreams" / ledger.run_id
+            publication_text = json.dumps(result)
+            pr_body = workstream_dir.joinpath("pr-body.md").read_text(encoding="utf-8")
+            calls = [
+                json.loads(line)
+                for line in fake_calls.read_text(encoding="utf-8").splitlines()
+            ]
+
+            expected_body_path = workstream_dir.joinpath("pr-body.md").resolve()
+            pr_call = next(call for call in calls if call["tool"] == "gh" and call["argv"][0:2] == ["pr", "create"])
+            command = result["command"]
+
+            self.assertEqual(result["status"], "failed-needs-human")
+            self.assertIn("afk run-workstream", result["retry"])
+            self.assertEqual(Path(pr_call["body_path"]), expected_body_path)
+            self.assertTrue(Path(pr_call["body_path"]).is_absolute())
+            self.assertEqual(command[command.index("--body-file") + 1], str(expected_body_path))
+            self.assertIn(str(expected_body_path), publication_text)
+            self.assertNotIn(str(mounted_gh_config), publication_text)
+            self.assertNotIn("Retry: not required after successful publication", pr_body)
+            self.assertIn("Retry: rerun the workstream if terminal publication fails", pr_body)
 
     def test_workstream_records_actionable_terminal_result_for_invalid_publisher_auth_config(self):
         cases = [

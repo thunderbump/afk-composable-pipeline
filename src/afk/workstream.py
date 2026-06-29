@@ -1219,6 +1219,7 @@ def publish_terminal_pr(
     auth_artifact = publisher_auth_artifact(auth)
     body = pr_body_markdown(normalized, state, steps, selected_work, ledger)
     ledger.write_text("pr-body.md", body)
+    pr_body_path = (ledger.path / "pr-body.md").resolve(strict=False)
     try:
         run_publisher_command(
             [config["gh_path"], "auth", "status", "--hostname", "github.com"],
@@ -1248,7 +1249,7 @@ def publish_terminal_pr(
                 "--title",
                 config["title"],
                 "--body-file",
-                str(ledger.path / "pr-body.md"),
+                str(pr_body_path),
             ]
             completed = run_publisher_command(command, cwd=checkout_path, tool="gh", auth=auth)
         else:
@@ -1262,7 +1263,7 @@ def publish_terminal_pr(
                 "--title",
                 config["title"],
                 "--body-file",
-                str(ledger.path / "pr-body.md"),
+                str(pr_body_path),
             ]
             completed, command = run_pr_update_command(
                 command,
@@ -1292,7 +1293,7 @@ def publish_terminal_pr(
                 else []
             ),
         },
-        "body_path": str(ledger.path / "pr-body.md"),
+        "body_path": str(pr_body_path),
     }
 
 
@@ -1316,6 +1317,7 @@ def run_pr_update_command(
             raise
     pr_number = pr_number_for_rest_update(config["pr"], config=config, checkout_path=checkout_path, auth=auth)
     ledger.write_json("pr-update.json", {"title": config["title"], "body": body})
+    pr_update_path = (ledger.path / "pr-update.json").resolve(strict=False)
     fallback_command = [
         config["gh_path"],
         "api",
@@ -1323,7 +1325,7 @@ def run_pr_update_command(
         "PATCH",
         f"repos/{config['repo']}/pulls/{pr_number}",
         "--input",
-        str(ledger.path / "pr-update.json"),
+        str(pr_update_path),
         "--jq",
         ".html_url",
     ]
@@ -1598,7 +1600,7 @@ def pr_body_markdown(
             "",
             "## Retry",
             "",
-            "Retry: not required after successful publication",
+            "Retry: rerun the workstream if terminal publication fails",
             "",
             "## Artifacts",
             "",
