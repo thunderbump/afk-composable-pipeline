@@ -35,6 +35,19 @@ class PiWorkersTest(unittest.TestCase):
             with self.subTest(command=command):
                 self.assertEqual(pi_command_provider(command), "openai-codex")
 
+    def test_pi_command_provider_detects_openai_codex_through_shell_exec_wrapper(self):
+        command = ["bash", "-lc", "exec pi -p '{prompt}' --provider openai-codex --model gpt-5.4-mini"]
+
+        self.assertEqual(pi_command_provider(command), "openai-codex")
+
+    def test_pi_command_provider_detects_openai_codex_through_env_split_string_wrapper(self):
+        command = [
+            "/usr/bin/env",
+            "--split-string=pi -p '{prompt}' --provider openai-codex --model gpt-5.4-mini",
+        ]
+
+        self.assertEqual(pi_command_provider(command), "openai-codex")
+
     def test_build_pi_real_worker_agent_returns_safe_real_agent_config(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)

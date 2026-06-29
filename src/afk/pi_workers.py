@@ -270,9 +270,13 @@ def _env_wrapped_pi_args(command: list[str]) -> list[str] | None:
         if part == "--":
             index += 1
             break
-        if part in {"-C", "--chdir", "-S", "--split-string"} and index + 1 < len(command):
+        if part in {"-C", "--chdir"} and index + 1 < len(command):
             index += 2
             continue
+        if part in {"-S", "--split-string"} and index + 1 < len(command):
+            return _parse_shell_command_args(command[index + 1])
+        if part.startswith("--split-string="):
+            return _parse_shell_command_args(part.partition("=")[2])
         if part in {"-u", "--unset"} and index + 1 < len(command):
             index += 2
             continue
@@ -317,6 +321,10 @@ def _parse_shell_command_args(command: str) -> list[str] | None:
         shell_args = shlex.split(command)
     except ValueError:
         return None
+    if shell_args[:1] == ["exec"]:
+        shell_args = shell_args[1:]
+        if shell_args[:1] == ["--"]:
+            shell_args = shell_args[1:]
     return pi_command_args(shell_args)
 
 
