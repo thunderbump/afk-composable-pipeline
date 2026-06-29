@@ -37,6 +37,8 @@ from afk.registry import (
 
 
 SCHEMA_VERSION = 1
+PRODUCTION_ROLE_PROFILE = "production"
+FAKE_LOCAL_ROLE_PROFILE = "fake-local"
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -325,6 +327,7 @@ def build_parser() -> argparse.ArgumentParser:
             "Overrides the default host sibling contract when checkout_root is a nested mount."
         ),
     )
+    add_role_profile_flag(generate_recipe_parser)
     add_implementation_agent_flags(generate_recipe_parser)
     add_reviewer_flags(generate_recipe_parser)
     add_retrospective_judge_flags(generate_recipe_parser)
@@ -392,6 +395,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Run the selected recipe through run-workstream after selection",
     )
+    add_role_profile_flag(run_next_parser)
     add_implementation_agent_flags(run_next_parser)
     add_reviewer_flags(run_next_parser)
     add_retrospective_judge_flags(run_next_parser)
@@ -400,11 +404,22 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def add_role_profile_flag(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--role-profile",
+        choices=(PRODUCTION_ROLE_PROFILE, FAKE_LOCAL_ROLE_PROFILE),
+        default=PRODUCTION_ROLE_PROFILE,
+        help=(
+            "Role defaults for generated recipes: production uses Pi-backed implementation, "
+            "review, and retrospective judge; fake-local preserves local fake adapters."
+        ),
+    )
+
+
 def add_implementation_agent_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--agent-mode",
         choices=("fake", "real-local", "pi"),
-        default="fake",
         help="Implementation adapter mode to embed in the generated recipe",
     )
     parser.add_argument(
@@ -440,7 +455,7 @@ def add_implementation_agent_flags(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--agent-pi-model",
-        default="gpt-5.4-mini",
+        default="gpt-5.4",
         help="Pi model for pi mode (gpt-5.4 or lower)",
     )
     parser.add_argument("--agent-pi-thinking", help="Optional Pi thinking level")
@@ -467,7 +482,6 @@ def add_reviewer_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--reviewer-mode",
         choices=("fake", "pi"),
-        default="fake",
         help="Reviewer mode to embed in the generated recipe",
     )
     parser.add_argument("--reviewer-timeout-seconds", type=int, help="Optional reviewer timeout in seconds")
@@ -479,7 +493,7 @@ def add_reviewer_flags(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--reviewer-pi-model",
-        default="gpt-5.4-mini",
+        default="gpt-5.4",
         help="Reviewer Pi model for pi mode (gpt-5.4 or lower)",
     )
     parser.add_argument("--reviewer-pi-thinking", help="Optional reviewer Pi thinking level")
@@ -499,7 +513,6 @@ def add_retrospective_judge_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--retrospective-judge-mode",
         choices=("disabled", "pi"),
-        default="disabled",
         help="Retrospective judge mode to embed in generated recipe",
     )
     parser.add_argument(
@@ -519,7 +532,7 @@ def add_retrospective_judge_flags(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--retrospective-judge-pi-model",
-        default="gpt-5.4-mini",
+        default="gpt-5.4",
         help="Retrospective judge Pi model for pi mode (gpt-5.4 or lower)",
     )
     parser.add_argument(
@@ -556,11 +569,33 @@ def add_publisher_flags(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def resolved_role_mode(
+    explicit_mode: str | None,
+    *,
+    role_profile: str,
+    production_mode: str,
+    fake_local_mode: str,
+) -> str:
+    if explicit_mode is not None:
+        return explicit_mode
+    if role_profile == PRODUCTION_ROLE_PROFILE:
+        return production_mode
+    if role_profile == FAKE_LOCAL_ROLE_PROFILE:
+        return fake_local_mode
+    raise ValueError(f"Unsupported --role-profile: {role_profile}")
+
+
 def recipe_agent_from_args(args: argparse.Namespace, *, checkout_path: Path) -> dict[str, Any] | None:
-    if args.agent_mode == "fake":
+    agent_mode = resolved_role_mode(
+        args.agent_mode,
+        role_profile=args.role_profile,
+        production_mode="pi",
+        fake_local_mode="fake",
+    )
+    if agent_mode == "fake":
         return None
     try:
-        if args.agent_mode == "real-local":
+        if agent_mode == "real-local":
             command = json.loads(args.agent_command_json)
         else:
             command = None
@@ -572,7 +607,7 @@ def recipe_agent_from_args(args: argparse.Namespace, *, checkout_path: Path) -> 
     if args.agent_timeout_seconds is not None and args.agent_timeout_seconds <= 0:
         raise ValueError("--agent-timeout-seconds must be greater than zero")
 
-    if args.agent_mode == "real-local":
+    if agent_mode == "real-local":
         return real_local_recipe_agent(
             command=command,
             codex_home=args.agent_codex_home,
@@ -581,7 +616,7 @@ def recipe_agent_from_args(args: argparse.Namespace, *, checkout_path: Path) -> 
             checkout_path=checkout_path,
             timeout_seconds=args.agent_timeout_seconds,
         )
-    if args.agent_mode == "pi":
+    if agent_mode == "pi":
         ponytail_extension = None
         ponytail_extension_source = None
         if args.agent_ponytail:
@@ -609,13 +644,19 @@ def recipe_agent_from_args(args: argparse.Namespace, *, checkout_path: Path) -> 
             wrapper_secret_file=args.agent_wrapper_secret_file,
             timeout_seconds=args.agent_timeout_seconds,
         )
-    raise ValueError(f"Unsupported --agent-mode: {args.agent_mode}")
+    raise ValueError(f"Unsupported --agent-mode: {agent_mode}")
 
 
 def recipe_reviewer_from_args(args: argparse.Namespace, *, checkout_path: Path) -> dict[str, Any] | None:
-    if args.reviewer_mode == "fake":
+    reviewer_mode = resolved_role_mode(
+        args.reviewer_mode,
+        role_profile=args.role_profile,
+        production_mode="pi",
+        fake_local_mode="fake",
+    )
+    if reviewer_mode == "fake":
         return None
-    if args.reviewer_mode == "pi":
+    if reviewer_mode == "pi":
         if args.reviewer_ponytail and (
             args.reviewer_ponytail_extension is not None
             or args.reviewer_ponytail_extension_source is not None
@@ -655,13 +696,19 @@ def recipe_reviewer_from_args(args: argparse.Namespace, *, checkout_path: Path) 
                 field_prefix="reviewer",
             ),
         }
-    raise ValueError(f"Unsupported --reviewer-mode: {args.reviewer_mode}")
+    raise ValueError(f"Unsupported --reviewer-mode: {reviewer_mode}")
 
 
 def recipe_retrospective_judge_from_args(args: argparse.Namespace, *, checkout_path: Path) -> dict[str, Any] | None:
-    if args.retrospective_judge_mode == "disabled":
+    retrospective_judge_mode = resolved_role_mode(
+        args.retrospective_judge_mode,
+        role_profile=args.role_profile,
+        production_mode="pi",
+        fake_local_mode="disabled",
+    )
+    if retrospective_judge_mode == "disabled":
         return None
-    if args.retrospective_judge_mode == "pi":
+    if retrospective_judge_mode == "pi":
         if args.retrospective_judge_ponytail and (
             args.retrospective_judge_ponytail_extension is not None
             or args.retrospective_judge_ponytail_extension_source is not None
@@ -704,7 +751,7 @@ def recipe_retrospective_judge_from_args(args: argparse.Namespace, *, checkout_p
                 field_prefix="retrospective_judge",
             ),
         }
-    raise ValueError(f"Unsupported --retrospective-judge-mode: {args.retrospective_judge_mode}")
+    raise ValueError(f"Unsupported --retrospective-judge-mode: {retrospective_judge_mode}")
 
 
 def recipe_validation_input_from_args(args: argparse.Namespace, *, project_contract: ProjectContract) -> dict[str, Any]:
