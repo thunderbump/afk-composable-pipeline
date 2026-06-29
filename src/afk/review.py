@@ -101,11 +101,11 @@ def review(input_data: Any, *, run_id: str, run_dir: Path | None) -> dict[str, A
         write_review_artifacts(run_dir, run_id, normalized)
         return review_output(request, evidence_pack, normalized)
 
+    raw_payload = read_reviewer_payload(raw_result, stdout=adapter_result["stdout"])
     stdout = redact_text(adapter_result["stdout"])
     stderr = redact_text(adapter_result["stderr"])
     write_adapter_logs(stdout, stderr)
 
-    raw_payload = read_reviewer_payload(raw_result)
     if raw_payload["status"] != "valid":
         normalized = normalized_reviewer_result(
             status="failed_protocol",
@@ -773,15 +773,27 @@ def minimal_reviewer_environment(temp_path: Path) -> dict[str, str]:
     return env
 
 
-def read_reviewer_payload(raw: str | None) -> dict[str, Any]:
+def read_reviewer_payload(raw: str | None, *, stdout: str) -> dict[str, Any]:
     if raw is None:
-        return {"status": "missing", "message": "reviewer result file was not produced"}
+        return read_reviewer_payload_from_stdout(stdout)
     try:
         payload = json.loads(raw)
     except json.JSONDecodeError:
         return {"status": "invalid", "message": "reviewer result file is not valid JSON"}
     if not isinstance(payload, dict):
         return {"status": "invalid", "message": "reviewer result file must contain an object"}
+    return {"status": "valid", "payload": redact_artifact_value(payload)}
+
+
+def read_reviewer_payload_from_stdout(stdout: str) -> dict[str, Any]:
+    if not stdout.strip():
+        return {"status": "missing", "message": "reviewer result file was not produced"}
+    try:
+        payload = json.loads(stdout)
+    except json.JSONDecodeError:
+        return {"status": "missing", "message": "reviewer result file was not produced"}
+    if not isinstance(payload, dict):
+        return {"status": "invalid", "message": "reviewer stdout must contain a JSON object"}
     return {"status": "valid", "payload": redact_artifact_value(payload)}
 
 
