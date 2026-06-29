@@ -261,13 +261,40 @@ def pi_command_args(command: list[str]) -> list[str] | None:
     return None
 
 
+def pi_command_executable(command: list[str]) -> str | None:
+    if not command:
+        return None
+    executable = Path(command[0]).name
+    if executable == "pi":
+        return command[0]
+    if executable == "env":
+        return _env_wrapped_pi_executable(command)
+    if executable in {"bash", "sh", "zsh"}:
+        return _shell_wrapped_pi_executable(command)
+    if executable.startswith("python") and _python_module_pi_args(command[1:]) is not None:
+        return command[0]
+    return None
+
+
 def pi_preflight_command(command: list[str], *, prompt: str) -> list[str] | None:
-    pi_args = pi_command_args(command)
-    if pi_args is None:
+    if not command:
         return None
-    prefix = _pi_invocation_prefix(command)
-    if prefix is None:
-        return None
+    executable = Path(command[0]).name
+    if executable == "pi":
+        return [command[0], *_filtered_pi_args(command[1:]), "--no-session", "--no-tools", "-p", prompt]
+    if executable == "env":
+        return _env_wrapped_preflight_command(command, prompt=prompt)
+    if executable in {"bash", "sh", "zsh"}:
+        return _shell_wrapped_preflight_command(command, prompt=prompt)
+    if executable.startswith("python"):
+        pi_args = _python_module_pi_args(command[1:])
+        if pi_args is None:
+            return None
+        return [command[0], "-m", "pi", *_filtered_pi_args(pi_args), "--no-session", "--no-tools", "-p", prompt]
+    return None
+
+
+def _filtered_pi_args(pi_args: list[str]) -> list[str]:
     filtered_args: list[str] = []
     skip_next = False
     for part in pi_args:
@@ -280,7 +307,90 @@ def pi_preflight_command(command: list[str], *, prompt: str) -> list[str] | None
         if part in {"--print", "--no-session", "--no-tools"}:
             continue
         filtered_args.append(part)
-    return prefix + filtered_args + ["--no-session", "--no-tools", "-p", prompt]
+    return filtered_args
+
+
+def _env_wrapped_pi_executable(command: list[str]) -> str | None:
+    split_string = _env_split_string(command[1:])
+    if split_string is not None:
+        return _shell_args_pi_executable(split_string)
+    remainder = _env_command_remainder(command[1:])
+    if remainder is None:
+        return None
+    return pi_command_executable(remainder)
+
+
+def _env_wrapped_preflight_command(command: list[str], *, prompt: str) -> list[str] | None:
+    leading, remainder = _env_command_parts(command[1:])
+    if leading is None:
+        return None
+    if remainder is None:
+        split_string = _env_split_string(command[1:])
+        if split_string is None:
+            return None
+        inner_preflight = _shell_args_preflight_command(split_string, prompt=prompt)
+        if inner_preflight is None:
+            return None
+        return [command[0], *leading, shlex.join(inner_preflight)]
+    inner_preflight = pi_preflight_command(remainder, prompt=prompt)
+    if inner_preflight is None:
+        return None
+    return [command[0], *leading, *inner_preflight]
+
+
+def _env_command_parts(command: list[str]) -> tuple[list[str], list[str] | None]:
+    leading: list[str] = []
+    index = 0
+    while index < len(command):
+        part = command[index]
+        if part == "--":
+            leading.append(part)
+            index += 1
+            break
+        if part in {"-C", "--chdir", "-u", "--unset", "-S", "--split-string"} and index + 1 < len(command):
+            leading.extend([part, command[index + 1]])
+            if part in {"-S", "--split-string"}:
+                return leading, None
+            index += 2
+            continue
+        if part.startswith("--split-string="):
+            leading.append(part.partition("=")[0])
+            return leading, None
+        if part.startswith("-"):
+            leading.append(part)
+            index += 1
+            continue
+        if "=" in part:
+            leading.append(part)
+            index += 1
+            continue
+        break
+    return leading, command[index:]
+
+
+def _env_split_string(command: list[str]) -> list[str] | None:
+    index = 0
+    while index < len(command):
+        part = command[index]
+        if part in {"-S", "--split-string"} and index + 1 < len(command):
+            return _parse_shell_command(command[index + 1])
+        if part.startswith("--split-string="):
+            return _parse_shell_command(part.partition("=")[2])
+        if part == "--":
+            break
+        if part in {"-C", "--chdir", "-u", "--unset"} and index + 1 < len(command):
+            index += 2
+            continue
+        if part.startswith("-") or "=" in part:
+            index += 1
+            continue
+        break
+    return None
+
+
+def _env_command_remainder(command: list[str]) -> list[str] | None:
+    _, remainder = _env_command_parts(command)
+    return remainder
 
 
 def _env_wrapped_pi_args(command: list[str]) -> list[str] | None:
@@ -336,10 +446,90 @@ def _shell_wrapped_pi_args(command: list[str]) -> list[str] | None:
     return None
 
 
+def _shell_wrapped_pi_executable(command: list[str]) -> str | None:
+    shell_args = _shell_command_args(command)
+    if shell_args is None:
+        return None
+    return _shell_args_pi_executable(shell_args)
+
+
+def _shell_wrapped_preflight_command(command: list[str], *, prompt: str) -> list[str] | None:
+    index = 0
+    while index < len(command):
+        part = command[index]
+        if part == "-c" and index + 1 < len(command):
+            shell_args = _parse_shell_command(command[index + 1])
+            if shell_args is None:
+                return None
+            inner_preflight = _shell_args_preflight_command(shell_args, prompt=prompt)
+            if inner_preflight is None:
+                return None
+            return [*command[: index + 1], shlex.join(inner_preflight), *command[index + 2 :]]
+        if part.startswith("-") and not part.startswith("--") and "c" in part[1:] and index + 1 < len(command):
+            shell_args = _parse_shell_command(command[index + 1])
+            if shell_args is None:
+                return None
+            inner_preflight = _shell_args_preflight_command(shell_args, prompt=prompt)
+            if inner_preflight is None:
+                return None
+            return [*command[: index + 1], shlex.join(inner_preflight), *command[index + 2 :]]
+        index += 1
+    return None
+
+
+def _shell_command_args(command: list[str]) -> list[str] | None:
+    index = 0
+    while index < len(command):
+        part = command[index]
+        if part == "-c" and index + 1 < len(command):
+            return _parse_shell_command(command[index + 1])
+        if part.startswith("-") and not part.startswith("--") and "c" in part[1:] and index + 1 < len(command):
+            return _parse_shell_command(command[index + 1])
+        index += 1
+    return None
+
+
+def _shell_args_pi_executable(shell_args: list[str]) -> str | None:
+    remainder = _shell_args_pi_remainder(shell_args)
+    if remainder is None:
+        return None
+    return pi_command_executable(remainder)
+
+
+def _shell_args_preflight_command(shell_args: list[str], *, prompt: str) -> list[str] | None:
+    prefix, remainder = _shell_command_prefix_and_remainder(shell_args)
+    if remainder is None:
+        return None
+    inner_preflight = pi_preflight_command(remainder, prompt=prompt)
+    if inner_preflight is None:
+        return None
+    return [*prefix, *inner_preflight]
+
+
+def _shell_args_pi_remainder(shell_args: list[str]) -> list[str] | None:
+    _, remainder = _shell_command_prefix_and_remainder(shell_args)
+    return remainder
+
+
+def _shell_command_prefix_and_remainder(shell_args: list[str]) -> tuple[list[str], list[str] | None]:
+    remainder = list(shell_args)
+    prefix: list[str] = []
+    while remainder and SHELL_ASSIGNMENT_PATTERN.match(remainder[0]):
+        prefix.append(remainder.pop(0))
+    if remainder[:1] == ["exec"]:
+        prefix.append(remainder.pop(0))
+        if remainder[:1] == ["--"]:
+            prefix.append(remainder.pop(0))
+        while remainder and SHELL_ASSIGNMENT_PATTERN.match(remainder[0]):
+            prefix.append(remainder.pop(0))
+    if not remainder:
+        return prefix, None
+    return prefix, remainder
+
+
 def _parse_shell_command_args(command: str) -> list[str] | None:
-    try:
-        shell_args = shlex.split(command)
-    except ValueError:
+    shell_args = _parse_shell_command(command)
+    if shell_args is None:
         return None
     shell_args = _strip_shell_assignment_prefix(shell_args)
     if shell_args[:1] == ["exec"]:
@@ -350,17 +540,11 @@ def _parse_shell_command_args(command: str) -> list[str] | None:
     return pi_command_args(shell_args)
 
 
-def _pi_invocation_prefix(command: list[str]) -> list[str] | None:
-    if not command:
+def _parse_shell_command(command: str) -> list[str] | None:
+    try:
+        return shlex.split(command)
+    except ValueError:
         return None
-    executable = Path(command[0]).name
-    if executable == "pi":
-        return [command[0]]
-    if executable.startswith("python") and _python_module_pi_args(command[1:]) is not None:
-        return [command[0], "-m", "pi"]
-    if pi_command_args(command) is not None:
-        return ["pi"]
-    return None
 
 
 def _strip_shell_assignment_prefix(command: list[str]) -> list[str]:

@@ -11,10 +11,45 @@ from afk.pi_workers import (
     PONYTAIL_PACKAGE_NAME,
     build_pi_real_worker_agent,
     pi_command_provider,
+    pi_preflight_command,
 )
 
 
 class PiWorkersTest(unittest.TestCase):
+    def test_pi_preflight_command_preserves_env_wrapped_executable_and_env(self):
+        command = [
+            "/usr/bin/env",
+            "-u",
+            "OLD_TOKEN",
+            "PI_WRAPPER_MODE=wrapped",
+            "./bin/pi",
+            "-p",
+            "{prompt}",
+            "--provider",
+            "openai-codex",
+            "--model",
+            "gpt-5.4-mini",
+        ]
+
+        self.assertEqual(
+            pi_preflight_command(command, prompt="Reply with OK only."),
+            [
+                "/usr/bin/env",
+                "-u",
+                "OLD_TOKEN",
+                "PI_WRAPPER_MODE=wrapped",
+                "./bin/pi",
+                "--provider",
+                "openai-codex",
+                "--model",
+                "gpt-5.4-mini",
+                "--no-session",
+                "--no-tools",
+                "-p",
+                "Reply with OK only.",
+            ],
+        )
+
     def test_pi_command_provider_detects_openai_codex_through_env_unset_wrapper(self):
         commands = [
             ["/usr/bin/env", "-u", "FOO", "pi", "-p", "{prompt}", "--provider", "openai-codex", "--model", "gpt-5.4-mini"],
