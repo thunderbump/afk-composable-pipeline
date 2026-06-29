@@ -15,6 +15,7 @@ PONYTAIL_PACKAGE_NAME = "ponytail"
 PONYTAIL_EXTENSION_SOURCE = "git:github.com/DietrichGebert/ponytail"
 MAX_MODEL_VERSION = (5, 4)
 MODEL_VERSION_PATTERN = re.compile(r"^gpt-(\d+)\.(\d+)(?:$|[-.])")
+SHELL_ASSIGNMENT_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=.*$")
 
 
 def build_pi_real_worker_agent(
@@ -321,11 +322,20 @@ def _parse_shell_command_args(command: str) -> list[str] | None:
         shell_args = shlex.split(command)
     except ValueError:
         return None
+    shell_args = _strip_shell_assignment_prefix(shell_args)
     if shell_args[:1] == ["exec"]:
         shell_args = shell_args[1:]
         if shell_args[:1] == ["--"]:
             shell_args = shell_args[1:]
+        shell_args = _strip_shell_assignment_prefix(shell_args)
     return pi_command_args(shell_args)
+
+
+def _strip_shell_assignment_prefix(command: list[str]) -> list[str]:
+    index = 0
+    while index < len(command) and SHELL_ASSIGNMENT_PATTERN.match(command[index]):
+        index += 1
+    return command[index:]
 
 
 def validate_model_cap(model: str) -> str:

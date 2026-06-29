@@ -40,6 +40,15 @@ class PiWorkersTest(unittest.TestCase):
 
         self.assertEqual(pi_command_provider(command), "openai-codex")
 
+    def test_pi_command_provider_detects_openai_codex_through_shell_assignment_prefix(self):
+        command = [
+            "bash",
+            "-lc",
+            "FOO=bar pi -p '{prompt}' --provider openai-codex --model gpt-5.4-mini",
+        ]
+
+        self.assertEqual(pi_command_provider(command), "openai-codex")
+
     def test_pi_command_provider_detects_openai_codex_through_env_split_string_wrapper(self):
         command = [
             "/usr/bin/env",
