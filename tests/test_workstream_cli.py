@@ -1104,6 +1104,146 @@ Path(os.environ["AFK_RETROSPECTIVE_JUDGE_RESULT"]).write_text(
             self.assertEqual(result["pipeline_retrospective"]["judge"]["status"], "passed")
             self.assertEqual(result["pipeline_retrospective"]["judge"]["summary"], "judge auth mounts available")
 
+    def test_workstream_blocks_before_steps_when_pi_openai_codex_auth_preflight_fails(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repo = temp_path / "repo-src"
+            checkout_root = temp_path / "checkouts"
+            checkout = checkout_root / "checkout"
+            ledger = temp_path / "ledger"
+            codex_home = temp_path / "codex-home"
+            config_home = temp_path / "xdg-config"
+            pi_config_home = temp_path / "pi-config"
+            pi_coding_agent_dir = temp_path / "pi-coding-agent"
+            fake_calls = temp_path / "pi-calls.jsonl"
+            leaked_secret = "ghp_preflight_secret_1234567890"
+            init_repo(repo)
+            codex_home.mkdir()
+            config_home.mkdir()
+            pi_config_home.mkdir()
+            pi_coding_agent_dir.mkdir()
+            fake_pi = temp_path / "pi"
+            write_executable(
+                fake_pi,
+                f"""#!{sys.executable}
+import json
+import sys
+from pathlib import Path
+
+Path({str(fake_calls)!r}).open("a", encoding="utf-8").write(
+    json.dumps({{"argv": sys.argv[1:]}}) + "\\n"
+)
+print("No API key for provider: openai-codex {leaked_secret}", file=sys.stderr)
+sys.exit(1)
+""",
+            )
+            recipe = {
+                "schema_version": 1,
+                "workstream_id": "central-cknp",
+                "parent": "central",
+                "steps": [
+                    {
+                        "name": "select-work",
+                        "input": {
+                            "required_labels": ["project:afk-composable-pipeline", "ready-for-agent"],
+                            "sources": [
+                                {
+                                    "type": "fixture",
+                                    "id": "fixture",
+                                    "items": [selected_fixture_item("central-cknp")],
+                                }
+                            ],
+                        },
+                    },
+                    {
+                        "name": "prepare-checkout",
+                        "input": {
+                            "repo_url": str(repo),
+                            "base_ref": "main",
+                            "checkout_root": str(checkout_root),
+                            "checkout_path": str(checkout),
+                        },
+                    },
+                    {
+                        "name": "implement",
+                        "input": {
+                            "guardrails": ["do not write secrets"],
+                            "validation": {"profile": "tier1", "commands": []},
+                            "agent": {
+                                "type": "real-agent-command",
+                                "command": [
+                                    str(fake_pi),
+                                    "-p",
+                                    "{prompt}",
+                                    "--provider",
+                                    "openai-codex",
+                                    "--model",
+                                    "gpt-5.4-mini",
+                                ],
+                                "result_path": "agent-result.json",
+                                "timeout_seconds": 10,
+                                "codex_home": str(codex_home),
+                                "config_home": str(config_home),
+                                "env": {
+                                    "PI_CONFIG_HOME": str(pi_config_home),
+                                    "PI_CODING_AGENT_DIR": str(pi_coding_agent_dir),
+                                },
+                            },
+                        },
+                    },
+                ],
+                "publisher": {"enabled": False},
+            }
+
+            completed = run_afk(
+                "run-workstream",
+                "--workstream-id",
+                "central-cknp",
+                "--input",
+                json.dumps(recipe),
+                "--ledger",
+                str(ledger),
+                env_overrides={
+                    "GIT_ALLOW_PROTOCOL": "file",
+                    "GIT_AUTHOR_NAME": "AFK Test",
+                    "GIT_AUTHOR_EMAIL": "afk-test@example.test",
+                    "GIT_COMMITTER_NAME": "AFK Test",
+                    "GIT_COMMITTER_EMAIL": "afk-test@example.test",
+                },
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            result_path = ledger / summary["result_path"]
+            result = json.loads(result_path.read_text(encoding="utf-8"))
+            preflight_path = result_path.parent / "pi-auth-preflight.json"
+            preflight = json.loads(preflight_path.read_text(encoding="utf-8"))
+            artifact_text = "\n".join(
+                [
+                    result_path.read_text(encoding="utf-8"),
+                    preflight_path.read_text(encoding="utf-8"),
+                ]
+            )
+            calls = [
+                json.loads(line)
+                for line in fake_calls.read_text(encoding="utf-8").splitlines()
+            ]
+
+            self.assertEqual(summary["status"], "blocked")
+            self.assertEqual(result["status"], "blocked")
+            self.assertEqual(result["steps"], [])
+            self.assertEqual(result["publication"]["status"], "blocked")
+            self.assertIn("Pi auth preflight failed for implement.agent", result["publication"]["reason"])
+            self.assertIn("No API key for provider: openai-codex", result["publication"]["reason"])
+            self.assertEqual(result["artifacts"]["pi_auth_preflight"], "pi-auth-preflight.json")
+            self.assertEqual(preflight["status"], "failed")
+            self.assertEqual(preflight["results"][0]["target"], "implement.agent")
+            self.assertIn("No API key for provider: openai-codex", preflight["results"][0]["summary"])
+            self.assertNotIn(leaked_secret, artifact_text)
+            self.assertIn("[REDACTED]", artifact_text)
+            self.assertEqual(len(calls), 1)
+            self.assertFalse(checkout.exists())
+
     def test_workstream_rejects_openai_codex_pi_retrospective_judge_without_required_mounts(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)

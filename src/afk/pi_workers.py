@@ -261,6 +261,28 @@ def pi_command_args(command: list[str]) -> list[str] | None:
     return None
 
 
+def pi_preflight_command(command: list[str], *, prompt: str) -> list[str] | None:
+    pi_args = pi_command_args(command)
+    if pi_args is None:
+        return None
+    prefix = _pi_invocation_prefix(command)
+    if prefix is None:
+        return None
+    filtered_args: list[str] = []
+    skip_next = False
+    for part in pi_args:
+        if skip_next:
+            skip_next = False
+            continue
+        if part == "-p":
+            skip_next = True
+            continue
+        if part in {"--print", "--no-session", "--no-tools"}:
+            continue
+        filtered_args.append(part)
+    return prefix + filtered_args + ["--no-session", "--no-tools", "-p", prompt]
+
+
 def _env_wrapped_pi_args(command: list[str]) -> list[str] | None:
     index = 0
     while index < len(command):
@@ -326,6 +348,19 @@ def _parse_shell_command_args(command: str) -> list[str] | None:
             shell_args = shell_args[1:]
         shell_args = _strip_shell_assignment_prefix(shell_args)
     return pi_command_args(shell_args)
+
+
+def _pi_invocation_prefix(command: list[str]) -> list[str] | None:
+    if not command:
+        return None
+    executable = Path(command[0]).name
+    if executable == "pi":
+        return [command[0]]
+    if executable.startswith("python") and _python_module_pi_args(command[1:]) is not None:
+        return [command[0], "-m", "pi"]
+    if pi_command_args(command) is not None:
+        return ["pi"]
+    return None
 
 
 def _strip_shell_assignment_prefix(command: list[str]) -> list[str]:

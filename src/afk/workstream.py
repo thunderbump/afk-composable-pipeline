@@ -13,8 +13,15 @@ from typing import Any, Callable
 from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
 from afk.contracts import ProjectContract
+from afk.implement import runtime_failure_excerpt
 from afk.jsonutil import canonical_json, sha256_json
-from afk.pi_workers import non_openai_pi_mount_error, openai_codex_pi_mount_error, validate_absolute_dir
+from afk.pi_workers import (
+    non_openai_pi_mount_error,
+    openai_codex_pi_mount_error,
+    pi_command_provider,
+    pi_preflight_command,
+    validate_absolute_dir,
+)
 from afk.redaction import is_secret_command_flag, is_secret_key, is_secret_value, redact_artifact_value, redact_text
 from afk.registry import StepResult
 
@@ -29,6 +36,8 @@ COMMAND_BEARER_SECRET_PATTERN = re.compile(r"\bBearer\s+[A-Za-z0-9._~+/=-]{12,}"
 PI_JUDGE_PROMPT_PLACEHOLDER = "{prompt}"
 PI_JUDGE_REQUEST_PATH_PLACEHOLDER = "{request_path}"
 PI_JUDGE_RESULT_PATH_PLACEHOLDER = "{result_path}"
+PI_AUTH_PREFLIGHT_PROMPT = "Reply with OK only."
+PI_AUTH_PREFLIGHT_TIMEOUT_SECONDS = 30.0
 
 
 @dataclass(frozen=True)
@@ -151,40 +160,46 @@ def run_workstream(
     }
     steps = []
 
-    for index, step_spec in enumerate(normalized["steps"]):
-        step_name = step_spec["name"]
-        remaining_steps = normalized["steps"][index + 1 :]
-        stop_reason = terminal_stop_reason(step_spec, state)
-        if stop_reason:
-            state["stop_reason"] = stop_reason
-            state["next_allowed_command"] = next_allowed_command_for_terminal_stop(state, normalized)
-            break
-        blocked_reason = workflow_order_blocking_reason(step_name, state, normalized["retry_policy"])
-        if blocked_reason:
-            state["blocked_reason"] = blocked_reason
-            break
-        step_input = composed_step_input(step_spec, normalized, state, ledger_dir)
-        step_profile = step_spec.get("profile")
-        equivalent_command = equivalent_run_step_command(
-            step_name,
-            step_input,
-            ledger_dir,
-            profile=step_profile,
-            project_contract=project_contract,
-        )
-        result = step_runner(step_name, step_input, ledger_dir, project_contract)
-        step_record = step_execution_record(
-            step_name,
-            result,
-            equivalent_command,
-            ledger_dir,
-        )
-        steps.append(step_record)
-        update_state_from_step(state, step_name, result, ledger_dir)
-        blocked_reason = blocking_reason_for_step(step_name, result, remaining_steps)
-        if blocked_reason:
-            state["blocked_reason"] = blocked_reason
-            break
+    pi_auth_preflight = run_pi_auth_preflight(normalized)
+    if pi_auth_preflight["status"] != "skipped":
+        ledger.write_json("pi-auth-preflight.json", pi_auth_preflight)
+    if pi_auth_preflight["status"] == "failed":
+        state["blocked_reason"] = pi_auth_preflight["reason"]
+    else:
+        for index, step_spec in enumerate(normalized["steps"]):
+            step_name = step_spec["name"]
+            remaining_steps = normalized["steps"][index + 1 :]
+            stop_reason = terminal_stop_reason(step_spec, state)
+            if stop_reason:
+                state["stop_reason"] = stop_reason
+                state["next_allowed_command"] = next_allowed_command_for_terminal_stop(state, normalized)
+                break
+            blocked_reason = workflow_order_blocking_reason(step_name, state, normalized["retry_policy"])
+            if blocked_reason:
+                state["blocked_reason"] = blocked_reason
+                break
+            step_input = composed_step_input(step_spec, normalized, state, ledger_dir)
+            step_profile = step_spec.get("profile")
+            equivalent_command = equivalent_run_step_command(
+                step_name,
+                step_input,
+                ledger_dir,
+                profile=step_profile,
+                project_contract=project_contract,
+            )
+            result = step_runner(step_name, step_input, ledger_dir, project_contract)
+            step_record = step_execution_record(
+                step_name,
+                result,
+                equivalent_command,
+                ledger_dir,
+            )
+            steps.append(step_record)
+            update_state_from_step(state, step_name, result, ledger_dir)
+            blocked_reason = blocking_reason_for_step(step_name, result, remaining_steps)
+            if blocked_reason:
+                state["blocked_reason"] = blocked_reason
+                break
 
     state["cleanup"] = final_cleanup_state(state)
 
@@ -447,6 +462,128 @@ def equivalent_run_step_command(
     if project_contract is not None:
         command.extend(["--project", project_contract.project_slug])
     return command
+
+
+def run_pi_auth_preflight(normalized: dict[str, Any]) -> dict[str, Any]:
+    results = []
+    for target in pi_auth_preflight_targets(normalized):
+        result = run_pi_auth_preflight_target(target)
+        results.append(result)
+        if result["status"] != "passed":
+            return {
+                "schema_version": SCHEMA_VERSION,
+                "status": "failed",
+                "reason": f"Pi auth preflight failed for {result['target']}: {result['summary']}",
+                "results": results,
+            }
+    if not results:
+        return {"schema_version": SCHEMA_VERSION, "status": "skipped", "results": []}
+    return {"schema_version": SCHEMA_VERSION, "status": "passed", "results": results}
+
+
+def pi_auth_preflight_targets(normalized: dict[str, Any]) -> list[dict[str, Any]]:
+    targets = []
+    for step in normalized["steps"]:
+        step_name = step["name"]
+        input_data = step["input"]
+        if step_name == "implement":
+            target = pi_auth_preflight_target("implement.agent", input_data.get("agent"))
+            if target is not None:
+                targets.append(target)
+        elif step_name == "review":
+            target = pi_auth_preflight_target("review.reviewer", input_data.get("reviewer"))
+            if target is not None:
+                targets.append(target)
+    target = pi_auth_preflight_target("retrospective_judge", normalized.get("retrospective_judge"))
+    if target is not None:
+        targets.append(target)
+    return targets
+
+
+def pi_auth_preflight_target(target_name: str, config: Any) -> dict[str, Any] | None:
+    if not isinstance(config, dict):
+        return None
+    command = config.get("command")
+    if not _is_string_list(command):
+        return None
+    command_list = list(command)
+    if pi_command_provider(command_list) != "openai-codex":
+        return None
+    timeout_seconds = PI_AUTH_PREFLIGHT_TIMEOUT_SECONDS
+    raw_timeout = config.get("timeout_seconds")
+    if isinstance(raw_timeout, (int, float)) and not isinstance(raw_timeout, bool) and raw_timeout > 0:
+        timeout_seconds = min(float(raw_timeout), PI_AUTH_PREFLIGHT_TIMEOUT_SECONDS)
+    env = config.get("env") if isinstance(config.get("env"), dict) else {}
+    return {
+        "target": target_name,
+        "command": command_list,
+        "codex_home": string_field(config, "codex_home") or "",
+        "config_home": string_field(config, "config_home") or "",
+        "env": {key: str(value) for key, value in env.items() if isinstance(value, str)},
+        "timeout_seconds": timeout_seconds,
+    }
+
+
+def run_pi_auth_preflight_target(target: dict[str, Any]) -> dict[str, Any]:
+    with tempfile.TemporaryDirectory(prefix="afk-pi-auth-") as temp_dir:
+        temp_path = Path(temp_dir)
+        env = _minimal_retrospective_judge_environment(temp_path, config_home=target["config_home"])
+        env.update(target["env"])
+        if target["codex_home"]:
+            env["CODEX_HOME"] = target["codex_home"]
+        env["AFK_PI_AUTH_PREFLIGHT"] = "1"
+        command = pi_preflight_command(target["command"], prompt=PI_AUTH_PREFLIGHT_PROMPT) or [
+            part.replace(PI_JUDGE_PROMPT_PLACEHOLDER, PI_AUTH_PREFLIGHT_PROMPT)
+            for part in target["command"]
+        ]
+        try:
+            completed = subprocess.run(
+                command,
+                cwd=temp_path,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=target["timeout_seconds"],
+            )
+        except OSError as exc:
+            message = redact_text(str(exc))
+            return {
+                "target": target["target"],
+                "provider": "openai-codex",
+                "status": "failed",
+                "summary": message,
+                "command": redact_artifact_value(command),
+                "returncode": None,
+                "stdout_excerpt": "",
+                "stderr_excerpt": message,
+            }
+        except subprocess.TimeoutExpired as exc:
+            stdout = redact_text(exc.stdout if isinstance(exc.stdout, str) else "")
+            stderr = redact_text(exc.stderr if isinstance(exc.stderr, str) else "")
+            return {
+                "target": target["target"],
+                "provider": "openai-codex",
+                "status": "failed",
+                "summary": "pi auth preflight timed out",
+                "command": redact_artifact_value(command),
+                "returncode": None,
+                "stdout_excerpt": stdout[-2000:],
+                "stderr_excerpt": stderr[-2000:],
+            }
+        stdout = redact_text(completed.stdout)
+        stderr = redact_text(completed.stderr)
+        summary = runtime_failure_excerpt(stderr) or runtime_failure_excerpt(stdout) or "pi auth preflight failed"
+        return {
+            "target": target["target"],
+            "provider": "openai-codex",
+            "status": "passed" if completed.returncode == 0 else "failed",
+            "summary": "authenticated" if completed.returncode == 0 else summary,
+            "command": redact_artifact_value(command),
+            "returncode": completed.returncode,
+            "stdout_excerpt": stdout[-2000:],
+            "stderr_excerpt": stderr[-2000:],
+        }
 
 
 def step_execution_record(
@@ -3834,6 +3971,8 @@ def workstream_artifacts(ledger: "WorkstreamLedger") -> dict[str, str]:
         "tracker": "tracker-result.json",
         "pipeline_retrospective": "pipeline-retrospective.json",
     }
+    if (ledger.path / "pi-auth-preflight.json").is_file():
+        artifacts["pi_auth_preflight"] = "pi-auth-preflight.json"
     if (ledger.path / "pr-body.md").is_file():
         artifacts["pr_body"] = "pr-body.md"
     if (ledger.path / "retrospective.json").is_file():
