@@ -101,11 +101,11 @@ def review(input_data: Any, *, run_id: str, run_dir: Path | None) -> dict[str, A
         write_review_artifacts(run_dir, run_id, normalized)
         return review_output(request, evidence_pack, normalized)
 
+    raw_payload = read_reviewer_payload(raw_result, stdout=adapter_result["stdout"])
     stdout = redact_text(adapter_result["stdout"])
     stderr = redact_text(adapter_result["stderr"])
     write_adapter_logs(stdout, stderr)
 
-    raw_payload = read_reviewer_payload(raw_result)
     if raw_payload["status"] != "valid":
         normalized = normalized_reviewer_result(
             status="failed_protocol",
@@ -115,6 +115,8 @@ def review(input_data: Any, *, run_id: str, run_dir: Path | None) -> dict[str, A
             adapter=adapter_record(request["reviewer"], adapter_result["returncode"], False),
             stdout=stdout,
             stderr=stderr,
+            result_source=raw_payload.get("result_source"),
+            result_file_present=raw_payload.get("result_file_present"),
         )
         write_review_artifacts(run_dir, run_id, normalized)
         return review_output(request, evidence_pack, normalized)
@@ -124,6 +126,8 @@ def review(input_data: Any, *, run_id: str, run_dir: Path | None) -> dict[str, A
         adapter=adapter_record(request["reviewer"], adapter_result["returncode"], False),
         stdout=stdout,
         stderr=stderr,
+        result_source=raw_payload["result_source"],
+        result_file_present=raw_payload["result_file_present"],
     )
     write_review_artifacts(run_dir, run_id, normalized)
     return review_output(request, evidence_pack, normalized)
@@ -773,16 +777,82 @@ def minimal_reviewer_environment(temp_path: Path) -> dict[str, str]:
     return env
 
 
-def read_reviewer_payload(raw: str | None) -> dict[str, Any]:
+def read_reviewer_payload(raw: str | None, *, stdout: str) -> dict[str, Any]:
     if raw is None:
-        return {"status": "missing", "message": "reviewer result file was not produced"}
+        return read_reviewer_payload_from_stdout(stdout)
     try:
         payload = json.loads(raw)
     except json.JSONDecodeError:
-        return {"status": "invalid", "message": "reviewer result file is not valid JSON"}
+        return {
+            "status": "invalid",
+            "message": "reviewer result file is not valid JSON",
+            "result_source": "reviewer_result_file",
+            "result_file_present": True,
+        }
     if not isinstance(payload, dict):
-        return {"status": "invalid", "message": "reviewer result file must contain an object"}
-    return {"status": "valid", "payload": redact_artifact_value(payload)}
+        return {
+            "status": "invalid",
+            "message": "reviewer result file must contain an object",
+            "result_source": "reviewer_result_file",
+            "result_file_present": True,
+        }
+    return {
+        "status": "valid",
+        "payload": redact_artifact_value(payload),
+        "result_source": "reviewer_result_file",
+        "result_file_present": True,
+    }
+
+
+def read_reviewer_payload_from_stdout(stdout: str) -> dict[str, Any]:
+    stripped_stdout = stdout.strip()
+    if not stripped_stdout:
+        return {
+            "status": "missing",
+            "message": "reviewer result file was not produced",
+            "result_source": "stdout_fallback",
+            "result_file_present": False,
+        }
+    try:
+        payload = json.loads(stripped_stdout)
+    except json.JSONDecodeError:
+        return {
+            "status": "invalid",
+            "message": "reviewer stdout is not valid JSON",
+            "result_source": "stdout_fallback",
+            "result_file_present": False,
+        }
+    if not isinstance(payload, dict):
+        return {
+            "status": "invalid",
+            "message": "reviewer stdout must contain a JSON object",
+            "result_source": "stdout_fallback",
+            "result_file_present": False,
+        }
+    if not stdout_payload_matches_schema(payload):
+        return {
+            "status": "invalid",
+            "message": "reviewer stdout JSON must match the reviewer result schema",
+            "result_source": "stdout_fallback",
+            "result_file_present": False,
+        }
+    return {
+        "status": "valid",
+        "payload": redact_artifact_value(payload),
+        "result_source": "stdout_fallback",
+        "result_file_present": False,
+    }
+
+
+def stdout_payload_matches_schema(payload: dict[str, Any]) -> bool:
+    if string_field(payload, "artifact_type") != "reviewer-result":
+        return False
+    raw_status = string_field(payload, "status") or ""
+    if raw_status not in {"pass", "fail", "request_revision"}:
+        return False
+    if string_field(payload, "summary") is None:
+        return False
+    return isinstance(payload.get("findings"), list)
 
 
 def normalize_reviewer_payload(
@@ -791,6 +861,8 @@ def normalize_reviewer_payload(
     adapter: dict[str, Any],
     stdout: str,
     stderr: str,
+    result_source: str,
+    result_file_present: bool,
 ) -> dict[str, Any]:
     raw_status = string_field(payload, "status") or ""
     if raw_status in {"pass", "passed", "success", "succeeded"}:
@@ -815,6 +887,8 @@ def normalize_reviewer_payload(
         adapter=adapter,
         stdout=stdout,
         stderr=stderr,
+        result_source=result_source,
+        result_file_present=result_file_present,
     )
 
 
@@ -827,7 +901,19 @@ def normalized_reviewer_result(
     adapter: dict[str, Any],
     stdout: str,
     stderr: str,
+    result_source: str | None = None,
+    result_file_present: bool | None = None,
 ) -> dict[str, Any]:
+    evidence = {
+        "stdout_path": "stdout.log",
+        "stderr_path": "stderr.log",
+        "stdout_excerpt": stdout[-2000:],
+        "stderr_excerpt": stderr[-2000:],
+    }
+    if result_source is not None:
+        evidence["result_source"] = result_source
+    if result_file_present is not None:
+        evidence["result_file_present"] = result_file_present
     return {
         "schema_version": SCHEMA_VERSION,
         "status": status,
@@ -835,12 +921,7 @@ def normalized_reviewer_result(
         "summary": redact_text(summary),
         "findings": redact_artifact_value(findings),
         "adapter": adapter,
-        "evidence": {
-            "stdout_path": "stdout.log",
-            "stderr_path": "stderr.log",
-            "stdout_excerpt": stdout[-2000:],
-            "stderr_excerpt": stderr[-2000:],
-        },
+        "evidence": evidence,
     }
 
 
