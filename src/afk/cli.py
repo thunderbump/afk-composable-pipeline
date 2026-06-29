@@ -22,6 +22,8 @@ from afk.recipes import (
 from afk.run_next import run_next
 from afk.pi_workers import (
     PONYTAIL_EXTENSION_SOURCE,
+    build_pi_mount_config,
+    build_provider_pi_mount_config,
     build_pi_real_worker_agent,
     build_pi_print_command,
 )
@@ -154,8 +156,8 @@ def main(argv: list[str] | None = None) -> int:
         try:
             validation_input = recipe_validation_input_from_args(args, project_contract=project_contract)
             recipe_agent = recipe_agent_from_args(args, checkout_path=Path(args.checkout_path))
-            reviewer = recipe_reviewer_from_args(args)
-            retrospective_judge = recipe_retrospective_judge_from_args(args)
+            reviewer = recipe_reviewer_from_args(args, checkout_path=Path(args.checkout_path))
+            retrospective_judge = recipe_retrospective_judge_from_args(args, checkout_path=Path(args.checkout_path))
             recipe_publisher = recipe_publisher_from_args(
                 args,
                 review_branch=f"afk/{branch_slug(args.workstream_id)}",
@@ -213,8 +215,8 @@ def main(argv: list[str] | None = None) -> int:
             parser.error("--ledger is required when --execute is set")
         try:
             recipe_agent = recipe_agent_from_args(args, checkout_path=Path(args.checkout_path))
-            reviewer = recipe_reviewer_from_args(args)
-            retrospective_judge = recipe_retrospective_judge_from_args(args)
+            reviewer = recipe_reviewer_from_args(args, checkout_path=Path(args.checkout_path))
+            retrospective_judge = recipe_retrospective_judge_from_args(args, checkout_path=Path(args.checkout_path))
             recipe_publisher_factory = recipe_publisher_factory_from_args(
                 args,
                 checkout_path=Path(args.checkout_path),
@@ -590,7 +592,7 @@ def recipe_agent_from_args(args: argparse.Namespace, *, checkout_path: Path) -> 
     raise ValueError(f"Unsupported --agent-mode: {args.agent_mode}")
 
 
-def recipe_reviewer_from_args(args: argparse.Namespace) -> dict[str, Any] | None:
+def recipe_reviewer_from_args(args: argparse.Namespace, *, checkout_path: Path) -> dict[str, Any] | None:
     if args.reviewer_mode == "fake":
         return None
     if args.reviewer_mode == "pi":
@@ -623,11 +625,20 @@ def recipe_reviewer_from_args(args: argparse.Namespace) -> dict[str, Any] | None
             "type": "fake-reviewer-command",
             "command": command,
             "timeout_seconds": reviewer_timeout,
+            **build_provider_pi_mount_config(
+                provider=args.reviewer_pi_provider,
+                codex_home=args.agent_codex_home,
+                config_home=args.agent_config_home,
+                pi_config_home=args.agent_pi_config_home,
+                pi_coding_agent_dir=args.agent_pi_coding_agent_dir,
+                checkout_path=checkout_path,
+                field_prefix="reviewer",
+            ),
         }
     raise ValueError(f"Unsupported --reviewer-mode: {args.reviewer_mode}")
 
 
-def recipe_retrospective_judge_from_args(args: argparse.Namespace) -> dict[str, Any] | None:
+def recipe_retrospective_judge_from_args(args: argparse.Namespace, *, checkout_path: Path) -> dict[str, Any] | None:
     if args.retrospective_judge_mode == "disabled":
         return None
     if args.retrospective_judge_mode == "pi":
@@ -663,6 +674,15 @@ def recipe_retrospective_judge_from_args(args: argparse.Namespace) -> dict[str, 
             "type": "local-command",
             "command": command,
             "timeout_seconds": judge_timeout,
+            **build_provider_pi_mount_config(
+                provider=args.retrospective_judge_pi_provider,
+                codex_home=args.agent_codex_home,
+                config_home=args.agent_config_home,
+                pi_config_home=args.agent_pi_config_home,
+                pi_coding_agent_dir=args.agent_pi_coding_agent_dir,
+                checkout_path=checkout_path,
+                field_prefix="retrospective_judge",
+            ),
         }
     raise ValueError(f"Unsupported --retrospective-judge-mode: {args.retrospective_judge_mode}")
 

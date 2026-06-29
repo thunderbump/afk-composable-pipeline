@@ -1020,6 +1020,558 @@ raise SystemExit(9)
             for path_name in result["pipeline_retrospective"]["judge"]["evidence"].values():
                 self.assertTrue((run_dir / path_name).is_file(), path_name)
 
+    def test_workstream_passes_pi_auth_mounts_through_to_openai_codex_pi_retrospective_judge_command(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repo = temp_path / "repo-src"
+            checkout = temp_path / "checkout"
+            ledger = temp_path / "ledger"
+            codex_home = temp_path / "codex-home"
+            config_home = temp_path / "xdg-config"
+            pi_config_home = temp_path / "pi-config"
+            pi_coding_agent_dir = temp_path / "pi-coding-agent"
+            init_repo(repo)
+            codex_home.mkdir()
+            config_home.mkdir()
+            pi_config_home.mkdir()
+            pi_coding_agent_dir.mkdir()
+            fake_git = temp_path / "publisher-git"
+            fake_gh = temp_path / "publisher-gh"
+            write_executable(
+                fake_git,
+                f"""#!{sys.executable}
+raise SystemExit(9)
+""",
+            )
+            write_executable(
+                fake_gh,
+                f"""#!{sys.executable}
+raise SystemExit(9)
+""",
+            )
+            pi_bin = temp_path / "pi"
+            write_executable(
+                pi_bin,
+                f"""#!{sys.executable}
+import json
+import os
+from pathlib import Path
+
+assert os.environ["CODEX_HOME"] == {str(codex_home)!r}
+assert os.environ["XDG_CONFIG_HOME"] == {str(config_home)!r}
+assert os.environ["PI_CONFIG_HOME"] == {str(pi_config_home)!r}
+assert os.environ["PI_CODING_AGENT_DIR"] == {str(pi_coding_agent_dir)!r}
+Path(os.environ["AFK_RETROSPECTIVE_JUDGE_RESULT"]).write_text(
+    json.dumps({{"status": "pass", "summary": "judge auth mounts available", "findings": []}}),
+    encoding="utf-8",
+)
+""",
+            )
+            recipe = merged_recipe_with_retrospective(temp_path, repo, checkout, fake_git, fake_gh)
+            recipe["retrospective_judge"] = {
+                "enabled": True,
+                "type": "local-command",
+                "command": [str(pi_bin), "-p", "{prompt}", "--provider", "openai-codex", "--model", "gpt-5.4-mini"],
+                "timeout_seconds": 10,
+                "codex_home": str(codex_home),
+                "config_home": str(config_home),
+                "env": {
+                    "PI_CONFIG_HOME": str(pi_config_home),
+                    "PI_CODING_AGENT_DIR": str(pi_coding_agent_dir),
+                },
+            }
+
+            completed = run_afk(
+                "run-workstream",
+                "--workstream-id",
+                "central-lve.9",
+                "--input",
+                json.dumps(recipe),
+                "--ledger",
+                str(ledger),
+                env_overrides={
+                    "GIT_ALLOW_PROTOCOL": "file",
+                    "GIT_AUTHOR_NAME": "AFK Test",
+                    "GIT_AUTHOR_EMAIL": "afk-test@example.test",
+                    "GIT_COMMITTER_NAME": "AFK Test",
+                    "GIT_COMMITTER_EMAIL": "afk-test@example.test",
+                },
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            result = json.loads((ledger / summary["result_path"]).read_text(encoding="utf-8"))
+            self.assertEqual(result["pipeline_retrospective"]["judge"]["status"], "passed")
+            self.assertEqual(result["pipeline_retrospective"]["judge"]["summary"], "judge auth mounts available")
+
+    def test_workstream_rejects_openai_codex_pi_retrospective_judge_without_required_mounts(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repo = temp_path / "repo-src"
+            checkout = temp_path / "checkout"
+            ledger = temp_path / "ledger"
+            fake_git = temp_path / "publisher-git"
+            fake_gh = temp_path / "publisher-gh"
+            init_repo(repo)
+            write_executable(
+                fake_git,
+                f"""#!{sys.executable}
+raise SystemExit(9)
+""",
+            )
+            write_executable(
+                fake_gh,
+                f"""#!{sys.executable}
+raise SystemExit(9)
+""",
+            )
+            recipe = merged_recipe_with_retrospective(temp_path, repo, checkout, fake_git, fake_gh)
+            recipe["retrospective_judge"] = {
+                "enabled": True,
+                "type": "local-command",
+                "command": ["pi", "-p", "{prompt}", "--provider", "openai-codex", "--model", "gpt-5.4-mini"],
+                "timeout_seconds": 10,
+            }
+
+            completed = run_afk(
+                "run-workstream",
+                "--workstream-id",
+                "central-lve.9",
+                "--input",
+                json.dumps(recipe),
+                "--ledger",
+                str(ledger),
+                env_overrides={
+                    "GIT_ALLOW_PROTOCOL": "file",
+                    "GIT_AUTHOR_NAME": "AFK Test",
+                    "GIT_AUTHOR_EMAIL": "afk-test@example.test",
+                    "GIT_COMMITTER_NAME": "AFK Test",
+                    "GIT_COMMITTER_EMAIL": "afk-test@example.test",
+                },
+            )
+
+            self.assertNotEqual(completed.returncode, 0, completed.stdout)
+            self.assertIn("retrospective_judge.codex_home", completed.stderr)
+            self.assertIn("pi --provider openai-codex", completed.stderr)
+
+    def test_workstream_rejects_wrapped_openai_codex_pi_retrospective_judge_without_required_mounts(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repo = temp_path / "repo-src"
+            checkout = temp_path / "checkout"
+            fake_git = temp_path / "publisher-git"
+            fake_gh = temp_path / "publisher-gh"
+            init_repo(repo)
+            write_executable(
+                fake_git,
+                f"""#!{sys.executable}
+raise SystemExit(9)
+""",
+            )
+            write_executable(
+                fake_gh,
+                f"""#!{sys.executable}
+raise SystemExit(9)
+""",
+            )
+            commands = [
+                ["/usr/bin/env", "pi", "-p", "{prompt}", "--provider", "openai-codex", "--model", "gpt-5.4-mini"],
+                ["python3", "-m", "pi", "-p", "{prompt}", "--provider", "openai-codex", "--model", "gpt-5.4-mini"],
+            ]
+            for command in commands:
+                with self.subTest(command=command):
+                    ledger = temp_path / f"ledger-{Path(command[0]).name}-{command[1].replace('/', '-')}"
+                    recipe = merged_recipe_with_retrospective(temp_path, repo, checkout, fake_git, fake_gh)
+                    recipe["retrospective_judge"] = {
+                        "enabled": True,
+                        "type": "local-command",
+                        "command": command,
+                        "timeout_seconds": 10,
+                    }
+
+                    completed = run_afk(
+                        "run-workstream",
+                        "--workstream-id",
+                        "central-lve.9",
+                        "--input",
+                        json.dumps(recipe),
+                        "--ledger",
+                        str(ledger),
+                        env_overrides={
+                            "GIT_ALLOW_PROTOCOL": "file",
+                            "GIT_AUTHOR_NAME": "AFK Test",
+                            "GIT_AUTHOR_EMAIL": "afk-test@example.test",
+                            "GIT_COMMITTER_NAME": "AFK Test",
+                            "GIT_COMMITTER_EMAIL": "afk-test@example.test",
+                        },
+                    )
+
+                    self.assertNotEqual(completed.returncode, 0, completed.stdout)
+                    self.assertIn("retrospective_judge.codex_home", completed.stderr)
+                    self.assertIn("pi --provider openai-codex", completed.stderr)
+
+    def test_workstream_rejects_shell_wrapped_openai_codex_pi_retrospective_judge_without_required_mounts(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repo = temp_path / "repo-src"
+            checkout = temp_path / "checkout"
+            fake_git = temp_path / "publisher-git"
+            fake_gh = temp_path / "publisher-gh"
+            init_repo(repo)
+            write_executable(
+                fake_git,
+                f"""#!{sys.executable}
+raise SystemExit(9)
+""",
+            )
+            write_executable(
+                fake_gh,
+                f"""#!{sys.executable}
+raise SystemExit(9)
+""",
+            )
+            recipe = merged_recipe_with_retrospective(temp_path, repo, checkout, fake_git, fake_gh)
+            recipe["retrospective_judge"] = {
+                "enabled": True,
+                "type": "local-command",
+                "command": ["bash", "-lc", "pi -p '{prompt}' --provider openai-codex --model gpt-5.4-mini"],
+                "timeout_seconds": 10,
+            }
+
+            completed = run_afk(
+                "run-workstream",
+                "--workstream-id",
+                "central-lve.9",
+                "--input",
+                json.dumps(recipe),
+                "--ledger",
+                str(temp_path / "ledger"),
+                env_overrides={
+                    "GIT_ALLOW_PROTOCOL": "file",
+                    "GIT_AUTHOR_NAME": "AFK Test",
+                    "GIT_AUTHOR_EMAIL": "afk-test@example.test",
+                    "GIT_COMMITTER_NAME": "AFK Test",
+                    "GIT_COMMITTER_EMAIL": "afk-test@example.test",
+                },
+            )
+
+            self.assertNotEqual(completed.returncode, 0, completed.stdout)
+            self.assertIn("retrospective_judge.codex_home", completed.stderr)
+            self.assertIn("pi --provider openai-codex", completed.stderr)
+
+    def test_workstream_rejects_assignment_prefixed_shell_wrapped_openai_codex_pi_retrospective_judge_without_required_mounts(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repo = temp_path / "repo-src"
+            checkout = temp_path / "checkout"
+            fake_git = temp_path / "publisher-git"
+            fake_gh = temp_path / "publisher-gh"
+            init_repo(repo)
+            write_executable(
+                fake_git,
+                f"""#!{sys.executable}
+raise SystemExit(9)
+""",
+            )
+            write_executable(
+                fake_gh,
+                f"""#!{sys.executable}
+raise SystemExit(9)
+""",
+            )
+            recipe = merged_recipe_with_retrospective(temp_path, repo, checkout, fake_git, fake_gh)
+            recipe["retrospective_judge"] = {
+                "enabled": True,
+                "type": "local-command",
+                "command": [
+                    "bash",
+                    "-lc",
+                    "FOO=bar pi -p '{prompt}' --provider openai-codex --model gpt-5.4-mini",
+                ],
+                "timeout_seconds": 10,
+            }
+
+            completed = run_afk(
+                "run-workstream",
+                "--workstream-id",
+                "central-lve.9",
+                "--input",
+                json.dumps(recipe),
+                "--ledger",
+                str(temp_path / "ledger"),
+                env_overrides={
+                    "GIT_ALLOW_PROTOCOL": "file",
+                    "GIT_AUTHOR_NAME": "AFK Test",
+                    "GIT_AUTHOR_EMAIL": "afk-test@example.test",
+                    "GIT_COMMITTER_NAME": "AFK Test",
+                    "GIT_COMMITTER_EMAIL": "afk-test@example.test",
+                },
+            )
+
+            self.assertNotEqual(completed.returncode, 0, completed.stdout)
+            self.assertIn("retrospective_judge.codex_home", completed.stderr)
+            self.assertIn("pi --provider openai-codex", completed.stderr)
+
+    def test_workstream_rejects_exec_and_split_string_wrapped_openai_codex_pi_retrospective_judge_without_required_mounts(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repo = temp_path / "repo-src"
+            checkout = temp_path / "checkout"
+            fake_git = temp_path / "publisher-git"
+            fake_gh = temp_path / "publisher-gh"
+            init_repo(repo)
+            write_executable(
+                fake_git,
+                f"""#!{sys.executable}
+raise SystemExit(9)
+""",
+            )
+            write_executable(
+                fake_gh,
+                f"""#!{sys.executable}
+raise SystemExit(9)
+""",
+            )
+            commands = [
+                ["bash", "-lc", "exec pi -p '{prompt}' --provider openai-codex --model gpt-5.4-mini"],
+                ["/usr/bin/env", "--split-string=pi -p '{prompt}' --provider openai-codex --model gpt-5.4-mini"],
+            ]
+            for command in commands:
+                with self.subTest(command=command):
+                    ledger = temp_path / f"ledger-{Path(command[0]).name}"
+                    recipe = merged_recipe_with_retrospective(temp_path, repo, checkout, fake_git, fake_gh)
+                    recipe["retrospective_judge"] = {
+                        "enabled": True,
+                        "type": "local-command",
+                        "command": command,
+                        "timeout_seconds": 10,
+                    }
+
+                    completed = run_afk(
+                        "run-workstream",
+                        "--workstream-id",
+                        "central-lve.9",
+                        "--input",
+                        json.dumps(recipe),
+                        "--ledger",
+                        str(ledger),
+                        env_overrides={
+                            "GIT_ALLOW_PROTOCOL": "file",
+                            "GIT_AUTHOR_NAME": "AFK Test",
+                            "GIT_AUTHOR_EMAIL": "afk-test@example.test",
+                            "GIT_COMMITTER_NAME": "AFK Test",
+                            "GIT_COMMITTER_EMAIL": "afk-test@example.test",
+                        },
+                    )
+
+                    self.assertNotEqual(completed.returncode, 0, completed.stdout)
+                    self.assertIn("retrospective_judge.codex_home", completed.stderr)
+                    self.assertIn("pi --provider openai-codex", completed.stderr)
+
+    def test_workstream_rejects_non_openai_pi_retrospective_judge_mounts_for_direct_entry_commands(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repo = temp_path / "repo-src"
+            checkout = temp_path / "checkout"
+            codex_home = temp_path / "codex-home"
+            config_home = temp_path / "xdg-config"
+            pi_config_home = temp_path / "pi-config"
+            pi_coding_agent_dir = temp_path / "pi-coding-agent"
+            fake_git = temp_path / "publisher-git"
+            fake_gh = temp_path / "publisher-gh"
+            init_repo(repo)
+            codex_home.mkdir()
+            config_home.mkdir()
+            pi_config_home.mkdir()
+            pi_coding_agent_dir.mkdir()
+            write_executable(
+                fake_git,
+                f"""#!{sys.executable}
+raise SystemExit(9)
+""",
+            )
+            write_executable(
+                fake_gh,
+                f"""#!{sys.executable}
+raise SystemExit(9)
+""",
+            )
+            commands = [
+                ["/usr/bin/env", "pi", "-p", "{prompt}", "--provider", "anthropic", "--model", "gpt-5.4-mini"],
+                ["python3", "-m", "pi", "-p", "{prompt}", "--provider", "anthropic", "--model", "gpt-5.4-mini"],
+            ]
+            for command in commands:
+                with self.subTest(command=command):
+                    ledger = temp_path / f"ledger-non-openai-{Path(command[0]).name}-{command[1].replace('/', '-')}"
+                    recipe = merged_recipe_with_retrospective(temp_path, repo, checkout, fake_git, fake_gh)
+                    recipe["retrospective_judge"] = {
+                        "enabled": True,
+                        "type": "local-command",
+                        "command": command,
+                        "timeout_seconds": 10,
+                        "codex_home": str(codex_home),
+                        "config_home": str(config_home),
+                        "env": {
+                            "PI_CONFIG_HOME": str(pi_config_home),
+                            "PI_CODING_AGENT_DIR": str(pi_coding_agent_dir),
+                        },
+                    }
+
+                    completed = run_afk(
+                        "run-workstream",
+                        "--workstream-id",
+                        "central-lve.9",
+                        "--input",
+                        json.dumps(recipe),
+                        "--ledger",
+                        str(ledger),
+                        env_overrides={
+                            "GIT_ALLOW_PROTOCOL": "file",
+                            "GIT_AUTHOR_NAME": "AFK Test",
+                            "GIT_AUTHOR_EMAIL": "afk-test@example.test",
+                            "GIT_COMMITTER_NAME": "AFK Test",
+                            "GIT_COMMITTER_EMAIL": "afk-test@example.test",
+                        },
+                    )
+
+                    self.assertNotEqual(completed.returncode, 0, completed.stdout)
+                    self.assertIn("retrospective_judge.codex_home", completed.stderr)
+                    self.assertIn(
+                        "only supported when retrospective_judge.command uses pi --provider openai-codex",
+                        completed.stderr,
+                    )
+
+    def test_workstream_rejects_unknown_provider_pi_retrospective_judge_mounts_for_direct_entry_commands(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repo = temp_path / "repo-src"
+            checkout = temp_path / "checkout"
+            codex_home = temp_path / "codex-home"
+            config_home = temp_path / "xdg-config"
+            pi_config_home = temp_path / "pi-config"
+            pi_coding_agent_dir = temp_path / "pi-coding-agent"
+            fake_git = temp_path / "publisher-git"
+            fake_gh = temp_path / "publisher-gh"
+            init_repo(repo)
+            codex_home.mkdir()
+            config_home.mkdir()
+            pi_config_home.mkdir()
+            pi_coding_agent_dir.mkdir()
+            write_executable(
+                fake_git,
+                f"""#!{sys.executable}
+raise SystemExit(9)
+""",
+            )
+            write_executable(
+                fake_gh,
+                f"""#!{sys.executable}
+raise SystemExit(9)
+""",
+            )
+            recipe = merged_recipe_with_retrospective(temp_path, repo, checkout, fake_git, fake_gh)
+            recipe["retrospective_judge"] = {
+                "enabled": True,
+                "type": "local-command",
+                "command": ["pi", "-p", "{prompt}", "--model", "gpt-5.4-mini"],
+                "timeout_seconds": 10,
+                "codex_home": str(codex_home),
+                "config_home": str(config_home),
+                "env": {
+                    "PI_CONFIG_HOME": str(pi_config_home),
+                    "PI_CODING_AGENT_DIR": str(pi_coding_agent_dir),
+                },
+            }
+
+            completed = run_afk(
+                "run-workstream",
+                "--workstream-id",
+                "central-lve.9",
+                "--input",
+                json.dumps(recipe),
+                "--ledger",
+                str(temp_path / "ledger"),
+                env_overrides={
+                    "GIT_ALLOW_PROTOCOL": "file",
+                    "GIT_AUTHOR_NAME": "AFK Test",
+                    "GIT_AUTHOR_EMAIL": "afk-test@example.test",
+                    "GIT_COMMITTER_NAME": "AFK Test",
+                    "GIT_COMMITTER_EMAIL": "afk-test@example.test",
+                },
+            )
+
+            self.assertNotEqual(completed.returncode, 0, completed.stdout)
+            self.assertIn("retrospective_judge.codex_home", completed.stderr)
+            self.assertIn("provider could not be determined", completed.stderr)
+
+    def test_workstream_rejects_non_pi_retrospective_judge_mounts_for_direct_entry_commands(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repo = temp_path / "repo-src"
+            checkout = temp_path / "checkout"
+            codex_home = temp_path / "codex-home"
+            config_home = temp_path / "xdg-config"
+            pi_config_home = temp_path / "pi-config"
+            pi_coding_agent_dir = temp_path / "pi-coding-agent"
+            fake_git = temp_path / "publisher-git"
+            fake_gh = temp_path / "publisher-gh"
+            init_repo(repo)
+            codex_home.mkdir()
+            config_home.mkdir()
+            pi_config_home.mkdir()
+            pi_coding_agent_dir.mkdir()
+            write_executable(
+                fake_git,
+                f"""#!{sys.executable}
+raise SystemExit(9)
+""",
+            )
+            write_executable(
+                fake_gh,
+                f"""#!{sys.executable}
+raise SystemExit(9)
+""",
+            )
+            recipe = merged_recipe_with_retrospective(temp_path, repo, checkout, fake_git, fake_gh)
+            recipe["retrospective_judge"] = {
+                "enabled": True,
+                "type": "local-command",
+                "command": [sys.executable, "-c", "raise SystemExit('judge should not run')"],
+                "timeout_seconds": 10,
+                "codex_home": str(codex_home),
+                "config_home": str(config_home),
+                "env": {
+                    "PI_CONFIG_HOME": str(pi_config_home),
+                    "PI_CODING_AGENT_DIR": str(pi_coding_agent_dir),
+                },
+            }
+
+            completed = run_afk(
+                "run-workstream",
+                "--workstream-id",
+                "central-lve.9",
+                "--input",
+                json.dumps(recipe),
+                "--ledger",
+                str(temp_path / "ledger"),
+                env_overrides={
+                    "GIT_ALLOW_PROTOCOL": "file",
+                    "GIT_AUTHOR_NAME": "AFK Test",
+                    "GIT_AUTHOR_EMAIL": "afk-test@example.test",
+                    "GIT_COMMITTER_NAME": "AFK Test",
+                    "GIT_COMMITTER_EMAIL": "afk-test@example.test",
+                },
+            )
+
+            self.assertNotEqual(completed.returncode, 0, completed.stdout)
+            self.assertIn("retrospective_judge.codex_home", completed.stderr)
+            self.assertIn(
+                "only supported when retrospective_judge.command uses pi --provider openai-codex",
+                completed.stderr,
+            )
+
     def test_workstream_substitutes_prompt_for_retrospective_judge_local_command(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)

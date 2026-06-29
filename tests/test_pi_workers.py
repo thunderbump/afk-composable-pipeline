@@ -6,10 +6,57 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from afk.pi_workers import PONYTAIL_EXTENSION_SOURCE, PONYTAIL_PACKAGE_NAME, build_pi_real_worker_agent
+from afk.pi_workers import (
+    PONYTAIL_EXTENSION_SOURCE,
+    PONYTAIL_PACKAGE_NAME,
+    build_pi_real_worker_agent,
+    pi_command_provider,
+)
 
 
 class PiWorkersTest(unittest.TestCase):
+    def test_pi_command_provider_detects_openai_codex_through_env_unset_wrapper(self):
+        commands = [
+            ["/usr/bin/env", "-u", "FOO", "pi", "-p", "{prompt}", "--provider", "openai-codex", "--model", "gpt-5.4-mini"],
+            [
+                "/usr/bin/env",
+                "--unset",
+                "FOO",
+                "pi",
+                "-p",
+                "{prompt}",
+                "--provider=openai-codex",
+                "--model",
+                "gpt-5.4-mini",
+            ],
+        ]
+
+        for command in commands:
+            with self.subTest(command=command):
+                self.assertEqual(pi_command_provider(command), "openai-codex")
+
+    def test_pi_command_provider_detects_openai_codex_through_shell_exec_wrapper(self):
+        command = ["bash", "-lc", "exec pi -p '{prompt}' --provider openai-codex --model gpt-5.4-mini"]
+
+        self.assertEqual(pi_command_provider(command), "openai-codex")
+
+    def test_pi_command_provider_detects_openai_codex_through_shell_assignment_prefix(self):
+        command = [
+            "bash",
+            "-lc",
+            "FOO=bar pi -p '{prompt}' --provider openai-codex --model gpt-5.4-mini",
+        ]
+
+        self.assertEqual(pi_command_provider(command), "openai-codex")
+
+    def test_pi_command_provider_detects_openai_codex_through_env_split_string_wrapper(self):
+        command = [
+            "/usr/bin/env",
+            "--split-string=pi -p '{prompt}' --provider openai-codex --model gpt-5.4-mini",
+        ]
+
+        self.assertEqual(pi_command_provider(command), "openai-codex")
+
     def test_build_pi_real_worker_agent_returns_safe_real_agent_config(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
@@ -93,6 +140,46 @@ class PiWorkersTest(unittest.TestCase):
                     pi_config_home=str(pi_config_home),
                     checkout_path=checkout_path,
                 )
+
+    def test_build_pi_real_worker_agent_requires_core_mount_directories(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            checkout_path = temp_path / "checkout"
+            codex_home = temp_path / "codex-home"
+            config_home = temp_path / "xdg-config"
+            pi_config_home = temp_path / "pi-config"
+            pi_coding_agent_dir = temp_path / "pi-coding-agent"
+
+            checkout_path.mkdir()
+            codex_home.mkdir()
+            config_home.mkdir()
+            pi_config_home.mkdir()
+            pi_coding_agent_dir.mkdir()
+
+            cases = [
+                ("codex_home", None, str(config_home), str(pi_config_home), "agent.codex_home is required"),
+                ("config_home", str(codex_home), None, str(pi_config_home), "agent.config_home is required"),
+                (
+                    "pi_config_home",
+                    str(codex_home),
+                    str(config_home),
+                    None,
+                    "agent.env.PI_CONFIG_HOME is required",
+                ),
+            ]
+            for _, raw_codex_home, raw_config_home, raw_pi_config_home, expected in cases:
+                with self.subTest(expected=expected):
+                    with self.assertRaisesRegex(ValueError, expected):
+                        build_pi_real_worker_agent(
+                            pi_bin="/opt/pi/bin/pi",
+                            provider="openai-codex",
+                            model="gpt-5.4-mini",
+                            codex_home=raw_codex_home,
+                            config_home=raw_config_home,
+                            pi_config_home=raw_pi_config_home,
+                            pi_coding_agent_dir=str(pi_coding_agent_dir),
+                            checkout_path=checkout_path,
+                        )
 
     def test_build_pi_real_worker_agent_supports_one_shot_ponytail_source(self):
         with tempfile.TemporaryDirectory() as temp_dir:

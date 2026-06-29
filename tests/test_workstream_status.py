@@ -1,4 +1,5 @@
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -151,6 +152,84 @@ class WorkstreamStatusMappingTest(unittest.TestCase):
                     ],
                 }
             )
+
+    def test_normalize_retrospective_judge_rejects_non_pi_mounts_without_checkout_path(self):
+        with self.subTest("existing absolute paths"), self.assertRaisesRegex(
+            WorkstreamError,
+            "only supported when retrospective_judge.command uses pi --provider openai-codex",
+        ):
+            with tempfile.TemporaryDirectory() as temp_dir:
+                temp_path = Path(temp_dir)
+                codex_home = temp_path / "codex-home"
+                config_home = temp_path / "xdg-config"
+                pi_config_home = temp_path / "pi-config"
+                pi_coding_agent_dir = temp_path / "pi-coding-agent"
+                codex_home.mkdir()
+                config_home.mkdir()
+                pi_config_home.mkdir()
+                pi_coding_agent_dir.mkdir()
+                normalize_retrospective_judge(
+                    {
+                        "enabled": True,
+                        "type": "local-command",
+                        "command": [sys.executable, "-c", "print('judge should not run')"],
+                        "codex_home": str(codex_home),
+                        "config_home": str(config_home),
+                        "env": {
+                            "PI_CONFIG_HOME": str(pi_config_home),
+                            "PI_CODING_AGENT_DIR": str(pi_coding_agent_dir),
+                        },
+                    }
+                )
+
+    def test_normalize_retrospective_judge_rejects_relative_openai_codex_mounts_without_checkout_path(self):
+        with self.assertRaisesRegex(WorkstreamError, "retrospective_judge.codex_home must be absolute"):
+            normalize_retrospective_judge(
+                {
+                    "enabled": True,
+                    "type": "local-command",
+                    "command": ["pi", "-p", "{prompt}", "--provider", "openai-codex", "--model", "gpt-5.4-mini"],
+                    "codex_home": "relative-codex-home",
+                    "config_home": "/tmp/xdg-config",
+                    "env": {
+                        "PI_CONFIG_HOME": "/tmp/pi-config",
+                        "PI_CODING_AGENT_DIR": "/tmp/pi-coding-agent",
+                    },
+                }
+            )
+
+    def test_normalize_retrospective_judge_rejects_mount_inside_later_checkout_path(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            checkout_one = temp_path / "checkout-one"
+            checkout_two = temp_path / "checkout-two"
+            codex_home = temp_path / "codex-home"
+            config_home = temp_path / "xdg-config"
+            pi_config_home = checkout_two / "pi-config"
+            pi_coding_agent_dir = temp_path / "pi-coding-agent"
+            checkout_one.mkdir()
+            checkout_two.mkdir()
+            codex_home.mkdir()
+            config_home.mkdir()
+            pi_config_home.mkdir()
+            pi_coding_agent_dir.mkdir()
+
+            with self.assertRaisesRegex(WorkstreamError, "retrospective_judge.env.PI_CONFIG_HOME must be outside checkout"):
+                normalize_retrospective_judge(
+                    {
+                        "enabled": True,
+                        "type": "local-command",
+                        "command": ["pi", "-p", "{prompt}", "--provider", "openai-codex", "--model", "gpt-5.4-mini"],
+                        "codex_home": str(codex_home),
+                        "config_home": str(config_home),
+                        "env": {
+                            "PI_CONFIG_HOME": str(pi_config_home),
+                            "PI_CODING_AGENT_DIR": str(pi_coding_agent_dir),
+                        },
+                    },
+                    checkout_path=checkout_one,
+                    checkout_paths=[checkout_one, checkout_two],
+                )
 
     def test_pipeline_retrospective_record_marks_judge_disabled_by_default(self):
         record = pipeline_retrospective_record(

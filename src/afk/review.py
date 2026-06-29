@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from afk.jsonutil import canonical_json
+from afk.pi_workers import non_openai_pi_mount_error, openai_codex_pi_mount_error, validate_absolute_dir
 from afk.redaction import is_secret_command_flag, redact_artifact_value, redact_text
 
 
@@ -167,7 +168,10 @@ def normalize_request(input_data: Any, *, run_id: str) -> dict[str, Any]:
     if cleanup["status"] != "valid":
         return invalid_request(cleanup["message"])
 
-    reviewer = normalize_reviewer(input_data.get("reviewer"))
+    reviewer = normalize_reviewer(
+        input_data.get("reviewer"),
+        checkout_path=Path(checkout["checkout"]["path"]),
+    )
     if reviewer["status"] != "valid":
         return invalid_request(reviewer["message"])
 
@@ -538,12 +542,12 @@ def normalize_cleanup(cleanup: Any) -> dict[str, Any]:
     return {"status": "valid", "cleanup": redact_artifact_value(normalized)}
 
 
-def normalize_reviewer(reviewer: Any) -> dict[str, Any]:
+def normalize_reviewer(reviewer: Any, *, checkout_path: Path) -> dict[str, Any]:
     if not isinstance(reviewer, dict):
         return {"status": "invalid", "message": "reviewer must be an object"}
     if reviewer.get("type") != "fake-reviewer-command":
         return {"status": "invalid", "message": "reviewer.type must be fake-reviewer-command"}
-    for forbidden_key in ("credentials_path", "auth_file", "token", "api_key", "env"):
+    for forbidden_key in ("credentials_path", "auth_file", "token", "api_key"):
         if forbidden_key in reviewer:
             return {"status": "invalid", "message": f"reviewer.{forbidden_key} is not supported"}
     command = reviewer.get("command")
@@ -555,13 +559,68 @@ def normalize_reviewer(reviewer: Any) -> dict[str, Any]:
     timeout_seconds = reviewer.get("timeout_seconds", reviewer.get("timeoutSeconds", 120))
     if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float)) or timeout_seconds <= 0:
         return {"status": "invalid", "message": "reviewer.timeout_seconds must be a positive number"}
+    normalized_reviewer = {
+        "type": "fake-reviewer-command",
+        "command": list(command),
+        "timeout_seconds": float(timeout_seconds),
+    }
+    for field_name in ("codex_home", "config_home"):
+        raw_value = reviewer.get(field_name)
+        if raw_value is None:
+            continue
+        if not isinstance(raw_value, str) or not raw_value.strip():
+            return {"status": "invalid", "message": f"reviewer.{field_name} must be an absolute directory path"}
+        try:
+            normalized_reviewer[field_name] = validate_absolute_dir(
+                raw_value,
+                f"reviewer.{field_name}",
+                checkout_path=checkout_path,
+            )
+        except ValueError as exc:
+            return {"status": "invalid", "message": str(exc)}
+    raw_env = reviewer.get("env")
+    if raw_env is not None:
+        if not isinstance(raw_env, dict):
+            return {"status": "invalid", "message": "reviewer.env must be an object"}
+        normalized_env: dict[str, str] = {}
+        for key, value in raw_env.items():
+            if key not in {"PI_CONFIG_HOME", "PI_CODING_AGENT_DIR"}:
+                return {
+                    "status": "invalid",
+                    "message": "reviewer.env only supports PI_CONFIG_HOME and PI_CODING_AGENT_DIR",
+                }
+            if not isinstance(value, str) or not value.strip():
+                return {"status": "invalid", "message": f"reviewer.env.{key} must be an absolute directory path"}
+            try:
+                normalized_env[key] = validate_absolute_dir(
+                    value,
+                    f"reviewer.env.{key}",
+                    checkout_path=checkout_path,
+                )
+            except ValueError as exc:
+                return {"status": "invalid", "message": str(exc)}
+        normalized_reviewer["env"] = normalized_env
+    mount_error = openai_codex_pi_mount_error(
+        command=normalized_reviewer["command"],
+        codex_home=normalized_reviewer.get("codex_home"),
+        config_home=normalized_reviewer.get("config_home"),
+        env=normalized_reviewer.get("env"),
+        field_prefix="reviewer",
+    )
+    if mount_error:
+        return {"status": "invalid", "message": mount_error}
+    mount_rejection = non_openai_pi_mount_error(
+        command=normalized_reviewer["command"],
+        codex_home=normalized_reviewer.get("codex_home"),
+        config_home=normalized_reviewer.get("config_home"),
+        env=normalized_reviewer.get("env"),
+        field_prefix="reviewer",
+    )
+    if mount_rejection:
+        return {"status": "invalid", "message": mount_rejection}
     return {
         "status": "valid",
-        "reviewer": {
-            "type": "fake-reviewer-command",
-            "command": list(command),
-            "timeout_seconds": float(timeout_seconds),
-        },
+        "reviewer": normalized_reviewer,
     }
 
 
@@ -689,7 +748,10 @@ def run_fake_reviewer_command(
     with tempfile.TemporaryDirectory() as temp_dir:
         temp_path = Path(temp_dir)
         result_path = temp_path / "reviewer-result.json"
-        env = minimal_reviewer_environment(temp_path)
+        env = minimal_reviewer_environment(temp_path, config_home=reviewer.get("config_home") or "")
+        env.update(reviewer.get("env") or {})
+        if reviewer.get("codex_home"):
+            env["CODEX_HOME"] = reviewer["codex_home"]
         env["AFK_REVIEWER_REQUEST"] = str(request_path)
         env["AFK_REVIEWER_RESULT"] = str(result_path)
         command = render_command(
@@ -754,7 +816,7 @@ def render_command(
     return rendered
 
 
-def minimal_reviewer_environment(temp_path: Path) -> dict[str, str]:
+def minimal_reviewer_environment(temp_path: Path, *, config_home: str = "") -> dict[str, str]:
     env: dict[str, str] = {}
     for key in (
         "PATH",
@@ -769,11 +831,14 @@ def minimal_reviewer_environment(temp_path: Path) -> dict[str, str]:
         if value is not None:
             env[key] = value
     home_path = temp_path / "home"
-    xdg_config_home = temp_path / "xdg-config"
     home_path.mkdir()
-    xdg_config_home.mkdir()
     env["HOME"] = str(home_path)
-    env["XDG_CONFIG_HOME"] = str(xdg_config_home)
+    if config_home:
+        env["XDG_CONFIG_HOME"] = config_home
+    else:
+        xdg_config_home = temp_path / "xdg-config"
+        xdg_config_home.mkdir()
+        env["XDG_CONFIG_HOME"] = str(xdg_config_home)
     return env
 
 

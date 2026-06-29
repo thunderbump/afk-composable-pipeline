@@ -468,6 +468,7 @@ class GenerateRecipeCliTest(unittest.TestCase):
             codex_home = temp_path / "codex-home"
             config_home = temp_path / "xdg-config"
             pi_config_home = temp_path / "pi-config"
+            pi_coding_agent_dir = temp_path / "pi-coding-agent"
             contracts_dir.mkdir()
             init_repo(repo)
             write_contract(contracts_dir / "demo.json", project_slug="demo", repo_url=str(repo))
@@ -475,6 +476,7 @@ class GenerateRecipeCliTest(unittest.TestCase):
             codex_home.mkdir()
             config_home.mkdir()
             pi_config_home.mkdir()
+            pi_coding_agent_dir.mkdir()
 
             completed = run_afk(
                 "generate-recipe",
@@ -513,6 +515,78 @@ class GenerateRecipeCliTest(unittest.TestCase):
             self.assertNotEqual(completed.returncode, 0, completed.stdout)
             self.assertIn("--agent-pi-coding-agent-dir is required when --agent-pi-provider=openai-codex", completed.stderr)
             self.assertFalse(output.exists())
+
+    def test_generate_recipe_requires_core_mount_flags_for_pi_agent(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            contracts_dir = temp_path / "contracts"
+            repo = temp_path / "repo-src"
+            ledger = temp_path / "ledger"
+            beads_workspace = temp_path / "central-beads"
+            checkout_root = temp_path / "checkouts"
+            checkout_path = checkout_root / "demo"
+            codex_home = temp_path / "codex-home"
+            config_home = temp_path / "xdg-config"
+            pi_config_home = temp_path / "pi-config"
+            pi_coding_agent_dir = temp_path / "pi-coding-agent"
+            contracts_dir.mkdir()
+            init_repo(repo)
+            write_contract(contracts_dir / "demo.json", project_slug="demo", repo_url=str(repo))
+            beads_workspace.mkdir()
+            codex_home.mkdir()
+            config_home.mkdir()
+            pi_config_home.mkdir()
+            pi_coding_agent_dir.mkdir()
+
+            cases = [
+                ("--agent-codex-home", "agent.codex_home is required"),
+                ("--agent-config-home", "agent.config_home is required"),
+                ("--agent-pi-config-home", "agent.env.PI_CONFIG_HOME is required"),
+            ]
+            for missing_option, expected_error in cases:
+                with self.subTest(option=missing_option):
+                    output = temp_path / f"{missing_option.removeprefix('--')}.json"
+                    args = [
+                        "generate-recipe",
+                        "--workstream-id",
+                        "central-6ue",
+                        "--project",
+                        "demo",
+                        "--contracts-dir",
+                        str(contracts_dir),
+                        "--ledger",
+                        str(ledger),
+                        "--beads-workspace",
+                        str(beads_workspace),
+                        "--checkout-root",
+                        str(checkout_root),
+                        "--checkout-path",
+                        str(checkout_path),
+                        "--validation-profile",
+                        "tier1",
+                        "--agent-mode",
+                        "pi",
+                        "--agent-pi-provider",
+                        "openai-codex",
+                        "--agent-pi-model",
+                        "gpt-5.4-mini",
+                        "--agent-pi-coding-agent-dir",
+                        str(pi_coding_agent_dir),
+                        "--output",
+                        str(output),
+                    ]
+                    if missing_option != "--agent-codex-home":
+                        args.extend(["--agent-codex-home", str(codex_home)])
+                    if missing_option != "--agent-config-home":
+                        args.extend(["--agent-config-home", str(config_home)])
+                    if missing_option != "--agent-pi-config-home":
+                        args.extend(["--agent-pi-config-home", str(pi_config_home)])
+
+                    completed = run_afk(*args)
+
+                    self.assertNotEqual(completed.returncode, 0, completed.stdout)
+                    self.assertIn(expected_error, completed.stderr)
+                    self.assertFalse(output.exists())
 
     def test_generate_recipe_rejects_secret_literal_pi_coding_agent_dir_without_writing_recipe(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -589,6 +663,7 @@ class GenerateRecipeCliTest(unittest.TestCase):
             codex_home = temp_path / "codex-home"
             config_home = temp_path / "xdg-config"
             pi_config_home = temp_path / "pi-config"
+            pi_coding_agent_dir = temp_path / "pi-coding-agent"
             contracts_dir.mkdir()
             init_repo(repo)
             write_contract(contracts_dir / "demo.json", project_slug="demo", repo_url=str(repo))
@@ -596,6 +671,7 @@ class GenerateRecipeCliTest(unittest.TestCase):
             codex_home.mkdir()
             config_home.mkdir()
             pi_config_home.mkdir()
+            pi_coding_agent_dir.mkdir()
 
             completed = run_afk(
                 "generate-recipe",
@@ -646,6 +722,7 @@ class GenerateRecipeCliTest(unittest.TestCase):
             codex_home = temp_path / "codex-home"
             config_home = temp_path / "xdg-config"
             pi_config_home = temp_path / "pi-config"
+            pi_coding_agent_dir = temp_path / "pi-coding-agent"
             contracts_dir.mkdir()
             init_repo(repo)
             write_contract(contracts_dir / "demo.json", project_slug="demo", repo_url=str(repo))
@@ -653,6 +730,7 @@ class GenerateRecipeCliTest(unittest.TestCase):
             codex_home.mkdir()
             config_home.mkdir()
             pi_config_home.mkdir()
+            pi_coding_agent_dir.mkdir()
 
             reviewer_mode = "pi"
             reviewer_pi_bin = "/opt/pi/bin/pi"
@@ -693,6 +771,14 @@ class GenerateRecipeCliTest(unittest.TestCase):
                 str(reviewer_timeout),
                 "--reviewer-ponytail-extension-source",
                 reviewer_ponytail,
+                "--agent-codex-home",
+                str(codex_home),
+                "--agent-config-home",
+                str(config_home),
+                "--agent-pi-config-home",
+                str(pi_config_home),
+                "--agent-pi-coding-agent-dir",
+                str(pi_coding_agent_dir),
                 "--retrospective-judge-mode",
                 "pi",
                 "--retrospective-judge-pi-bin",
@@ -723,6 +809,15 @@ class GenerateRecipeCliTest(unittest.TestCase):
                 ),
             )
             self.assertEqual(reviewer["timeout_seconds"], reviewer_timeout)
+            self.assertEqual(reviewer["codex_home"], str(codex_home))
+            self.assertEqual(reviewer["config_home"], str(config_home))
+            self.assertEqual(
+                reviewer["env"],
+                {
+                    "PI_CONFIG_HOME": str(pi_config_home),
+                    "PI_CODING_AGENT_DIR": str(pi_coding_agent_dir),
+                },
+            )
             retrospective_judge = recipe["retrospective_judge"]
             self.assertEqual(retrospective_judge["enabled"], True)
             self.assertEqual(
@@ -736,6 +831,94 @@ class GenerateRecipeCliTest(unittest.TestCase):
             )
             self.assertEqual(retrospective_judge["type"], "local-command")
             self.assertEqual(retrospective_judge["timeout_seconds"], judge_timeout)
+            self.assertEqual(retrospective_judge["codex_home"], str(codex_home))
+            self.assertEqual(retrospective_judge["config_home"], str(config_home))
+            self.assertEqual(
+                retrospective_judge["env"],
+                {
+                    "PI_CONFIG_HOME": str(pi_config_home),
+                    "PI_CODING_AGENT_DIR": str(pi_coding_agent_dir),
+                },
+            )
+
+    def test_generate_recipe_does_not_copy_shared_agent_mounts_to_non_openai_pi_reviewer_or_judge(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            contracts_dir = temp_path / "contracts"
+            repo = temp_path / "repo-src"
+            output = temp_path / "recipe.json"
+            ledger = temp_path / "ledger"
+            beads_workspace = temp_path / "central-beads"
+            checkout_root = temp_path / "checkouts"
+            checkout_path = checkout_root / "demo"
+            codex_home = temp_path / "codex-home"
+            config_home = temp_path / "xdg-config"
+            pi_config_home = temp_path / "pi-config"
+            pi_coding_agent_dir = temp_path / "pi-coding-agent"
+            contracts_dir.mkdir()
+            init_repo(repo)
+            write_contract(contracts_dir / "demo.json", project_slug="demo", repo_url=str(repo))
+            beads_workspace.mkdir()
+            codex_home.mkdir()
+            config_home.mkdir()
+            pi_config_home.mkdir()
+            pi_coding_agent_dir.mkdir()
+
+            completed = run_afk(
+                "generate-recipe",
+                "--workstream-id",
+                "central-anh.6",
+                "--project",
+                "demo",
+                "--contracts-dir",
+                str(contracts_dir),
+                "--ledger",
+                str(ledger),
+                "--beads-workspace",
+                str(beads_workspace),
+                "--checkout-root",
+                str(checkout_root),
+                "--checkout-path",
+                str(checkout_path),
+                "--validation-profile",
+                "tier1",
+                "--agent-mode",
+                "fake",
+                "--reviewer-mode",
+                "pi",
+                "--reviewer-pi-provider",
+                "anthropic",
+                "--reviewer-pi-model",
+                "gpt-5.4-mini",
+                "--retrospective-judge-mode",
+                "pi",
+                "--retrospective-judge-pi-provider",
+                "anthropic",
+                "--retrospective-judge-pi-model",
+                "gpt-5.4-mini",
+                "--agent-codex-home",
+                str(codex_home),
+                "--agent-config-home",
+                str(config_home),
+                "--agent-pi-config-home",
+                str(pi_config_home),
+                "--agent-pi-coding-agent-dir",
+                str(pi_coding_agent_dir),
+                "--output",
+                str(output),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            recipe = json.loads(output.read_text(encoding="utf-8"))
+            reviewer = recipe["steps"][4]["input"]["reviewer"]
+            retrospective_judge = recipe["retrospective_judge"]
+
+            self.assertNotIn("codex_home", reviewer)
+            self.assertNotIn("config_home", reviewer)
+            self.assertNotIn("env", reviewer)
+            self.assertNotIn("codex_home", retrospective_judge)
+            self.assertNotIn("config_home", retrospective_judge)
+            self.assertNotIn("env", retrospective_judge)
 
     def test_generate_recipe_rejects_disallowed_pi_reviewer_model(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -849,6 +1032,132 @@ class GenerateRecipeCliTest(unittest.TestCase):
 
             self.assertNotEqual(completed.returncode, 0, completed.stdout)
             self.assertIn("Pi worker model must be gpt-5.4 or lower", completed.stderr)
+            self.assertFalse(output.exists())
+
+    def test_generate_recipe_rejects_openai_codex_pi_reviewer_without_pi_coding_agent_dir(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            contracts_dir = temp_path / "contracts"
+            repo = temp_path / "repo-src"
+            output = temp_path / "recipe.json"
+            ledger = temp_path / "ledger"
+            beads_workspace = temp_path / "central-beads"
+            checkout_root = temp_path / "checkouts"
+            checkout_path = checkout_root / "demo"
+            codex_home = temp_path / "codex-home"
+            config_home = temp_path / "xdg-config"
+            pi_config_home = temp_path / "pi-config"
+            contracts_dir.mkdir()
+            init_repo(repo)
+            write_contract(contracts_dir / "demo.json", project_slug="demo", repo_url=str(repo))
+            beads_workspace.mkdir()
+            codex_home.mkdir()
+            config_home.mkdir()
+            pi_config_home.mkdir()
+
+            completed = run_afk(
+                "generate-recipe",
+                "--workstream-id",
+                "central-anh.6",
+                "--project",
+                "demo",
+                "--contracts-dir",
+                str(contracts_dir),
+                "--ledger",
+                str(ledger),
+                "--beads-workspace",
+                str(beads_workspace),
+                "--checkout-root",
+                str(checkout_root),
+                "--checkout-path",
+                str(checkout_path),
+                "--validation-profile",
+                "tier1",
+                "--agent-mode",
+                "fake",
+                "--reviewer-mode",
+                "pi",
+                "--reviewer-pi-bin",
+                "/opt/pi/bin/pi",
+                "--reviewer-pi-provider",
+                "openai-codex",
+                "--reviewer-pi-model",
+                "gpt-5.4-mini",
+                "--agent-codex-home",
+                str(codex_home),
+                "--agent-config-home",
+                str(config_home),
+                "--agent-pi-config-home",
+                str(pi_config_home),
+                "--output",
+                str(output),
+            )
+
+            self.assertNotEqual(completed.returncode, 0, completed.stdout)
+            self.assertIn("reviewer.env.PI_CODING_AGENT_DIR is required", completed.stderr)
+            self.assertFalse(output.exists())
+
+    def test_generate_recipe_rejects_openai_codex_pi_retrospective_judge_without_pi_coding_agent_dir(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            contracts_dir = temp_path / "contracts"
+            repo = temp_path / "repo-src"
+            output = temp_path / "recipe.json"
+            ledger = temp_path / "ledger"
+            beads_workspace = temp_path / "central-beads"
+            checkout_root = temp_path / "checkouts"
+            checkout_path = checkout_root / "demo"
+            codex_home = temp_path / "codex-home"
+            config_home = temp_path / "xdg-config"
+            pi_config_home = temp_path / "pi-config"
+            contracts_dir.mkdir()
+            init_repo(repo)
+            write_contract(contracts_dir / "demo.json", project_slug="demo", repo_url=str(repo))
+            beads_workspace.mkdir()
+            codex_home.mkdir()
+            config_home.mkdir()
+            pi_config_home.mkdir()
+
+            completed = run_afk(
+                "generate-recipe",
+                "--workstream-id",
+                "central-anh.6",
+                "--project",
+                "demo",
+                "--contracts-dir",
+                str(contracts_dir),
+                "--ledger",
+                str(ledger),
+                "--beads-workspace",
+                str(beads_workspace),
+                "--checkout-root",
+                str(checkout_root),
+                "--checkout-path",
+                str(checkout_path),
+                "--validation-profile",
+                "tier1",
+                "--agent-mode",
+                "fake",
+                "--retrospective-judge-mode",
+                "pi",
+                "--retrospective-judge-pi-bin",
+                "/opt/pi/bin/pi",
+                "--retrospective-judge-pi-provider",
+                "openai-codex",
+                "--retrospective-judge-pi-model",
+                "gpt-5.4-mini",
+                "--agent-codex-home",
+                str(codex_home),
+                "--agent-config-home",
+                str(config_home),
+                "--agent-pi-config-home",
+                str(pi_config_home),
+                "--output",
+                str(output),
+            )
+
+            self.assertNotEqual(completed.returncode, 0, completed.stdout)
+            self.assertIn("retrospective_judge.env.PI_CODING_AGENT_DIR is required", completed.stderr)
             self.assertFalse(output.exists())
 
     def test_generate_recipe_writes_project_worker_validation_when_requested(self):
