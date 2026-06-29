@@ -24,7 +24,7 @@ from afk.pi_workers import (
     validate_absolute_dir,
 )
 from afk.redaction import is_secret_command_flag, is_secret_key, is_secret_value, redact_artifact_value, redact_text
-from afk.recipes import branch_slug
+from afk.recipes import review_branch_for_workstream
 from afk.registry import StepResult
 
 
@@ -385,7 +385,7 @@ def normalize_recipe(
     if not resolved_workstream_id:
         raise WorkstreamError("--workstream-id or input.workstream_id is required")
     resolved_parent = parent or string_field(recipe, "parent") or ""
-    review_branch = string_field(recipe, "review_branch") or f"afk/{resolved_workstream_id}"
+    review_branch = string_field(recipe, "review_branch") or review_branch_for_workstream(resolved_workstream_id)
     publisher = recipe.get("publisher", {"enabled": False})
     retry_policy = normalize_retry_policy(recipe.get("retry_policy"))
     tracker = normalize_tracker_config(recipe.get("tracker"))
@@ -1505,7 +1505,7 @@ def workstream_owned_afk_branch(normalized: dict[str, Any]) -> str:
     workstream_id = string_field(normalized, "workstream_id") or ""
     if not workstream_id:
         return ""
-    return f"afk/{branch_slug(workstream_id)}"
+    return review_branch_for_workstream(workstream_id)
 
 
 def checkout_start_commit(state: dict[str, Any]) -> str:
