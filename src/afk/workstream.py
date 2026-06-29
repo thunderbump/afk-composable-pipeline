@@ -429,6 +429,7 @@ def composed_step_input(
             current_checkout_path = string_field(checkout, "checkout_path")
             next_checkout_path = string_field(input_data, "checkout_path")
             requested_ref = string_field(checkout, "start_commit") or string_field(checkout, "requested_ref")
+            base_commit = string_field(checkout, "base_commit") or string_field(checkout, "start_commit")
             has_explicit_requested_ref = bool(string_field(input_data, "requested_ref") or string_field(input_data, "ref"))
             if (
                 requested_ref
@@ -437,6 +438,7 @@ def composed_step_input(
                 and not has_explicit_requested_ref
             ):
                 input_data["requested_ref"] = requested_ref
+                input_data["base_commit"] = base_commit
     elif step_name == "implement":
         input_data["work_selection"] = {"schema_version": SCHEMA_VERSION, "selected_work": state["selected_work"]}
         if selected_work_count(state) > 1 and "work_index" not in input_data and "work_scope" not in input_data:
@@ -1502,15 +1504,15 @@ def afk_review_branch_retry_context(
     elif not remote_tip:
         reason = "remote review branch could not be resolved for retry"
     elif not base_commit:
-        reason = "checkout start commit is required for retry safety"
+        reason = "checkout base commit is required for retry safety"
     elif not local_head:
         reason = "local HEAD could not be resolved for retry safety"
     elif not remote_descends_from_base:
-        reason = "remote review branch does not descend from the checkout start commit"
+        reason = "remote review branch does not descend from the checkout base commit"
     elif not local_descends_from_base:
-        reason = "local HEAD does not descend from the checkout start commit"
+        reason = "local HEAD does not descend from the checkout base commit"
     else:
-        reason = "remote and local heads descend from the checkout start commit"
+        reason = "remote and local heads descend from the checkout base commit"
     eligible = (
         bool(remote_tip)
         and bool(base_commit)
@@ -1564,7 +1566,24 @@ def publisher_remote_branch_oid(config: dict[str, Any], *, checkout_path: Path, 
     )
     if completed.returncode != 0 or not completed.stdout.strip():
         return ""
-    return completed.stdout.strip().split()[0]
+    remote_tip = completed.stdout.strip().split()[0]
+    if publisher_commit_exists_locally(config["git_path"], remote_tip, checkout_path=checkout_path, auth=auth):
+        return remote_tip
+    fetch_completed = run_publisher_diagnostic_command(
+        [config["git_path"], "fetch", config["remote"], push_ref],
+        cwd=checkout_path,
+        auth=auth,
+    )
+    if fetch_completed.returncode != 0:
+        return remote_tip
+    if publisher_commit_exists_locally(config["git_path"], remote_tip, checkout_path=checkout_path, auth=auth):
+        return remote_tip
+    return publisher_resolved_commit(
+        config["git_path"],
+        "FETCH_HEAD",
+        checkout_path=checkout_path,
+        auth=auth,
+    ) or remote_tip
 
 
 def publisher_resolved_commit(git_path: str, ref: str, *, checkout_path: Path, auth: dict[str, Any]) -> str:
@@ -1578,6 +1597,23 @@ def publisher_resolved_commit(git_path: str, ref: str, *, checkout_path: Path, a
     if completed.returncode != 0:
         return ""
     return completed.stdout.strip().splitlines()[-1] if completed.stdout.strip() else ""
+
+
+def publisher_commit_exists_locally(
+    git_path: str,
+    commit: str,
+    *,
+    checkout_path: Path,
+    auth: dict[str, Any],
+) -> bool:
+    if not commit:
+        return False
+    completed = run_publisher_diagnostic_command(
+        [git_path, "cat-file", "-e", f"{commit}^{{commit}}"],
+        cwd=checkout_path,
+        auth=auth,
+    )
+    return completed.returncode == 0
 
 
 def publisher_merge_base(

@@ -54,6 +54,7 @@ def prepare_checkout(
     base_ref = request["base_ref"]
     requested_ref = request["requested_ref"]
     review_branch = request["review_branch"]
+    base_commit = request["base_commit"]
 
     try:
         if checkout_path.exists():
@@ -126,7 +127,7 @@ def prepare_checkout(
             "base_ref": base_ref,
             "requested_ref": requested_ref,
             "checkout_root": str(checkout_root),
-            "base_commit": start_commit,
+            "base_commit": base_commit or start_commit,
             "start_commit": start_commit,
             "review_branch": review_branch,
             "checkout_path": str(checkout_path),
@@ -174,6 +175,7 @@ def normalize_request(input_data: Any, *, project_contract: Any, run_id: str) ->
         "checkout_path",
         "checkout_root",
         "review_branch",
+        "base_commit",
     ):
         if key in input_data and input_data[key] is not None and not isinstance(input_data[key], str):
             return invalid_request(f"{key} must be a string")
@@ -216,6 +218,7 @@ def normalize_request(input_data: Any, *, project_contract: Any, run_id: str) ->
         "checkout_root": checkout_root,
         "checkout_path": checkout_path,
         "review_branch": review_branch,
+        "base_commit": string_field(input_data, "base_commit"),
         "publish": publish,
     }
 
