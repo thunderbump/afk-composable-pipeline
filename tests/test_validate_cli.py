@@ -72,6 +72,118 @@ def run_dir_text(run_dir):
 
 
 class ValidateCliTest(unittest.TestCase):
+    def test_validate_default_project_worker_uses_absolute_artifact_paths_with_relative_ledger(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as temp_dir:
+            temp_path = Path(temp_dir)
+            checkout = temp_path / "checkout"
+            scripts_dir = checkout / "scripts"
+            start_commit = init_checkout(checkout)
+            ledger = temp_path / "ledger"
+            relative_ledger = os.path.relpath(ledger, ROOT)
+            worker_script = textwrap.dedent(
+                f"""
+                #!{sys.executable}
+                import json
+                import os
+                import sys
+                from pathlib import Path
+
+                if sys.argv[1:] != ["run", "--request", sys.argv[3]]:
+                    raise SystemExit("unexpected argv")
+                request_path = Path(sys.argv[3])
+                if not request_path.is_absolute():
+                    raise SystemExit("request path must be absolute")
+                result_path = Path(os.environ["AFK_WORKER_RESULT"])
+                evidence_dir = Path(os.environ["AFK_WORKER_EVIDENCE_DIR"])
+                env_request_path = Path(os.environ["AFK_WORKER_REQUEST"])
+                if not result_path.is_absolute():
+                    raise SystemExit("result path must be absolute")
+                if not evidence_dir.is_absolute():
+                    raise SystemExit("evidence dir must be absolute")
+                if not env_request_path.is_absolute():
+                    raise SystemExit("env request path must be absolute")
+                request = json.loads(request_path.read_text(encoding="utf-8"))
+                if not Path(request["evidence_dir"]).is_absolute():
+                    raise SystemExit("request evidence_dir must be absolute")
+                result_path.parent.mkdir(parents=True, exist_ok=True)
+                result_path.write_text(
+                    json.dumps(
+                        {{
+                            "profile": request["profile"],
+                            "status": "pass",
+                            "failureCount": 0,
+                            "repo": request["repo"],
+                            "checkout": {{
+                                "source": "local",
+                                "path": request["repo"],
+                                "requestedRef": request["ref"],
+                                "requestedCommit": request["commit"],
+                                "resolvedCommit": request["commit"],
+                            }},
+                            "metadata": {{
+                                "request_path": str(request_path),
+                                "env_request_path_absolute": env_request_path.is_absolute(),
+                                "result_path_absolute": result_path.is_absolute(),
+                                "evidence_dir_absolute": evidence_dir.is_absolute(),
+                                "request_evidence_dir": request["evidence_dir"],
+                            }},
+                            "steps": [],
+                        }}
+                    ),
+                    encoding="utf-8",
+                )
+                """
+            ).strip()
+
+            scripts_dir.mkdir(parents=True)
+            worker_path = scripts_dir / "validation-worker.sh"
+            worker_path.write_text(worker_script, encoding="utf-8")
+            worker_path.chmod(0o755)
+
+            completed = run_afk(
+                "run-step",
+                "validate",
+                "--profile",
+                "tier3-harness",
+                "--project",
+                "bump-eqemu",
+                "--input",
+                json.dumps(
+                    {
+                        "checkout": {
+                            "status": "prepared",
+                            "repo_url": "git@github.com:thunderbump/bump-EQEmu.git",
+                            "checkout_path": str(checkout),
+                            "review_branch": "afk/validate",
+                            "requested_ref": "main",
+                            "start_commit": start_commit,
+                        },
+                        "validation": {"dry_run": True, "timeout_seconds": 30},
+                    }
+                ),
+                "--ledger",
+                relative_ledger,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+            worker_request = json.loads((run_dir / "worker-request.json").read_text(encoding="utf-8"))
+            worker_result = json.loads((run_dir / "worker-result.json").read_text(encoding="utf-8"))
+            metadata = worker_result["result"]["raw"]["metadata"]
+
+            self.assertEqual(result["output"]["status"], "validated")
+            self.assertTrue(Path(worker_request["evidence_dir"]).is_absolute())
+            self.assertEqual(worker_request["repo"], str(checkout))
+            self.assertEqual(worker_request["ref"], "main")
+            self.assertEqual(worker_request["commit"], start_commit)
+            self.assertTrue(Path(metadata["request_path"]).is_absolute())
+            self.assertTrue(metadata["env_request_path_absolute"])
+            self.assertTrue(metadata["result_path_absolute"])
+            self.assertTrue(metadata["evidence_dir_absolute"])
+            self.assertEqual(metadata["request_evidence_dir"], worker_request["evidence_dir"])
+
     def test_validate_runs_local_worker_and_records_request_and_result_artifacts(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
