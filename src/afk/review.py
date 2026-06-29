@@ -786,12 +786,13 @@ def read_reviewer_payload(raw: str | None, *, stdout: str) -> dict[str, Any]:
 
 
 def read_reviewer_payload_from_stdout(stdout: str) -> dict[str, Any]:
-    if not stdout.strip():
+    stripped_stdout = stdout.strip()
+    if not stripped_stdout:
         return {"status": "missing", "message": "reviewer result file was not produced"}
     try:
-        payload = json.loads(stdout)
+        payload = json.loads(stripped_stdout)
     except json.JSONDecodeError:
-        return {"status": "missing", "message": "reviewer result file was not produced"}
+        return {"status": "invalid", "message": "reviewer stdout is not valid JSON"}
     if not isinstance(payload, dict):
         return {"status": "invalid", "message": "reviewer stdout must contain a JSON object"}
     raw_status = string_field(payload, "status") or ""
