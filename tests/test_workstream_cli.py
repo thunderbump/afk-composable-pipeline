@@ -1104,6 +1104,668 @@ Path(os.environ["AFK_RETROSPECTIVE_JUDGE_RESULT"]).write_text(
             self.assertEqual(result["pipeline_retrospective"]["judge"]["status"], "passed")
             self.assertEqual(result["pipeline_retrospective"]["judge"]["summary"], "judge auth mounts available")
 
+    def test_workstream_blocks_before_steps_when_pi_openai_codex_auth_preflight_fails(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repo = temp_path / "repo-src"
+            checkout_root = temp_path / "checkouts"
+            checkout = checkout_root / "checkout"
+            ledger = temp_path / "ledger"
+            codex_home = temp_path / "codex-home"
+            config_home = temp_path / "xdg-config"
+            pi_config_home = temp_path / "pi-config"
+            pi_coding_agent_dir = temp_path / "pi-coding-agent"
+            fake_calls = temp_path / "pi-calls.jsonl"
+            judge_marker = temp_path / "judge-ran.txt"
+            leaked_secret = "ghp_preflight_secret_1234567890"
+            init_repo(repo)
+            codex_home.mkdir()
+            config_home.mkdir()
+            pi_config_home.mkdir()
+            pi_coding_agent_dir.mkdir()
+            fake_pi = temp_path / "pi"
+            write_executable(
+                fake_pi,
+                f"""#!{sys.executable}
+import json
+import sys
+from pathlib import Path
+
+Path({str(fake_calls)!r}).open("a", encoding="utf-8").write(
+    json.dumps({{"argv": sys.argv[1:]}}) + "\\n"
+)
+print("No API key for provider: openai-codex {leaked_secret}", file=sys.stderr)
+sys.exit(1)
+""",
+            )
+            recipe = {
+                "schema_version": 1,
+                "workstream_id": "central-cknp",
+                "parent": "central",
+                "steps": [
+                    {
+                        "name": "select-work",
+                        "input": {
+                            "required_labels": ["project:afk-composable-pipeline", "ready-for-agent"],
+                            "sources": [
+                                {
+                                    "type": "fixture",
+                                    "id": "fixture",
+                                    "items": [selected_fixture_item("central-cknp")],
+                                }
+                            ],
+                        },
+                    },
+                    {
+                        "name": "prepare-checkout",
+                        "input": {
+                            "repo_url": str(repo),
+                            "base_ref": "main",
+                            "checkout_root": str(checkout_root),
+                            "checkout_path": str(checkout),
+                        },
+                    },
+                    {
+                        "name": "implement",
+                        "input": {
+                            "guardrails": ["do not write secrets"],
+                            "validation": {"profile": "tier1", "commands": []},
+                            "agent": {
+                                "type": "real-agent-command",
+                                "command": [
+                                    str(fake_pi),
+                                    "-p",
+                                    "{prompt}",
+                                    "--provider",
+                                    "openai-codex",
+                                    "--model",
+                                    "gpt-5.4-mini",
+                                ],
+                                "result_path": "agent-result.json",
+                                "timeout_seconds": 10,
+                                "codex_home": str(codex_home),
+                                "config_home": str(config_home),
+                                "env": {
+                                    "PI_CONFIG_HOME": str(pi_config_home),
+                                    "PI_CODING_AGENT_DIR": str(pi_coding_agent_dir),
+                                },
+                            },
+                        },
+                    },
+                ],
+                "retrospective_judge": {
+                    "enabled": True,
+                    "type": "local-command",
+                    "command": [
+                        sys.executable,
+                        "-c",
+                        f"from pathlib import Path; Path({str(judge_marker)!r}).write_text('judge ran\\n', encoding='utf-8')",
+                    ],
+                    "timeout_seconds": 10,
+                },
+                "publisher": {"enabled": False},
+            }
+
+            completed = run_afk(
+                "run-workstream",
+                "--workstream-id",
+                "central-cknp",
+                "--input",
+                json.dumps(recipe),
+                "--ledger",
+                str(ledger),
+                env_overrides={
+                    "GIT_ALLOW_PROTOCOL": "file",
+                    "GIT_AUTHOR_NAME": "AFK Test",
+                    "GIT_AUTHOR_EMAIL": "afk-test@example.test",
+                    "GIT_COMMITTER_NAME": "AFK Test",
+                    "GIT_COMMITTER_EMAIL": "afk-test@example.test",
+                },
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            result_path = ledger / summary["result_path"]
+            result = json.loads(result_path.read_text(encoding="utf-8"))
+            preflight_path = result_path.parent / "pi-auth-preflight.json"
+            preflight = json.loads(preflight_path.read_text(encoding="utf-8"))
+            artifact_text = "\n".join(
+                [
+                    result_path.read_text(encoding="utf-8"),
+                    preflight_path.read_text(encoding="utf-8"),
+                ]
+            )
+            calls = [
+                json.loads(line)
+                for line in fake_calls.read_text(encoding="utf-8").splitlines()
+            ]
+
+            self.assertEqual(summary["status"], "blocked")
+            self.assertEqual(result["status"], "blocked")
+            self.assertEqual(result["steps"], [])
+            self.assertEqual(result["publication"]["status"], "blocked")
+            self.assertIn("Pi auth preflight failed for implement.agent", result["publication"]["reason"])
+            self.assertIn("No API key for provider: openai-codex", result["publication"]["reason"])
+            self.assertEqual(result["artifacts"]["pi_auth_preflight"], "pi-auth-preflight.json")
+            self.assertEqual(preflight["status"], "failed")
+            self.assertEqual(preflight["results"][0]["target"], "implement.agent")
+            self.assertIn("No API key for provider: openai-codex", preflight["results"][0]["summary"])
+            self.assertEqual(result["pipeline_retrospective"]["judge"]["enabled"], True)
+            self.assertEqual(result["pipeline_retrospective"]["judge"]["status"], "skipped")
+            self.assertEqual(result["pipeline_retrospective"]["judge"]["classification"], "auth_preflight_failed")
+            self.assertIn("Pi auth preflight failed for implement.agent", result["pipeline_retrospective"]["judge"]["summary"])
+            self.assertNotIn(leaked_secret, artifact_text)
+            self.assertIn("[REDACTED]", artifact_text)
+            self.assertEqual(len(calls), 1)
+            self.assertFalse(checkout.exists())
+            self.assertFalse(judge_marker.exists())
+
+    def test_workstream_defers_checkout_local_shell_wrapped_pi_auth_preflight_until_checkout_exists(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repo = temp_path / "repo-src"
+            checkout = temp_path / "checkout"
+            ledger = temp_path / "ledger"
+            codex_home = temp_path / "codex-home"
+            config_home = temp_path / "xdg-config"
+            pi_config_home = temp_path / "pi-config"
+            pi_coding_agent_dir = temp_path / "pi-coding-agent"
+            fake_calls = temp_path / "checkout-local-pi-calls.jsonl"
+            init_repo(repo)
+            codex_home.mkdir()
+            config_home.mkdir()
+            pi_config_home.mkdir()
+            pi_coding_agent_dir.mkdir()
+            repo_bin = repo / "bin"
+            repo_bin.mkdir()
+            write_executable(
+                repo_bin / "pi",
+                f"""#!{sys.executable}
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+calls_path = Path({str(fake_calls)!r})
+calls_path.open("a", encoding="utf-8").write(
+    json.dumps(
+        {{
+            "argv": sys.argv[1:],
+            "cwd": os.getcwd(),
+            "preflight": os.environ.get("AFK_PI_AUTH_PREFLIGHT") == "1",
+            "wrapper_mode": os.environ.get("PI_WRAPPER_MODE"),
+        }}
+    )
+    + "\\n"
+)
+if os.environ.get("PI_WRAPPER_MODE") != "wrapped":
+    raise SystemExit("missing wrapper mode")
+if os.environ.get("AFK_PI_AUTH_PREFLIGHT") == "1":
+    raise SystemExit(0)
+Path("implemented.txt").write_text("central-lve.9\\n", encoding="utf-8")
+subprocess.run(["git", "add", "implemented.txt"], check=True)
+subprocess.run(["git", "commit", "-m", "implement central-lve.9"], check=True)
+Path("agent-result.json").write_text(
+    json.dumps({{"status": "completed", "summary": "checkout-local wrapped pi succeeded"}}),
+    encoding="utf-8",
+)
+""",
+            )
+            git(repo, "add", "bin/pi")
+            git(repo, "commit", "-m", "add checkout-local pi adapter")
+            fake_git = temp_path / "publisher-git"
+            fake_gh = temp_path / "publisher-gh"
+            write_executable(
+                fake_git,
+                f"""#!{sys.executable}
+import json
+import sys
+from pathlib import Path
+Path({str(temp_path / "fake-git-calls.jsonl")!r}).write_text(json.dumps(sys.argv[1:]) + "\\n", encoding="utf-8")
+""",
+            )
+            write_executable(
+                fake_gh,
+                f"""#!{sys.executable}
+import sys
+if sys.argv[1:4] == ["auth", "status", "--hostname"]:
+    raise SystemExit(0)
+if sys.argv[1:3] == ["pr", "create"]:
+    print("https://github.example/pr/123")
+    raise SystemExit(0)
+raise SystemExit(9)
+""",
+            )
+            recipe = successful_recipe(temp_path, repo, checkout, fake_git, fake_gh)
+            recipe["steps"][2]["input"]["agent"] = {
+                "type": "real-agent-command",
+                "command": [
+                    "bash",
+                    "-lc",
+                    "PI_WRAPPER_MODE=wrapped exec ./bin/pi -p '{prompt}' --provider openai-codex --model gpt-5.4-mini",
+                ],
+                "result_path": "agent-result.json",
+                "timeout_seconds": 10,
+                "codex_home": str(codex_home),
+                "config_home": str(config_home),
+                "env": {
+                    "PI_CONFIG_HOME": str(pi_config_home),
+                    "PI_CODING_AGENT_DIR": str(pi_coding_agent_dir),
+                },
+            }
+
+            completed = run_afk(
+                "run-workstream",
+                "--workstream-id",
+                "central-lve.9",
+                "--input",
+                json.dumps(recipe),
+                "--ledger",
+                str(ledger),
+                env_overrides={
+                    "GIT_ALLOW_PROTOCOL": "file",
+                    "GIT_AUTHOR_NAME": "AFK Test",
+                    "GIT_AUTHOR_EMAIL": "afk-test@example.test",
+                    "GIT_COMMITTER_NAME": "AFK Test",
+                    "GIT_COMMITTER_EMAIL": "afk-test@example.test",
+                },
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            result = json.loads((ledger / summary["result_path"]).read_text(encoding="utf-8"))
+            calls = [json.loads(line) for line in fake_calls.read_text(encoding="utf-8").splitlines()]
+            run_dir = ledger / "workstreams" / summary["run_id"]
+            preflight = json.loads((run_dir / "pi-auth-preflight.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(result["status"], "published")
+            self.assertEqual(result["steps"][2]["name"], "implement")
+            self.assertEqual(result["pipeline_retrospective"]["judge"]["status"], "disabled")
+            self.assertEqual(len(calls), 2)
+            self.assertTrue(calls[0]["preflight"])
+            self.assertFalse(calls[1]["preflight"])
+            self.assertEqual(calls[0]["wrapper_mode"], "wrapped")
+            self.assertEqual(calls[1]["wrapper_mode"], "wrapped")
+            self.assertEqual(calls[0]["cwd"], str(checkout))
+            self.assertEqual(calls[1]["cwd"], str(checkout))
+            self.assertEqual(preflight["status"], "passed")
+            self.assertEqual([item["status"] for item in preflight["results"]], ["deferred", "passed"])
+
+    def test_workstream_does_not_retry_deferred_retrospective_judge_preflight_without_prepared_checkout(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repo = temp_path / "repo-src"
+            checkout = temp_path / "checkout"
+            ledger = temp_path / "ledger"
+            codex_home = temp_path / "codex-home"
+            config_home = temp_path / "xdg-config"
+            pi_config_home = temp_path / "pi-config"
+            pi_coding_agent_dir = temp_path / "pi-coding-agent"
+            fake_git = temp_path / "publisher-git"
+            fake_gh = temp_path / "publisher-gh"
+            init_repo(repo)
+            codex_home.mkdir()
+            config_home.mkdir()
+            pi_config_home.mkdir()
+            pi_coding_agent_dir.mkdir()
+            write_executable(
+                fake_git,
+                f"""#!{sys.executable}
+raise SystemExit(9)
+""",
+            )
+            write_executable(
+                fake_gh,
+                f"""#!{sys.executable}
+raise SystemExit(9)
+""",
+            )
+            recipe = successful_recipe(temp_path, repo, checkout, fake_git, fake_gh)
+            recipe["steps"][0]["input"]["sources"][0]["items"] = []
+            recipe["publisher"] = {"enabled": False}
+            recipe["retrospective_judge"] = {
+                "enabled": True,
+                "type": "local-command",
+                "command": [
+                    "bash",
+                    "-lc",
+                    "exec ./bin/pi -p '{prompt}' --provider openai-codex --model gpt-5.4-mini",
+                ],
+                "timeout_seconds": 10,
+                "codex_home": str(codex_home),
+                "config_home": str(config_home),
+                "env": {
+                    "PI_CONFIG_HOME": str(pi_config_home),
+                    "PI_CODING_AGENT_DIR": str(pi_coding_agent_dir),
+                },
+            }
+
+            completed = run_afk(
+                "run-workstream",
+                "--workstream-id",
+                "central-lve.9",
+                "--input",
+                json.dumps(recipe),
+                "--ledger",
+                str(ledger),
+                env_overrides={
+                    "GIT_ALLOW_PROTOCOL": "file",
+                    "GIT_AUTHOR_NAME": "AFK Test",
+                    "GIT_AUTHOR_EMAIL": "afk-test@example.test",
+                    "GIT_COMMITTER_NAME": "AFK Test",
+                    "GIT_COMMITTER_EMAIL": "afk-test@example.test",
+                },
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            result_path = ledger / summary["result_path"]
+            result = json.loads(result_path.read_text(encoding="utf-8"))
+            preflight = json.loads((result_path.parent / "pi-auth-preflight.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(summary["status"], "blocked")
+            self.assertEqual(result["publication"]["reason"], "select-work selected no work items")
+            self.assertEqual(preflight["status"], "deferred")
+            self.assertTrue(all(item["status"] != "failed" for item in preflight["results"]))
+            self.assertEqual(result["pipeline_retrospective"]["judge"]["status"], "skipped")
+            self.assertEqual(result["pipeline_retrospective"]["judge"]["classification"], "checkout_unavailable")
+            self.assertIn("no prepared checkout", result["pipeline_retrospective"]["judge"]["summary"])
+            self.assertFalse(checkout.exists())
+
+    def test_workstream_pi_auth_preflight_preserves_implement_wrapper_secret_metadata_in_job_capsule(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repo = temp_path / "repo-src"
+            checkout = temp_path / "checkout"
+            ledger = temp_path / "ledger"
+            codex_home = temp_path / "codex-home"
+            config_home = temp_path / "xdg-config"
+            pi_config_home = temp_path / "pi-config"
+            pi_coding_agent_dir = temp_path / "pi-coding-agent"
+            wrapper_secret_dir = temp_path / "runner-secrets"
+            wrapper_secret_file = wrapper_secret_dir / "openai-api-key.txt"
+            preflight_observation = temp_path / "preflight-observation.json"
+            secret_refs = {
+                "primary": {
+                    "secretRef": {
+                        "provider": "runner-local-files",
+                        "name": "codex-auth",
+                        "key": "openai_api_key",
+                    }
+                }
+            }
+            wrapper_secret = "ghp_wrapper_preflight_secret_1234567890"
+            init_repo(repo)
+            codex_home.mkdir()
+            config_home.mkdir()
+            pi_config_home.mkdir()
+            pi_coding_agent_dir.mkdir()
+            wrapper_secret_dir.mkdir()
+            wrapper_secret_file.write_text(wrapper_secret + "\n", encoding="utf-8")
+            fake_git = temp_path / "publisher-git"
+            fake_gh = temp_path / "publisher-gh"
+            pi_bin = temp_path / "pi"
+            write_executable(
+                fake_git,
+                f"""#!{sys.executable}
+import json
+import sys
+from pathlib import Path
+Path({str(temp_path / "fake-git-calls.jsonl")!r}).write_text(json.dumps(sys.argv[1:]) + "\\n", encoding="utf-8")
+""",
+            )
+            write_executable(
+                fake_gh,
+                f"""#!{sys.executable}
+import sys
+if sys.argv[1:4] == ["auth", "status", "--hostname"]:
+    raise SystemExit(0)
+if sys.argv[1:3] == ["pr", "create"]:
+    print("https://github.example/pr/123")
+    raise SystemExit(0)
+raise SystemExit(9)
+""",
+            )
+            write_executable(
+                pi_bin,
+                f"""#!{sys.executable}
+import json
+import os
+import subprocess
+from pathlib import Path
+
+capsule = json.loads(Path(os.environ["AFK_JOB_CAPSULE"]).read_text(encoding="utf-8"))
+if os.environ.get("AFK_PI_AUTH_PREFLIGHT") == "1":
+    Path({str(preflight_observation)!r}).write_text(
+        json.dumps(
+            {{
+                "wrapper_secret_files": capsule["agent_mounts"]["wrapper_secret_files"],
+                "secret_refs": capsule["agent_mounts"]["secret_refs"],
+            }}
+        ),
+        encoding="utf-8",
+    )
+    raise SystemExit(0)
+Path("implemented.txt").write_text("wrapper metadata preserved\\n", encoding="utf-8")
+subprocess.run(["git", "add", "implemented.txt"], check=True)
+subprocess.run(["git", "commit", "-m", "preserve preflight wrapper metadata"], check=True)
+Path(os.environ["AFK_AGENT_RESULT_PATH"]).write_text(
+    json.dumps({{"status": "completed", "summary": "wrapper metadata preserved"}}),
+    encoding="utf-8",
+)
+""",
+            )
+            recipe = successful_recipe(temp_path, repo, checkout, fake_git, fake_gh)
+            recipe["steps"][2]["input"]["agent"] = {
+                "type": "real-agent-command",
+                "command": [str(pi_bin), "-p", "{prompt}", "--provider", "openai-codex", "--model", "gpt-5.4-mini"],
+                "result_path": "agent-result.json",
+                "timeout_seconds": 10,
+                "codex_home": str(codex_home),
+                "config_home": str(config_home),
+                "env": {
+                    "PI_CONFIG_HOME": str(pi_config_home),
+                    "PI_CODING_AGENT_DIR": str(pi_coding_agent_dir),
+                },
+                "wrapper_secret_files": {"primary": str(wrapper_secret_file)},
+                "secret_refs": secret_refs,
+            }
+
+            completed = run_afk(
+                "run-workstream",
+                "--workstream-id",
+                "central-lve.9",
+                "--input",
+                json.dumps(recipe),
+                "--ledger",
+                str(ledger),
+                env_overrides={
+                    "GIT_ALLOW_PROTOCOL": "file",
+                    "GIT_AUTHOR_NAME": "AFK Test",
+                    "GIT_AUTHOR_EMAIL": "afk-test@example.test",
+                    "GIT_COMMITTER_NAME": "AFK Test",
+                    "GIT_COMMITTER_EMAIL": "afk-test@example.test",
+                },
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "workstreams" / summary["run_id"]
+            observation = json.loads(preflight_observation.read_text(encoding="utf-8"))
+            artifact_text = "\n".join(
+                path.read_text(encoding="utf-8")
+                for path in run_dir.iterdir()
+                if path.is_file()
+            )
+
+            self.assertEqual(observation["wrapper_secret_files"], {"primary": str(wrapper_secret_file)})
+            self.assertEqual(observation["secret_refs"], secret_refs)
+            self.assertNotIn(wrapper_secret, artifact_text)
+
+    def test_workstream_pi_auth_preflight_renders_reviewer_and_judge_path_placeholders(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repo = temp_path / "repo-src"
+            checkout = temp_path / "checkout"
+            ledger = temp_path / "ledger"
+            codex_home = temp_path / "codex-home"
+            config_home = temp_path / "xdg-config"
+            pi_config_home = temp_path / "pi-config"
+            pi_coding_agent_dir = temp_path / "pi-coding-agent"
+            pi_calls = temp_path / "pi-calls.jsonl"
+            init_repo(repo)
+            codex_home.mkdir()
+            config_home.mkdir()
+            pi_config_home.mkdir()
+            pi_coding_agent_dir.mkdir()
+            fake_git = temp_path / "publisher-git"
+            fake_gh = temp_path / "publisher-gh"
+            pi_bin = temp_path / "pi"
+            write_executable(
+                fake_git,
+                f"""#!{sys.executable}
+import json
+import sys
+from pathlib import Path
+Path({str(temp_path / "fake-git-calls.jsonl")!r}).write_text(json.dumps(sys.argv[1:]) + "\\n", encoding="utf-8")
+""",
+            )
+            write_executable(
+                fake_gh,
+                f"""#!{sys.executable}
+import sys
+if sys.argv[1:4] == ["auth", "status", "--hostname"]:
+    raise SystemExit(0)
+if sys.argv[1:3] == ["pr", "create"]:
+    print("https://github.example/pr/123")
+    raise SystemExit(0)
+raise SystemExit(9)
+""",
+            )
+            write_executable(
+                pi_bin,
+                f"""#!{sys.executable}
+import json
+import os
+import sys
+from pathlib import Path
+
+if "AFK_REVIEWER_REQUEST" in os.environ:
+    target = "reviewer"
+    request_env = os.environ["AFK_REVIEWER_REQUEST"]
+    result_env = os.environ["AFK_REVIEWER_RESULT"]
+elif "AFK_RETROSPECTIVE_JUDGE_REQUEST" in os.environ:
+    target = "retrospective_judge"
+    request_env = os.environ["AFK_RETROSPECTIVE_JUDGE_REQUEST"]
+    result_env = os.environ["AFK_RETROSPECTIVE_JUDGE_RESULT"]
+else:
+    raise SystemExit("unexpected pi target")
+
+record = {{
+    "target": target,
+    "preflight": os.environ.get("AFK_PI_AUTH_PREFLIGHT") == "1",
+    "request_in_argv": request_env in sys.argv[1:],
+    "result_in_argv": result_env in sys.argv[1:],
+    "placeholder_seen": any(
+        "{{request_path}}" in arg or "{{result_path}}" in arg
+        for arg in sys.argv[1:]
+    ),
+}}
+Path({str(pi_calls)!r}).open("a", encoding="utf-8").write(json.dumps(record) + "\\n")
+if record["placeholder_seen"] or not record["request_in_argv"] or not record["result_in_argv"]:
+    raise SystemExit("preflight path placeholders were not rendered")
+if record["preflight"]:
+    raise SystemExit(0)
+if target == "reviewer":
+    Path(result_env).write_text(
+        json.dumps({{"status": "pass", "summary": "review placeholders rendered", "findings": []}}),
+        encoding="utf-8",
+    )
+else:
+    Path(result_env).write_text(
+        json.dumps({{"status": "pass", "summary": "judge placeholders rendered", "findings": []}}),
+        encoding="utf-8",
+    )
+""",
+            )
+            recipe = merged_recipe_with_retrospective(temp_path, repo, checkout, fake_git, fake_gh)
+            recipe["steps"][4]["input"]["reviewer"] = {
+                "type": "fake-reviewer-command",
+                "command": [
+                    str(pi_bin),
+                    "-p",
+                    "{prompt}",
+                    "--provider",
+                    "openai-codex",
+                    "--model",
+                    "gpt-5.4-mini",
+                    "{request_path}",
+                    "{result_path}",
+                ],
+                "timeout_seconds": 10,
+                "codex_home": str(codex_home),
+                "config_home": str(config_home),
+                "env": {
+                    "PI_CONFIG_HOME": str(pi_config_home),
+                    "PI_CODING_AGENT_DIR": str(pi_coding_agent_dir),
+                },
+            }
+            recipe["retrospective_judge"] = {
+                "enabled": True,
+                "type": "local-command",
+                "command": [
+                    str(pi_bin),
+                    "-p",
+                    "{prompt}",
+                    "--provider",
+                    "openai-codex",
+                    "--model",
+                    "gpt-5.4-mini",
+                    "{request_path}",
+                    "{result_path}",
+                ],
+                "timeout_seconds": 10,
+                "codex_home": str(codex_home),
+                "config_home": str(config_home),
+                "env": {
+                    "PI_CONFIG_HOME": str(pi_config_home),
+                    "PI_CODING_AGENT_DIR": str(pi_coding_agent_dir),
+                },
+            }
+
+            completed = run_afk(
+                "run-workstream",
+                "--workstream-id",
+                "central-lve.9",
+                "--input",
+                json.dumps(recipe),
+                "--ledger",
+                str(ledger),
+                env_overrides={
+                    "GIT_ALLOW_PROTOCOL": "file",
+                    "GIT_AUTHOR_NAME": "AFK Test",
+                    "GIT_AUTHOR_EMAIL": "afk-test@example.test",
+                    "GIT_COMMITTER_NAME": "AFK Test",
+                    "GIT_COMMITTER_EMAIL": "afk-test@example.test",
+                },
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            result = json.loads((ledger / summary["result_path"]).read_text(encoding="utf-8"))
+            calls = [json.loads(line) for line in pi_calls.read_text(encoding="utf-8").splitlines()]
+            preflight_calls = [call for call in calls if call["preflight"]]
+
+            self.assertEqual(result["status"], "closed")
+            self.assertEqual([step["name"] for step in result["steps"]], ["select-work", "prepare-checkout", "implement", "validate", "review"])
+            self.assertEqual(result["pipeline_retrospective"]["judge"]["status"], "passed")
+            self.assertEqual({call["target"] for call in preflight_calls}, {"reviewer", "retrospective_judge"})
+            self.assertEqual(sorted(call["target"] for call in calls), ["retrospective_judge", "retrospective_judge", "reviewer", "reviewer"])
+            self.assertTrue(all(not call["placeholder_seen"] for call in calls))
+            self.assertTrue(all(call["request_in_argv"] for call in calls))
+            self.assertTrue(all(call["result_in_argv"] for call in calls))
+
     def test_workstream_rejects_openai_codex_pi_retrospective_judge_without_required_mounts(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)

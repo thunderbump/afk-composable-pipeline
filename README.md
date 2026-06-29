@@ -486,21 +486,38 @@ compatibility with older Pi/config state, but setting only `PI_CONFIG_HOME` is
 not a supported Codex subscription auth injection path and can still fail with
 `No API key for provider: openai-codex`.
 
+Before `run-next --execute` or `run-workstream`, verify the mounted Pi auth path
+locally with the same directories AFK will pass through:
+
+```bash
+PI_CODING_AGENT_DIR=/path/outside/checkout \
+PI_CONFIG_HOME=/path/outside/checkout \
+CODEX_HOME=/path/outside/checkout \
+pi --provider openai-codex --model gpt-5.4-mini --no-session --no-tools -p "Reply with OK only."
+```
+
+If that smoke command fails, refresh or repair Pi auth outside git before
+rerunning AFK, for example by launching interactive `pi` with the same
+`PI_CODING_AGENT_DIR` and using `/login`.
+
 AFK forwards wrapper secret file paths only; it never forwards secret values in
 `agent.env` or command args. Wrapper-side consumers read mounted files and export
 real tokens before launching real Pi/Codex commands. Secret-bearing values are
 not persisted in artifacts; they are only redacted in stdout/stderr and normalized
 payloads.
 
-Expected runtime auth evidence:
+Expected auth evidence:
 
-- Missing Codex auth should fail as `failed_runtime` with runtime evidence in
-  `step-result.output.failures` and an adapter stderr/stdout excerpt that shows a
-  missing-credential error (for example `missing credentials`).
-- Expired Pi OAuth should fail as `failed_runtime` and can surface as
-  `No API key for provider: openai-codex` in the adapter stderr excerpt.
 - If an auth mount is invalid, AFK stops before execution and records
   `agent.env.*`/`agent.*` mount validation messages in the step result message.
+- If Pi `openai-codex` auth cannot answer a minimal prompt with the configured
+  mounts, `run-workstream` stops before any workstream step runs, records
+  `pi-auth-preflight.json`, and returns a blocked result whose reason includes a
+  redacted Pi auth failure summary such as `No API key for provider:
+  openai-codex`.
+- If preflight passes but auth later expires during a real role invocation, the
+  affected implement/review/judge step can still fail as `failed_runtime` with
+  runtime evidence in the step artifacts.
 
 Minimal recipe fragment for remote/container portability (for `central-afk-pr.7`):
 
