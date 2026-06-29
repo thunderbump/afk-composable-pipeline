@@ -1868,6 +1868,13 @@ def tracker_record(
             )
             record["pr_url"] = decision_pr_url
             return record
+        if publication.get("status") != "tracker-closed":
+            record["comment"] = (
+                "A terminal merge decision is recorded, but publication did not reach the tracker-closing "
+                "terminal state; keep the source Beads item open."
+            )
+            record["pr_url"] = decision_pr_url
+            return record
         record["status"] = "closed"
         record["close_source_item"] = True
         record["close_reason"] = merged_close_reason(decision)
@@ -1885,6 +1892,13 @@ def tracker_record(
             record["comment"] = (
                 "PR review cycles still require a response; the terminal no-merge decision is recorded, but keep "
                 "the source Beads item open until review_feedback_status is set to resolved or waived."
+            )
+            record["pr_url"] = decision_pr_url
+            return record
+        if publication.get("status") != "tracker-closed":
+            record["comment"] = (
+                "A terminal no-merge decision is recorded, but publication did not reach the tracker-closing "
+                "terminal state; keep the source Beads item open."
             )
             record["pr_url"] = decision_pr_url
             return record
