@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import codecs
 import os
 import re
+import signal
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +30,8 @@ class WorkerRuntimeError(RuntimeError):
         returncode: int | None = None,
         timed_out: bool = False,
         command: list[str] | None = None,
+        adapter_details: dict[str, Any] | None = None,
+        failure_artifact: dict[str, Any] | None = None,
     ):
         super().__init__(message)
         self.message = message
@@ -34,6 +40,8 @@ class WorkerRuntimeError(RuntimeError):
         self.returncode = returncode
         self.timed_out = timed_out
         self.command = list(command) if isinstance(command, list) else None
+        self.adapter_details = redact_artifact_value(adapter_details or {})
+        self.failure_artifact = redact_artifact_value(failure_artifact or {})
 
 
 def validate_step(context: Any) -> dict[str, Any]:
@@ -84,34 +92,27 @@ def validate(
         stdout = redact_text(exc.stdout)
         stderr = redact_text(exc.stderr or exc.message)
         write_adapter_logs(stdout, stderr)
-        raw_payload = read_worker_payload(result_path, fallback_path=evidence_result_path)
-        if raw_payload["status"] == "valid":
-            sync_worker_payload_artifacts(result_path, evidence_result_path, raw_payload["payload"])
-        if raw_payload["status"] == "invalid":
-            sync_worker_protocol_artifacts(result_path, evidence_result_path, raw_payload["message"])
-            normalized = normalized_worker_result(
-                status="failed_protocol",
-                classification="protocol_failure",
-                summary=raw_payload["message"],
-                raw_result=None,
-                adapter=adapter_record(
-                    request["worker"], exc.returncode, exc.timed_out, command=exc.command
-                ),
-                stdout=stdout,
-                stderr=stderr,
-                evidence_dir=evidence_dir,
-                stdout_path=stdout_log_path,
-                stderr_path=stderr_log_path,
-            )
-            worker_result = {"raw": None, "normalized": normalized}
-            write_worker_result(worker_result_path, run_id, worker_result)
-            return validate_output(request, worker_request, worker_result)
+        read_worker_payload(result_path, fallback_path=evidence_result_path)
+        sync_worker_failure_artifacts(
+            result_path,
+            evidence_result_path,
+            "failed_timeout" if exc.timed_out else "failed_runtime",
+            "timeout" if exc.timed_out else "runtime_failure",
+            exc.message,
+            details=exc.failure_artifact,
+        )
         normalized = normalized_worker_result(
             status="failed_timeout" if exc.timed_out else "failed_runtime",
             classification="timeout" if exc.timed_out else "runtime_failure",
             summary=exc.message,
             raw_result=None,
-            adapter=adapter_record(request["worker"], exc.returncode, exc.timed_out, command=exc.command),
+            adapter=adapter_record(
+                request["worker"],
+                exc.returncode,
+                exc.timed_out,
+                command=exc.command,
+                details={**exc.adapter_details, **exc.failure_artifact},
+            ),
             stdout=stdout,
             stderr=stderr,
             evidence_dir=evidence_dir,
@@ -535,12 +536,19 @@ def run_command_adapter(
         evidence_dir=evidence_dir,
         profile=profile,
     )
+    if worker["type"] == "local-command":
+        return run_local_command_adapter(
+            command,
+            cwd=checkout_path,
+            env=env,
+            timeout_seconds=worker["timeout_seconds"],
+        )
     try:
         completed = subprocess.run(
             command,
             cwd=checkout_path,
             env=env,
-            text=True,
+            text=False,
             capture_output=True,
             check=False,
             timeout=worker["timeout_seconds"],
@@ -548,8 +556,8 @@ def run_command_adapter(
     except OSError as exc:
         raise WorkerRuntimeError(str(exc), stderr=str(exc), returncode=None, command=command) from exc
     except subprocess.TimeoutExpired as exc:
-        stdout = exc.stdout if isinstance(exc.stdout, str) else ""
-        stderr = exc.stderr if isinstance(exc.stderr, str) else ""
+        stdout = decode_adapter_output(exc.stdout)
+        stderr = decode_adapter_output(exc.stderr)
         raise WorkerRuntimeError(
             "worker command timed out",
             stdout=stdout,
@@ -561,9 +569,512 @@ def run_command_adapter(
     return {
         "command": command,
         "returncode": completed.returncode,
-        "stdout": completed.stdout,
-        "stderr": completed.stderr,
+        "stdout": decode_adapter_output(completed.stdout),
+        "stderr": decode_adapter_output(completed.stderr),
     }
+
+
+STOPPED_PROCESS_REMEDIATION = (
+    "Send SIGCONT to the worker process group to resume it for debugging, then fix PTY/job-control "
+    "behavior or the worker script before retrying validation. AFK only inspects and cleans up the "
+    "worker process group it started; descendants that detach with setsid/setpgid are outside AFK's "
+    "cleanup guarantee."
+)
+
+
+def run_local_command_adapter(
+    command: list[str],
+    *,
+    cwd: Path,
+    env: dict[str, str],
+    timeout_seconds: float,
+) -> dict[str, Any]:
+    process_groups_available = supports_process_groups()
+    try:
+        process = subprocess.Popen(
+            command,
+            cwd=cwd,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=process_groups_available,
+        )
+    except OSError as exc:
+        raise WorkerRuntimeError(str(exc), stderr=str(exc), returncode=None, command=command) from exc
+
+    stdout_chunks: list[str] = []
+    stderr_chunks: list[str] = []
+    stdout_thread = stream_reader(process.stdout, stdout_chunks)
+    stderr_thread = stream_reader(process.stderr, stderr_chunks)
+    deadline = time.monotonic() + timeout_seconds
+
+    while True:
+        if process.poll() is not None:
+            break
+        stopped_processes = stopped_worker_processes(process.pid, process_groups_available=process_groups_available)
+        if stopped_processes:
+            raise stopped_process_error(
+                process,
+                command=command,
+                stdout_thread=stdout_thread,
+                stderr_thread=stderr_thread,
+                stdout_chunks=stdout_chunks,
+                stderr_chunks=stderr_chunks,
+                process_groups_available=process_groups_available,
+                stopped_processes=stopped_processes,
+            )
+        if time.monotonic() >= deadline:
+            raise timeout_runtime_error(
+                process,
+                command=command,
+                stdout_thread=stdout_thread,
+                stderr_thread=stderr_thread,
+                stdout_chunks=stdout_chunks,
+                stderr_chunks=stderr_chunks,
+                process_groups_available=process_groups_available,
+                post_exit=False,
+            )
+        time.sleep(min(0.05, max(deadline - time.monotonic(), 0.0)))
+
+    stdout, stderr, drained = drain_post_exit_output(
+        process=process,
+        command=command,
+        stdout_thread=stdout_thread,
+        stderr_thread=stderr_thread,
+        stdout_chunks=stdout_chunks,
+        stderr_chunks=stderr_chunks,
+        process_groups_available=process_groups_available,
+        deadline=deadline,
+    )
+    if not drained:
+        raise timeout_runtime_error(
+            process,
+            command=command,
+            stdout_thread=stdout_thread,
+            stderr_thread=stderr_thread,
+            stdout_chunks=stdout_chunks,
+            stderr_chunks=stderr_chunks,
+            process_groups_available=process_groups_available,
+            post_exit=True,
+        )
+    return {
+        "command": command,
+        "returncode": process.returncode,
+        "stdout": stdout,
+        "stderr": stderr,
+    }
+
+
+def stream_reader(stream: Any, chunks: list[str]) -> threading.Thread:
+    def read_stream() -> None:
+        if stream is None:
+            return
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        try:
+            while True:
+                chunk = stream.read(4096)
+                if not chunk:
+                    break
+                if isinstance(chunk, bytes):
+                    text = decoder.decode(chunk)
+                else:
+                    text = decode_adapter_output(chunk)
+                if text:
+                    chunks.append(text)
+            tail = decoder.decode(b"", final=True)
+            if tail:
+                chunks.append(tail)
+        finally:
+            stream.close()
+
+    thread = threading.Thread(target=read_stream, daemon=True)
+    thread.start()
+    return thread
+
+
+def finalize_process_output(
+    process: subprocess.Popen[str],
+    *,
+    stdout_thread: threading.Thread,
+    stderr_thread: threading.Thread,
+    stdout_chunks: list[str],
+    stderr_chunks: list[str],
+    output_timeout: float | None,
+    process_groups_available: bool,
+) -> tuple[str, str, bool]:
+    try:
+        process.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        terminate_process_tree(process, process_groups_available=process_groups_available)
+        try:
+            process.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            pass
+    stdout_done, stderr_done = join_reader_threads(stdout_thread, stderr_thread, timeout=output_timeout)
+    return ("".join(stdout_chunks), "".join(stderr_chunks), stdout_done and stderr_done)
+
+
+def join_reader_threads(
+    stdout_thread: threading.Thread,
+    stderr_thread: threading.Thread,
+    *,
+    timeout: float | None,
+) -> tuple[bool, bool]:
+    if timeout is None:
+        stdout_thread.join()
+        stderr_thread.join()
+        return (not stdout_thread.is_alive(), not stderr_thread.is_alive())
+    if timeout <= 0:
+        return (not stdout_thread.is_alive(), not stderr_thread.is_alive())
+    started_at = time.monotonic()
+    stdout_thread.join(timeout=timeout)
+    elapsed = time.monotonic() - started_at
+    remaining = max(timeout - elapsed, 0.0)
+    stderr_thread.join(timeout=remaining)
+    return (not stdout_thread.is_alive(), not stderr_thread.is_alive())
+
+
+def supports_process_groups() -> bool:
+    return os.name == "posix" and hasattr(os, "killpg")
+
+
+def decode_adapter_output(output: Any) -> str:
+    if output is None:
+        return ""
+    if isinstance(output, str):
+        return output
+    if isinstance(output, bytes):
+        return output.decode("utf-8", errors="replace")
+    return str(output)
+
+
+def terminate_process_tree(process: subprocess.Popen[str], *, process_groups_available: bool) -> None:
+    if process_groups_available:
+        terminate_process_group(process)
+        return
+    if process.poll() is not None:
+        return
+    try:
+        process.terminate()
+    except OSError:
+        return
+    try:
+        process.wait(timeout=0.2)
+        return
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    try:
+        process.kill()
+    except OSError:
+        return
+
+
+def terminate_process_group(process: subprocess.Popen[str]) -> None:
+    process_group = process.pid
+    for sig in available_group_termination_signals():
+        try:
+            os.killpg(process_group, sig)
+        except ProcessLookupError:
+            return
+        except OSError:
+            return
+    try:
+        process.wait(timeout=0.2)
+        return
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    try:
+        os.killpg(process_group, signal.SIGKILL)
+    except (OSError, ProcessLookupError):
+        return
+
+
+def available_group_termination_signals() -> list[int]:
+    signals: list[int] = []
+    sigcont = getattr(signal, "SIGCONT", None)
+    if sigcont is not None:
+        signals.append(sigcont)
+    sigterm = getattr(signal, "SIGTERM", None)
+    if sigterm is not None:
+        signals.append(sigterm)
+    return signals
+
+
+def stopped_process_tree(root_pid: int) -> list[dict[str, Any]]:
+    if sys.platform != "linux":
+        return []
+    pending = [root_pid]
+    seen: set[int] = set()
+    stopped: list[dict[str, Any]] = []
+    while pending:
+        pid = pending.pop(0)
+        if pid in seen:
+            continue
+        seen.add(pid)
+        status = read_proc_status(pid)
+        if status is None:
+            continue
+        pending.extend(proc_children(pid))
+        state_code = string_field(status, "state_code") or ""
+        if state_code in {"T", "t"}:
+            stopped.append(status)
+    return sorted(stopped, key=lambda item: int(item["pid"]))
+
+
+def stopped_process_group(process_group: int) -> list[dict[str, Any]]:
+    if sys.platform != "linux":
+        return []
+    stopped: list[dict[str, Any]] = []
+    for pid in process_group_members(process_group):
+        status = read_proc_status(pid)
+        if status is None:
+            continue
+        state_code = string_field(status, "state_code") or ""
+        if state_code in {"T", "t"}:
+            stopped.append(status)
+    return sorted(stopped, key=lambda item: int(item["pid"]))
+
+
+def stopped_worker_processes(root_pid: int, *, process_groups_available: bool) -> list[dict[str, Any]]:
+    stopped = {int(item["pid"]): item for item in stopped_process_tree(root_pid)}
+    if process_groups_available:
+        for item in stopped_process_group(root_pid):
+            stopped[int(item["pid"])] = item
+    return [stopped[pid] for pid in sorted(stopped)]
+
+
+def process_group_members(process_group: int) -> list[int]:
+    proc_root = Path("/proc")
+    try:
+        proc_entries = list(proc_root.iterdir())
+    except OSError:
+        return []
+    members: list[int] = []
+    for entry in proc_entries:
+        if not entry.name.isdigit():
+            continue
+        try:
+            pid = int(entry.name)
+        except ValueError:
+            continue
+        if proc_process_group(pid) == process_group:
+            members.append(pid)
+    return members
+
+
+def proc_process_group(pid: int) -> int | None:
+    stat_path = Path(f"/proc/{pid}/stat")
+    try:
+        raw = stat_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    closing = raw.rfind(")")
+    if closing == -1:
+        return None
+    fields = raw[closing + 2 :].split()
+    if len(fields) < 3:
+        return None
+    try:
+        return int(fields[2])
+    except ValueError:
+        return None
+
+
+def proc_children(pid: int) -> list[int]:
+    children_path = Path(f"/proc/{pid}/task/{pid}/children")
+    try:
+        text = children_path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return []
+    children: list[int] = []
+    for item in text.split():
+        try:
+            children.append(int(item))
+        except ValueError:
+            continue
+    return children
+
+
+def read_proc_status(pid: int) -> dict[str, Any] | None:
+    status_path = Path(f"/proc/{pid}/status")
+    try:
+        lines = status_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    values: dict[str, str] = {}
+    for line in lines:
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        values[key] = value.strip()
+    state = values.get("State", "")
+    state_code = state[:1]
+    result: dict[str, Any] = {
+        "pid": pid,
+        "name": values.get("Name", ""),
+        "state": state,
+        "state_code": state_code,
+    }
+    ppid_text = values.get("PPid", "")
+    if ppid_text.isdigit():
+        result["ppid"] = int(ppid_text)
+    return result
+
+
+def format_stopped_process_message(root_pid: int, stopped_processes: list[dict[str, Any]]) -> str:
+    entries = [
+        f"pid {item['pid']} {item.get('name') or 'process'} State: {item.get('state') or '?'}"
+        for item in stopped_processes[:3]
+    ]
+    if len(stopped_processes) > 3:
+        entries.append(f"+{len(stopped_processes) - 3} more")
+    details = "; ".join(entries)
+    return (
+        f"worker process group stopped under pid {root_pid}: {details}. "
+        f"Remediation: {STOPPED_PROCESS_REMEDIATION}"
+    )
+
+
+def descendant_stdio_failure_artifact(*, process_groups_available: bool) -> dict[str, Any]:
+    remediation = (
+        "Ensure descendants in the worker process group exit or close inherited stdout/stderr before "
+        "the worker process exits. Descendants that detach with setsid/setpgid are outside AFK's "
+        "cleanup guarantee."
+    )
+    artifact: dict[str, Any] = {
+        "process_state": "stdout_stderr_open_after_exit",
+        "remediation": remediation,
+    }
+    if not process_groups_available:
+        artifact["cleanup_scope"] = "best_effort"
+        artifact["remediation"] = (
+            remediation + " Process groups are unavailable, so descendant cleanup is best-effort only."
+        )
+    return artifact
+
+
+def stopped_process_error(
+    process: subprocess.Popen[Any],
+    *,
+    command: list[str],
+    stdout_thread: threading.Thread,
+    stderr_thread: threading.Thread,
+    stdout_chunks: list[str],
+    stderr_chunks: list[str],
+    process_groups_available: bool,
+    stopped_processes: list[dict[str, Any]],
+) -> WorkerRuntimeError:
+    message = format_stopped_process_message(process.pid, stopped_processes)
+    terminate_process_tree(process, process_groups_available=process_groups_available)
+    stdout, stderr, _ = finalize_process_output(
+        process,
+        stdout_thread=stdout_thread,
+        stderr_thread=stderr_thread,
+        stdout_chunks=stdout_chunks,
+        stderr_chunks=stderr_chunks,
+        output_timeout=1.0,
+        process_groups_available=process_groups_available,
+    )
+    return WorkerRuntimeError(
+        message,
+        stdout=stdout,
+        stderr=append_error_message(stderr, message),
+        returncode=process.returncode,
+        command=command,
+        adapter_details={"stopped_processes": stopped_processes},
+        failure_artifact={
+            "process_state": "stopped",
+            "stopped_processes": stopped_processes,
+            "remediation": STOPPED_PROCESS_REMEDIATION,
+        },
+    )
+
+
+def timeout_runtime_error(
+    process: subprocess.Popen[Any],
+    *,
+    command: list[str],
+    stdout_thread: threading.Thread,
+    stderr_thread: threading.Thread,
+    stdout_chunks: list[str],
+    stderr_chunks: list[str],
+    process_groups_available: bool,
+    post_exit: bool,
+) -> WorkerRuntimeError:
+    terminate_process_tree(process, process_groups_available=process_groups_available)
+    stdout, stderr, _ = finalize_process_output(
+        process,
+        stdout_thread=stdout_thread,
+        stderr_thread=stderr_thread,
+        stdout_chunks=stdout_chunks,
+        stderr_chunks=stderr_chunks,
+        output_timeout=1.0,
+        process_groups_available=process_groups_available,
+    )
+    failure_artifact = (
+        descendant_stdio_failure_artifact(process_groups_available=process_groups_available) if post_exit else None
+    )
+    return WorkerRuntimeError(
+        "worker command timed out",
+        stdout=stdout,
+        stderr=stderr or "worker command timed out",
+        returncode=process.returncode,
+        timed_out=True,
+        command=command,
+        adapter_details=(
+            {
+                "process_state": failure_artifact["process_state"],
+                **({"cleanup_scope": failure_artifact["cleanup_scope"]} if "cleanup_scope" in failure_artifact else {}),
+            }
+            if failure_artifact
+            else None
+        ),
+        failure_artifact=failure_artifact,
+    )
+
+
+def drain_post_exit_output(
+    *,
+    process: subprocess.Popen[Any],
+    command: list[str],
+    stdout_thread: threading.Thread,
+    stderr_thread: threading.Thread,
+    stdout_chunks: list[str],
+    stderr_chunks: list[str],
+    process_groups_available: bool,
+    deadline: float,
+) -> tuple[str, str, bool]:
+    while True:
+        remaining = max(deadline - time.monotonic(), 0.0)
+        stdout_done, stderr_done = join_reader_threads(
+            stdout_thread,
+            stderr_thread,
+            timeout=min(0.05, remaining) if remaining > 0 else 0.0,
+        )
+        stopped_processes = stopped_worker_processes(process.pid, process_groups_available=process_groups_available)
+        if stopped_processes:
+            raise stopped_process_error(
+                process,
+                command=command,
+                stdout_thread=stdout_thread,
+                stderr_thread=stderr_thread,
+                stdout_chunks=stdout_chunks,
+                stderr_chunks=stderr_chunks,
+                process_groups_available=process_groups_available,
+                stopped_processes=stopped_processes,
+            )
+        if stdout_done and stderr_done:
+            return ("".join(stdout_chunks), "".join(stderr_chunks), True)
+        if remaining <= 0:
+            return ("".join(stdout_chunks), "".join(stderr_chunks), False)
+
+
+def append_error_message(stderr: str, message: str) -> str:
+    if not stderr:
+        return message
+    if stderr.endswith("\n"):
+        return stderr + message
+    return stderr + "\n" + message
 
 
 def render_command(
@@ -720,6 +1231,8 @@ def sync_worker_failure_artifacts(
     status: str,
     classification: str,
     message: str,
+    *,
+    details: dict[str, Any] | None = None,
 ) -> None:
     payload = {
         "schema_version": SCHEMA_VERSION,
@@ -727,6 +1240,8 @@ def sync_worker_failure_artifacts(
         "classification": classification,
         "summary": message,
     }
+    if details:
+        payload.update(redact_artifact_value(details))
     replace_worker_result_evidence(worker_output_path, payload)
     replace_worker_result_evidence(evidence_result_path, payload)
 
@@ -840,6 +1355,7 @@ def adapter_record(
     timed_out: bool,
     *,
     command: list[str] | None = None,
+    details: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     adapter = {
         "type": worker["type"],
@@ -850,6 +1366,8 @@ def adapter_record(
         adapter["command"] = redact_artifact_value(command)
     if worker.get("host"):
         adapter["host"] = worker["host"]
+    if details:
+        adapter.update(redact_artifact_value(details))
     return adapter
 
 
