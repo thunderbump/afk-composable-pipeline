@@ -332,6 +332,7 @@ def normalize_recipe(
     retrospective_judge = normalize_retrospective_judge(
         recipe.get("retrospective_judge"),
         checkout_path=recipe_checkout_path(normalized_steps),
+        checkout_paths=recipe_checkout_paths(normalized_steps),
     )
     validate_retrospective_terminal_decision(retrospective, tracker)
     return {
@@ -411,6 +412,14 @@ def composed_step_input(
 
 
 def recipe_checkout_path(steps: list[dict[str, Any]]) -> Path | None:
+    checkout_paths = recipe_checkout_paths(steps)
+    if checkout_paths:
+        return checkout_paths[0]
+    return None
+
+
+def recipe_checkout_paths(steps: list[dict[str, Any]]) -> list[Path]:
+    checkout_paths = []
     for step in steps:
         if step.get("name") != "prepare-checkout":
             continue
@@ -419,8 +428,8 @@ def recipe_checkout_path(steps: list[dict[str, Any]]) -> Path | None:
             continue
         checkout_path = string_field(input_data, "checkout_path")
         if checkout_path:
-            return Path(checkout_path)
-    return None
+            checkout_paths.append(Path(checkout_path))
+    return checkout_paths
 
 
 def equivalent_run_step_command(
@@ -3505,7 +3514,12 @@ def normalize_retrospective(retrospective: Any) -> dict[str, Any]:
     return normalized
 
 
-def normalize_retrospective_judge(retrospective_judge: Any, *, checkout_path: Path | None = None) -> dict[str, Any]:
+def normalize_retrospective_judge(
+    retrospective_judge: Any,
+    *,
+    checkout_path: Path | None = None,
+    checkout_paths: list[Path] | None = None,
+) -> dict[str, Any]:
     if retrospective_judge is None:
         return {"enabled": False}
     if not isinstance(retrospective_judge, dict):
@@ -3548,8 +3562,7 @@ def normalize_retrospective_judge(retrospective_judge: Any, *, checkout_path: Pa
         "command": list(command),
         "timeout_seconds": float(timeout_seconds),
     }
-    if checkout_path is None:
-        return normalized
+    checkout_mount_boundaries = checkout_paths or ([checkout_path] if checkout_path is not None else [])
     for field_name in ("codex_home", "config_home"):
         raw_value = retrospective_judge.get(field_name)
         if raw_value is None:
@@ -3557,10 +3570,11 @@ def normalize_retrospective_judge(retrospective_judge: Any, *, checkout_path: Pa
         if not isinstance(raw_value, str) or not raw_value.strip():
             raise WorkstreamError(f"retrospective_judge.{field_name} must be an absolute directory path")
         try:
-            normalized[field_name] = validate_absolute_dir(
+            normalized[field_name] = validate_retrospective_judge_mount_dir(
                 raw_value,
                 f"retrospective_judge.{field_name}",
                 checkout_path=checkout_path,
+                checkout_paths=checkout_mount_boundaries,
             )
         except ValueError as exc:
             raise WorkstreamError(str(exc)) from exc
@@ -3577,10 +3591,11 @@ def normalize_retrospective_judge(retrospective_judge: Any, *, checkout_path: Pa
             if not isinstance(value, str) or not value.strip():
                 raise WorkstreamError(f"retrospective_judge.env.{key} must be an absolute directory path")
             try:
-                normalized_env[key] = validate_absolute_dir(
+                normalized_env[key] = validate_retrospective_judge_mount_dir(
                     value,
                     f"retrospective_judge.env.{key}",
                     checkout_path=checkout_path,
+                    checkout_paths=checkout_mount_boundaries,
                 )
             except ValueError as exc:
                 raise WorkstreamError(str(exc)) from exc
@@ -3603,6 +3618,31 @@ def normalize_retrospective_judge(retrospective_judge: Any, *, checkout_path: Pa
     )
     if mount_rejection:
         raise WorkstreamError(mount_rejection)
+    return normalized
+
+
+def validate_retrospective_judge_mount_dir(
+    value: str,
+    field: str,
+    *,
+    checkout_path: Path | None,
+    checkout_paths: list[Path],
+) -> str:
+    if checkout_path is None:
+        path_value = Path(value)
+        if not path_value.is_absolute():
+            raise ValueError(f"{field} must be absolute")
+        if not path_value.is_dir():
+            raise ValueError(f"{field} must be an existing directory")
+        for checkout_boundary in checkout_paths:
+            if path_is_equal_to_or_inside(path_value, checkout_boundary):
+                raise ValueError(f"{field} must be outside checkout")
+        return value
+    normalized = validate_absolute_dir(value, field, checkout_path=checkout_path)
+    path_value = Path(normalized)
+    for checkout_boundary in checkout_paths:
+        if path_is_equal_to_or_inside(path_value, checkout_boundary):
+            raise ValueError(f"{field} must be outside checkout")
     return normalized
 
 
