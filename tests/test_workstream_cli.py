@@ -654,6 +654,84 @@ sys.exit(0)
             self.assertIn("Artifacts", body)
             self.assertIn(result["steps"][-1]["result_path"], body)
 
+    def test_workstream_reaches_validated_unpublished_with_real_reviewer_stdout_json(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repo = temp_path / "repo-src"
+            checkout = temp_path / "checkout"
+            ledger = temp_path / "ledger"
+            fake_calls = temp_path / "fake-calls.jsonl"
+            init_repo(repo)
+            fake_git = temp_path / "publisher-git"
+            fake_gh = temp_path / "publisher-gh"
+            write_executable(
+                fake_git,
+                f"""#!{sys.executable}
+from pathlib import Path
+Path({str(fake_calls)!r}).write_text("git should not run\\n", encoding="utf-8")
+""",
+            )
+            write_executable(
+                fake_gh,
+                f"""#!{sys.executable}
+from pathlib import Path
+Path({str(fake_calls)!r}).write_text("gh should not run\\n", encoding="utf-8")
+""",
+            )
+            reviewer_code = textwrap.dedent(
+                """
+                import json
+
+                print(json.dumps({"status": "pass", "summary": "stdout review passed", "findings": []}))
+                """
+            ).strip()
+            recipe = successful_recipe(temp_path, repo, checkout, fake_git, fake_gh)
+            recipe["publisher"] = {"enabled": False}
+            recipe["steps"][4]["input"]["reviewer"] = {
+                "type": "real-reviewer-command",
+                "command": [sys.executable, "-c", reviewer_code],
+                "timeout_seconds": 10,
+            }
+
+            completed = run_afk(
+                "run-workstream",
+                "--workstream-id",
+                "central-lve.9",
+                "--input",
+                json.dumps(recipe),
+                "--ledger",
+                str(ledger),
+                env_overrides={
+                    "GIT_ALLOW_PROTOCOL": "file",
+                    "GIT_AUTHOR_NAME": "AFK Test",
+                    "GIT_AUTHOR_EMAIL": "afk-test@example.test",
+                    "GIT_COMMITTER_NAME": "AFK Test",
+                    "GIT_COMMITTER_EMAIL": "afk-test@example.test",
+                },
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            result = json.loads((ledger / summary["result_path"]).read_text(encoding="utf-8"))
+            review_step = next(step for step in result["steps"] if step["name"] == "review")
+            review_result = json.loads(
+                (ledger / "runs" / review_step["run_id"] / "reviewer-result.json").read_text(encoding="utf-8")
+            )
+
+            self.assertEqual(summary["status"], "validated-unpublished")
+            self.assertEqual(result["status"], "validated-unpublished")
+            self.assertEqual(result["publication"]["status"], "validated-unpublished")
+            self.assertEqual(
+                [step["name"] for step in result["steps"]],
+                ["select-work", "prepare-checkout", "implement", "validate", "review"],
+            )
+            self.assertEqual(result["selected_work"][0]["result"], "passed")
+            self.assertEqual(review_result["result"]["status"], "passed")
+            self.assertEqual(review_result["result"]["adapter"]["type"], "real-reviewer-command")
+            self.assertEqual(review_result["result"]["evidence"]["result_source"], "stdout_fallback")
+            self.assertEqual(review_result["result"]["evidence"]["result_file_present"], False)
+            self.assertFalse(fake_calls.exists())
+
     def test_workstream_terminal_merge_decision_closes_tracker_without_republishing(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)

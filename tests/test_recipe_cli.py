@@ -251,7 +251,7 @@ class GenerateRecipeCliTest(unittest.TestCase):
             )
 
             reviewer = recipe["steps"][4]["input"]["reviewer"]
-            self.assertEqual(reviewer["type"], "fake-reviewer-command")
+            self.assertEqual(reviewer["type"], "real-reviewer-command")
             self.assertEqual(
                 reviewer["command"],
                 build_pi_print_command(
@@ -999,7 +999,7 @@ class GenerateRecipeCliTest(unittest.TestCase):
             self.assertEqual(completed.returncode, 0, completed.stderr)
             recipe = json.loads(output.read_text(encoding="utf-8"))
             reviewer = recipe["steps"][4]["input"]["reviewer"]
-            self.assertEqual(reviewer["type"], "fake-reviewer-command")
+            self.assertEqual(reviewer["type"], "real-reviewer-command")
             self.assertEqual(
                 reviewer["command"],
                 build_pi_print_command(

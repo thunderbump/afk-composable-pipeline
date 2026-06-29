@@ -1797,6 +1797,7 @@ sys.exit(0)
             payload = json.loads(completed.stdout)
             self.assertEqual(len(payload["selection_result"]["selected_work"]), 1)
             review_input = payload["recipe"]["steps"][4]["input"]["reviewer"]
+            self.assertEqual(review_input["type"], "real-reviewer-command")
             self.assertEqual(
                 review_input["command"],
                 build_pi_print_command(
@@ -2099,6 +2100,7 @@ raise SystemExit(1)
             )
 
             review_input = payload["recipe"]["steps"][4]["input"]["reviewer"]
+            self.assertEqual(review_input["type"], "real-reviewer-command")
             self.assertEqual(
                 review_input["command"],
                 build_pi_print_command(

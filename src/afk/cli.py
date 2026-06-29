@@ -706,7 +706,7 @@ def recipe_reviewer_from_args(
         if reviewer_timeout <= 0:
             raise ValueError("--reviewer-timeout-seconds must be greater than zero")
         return {
-            "type": "fake-reviewer-command",
+            "type": "real-reviewer-command",
             "command": command,
             "timeout_seconds": reviewer_timeout,
             **build_provider_pi_mount_config(
