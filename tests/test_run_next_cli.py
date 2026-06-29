@@ -118,6 +118,8 @@ class RunNextCliTest(unittest.TestCase):
             "/tmp/checkouts/bump-EQEmu",
             "--validation-profile",
             "tier1",
+                "--role-profile",
+                "fake-local",
             "--ledger",
             "/tmp/ledger",
         )
@@ -146,6 +148,8 @@ class RunNextCliTest(unittest.TestCase):
                 str(checkout_path),
                 "--validation-profile",
                 "tier1",
+                "--role-profile",
+                "fake-local",
                 "--ledger",
                 str(temp_path / "ledger"),
             )
@@ -193,6 +197,8 @@ raise SystemExit(9)
                 str(checkout_path),
                 "--validation-profile",
                 "tier1",
+                "--role-profile",
+                "fake-local",
                 "--ledger",
                 str(temp_path / "ledger"),
                 env={"GH_TOKEN": None, "GITHUB_TOKEN": None, "PATH": str(fake_bin)},
@@ -222,6 +228,62 @@ raise SystemExit(9)
                 [status["status"] for status in payload["selection_result"]["source_statuses"]],
                 ["skipped_no_auth", "skipped_no_auth"],
             )
+
+    def test_run_next_production_preview_preserves_no_candidate_selection_output_without_pi_auth_mounts(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            fake_bin = temp_path / "bin"
+            beads_workspace = temp_path / "beads"
+            checkout_root = temp_path / "checkouts"
+            checkout_path = checkout_root / "bump-EQEmu"
+            beads_workspace.mkdir()
+            fake_bin.mkdir()
+            write_executable(
+                fake_bin / "gh",
+                f"""#!{sys.executable}
+import sys
+
+if sys.argv[1:3] == ["auth", "status"]:
+    sys.exit(1)
+raise SystemExit(9)
+""",
+            )
+            write_executable(
+                fake_bin / "bd",
+                f"""#!{sys.executable}
+raise SystemExit(9)
+""",
+            )
+
+            completed = run_afk(
+                "run-next",
+                "--project",
+                "bump-eqemu",
+                "--contracts-dir",
+                "project-contracts",
+                "--beads-workspace",
+                str(beads_workspace),
+                "--checkout-root",
+                str(checkout_root),
+                "--checkout-path",
+                str(checkout_path),
+                "--validation-profile",
+                "tier1",
+                "--ledger",
+                str(temp_path / "ledger"),
+                env={"GH_TOKEN": None, "GITHUB_TOKEN": None, "PATH": str(fake_bin)},
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            payload = json.loads(completed.stdout)
+            self.assertEqual(payload["selector"]["selected"], None)
+            self.assertEqual(payload["selector"]["rationale"], "no candidates")
+            self.assertEqual(payload["selection_result"]["selected_work"], [])
+            self.assertEqual(
+                [status["status"] for status in payload["selection_result"]["source_statuses"]],
+                ["skipped_no_auth", "skipped_no_auth"],
+            )
+            self.assertIsNone(payload["recipe"])
 
     def test_run_next_targets_afk_composable_pipeline_with_first_party_contract(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -281,6 +343,8 @@ else:
                 str(checkout_path),
                 "--validation-profile",
                 "tier1",
+                "--role-profile",
+                "fake-local",
                 "--ledger",
                 str(temp_path / "ledger"),
                 env={"GH_TOKEN": None, "GITHUB_TOKEN": None, "PATH": str(fake_bin)},
@@ -318,8 +382,342 @@ else:
                     "checkout_path": str(checkout_path),
                 },
             )
-            implement = next(step for step in recipe["steps"] if step["name"] == "implement")
-            validate = next(step for step in recipe["steps"] if step["name"] == "validate")
+
+    def test_run_next_defaults_to_production_pi_roles_when_mounts_are_present(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            fake_bin = temp_path / "bin"
+            beads_workspace = temp_path / "beads"
+            checkout_root = temp_path / "checkouts"
+            checkout_path = checkout_root / "bump-EQEmu"
+            codex_home = temp_path / "codex-home"
+            config_home = temp_path / "xdg-config"
+            pi_config_home = temp_path / "pi-config"
+            pi_coding_agent_dir = temp_path / "pi-coding-agent"
+            checkout_root.mkdir()
+            checkout_path.mkdir()
+            beads_workspace.mkdir()
+            fake_bin.mkdir()
+            codex_home.mkdir()
+            config_home.mkdir()
+            pi_config_home.mkdir()
+            pi_coding_agent_dir.mkdir()
+            secret_dir = beads_workspace / "secrets"
+            secret_dir.mkdir(parents=True)
+            secret_dir.joinpath("dolt_beads_password.txt").write_text("beads-secret", encoding="utf-8")
+
+            write_executable(
+                fake_bin / "gh",
+                "#!%s\nraise SystemExit(1)\n" % sys.executable,
+            )
+            write_executable(
+                fake_bin / "bd",
+                "#!%s\n"
+                "import json\n"
+                "import sys\n"
+                "if sys.argv[1:2] == ['list']:\n"
+                "    print(json.dumps([{'id': 'central-lve.11'}]))\n"
+                "elif sys.argv[1:2] == ['show']:\n"
+                "    print(json.dumps({\n"
+                "        'id': 'central-lve.11',\n"
+                "        'title': 'Generated pi defaults',\n"
+                "        'status': 'open',\n"
+                "        'labels': ['project:bump-eqemu', 'ready-for-agent'],\n"
+                "        'metadata': {'workstream': 'central-lve', 'afk.ready': True},\n"
+                "        'acceptance_criteria': ['generated by test'],\n"
+                "    }))\n"
+                "else:\n"
+                "    raise SystemExit(9)\n" % sys.executable,
+            )
+
+            completed = run_afk(
+                "run-next",
+                "--project",
+                "bump-eqemu",
+                "--contracts-dir",
+                "project-contracts",
+                "--beads-workspace",
+                str(beads_workspace),
+                "--checkout-root",
+                str(checkout_root),
+                "--checkout-path",
+                str(checkout_path),
+                "--validation-profile",
+                "tier1",
+                "--agent-codex-home",
+                str(codex_home),
+                "--agent-config-home",
+                str(config_home),
+                "--agent-pi-config-home",
+                str(pi_config_home),
+                "--agent-pi-coding-agent-dir",
+                str(pi_coding_agent_dir),
+                env={"GH_TOKEN": None, "GITHUB_TOKEN": None, "PATH": str(fake_bin)},
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            payload = json.loads(completed.stdout)
+
+            implement_agent = payload["recipe"]["steps"][2]["input"]["agent"]
+            self.assertEqual(implement_agent["type"], "real-agent-command")
+            self.assertEqual(
+                implement_agent["command"],
+                ["pi", "-p", "{prompt}", "--provider", "openai-codex", "--model", "gpt-5.4"],
+            )
+            self.assertEqual(
+                implement_agent["env"],
+                {
+                    "PI_CONFIG_HOME": str(pi_config_home),
+                    "PI_CODING_AGENT_DIR": str(pi_coding_agent_dir),
+                },
+            )
+
+            reviewer = payload["recipe"]["steps"][4]["input"]["reviewer"]
+            self.assertEqual(
+                reviewer["command"],
+                build_pi_print_command(
+                    pi_bin="pi",
+                    provider="openai-codex",
+                    model="gpt-5.4",
+                ),
+            )
+            self.assertEqual(reviewer["timeout_seconds"], 30)
+
+            retrospective_judge = payload["recipe"]["retrospective_judge"]
+            self.assertEqual(
+                retrospective_judge["command"],
+                build_pi_print_command(
+                    pi_bin="pi",
+                    provider="openai-codex",
+                    model="gpt-5.4",
+                ),
+            )
+            self.assertEqual(retrospective_judge["timeout_seconds"], 120)
+
+    def test_run_next_preview_preserves_production_recipe_without_pi_auth_mounts(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            fake_bin = temp_path / "bin"
+            beads_workspace = temp_path / "beads"
+            checkout_root = temp_path / "checkouts"
+            checkout_path = checkout_root / "bump-EQEmu"
+            checkout_root.mkdir()
+            checkout_path.mkdir()
+            beads_workspace.mkdir()
+            fake_bin.mkdir()
+            secret_dir = beads_workspace / "secrets"
+            secret_dir.mkdir(parents=True)
+            secret_dir.joinpath("dolt_beads_password.txt").write_text("beads-secret", encoding="utf-8")
+
+            write_executable(
+                fake_bin / "gh",
+                "#!%s\nraise SystemExit(1)\n" % sys.executable,
+            )
+            write_executable(
+                fake_bin / "bd",
+                "#!%s\n"
+                "import json\n"
+                "import sys\n"
+                "if sys.argv[1:2] == ['list']:\n"
+                "    print(json.dumps([{'id': 'central-lve.11'}]))\n"
+                "elif sys.argv[1:2] == ['show']:\n"
+                "    print(json.dumps({\n"
+                "        'id': 'central-lve.11',\n"
+                "        'title': 'Generated pi defaults without mounts',\n"
+                "        'status': 'open',\n"
+                "        'labels': ['project:bump-eqemu', 'ready-for-agent'],\n"
+                "        'metadata': {'workstream': 'central-lve', 'afk.ready': True},\n"
+                "        'acceptance_criteria': ['generated by test'],\n"
+                "    }))\n"
+                "else:\n"
+                "    raise SystemExit(9)\n" % sys.executable,
+            )
+
+            completed = run_afk(
+                "run-next",
+                "--project",
+                "bump-eqemu",
+                "--contracts-dir",
+                "project-contracts",
+                "--beads-workspace",
+                str(beads_workspace),
+                "--checkout-root",
+                str(checkout_root),
+                "--checkout-path",
+                str(checkout_path),
+                "--validation-profile",
+                "tier1",
+                env={"GH_TOKEN": None, "GITHUB_TOKEN": None, "PATH": str(fake_bin)},
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            payload = json.loads(completed.stdout)
+
+            self.assertEqual(payload["selector"]["selected"]["external_id"], "central-lve.11")
+            self.assertIsNone(payload["workstream_result"])
+            self.assertEqual(payload["selection_result"]["selected_work"][0]["external_id"], "central-lve.11")
+
+            implement_agent = payload["recipe"]["steps"][2]["input"]["agent"]
+            self.assertEqual(implement_agent["type"], "real-agent-command")
+            self.assertEqual(
+                implement_agent["command"],
+                ["pi", "-p", "{prompt}", "--provider", "openai-codex", "--model", "gpt-5.4"],
+            )
+            self.assertNotIn("codex_home", implement_agent)
+            self.assertNotIn("config_home", implement_agent)
+            self.assertNotIn("env", implement_agent)
+
+            reviewer = payload["recipe"]["steps"][4]["input"]["reviewer"]
+            self.assertEqual(
+                reviewer["command"],
+                build_pi_print_command(
+                    pi_bin="pi",
+                    provider="openai-codex",
+                    model="gpt-5.4",
+                ),
+            )
+            self.assertNotIn("codex_home", reviewer)
+            self.assertNotIn("config_home", reviewer)
+            self.assertNotIn("env", reviewer)
+
+            retrospective_judge = payload["recipe"]["retrospective_judge"]
+            self.assertEqual(
+                retrospective_judge["command"],
+                build_pi_print_command(
+                    pi_bin="pi",
+                    provider="openai-codex",
+                    model="gpt-5.4",
+                ),
+            )
+            self.assertNotIn("codex_home", retrospective_judge)
+            self.assertNotIn("config_home", retrospective_judge)
+            self.assertNotIn("env", retrospective_judge)
+
+    def test_run_next_execute_production_defaults_fail_without_pi_auth_mounts(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            fake_bin = temp_path / "bin"
+            beads_workspace = temp_path / "beads"
+            checkout_root = temp_path / "checkouts"
+            checkout_path = checkout_root / "bump-EQEmu"
+            ledger = temp_path / "ledger"
+            checkout_root.mkdir()
+            checkout_path.mkdir()
+            beads_workspace.mkdir()
+            fake_bin.mkdir()
+            secret_dir = beads_workspace / "secrets"
+            secret_dir.mkdir(parents=True)
+            secret_dir.joinpath("dolt_beads_password.txt").write_text("beads-secret", encoding="utf-8")
+
+            write_executable(
+                fake_bin / "gh",
+                "#!%s\nraise SystemExit(1)\n" % sys.executable,
+            )
+            write_executable(
+                fake_bin / "bd",
+                "#!%s\n"
+                "import json\n"
+                "import sys\n"
+                "if sys.argv[1:2] == ['list']:\n"
+                "    print(json.dumps([{'id': 'central-lve.11'}]))\n"
+                "elif sys.argv[1:2] == ['show']:\n"
+                "    print(json.dumps({\n"
+                "        'id': 'central-lve.11',\n"
+                "        'title': 'Generated pi defaults without mounts',\n"
+                "        'status': 'open',\n"
+                "        'labels': ['project:bump-eqemu', 'ready-for-agent'],\n"
+                "        'metadata': {'workstream': 'central-lve', 'afk.ready': True},\n"
+                "        'acceptance_criteria': ['generated by test'],\n"
+                "    }))\n"
+                "else:\n"
+                "    raise SystemExit(9)\n" % sys.executable,
+            )
+
+            completed = run_afk(
+                "run-next",
+                "--project",
+                "bump-eqemu",
+                "--contracts-dir",
+                "project-contracts",
+                "--beads-workspace",
+                str(beads_workspace),
+                "--checkout-root",
+                str(checkout_root),
+                "--checkout-path",
+                str(checkout_path),
+                "--validation-profile",
+                "tier1",
+                "--ledger",
+                str(ledger),
+                "--execute",
+                env={"GH_TOKEN": None, "GITHUB_TOKEN": None, "PATH": str(fake_bin)},
+            )
+
+            self.assertNotEqual(completed.returncode, 0, completed.stdout)
+            self.assertIn("agent.codex_home is required", completed.stderr)
+
+    def test_run_next_fake_local_role_profile_preserves_fake_adapters(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            fake_bin = temp_path / "bin"
+            beads_workspace = temp_path / "beads"
+            checkout_root = temp_path / "checkouts"
+            checkout_path = checkout_root / "bump-EQEmu"
+            beads_workspace.mkdir()
+            fake_bin.mkdir()
+            secret_dir = beads_workspace / "secrets"
+            secret_dir.mkdir(parents=True)
+            secret_dir.joinpath("dolt_beads_password.txt").write_text("beads-secret", encoding="utf-8")
+            write_executable(
+                fake_bin / "gh",
+                "#!%s\nraise SystemExit(1)\n" % sys.executable,
+            )
+            write_executable(
+                fake_bin / "bd",
+                "#!%s\n"
+                "import json\n"
+                "import sys\n"
+                "if sys.argv[1:2] == ['list']:\n"
+                "    print(json.dumps([{'id': 'central-lve.11'}]))\n"
+                "elif sys.argv[1:2] == ['show']:\n"
+                "    print(json.dumps({\n"
+                "        'id': 'central-lve.11',\n"
+                "        'title': 'Generated fake defaults',\n"
+                "        'status': 'open',\n"
+                "        'labels': ['project:bump-eqemu', 'ready-for-agent'],\n"
+                "        'metadata': {'workstream': 'central-lve', 'afk.ready': True},\n"
+                "        'acceptance_criteria': ['generated by test'],\n"
+                "    }))\n"
+                "else:\n"
+                "    raise SystemExit(9)\n" % sys.executable,
+            )
+
+            completed = run_afk(
+                "run-next",
+                "--project",
+                "bump-eqemu",
+                "--contracts-dir",
+                "project-contracts",
+                "--beads-workspace",
+                str(beads_workspace),
+                "--checkout-root",
+                str(checkout_root),
+                "--checkout-path",
+                str(checkout_path),
+                "--validation-profile",
+                "tier1",
+                "--role-profile",
+                "fake-local",
+                env={"GH_TOKEN": None, "GITHUB_TOKEN": None, "PATH": str(fake_bin)},
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            payload = json.loads(completed.stdout)
+            self.assertEqual(payload["recipe"]["steps"][2]["input"]["agent"]["type"], "fake-pi-command")
+            self.assertEqual(payload["recipe"]["steps"][4]["input"]["reviewer"]["type"], "fake-reviewer-command")
+            self.assertNotIn("retrospective_judge", payload["recipe"])
+            implement = next(step for step in payload["recipe"]["steps"] if step["name"] == "implement")
+            validate = next(step for step in payload["recipe"]["steps"] if step["name"] == "validate")
             self.assertEqual(implement["input"]["validation"]["profile"], "tier1")
             self.assertEqual(validate["profile"], "tier1")
             self.assertEqual(validate["input"]["validation"]["profile"], "tier1")
@@ -832,6 +1230,8 @@ else:
                 str(checkout_path),
                 "--validation-profile",
                 "tier1",
+                "--role-profile",
+                "fake-local",
                 env={"GH_TOKEN": None, "GITHUB_TOKEN": None, "PATH": str(fake_bin)},
             )
 
@@ -922,6 +1322,8 @@ else:
                 str(checkout_path),
                 "--validation-profile",
                 "tier1",
+                "--role-profile",
+                "fake-local",
                 "--validation-mode",
                 "project-worker",
                 "--validation-stack-path",
@@ -1017,6 +1419,8 @@ else:
                 str(checkout_path),
                 "--validation-profile",
                 "tier1",
+                "--role-profile",
+                "fake-local",
                 "--agent-mode",
                 "pi",
                 "--agent-pi-bin",
@@ -1189,6 +1593,8 @@ else:
                 str(checkout_path),
                 "--validation-profile",
                 "tier1",
+                "--role-profile",
+                "fake-local",
                 "--validation-mode",
                 "project-worker",
                 "--validation-stack-path",
@@ -1269,6 +1675,8 @@ sys.exit(0)
                 str(checkout_path),
                 "--validation-profile",
                 "tier1",
+                "--role-profile",
+                "fake-local",
                 "--agent-mode",
                 "pi",
                 "--agent-pi-model",
@@ -1348,6 +1756,8 @@ sys.exit(0)
                 str(checkout_path),
                 "--validation-profile",
                 "tier1",
+                "--role-profile",
+                "fake-local",
                 "--agent-mode",
                 "fake",
                 "--reviewer-mode",
@@ -1466,6 +1876,8 @@ print(json.dumps({{"schema_version":1,"source_statuses":[],"selected_work":[],"s
                 str(checkout_path),
                 "--validation-profile",
                 "tier1",
+                "--role-profile",
+                "fake-local",
                 "--reviewer-mode",
                 "pi",
                 "--reviewer-pi-model",
@@ -1517,6 +1929,8 @@ print(json.dumps({{"schema_version":1,"source_statuses":[],"selected_work":[],"s
                 str(checkout_path),
                 "--validation-profile",
                 "tier1",
+                "--role-profile",
+                "fake-local",
                 "--retrospective-judge-mode",
                 "pi",
                 "--retrospective-judge-pi-model",
@@ -1590,6 +2004,8 @@ raise SystemExit(1)
                 str(checkout_path),
                 "--validation-profile",
                 "tier1",
+                "--role-profile",
+                "fake-local",
                 "--agent-mode",
                 "pi",
                 "--agent-pi-bin",
@@ -1812,6 +2228,8 @@ raise SystemExit(9)
                         str(checkout_path),
                         "--validation-profile",
                         "tier1",
+                "--role-profile",
+                "fake-local",
                         *extra_args,
                         env={"GH_TOKEN": None, "GITHUB_TOKEN": None, "PATH": str(fake_bin)},
                     )
@@ -1865,6 +2283,8 @@ raise SystemExit(9)
                 str(checkout_path),
                 "--validation-profile",
                 "tier1",
+                "--role-profile",
+                "fake-local",
                 "--publisher-mode",
                 "create",
                 "--publisher-repo",

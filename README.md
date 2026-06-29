@@ -318,23 +318,51 @@ PYTHONPATH=src python3 -m afk generate-recipe \
   --checkout-root /work \
   --checkout-path /work/bump-EQEmu \
   --validation-profile tier1 \
+  --agent-codex-home /work/mounts/codex-home \
+  --agent-config-home /work/mounts/xdg-config \
+  --agent-pi-config-home /work/mounts/pi-config \
+  --agent-pi-coding-agent-dir /work/mounts/pi-coding-agent \
   --output recipes/central-afk-pr.1.json
 ```
 
 The generated recipe is inspectable JSON for `afk run-workstream --input`.
 It uses the contract repo URL/base branch, explicit Beads workspace and checkout
 mounts, a `target_ids` selector for the requested Beads item, the named
-validation profile, local fake implementation/validation/review adapters, and
-`"publisher": {"enabled": false}`. Replace the local adapters or publisher only
-when real worker/publisher credentials are intentionally available; the
-generator does not invent credentials.
+validation profile, production role defaults for Pi-backed implementation,
+review, and retrospective judging, and `"publisher": {"enabled": false}`.
+Without per-role override flags, `generate-recipe` now assumes
+`--role-profile production`, which uses `pi --provider openai-codex --model
+gpt-5.4` for those roles and requires the shared auth/config mounts shown
+above. Missing mounts fail fast with actionable `agent.*`, `reviewer.*`, or
+`retrospective_judge.*` errors instead of silently falling back to fake roles.
+
+For tests, CI fixtures, or local smoke runs that should stay offline, pass
+`--role-profile fake-local`. That preserves fake implementation/review adapters
+and leaves the retrospective judge disabled unless you explicitly opt back into
+Pi roles:
+
+```sh
+PYTHONPATH=src python3 -m afk generate-recipe \
+  --workstream-id central-afk-pr.1 \
+  --project bump-eqemu \
+  --contracts-dir project-contracts \
+  --ledger ledger \
+  --beads-workspace /home/bump/Projects/beads \
+  --checkout-root /work \
+  --checkout-path /work/bump-EQEmu \
+  --validation-profile tier1 \
+  --role-profile fake-local \
+  --output recipes/central-afk-pr.1.json
+```
 
 For a real Pi implementation worker using Codex subscription auth, pass
-`--agent-mode pi` with the usual `--agent-codex-home`, `--agent-config-home`,
-and legacy `--agent-pi-config-home` mounts, plus
+the usual `--agent-codex-home`, `--agent-config-home`, and legacy
+`--agent-pi-config-home` mounts, plus
 `--agent-pi-coding-agent-dir /path/outside/checkout`. The generated recipe will
 emit `PI_CODING_AGENT_DIR` for Pi's agent auth lookup and will not emit
-`--api-key`, `OPENAI_API_KEY`, or token values.
+`--api-key`, `OPENAI_API_KEY`, or token values. Override `--agent-mode`,
+`--reviewer-mode`, or `--retrospective-judge-mode` only when you need something
+other than the role profile defaults.
 
 For `--validation-mode project-worker`, the generator embeds the worker host
 contract into `steps[].input.validation`. By default that keeps
@@ -361,7 +389,11 @@ PYTHONPATH=src python3 -m afk run-next \
   --beads-workspace /home/bump/Projects/beads \
   --checkout-root /work \
   --checkout-path /work/bump-EQEmu \
-  --validation-profile tier1
+  --validation-profile tier1 \
+  --agent-codex-home /work/mounts/codex-home \
+  --agent-config-home /work/mounts/xdg-config \
+  --agent-pi-config-home /work/mounts/pi-config \
+  --agent-pi-coding-agent-dir /work/mounts/pi-coding-agent
 ```
 
 To preview this pipeline repo against its own first-party contract, switch the
@@ -374,7 +406,11 @@ PYTHONPATH=src python3 -m afk run-next \
   --beads-workspace /home/bump/Projects/beads \
   --checkout-root /work \
   --checkout-path /work/afk-composable-pipeline \
-  --validation-profile tier1
+  --validation-profile tier1 \
+  --agent-codex-home /work/mounts/codex-home \
+  --agent-config-home /work/mounts/xdg-config \
+  --agent-pi-config-home /work/mounts/pi-config \
+  --agent-pi-coding-agent-dir /work/mounts/pi-coding-agent
 ```
 
 `--beads-workspace` must point at the central Beads workspace, not a
@@ -392,6 +428,17 @@ the lightweight model names `gpt-5.3-codex-spark` and `gpt-5.4-mini`; if the
 model call fails or returns an invalid choice, it falls back to deterministic
 selection.
 
+Like `generate-recipe`, `run-next` defaults to `--role-profile production`.
+That means the emitted recipe uses Pi-backed implementation, reviewer, and
+retrospective-judge roles unless you override them explicitly. Preview-only
+`run-next` still emits selection status plus a production-shaped recipe even
+when the Codex/Pi mount flags are absent, which keeps `source_statuses`,
+`no-candidates`, and recipe inspection usable in unprovisioned environments.
+When you add `--execute`, `run-next` validates the required mounts up front and
+fails fast with a direct mount-validation error if they are missing. Use
+`--role-profile fake-local` for offline smoke runs, fixture tests, and other
+cases where fake adapters are still the right default.
+
 For `bump-eqemu`, GitHub Issues are effectively disabled, so Beads are the
 practical source there for now. The command still includes the GitHub source
 when the contract repo points at GitHub, and it will skip cleanly when auth is
@@ -402,10 +449,10 @@ does not execute it unless `--execute` is set. For a safe dogfood run, validate
 the preview payload in CI or locally first, then add `--execute` in a controlled
 runner.
 
-When using `--agent-mode pi`, `--reviewer-mode pi`, and `--retrospective-judge-mode
-pi`, all worker model flags are validated with the same cap:
-`gpt-5.4` or lower. Examples in this repo use `gpt-5.4-mini` for lightweight
-and `gpt-5.4` for conservative judge/reviewer workloads.
+When using Pi-backed roles, all worker model flags are validated with the same
+cap: `gpt-5.4` or lower. The production role profile defaults to `gpt-5.4` for
+implementation, review, and retrospective judge. The lightweight selector path
+stays limited to `gpt-5.3-codex-spark` and `gpt-5.4-mini`.
 
 `--agent-ponytail`, `--reviewer-ponytail`, and
 `--retrospective-judge-ponytail` all map to the same bundled extension source
@@ -493,8 +540,14 @@ locally with the same directories AFK will pass through:
 PI_CODING_AGENT_DIR=/path/outside/checkout \
 PI_CONFIG_HOME=/path/outside/checkout \
 CODEX_HOME=/path/outside/checkout \
-pi --provider openai-codex --model gpt-5.4-mini --no-session --no-tools -p "Reply with OK only."
+pi --provider openai-codex --model gpt-5.4 --no-session --no-tools -p "Reply with OK only."
 ```
+
+The same mount set is required for the production-default `generate-recipe`
+path and for `run-next --execute`. Preview-only `run-next` can still emit an
+inspectable production-shaped recipe without the Pi auth mounts. If you only
+want inspectable fake recipes locally, use `--role-profile fake-local` and
+skip the Pi auth mounts entirely.
 
 If that smoke command fails, refresh or repair Pi auth outside git before
 rerunning AFK, for example by launching interactive `pi` with the same

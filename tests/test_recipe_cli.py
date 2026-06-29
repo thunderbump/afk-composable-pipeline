@@ -124,6 +124,8 @@ class GenerateRecipeCliTest(unittest.TestCase):
                 str(checkout_path),
                 "--validation-profile",
                 "tier1",
+                "--role-profile",
+                "fake-local",
                 "--output",
                 str(output),
             )
@@ -176,6 +178,189 @@ class GenerateRecipeCliTest(unittest.TestCase):
             self.assertEqual(reviewer["timeout_seconds"], 30)
             self.assertNotIn("retrospective_judge", recipe)
 
+    def test_generate_recipe_defaults_to_production_pi_roles_when_mounts_are_present(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            contracts_dir = temp_path / "contracts"
+            repo = temp_path / "repo-src"
+            output = temp_path / "recipe.json"
+            ledger = temp_path / "ledger"
+            beads_workspace = temp_path / "central-beads"
+            checkout_root = temp_path / "checkouts"
+            checkout_path = checkout_root / "demo"
+            codex_home = temp_path / "codex-home"
+            config_home = temp_path / "xdg-config"
+            pi_config_home = temp_path / "pi-config"
+            pi_coding_agent_dir = temp_path / "pi-coding-agent"
+            contracts_dir.mkdir()
+            init_repo(repo)
+            write_contract(contracts_dir / "demo.json", project_slug="demo", repo_url=str(repo))
+            beads_workspace.mkdir()
+            codex_home.mkdir()
+            config_home.mkdir()
+            pi_config_home.mkdir()
+            pi_coding_agent_dir.mkdir()
+
+            completed = run_afk(
+                "generate-recipe",
+                "--workstream-id",
+                "central-anh.6",
+                "--project",
+                "demo",
+                "--contracts-dir",
+                str(contracts_dir),
+                "--ledger",
+                str(ledger),
+                "--beads-workspace",
+                str(beads_workspace),
+                "--checkout-root",
+                str(checkout_root),
+                "--checkout-path",
+                str(checkout_path),
+                "--validation-profile",
+                "tier1",
+                "--agent-codex-home",
+                str(codex_home),
+                "--agent-config-home",
+                str(config_home),
+                "--agent-pi-config-home",
+                str(pi_config_home),
+                "--agent-pi-coding-agent-dir",
+                str(pi_coding_agent_dir),
+                "--output",
+                str(output),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            recipe = json.loads(output.read_text(encoding="utf-8"))
+
+            implement_agent = recipe["steps"][2]["input"]["agent"]
+            self.assertEqual(implement_agent["type"], "real-agent-command")
+            self.assertEqual(
+                implement_agent["command"],
+                ["pi", "-p", "{prompt}", "--provider", "openai-codex", "--model", "gpt-5.4"],
+            )
+            self.assertEqual(implement_agent["codex_home"], str(codex_home))
+            self.assertEqual(implement_agent["config_home"], str(config_home))
+            self.assertEqual(
+                implement_agent["env"],
+                {
+                    "PI_CONFIG_HOME": str(pi_config_home),
+                    "PI_CODING_AGENT_DIR": str(pi_coding_agent_dir),
+                },
+            )
+
+            reviewer = recipe["steps"][4]["input"]["reviewer"]
+            self.assertEqual(reviewer["type"], "fake-reviewer-command")
+            self.assertEqual(
+                reviewer["command"],
+                build_pi_print_command(
+                    pi_bin="pi",
+                    provider="openai-codex",
+                    model="gpt-5.4",
+                ),
+            )
+            self.assertEqual(reviewer["timeout_seconds"], 30)
+
+            retrospective_judge = recipe["retrospective_judge"]
+            self.assertEqual(retrospective_judge["enabled"], True)
+            self.assertEqual(retrospective_judge["type"], "local-command")
+            self.assertEqual(
+                retrospective_judge["command"],
+                build_pi_print_command(
+                    pi_bin="pi",
+                    provider="openai-codex",
+                    model="gpt-5.4",
+                ),
+            )
+            self.assertEqual(retrospective_judge["timeout_seconds"], 120)
+
+    def test_generate_recipe_fake_local_role_profile_preserves_fake_adapters(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            contracts_dir = temp_path / "contracts"
+            repo = temp_path / "repo-src"
+            output = temp_path / "recipe.json"
+            ledger = temp_path / "ledger"
+            beads_workspace = temp_path / "central-beads"
+            checkout_root = temp_path / "checkouts"
+            checkout_path = checkout_root / "demo"
+            contracts_dir.mkdir()
+            init_repo(repo)
+            write_contract(contracts_dir / "demo.json", project_slug="demo", repo_url=str(repo))
+            beads_workspace.mkdir()
+
+            completed = run_afk(
+                "generate-recipe",
+                "--workstream-id",
+                "central-anh.6",
+                "--project",
+                "demo",
+                "--contracts-dir",
+                str(contracts_dir),
+                "--ledger",
+                str(ledger),
+                "--beads-workspace",
+                str(beads_workspace),
+                "--checkout-root",
+                str(checkout_root),
+                "--checkout-path",
+                str(checkout_path),
+                "--validation-profile",
+                "tier1",
+                "--role-profile",
+                "fake-local",
+                "--output",
+                str(output),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            recipe = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(recipe["steps"][2]["input"]["agent"]["type"], "fake-pi-command")
+            self.assertEqual(recipe["steps"][4]["input"]["reviewer"]["type"], "fake-reviewer-command")
+            self.assertNotIn("retrospective_judge", recipe)
+
+    def test_generate_recipe_production_default_fails_fast_without_pi_auth_mounts(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            contracts_dir = temp_path / "contracts"
+            repo = temp_path / "repo-src"
+            output = temp_path / "recipe.json"
+            ledger = temp_path / "ledger"
+            beads_workspace = temp_path / "central-beads"
+            checkout_root = temp_path / "checkouts"
+            checkout_path = checkout_root / "demo"
+            contracts_dir.mkdir()
+            init_repo(repo)
+            write_contract(contracts_dir / "demo.json", project_slug="demo", repo_url=str(repo))
+            beads_workspace.mkdir()
+
+            completed = run_afk(
+                "generate-recipe",
+                "--workstream-id",
+                "central-anh.6",
+                "--project",
+                "demo",
+                "--contracts-dir",
+                str(contracts_dir),
+                "--ledger",
+                str(ledger),
+                "--beads-workspace",
+                str(beads_workspace),
+                "--checkout-root",
+                str(checkout_root),
+                "--checkout-path",
+                str(checkout_path),
+                "--validation-profile",
+                "tier1",
+                "--output",
+                str(output),
+            )
+
+            self.assertNotEqual(completed.returncode, 0, completed.stdout)
+            self.assertIn("agent.codex_home is required", completed.stderr)
+            self.assertFalse(output.exists())
+
     def test_generate_recipe_writes_real_local_agent_and_enabled_publisher_when_requested(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
@@ -217,6 +402,8 @@ class GenerateRecipeCliTest(unittest.TestCase):
                 str(checkout_path),
                 "--validation-profile",
                 "tier1",
+                "--role-profile",
+                "fake-local",
                 "--agent-mode",
                 "real-local",
                 "--agent-command-json",
@@ -309,6 +496,8 @@ class GenerateRecipeCliTest(unittest.TestCase):
                 str(checkout_path),
                 "--validation-profile",
                 "tier1",
+                "--role-profile",
+                "fake-local",
                 "--agent-mode",
                 "pi",
                 "--agent-pi-bin",
@@ -415,6 +604,8 @@ class GenerateRecipeCliTest(unittest.TestCase):
                 str(checkout_path),
                 "--validation-profile",
                 "tier1",
+                "--role-profile",
+                "fake-local",
                 "--agent-mode",
                 "pi",
                 "--agent-pi-provider",
@@ -496,6 +687,8 @@ class GenerateRecipeCliTest(unittest.TestCase):
                 str(checkout_path),
                 "--validation-profile",
                 "tier1",
+                "--role-profile",
+                "fake-local",
                 "--agent-mode",
                 "pi",
                 "--agent-pi-provider",
@@ -564,6 +757,8 @@ class GenerateRecipeCliTest(unittest.TestCase):
                         str(checkout_path),
                         "--validation-profile",
                         "tier1",
+                "--role-profile",
+                "fake-local",
                         "--agent-mode",
                         "pi",
                         "--agent-pi-provider",
@@ -630,6 +825,8 @@ class GenerateRecipeCliTest(unittest.TestCase):
                 str(checkout_path),
                 "--validation-profile",
                 "tier1",
+                "--role-profile",
+                "fake-local",
                 "--agent-mode",
                 "pi",
                 "--agent-codex-home",
@@ -691,6 +888,8 @@ class GenerateRecipeCliTest(unittest.TestCase):
                 str(checkout_path),
                 "--validation-profile",
                 "tier1",
+                "--role-profile",
+                "fake-local",
                 "--agent-mode",
                 "pi",
                 "--agent-pi-model",
@@ -757,6 +956,8 @@ class GenerateRecipeCliTest(unittest.TestCase):
                 str(checkout_path),
                 "--validation-profile",
                 "tier1",
+                "--role-profile",
+                "fake-local",
                 "--agent-mode",
                 "fake",
                 "--reviewer-mode",
@@ -882,6 +1083,8 @@ class GenerateRecipeCliTest(unittest.TestCase):
                 str(checkout_path),
                 "--validation-profile",
                 "tier1",
+                "--role-profile",
+                "fake-local",
                 "--agent-mode",
                 "fake",
                 "--reviewer-mode",
@@ -959,6 +1162,8 @@ class GenerateRecipeCliTest(unittest.TestCase):
                 str(checkout_path),
                 "--validation-profile",
                 "tier1",
+                "--role-profile",
+                "fake-local",
                 "--reviewer-mode",
                 "pi",
                 "--reviewer-pi-model",
@@ -1022,6 +1227,8 @@ class GenerateRecipeCliTest(unittest.TestCase):
                 str(checkout_path),
                 "--validation-profile",
                 "tier1",
+                "--role-profile",
+                "fake-local",
                 "--retrospective-judge-mode",
                 "pi",
                 "--retrospective-judge-pi-model",
@@ -1073,6 +1280,8 @@ class GenerateRecipeCliTest(unittest.TestCase):
                 str(checkout_path),
                 "--validation-profile",
                 "tier1",
+                "--role-profile",
+                "fake-local",
                 "--agent-mode",
                 "fake",
                 "--reviewer-mode",
@@ -1136,6 +1345,8 @@ class GenerateRecipeCliTest(unittest.TestCase):
                 str(checkout_path),
                 "--validation-profile",
                 "tier1",
+                "--role-profile",
+                "fake-local",
                 "--agent-mode",
                 "fake",
                 "--retrospective-judge-mode",
@@ -1188,6 +1399,8 @@ class GenerateRecipeCliTest(unittest.TestCase):
                 str(checkout_path),
                 "--validation-profile",
                 "tier1",
+                "--role-profile",
+                "fake-local",
                 "--validation-mode",
                 "project-worker",
                 "--output",
@@ -1242,6 +1455,8 @@ class GenerateRecipeCliTest(unittest.TestCase):
                 str(checkout_path),
                 "--validation-profile",
                 "tier3-harness",
+                "--role-profile",
+                "fake-local",
                 "--validation-mode",
                 "project-worker",
                 "--output",
@@ -1289,6 +1504,8 @@ class GenerateRecipeCliTest(unittest.TestCase):
                 str(checkout_path),
                 "--validation-profile",
                 "tier3-harness",
+                "--role-profile",
+                "fake-local",
                 "--validation-mode",
                 "project-worker",
                 "--validation-stack-path",
@@ -1342,6 +1559,8 @@ class GenerateRecipeCliTest(unittest.TestCase):
                 str(checkout_path),
                 "--validation-profile",
                 "tier1",
+                "--role-profile",
+                "fake-local",
                 "--validation-mode",
                 "project-worker",
                 "--output",
@@ -1390,6 +1609,8 @@ class GenerateRecipeCliTest(unittest.TestCase):
                         str(checkout_path),
                         "--validation-profile",
                         "tier1",
+                "--role-profile",
+                "fake-local",
                         "--validation-mode",
                         mode,
                         "--validation-timeout-seconds",
@@ -1441,6 +1662,8 @@ class GenerateRecipeCliTest(unittest.TestCase):
                 str(checkout_path),
                 "--validation-profile",
                 "tier1",
+                "--role-profile",
+                "fake-local",
                 "--agent-mode",
                 "real-local",
                 "--agent-command-json",
@@ -1496,6 +1719,8 @@ class GenerateRecipeCliTest(unittest.TestCase):
                         checkout_path,
                         "--validation-profile",
                         "tier1",
+                "--role-profile",
+                "fake-local",
                         "--output",
                         str(output),
                     )
@@ -1537,6 +1762,8 @@ class GenerateRecipeCliTest(unittest.TestCase):
                 str(outside_checkout),
                 "--validation-profile",
                 "tier1",
+                "--role-profile",
+                "fake-local",
                 "--output",
                 str(output),
             )
@@ -1600,6 +1827,8 @@ class GenerateRecipeCliTest(unittest.TestCase):
                         str(checkout_path),
                         "--validation-profile",
                         "tier1",
+                "--role-profile",
+                "fake-local",
                         "--agent-mode",
                         "real-local",
                         "--agent-command-json",
@@ -1660,6 +1889,8 @@ class GenerateRecipeCliTest(unittest.TestCase):
                 str(checkout_root / "demo"),
                 "--validation-profile",
                 "tier1",
+                "--role-profile",
+                "fake-local",
                 "--output",
                 str(output),
             )
@@ -1744,6 +1975,8 @@ sys.exit(9)
                 str(checkout_path),
                 "--validation-profile",
                 "tier1",
+                "--role-profile",
+                "fake-local",
                 "--output",
                 str(output),
             )
@@ -1852,6 +2085,8 @@ sys.exit(9)
                 str(checkout_path),
                 "--validation-profile",
                 "tier1",
+                "--role-profile",
+                "fake-local",
                 "--output",
                 str(output),
             )
@@ -1943,6 +2178,8 @@ sys.exit(9)
                         str(checkout_root / name),
                         "--validation-profile",
                         "tier1",
+                "--role-profile",
+                "fake-local",
                         "--output",
                         str(output),
                     )
