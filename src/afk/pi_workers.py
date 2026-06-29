@@ -208,12 +208,6 @@ def non_openai_pi_mount_error(
     env: Mapping[str, str] | None,
     field_prefix: str,
 ) -> str | None:
-    pi_args = pi_command_args(command)
-    if pi_args is None:
-        return None
-    provider = pi_command_provider(command)
-    if provider == "openai-codex":
-        return None
     mounted_env = env or {}
     mounted = []
     if codex_home:
@@ -225,6 +219,9 @@ def non_openai_pi_mount_error(
     if mounted_env.get("PI_CODING_AGENT_DIR"):
         mounted.append(f"{field_prefix}.env.PI_CODING_AGENT_DIR")
     if not mounted:
+        return None
+    provider = pi_command_provider(command)
+    if provider == "openai-codex":
         return None
     verb = "is" if len(mounted) == 1 else "are"
     if provider is None:
