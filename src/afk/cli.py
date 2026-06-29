@@ -214,6 +214,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.execute and not args.ledger:
             parser.error("--ledger is required when --execute is set")
         try:
+            validation_input = recipe_validation_input_from_args(args, project_contract=project_contract)
             recipe_agent = recipe_agent_from_args(args, checkout_path=Path(args.checkout_path))
             reviewer = recipe_reviewer_from_args(args, checkout_path=Path(args.checkout_path))
             retrospective_judge = recipe_retrospective_judge_from_args(args, checkout_path=Path(args.checkout_path))
@@ -237,6 +238,7 @@ def main(argv: list[str] | None = None) -> int:
                 checkout_root=Path(args.checkout_root),
                 checkout_path=Path(args.checkout_path),
                 validation_profile=args.validation_profile,
+                validation_input=validation_input,
                 agent=recipe_agent,
                 reviewer=reviewer,
                 retrospective_judge=retrospective_judge,
@@ -347,6 +349,24 @@ def build_parser() -> argparse.ArgumentParser:
     run_next_parser.add_argument("--checkout-root", required=True, help="Explicit checkout root mount")
     run_next_parser.add_argument("--checkout-path", required=True, help="Explicit checkout path under checkout root")
     run_next_parser.add_argument("--validation-profile", required=True, help="Project validation profile name")
+    run_next_parser.add_argument(
+        "--validation-mode",
+        choices=("fake", "project-worker"),
+        default="fake",
+        help="Validation adapter mode to embed in the generated recipe",
+    )
+    run_next_parser.add_argument(
+        "--validation-timeout-seconds",
+        type=int,
+        help="Optional validation timeout in seconds",
+    )
+    run_next_parser.add_argument(
+        "--validation-stack-path",
+        help=(
+            "Absolute validation stack path for project-worker recipes. "
+            "Overrides the default host sibling contract when checkout_root is a nested mount."
+        ),
+    )
     run_next_parser.add_argument(
         "--ready-tag",
         default="ready-for-agent",
