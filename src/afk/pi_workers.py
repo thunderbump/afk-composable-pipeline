@@ -16,6 +16,7 @@ PONYTAIL_EXTENSION_SOURCE = "git:github.com/DietrichGebert/ponytail"
 MAX_MODEL_VERSION = (5, 4)
 MODEL_VERSION_PATTERN = re.compile(r"^gpt-(\d+)\.(\d+)(?:$|[-.])")
 SHELL_ASSIGNMENT_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=.*$")
+PYTHON_OPTIONS_WITH_SEPARATE_VALUES = frozenset({"-W", "-X", "--check-hash-based-pycs"})
 
 
 def build_pi_real_worker_agent(
@@ -451,6 +452,14 @@ def _python_module_pi_command_parts(command: list[str]) -> tuple[list[str], list
             if command[index + 1] != "pi":
                 return None
             return command[:index], command[index + 2 :]
+        if part in PYTHON_OPTIONS_WITH_SEPARATE_VALUES:
+            if index + 1 >= len(command):
+                return None
+            next_part = command[index + 1]
+            if next_part.startswith("-"):
+                return None
+            index += 2
+            continue
         if not part.startswith("-"):
             return None
         index += 1
