@@ -24,6 +24,7 @@ from afk.pi_workers import (
     validate_absolute_dir,
 )
 from afk.redaction import is_secret_command_flag, is_secret_key, is_secret_value, redact_artifact_value, redact_text
+from afk.recipes import branch_slug
 from afk.registry import StepResult
 
 
@@ -1283,6 +1284,17 @@ def publish_terminal_pr(
                 body=body,
             )
     except PublisherError as exc:
+        if git_push_result is not None:
+            details = dict(exc.details)
+            details.setdefault("git_push", git_push_result)
+            command_details = details.get("commands") if isinstance(details.get("commands"), dict) else {}
+            if git_push_command and "git_push" not in command_details:
+                command_details["git_push"] = git_push_command
+            if git_push_retry_command and "git_push_retry" not in command_details:
+                command_details["git_push_retry"] = git_push_retry_command
+            if command_details:
+                details["commands"] = command_details
+            exc.details = details
         return failed_publication(exc, normalized, auth=auth_artifact)
     result = {
         "schema_version": SCHEMA_VERSION,
@@ -1355,6 +1367,7 @@ def push_review_branch(
             "base_commit": retry_context["base_commit"],
             "local_head": retry_context["local_head"],
             "merge_base": retry_context["merge_base"],
+            "owned_branch": retry_context["owned_branch"],
         }
     )
     if not retry_context["eligible"]:
@@ -1438,6 +1451,7 @@ def afk_review_branch_retry_context(
     checkout_path: Path,
     auth: dict[str, Any],
 ) -> dict[str, Any]:
+    owned_branch = workstream_owned_afk_branch(normalized)
     lease_expected = publisher_remote_branch_oid(config, checkout_path=checkout_path, auth=auth)
     base_commit = publisher_resolved_commit(
         config["git_path"],
@@ -1462,6 +1476,10 @@ def afk_review_branch_retry_context(
         reason = "review branch retry is only allowed for afk/ branches"
     elif config["head"] != normalized["review_branch"]:
         reason = "publisher head does not match the normalized review branch"
+    elif not owned_branch:
+        reason = "workstream id is required to prove AFK review-branch ownership"
+    elif config["head"] != owned_branch:
+        reason = f"review branch does not match the workstream-owned AFK branch {owned_branch}"
     elif not lease_expected:
         reason = "remote review branch could not be resolved for retry"
     elif not base_commit:
@@ -1479,7 +1497,15 @@ def afk_review_branch_retry_context(
         "base_commit": base_commit,
         "local_head": local_head,
         "merge_base": merge_base,
+        "owned_branch": owned_branch,
     }
+
+
+def workstream_owned_afk_branch(normalized: dict[str, Any]) -> str:
+    workstream_id = string_field(normalized, "workstream_id") or ""
+    if not workstream_id:
+        return ""
+    return f"afk/{branch_slug(workstream_id)}"
 
 
 def checkout_start_commit(state: dict[str, Any]) -> str:
