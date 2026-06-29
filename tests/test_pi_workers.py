@@ -50,6 +50,38 @@ class PiWorkersTest(unittest.TestCase):
             ],
         )
 
+    def test_pi_preflight_command_preserves_python_module_interpreter_flags(self):
+        command = [
+            "python3",
+            "-I",
+            "-m",
+            "pi",
+            "-p",
+            "{prompt}",
+            "--provider",
+            "openai-codex",
+            "--model",
+            "gpt-5.4-mini",
+        ]
+
+        self.assertEqual(
+            pi_preflight_command(command, prompt="Reply with OK only."),
+            [
+                "python3",
+                "-I",
+                "-m",
+                "pi",
+                "--provider",
+                "openai-codex",
+                "--model",
+                "gpt-5.4-mini",
+                "--no-session",
+                "--no-tools",
+                "-p",
+                "Reply with OK only.",
+            ],
+        )
+
     def test_pi_command_provider_detects_openai_codex_through_env_unset_wrapper(self):
         commands = [
             ["/usr/bin/env", "-u", "FOO", "pi", "-p", "{prompt}", "--provider", "openai-codex", "--model", "gpt-5.4-mini"],

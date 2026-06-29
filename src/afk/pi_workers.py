@@ -257,7 +257,11 @@ def pi_command_args(command: list[str]) -> list[str] | None:
     if executable in {"bash", "sh", "zsh"}:
         return _shell_wrapped_pi_args(command[1:])
     if executable.startswith("python"):
-        return _python_module_pi_args(command[1:])
+        python_module = _python_module_pi_command_parts(command[1:])
+        if python_module is None:
+            return None
+        _, pi_args = python_module
+        return pi_args
     return None
 
 
@@ -287,10 +291,21 @@ def pi_preflight_command(command: list[str], *, prompt: str) -> list[str] | None
     if executable in {"bash", "sh", "zsh"}:
         return _shell_wrapped_preflight_command(command, prompt=prompt)
     if executable.startswith("python"):
-        pi_args = _python_module_pi_args(command[1:])
-        if pi_args is None:
+        python_module = _python_module_pi_command_parts(command[1:])
+        if python_module is None:
             return None
-        return [command[0], "-m", "pi", *_filtered_pi_args(pi_args), "--no-session", "--no-tools", "-p", prompt]
+        interpreter_args, pi_args = python_module
+        return [
+            command[0],
+            *interpreter_args,
+            "-m",
+            "pi",
+            *_filtered_pi_args(pi_args),
+            "--no-session",
+            "--no-tools",
+            "-p",
+            prompt,
+        ]
     return None
 
 
@@ -421,13 +436,21 @@ def _env_wrapped_pi_args(command: list[str]) -> list[str] | None:
 
 
 def _python_module_pi_args(command: list[str]) -> list[str] | None:
+    python_module = _python_module_pi_command_parts(command)
+    if python_module is None:
+        return None
+    _, pi_args = python_module
+    return pi_args
+
+
+def _python_module_pi_command_parts(command: list[str]) -> tuple[list[str], list[str]] | None:
     index = 0
     while index < len(command):
         part = command[index]
         if part == "-m" and index + 1 < len(command):
             if command[index + 1] != "pi":
                 return None
-            return command[index + 2 :]
+            return command[:index], command[index + 2 :]
         if not part.startswith("-"):
             return None
         index += 1
