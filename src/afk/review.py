@@ -794,6 +794,12 @@ def read_reviewer_payload_from_stdout(stdout: str) -> dict[str, Any]:
         return {"status": "missing", "message": "reviewer result file was not produced"}
     if not isinstance(payload, dict):
         return {"status": "invalid", "message": "reviewer stdout must contain a JSON object"}
+    raw_status = string_field(payload, "status") or ""
+    if raw_status not in {"pass", "fail", "request_revision"}:
+        return {
+            "status": "invalid",
+            "message": "reviewer stdout JSON must match the reviewer result schema",
+        }
     return {"status": "valid", "payload": redact_artifact_value(payload)}
 
 
