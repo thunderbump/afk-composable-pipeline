@@ -32,7 +32,7 @@ def generate_workstream_recipe(
     if url_has_secret_material(project_contract.repo_url):
         raise ValueError("project contract repo_url must not contain embedded credentials or query parameters")
 
-    review_branch = f"afk/{branch_slug(workstream_id)}"
+    review_branch = review_branch_for_workstream(workstream_id)
     recipe_required_labels = required_labels if required_labels is not None else list(project_contract.beads_labels)
     implement_agent = agent if agent is not None else default_recipe_agent()
     validate_step_input = validation_input if validation_input is not None else default_validation_input(validation_profile)
@@ -121,6 +121,10 @@ def parent_from_workstream_id(workstream_id: str) -> str:
 def branch_slug(value: str) -> str:
     slug = re.sub(r"[^A-Za-z0-9]+", "-", value).strip("-").lower()
     return slug or "workstream"
+
+
+def review_branch_for_workstream(workstream_id: str) -> str:
+    return f"afk/{branch_slug(workstream_id)}"
 
 
 def default_agent_code() -> str:
