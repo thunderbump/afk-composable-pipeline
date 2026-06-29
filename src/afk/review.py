@@ -845,6 +845,8 @@ def read_reviewer_payload_from_stdout(stdout: str) -> dict[str, Any]:
 
 
 def stdout_payload_matches_schema(payload: dict[str, Any]) -> bool:
+    if string_field(payload, "artifact_type") != "reviewer-result":
+        return False
     raw_status = string_field(payload, "status") or ""
     if raw_status not in {"pass", "fail", "request_revision"}:
         return False

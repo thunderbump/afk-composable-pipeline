@@ -586,6 +586,7 @@ class ReviewCliTest(unittest.TestCase):
                 print(
                     json.dumps(
                         {
+                            "artifact_type": "reviewer-result",
                             "status": "request_revision",
                             "summary": "stdout requested changes",
                             "findings": [
@@ -631,6 +632,68 @@ class ReviewCliTest(unittest.TestCase):
             self.assertEqual(result["output"]["classification"], "review_revision_requested")
             self.assertEqual(reviewer_result["result"]["status"], "request_revision")
             self.assertEqual(reviewer_result["result"]["findings"][0]["title"], "Need another validation pass")
+            self.assertEqual(reviewer_result["result"]["evidence"]["result_source"], "stdout_fallback")
+            self.assertEqual(reviewer_result["result"]["evidence"]["result_file_present"], False)
+
+    def test_review_rejects_unmarked_review_shaped_stdout_json_when_result_file_is_absent(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            checkout = temp_path / "checkout"
+            start_commit = init_checkout(checkout)
+            head_commit = git(checkout, "rev-parse", "HEAD")
+            validation_step, validation_worker = write_validation_artifacts(temp_path / "validation-run")
+            ledger = temp_path / "ledger"
+            reviewer_code = textwrap.dedent(
+                """
+                import json
+
+                print(
+                    json.dumps(
+                        {
+                            "status": "request_revision",
+                            "summary": "stdout requested changes",
+                            "findings": [
+                                {
+                                    "status": "request_revision",
+                                    "title": "Need another validation pass",
+                                    "evidence": ["stdout fallback"],
+                                }
+                            ],
+                        }
+                    )
+                )
+                """
+            ).strip()
+
+            completed = run_afk(
+                "run-step",
+                "review",
+                "--input",
+                json.dumps(
+                    review_input(
+                        checkout=checkout,
+                        start_commit=start_commit,
+                        head_commit=head_commit,
+                        validation_step=validation_step,
+                        validation_worker=validation_worker,
+                        reviewer_code=reviewer_code,
+                    )
+                ),
+                "--ledger",
+                str(ledger),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+            reviewer_result = json.loads((run_dir / "reviewer-result.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(summary["status"], "failed")
+            self.assertEqual(result["status"], "failed")
+            self.assertEqual(result["output"]["status"], "failed_protocol")
+            self.assertEqual(result["output"]["classification"], "protocol_failure")
+            self.assertEqual(result["output"]["summary"], "reviewer stdout JSON must match the reviewer result schema")
             self.assertEqual(reviewer_result["result"]["evidence"]["result_source"], "stdout_fallback")
             self.assertEqual(reviewer_result["result"]["evidence"]["result_file_present"], False)
 
