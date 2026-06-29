@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from afk.implement import agent_command_secret_error, normalize_wrapper_secret_files, path_is_equal_to_or_inside
 from afk.redaction import is_secret_value
@@ -124,11 +124,12 @@ def build_provider_pi_mount_config(
     field_prefix: str,
 ) -> dict[str, Any]:
     provider_name = require_non_empty(provider, "provider")
-    if provider_name == "openai-codex":
-        require_non_empty(codex_home, f"{field_prefix}.codex_home")
-        require_non_empty(config_home, f"{field_prefix}.config_home")
-        require_non_empty(pi_config_home, f"{field_prefix}.env.PI_CONFIG_HOME")
-        require_non_empty(pi_coding_agent_dir, f"{field_prefix}.env.PI_CODING_AGENT_DIR")
+    if provider_name != "openai-codex":
+        return {}
+    require_non_empty(codex_home, f"{field_prefix}.codex_home")
+    require_non_empty(config_home, f"{field_prefix}.config_home")
+    require_non_empty(pi_config_home, f"{field_prefix}.env.PI_CONFIG_HOME")
+    require_non_empty(pi_coding_agent_dir, f"{field_prefix}.env.PI_CODING_AGENT_DIR")
     return build_pi_mount_config(
         codex_home=codex_home,
         config_home=config_home,
@@ -166,6 +167,45 @@ def build_pi_print_command(
     if secret_error:
         raise ValueError(secret_error)
     return command
+
+
+def openai_codex_pi_mount_error(
+    *,
+    command: list[str],
+    codex_home: str | None,
+    config_home: str | None,
+    env: Mapping[str, str] | None,
+    field_prefix: str,
+) -> str | None:
+    if pi_command_provider(command) != "openai-codex":
+        return None
+    mounted_env = env or {}
+    missing = []
+    if not codex_home:
+        missing.append(f"{field_prefix}.codex_home")
+    if not config_home:
+        missing.append(f"{field_prefix}.config_home")
+    if not mounted_env.get("PI_CONFIG_HOME"):
+        missing.append(f"{field_prefix}.env.PI_CONFIG_HOME")
+    if not mounted_env.get("PI_CODING_AGENT_DIR"):
+        missing.append(f"{field_prefix}.env.PI_CODING_AGENT_DIR")
+    if not missing:
+        return None
+    verb = "is" if len(missing) == 1 else "are"
+    return f"{', '.join(missing)} {verb} required when {field_prefix}.command uses pi --provider openai-codex"
+
+
+def pi_command_provider(command: list[str]) -> str | None:
+    if not command or Path(command[0]).name != "pi":
+        return None
+    for index, part in enumerate(command[1:], start=1):
+        if part == "--provider" and index + 1 < len(command):
+            provider = command[index + 1].strip()
+            return provider or None
+        if part.startswith("--provider="):
+            provider = part.partition("=")[2].strip()
+            return provider or None
+    return None
 
 
 def validate_model_cap(model: str) -> str:

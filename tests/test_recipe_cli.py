@@ -769,6 +769,85 @@ class GenerateRecipeCliTest(unittest.TestCase):
                 },
             )
 
+    def test_generate_recipe_does_not_copy_shared_agent_mounts_to_non_openai_pi_reviewer_or_judge(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            contracts_dir = temp_path / "contracts"
+            repo = temp_path / "repo-src"
+            output = temp_path / "recipe.json"
+            ledger = temp_path / "ledger"
+            beads_workspace = temp_path / "central-beads"
+            checkout_root = temp_path / "checkouts"
+            checkout_path = checkout_root / "demo"
+            codex_home = temp_path / "codex-home"
+            config_home = temp_path / "xdg-config"
+            pi_config_home = temp_path / "pi-config"
+            pi_coding_agent_dir = temp_path / "pi-coding-agent"
+            contracts_dir.mkdir()
+            init_repo(repo)
+            write_contract(contracts_dir / "demo.json", project_slug="demo", repo_url=str(repo))
+            beads_workspace.mkdir()
+            codex_home.mkdir()
+            config_home.mkdir()
+            pi_config_home.mkdir()
+            pi_coding_agent_dir.mkdir()
+
+            completed = run_afk(
+                "generate-recipe",
+                "--workstream-id",
+                "central-anh.6",
+                "--project",
+                "demo",
+                "--contracts-dir",
+                str(contracts_dir),
+                "--ledger",
+                str(ledger),
+                "--beads-workspace",
+                str(beads_workspace),
+                "--checkout-root",
+                str(checkout_root),
+                "--checkout-path",
+                str(checkout_path),
+                "--validation-profile",
+                "tier1",
+                "--agent-mode",
+                "fake",
+                "--reviewer-mode",
+                "pi",
+                "--reviewer-pi-provider",
+                "anthropic",
+                "--reviewer-pi-model",
+                "gpt-5.4-mini",
+                "--retrospective-judge-mode",
+                "pi",
+                "--retrospective-judge-pi-provider",
+                "anthropic",
+                "--retrospective-judge-pi-model",
+                "gpt-5.4-mini",
+                "--agent-codex-home",
+                str(codex_home),
+                "--agent-config-home",
+                str(config_home),
+                "--agent-pi-config-home",
+                str(pi_config_home),
+                "--agent-pi-coding-agent-dir",
+                str(pi_coding_agent_dir),
+                "--output",
+                str(output),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            recipe = json.loads(output.read_text(encoding="utf-8"))
+            reviewer = recipe["steps"][4]["input"]["reviewer"]
+            retrospective_judge = recipe["retrospective_judge"]
+
+            self.assertNotIn("codex_home", reviewer)
+            self.assertNotIn("config_home", reviewer)
+            self.assertNotIn("env", reviewer)
+            self.assertNotIn("codex_home", retrospective_judge)
+            self.assertNotIn("config_home", retrospective_judge)
+            self.assertNotIn("env", retrospective_judge)
+
     def test_generate_recipe_rejects_disallowed_pi_reviewer_model(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
