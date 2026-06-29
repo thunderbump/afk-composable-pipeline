@@ -255,21 +255,32 @@ def run_workstream(
     selected_work = selected_work_records(state)
     pipeline_retrospective = pipeline_retrospective_record(state, publication, tracker, normalized)
     retrospective_judge_skip_reason = ""
+    retrospective_judge_skip_classification = "auth_preflight_failed"
     if state["blocked_reason"].startswith("Pi auth preflight failed for "):
         retrospective_judge_skip_reason = state["blocked_reason"]
     else:
         retrospective_judge_target = pi_auth_preflight_target("retrospective_judge", normalized.get("retrospective_judge"))
         if retrospective_judge_target is not None and pi_auth_preflight_status.get(retrospective_judge_target["target"]) == "deferred":
-            auth_result = run_pi_auth_preflight_target(
-                retrospective_judge_target,
-                cwd=checkout_path_from_state(state),
-            )
+            checkout_path = prepared_checkout_path_from_state(state)
+            if checkout_path is None:
+                auth_result = deferred_pi_auth_preflight_result(
+                    retrospective_judge_target,
+                    summary="checkout-local Pi auth preflight remains deferred because no prepared checkout is available",
+                )
+                retrospective_judge_skip_reason = auth_result["summary"]
+                retrospective_judge_skip_classification = "checkout_unavailable"
+            else:
+                auth_result = run_pi_auth_preflight_target(
+                    retrospective_judge_target,
+                    cwd=checkout_path,
+                )
             pi_auth_preflight["results"].append(auth_result)
             pi_auth_preflight = summarize_pi_auth_preflight(pi_auth_preflight["results"])
             pi_auth_preflight_status[retrospective_judge_target["target"]] = auth_result["status"]
             ledger.write_json("pi-auth-preflight.json", pi_auth_preflight)
             if auth_result["status"] == "failed":
                 retrospective_judge_skip_reason = pi_auth_preflight_failure_reason(auth_result)
+                retrospective_judge_skip_classification = "auth_preflight_failed"
     retrospective_judge = _run_retrospective_judge(
         normalized=normalized,
         state=state,
@@ -279,6 +290,7 @@ def run_workstream(
         pipeline_retrospective=pipeline_retrospective,
         ledger=ledger,
         skip_reason=retrospective_judge_skip_reason,
+        skip_classification=retrospective_judge_skip_classification,
     )
     pipeline_retrospective = _apply_retrospective_judge(
         pipeline_retrospective,
@@ -564,7 +576,7 @@ def pi_auth_preflight_target(target_name: str, config: Any) -> dict[str, Any] | 
     if isinstance(raw_timeout, (int, float)) and not isinstance(raw_timeout, bool) and raw_timeout > 0:
         timeout_seconds = min(float(raw_timeout), PI_AUTH_PREFLIGHT_TIMEOUT_SECONDS)
     env = config.get("env") if isinstance(config.get("env"), dict) else {}
-    return {
+    target = {
         "target": target_name,
         "command": command_list,
         "codex_home": string_field(config, "codex_home") or "",
@@ -573,6 +585,9 @@ def pi_auth_preflight_target(target_name: str, config: Any) -> dict[str, Any] | 
         "timeout_seconds": timeout_seconds,
         "defer_until_checkout": pi_auth_preflight_requires_checkout(command_list),
     }
+    if target_name == "implement.agent":
+        target["job_capsule"] = _implement_preflight_job_capsule(config)
+    return target
 
 
 def pi_auth_preflight_requires_checkout(command: list[str]) -> bool:
@@ -607,10 +622,11 @@ def run_pi_auth_preflight_target(
         if target["codex_home"]:
             env["CODEX_HOME"] = target["codex_home"]
         env["AFK_PI_AUTH_PREFLIGHT"] = "1"
-        _seed_pi_auth_preflight_runtime_env(target["target"], env=env, temp_path=temp_path)
-        command = pi_preflight_command(target["command"], prompt=PI_AUTH_PREFLIGHT_PROMPT) or [
+        _seed_pi_auth_preflight_runtime_env(target, env=env, temp_path=temp_path)
+        rendered_command = _render_pi_auth_preflight_command(target, temp_path=temp_path)
+        command = pi_preflight_command(rendered_command, prompt=PI_AUTH_PREFLIGHT_PROMPT) or [
             part.replace(PI_JUDGE_PROMPT_PLACEHOLDER, PI_AUTH_PREFLIGHT_PROMPT)
-            for part in target["command"]
+            for part in rendered_command
         ]
         run_cwd = cwd or temp_path
         try:
@@ -663,10 +679,79 @@ def run_pi_auth_preflight_target(
         }
 
 
-def _seed_pi_auth_preflight_runtime_env(target_name: str, *, env: dict[str, str], temp_path: Path) -> None:
+def deferred_pi_auth_preflight_result(target: dict[str, Any], *, summary: str) -> dict[str, Any]:
+    return {
+        "target": target["target"],
+        "provider": "openai-codex",
+        "status": "deferred",
+        "summary": summary,
+        "command": redact_artifact_value(target["command"]),
+        "returncode": None,
+        "stdout_excerpt": "",
+        "stderr_excerpt": "",
+    }
+
+
+def _render_pi_auth_preflight_command(target: dict[str, Any], *, temp_path: Path) -> list[str]:
+    command = list(target["command"])
+    if target["target"] == "review.reviewer":
+        return _render_retrospective_command(
+            command,
+            {
+                PI_JUDGE_REQUEST_PATH_PLACEHOLDER: str(temp_path / "reviewer-request.json"),
+                PI_JUDGE_RESULT_PATH_PLACEHOLDER: str(temp_path / "reviewer-result.json"),
+            },
+        )
+    if target["target"] == "retrospective_judge":
+        return _render_retrospective_command(
+            command,
+            {
+                PI_JUDGE_REQUEST_PATH_PLACEHOLDER: str(temp_path / "retrospective-judge-request.json"),
+                PI_JUDGE_RESULT_PATH_PLACEHOLDER: str(temp_path / "retrospective-judge-result.json"),
+            },
+        )
+    return command
+
+
+def _implement_preflight_job_capsule(config: Any) -> dict[str, Any]:
+    agent_mounts = {
+        "codex_home": string_field(config, "codex_home") or "",
+        "config_home": string_field(config, "config_home") or "",
+        "pi_config_home": (
+            string_field(config.get("env"), "PI_CONFIG_HOME") if isinstance(config, dict) else ""
+        )
+        or "",
+    }
+    if isinstance(config, dict):
+        wrapper_secret_files = config.get("wrapper_secret_files")
+        if isinstance(wrapper_secret_files, dict) and wrapper_secret_files:
+            agent_mounts["wrapper_secret_files"] = {
+                key: str(value) for key, value in wrapper_secret_files.items() if isinstance(value, str)
+            }
+        secret_refs = config.get("secret_refs")
+        if isinstance(secret_refs, dict) and secret_refs:
+            agent_mounts["secret_refs"] = json.loads(canonical_json(secret_refs))
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "artifact_type": "job-capsule",
+        "agent_mounts": agent_mounts,
+        "completion_contract": {
+            "result_path": "agent-result.json",
+            "result_path_env": "AFK_AGENT_RESULT_PATH",
+            "write_result_file_before_exit": True,
+        },
+    }
+
+
+def _seed_pi_auth_preflight_runtime_env(target: dict[str, Any], *, env: dict[str, str], temp_path: Path) -> None:
+    target_name = target["target"]
     if target_name == "implement.agent":
         capsule_path = temp_path / "job-capsule.json"
-        capsule_path.write_text('{"artifact_type":"job-capsule"}\n', encoding="utf-8")
+        capsule = target.get("job_capsule")
+        if isinstance(capsule, dict):
+            capsule_path.write_text(canonical_json(capsule) + "\n", encoding="utf-8")
+        else:
+            capsule_path.write_text('{"artifact_type":"job-capsule"}\n', encoding="utf-8")
         env["AFK_JOB_CAPSULE"] = str(capsule_path)
         env["AFK_AGENT_RESULT_PATH"] = "agent-result.json"
         return
@@ -2236,11 +2321,11 @@ def _disabled_retrospective_judge_record() -> dict[str, Any]:
     }
 
 
-def _skipped_retrospective_judge_record(summary: str) -> dict[str, Any]:
+def _skipped_retrospective_judge_record(summary: str, *, classification: str) -> dict[str, Any]:
     return {
         "enabled": True,
         "status": "skipped",
-        "classification": "auth_preflight_failed",
+        "classification": classification,
         "summary": redact_text(summary),
         "findings": [],
     }
@@ -2304,12 +2389,13 @@ def _run_retrospective_judge(
     pipeline_retrospective: dict[str, Any],
     ledger: "WorkstreamLedger",
     skip_reason: str = "",
+    skip_classification: str = "auth_preflight_failed",
 ) -> dict[str, Any]:
     judge = normalized.get("retrospective_judge") if isinstance(normalized, dict) else {}
     if not isinstance(judge, dict) or not judge.get("enabled"):
         return _disabled_retrospective_judge_record()
     if skip_reason:
-        return _skipped_retrospective_judge_record(skip_reason)
+        return _skipped_retrospective_judge_record(skip_reason, classification=skip_classification)
     evidence_pack = _build_retrospective_judge_evidence_pack(
         normalized=normalized,
         state=state,
@@ -4189,6 +4275,16 @@ def checkout_path_from_state(state: dict[str, Any]) -> Path:
     if isinstance(path, str) and path:
         return Path(path)
     return Path.cwd()
+
+
+def prepared_checkout_path_from_state(state: dict[str, Any]) -> Path | None:
+    checkout = state.get("checkout") if isinstance(state.get("checkout"), dict) else {}
+    if checkout.get("status") != "prepared":
+        return None
+    path = checkout.get("checkout_path") or checkout.get("path")
+    if isinstance(path, str) and path:
+        return Path(path)
+    return None
 
 
 def validation_name(validation: dict[str, Any]) -> str:
