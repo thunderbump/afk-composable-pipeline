@@ -94,30 +94,7 @@ def validate(
         raw_payload = read_worker_payload(result_path, fallback_path=evidence_result_path)
         if raw_payload["status"] == "valid":
             sync_worker_payload_artifacts(result_path, evidence_result_path, raw_payload["payload"])
-        if raw_payload["status"] == "invalid":
-            sync_worker_protocol_artifacts(result_path, evidence_result_path, raw_payload["message"])
-            normalized = normalized_worker_result(
-                status="failed_protocol",
-                classification="protocol_failure",
-                summary=raw_payload["message"],
-                raw_result=None,
-                adapter=adapter_record(
-                    request["worker"],
-                    exc.returncode,
-                    exc.timed_out,
-                    command=exc.command,
-                    details=exc.adapter_details,
-                ),
-                stdout=stdout,
-                stderr=stderr,
-                evidence_dir=evidence_dir,
-                stdout_path=stdout_log_path,
-                stderr_path=stderr_log_path,
-            )
-            worker_result = {"raw": None, "normalized": normalized}
-            write_worker_result(worker_result_path, run_id, worker_result)
-            return validate_output(request, worker_request, worker_result)
-        if exc.failure_artifact:
+        else:
             sync_worker_failure_artifacts(
                 result_path,
                 evidence_result_path,
@@ -136,7 +113,7 @@ def validate(
                 exc.returncode,
                 exc.timed_out,
                 command=exc.command,
-                details=exc.adapter_details,
+                details={**exc.adapter_details, **exc.failure_artifact},
             ),
             stdout=stdout,
             stderr=stderr,
@@ -612,6 +589,7 @@ def run_local_command_adapter(
     env: dict[str, str],
     timeout_seconds: float,
 ) -> dict[str, Any]:
+    process_groups_available = supports_process_groups()
     try:
         process = subprocess.Popen(
             command,
@@ -620,7 +598,7 @@ def run_local_command_adapter(
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            start_new_session=True,
+            start_new_session=process_groups_available,
         )
     except OSError as exc:
         raise WorkerRuntimeError(str(exc), stderr=str(exc), returncode=None, command=command) from exc
@@ -637,13 +615,15 @@ def run_local_command_adapter(
         stopped_processes = stopped_process_tree(process.pid)
         if stopped_processes:
             message = format_stopped_process_message(process.pid, stopped_processes)
-            terminate_process_group(process)
-            stdout, stderr = finalize_process_output(
+            terminate_process_tree(process, process_groups_available=process_groups_available)
+            stdout, stderr, _ = finalize_process_output(
                 process,
                 stdout_thread=stdout_thread,
                 stderr_thread=stderr_thread,
                 stdout_chunks=stdout_chunks,
                 stderr_chunks=stderr_chunks,
+                output_timeout=1.0,
+                process_groups_available=process_groups_available,
             )
             raise WorkerRuntimeError(
                 message,
@@ -659,13 +639,15 @@ def run_local_command_adapter(
                 },
             )
         if time.monotonic() >= deadline:
-            terminate_process_group(process)
-            stdout, stderr = finalize_process_output(
+            terminate_process_tree(process, process_groups_available=process_groups_available)
+            stdout, stderr, _ = finalize_process_output(
                 process,
                 stdout_thread=stdout_thread,
                 stderr_thread=stderr_thread,
                 stdout_chunks=stdout_chunks,
                 stderr_chunks=stderr_chunks,
+                output_timeout=1.0,
+                process_groups_available=process_groups_available,
             )
             raise WorkerRuntimeError(
                 "worker command timed out",
@@ -677,13 +659,39 @@ def run_local_command_adapter(
             )
         time.sleep(min(0.05, max(deadline - time.monotonic(), 0.0)))
 
-    stdout, stderr = finalize_process_output(
+    stdout, stderr, drained = finalize_process_output(
         process,
         stdout_thread=stdout_thread,
         stderr_thread=stderr_thread,
         stdout_chunks=stdout_chunks,
         stderr_chunks=stderr_chunks,
+        output_timeout=max(deadline - time.monotonic(), 0.0),
+        process_groups_available=process_groups_available,
     )
+    if not drained:
+        message = "worker descendant kept stdout/stderr open after worker exit"
+        terminate_process_tree(process, process_groups_available=process_groups_available)
+        stdout, stderr, _ = finalize_process_output(
+            process,
+            stdout_thread=stdout_thread,
+            stderr_thread=stderr_thread,
+            stdout_chunks=stdout_chunks,
+            stderr_chunks=stderr_chunks,
+            output_timeout=1.0,
+            process_groups_available=process_groups_available,
+        )
+        raise WorkerRuntimeError(
+            message,
+            stdout=stdout,
+            stderr=append_error_message(stderr, message),
+            returncode=process.returncode,
+            command=command,
+            adapter_details={"process_state": "stdout_stderr_open_after_exit"},
+            failure_artifact={
+                "process_state": "stdout_stderr_open_after_exit",
+                "remediation": "Ensure worker descendants exit or close inherited stdout/stderr before the worker process exits.",
+            },
+        )
     return {
         "command": command,
         "returncode": process.returncode,
@@ -717,35 +725,95 @@ def finalize_process_output(
     stderr_thread: threading.Thread,
     stdout_chunks: list[str],
     stderr_chunks: list[str],
-) -> tuple[str, str]:
+    output_timeout: float | None,
+    process_groups_available: bool,
+) -> tuple[str, str, bool]:
     try:
         process.wait(timeout=1)
     except subprocess.TimeoutExpired:
+        terminate_process_tree(process, process_groups_available=process_groups_available)
+        try:
+            process.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            pass
+    stdout_done, stderr_done = join_reader_threads(stdout_thread, stderr_thread, timeout=output_timeout)
+    return ("".join(stdout_chunks), "".join(stderr_chunks), stdout_done and stderr_done)
+
+
+def join_reader_threads(
+    stdout_thread: threading.Thread,
+    stderr_thread: threading.Thread,
+    *,
+    timeout: float | None,
+) -> tuple[bool, bool]:
+    if timeout is None:
+        stdout_thread.join()
+        stderr_thread.join()
+        return (not stdout_thread.is_alive(), not stderr_thread.is_alive())
+    if timeout <= 0:
+        return (not stdout_thread.is_alive(), not stderr_thread.is_alive())
+    started_at = time.monotonic()
+    stdout_thread.join(timeout=timeout)
+    elapsed = time.monotonic() - started_at
+    remaining = max(timeout - elapsed, 0.0)
+    stderr_thread.join(timeout=remaining)
+    return (not stdout_thread.is_alive(), not stderr_thread.is_alive())
+
+
+def supports_process_groups() -> bool:
+    return os.name == "posix" and hasattr(os, "killpg")
+
+
+def terminate_process_tree(process: subprocess.Popen[str], *, process_groups_available: bool) -> None:
+    if process_groups_available:
         terminate_process_group(process)
-        process.wait(timeout=1)
-    stdout_thread.join(timeout=1)
-    stderr_thread.join(timeout=1)
-    return ("".join(stdout_chunks), "".join(stderr_chunks))
+        return
+    if process.poll() is not None:
+        return
+    try:
+        process.terminate()
+    except OSError:
+        return
+    try:
+        process.wait(timeout=0.2)
+        return
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    try:
+        process.kill()
+    except OSError:
+        return
 
 
 def terminate_process_group(process: subprocess.Popen[str]) -> None:
-    if process.poll() is not None:
-        return
     process_group = process.pid
-    for sig in (signal.SIGCONT, signal.SIGTERM):
+    for sig in available_group_termination_signals():
         try:
             os.killpg(process_group, sig)
         except ProcessLookupError:
             return
+        except OSError:
+            return
     try:
         process.wait(timeout=0.2)
         return
-    except subprocess.TimeoutExpired:
+    except (OSError, subprocess.TimeoutExpired):
         pass
     try:
         os.killpg(process_group, signal.SIGKILL)
-    except ProcessLookupError:
+    except (OSError, ProcessLookupError):
         return
+
+
+def available_group_termination_signals() -> list[int]:
+    signals: list[int] = []
+    sigcont = getattr(signal, "SIGCONT", None)
+    if sigcont is not None:
+        signals.append(sigcont)
+    sigterm = getattr(signal, "SIGTERM", None)
+    if sigterm is not None:
+        signals.append(sigterm)
+    return signals
 
 
 def stopped_process_tree(root_pid: int) -> list[dict[str, Any]]:
