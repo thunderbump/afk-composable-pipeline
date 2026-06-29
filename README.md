@@ -430,11 +430,14 @@ selection.
 
 Like `generate-recipe`, `run-next` defaults to `--role-profile production`.
 That means the emitted recipe uses Pi-backed implementation, reviewer, and
-retrospective-judge roles unless you override them explicitly. If the required
-Codex/Pi mount flags are missing, `run-next` fails before selection execution
-continues with a direct mount-validation error. Use `--role-profile fake-local`
-for offline smoke runs, fixture tests, and other cases where fake adapters are
-still the right default.
+retrospective-judge roles unless you override them explicitly. Preview-only
+`run-next` still emits selection status plus a production-shaped recipe even
+when the Codex/Pi mount flags are absent, which keeps `source_statuses`,
+`no-candidates`, and recipe inspection usable in unprovisioned environments.
+When you add `--execute`, `run-next` validates the required mounts up front and
+fails fast with a direct mount-validation error if they are missing. Use
+`--role-profile fake-local` for offline smoke runs, fixture tests, and other
+cases where fake adapters are still the right default.
 
 For `bump-eqemu`, GitHub Issues are effectively disabled, so Beads are the
 practical source there for now. The command still includes the GitHub source
@@ -540,9 +543,11 @@ CODEX_HOME=/path/outside/checkout \
 pi --provider openai-codex --model gpt-5.4 --no-session --no-tools -p "Reply with OK only."
 ```
 
-The same mount set is required for the production-default `generate-recipe` and
-`run-next` paths. If you only want inspectable fake recipes locally, use
-`--role-profile fake-local` and skip the Pi auth mounts entirely.
+The same mount set is required for the production-default `generate-recipe`
+path and for `run-next --execute`. Preview-only `run-next` can still emit an
+inspectable production-shaped recipe without the Pi auth mounts. If you only
+want inspectable fake recipes locally, use `--role-profile fake-local` and
+skip the Pi auth mounts entirely.
 
 If that smoke command fails, refresh or repair Pi auth outside git before
 rerunning AFK, for example by launching interactive `pi` with the same

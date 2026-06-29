@@ -217,9 +217,21 @@ def main(argv: list[str] | None = None) -> int:
             parser.error("--ledger is required when --execute is set")
         try:
             validation_input = recipe_validation_input_from_args(args, project_contract=project_contract)
-            recipe_agent = recipe_agent_from_args(args, checkout_path=Path(args.checkout_path))
-            reviewer = recipe_reviewer_from_args(args, checkout_path=Path(args.checkout_path))
-            retrospective_judge = recipe_retrospective_judge_from_args(args, checkout_path=Path(args.checkout_path))
+            recipe_agent = recipe_agent_from_args(
+                args,
+                checkout_path=Path(args.checkout_path),
+                require_pi_mounts=args.execute,
+            )
+            reviewer = recipe_reviewer_from_args(
+                args,
+                checkout_path=Path(args.checkout_path),
+                require_pi_mounts=args.execute,
+            )
+            retrospective_judge = recipe_retrospective_judge_from_args(
+                args,
+                checkout_path=Path(args.checkout_path),
+                require_pi_mounts=args.execute,
+            )
             recipe_publisher_factory = recipe_publisher_factory_from_args(
                 args,
                 checkout_path=Path(args.checkout_path),
@@ -585,7 +597,12 @@ def resolved_role_mode(
     raise ValueError(f"Unsupported --role-profile: {role_profile}")
 
 
-def recipe_agent_from_args(args: argparse.Namespace, *, checkout_path: Path) -> dict[str, Any] | None:
+def recipe_agent_from_args(
+    args: argparse.Namespace,
+    *,
+    checkout_path: Path,
+    require_pi_mounts: bool = True,
+) -> dict[str, Any] | None:
     agent_mode = resolved_role_mode(
         args.agent_mode,
         role_profile=args.role_profile,
@@ -643,11 +660,17 @@ def recipe_agent_from_args(args: argparse.Namespace, *, checkout_path: Path) -> 
             ponytail_extension_source=ponytail_extension_source,
             wrapper_secret_file=args.agent_wrapper_secret_file,
             timeout_seconds=args.agent_timeout_seconds,
+            require_mounts=require_pi_mounts,
         )
     raise ValueError(f"Unsupported --agent-mode: {agent_mode}")
 
 
-def recipe_reviewer_from_args(args: argparse.Namespace, *, checkout_path: Path) -> dict[str, Any] | None:
+def recipe_reviewer_from_args(
+    args: argparse.Namespace,
+    *,
+    checkout_path: Path,
+    require_pi_mounts: bool = True,
+) -> dict[str, Any] | None:
     reviewer_mode = resolved_role_mode(
         args.reviewer_mode,
         role_profile=args.role_profile,
@@ -694,12 +717,18 @@ def recipe_reviewer_from_args(args: argparse.Namespace, *, checkout_path: Path) 
                 pi_coding_agent_dir=args.agent_pi_coding_agent_dir,
                 checkout_path=checkout_path,
                 field_prefix="reviewer",
+                require_mounts=require_pi_mounts,
             ),
         }
     raise ValueError(f"Unsupported --reviewer-mode: {reviewer_mode}")
 
 
-def recipe_retrospective_judge_from_args(args: argparse.Namespace, *, checkout_path: Path) -> dict[str, Any] | None:
+def recipe_retrospective_judge_from_args(
+    args: argparse.Namespace,
+    *,
+    checkout_path: Path,
+    require_pi_mounts: bool = True,
+) -> dict[str, Any] | None:
     retrospective_judge_mode = resolved_role_mode(
         args.retrospective_judge_mode,
         role_profile=args.role_profile,
@@ -749,6 +778,7 @@ def recipe_retrospective_judge_from_args(args: argparse.Namespace, *, checkout_p
                 pi_coding_agent_dir=args.agent_pi_coding_agent_dir,
                 checkout_path=checkout_path,
                 field_prefix="retrospective_judge",
+                require_mounts=require_pi_mounts,
             ),
         }
     raise ValueError(f"Unsupported --retrospective-judge-mode: {retrospective_judge_mode}")

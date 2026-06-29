@@ -35,11 +35,13 @@ def build_pi_real_worker_agent(
     ponytail_extension_source: str | None = None,
     wrapper_secret_file: str | None = None,
     timeout_seconds: int | None = None,
+    require_mounts: bool = True,
 ) -> dict[str, Any]:
     provider_name = require_non_empty(provider, "provider")
-    require_non_empty(codex_home, "agent.codex_home")
-    require_non_empty(config_home, "agent.config_home")
-    require_non_empty(pi_config_home, "agent.env.PI_CONFIG_HOME")
+    if require_mounts:
+        require_non_empty(codex_home, "agent.codex_home")
+        require_non_empty(config_home, "agent.config_home")
+        require_non_empty(pi_config_home, "agent.env.PI_CONFIG_HOME")
     command = build_pi_print_command(
         pi_bin=pi_bin,
         provider=provider_name,
@@ -62,7 +64,7 @@ def build_pi_real_worker_agent(
             field_prefix="agent",
         ),
     }
-    if pi_coding_agent_dir is None and provider_name == "openai-codex":
+    if require_mounts and pi_coding_agent_dir is None and provider_name == "openai-codex":
         raise ValueError("--agent-pi-coding-agent-dir is required when --agent-pi-provider=openai-codex")
     if wrapper_secret_file is not None:
         wrapper_secret_files = normalize_wrapper_secret_files(
@@ -128,14 +130,16 @@ def build_provider_pi_mount_config(
     pi_coding_agent_dir: str | None,
     checkout_path: Path,
     field_prefix: str,
+    require_mounts: bool = True,
 ) -> dict[str, Any]:
     provider_name = require_non_empty(provider, "provider")
     if provider_name != "openai-codex":
         return {}
-    require_non_empty(codex_home, f"{field_prefix}.codex_home")
-    require_non_empty(config_home, f"{field_prefix}.config_home")
-    require_non_empty(pi_config_home, f"{field_prefix}.env.PI_CONFIG_HOME")
-    require_non_empty(pi_coding_agent_dir, f"{field_prefix}.env.PI_CODING_AGENT_DIR")
+    if require_mounts:
+        require_non_empty(codex_home, f"{field_prefix}.codex_home")
+        require_non_empty(config_home, f"{field_prefix}.config_home")
+        require_non_empty(pi_config_home, f"{field_prefix}.env.PI_CONFIG_HOME")
+        require_non_empty(pi_coding_agent_dir, f"{field_prefix}.env.PI_CODING_AGENT_DIR")
     return build_pi_mount_config(
         codex_home=codex_home,
         config_home=config_home,
