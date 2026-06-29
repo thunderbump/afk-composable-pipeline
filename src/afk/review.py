@@ -15,6 +15,7 @@ from afk.redaction import is_secret_command_flag, redact_artifact_value, redact_
 
 
 SCHEMA_VERSION = 1
+REVIEWER_COMMAND_TYPES = {"fake-reviewer-command", "real-reviewer-command"}
 
 
 class ReviewerRuntimeError(RuntimeError):
@@ -545,8 +546,12 @@ def normalize_cleanup(cleanup: Any) -> dict[str, Any]:
 def normalize_reviewer(reviewer: Any, *, checkout_path: Path) -> dict[str, Any]:
     if not isinstance(reviewer, dict):
         return {"status": "invalid", "message": "reviewer must be an object"}
-    if reviewer.get("type") != "fake-reviewer-command":
-        return {"status": "invalid", "message": "reviewer.type must be fake-reviewer-command"}
+    reviewer_type = string_field(reviewer, "type") or ""
+    if reviewer_type not in REVIEWER_COMMAND_TYPES:
+        return {
+            "status": "invalid",
+            "message": "reviewer.type must be fake-reviewer-command or real-reviewer-command",
+        }
     for forbidden_key in ("credentials_path", "auth_file", "token", "api_key"):
         if forbidden_key in reviewer:
             return {"status": "invalid", "message": f"reviewer.{forbidden_key} is not supported"}
@@ -560,7 +565,7 @@ def normalize_reviewer(reviewer: Any, *, checkout_path: Path) -> dict[str, Any]:
     if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float)) or timeout_seconds <= 0:
         return {"status": "invalid", "message": "reviewer.timeout_seconds must be a positive number"}
     normalized_reviewer = {
-        "type": "fake-reviewer-command",
+        "type": reviewer_type,
         "command": list(command),
         "timeout_seconds": float(timeout_seconds),
     }
@@ -910,7 +915,8 @@ def read_reviewer_payload_from_stdout(stdout: str) -> dict[str, Any]:
 
 
 def stdout_payload_matches_schema(payload: dict[str, Any]) -> bool:
-    if string_field(payload, "artifact_type") != "reviewer-result":
+    artifact_type = string_field(payload, "artifact_type")
+    if artifact_type not in (None, "", "reviewer-result"):
         return False
     raw_status = string_field(payload, "status") or ""
     if raw_status not in {"pass", "fail", "request_revision"}:
