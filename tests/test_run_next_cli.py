@@ -471,6 +471,7 @@ else:
                     "PI_CODING_AGENT_DIR": str(pi_coding_agent_dir),
                 },
             )
+            self.assertEqual(implement_agent["timeout_seconds"], 3600)
 
             reviewer = payload["recipe"]["steps"][4]["input"]["reviewer"]
             self.assertEqual(
@@ -1668,7 +1669,7 @@ else:
                     "PI_CODING_AGENT_DIR": str(pi_coding_agent_dir),
                 },
             )
-            self.assertEqual(implement["timeout_seconds"], 3600)
+            self.assertNotIn("timeout_seconds", implement)
             self.assertNotIn("agent-secret", json.dumps(payload["recipe"]))
 
     def test_run_next_execute_uses_project_worker_validation_input_when_requested(self):

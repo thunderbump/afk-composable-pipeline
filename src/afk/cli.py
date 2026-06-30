@@ -626,7 +626,11 @@ def recipe_agent_from_args(
     if args.agent_timeout_seconds is not None and args.agent_timeout_seconds <= 0:
         raise ValueError("--agent-timeout-seconds must be greater than zero")
     timeout_seconds = args.agent_timeout_seconds
-    if timeout_seconds is None and agent_mode in {"real-local", "pi"}:
+    if (
+        timeout_seconds is None
+        and args.role_profile == PRODUCTION_ROLE_PROFILE
+        and agent_mode in {"real-local", "pi"}
+    ):
         timeout_seconds = PRODUCTION_IMPLEMENTATION_TIMEOUT_SECONDS
 
     if agent_mode == "real-local":
