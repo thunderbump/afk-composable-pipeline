@@ -1368,7 +1368,10 @@ def close_published_pr(
             url=pr_url,
             commands={"gh_view": view_command},
         )
-    if review_cycles_require_response(normalized.get("review_cycles")):
+    if (
+        review_cycles_require_response(normalized.get("review_cycles"))
+        and configured_review_feedback_status not in TERMINAL_REVIEW_FEEDBACK_STATUSES
+    ):
         return tracker_close_blocked_publication(
             reason=(
                 "terminal PR closure requires addressed review-cycle responses before merge; "
