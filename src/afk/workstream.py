@@ -494,10 +494,10 @@ def merged_implement_validation_input(
     if "profile" not in merged and isinstance(validate_context.get("profile"), str):
         merged["profile"] = validate_context["profile"]
     validate_commands = validate_context.get("commands", [])
-    explicitly_suppresses_commands = (
-        merged.get("commands") == [] and merged.get("run_commands_during_implementation") is False
-    )
-    should_backfill_commands = "commands" not in merged or (
+    explicitly_suppresses_commands = merged.get("run_commands_during_implementation") is False
+    should_backfill_commands = (
+        "commands" not in merged and not explicitly_suppresses_commands
+    ) or (
         merged.get("commands") == [] and bool(validate_commands) and not explicitly_suppresses_commands
     )
     if should_backfill_commands:
