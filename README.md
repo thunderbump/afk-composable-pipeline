@@ -851,6 +851,14 @@ command in a minimal environment, and records the normalized outcome in
 `retrospective-follow-up-result.json` plus stdout/stderr logs. Command failures
 are kept inside `pipeline_retrospective.follow_up.creation` and do not alter
 the functional publication or tracker result.
+Set `retrospective_follow_up.creator: "beads"` for a deterministic local Beads
+creator instead of the command adapter. This mode stays opt-in, reads the Dolt
+password from `<beads_workspace>/secrets/dolt_beads_password.txt`, creates
+Beads with the recommendation labels plus any configured extra `labels`, writes
+stable fingerprint/category/severity metadata for dedupe, and records evidence
+paths in the created Bead description. Duplicate fingerprints already present
+in Beads are recorded without creating a second item, so recommendation-only
+mode remains available by leaving `enabled: false`.
 `retrospective.json`, when present, stores the user-supplied terminal
 retrospective evidence separately from the derived pipeline retrospective.
 `review_cycles` evidence, when supplied, is included in both

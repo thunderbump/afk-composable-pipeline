@@ -3952,6 +3952,21 @@ def _run_retrospective_follow_up(
         )
         _write_retrospective_follow_up_result(result_path, ledger.run_id, normalized_result)
         return normalized_result
+    if follow_up_config.get("creator") == "beads":
+        normalized_result = _run_retrospective_follow_up_beads_creator(
+            follow_up_config=follow_up_config,
+            normalized=normalized,
+            pipeline_retrospective=pipeline_retrospective,
+            recommended=recommended,
+            existing_created=existing_created,
+            ledger=ledger,
+            request_path=request_path,
+            result_path=result_path,
+            stdout_path=stdout_path,
+            stderr_path=stderr_path,
+        )
+        _write_retrospective_follow_up_result(result_path, ledger.run_id, normalized_result)
+        return normalized_result
     checkout_path = checkout_path_from_state(state)
     try:
         adapter_result, raw_payload = _run_retrospective_follow_up_command(
@@ -4081,6 +4096,465 @@ def _build_retrospective_follow_up_request(
             "created": "list[object]",
         },
     }
+
+
+def _run_retrospective_follow_up_beads_creator(
+    *,
+    follow_up_config: dict[str, Any],
+    normalized: dict[str, Any],
+    pipeline_retrospective: dict[str, Any],
+    recommended: list[dict[str, Any]],
+    existing_created: list[dict[str, Any]],
+    ledger: "WorkstreamLedger",
+    request_path: Path,
+    result_path: Path,
+    stdout_path: Path,
+    stderr_path: Path,
+) -> dict[str, Any]:
+    workspace = Path(follow_up_config["beads_workspace"])
+    password = _read_retrospective_follow_up_beads_password(workspace / "secrets" / "dolt_beads_password.txt")
+    env = _retrospective_follow_up_beads_environment(password)
+    exact_secrets = {password}
+    created_items: list[dict[str, Any]] = []
+    try:
+        existing_by_fingerprint, list_stdout = _load_existing_retrospective_follow_up_beads(
+            workspace=workspace,
+            env=env,
+            exact_secrets=exact_secrets,
+            recommended=recommended,
+        )
+        created_count = 0
+        duplicate_count = 0
+        for recommendation in recommended:
+            if not isinstance(recommendation, dict):
+                continue
+            fingerprint = string_field(recommendation, "fingerprint") or ""
+            if not fingerprint:
+                continue
+            if fingerprint in existing_by_fingerprint:
+                existing_item = existing_by_fingerprint[fingerprint]
+                created_items.append(
+                    _retrospective_follow_up_existing_bead_item(existing_item, recommendation)
+                )
+                duplicate_count += 1
+                continue
+            if fingerprint in {
+                string_field(item, "fingerprint") or ""
+                for item in existing_created
+                if isinstance(item, dict)
+            }:
+                created_item = _retrospective_follow_up_existing_created_item(
+                    fingerprint=fingerprint,
+                    recommendation=recommendation,
+                    existing_created=existing_created,
+                )
+                if created_item is not None:
+                    created_items.append(created_item)
+                duplicate_count += 1
+                continue
+            bead_id, create_stdout = _create_retrospective_follow_up_bead(
+                workspace=workspace,
+                env=env,
+                exact_secrets=exact_secrets,
+                follow_up_config=follow_up_config,
+                normalized=normalized,
+                pipeline_retrospective=pipeline_retrospective,
+                recommendation=recommendation,
+                ledger=ledger,
+                request_path=request_path,
+                result_path=result_path,
+            )
+            list_stdout += create_stdout
+            created_item = _retrospective_created_follow_up_item(
+                {
+                    "id": bead_id,
+                    "summary": string_field(recommendation, "summary") or "",
+                    "labels": recommendation.get("labels"),
+                    "fingerprint": fingerprint,
+                },
+                kind=string_field(recommendation, "kind") or "beads-created",
+            )
+            if created_item is not None:
+                created_item["fingerprint"] = fingerprint
+                created_items.append(created_item)
+            created_count += 1
+        status = "created" if created_count else "recorded"
+        classification = "success_created" if created_count else "success_recorded"
+        summary = _retrospective_follow_up_beads_summary(created_count=created_count, duplicate_count=duplicate_count)
+        return _normalized_retrospective_follow_up_result(
+            enabled=True,
+            status=status,
+            classification=classification,
+            summary=summary,
+            created=_merge_retrospective_created_follow_up([], created_items),
+            stdout=list_stdout,
+            stderr="",
+            request_path=request_path,
+            result_path=result_path,
+            stdout_path=stdout_path,
+            stderr_path=stderr_path,
+        ) | {
+            "creator": {
+                "type": "beads",
+                "workspace": str(workspace),
+                "labels": redact_artifact_value(follow_up_config.get("labels", [])),
+                "dedupe": "fingerprint",
+            }
+        }
+    except _RetrospectiveFollowUpError as exc:
+        return _normalized_retrospective_follow_up_result(
+            enabled=True,
+            status="failed",
+            classification="beads_creation_failure",
+            summary=exc.message,
+            created=_merge_retrospective_created_follow_up([], created_items),
+            stdout=exc.stdout,
+            stderr=exc.stderr,
+            request_path=request_path,
+            result_path=result_path,
+            stdout_path=stdout_path,
+            stderr_path=stderr_path,
+        ) | {
+            "creator": {
+                "type": "beads",
+                "workspace": str(workspace),
+                "labels": redact_artifact_value(follow_up_config.get("labels", [])),
+                "dedupe": "fingerprint",
+            }
+        }
+
+
+def _read_retrospective_follow_up_beads_password(credentials_path: Path) -> str:
+    try:
+        lines = credentials_path.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        raise _RetrospectiveFollowUpError(
+            "Beads credentials are not available for retrospective follow-up creation",
+            command=["bd", "create"],
+            returncode=None,
+            stderr=str(exc),
+        ) from exc
+    if not lines or not lines[0]:
+        raise _RetrospectiveFollowUpError(
+            "Beads credentials are not available for retrospective follow-up creation",
+            command=["bd", "create"],
+            returncode=None,
+        )
+    return lines[0]
+
+
+def _retrospective_follow_up_beads_environment(password: str) -> dict[str, str]:
+    env = {key: value for key in ("PATH", "LANG", "LC_ALL") if (value := os.environ.get(key)) is not None}
+    env["BEADS_DOLT_PASSWORD"] = password
+    return env
+
+
+def _load_existing_retrospective_follow_up_beads(
+    *,
+    workspace: Path,
+    env: dict[str, str],
+    exact_secrets: set[str],
+    recommended: list[dict[str, Any]],
+) -> tuple[dict[str, dict[str, Any]], str]:
+    command = ["bd", "list", "--json", "--no-pager", "--limit", "0"]
+    project_label = _retrospective_follow_up_project_label(recommended)
+    if project_label:
+        command.extend(["--label", project_label])
+    completed = _run_retrospective_follow_up_beads_command(
+        command,
+        workspace=workspace,
+        env=env,
+        exact_secrets=exact_secrets,
+        message_on_failure="bd list failed",
+    )
+    try:
+        payload = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise _RetrospectiveFollowUpError(
+            "bd list returned invalid JSON payload",
+            command=command,
+            returncode=completed.returncode,
+            stdout=completed.stdout,
+            stderr=completed.stderr,
+        ) from exc
+    if not isinstance(payload, list):
+        raise _RetrospectiveFollowUpError(
+            "bd list must return a JSON list payload",
+            command=command,
+            returncode=completed.returncode,
+            stdout=completed.stdout,
+            stderr=completed.stderr,
+        )
+    existing_by_fingerprint: dict[str, dict[str, Any]] = {}
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+        fingerprint = string_field(metadata, "afk.retrospective_follow_up.fingerprint") or ""
+        if fingerprint and fingerprint not in existing_by_fingerprint:
+            existing_by_fingerprint[fingerprint] = item
+    return existing_by_fingerprint, redact_text(completed.stdout, exact_secrets=exact_secrets)
+
+
+def _retrospective_follow_up_existing_bead_item(
+    existing_bead: dict[str, Any],
+    recommendation: dict[str, Any],
+) -> dict[str, Any]:
+    normalized = _retrospective_created_follow_up_item(
+        {
+            "id": string_field(existing_bead, "id") or "",
+            "summary": string_field(existing_bead, "title") or string_field(recommendation, "summary") or "",
+            "labels": existing_bead.get("labels") or recommendation.get("labels"),
+        },
+        kind=string_field(recommendation, "kind") or "beads-existing",
+    ) or {
+        "kind": string_field(recommendation, "kind") or "beads-existing",
+        "summary": string_field(recommendation, "summary") or "",
+        "labels": _retrospective_follow_up_labels(recommendation.get("labels")),
+    }
+    normalized["fingerprint"] = string_field(recommendation, "fingerprint") or ""
+    return normalized
+
+
+def _retrospective_follow_up_existing_created_item(
+    *,
+    fingerprint: str,
+    recommendation: dict[str, Any],
+    existing_created: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    for item in existing_created:
+        if not isinstance(item, dict) or string_field(item, "fingerprint") != fingerprint:
+            continue
+        normalized = _retrospective_created_follow_up_item(
+            item,
+            kind=string_field(item, "kind") or string_field(recommendation, "kind") or "beads-existing",
+        )
+        if normalized is None:
+            normalized = _retrospective_created_follow_up_item(
+                {
+                    "summary": string_field(recommendation, "summary") or "",
+                    "labels": recommendation.get("labels"),
+                },
+                kind=string_field(recommendation, "kind") or "beads-existing",
+            )
+        if normalized is not None:
+            normalized["fingerprint"] = fingerprint
+        return normalized
+    return None
+
+
+def _create_retrospective_follow_up_bead(
+    *,
+    workspace: Path,
+    env: dict[str, str],
+    exact_secrets: set[str],
+    follow_up_config: dict[str, Any],
+    normalized: dict[str, Any],
+    pipeline_retrospective: dict[str, Any],
+    recommendation: dict[str, Any],
+    ledger: "WorkstreamLedger",
+    request_path: Path,
+    result_path: Path,
+) -> tuple[str, str]:
+    fingerprint = string_field(recommendation, "fingerprint") or ""
+    metadata = _retrospective_follow_up_bead_metadata(
+        normalized=normalized,
+        pipeline_retrospective=pipeline_retrospective,
+        recommendation=recommendation,
+        fingerprint=fingerprint,
+    )
+    command = [
+        "bd",
+        "create",
+        "--silent",
+        "--title",
+        string_field(recommendation, "summary") or "AFK retrospective follow-up",
+        "--description",
+        _retrospective_follow_up_bead_description(
+            normalized=normalized,
+            pipeline_retrospective=pipeline_retrospective,
+            recommendation=recommendation,
+            ledger=ledger,
+            request_path=request_path,
+            result_path=result_path,
+        ),
+        "--labels",
+        ",".join(_retrospective_follow_up_bead_labels(recommendation, follow_up_config)),
+        "--metadata",
+        canonical_json(metadata),
+    ]
+    completed = _run_retrospective_follow_up_beads_command(
+        command,
+        workspace=workspace,
+        env=env,
+        exact_secrets=exact_secrets,
+        message_on_failure="bd create failed",
+    )
+    bead_id = completed.stdout.strip()
+    if not bead_id:
+        raise _RetrospectiveFollowUpError(
+            "bd create did not return a Bead ID",
+            command=command,
+            returncode=completed.returncode,
+            stdout=completed.stdout,
+            stderr=completed.stderr,
+        )
+    return bead_id, redact_text(completed.stdout, exact_secrets=exact_secrets)
+
+
+def _retrospective_follow_up_bead_labels(
+    recommendation: dict[str, Any],
+    follow_up_config: dict[str, Any],
+) -> list[str]:
+    labels = _retrospective_follow_up_labels(recommendation.get("labels"))
+    for label in follow_up_config.get("labels", []):
+        if label not in labels:
+            labels.append(label)
+    if not any(label.startswith("project:") for label in labels):
+        labels.append(_retrospective_follow_up_project_label([recommendation]))
+    return labels
+
+
+def _retrospective_follow_up_bead_metadata(
+    *,
+    normalized: dict[str, Any],
+    pipeline_retrospective: dict[str, Any],
+    recommendation: dict[str, Any],
+    fingerprint: str,
+) -> dict[str, Any]:
+    signal_details = _retrospective_follow_up_signal_details(pipeline_retrospective, recommendation)
+    metadata: dict[str, Any] = {
+        "afk.retrospective_follow_up.fingerprint": fingerprint,
+        "afk.retrospective_follow_up.category": signal_details["category"],
+        "afk.retrospective_follow_up.severity": signal_details["severity"],
+        "afk.retrospective_follow_up.workstream_id": normalized["workstream_id"],
+        "afk.retrospective_follow_up.parent": normalized["parent"],
+    }
+    if signal_details["evidence_paths"]:
+        metadata["afk.retrospective_follow_up.evidence_paths"] = signal_details["evidence_paths"]
+    return metadata
+
+
+def _retrospective_follow_up_bead_description(
+    *,
+    normalized: dict[str, Any],
+    pipeline_retrospective: dict[str, Any],
+    recommendation: dict[str, Any],
+    ledger: "WorkstreamLedger",
+    request_path: Path,
+    result_path: Path,
+) -> str:
+    signal_details = _retrospective_follow_up_signal_details(pipeline_retrospective, recommendation)
+    evidence_paths = [
+        str(_retrospective_follow_up_resolve_evidence_path(ledger, path))
+        for path in signal_details["evidence_paths"]
+    ]
+    evidence_paths.extend(
+        [
+            str(request_path),
+            str(result_path),
+        ]
+    )
+    lines = [
+        "AFK retrospective follow-up recommendation.",
+        "",
+        f"Workstream: {normalized['workstream_id']}",
+        f"Parent: {normalized['parent']}",
+        f"Category: {signal_details['category']}",
+        f"Severity: {signal_details['severity']}",
+        f"Fingerprint: {string_field(recommendation, 'fingerprint') or ''}",
+    ]
+    if evidence_paths:
+        lines.extend(["", "Evidence paths:"])
+        for path in evidence_paths:
+            if path and path not in lines:
+                lines.append(f"- {path}")
+    return "\n".join(lines)
+
+
+def _retrospective_follow_up_signal_details(
+    pipeline_retrospective: dict[str, Any],
+    recommendation: dict[str, Any],
+) -> dict[str, Any]:
+    kind = string_field(recommendation, "kind") or "retrospective-follow-up"
+    signals = pipeline_retrospective.get("signals") if isinstance(pipeline_retrospective.get("signals"), list) else []
+    severity = ""
+    evidence_paths: list[str] = []
+    for signal in signals:
+        if not isinstance(signal, dict) or string_field(signal, "kind") != kind:
+            continue
+        if not severity:
+            severity = string_field(signal, "severity") or ""
+        for path in signal.get("evidence_paths") if isinstance(signal.get("evidence_paths"), list) else []:
+            if isinstance(path, str) and path and path not in evidence_paths:
+                evidence_paths.append(path)
+    return {
+        "category": kind,
+        "severity": severity or "unknown",
+        "evidence_paths": evidence_paths,
+    }
+
+
+def _retrospective_follow_up_resolve_evidence_path(ledger: "WorkstreamLedger", path: str) -> Path:
+    evidence_path = Path(path)
+    if evidence_path.is_absolute():
+        return evidence_path
+    return ledger.path / path
+
+
+def _retrospective_follow_up_project_label(recommended: list[dict[str, Any]]) -> str:
+    for recommendation in recommended:
+        if not isinstance(recommendation, dict):
+            continue
+        for label in _retrospective_follow_up_labels(recommendation.get("labels")):
+            if label.startswith("project:"):
+                return label
+    return "project:afk-composable-pipeline"
+
+
+def _retrospective_follow_up_beads_summary(*, created_count: int, duplicate_count: int) -> str:
+    if created_count and duplicate_count:
+        return f"Created {created_count} retrospective follow-up Beads and suppressed {duplicate_count} duplicates."
+    if created_count:
+        return f"Created {created_count} retrospective follow-up Beads."
+    if duplicate_count:
+        return f"Suppressed {duplicate_count} duplicate retrospective follow-up recommendations."
+    return "No retrospective follow-up Beads were created."
+
+
+def _run_retrospective_follow_up_beads_command(
+    command: list[str],
+    *,
+    workspace: Path,
+    env: dict[str, str],
+    exact_secrets: set[str],
+    message_on_failure: str,
+) -> subprocess.CompletedProcess[str]:
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=workspace,
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+    except OSError as exc:
+        raise _RetrospectiveFollowUpError(
+            str(exc),
+            command=command,
+            returncode=None,
+            stderr=redact_text(str(exc), exact_secrets=exact_secrets),
+        ) from exc
+    if completed.returncode != 0:
+        raise _RetrospectiveFollowUpError(
+            message_on_failure,
+            command=command,
+            returncode=completed.returncode,
+            stdout=redact_text(completed.stdout, exact_secrets=exact_secrets),
+            stderr=redact_text(completed.stderr, exact_secrets=exact_secrets),
+        )
+    return completed
 
 
 def _run_retrospective_follow_up_command(
@@ -5097,15 +5571,49 @@ def normalize_retrospective_follow_up_config(retrospective_follow_up: Any) -> di
     unsupported = [
         key
         for key in retrospective_follow_up
-        if key not in {"enabled", "type", "command", "timeout_seconds", "timeoutSeconds"}
+        if key
+        not in {
+            "enabled",
+            "creator",
+            "type",
+            "command",
+            "timeout_seconds",
+            "timeoutSeconds",
+            "beads_workspace",
+            "labels",
+        }
     ]
     if unsupported:
-        raise WorkstreamError("retrospective_follow_up only supports enabled, type, command, timeout_seconds")
+        raise WorkstreamError(
+            "retrospective_follow_up only supports enabled, creator, type, command, timeout_seconds, "
+            "beads_workspace, labels"
+        )
     enabled = retrospective_follow_up.get("enabled", False)
     if not isinstance(enabled, bool):
         raise WorkstreamError("retrospective_follow_up.enabled must be a boolean")
     if not enabled:
         return {"enabled": False}
+    creator = string_field(retrospective_follow_up, "creator") or "command"
+    if creator not in {"command", "beads"}:
+        raise WorkstreamError("retrospective_follow_up.creator must be command or beads")
+    if creator == "beads":
+        beads_workspace = retrospective_follow_up.get("beads_workspace")
+        if not isinstance(beads_workspace, str) or not beads_workspace:
+            raise WorkstreamError("retrospective_follow_up.beads_workspace must be an absolute directory")
+        workspace_path = Path(beads_workspace)
+        if not workspace_path.is_absolute():
+            raise WorkstreamError("retrospective_follow_up.beads_workspace must be an absolute directory")
+        if not workspace_path.is_dir():
+            raise WorkstreamError("retrospective_follow_up.beads_workspace must be an existing directory")
+        labels = retrospective_follow_up.get("labels", [])
+        if not _is_string_list(labels):
+            raise WorkstreamError("retrospective_follow_up.labels must be a list of strings")
+        return {
+            "enabled": True,
+            "creator": "beads",
+            "beads_workspace": str(workspace_path),
+            "labels": list(labels),
+        }
     follow_up_type = string_field(retrospective_follow_up, "type") or "local-command"
     if follow_up_type not in {"local-command", "fake-follow-up-command"}:
         raise WorkstreamError("retrospective_follow_up.type must be local-command or fake-follow-up-command")
@@ -5125,6 +5633,7 @@ def normalize_retrospective_follow_up_config(retrospective_follow_up: Any) -> di
         raise WorkstreamError("retrospective_follow_up.timeout_seconds must be a positive number")
     return {
         "enabled": True,
+        "creator": "command",
         "type": follow_up_type,
         "command": list(command),
         "timeout_seconds": float(timeout_seconds),
