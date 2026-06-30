@@ -153,15 +153,17 @@ The recipe schema is intentionally small:
   values.
 - `retry_policy.max_retries` is optional and defaults to `0`. It bounds how many
   same-item retry checkout cycles may start after a failed validation.
-- `review_cycles` is optional evidence for PR review passes after publication.
-  Each cycle records reviewer roles such as `correctness` and `bug-risk`,
-  review status, summary, optional PR comment URL, whether a response is
-  required, and optional response evidence. Accepted cycle/review statuses are
-  `passed`, `findings-open`, `request-changes`, and `findings-addressed`.
-  Response objects must carry `status: "addressed"` or
-  `status: "findings-addressed"`; a non-empty response string is also accepted
-  as freeform addressed evidence. Repeated cycles are preserved so findings
-  from earlier passes are not overwritten.
+- `review_cycles` is optional while a PR is still open, but terminal tracker
+  close guidance requires recorded review-cycle evidence unless the terminal
+  decision explicitly documents a waiver with
+  `review_feedback_status: "waived"`. Each cycle records reviewer roles such as
+  `correctness` and `bug-risk`, review status, summary, optional PR comment
+  URL, whether a response is required, and optional response evidence.
+  Accepted cycle/review statuses are `passed`, `findings-open`,
+  `request-changes`, and `findings-addressed`. Response objects must carry
+  `status: "addressed"` or `status: "findings-addressed"`; a non-empty
+  response string is also accepted as freeform addressed evidence. Repeated
+  cycles are preserved so findings from earlier passes are not overwritten.
 - `retrospective` is optional terminal evidence for a merged or explicit
   `no-merge` tracker decision. It carries a concise summary plus optional
   `changes`, `validation`, `review`, `unresolved_risks`, and
@@ -182,9 +184,12 @@ The recipe schema is intentionally small:
   `{"status":"no-merge","reason":"<why>","pr_url":"<url>"}` when the branch is
   intentionally not going to merge and the source Beads item should close with
   that reason. `pr_url` is required for merged/no-merge terminal decisions. When
-  unresolved `review_cycles` findings still require a response, add
-  `review_feedback_status: "resolved"` or `"waived"` before AFK will emit
-  close guidance for a terminal merge/no-merge decision.
+  no `review_cycles` have been recorded, set
+  `review_feedback_status: "waived"` to document the explicit waiver before AFK
+  will emit close guidance. When recorded `review_cycles` still contain
+  response-required findings, add `review_feedback_status: "resolved"` or
+  `"waived"` before AFK will emit close guidance for a terminal merge/no-merge
+  decision.
 - `steps` is an ordered list of existing step names: `select-work`,
   `prepare-checkout`, `implement`, `validate`, and `review`. Each step has an
   explicit `input` object, plus optional `profile` for `validate`.
@@ -846,7 +851,10 @@ present and all response-required findings are addressed, the tracker state
 advances to `review-feedback-addressed` and still keeps the source item open
 until merge or no-merge. AFK only treats a response object as addressed when
 its `status` is `addressed` or `findings-addressed`; a non-empty response
-string is the freeform addressed evidence path.
+string is the freeform addressed evidence path. Terminal merge/no-merge close
+guidance is blocked when no review-cycle evidence is recorded unless
+`tracker.terminal_decision.review_feedback_status` is explicitly set to
+`waived`.
 `retrospective` evidence, when supplied, is also included in both
 `workstream-result.json` and `tracker-result.json`, while
 `pipeline_retrospective` is always included in `workstream-result.json`. Use
@@ -873,7 +881,8 @@ immediately eligible for PR publication on a follow-up rerun.
 `awaiting-review`; it stays open until the PR merges or
 `tracker.terminal_decision.status == "no-merge"` is recorded.
 `tracker-close-blocked` means a terminal merge/no-merge decision was recorded,
-but unresolved review feedback still requires `review_feedback_status:
+but AFK still needs either recorded review-cycle evidence or an explicit waiver,
+or unresolved review feedback still requires `review_feedback_status:
 "resolved"` or `"waived"` before AFK can close the source item.
 `tracker-closed` means a terminal merge or no-merge decision was recorded, so
 AFK skipped publisher commands and emitted tracker close guidance instead.

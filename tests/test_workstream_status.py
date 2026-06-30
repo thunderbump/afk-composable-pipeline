@@ -789,6 +789,22 @@ class WorkstreamStatusMappingTest(unittest.TestCase):
             "closed",
         )
 
+    def test_workstream_status_from_tracker_close_blocked_uses_tracker_status_when_available(self):
+        self.assertEqual(
+            workstream_status_from_publication(
+                {"status": "tracker-close-blocked"},
+                {"status": "validated"},
+            ),
+            "validated",
+        )
+        self.assertEqual(
+            workstream_status_from_publication(
+                {"status": "tracker-close-blocked"},
+                {"status": "review-findings-open"},
+            ),
+            "review-findings-open",
+        )
+
     def test_workstream_status_from_publication_unknown_status_defaults(
         self,
     ):
@@ -1040,7 +1056,7 @@ class WorkstreamStatusMappingTest(unittest.TestCase):
         )
         self.assertIn("resolved before closure", record["comment"])
 
-    def test_tracker_record_ignores_feedback_resolution_text_when_no_review_cycles_require_response(self):
+    def test_tracker_record_keeps_terminal_merge_open_without_recorded_review_cycles(self):
         record = tracker_record(
             {
                 "workstream_id": "central-afk-pr.17",
@@ -1056,16 +1072,74 @@ class WorkstreamStatusMappingTest(unittest.TestCase):
                 "review_cycles": [],
             },
             tracker_state(),
+            {"status": "tracker-close-blocked"},
+        )
+
+        self.assertEqual(record["status"], "validated")
+        self.assertFalse(record["close_source_item"])
+        self.assertEqual(record["close_reason"], "")
+        self.assertIn("review cycle evidence", record["comment"])
+
+    def test_tracker_record_closes_terminal_merge_when_addressed_review_cycles_are_recorded(self):
+        record = tracker_record(
+            {
+                "workstream_id": "central-afk-pr.17",
+                "tracker": {
+                    "terminal_decision": {
+                        "status": "merged",
+                        "merge_commit": "deadbeef",
+                        "reason": "",
+                        "pr_url": "https://github.example/pr/17",
+                        "review_feedback_status": "",
+                    }
+                },
+                "review_cycles": [
+                    {
+                        "cycle": 1,
+                        "status": "findings-addressed",
+                        "reviews": [
+                            {
+                                "role": "correctness",
+                                "status": "request-changes",
+                                "summary": "Please tighten the close guidance.",
+                                "requires_response": True,
+                                "response": {"status": "addressed", "summary": "Fixed in follow-up."},
+                            }
+                        ],
+                    }
+                ],
+            },
+            tracker_state(),
             {"status": "tracker-closed"},
         )
 
         self.assertEqual(record["status"], "closed")
         self.assertTrue(record["close_source_item"])
         self.assertEqual(record["close_reason"], "merged via deadbeef")
-        self.assertEqual(
-            record["comment"],
-            "PR merged; close the source Beads item with the recorded merge commit.",
+
+    def test_tracker_record_closes_terminal_merge_when_missing_review_cycles_are_explicitly_waived(self):
+        record = tracker_record(
+            {
+                "workstream_id": "central-afk-pr.17",
+                "tracker": {
+                    "terminal_decision": {
+                        "status": "merged",
+                        "merge_commit": "deadbeef",
+                        "reason": "",
+                        "pr_url": "https://github.example/pr/17",
+                        "review_feedback_status": "waived",
+                    }
+                },
+                "review_cycles": [],
+            },
+            tracker_state(),
+            {"status": "tracker-closed"},
         )
+
+        self.assertEqual(record["status"], "closed")
+        self.assertTrue(record["close_source_item"])
+        self.assertEqual(record["close_reason"], "merged via deadbeef")
+        self.assertIn("explicitly waived", record["comment"])
 
     def test_tracker_record_closes_terminal_no_merge_when_feedback_is_explicitly_waived(self):
         review_cycles = [
