@@ -192,20 +192,26 @@ The recipe schema is intentionally small:
   into `implement`, checkout and profile into `validate`, and work item,
   checkout, implementation, final validation artifacts, and cleanup into
   `review`.
-- `publisher` supports `mode: "create"` with `gh pr create` or `mode: "update"`
-  with `gh pr edit`. If `gh pr edit` fails on the GitHub Projects classic
-  GraphQL deprecation path, AFK falls back to `gh api --method PATCH
-  repos/<owner>/<repo>/pulls/<number> --input <json>`. `git.path`/`gh.path` may
-  point at fake command shims for offline tests. `git.push: true` pushes `HEAD`
-  to the configured PR head before invoking `gh`.
-- AFK always runs `gh auth status --hostname github.com` before any `git push`
-  or `gh pr create/edit` attempt. Publisher auth stays on the minimal scrubbed
-  environment by default, so missing GitHub auth blocks publication before
-  push with terminal evidence and retry instructions. To publish a real GitHub
-  PR deliberately, mount a GitHub CLI config directory outside the checkout and
-  set `publisher.gh.auth.config_dir` to that absolute path. AFK passes it to
-  `gh` through `GH_CONFIG_DIR` after validating that the directory exists and
-  is outside the target checkout.
+- `publisher` supports `mode: "create"` with `gh pr create`, `mode: "update"`
+  with `gh pr edit`, or `mode: "close"` for an already-published PR. Close mode
+  requires `publisher.pr`, verifies the published PR state with `gh pr view`,
+  merges it with `gh pr merge` only when the PR is open, non-draft, and
+  `mergeStateStatus == "CLEAN"`, records a runtime terminal decision, closes the
+  selected Beads or GitHub issue source item, and then lets the retrospective
+  pass run against the closed state. If `gh pr edit` fails on the GitHub
+  Projects classic GraphQL deprecation path, AFK falls back to
+  `gh api --method PATCH repos/<owner>/<repo>/pulls/<number> --input <json>`.
+  `git.path`/`gh.path` may point at fake command shims for offline tests.
+  `git.push: true` pushes `HEAD` to the configured PR head before invoking `gh`
+  in create/update mode.
+- AFK always runs `gh auth status --hostname github.com` before any `git push`,
+  `gh pr create/edit`, or `gh pr view/merge` close-mode attempt. Publisher auth
+  stays on the minimal scrubbed environment by default, so missing GitHub auth
+  blocks publication before push with terminal evidence and retry instructions.
+  To publish a real GitHub PR deliberately, mount a GitHub CLI config directory
+  outside the checkout and set `publisher.gh.auth.config_dir` to that absolute
+  path. AFK passes it to `gh` through `GH_CONFIG_DIR` after validating that the
+  directory exists and is outside the target checkout.
 - Do not place raw token values in recipes. `publisher.gh.token`,
   `publisher.gh.github_token`, `publisher.gh.access_token`, `publisher.gh.api_key`,
   and similar ad hoc secret-bearing auth keys are rejected. Ambient `GH_TOKEN`,
