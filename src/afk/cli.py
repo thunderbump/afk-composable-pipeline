@@ -264,6 +264,7 @@ def main(argv: list[str] | None = None) -> int:
                 execute=args.execute,
                 ledger_dir=Path(args.ledger) if args.ledger else None,
                 workstream_runner=workstream_runner,
+                tracker_artifact_root=Path(args.contracts_dir).resolve().parent,
             )
         except ValueError as exc:
             parser.error(str(exc))
