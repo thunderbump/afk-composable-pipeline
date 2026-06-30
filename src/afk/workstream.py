@@ -495,7 +495,11 @@ def merged_implement_validation_input(
         merged = dict(implement_validation)
     else:
         merged = {}
-    validate_context = validate_step_implement_context(steps, implement_step_index=step_index)
+    validate_context = validate_step_implement_context(
+        steps,
+        implement_step_index=step_index,
+        preferred_profile=string_field(merged, "profile"),
+    )
     if "profile" not in merged and isinstance(validate_context.get("profile"), str):
         merged["profile"] = validate_context["profile"]
     validate_commands = validate_context.get("commands", [])
@@ -522,38 +526,54 @@ def validate_step_implement_context(
     steps: list[dict[str, Any]],
     *,
     implement_step_index: int | None = None,
+    preferred_profile: str | None = None,
 ) -> dict[str, Any]:
     if implement_step_index is None:
         candidate_steps = steps
     else:
         candidate_steps = steps[implement_step_index + 1 :]
+    fallback_context: dict[str, Any] | None = None
     for step in candidate_steps:
         if step.get("name") != "validate":
             continue
-        input_data = step.get("input")
-        if not isinstance(input_data, dict):
+        context = validate_step_context(step)
+        if not context:
             continue
-        validation = input_data.get("validation")
-        if not isinstance(validation, dict):
-            continue
-        context: dict[str, Any] = {}
-        profile = string_field(validation, "profile") or string_field(step, "profile")
-        if profile:
-            context["profile"] = profile
-        commands = validation.get("commands")
-        if isinstance(commands, list) and all(_is_string_list(command) for command in commands):
-            context["commands"] = [list(command) for command in commands]
-        worker_home = string_field(validation, "worker_home") or string_field(validation, "workerHome")
-        if worker_home:
-            context["worker_home"] = worker_home
-        stack = validation.get("stack")
-        if isinstance(stack, dict):
-            role = string_field(stack, "role") or "validation"
-            path = string_field(stack, "path")
-            if path:
-                context["stack"] = {"role": role, "path": path}
-        return context
-    return {}
+        if preferred_profile is None:
+            return context
+        if context.get("profile") == preferred_profile:
+            return context
+        if fallback_context is None:
+            fallback_context = context
+    if preferred_profile is not None:
+        return {}
+    return fallback_context or {}
+
+
+def validate_step_context(step: dict[str, Any]) -> dict[str, Any]:
+    input_data = step.get("input")
+    if not isinstance(input_data, dict):
+        return {}
+    validation = input_data.get("validation")
+    if not isinstance(validation, dict):
+        validation = {}
+    context: dict[str, Any] = {}
+    profile = string_field(validation, "profile") or string_field(step, "profile")
+    if profile:
+        context["profile"] = profile
+    commands = validation.get("commands")
+    if isinstance(commands, list) and all(_is_string_list(command) for command in commands):
+        context["commands"] = [list(command) for command in commands]
+    worker_home = string_field(validation, "worker_home") or string_field(validation, "workerHome")
+    if worker_home:
+        context["worker_home"] = worker_home
+    stack = validation.get("stack")
+    if isinstance(stack, dict):
+        role = string_field(stack, "role") or "validation"
+        path = string_field(stack, "path")
+        if path:
+            context["stack"] = {"role": role, "path": path}
+    return context
 
 
 def recipe_checkout_path(steps: list[dict[str, Any]]) -> Path | None:

@@ -7262,6 +7262,68 @@ sys.exit(0)
             },
         )
 
+    def test_merged_implement_validation_input_prefers_following_validate_step_with_matching_profile(self):
+        merged = merged_implement_validation_input(
+            {"profile": "tier2", "commands": []},
+            [
+                {
+                    "name": "validate",
+                    "profile": "tier1",
+                    "input": {
+                        "validation": {
+                            "profile": "tier1",
+                            "commands": [["make", "tier1-validate"]],
+                            "worker_home": "/tmp/tier1-worker-home",
+                            "stack": {
+                                "role": "validation",
+                                "path": "/tmp/tier1-validation-stack",
+                            },
+                        }
+                    },
+                },
+                {
+                    "name": "validate",
+                    "profile": "tier2",
+                    "input": {
+                        "validation": {
+                            "profile": "tier2",
+                            "commands": [["make", "tier2-validate"]],
+                            "worker_home": "/tmp/tier2-worker-home",
+                            "stack": {
+                                "role": "validation",
+                                "path": "/tmp/tier2-validation-stack",
+                            },
+                        }
+                    },
+                },
+            ],
+        )
+
+        self.assertEqual(merged["profile"], "tier2")
+        self.assertEqual(merged["commands"], [["make", "tier2-validate"]])
+        self.assertEqual(merged["worker_home"], "/tmp/tier2-worker-home")
+        self.assertEqual(
+            merged["stack"],
+            {
+                "role": "validation",
+                "path": "/tmp/tier2-validation-stack",
+            },
+        )
+
+    def test_merged_implement_validation_input_backfills_profile_from_legacy_validate_step_profile(self):
+        merged = merged_implement_validation_input(
+            {"commands": []},
+            [
+                {
+                    "name": "validate",
+                    "profile": "tier1",
+                    "input": {},
+                }
+            ],
+        )
+
+        self.assertEqual(merged["profile"], "tier1")
+
     def test_implement_normalize_validation_accepts_validation_worker_home_alias_and_default_stack_role(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
