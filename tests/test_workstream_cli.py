@@ -8590,6 +8590,8 @@ if sys.argv[1:4] == ["show", "central-lve.9", "--json"]:
     )
     raise SystemExit(0)
 if sys.argv[1:3] == ["close", "central-lve.9"]:
+    print(f"BEADS_DOLT_PASSWORD={{os.environ.get('BEADS_DOLT_PASSWORD', '')}}")
+    print(os.environ.get("BEADS_DOLT_PASSWORD", ""), file=sys.stderr)
     print("beads close exploded", file=sys.stderr)
     raise SystemExit(7)
 raise SystemExit(9)
@@ -8684,11 +8686,20 @@ raise SystemExit(9)
             self.assertEqual(result["publication"]["tracker_close"]["tool"], "bd")
             self.assertEqual(result["publication"]["tracker_close"]["reason"], "bd close failed")
             self.assertIn("source item remains open", result["publication"]["tracker_close"]["remediation"])
+            self.assertEqual(
+                result["publication"]["tracker_close"]["stdout_excerpt"],
+                "BEADS_DOLT_PASSWORD=[REDACTED]\n",
+            )
+            self.assertEqual(
+                result["publication"]["tracker_close"]["stderr_excerpt"],
+                "[REDACTED]\nbeads close exploded\n",
+            )
             self.assertEqual(result["tracker"]["terminal_decision"]["status"], "merged")
             self.assertEqual(result["tracker"]["merge_commit"], "deadbeef")
             self.assertEqual(result["tracker"]["pr_url"], "https://github.example/pr/123")
             self.assertFalse(result["tracker"]["close_source_item"])
             self.assertIn("closure failed", result["tracker"]["comment"])
+            self.assertNotIn("test-password", json.dumps(result))
             self.assertEqual(
                 [call["tool"] for call in calls],
                 ["bd", "bd", "gh", "gh", "gh", "gh", "bd"],
@@ -8708,6 +8719,7 @@ raise SystemExit(9)
             fake_bin.mkdir()
             beads_secret_dir.mkdir(parents=True)
             (beads_secret_dir / "dolt_beads_password.txt").write_text("test-password\n", encoding="utf-8")
+            follow_up = temp_path / "retrospective-follow-up"
             init_repo(repo)
             fake_git = temp_path / "publisher-git"
             fake_gh = temp_path / "publisher-gh"
@@ -8753,6 +8765,14 @@ if sys.argv[1:4] == ["show", "central-lve.9", "--json"]:
     )
     raise SystemExit(0)
 raise SystemExit(9)
+""",
+            )
+            write_executable(
+                follow_up,
+                f"""#!{sys.executable}
+from pathlib import Path
+Path({str(fake_calls)!r}).open("a", encoding="utf-8").write('{{"tool":"follow-up"}}\\n')
+raise SystemExit(0)
 """,
             )
             write_executable(
@@ -8803,6 +8823,16 @@ raise SystemExit(9)
                     ],
                 }
             ]
+            recipe["retrospective"] = {
+                "summary": "Should not be recorded before close mode reaches a merged or no-merge terminal closure.",
+                "changes": ["Blocked merge left terminal evidence unavailable."],
+            }
+            recipe["retrospective_follow_up"] = {
+                "enabled": True,
+                "type": "local-command",
+                "command": [str(follow_up)],
+                "timeout_seconds": 10,
+            }
 
             completed = run_afk(
                 "run-workstream",
@@ -8835,7 +8865,59 @@ raise SystemExit(9)
             self.assertEqual(result["tracker"]["terminal_decision"]["status"], "blocked")
             self.assertEqual(result["tracker"]["terminal_decision"]["pr_url"], "https://github.example/pr/123")
             self.assertIn("BLOCKED", result["tracker"]["terminal_decision"]["reason"])
+            self.assertEqual(result["retrospective"], {})
+            self.assertEqual(result["tracker"]["retrospective"], {})
+            self.assertNotIn("retrospective", result["artifacts"])
+            self.assertNotIn("retrospective_follow_up_request", result["artifacts"])
+            self.assertNotIn("retrospective_follow_up_result", result["artifacts"])
+            self.assertFalse((ledger / "workstreams" / summary["run_id"] / "retrospective.json").exists())
+            self.assertFalse((ledger / "workstreams" / summary["run_id"] / "retrospective-follow-up-request.json").exists())
+            self.assertFalse((ledger / "workstreams" / summary["run_id"] / "retrospective-follow-up-result.json").exists())
             self.assertEqual([call["tool"] for call in calls], ["bd", "bd", "gh", "gh"])
+
+    def test_workstream_close_mode_requires_explicit_publisher_pr(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repo = temp_path / "repo-src"
+            checkout = temp_path / "checkout"
+            ledger = temp_path / "ledger"
+            init_repo(repo)
+            fake_git = temp_path / "publisher-git"
+            fake_gh = temp_path / "publisher-gh"
+            write_executable(
+                fake_git,
+                f"""#!{sys.executable}
+raise SystemExit(0)
+""",
+            )
+            write_executable(
+                fake_gh,
+                f"""#!{sys.executable}
+raise SystemExit(0)
+""",
+            )
+            recipe = successful_recipe(temp_path, repo, checkout, fake_git, fake_gh)
+            recipe["publisher"]["mode"] = "close"
+            recipe["publisher"].pop("pr", None)
+            recipe["publisher"]["git"]["push"] = False
+
+            completed = run_afk(
+                "run-workstream",
+                "--workstream-id",
+                "central-lve.9",
+                "--input",
+                json.dumps(recipe),
+                "--ledger",
+                str(ledger),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            result = json.loads((ledger / summary["result_path"]).read_text(encoding="utf-8"))
+
+            self.assertEqual(summary["status"], "failed-needs-human")
+            self.assertEqual(result["publication"]["status"], "failed-needs-human")
+            self.assertEqual(result["publication"]["reason"], "publisher.pr is required for close")
 
     def test_workstream_pr_body_redacts_validation_worker_command_secret_args(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -9245,6 +9327,82 @@ Path({str(fake_calls)!r}).write_text("gh should not run\\n", encoding="utf-8")
             self.assertNotIn("pr_body", result["artifacts"])
             self.assertFalse(result_path.parent.joinpath("pr-body.md").exists())
             self.assertFalse(fake_calls.exists())
+
+    def test_workstream_disabled_close_mode_omits_terminal_retrospective_until_terminal_closure_exists(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repo = temp_path / "repo-src"
+            checkout = temp_path / "checkout"
+            ledger = temp_path / "ledger"
+            follow_up_ran = temp_path / "follow-up-ran.txt"
+            init_repo(repo)
+            fake_git = temp_path / "publisher-git"
+            fake_gh = temp_path / "publisher-gh"
+            follow_up = temp_path / "retrospective-follow-up"
+            write_executable(
+                fake_git,
+                f"""#!{sys.executable}
+raise SystemExit(0)
+""",
+            )
+            write_executable(
+                fake_gh,
+                f"""#!{sys.executable}
+raise SystemExit(0)
+""",
+            )
+            write_executable(
+                follow_up,
+                f"""#!{sys.executable}
+from pathlib import Path
+Path({str(follow_up_ran)!r}).write_text("ran\\n", encoding="utf-8")
+raise SystemExit(0)
+""",
+            )
+            recipe = successful_recipe(temp_path, repo, checkout, fake_git, fake_gh)
+            recipe["publisher"] = {"enabled": False, "mode": "close", "pr": "123"}
+            recipe["retrospective"] = {
+                "summary": "Should not be recorded while close mode is disabled.",
+                "changes": ["Terminal evidence is only valid after merged or no-merge closure."],
+            }
+            recipe["retrospective_follow_up"] = {
+                "enabled": True,
+                "type": "local-command",
+                "command": [str(follow_up)],
+                "timeout_seconds": 10,
+            }
+
+            completed = run_afk(
+                "run-workstream",
+                "--workstream-id",
+                "central-lve.9",
+                "--input",
+                json.dumps(recipe),
+                "--ledger",
+                str(ledger),
+                env_overrides={
+                    "GIT_ALLOW_PROTOCOL": "file",
+                    "GIT_AUTHOR_NAME": "AFK Test",
+                    "GIT_AUTHOR_EMAIL": "afk-test@example.test",
+                    "GIT_COMMITTER_NAME": "AFK Test",
+                    "GIT_COMMITTER_EMAIL": "afk-test@example.test",
+                },
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            result_path = ledger / summary["result_path"]
+            result = json.loads(result_path.read_text(encoding="utf-8"))
+
+            self.assertEqual(summary["status"], "validated-unpublished")
+            self.assertEqual(result["publication"]["status"], "validated-unpublished")
+            self.assertEqual(result["retrospective"], {})
+            self.assertEqual(result["tracker"]["retrospective"], {})
+            self.assertNotIn("retrospective", result["artifacts"])
+            self.assertNotIn("retrospective_follow_up_request", result["artifacts"])
+            self.assertFalse(result_path.parent.joinpath("retrospective.json").exists())
+            self.assertFalse(result_path.parent.joinpath("retrospective-follow-up-request.json").exists())
+            self.assertFalse(follow_up_ran.exists())
 
     def test_workstream_redacts_secret_shaped_values_from_pr_body_and_published_body(self):
         with tempfile.TemporaryDirectory() as temp_dir:

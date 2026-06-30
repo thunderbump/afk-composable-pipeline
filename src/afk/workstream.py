@@ -299,6 +299,7 @@ def run_workstream(
         pipeline_retrospective,
         retrospective_judge,
         normalized=normalized,
+        publication=publication,
     )
     retrospective_follow_up_creation = _run_retrospective_follow_up(
         normalized=normalized,
@@ -315,8 +316,9 @@ def run_workstream(
 
     ledger.write_json("publication-result.json", publication)
     ledger.write_json("tracker-result.json", tracker)
-    if normalized["retrospective"]:
-        ledger.write_json("retrospective.json", redact_retrospective(normalized["retrospective"]))
+    terminal_retrospective = effective_retrospective(normalized, publication)
+    if terminal_retrospective:
+        ledger.write_json("retrospective.json", redact_retrospective(terminal_retrospective))
     ledger.write_json("pipeline-retrospective.json", pipeline_retrospective)
     result_payload = {
         "schema_version": SCHEMA_VERSION,
@@ -326,7 +328,7 @@ def run_workstream(
         "review_branch": normalized["review_branch"],
         "status": status,
         "review_cycles": redact_review_cycles(normalized["review_cycles"]),
-        "retrospective": redact_retrospective(normalized["retrospective"]),
+        "retrospective": redact_retrospective(terminal_retrospective),
         "steps": steps,
         "selected_work": selected_work,
         "cleanup": state["cleanup"],
@@ -1631,6 +1633,7 @@ def close_selected_source_item(
             command,
             cwd=workspace,
             extra_env={"BEADS_DOLT_PASSWORD": password},
+            exact_secrets={password},
             message_on_failure="bd close failed",
         )
         return {
@@ -1723,6 +1726,7 @@ def run_local_tracker_command(
     *,
     cwd: Path,
     extra_env: dict[str, str],
+    exact_secrets: set[str] | None = None,
     message_on_failure: str,
 ) -> subprocess.CompletedProcess[str]:
     env = {key: value for key in ("PATH", "LANG", "LC_ALL") if (value := os.environ.get(key)) is not None}
@@ -1737,14 +1741,19 @@ def run_local_tracker_command(
             check=False,
         )
     except OSError as exc:
-        raise PublisherError(str(exc), command=command, returncode=None, stderr=str(exc)) from exc
+        raise PublisherError(
+            str(exc),
+            command=command,
+            returncode=None,
+            stderr=redact_text(str(exc), exact_secrets=exact_secrets),
+        ) from exc
     if completed.returncode != 0:
         raise PublisherError(
             message_on_failure,
             command=command,
             returncode=completed.returncode,
-            stdout=completed.stdout,
-            stderr=completed.stderr,
+            stdout=redact_text(completed.stdout, exact_secrets=exact_secrets),
+            stderr=redact_text(completed.stderr, exact_secrets=exact_secrets),
         )
     return completed
 
@@ -2214,13 +2223,16 @@ def normalize_publisher_config(publisher: dict[str, Any], normalized: dict[str, 
     title = string_field(publisher, "title") or f"{normalized['workstream_id']}: workstream"
     repo = string_field(publisher, "repo") or ""
     base = string_field(publisher, "base") or ""
-    pr = string_field(publisher, "pr") or head
+    raw_pr = string_field(publisher, "pr") or ""
+    pr = raw_pr or head
     if not repo:
         raise WorkstreamError("publisher.repo is required")
     if mode == "create" and not base:
         raise WorkstreamError("publisher.base is required for create")
-    if mode == "close" and not pr:
+    if mode == "close" and not raw_pr:
         raise WorkstreamError("publisher.pr is required for close")
+    if mode == "close":
+        pr = raw_pr
     gh_auth = normalize_publisher_gh_auth(gh)
     return {
         "mode": mode,
@@ -3044,7 +3056,7 @@ def tracker_record(
         "review_summary": string_field(review, "summary") or "",
         "review_findings": tracker_review_findings(review),
         "review_cycles": redact_review_cycles(normalized.get("review_cycles") or []),
-        "retrospective": redact_retrospective(normalized.get("retrospective")),
+        "retrospective": redact_retrospective(effective_retrospective(normalized, publication)),
         "terminal_decision": redact_artifact_value(decision),
     }
     decision_status = decision.get("status")
@@ -3188,7 +3200,7 @@ def pipeline_retrospective_record(
         + _blocked_retrospective_signals(publication)
         + _cleanup_retrospective_signals(state)
     )
-    follow_up = _retrospective_follow_up_record(signals, normalized)
+    follow_up = _retrospective_follow_up_record(signals, normalized, publication)
     return {
         "schema_version": SCHEMA_VERSION,
         "status": workstream_status_from_publication(publication),
@@ -3224,6 +3236,7 @@ def _apply_retrospective_judge(
     judge: dict[str, Any],
     *,
     normalized: dict[str, Any] | None,
+    publication: dict[str, Any],
 ) -> dict[str, Any]:
     record = dict(pipeline_retrospective)
     if not judge:
@@ -3235,7 +3248,7 @@ def _apply_retrospective_judge(
         signals.extend(judge_signals)
     record["signals"] = signals
     record["health"] = _retrospective_health(signals)
-    follow_up = _retrospective_follow_up_record(signals, normalized)
+    follow_up = _retrospective_follow_up_record(signals, normalized, publication)
     record["recommended_follow_up"] = _legacy_recommended_follow_up(follow_up["recommended"])
     record["follow_up"] = follow_up
     record["judge"] = judge
@@ -3377,7 +3390,7 @@ def _build_retrospective_judge_evidence_pack(
             "status": workstream_status_from_publication(publication),
         },
         "selected_work": _retrospective_judge_prompt_selected_work(selected_work),
-        "retrospective": redact_retrospective(normalized.get("retrospective")),
+        "retrospective": redact_retrospective(effective_retrospective(normalized, publication)),
         "publication": {
             "status": redact_text(str(publication.get("status") or "")),
             "reason": redact_text(str(publication.get("reason") or "")),
@@ -3727,6 +3740,8 @@ def _run_retrospective_follow_up(
     follow_up_config = normalized.get("retrospective_follow_up") if isinstance(normalized, dict) else {}
     if not isinstance(follow_up_config, dict) or not follow_up_config.get("enabled"):
         return _disabled_retrospective_follow_up_creation_record()
+    if not retrospective_follow_up_allowed(normalized, publication):
+        return _disabled_retrospective_follow_up_creation_record()
     follow_up = (
         pipeline_retrospective.get("follow_up") if isinstance(pipeline_retrospective.get("follow_up"), dict) else {}
     )
@@ -3865,7 +3880,7 @@ def _build_retrospective_follow_up_request(
             "review_branch": normalized["review_branch"],
             "status": workstream_status_from_publication(publication),
         },
-        "retrospective": redact_retrospective(normalized.get("retrospective")),
+        "retrospective": redact_retrospective(effective_retrospective(normalized, publication)),
         "publication": {
             "status": redact_text(str(publication.get("status") or "")),
             "reason": redact_text(str(publication.get("reason") or "")),
@@ -4259,7 +4274,11 @@ def _cleanup_retrospective_signals(state: dict[str, Any]) -> list[dict[str, Any]
     ]
 
 
-def _retrospective_follow_up_record(signals: list[dict[str, Any]], normalized: dict[str, Any] | None) -> dict[str, Any]:
+def _retrospective_follow_up_record(
+    signals: list[dict[str, Any]],
+    normalized: dict[str, Any] | None,
+    publication: dict[str, Any],
+) -> dict[str, Any]:
     recommended = []
     created = []
     recommended_fingerprints: set[str] = set()
@@ -4267,7 +4286,7 @@ def _retrospective_follow_up_record(signals: list[dict[str, Any]], normalized: d
     created_fingerprints: set[str] = set()
     created_identities: set[str] = set()
     if normalized is not None:
-        retrospective = normalized.get("retrospective") if isinstance(normalized, dict) else {}
+        retrospective = effective_retrospective(normalized, publication)
         configured = retrospective.get("follow_up") if isinstance(retrospective, dict) else {}
         configured_recommended = configured.get("recommended") if isinstance(configured, dict) else []
         if isinstance(configured_recommended, list):
@@ -4947,9 +4966,36 @@ def validate_retrospective_terminal_decision(
     decision = tracker.get("terminal_decision") if isinstance(tracker, dict) else {}
     if isinstance(decision, dict) and decision.get("status") in {"merged", "no-merge"}:
         return
-    if (string_field(publisher, "mode") or "") == "close":
+    publisher_config = publisher if isinstance(publisher, dict) else {}
+    if (string_field(publisher_config, "mode") or "") == "close":
         return
     raise WorkstreamError("retrospective requires tracker.terminal_decision.status to be merged or no-merge")
+
+
+def effective_retrospective(normalized: dict[str, Any], publication: dict[str, Any]) -> dict[str, Any]:
+    retrospective = normalized.get("retrospective") if isinstance(normalized, dict) else {}
+    if not isinstance(retrospective, dict) or not retrospective:
+        return {}
+    if publisher_mode(normalized) != "close":
+        return retrospective
+    decision_status = effective_tracker_terminal_decision(normalized, publication).get("status")
+    if decision_status not in {"merged", "no-merge"}:
+        return {}
+    return retrospective
+
+
+def retrospective_follow_up_allowed(normalized: dict[str, Any], publication: dict[str, Any]) -> bool:
+    if publisher_mode(normalized) != "close":
+        return True
+    decision_status = effective_tracker_terminal_decision(normalized, publication).get("status")
+    return decision_status in {"merged", "no-merge"}
+
+
+def publisher_mode(normalized: dict[str, Any]) -> str:
+    publisher = normalized.get("publisher") if isinstance(normalized, dict) else {}
+    if not isinstance(publisher, dict):
+        publisher = {}
+    return string_field(publisher, "mode") or "create"
 
 
 def review_cycles_require_response(review_cycles: Any) -> bool:
