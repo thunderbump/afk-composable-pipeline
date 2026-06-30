@@ -8334,6 +8334,591 @@ sys.exit(9)
             )
             self.assertEqual(calls[3]["argv"][3], "repos/thunderbump/afk-composable-pipeline/pulls/987")
 
+    def test_workstream_close_mode_merges_existing_pr_closes_bead_and_runs_retrospective_afterward(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repo = temp_path / "repo-src"
+            checkout = temp_path / "checkout"
+            ledger = temp_path / "ledger"
+            fake_calls = temp_path / "fake-calls.jsonl"
+            beads_workspace = temp_path / "beads"
+            beads_secret_dir = beads_workspace / "secrets"
+            fake_bin = temp_path / "bin"
+            fake_bin.mkdir()
+            beads_secret_dir.mkdir(parents=True)
+            (beads_secret_dir / "dolt_beads_password.txt").write_text("test-password\n", encoding="utf-8")
+            init_repo(repo)
+            fake_git = temp_path / "publisher-git"
+            fake_gh = temp_path / "publisher-gh"
+            fake_bd = fake_bin / "bd"
+            follow_up = temp_path / "retrospective-follow-up"
+            write_executable(
+                fake_git,
+                f"""#!{sys.executable}
+from pathlib import Path
+Path({str(fake_calls)!r}).write_text("git should not run\\n", encoding="utf-8")
+raise SystemExit(9)
+""",
+            )
+            write_executable(
+                fake_bd,
+                f"""#!{sys.executable}
+import json
+import os
+import sys
+from pathlib import Path
+
+record = {{
+    "tool": "bd",
+    "argv": sys.argv[1:],
+    "cwd": os.getcwd(),
+}}
+Path({str(fake_calls)!r}).open("a", encoding="utf-8").write(json.dumps(record) + "\\n")
+if sys.argv[1:3] == ["list", "--json"]:
+    print(json.dumps([{{"id": "central-lve.9"}}]))
+    raise SystemExit(0)
+if sys.argv[1:4] == ["show", "central-lve.9", "--json"]:
+    print(
+        json.dumps(
+            {{
+                "id": "central-lve.9",
+                "title": "Compose workstream recipe and terminal PR publisher",
+                "status": "open",
+                "labels": ["project:afk-composable-pipeline", "ready-for-agent"],
+                "metadata": {{"workstream": "central-lve", "afk.ready": True}},
+                "description": "Acceptance Criteria\\n- Merge the published PR\\n",
+                "dependencies": [],
+            }}
+        )
+    )
+    raise SystemExit(0)
+if sys.argv[1:3] == ["close", "central-lve.9"]:
+    raise SystemExit(0)
+raise SystemExit(9)
+""",
+            )
+            write_executable(
+                fake_gh,
+                f"""#!{sys.executable}
+import json
+import sys
+from pathlib import Path
+
+record = {{"tool": "gh", "argv": sys.argv[1:]}}
+Path({str(fake_calls)!r}).open("a", encoding="utf-8").write(json.dumps(record) + "\\n")
+if sys.argv[1:4] == ["auth", "status", "--hostname"]:
+    raise SystemExit(0)
+if sys.argv[1:4] == ["pr", "view", "123"]:
+    if any("mergeCommit" in arg for arg in sys.argv):
+        print(json.dumps({{"url": "https://github.example/pr/123", "mergeCommit": {{"oid": "deadbeef"}}, "mergedAt": "2026-06-29T12:00:00Z"}}))
+    else:
+        print(json.dumps({{"url": "https://github.example/pr/123", "isDraft": False, "state": "OPEN", "mergeStateStatus": "CLEAN", "headRefOid": "abc123"}}))
+    raise SystemExit(0)
+if sys.argv[1:4] == ["pr", "merge", "123"]:
+    raise SystemExit(0)
+raise SystemExit(9)
+""",
+            )
+            write_executable(
+                follow_up,
+                f"""#!{sys.executable}
+import json
+import os
+from pathlib import Path
+
+record = {{
+    "tool": "follow-up",
+    "request_path": os.environ["AFK_RETROSPECTIVE_FOLLOW_UP_REQUEST"],
+}}
+Path({str(fake_calls)!r}).open("a", encoding="utf-8").write(json.dumps(record) + "\\n")
+Path(os.environ["AFK_RETROSPECTIVE_FOLLOW_UP_RESULT"]).write_text(
+    json.dumps({{"status": "created", "created": [{{"id": "central-r5kv", "summary": "Document close-mode follow-up."}}]}}),
+    encoding="utf-8",
+)
+""",
+            )
+            recipe = successful_recipe(temp_path, repo, checkout, fake_git, fake_gh)
+            recipe["steps"][0]["input"] = {
+                "required_labels": ["ready-for-agent"],
+                "sources": [
+                    {
+                        "type": "beads",
+                        "id": "central-beads",
+                        "workspace": str(beads_workspace),
+                        "workspace_kind": "central",
+                        "status": "open",
+                        "labels": ["project:afk-composable-pipeline", "ready-for-agent"],
+                    }
+                ],
+            }
+            recipe["publisher"]["mode"] = "close"
+            recipe["publisher"]["pr"] = "123"
+            recipe["publisher"]["git"]["push"] = False
+            recipe["review_cycles"] = [
+                {
+                    "status": "findings-addressed",
+                    "reviews": [
+                        {
+                            "role": "correctness",
+                            "status": "request-changes",
+                            "summary": "Please address the review findings before merge.",
+                            "requires_response": True,
+                            "response": {"status": "addressed", "summary": "Addressed on the PR."},
+                        }
+                    ],
+                }
+            ]
+            recipe["retrospective"] = {
+                "summary": "Merged the published PR and closed the source bead.",
+                "changes": ["Merged PR #123 after addressed review feedback."],
+                "follow_up": {
+                    "recommended": [
+                        {
+                            "id": "central-r5kv",
+                            "summary": "Document close-mode follow-up.",
+                            "labels": ["project:afk-composable-pipeline"],
+                        }
+                    ]
+                },
+            }
+            recipe["retrospective_follow_up"] = {
+                "enabled": True,
+                "type": "local-command",
+                "command": [str(follow_up)],
+                "timeout_seconds": 10,
+            }
+
+            completed = run_afk(
+                "run-workstream",
+                "--workstream-id",
+                "central-lve.9",
+                "--input",
+                json.dumps(recipe),
+                "--ledger",
+                str(ledger),
+                env_overrides={
+                    "GIT_ALLOW_PROTOCOL": "file",
+                    "GIT_AUTHOR_NAME": "AFK Test",
+                    "GIT_AUTHOR_EMAIL": "afk-test@example.test",
+                    "GIT_COMMITTER_NAME": "AFK Test",
+                    "GIT_COMMITTER_EMAIL": "afk-test@example.test",
+                    "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+                },
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            result = json.loads((ledger / summary["result_path"]).read_text(encoding="utf-8"))
+            calls = [json.loads(line) for line in fake_calls.read_text(encoding="utf-8").splitlines()]
+
+            self.assertEqual(summary["status"], "closed")
+            self.assertEqual(result["publication"]["status"], "tracker-closed")
+            self.assertEqual(result["publication"]["mode"], "close")
+            self.assertEqual(result["publication"]["url"], "https://github.example/pr/123")
+            self.assertEqual(result["tracker"]["status"], "closed")
+            self.assertTrue(result["tracker"]["close_source_item"])
+            self.assertEqual(result["tracker"]["close_reason"], "merged via deadbeef")
+            self.assertEqual(result["tracker"]["terminal_decision"]["status"], "merged")
+            self.assertEqual(result["tracker"]["terminal_decision"]["merge_commit"], "deadbeef")
+            self.assertEqual(result["tracker"]["terminal_decision"]["pr_url"], "https://github.example/pr/123")
+            self.assertEqual(
+                [call["tool"] for call in calls],
+                ["bd", "bd", "gh", "gh", "gh", "gh", "bd", "follow-up"],
+            )
+            self.assertEqual(calls[-2]["argv"][0:2], ["close", "central-lve.9"])
+            self.assertEqual(calls[-1]["tool"], "follow-up")
+            self.assertEqual(
+                result["pipeline_retrospective"]["follow_up"]["creation"]["status"],
+                "created",
+            )
+
+    def test_workstream_close_mode_records_merged_terminal_decision_when_bead_close_fails(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repo = temp_path / "repo-src"
+            checkout = temp_path / "checkout"
+            ledger = temp_path / "ledger"
+            fake_calls = temp_path / "fake-calls.jsonl"
+            beads_workspace = temp_path / "beads"
+            beads_secret_dir = beads_workspace / "secrets"
+            fake_bin = temp_path / "bin"
+            fake_bin.mkdir()
+            beads_secret_dir.mkdir(parents=True)
+            (beads_secret_dir / "dolt_beads_password.txt").write_text("test-password\n", encoding="utf-8")
+            init_repo(repo)
+            fake_git = temp_path / "publisher-git"
+            fake_gh = temp_path / "publisher-gh"
+            fake_bd = fake_bin / "bd"
+            write_executable(
+                fake_git,
+                f"""#!{sys.executable}
+from pathlib import Path
+Path({str(fake_calls)!r}).write_text("git should not run\\n", encoding="utf-8")
+raise SystemExit(9)
+""",
+            )
+            write_executable(
+                fake_bd,
+                f"""#!{sys.executable}
+import json
+import os
+import sys
+from pathlib import Path
+
+record = {{
+    "tool": "bd",
+    "argv": sys.argv[1:],
+    "cwd": os.getcwd(),
+}}
+Path({str(fake_calls)!r}).open("a", encoding="utf-8").write(json.dumps(record) + "\\n")
+if sys.argv[1:3] == ["list", "--json"]:
+    print(json.dumps([{{"id": "central-lve.9"}}]))
+    raise SystemExit(0)
+if sys.argv[1:4] == ["show", "central-lve.9", "--json"]:
+    print(
+        json.dumps(
+            {{
+                "id": "central-lve.9",
+                "title": "Compose workstream recipe and terminal PR publisher",
+                "status": "open",
+                "labels": ["project:afk-composable-pipeline", "ready-for-agent"],
+                "metadata": {{"workstream": "central-lve", "afk.ready": True}},
+                "description": "Acceptance Criteria\\n- Merge the published PR\\n",
+                "dependencies": [],
+            }}
+        )
+    )
+    raise SystemExit(0)
+if sys.argv[1:3] == ["close", "central-lve.9"]:
+    print(f"BEADS_DOLT_PASSWORD={{os.environ.get('BEADS_DOLT_PASSWORD', '')}}")
+    print(os.environ.get("BEADS_DOLT_PASSWORD", ""), file=sys.stderr)
+    print("beads close exploded", file=sys.stderr)
+    raise SystemExit(7)
+raise SystemExit(9)
+""",
+            )
+            write_executable(
+                fake_gh,
+                f"""#!{sys.executable}
+import json
+import sys
+from pathlib import Path
+
+record = {{"tool": "gh", "argv": sys.argv[1:]}}
+Path({str(fake_calls)!r}).open("a", encoding="utf-8").write(json.dumps(record) + "\\n")
+if sys.argv[1:4] == ["auth", "status", "--hostname"]:
+    raise SystemExit(0)
+if sys.argv[1:4] == ["pr", "view", "123"]:
+    if any("mergeCommit" in arg for arg in sys.argv):
+        print(json.dumps({{"url": "https://github.example/pr/123", "mergeCommit": {{"oid": "deadbeef"}}, "mergedAt": "2026-06-29T12:00:00Z"}}))
+    else:
+        print(json.dumps({{"url": "https://github.example/pr/123", "isDraft": False, "state": "OPEN", "mergeStateStatus": "CLEAN", "headRefOid": "abc123"}}))
+    raise SystemExit(0)
+if sys.argv[1:4] == ["pr", "merge", "123"]:
+    raise SystemExit(0)
+raise SystemExit(9)
+""",
+            )
+            recipe = successful_recipe(temp_path, repo, checkout, fake_git, fake_gh)
+            recipe["steps"][0]["input"] = {
+                "required_labels": ["ready-for-agent"],
+                "sources": [
+                    {
+                        "type": "beads",
+                        "id": "central-beads",
+                        "workspace": str(beads_workspace),
+                        "workspace_kind": "central",
+                        "status": "open",
+                        "labels": ["project:afk-composable-pipeline", "ready-for-agent"],
+                    }
+                ],
+            }
+            recipe["publisher"]["mode"] = "close"
+            recipe["publisher"]["pr"] = "123"
+            recipe["publisher"]["git"]["push"] = False
+            recipe["review_cycles"] = [
+                {
+                    "status": "findings-addressed",
+                    "reviews": [
+                        {
+                            "role": "correctness",
+                            "status": "request-changes",
+                            "summary": "Please address the review findings before merge.",
+                            "requires_response": True,
+                            "response": {"status": "addressed", "summary": "Addressed on the PR."},
+                        }
+                    ],
+                }
+            ]
+
+            completed = run_afk(
+                "run-workstream",
+                "--workstream-id",
+                "central-lve.9",
+                "--input",
+                json.dumps(recipe),
+                "--ledger",
+                str(ledger),
+                env_overrides={
+                    "GIT_ALLOW_PROTOCOL": "file",
+                    "GIT_AUTHOR_NAME": "AFK Test",
+                    "GIT_AUTHOR_EMAIL": "afk-test@example.test",
+                    "GIT_COMMITTER_NAME": "AFK Test",
+                    "GIT_COMMITTER_EMAIL": "afk-test@example.test",
+                    "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+                },
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            result = json.loads((ledger / summary["result_path"]).read_text(encoding="utf-8"))
+            calls = [json.loads(line) for line in fake_calls.read_text(encoding="utf-8").splitlines()]
+
+            self.assertEqual(summary["status"], "failed-needs-human")
+            self.assertEqual(result["publication"]["status"], "failed-needs-human")
+            self.assertEqual(result["publication"]["mode"], "close")
+            self.assertEqual(result["publication"]["url"], "https://github.example/pr/123")
+            self.assertEqual(result["publication"]["merge_commit"], "deadbeef")
+            self.assertEqual(result["publication"]["terminal_decision"]["status"], "merged")
+            self.assertEqual(result["publication"]["terminal_decision"]["merge_commit"], "deadbeef")
+            self.assertEqual(result["publication"]["terminal_decision"]["pr_url"], "https://github.example/pr/123")
+            self.assertEqual(result["publication"]["tracker_close"]["status"], "failed")
+            self.assertEqual(result["publication"]["tracker_close"]["tool"], "bd")
+            self.assertEqual(result["publication"]["tracker_close"]["reason"], "bd close failed")
+            self.assertIn("source item remains open", result["publication"]["tracker_close"]["remediation"])
+            self.assertEqual(
+                result["publication"]["tracker_close"]["stdout_excerpt"],
+                "BEADS_DOLT_PASSWORD=[REDACTED]\n",
+            )
+            self.assertEqual(
+                result["publication"]["tracker_close"]["stderr_excerpt"],
+                "[REDACTED]\nbeads close exploded\n",
+            )
+            self.assertEqual(result["tracker"]["terminal_decision"]["status"], "merged")
+            self.assertEqual(result["tracker"]["merge_commit"], "deadbeef")
+            self.assertEqual(result["tracker"]["pr_url"], "https://github.example/pr/123")
+            self.assertFalse(result["tracker"]["close_source_item"])
+            self.assertIn("closure failed", result["tracker"]["comment"])
+            self.assertNotIn("test-password", json.dumps(result))
+            self.assertEqual(
+                [call["tool"] for call in calls],
+                ["bd", "bd", "gh", "gh", "gh", "gh", "bd"],
+            )
+            self.assertEqual(calls[-1]["argv"][0:2], ["close", "central-lve.9"])
+
+    def test_workstream_close_mode_records_blocked_terminal_decision_without_closing_bead(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repo = temp_path / "repo-src"
+            checkout = temp_path / "checkout"
+            ledger = temp_path / "ledger"
+            fake_calls = temp_path / "fake-calls.jsonl"
+            beads_workspace = temp_path / "beads"
+            beads_secret_dir = beads_workspace / "secrets"
+            fake_bin = temp_path / "bin"
+            fake_bin.mkdir()
+            beads_secret_dir.mkdir(parents=True)
+            (beads_secret_dir / "dolt_beads_password.txt").write_text("test-password\n", encoding="utf-8")
+            follow_up = temp_path / "retrospective-follow-up"
+            init_repo(repo)
+            fake_git = temp_path / "publisher-git"
+            fake_gh = temp_path / "publisher-gh"
+            fake_bd = fake_bin / "bd"
+            write_executable(
+                fake_git,
+                f"""#!{sys.executable}
+from pathlib import Path
+Path({str(fake_calls)!r}).write_text("git should not run\\n", encoding="utf-8")
+raise SystemExit(9)
+""",
+            )
+            write_executable(
+                fake_bd,
+                f"""#!{sys.executable}
+import json
+import os
+import sys
+from pathlib import Path
+
+record = {{
+    "tool": "bd",
+    "argv": sys.argv[1:],
+    "cwd": os.getcwd(),
+}}
+Path({str(fake_calls)!r}).open("a", encoding="utf-8").write(json.dumps(record) + "\\n")
+if sys.argv[1:3] == ["list", "--json"]:
+    print(json.dumps([{{"id": "central-lve.9"}}]))
+    raise SystemExit(0)
+if sys.argv[1:4] == ["show", "central-lve.9", "--json"]:
+    print(
+        json.dumps(
+            {{
+                "id": "central-lve.9",
+                "title": "Compose workstream recipe and terminal PR publisher",
+                "status": "open",
+                "labels": ["project:afk-composable-pipeline", "ready-for-agent"],
+                "metadata": {{"workstream": "central-lve", "afk.ready": True}},
+                "description": "Acceptance Criteria\\n- Merge the published PR\\n",
+                "dependencies": [],
+            }}
+        )
+    )
+    raise SystemExit(0)
+raise SystemExit(9)
+""",
+            )
+            write_executable(
+                follow_up,
+                f"""#!{sys.executable}
+from pathlib import Path
+Path({str(fake_calls)!r}).open("a", encoding="utf-8").write('{{"tool":"follow-up"}}\\n')
+raise SystemExit(0)
+""",
+            )
+            write_executable(
+                fake_gh,
+                f"""#!{sys.executable}
+import json
+import sys
+from pathlib import Path
+
+record = {{"tool": "gh", "argv": sys.argv[1:]}}
+Path({str(fake_calls)!r}).open("a", encoding="utf-8").write(json.dumps(record) + "\\n")
+if sys.argv[1:4] == ["auth", "status", "--hostname"]:
+    raise SystemExit(0)
+if sys.argv[1:4] == ["pr", "view", "123"]:
+    print(json.dumps({{"url": "https://github.example/pr/123", "isDraft": False, "state": "OPEN", "mergeStateStatus": "BLOCKED", "headRefOid": "abc123"}}))
+    raise SystemExit(0)
+raise SystemExit(9)
+""",
+            )
+            recipe = successful_recipe(temp_path, repo, checkout, fake_git, fake_gh)
+            recipe["steps"][0]["input"] = {
+                "required_labels": ["ready-for-agent"],
+                "sources": [
+                    {
+                        "type": "beads",
+                        "id": "central-beads",
+                        "workspace": str(beads_workspace),
+                        "workspace_kind": "central",
+                        "status": "open",
+                        "labels": ["project:afk-composable-pipeline", "ready-for-agent"],
+                    }
+                ],
+            }
+            recipe["publisher"]["mode"] = "close"
+            recipe["publisher"]["pr"] = "123"
+            recipe["publisher"]["git"]["push"] = False
+            recipe["review_cycles"] = [
+                {
+                    "status": "findings-addressed",
+                    "reviews": [
+                        {
+                            "role": "correctness",
+                            "status": "request-changes",
+                            "summary": "Please address the review findings before merge.",
+                            "requires_response": True,
+                            "response": {"status": "addressed", "summary": "Addressed on the PR."},
+                        }
+                    ],
+                }
+            ]
+            recipe["retrospective"] = {
+                "summary": "Should not be recorded before close mode reaches a merged or no-merge terminal closure.",
+                "changes": ["Blocked merge left terminal evidence unavailable."],
+            }
+            recipe["retrospective_follow_up"] = {
+                "enabled": True,
+                "type": "local-command",
+                "command": [str(follow_up)],
+                "timeout_seconds": 10,
+            }
+
+            completed = run_afk(
+                "run-workstream",
+                "--workstream-id",
+                "central-lve.9",
+                "--input",
+                json.dumps(recipe),
+                "--ledger",
+                str(ledger),
+                env_overrides={
+                    "GIT_ALLOW_PROTOCOL": "file",
+                    "GIT_AUTHOR_NAME": "AFK Test",
+                    "GIT_AUTHOR_EMAIL": "afk-test@example.test",
+                    "GIT_COMMITTER_NAME": "AFK Test",
+                    "GIT_COMMITTER_EMAIL": "afk-test@example.test",
+                    "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+                },
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            result = json.loads((ledger / summary["result_path"]).read_text(encoding="utf-8"))
+            calls = [json.loads(line) for line in fake_calls.read_text(encoding="utf-8").splitlines()]
+
+            self.assertEqual(summary["status"], "blocked")
+            self.assertEqual(result["publication"]["status"], "blocked")
+            self.assertEqual(result["publication"]["mode"], "close")
+            self.assertEqual(result["tracker"]["status"], "review-feedback-addressed")
+            self.assertFalse(result["tracker"]["close_source_item"])
+            self.assertEqual(result["tracker"]["terminal_decision"]["status"], "blocked")
+            self.assertEqual(result["tracker"]["terminal_decision"]["pr_url"], "https://github.example/pr/123")
+            self.assertIn("BLOCKED", result["tracker"]["terminal_decision"]["reason"])
+            self.assertEqual(result["retrospective"], {})
+            self.assertEqual(result["tracker"]["retrospective"], {})
+            self.assertNotIn("retrospective", result["artifacts"])
+            self.assertNotIn("retrospective_follow_up_request", result["artifacts"])
+            self.assertNotIn("retrospective_follow_up_result", result["artifacts"])
+            self.assertFalse((ledger / "workstreams" / summary["run_id"] / "retrospective.json").exists())
+            self.assertFalse((ledger / "workstreams" / summary["run_id"] / "retrospective-follow-up-request.json").exists())
+            self.assertFalse((ledger / "workstreams" / summary["run_id"] / "retrospective-follow-up-result.json").exists())
+            self.assertEqual([call["tool"] for call in calls], ["bd", "bd", "gh", "gh"])
+
+    def test_workstream_close_mode_requires_explicit_publisher_pr(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repo = temp_path / "repo-src"
+            checkout = temp_path / "checkout"
+            ledger = temp_path / "ledger"
+            init_repo(repo)
+            fake_git = temp_path / "publisher-git"
+            fake_gh = temp_path / "publisher-gh"
+            write_executable(
+                fake_git,
+                f"""#!{sys.executable}
+raise SystemExit(0)
+""",
+            )
+            write_executable(
+                fake_gh,
+                f"""#!{sys.executable}
+raise SystemExit(0)
+""",
+            )
+            recipe = successful_recipe(temp_path, repo, checkout, fake_git, fake_gh)
+            recipe["publisher"]["mode"] = "close"
+            recipe["publisher"].pop("pr", None)
+            recipe["publisher"]["git"]["push"] = False
+
+            completed = run_afk(
+                "run-workstream",
+                "--workstream-id",
+                "central-lve.9",
+                "--input",
+                json.dumps(recipe),
+                "--ledger",
+                str(ledger),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            result = json.loads((ledger / summary["result_path"]).read_text(encoding="utf-8"))
+
+            self.assertEqual(summary["status"], "failed-needs-human")
+            self.assertEqual(result["publication"]["status"], "failed-needs-human")
+            self.assertEqual(result["publication"]["reason"], "publisher.pr is required for close")
+
     def test_workstream_pr_body_redacts_validation_worker_command_secret_args(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
@@ -8743,6 +9328,82 @@ Path({str(fake_calls)!r}).write_text("gh should not run\\n", encoding="utf-8")
             self.assertFalse(result_path.parent.joinpath("pr-body.md").exists())
             self.assertFalse(fake_calls.exists())
 
+    def test_workstream_disabled_close_mode_omits_terminal_retrospective_until_terminal_closure_exists(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repo = temp_path / "repo-src"
+            checkout = temp_path / "checkout"
+            ledger = temp_path / "ledger"
+            follow_up_ran = temp_path / "follow-up-ran.txt"
+            init_repo(repo)
+            fake_git = temp_path / "publisher-git"
+            fake_gh = temp_path / "publisher-gh"
+            follow_up = temp_path / "retrospective-follow-up"
+            write_executable(
+                fake_git,
+                f"""#!{sys.executable}
+raise SystemExit(0)
+""",
+            )
+            write_executable(
+                fake_gh,
+                f"""#!{sys.executable}
+raise SystemExit(0)
+""",
+            )
+            write_executable(
+                follow_up,
+                f"""#!{sys.executable}
+from pathlib import Path
+Path({str(follow_up_ran)!r}).write_text("ran\\n", encoding="utf-8")
+raise SystemExit(0)
+""",
+            )
+            recipe = successful_recipe(temp_path, repo, checkout, fake_git, fake_gh)
+            recipe["publisher"] = {"enabled": False, "mode": "close", "pr": "123"}
+            recipe["retrospective"] = {
+                "summary": "Should not be recorded while close mode is disabled.",
+                "changes": ["Terminal evidence is only valid after merged or no-merge closure."],
+            }
+            recipe["retrospective_follow_up"] = {
+                "enabled": True,
+                "type": "local-command",
+                "command": [str(follow_up)],
+                "timeout_seconds": 10,
+            }
+
+            completed = run_afk(
+                "run-workstream",
+                "--workstream-id",
+                "central-lve.9",
+                "--input",
+                json.dumps(recipe),
+                "--ledger",
+                str(ledger),
+                env_overrides={
+                    "GIT_ALLOW_PROTOCOL": "file",
+                    "GIT_AUTHOR_NAME": "AFK Test",
+                    "GIT_AUTHOR_EMAIL": "afk-test@example.test",
+                    "GIT_COMMITTER_NAME": "AFK Test",
+                    "GIT_COMMITTER_EMAIL": "afk-test@example.test",
+                },
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            result_path = ledger / summary["result_path"]
+            result = json.loads(result_path.read_text(encoding="utf-8"))
+
+            self.assertEqual(summary["status"], "validated-unpublished")
+            self.assertEqual(result["publication"]["status"], "validated-unpublished")
+            self.assertEqual(result["retrospective"], {})
+            self.assertEqual(result["tracker"]["retrospective"], {})
+            self.assertNotIn("retrospective", result["artifacts"])
+            self.assertNotIn("retrospective_follow_up_request", result["artifacts"])
+            self.assertFalse(result_path.parent.joinpath("retrospective.json").exists())
+            self.assertFalse(result_path.parent.joinpath("retrospective-follow-up-request.json").exists())
+            self.assertFalse(follow_up_ran.exists())
+
     def test_workstream_redacts_secret_shaped_values_from_pr_body_and_published_body(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
@@ -8999,7 +9660,7 @@ Path({str(fake_calls)!r}).write_text("gh should not run\\n", encoding="utf-8")
             (
                 "invalid_mode",
                 lambda publisher: publisher.__setitem__("mode", "delete"),
-                "publisher.mode must be create or update",
+                "publisher.mode must be create, update or close",
             ),
         ]
         for case_name, mutate_publisher, expected_reason in cases:

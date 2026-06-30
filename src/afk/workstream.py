@@ -299,6 +299,7 @@ def run_workstream(
         pipeline_retrospective,
         retrospective_judge,
         normalized=normalized,
+        publication=publication,
     )
     retrospective_follow_up_creation = _run_retrospective_follow_up(
         normalized=normalized,
@@ -315,8 +316,9 @@ def run_workstream(
 
     ledger.write_json("publication-result.json", publication)
     ledger.write_json("tracker-result.json", tracker)
-    if normalized["retrospective"]:
-        ledger.write_json("retrospective.json", redact_retrospective(normalized["retrospective"]))
+    terminal_retrospective = effective_retrospective(normalized, publication)
+    if terminal_retrospective:
+        ledger.write_json("retrospective.json", redact_retrospective(terminal_retrospective))
     ledger.write_json("pipeline-retrospective.json", pipeline_retrospective)
     result_payload = {
         "schema_version": SCHEMA_VERSION,
@@ -326,7 +328,7 @@ def run_workstream(
         "review_branch": normalized["review_branch"],
         "status": status,
         "review_cycles": redact_review_cycles(normalized["review_cycles"]),
-        "retrospective": redact_retrospective(normalized["retrospective"]),
+        "retrospective": redact_retrospective(terminal_retrospective),
         "steps": steps,
         "selected_work": selected_work,
         "cleanup": state["cleanup"],
@@ -397,7 +399,7 @@ def normalize_recipe(
         checkout_path=recipe_checkout_path(normalized_steps),
         checkout_paths=recipe_checkout_paths(normalized_steps),
     )
-    validate_retrospective_terminal_decision(retrospective, tracker)
+    validate_retrospective_terminal_decision(retrospective, tracker, publisher=recipe.get("publisher"))
     return {
         "schema_version": SCHEMA_VERSION,
         "workstream_id": resolved_workstream_id,
@@ -1223,9 +1225,6 @@ def publish_terminal_pr(
         )
     auth = config["gh_auth"]
     auth_artifact = publisher_auth_artifact(auth)
-    body = pr_body_markdown(normalized, state, steps, selected_work, ledger)
-    ledger.write_text("pr-body.md", body)
-    pr_body_path = (ledger.path / "pr-body.md").resolve(strict=False)
     git_push_result: dict[str, Any] | None = None
     git_push_command: list[str] = []
     git_push_retry_command: list[str] = []
@@ -1237,6 +1236,18 @@ def publish_terminal_pr(
             auth=auth,
             message_on_failure="gh auth status failed",
         )
+        if config["mode"] == "close":
+            return close_published_pr(
+                config,
+                normalized=normalized,
+                state=state,
+                ledger=ledger,
+                auth=auth,
+                auth_artifact=auth_artifact,
+            )
+        body = pr_body_markdown(normalized, state, steps, selected_work, ledger)
+        ledger.write_text("pr-body.md", body)
+        pr_body_path = (ledger.path / "pr-body.md").resolve(strict=False)
         if config["push"]:
             git_push = push_review_branch(
                 config,
@@ -1319,6 +1330,447 @@ def publish_terminal_pr(
     if git_push_result is not None:
         result["git_push"] = redact_artifact_value(git_push_result)
     return result
+
+
+def close_published_pr(
+    config: dict[str, Any],
+    *,
+    normalized: dict[str, Any],
+    state: dict[str, Any],
+    ledger: "WorkstreamLedger",
+    auth: dict[str, Any],
+    auth_artifact: dict[str, Any],
+) -> dict[str, Any]:
+    checkout_path = checkout_path_from_state(state)
+    view_payload, view_command = publisher_pr_view(
+        config,
+        checkout_path=checkout_path,
+        auth=auth,
+        fields=["url", "state", "isDraft", "mergeStateStatus", "headRefOid"],
+    )
+    pr_url = publisher_pr_url(view_payload, fallback=config["pr"])
+    if review_cycles_require_response(normalized.get("review_cycles")):
+        return tracker_close_blocked_publication(
+            reason=(
+                "terminal PR closure requires addressed review-cycle responses before merge; "
+                "record response evidence or set review_feedback_status"
+            ),
+            terminal_decision={
+                "status": "blocked",
+                "reason": "review cycle responses are still required before terminal PR closure",
+                "pr_url": pr_url,
+            },
+            mode="close",
+            url=pr_url,
+            commands={"gh_view": view_command},
+        )
+    merge_state_status = string_field(view_payload, "mergeStateStatus") or ""
+    if (
+        (string_field(view_payload, "state") or "").upper() != "OPEN"
+        or bool(view_payload.get("isDraft"))
+        or merge_state_status != "CLEAN"
+    ):
+        blocked_reason = (
+            "terminal PR closure is blocked: "
+            f"state={(string_field(view_payload, 'state') or 'unknown').upper()}, "
+            f"draft={bool(view_payload.get('isDraft'))}, "
+            f"mergeStateStatus={merge_state_status or 'unknown'}"
+        )
+        return blocked_terminal_closure_publication(
+            blocked_reason,
+            normalized=normalized,
+            auth=auth_artifact,
+            pr_url=pr_url,
+            commands={"gh_view": view_command},
+            merge_state=view_payload,
+        )
+    merge_command = [
+        config["gh_path"],
+        "pr",
+        "merge",
+        config["pr"],
+        "--repo",
+        config["repo"],
+        "--merge",
+    ]
+    implemented_commit = implemented_after_commit(state)
+    if implemented_commit:
+        merge_command.extend(["--match-head-commit", implemented_commit])
+    try:
+        run_publisher_command(
+            merge_command,
+            cwd=checkout_path,
+            tool="gh",
+            auth=auth,
+            message_on_failure="gh pr merge failed",
+        )
+    except PublisherError as exc:
+        return blocked_terminal_closure_publication(
+            f"terminal PR closure is blocked: {exc.message}",
+            normalized=normalized,
+            auth=auth_artifact,
+            pr_url=pr_url,
+            commands={"gh_view": view_command, "gh_merge": merge_command},
+            stdout=exc.stdout,
+            stderr=exc.stderr,
+            returncode=exc.returncode,
+        )
+    merged_payload, merged_view_command = publisher_pr_view(
+        config,
+        checkout_path=checkout_path,
+        auth=auth,
+        fields=["url", "mergeCommit", "mergedAt"],
+    )
+    merge_commit = publisher_pr_merge_commit(merged_payload)
+    if not merge_commit:
+        raise PublisherError(
+            "merged PR did not report a merge commit",
+            command=merged_view_command,
+            returncode=0,
+            stdout=json.dumps(merged_payload),
+            stderr="",
+        )
+    terminal_decision = {
+        "status": "merged",
+        "merge_commit": merge_commit,
+        "reason": "",
+        "pr_url": publisher_pr_url(merged_payload, fallback=pr_url),
+        "review_feedback_status": "",
+    }
+    try:
+        tracker_close = close_selected_source_item(
+            normalized=normalized,
+            state=state,
+            config=config,
+            checkout_path=checkout_path,
+            auth=auth,
+            close_reason=f"merged via {merge_commit}",
+        )
+    except PublisherError as exc:
+        return merged_terminal_tracker_close_failed_publication(
+            auth=auth_artifact,
+            pr_url=terminal_decision["pr_url"],
+            merge_commit=merge_commit,
+            terminal_decision=terminal_decision,
+            commands={
+                "gh_view": view_command,
+                "gh_merge": merge_command,
+                "gh_view_merged": merged_view_command,
+            },
+            exc=exc,
+        )
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "status": "tracker-closed",
+        "enabled": True,
+        "mode": "close",
+        "reason": "terminal PR merged and source item closed",
+        "auth": auth_artifact,
+        "url": terminal_decision["pr_url"],
+        "merge_commit": merge_commit,
+        "next_allowed_command": "none",
+        "retry": "",
+        "commands": {
+            "gh_view": redact_artifact_value(view_command),
+            "gh_merge": redact_artifact_value(merge_command),
+            "gh_view_merged": redact_artifact_value(merged_view_command),
+        },
+        "tracker_close": tracker_close,
+        "terminal_decision": terminal_decision,
+    }
+
+
+def merged_terminal_tracker_close_failed_publication(
+    *,
+    auth: dict[str, Any],
+    pr_url: str,
+    merge_commit: str,
+    terminal_decision: dict[str, Any],
+    commands: dict[str, list[str]],
+    exc: PublisherError,
+) -> dict[str, Any]:
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "status": "failed-needs-human",
+        "enabled": True,
+        "mode": "close",
+        "reason": "terminal PR merged, but source item closure failed",
+        "auth": auth,
+        "url": redact_text(pr_url),
+        "merge_commit": redact_text(merge_commit),
+        "next_allowed_command": "none",
+        "retry": (
+            "PR is already merged. Remediate the recorded source-item closure failure, then close the source item "
+            "with the recorded terminal decision evidence instead of attempting another PR merge."
+        ),
+        "commands": {key: redact_artifact_value(value) for key, value in commands.items()},
+        "terminal_decision": runtime_terminal_decision(terminal_decision),
+        "tracker_close": tracker_close_failure_artifact(exc),
+    }
+
+
+def publisher_pr_view(
+    config: dict[str, Any],
+    *,
+    checkout_path: Path,
+    auth: dict[str, Any],
+    fields: list[str],
+) -> tuple[dict[str, Any], list[str]]:
+    command = [
+        config["gh_path"],
+        "pr",
+        "view",
+        config["pr"],
+        "--repo",
+        config["repo"],
+        "--json",
+        ",".join(fields),
+    ]
+    completed = run_publisher_command(command, cwd=checkout_path, tool="gh", auth=auth)
+    try:
+        payload = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise PublisherError(
+            "gh pr view returned invalid JSON payload",
+            command=command,
+            returncode=completed.returncode,
+            stdout=completed.stdout,
+            stderr=completed.stderr,
+        ) from exc
+    if not isinstance(payload, dict):
+        raise PublisherError(
+            "gh pr view must return an object payload",
+            command=command,
+            returncode=completed.returncode,
+            stdout=completed.stdout,
+            stderr=completed.stderr,
+        )
+    return payload, command
+
+
+def publisher_pr_url(payload: dict[str, Any], *, fallback: str = "") -> str:
+    return redact_text(string_field(payload, "url") or fallback)
+
+
+def publisher_pr_merge_commit(payload: dict[str, Any]) -> str:
+    merge_commit = payload.get("mergeCommit")
+    if isinstance(merge_commit, dict):
+        return redact_text(string_field(merge_commit, "oid") or "")
+    return ""
+
+
+def blocked_terminal_closure_publication(
+    reason: str,
+    *,
+    normalized: dict[str, Any],
+    auth: dict[str, Any],
+    pr_url: str,
+    commands: dict[str, list[str]],
+    merge_state: dict[str, Any] | None = None,
+    stdout: str = "",
+    stderr: str = "",
+    returncode: int | None = None,
+) -> dict[str, Any]:
+    result = blocked_publication(reason, normalized, "latest")
+    result.update(
+        {
+            "mode": "close",
+            "auth": auth,
+            "url": redact_text(pr_url),
+            "returncode": returncode,
+            "stdout_excerpt": redact_text(stdout[-2000:]),
+            "stderr_excerpt": redact_text(stderr[-2000:]),
+            "commands": {key: redact_artifact_value(value) for key, value in commands.items()},
+            "terminal_decision": {
+                "status": "blocked",
+                "merge_commit": "",
+                "reason": redact_text(reason),
+                "pr_url": redact_text(pr_url),
+                "review_feedback_status": "",
+            },
+        }
+    )
+    if merge_state is not None:
+        result["merge_state"] = redact_artifact_value(merge_state)
+    return result
+
+
+def close_selected_source_item(
+    *,
+    normalized: dict[str, Any],
+    state: dict[str, Any],
+    config: dict[str, Any],
+    checkout_path: Path,
+    auth: dict[str, Any],
+    close_reason: str,
+) -> dict[str, Any]:
+    selected_item = current_selected_work_item(state)
+    if selected_item is None:
+        raise PublisherError(
+            "no selected work item is available for source closure",
+            command=[],
+            returncode=None,
+        )
+    source_type = string_field(selected_item, "source_type") or ""
+    if source_type == "beads":
+        source = selected_work_source_config(normalized, selected_item)
+        if source is None:
+            raise PublisherError(
+                "could not resolve the Beads source configuration for terminal closure",
+                command=["bd", "close", string_field(selected_item, "external_id") or ""],
+                returncode=None,
+            )
+        workspace = Path(str(source.get("workspace") or ""))
+        password = read_tracker_beads_password(workspace / "secrets" / "dolt_beads_password.txt")
+        command = [
+            "bd",
+            "close",
+            string_field(selected_item, "external_id") or "",
+            "--reason",
+            close_reason,
+        ]
+        run_local_tracker_command(
+            command,
+            cwd=workspace,
+            extra_env={"BEADS_DOLT_PASSWORD": password},
+            exact_secrets={password},
+            message_on_failure="bd close failed",
+        )
+        return {
+            "status": "closed",
+            "tool": "bd",
+            "command": redact_artifact_value(command),
+        }
+    if source_type == "github_issues":
+        repo, issue_number = github_issue_close_target(selected_item)
+        command = [
+            config["gh_path"],
+            "issue",
+            "close",
+            issue_number,
+            "--repo",
+            repo,
+            "--reason",
+            "completed",
+            "--comment",
+            close_reason,
+        ]
+        run_publisher_command(
+            command,
+            cwd=checkout_path,
+            tool="gh",
+            auth=auth,
+            message_on_failure="gh issue close failed",
+        )
+        return {
+            "status": "closed",
+            "tool": "gh",
+            "command": redact_artifact_value(command),
+        }
+    raise PublisherError(
+        f"source type {source_type or 'unknown'} does not support automatic terminal closure",
+        command=[],
+        returncode=None,
+    )
+
+
+def current_selected_work_item(state: dict[str, Any]) -> dict[str, Any] | None:
+    selected_work = state.get("selected_work")
+    if not isinstance(selected_work, list) or not selected_work:
+        return None
+    first_item = selected_work[0]
+    return first_item if isinstance(first_item, dict) else None
+
+
+def selected_work_source_config(normalized: dict[str, Any], selected_item: dict[str, Any]) -> dict[str, Any] | None:
+    source_id = string_field(selected_item, "source_id") or ""
+    source_type = string_field(selected_item, "source_type") or ""
+    for step in normalized.get("steps", []):
+        if not isinstance(step, dict) or step.get("name") != "select-work":
+            continue
+        input_data = step.get("input") if isinstance(step.get("input"), dict) else {}
+        sources = input_data.get("sources")
+        if not isinstance(sources, list):
+            continue
+        for source in sources:
+            if not isinstance(source, dict):
+                continue
+            candidate_source_id = str(source.get("id") or source.get("type") or "")
+            candidate_source_type = str(source.get("type") or "")
+            if candidate_source_id == source_id and candidate_source_type == source_type:
+                return source
+    return None
+
+
+def read_tracker_beads_password(credentials_path: Path) -> str:
+    try:
+        lines = credentials_path.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        raise PublisherError(
+            "Beads credentials are not available for terminal closure",
+            command=["bd", "close"],
+            returncode=None,
+            stderr=str(exc),
+        ) from exc
+    if not lines or not lines[0]:
+        raise PublisherError(
+            "Beads credentials are not available for terminal closure",
+            command=["bd", "close"],
+            returncode=None,
+        )
+    return lines[0]
+
+
+def run_local_tracker_command(
+    command: list[str],
+    *,
+    cwd: Path,
+    extra_env: dict[str, str],
+    exact_secrets: set[str] | None = None,
+    message_on_failure: str,
+) -> subprocess.CompletedProcess[str]:
+    env = {key: value for key in ("PATH", "LANG", "LC_ALL") if (value := os.environ.get(key)) is not None}
+    env.update(extra_env)
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=cwd,
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+    except OSError as exc:
+        raise PublisherError(
+            str(exc),
+            command=command,
+            returncode=None,
+            stderr=redact_text(str(exc), exact_secrets=exact_secrets),
+        ) from exc
+    if completed.returncode != 0:
+        raise PublisherError(
+            message_on_failure,
+            command=command,
+            returncode=completed.returncode,
+            stdout=redact_text(completed.stdout, exact_secrets=exact_secrets),
+            stderr=redact_text(completed.stderr, exact_secrets=exact_secrets),
+        )
+    return completed
+
+
+def github_issue_close_target(selected_item: dict[str, Any]) -> tuple[str, str]:
+    raw = selected_item.get("raw") if isinstance(selected_item.get("raw"), dict) else {}
+    github = raw.get("github") if isinstance(raw.get("github"), dict) else {}
+    repo = string_field(github, "repo") or ""
+    number = github.get("number")
+    issue_number = str(number).strip() if isinstance(number, int) and not isinstance(number, bool) else ""
+    if repo and issue_number:
+        return repo, issue_number
+    raise PublisherError(
+        "GitHub issue source is missing repo or issue number for terminal closure",
+        command=[],
+        returncode=None,
+    )
 
 
 def push_review_branch(
@@ -1759,8 +2211,8 @@ def pr_number_for_rest_update(
 
 def normalize_publisher_config(publisher: dict[str, Any], normalized: dict[str, Any]) -> dict[str, Any]:
     mode = string_field(publisher, "mode") or "create"
-    if mode not in {"create", "update"}:
-        raise WorkstreamError("publisher.mode must be create or update")
+    if mode not in {"create", "update", "close"}:
+        raise WorkstreamError("publisher.mode must be create, update or close")
     gh = publisher.get("gh", {})
     git = publisher.get("git", {})
     if not isinstance(gh, dict) or not isinstance(git, dict):
@@ -1771,11 +2223,16 @@ def normalize_publisher_config(publisher: dict[str, Any], normalized: dict[str, 
     title = string_field(publisher, "title") or f"{normalized['workstream_id']}: workstream"
     repo = string_field(publisher, "repo") or ""
     base = string_field(publisher, "base") or ""
-    pr = string_field(publisher, "pr") or head
+    raw_pr = string_field(publisher, "pr") or ""
+    pr = raw_pr or head
     if not repo:
         raise WorkstreamError("publisher.repo is required")
     if mode == "create" and not base:
         raise WorkstreamError("publisher.base is required for create")
+    if mode == "close" and not raw_pr:
+        raise WorkstreamError("publisher.pr is required for close")
+    if mode == "close":
+        pr = raw_pr
     gh_auth = normalize_publisher_gh_auth(gh)
     return {
         "mode": mode,
@@ -2021,15 +2478,7 @@ def normalize_retry_policy(retry_policy: Any) -> dict[str, int]:
 
 def normalize_tracker_config(tracker: Any) -> dict[str, Any]:
     if tracker is None:
-        return {
-            "terminal_decision": {
-                "status": "",
-                "merge_commit": "",
-                "reason": "",
-                "pr_url": "",
-                "review_feedback_status": "",
-            }
-        }
+        return {"terminal_decision": empty_terminal_decision()}
     if not isinstance(tracker, dict):
         raise WorkstreamError("tracker must be an object")
     unsupported = [key for key in tracker if key != "terminal_decision"]
@@ -2040,7 +2489,7 @@ def normalize_tracker_config(tracker: Any) -> dict[str, Any]:
 
 def normalize_tracker_terminal_decision(decision: Any) -> dict[str, str]:
     if decision is None:
-        return {"status": "", "merge_commit": "", "reason": "", "pr_url": "", "review_feedback_status": ""}
+        return empty_terminal_decision()
     if not isinstance(decision, dict):
         raise WorkstreamError("tracker.terminal_decision must be an object")
     unsupported = [
@@ -2056,7 +2505,7 @@ def normalize_tracker_terminal_decision(decision: Any) -> dict[str, str]:
     pr_url = string_field(decision, "pr_url") or ""
     review_feedback_status = string_field(decision, "review_feedback_status") or ""
     if not status and not merge_commit and not reason and not pr_url and not review_feedback_status:
-        return {"status": "", "merge_commit": "", "reason": "", "pr_url": "", "review_feedback_status": ""}
+        return empty_terminal_decision()
     if status not in {"merged", "no-merge"}:
         raise WorkstreamError("tracker.terminal_decision.status must be merged or no-merge")
     if status == "merged" and not merge_commit:
@@ -2080,6 +2529,22 @@ def normalize_tracker_terminal_decision(decision: Any) -> dict[str, str]:
         "reason": reason,
         "pr_url": pr_url,
         "review_feedback_status": review_feedback_status,
+    }
+
+
+def empty_terminal_decision() -> dict[str, str]:
+    return {"status": "", "merge_commit": "", "reason": "", "pr_url": "", "review_feedback_status": ""}
+
+
+def runtime_terminal_decision(decision: Any) -> dict[str, str]:
+    if not isinstance(decision, dict):
+        return empty_terminal_decision()
+    return {
+        "status": string_field(decision, "status") or "",
+        "merge_commit": string_field(decision, "merge_commit") or "",
+        "reason": string_field(decision, "reason") or "",
+        "pr_url": string_field(decision, "pr_url") or "",
+        "review_feedback_status": string_field(decision, "review_feedback_status") or "",
     }
 
 
@@ -2483,17 +2948,46 @@ def tracker_terminal_decision_allows_close(normalized: dict[str, Any]) -> bool:
     return terminal_review_feedback_status(decision) in TERMINAL_REVIEW_FEEDBACK_STATUSES
 
 
-def tracker_close_blocked_publication() -> dict[str, Any]:
+def tracker_close_blocked_publication(
+    *,
+    reason: str | None = None,
+    terminal_decision: dict[str, Any] | None = None,
+    mode: str = "",
+    url: str = "",
+    commands: dict[str, list[str]] | None = None,
+) -> dict[str, Any]:
     return {
         "schema_version": SCHEMA_VERSION,
         "status": "tracker-close-blocked",
         "enabled": False,
-        "reason": (
+        "reason": reason
+        or (
             "terminal tracker decision recorded, but unresolved review feedback still requires an explicit "
             "review_feedback_status of resolved or waived before the source item can close"
         ),
         "next_allowed_command": "none",
         "retry": "",
+        "mode": mode,
+        "url": redact_text(url),
+        "commands": {key: redact_artifact_value(value) for key, value in (commands or {}).items()},
+        "terminal_decision": runtime_terminal_decision(terminal_decision),
+    }
+
+
+def tracker_close_failure_artifact(exc: PublisherError) -> dict[str, Any]:
+    tool = redact_text(exc.command[0]) if exc.command else ""
+    return {
+        "status": "failed",
+        "tool": tool,
+        "reason": exc.message,
+        "command": redact_artifact_value(exc.command),
+        "returncode": exc.returncode,
+        "stdout_excerpt": redact_text(exc.stdout[-2000:]),
+        "stderr_excerpt": redact_text(exc.stderr[-2000:]),
+        "remediation": (
+            "The PR is already merged, but the source item remains open. Remediate the tracker/source close "
+            "failure and retry only the source closure, or close it manually with the recorded merge commit."
+        ),
     }
 
 
@@ -2544,7 +3038,7 @@ def tracker_record(
     state: dict[str, Any],
     publication: dict[str, Any],
 ) -> dict[str, Any]:
-    decision = normalized["tracker"]["terminal_decision"]
+    decision = effective_tracker_terminal_decision(normalized, publication)
     decision_pr_url = redact_text(decision.get("pr_url") or "")
     decision_review_feedback_status = terminal_review_feedback_status(decision)
     review_feedback_requires_response = review_cycles_require_response(normalized.get("review_cycles"))
@@ -2562,25 +3056,31 @@ def tracker_record(
         "review_summary": string_field(review, "summary") or "",
         "review_findings": tracker_review_findings(review),
         "review_cycles": redact_review_cycles(normalized.get("review_cycles") or []),
-        "retrospective": redact_retrospective(normalized.get("retrospective")),
+        "retrospective": redact_retrospective(effective_retrospective(normalized, publication)),
         "terminal_decision": redact_artifact_value(decision),
     }
     decision_status = decision.get("status")
     if decision_status == "merged":
+        record["merge_commit"] = redact_text(decision["merge_commit"])
+        record["pr_url"] = decision_pr_url
         if review_feedback_requires_response and not decision_review_feedback_status:
             record["status"] = "review-findings-open"
             record["comment"] = (
                 "PR review cycles still require a response; the terminal decision is recorded, but keep the "
                 "source Beads item open until review_feedback_status is set to resolved or waived."
             )
-            record["pr_url"] = decision_pr_url
             return record
         if publication.get("status") != "tracker-closed":
-            record["comment"] = (
-                "A terminal merge decision is recorded, but publication did not reach the tracker-closing "
-                "terminal state; keep the source Beads item open."
-            )
-            record["pr_url"] = decision_pr_url
+            if publication_tracker_close_failed(publication):
+                record["comment"] = (
+                    "PR merged and the terminal decision is recorded, but source item closure failed; keep the "
+                    "source Beads item open until the recorded tracker_close failure is remediated."
+                )
+            else:
+                record["comment"] = (
+                    "A terminal merge decision is recorded, but publication did not reach the tracker-closing "
+                    "terminal state; keep the source Beads item open."
+                )
             return record
         record["status"] = "closed"
         record["close_source_item"] = True
@@ -2590,8 +3090,16 @@ def tracker_record(
             decision_review_feedback_status,
             review_feedback_requires_response,
         )
-        record["merge_commit"] = redact_text(decision["merge_commit"])
-        record["pr_url"] = decision_pr_url
+        return record
+    if decision_status == "blocked":
+        if review_feedback_requires_response:
+            record["status"] = "review-findings-open"
+        elif normalized.get("review_cycles"):
+            record["status"] = "review-feedback-addressed"
+        record["comment"] = (
+            "Terminal PR closure is blocked; keep the source Beads item open until the recorded blocker is cleared."
+        )
+        record["pr_url"] = decision_pr_url or redact_text(str(publication.get("url") or ""))
         return record
     if decision_status == "no-merge":
         if review_feedback_requires_response and not decision_review_feedback_status:
@@ -2650,6 +3158,18 @@ def tracker_record(
     return record
 
 
+def effective_tracker_terminal_decision(normalized: dict[str, Any], publication: dict[str, Any]) -> dict[str, str]:
+    decision = normalized["tracker"]["terminal_decision"]
+    if decision.get("status"):
+        return decision
+    return runtime_terminal_decision(publication.get("terminal_decision"))
+
+
+def publication_tracker_close_failed(publication: dict[str, Any]) -> bool:
+    tracker_close = publication.get("tracker_close")
+    return isinstance(tracker_close, dict) and string_field(tracker_close, "status") == "failed"
+
+
 def tracker_progress_status(state: dict[str, Any]) -> str:
     if has_current_validated_evidence(state):
         return "validated"
@@ -2680,7 +3200,7 @@ def pipeline_retrospective_record(
         + _blocked_retrospective_signals(publication)
         + _cleanup_retrospective_signals(state)
     )
-    follow_up = _retrospective_follow_up_record(signals, normalized)
+    follow_up = _retrospective_follow_up_record(signals, normalized, publication)
     return {
         "schema_version": SCHEMA_VERSION,
         "status": workstream_status_from_publication(publication),
@@ -2716,6 +3236,7 @@ def _apply_retrospective_judge(
     judge: dict[str, Any],
     *,
     normalized: dict[str, Any] | None,
+    publication: dict[str, Any],
 ) -> dict[str, Any]:
     record = dict(pipeline_retrospective)
     if not judge:
@@ -2727,7 +3248,7 @@ def _apply_retrospective_judge(
         signals.extend(judge_signals)
     record["signals"] = signals
     record["health"] = _retrospective_health(signals)
-    follow_up = _retrospective_follow_up_record(signals, normalized)
+    follow_up = _retrospective_follow_up_record(signals, normalized, publication)
     record["recommended_follow_up"] = _legacy_recommended_follow_up(follow_up["recommended"])
     record["follow_up"] = follow_up
     record["judge"] = judge
@@ -2869,7 +3390,7 @@ def _build_retrospective_judge_evidence_pack(
             "status": workstream_status_from_publication(publication),
         },
         "selected_work": _retrospective_judge_prompt_selected_work(selected_work),
-        "retrospective": redact_retrospective(normalized.get("retrospective")),
+        "retrospective": redact_retrospective(effective_retrospective(normalized, publication)),
         "publication": {
             "status": redact_text(str(publication.get("status") or "")),
             "reason": redact_text(str(publication.get("reason") or "")),
@@ -3219,6 +3740,8 @@ def _run_retrospective_follow_up(
     follow_up_config = normalized.get("retrospective_follow_up") if isinstance(normalized, dict) else {}
     if not isinstance(follow_up_config, dict) or not follow_up_config.get("enabled"):
         return _disabled_retrospective_follow_up_creation_record()
+    if not retrospective_follow_up_allowed(normalized, publication):
+        return _disabled_retrospective_follow_up_creation_record()
     follow_up = (
         pipeline_retrospective.get("follow_up") if isinstance(pipeline_retrospective.get("follow_up"), dict) else {}
     )
@@ -3357,7 +3880,7 @@ def _build_retrospective_follow_up_request(
             "review_branch": normalized["review_branch"],
             "status": workstream_status_from_publication(publication),
         },
-        "retrospective": redact_retrospective(normalized.get("retrospective")),
+        "retrospective": redact_retrospective(effective_retrospective(normalized, publication)),
         "publication": {
             "status": redact_text(str(publication.get("status") or "")),
             "reason": redact_text(str(publication.get("reason") or "")),
@@ -3751,7 +4274,11 @@ def _cleanup_retrospective_signals(state: dict[str, Any]) -> list[dict[str, Any]
     ]
 
 
-def _retrospective_follow_up_record(signals: list[dict[str, Any]], normalized: dict[str, Any] | None) -> dict[str, Any]:
+def _retrospective_follow_up_record(
+    signals: list[dict[str, Any]],
+    normalized: dict[str, Any] | None,
+    publication: dict[str, Any],
+) -> dict[str, Any]:
     recommended = []
     created = []
     recommended_fingerprints: set[str] = set()
@@ -3759,7 +4286,7 @@ def _retrospective_follow_up_record(signals: list[dict[str, Any]], normalized: d
     created_fingerprints: set[str] = set()
     created_identities: set[str] = set()
     if normalized is not None:
-        retrospective = normalized.get("retrospective") if isinstance(normalized, dict) else {}
+        retrospective = effective_retrospective(normalized, publication)
         configured = retrospective.get("follow_up") if isinstance(retrospective, dict) else {}
         configured_recommended = configured.get("recommended") if isinstance(configured, dict) else []
         if isinstance(configured_recommended, list):
@@ -4428,13 +4955,47 @@ def normalize_retrospective_follow_up_config(retrospective_follow_up: Any) -> di
     }
 
 
-def validate_retrospective_terminal_decision(retrospective: dict[str, Any], tracker: dict[str, Any]) -> None:
+def validate_retrospective_terminal_decision(
+    retrospective: dict[str, Any],
+    tracker: dict[str, Any],
+    *,
+    publisher: Any = None,
+) -> None:
     if not retrospective:
         return
     decision = tracker.get("terminal_decision") if isinstance(tracker, dict) else {}
     if isinstance(decision, dict) and decision.get("status") in {"merged", "no-merge"}:
         return
+    publisher_config = publisher if isinstance(publisher, dict) else {}
+    if (string_field(publisher_config, "mode") or "") == "close":
+        return
     raise WorkstreamError("retrospective requires tracker.terminal_decision.status to be merged or no-merge")
+
+
+def effective_retrospective(normalized: dict[str, Any], publication: dict[str, Any]) -> dict[str, Any]:
+    retrospective = normalized.get("retrospective") if isinstance(normalized, dict) else {}
+    if not isinstance(retrospective, dict) or not retrospective:
+        return {}
+    if publisher_mode(normalized) != "close":
+        return retrospective
+    decision_status = effective_tracker_terminal_decision(normalized, publication).get("status")
+    if decision_status not in {"merged", "no-merge"}:
+        return {}
+    return retrospective
+
+
+def retrospective_follow_up_allowed(normalized: dict[str, Any], publication: dict[str, Any]) -> bool:
+    if publisher_mode(normalized) != "close":
+        return True
+    decision_status = effective_tracker_terminal_decision(normalized, publication).get("status")
+    return decision_status in {"merged", "no-merge"}
+
+
+def publisher_mode(normalized: dict[str, Any]) -> str:
+    publisher = normalized.get("publisher") if isinstance(normalized, dict) else {}
+    if not isinstance(publisher, dict):
+        publisher = {}
+    return string_field(publisher, "mode") or "create"
 
 
 def review_cycles_require_response(review_cycles: Any) -> bool:
