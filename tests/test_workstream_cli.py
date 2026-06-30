@@ -265,6 +265,7 @@ def merged_recipe_with_retrospective(temp_path, repo, checkout, fake_git, fake_g
             "status": "merged",
             "merge_commit": "deadbeef",
             "pr_url": "https://github.example/pr/123",
+            "review_feedback_status": "waived",
         }
     }
     recipe["retrospective"] = {
@@ -797,6 +798,7 @@ raise SystemExit(9)
                     "status": "merged",
                     "merge_commit": "deadbeef",
                     "pr_url": "https://github.example/pr/123",
+                    "review_feedback_status": "waived",
                 }
             }
 
@@ -866,6 +868,7 @@ raise SystemExit(9)
                     "status": "merged",
                     "merge_commit": "deadbeef",
                     "pr_url": "https://github.example/pr/123",
+                    "review_feedback_status": "waived",
                 }
             }
             recipe["retrospective"] = {
@@ -3450,6 +3453,7 @@ raise SystemExit(9)
                     "status": "no-merge",
                     "reason": "Superseded by follow-up PR",
                     "pr_url": "https://github.example/pr/123",
+                    "review_feedback_status": "waived",
                 }
             }
             recipe["retrospective"] = {
@@ -3697,7 +3701,7 @@ raise SystemExit(9)
             )
             self.assertIn("resolved before closure", result["tracker"]["comment"])
 
-    def test_workstream_terminal_merge_decision_ignores_feedback_resolution_text_without_response_required_cycles(self):
+    def test_workstream_terminal_merge_decision_requires_recorded_review_cycles_or_waiver(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
             repo = temp_path / "repo-src"
@@ -3755,15 +3759,89 @@ raise SystemExit(9)
             result = json.loads((ledger / summary["result_path"]).read_text(encoding="utf-8"))
 
             self.assertFalse(fake_calls.exists())
+            self.assertEqual(summary["status"], "review-findings-open")
+            self.assertEqual(result["publication"]["status"], "tracker-close-blocked")
+            self.assertIn("review cycle evidence", result["publication"]["reason"])
+            self.assertEqual(result["tracker"]["status"], "validated")
+            self.assertFalse(result["tracker"]["close_source_item"])
+            self.assertIn("review cycle evidence", result["tracker"]["comment"])
+
+    def test_workstream_terminal_merge_decision_closes_when_review_cycles_are_recorded_and_addressed(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repo = temp_path / "repo-src"
+            checkout = temp_path / "checkout"
+            ledger = temp_path / "ledger"
+            fake_calls = temp_path / "fake-calls.jsonl"
+            init_repo(repo)
+            fake_git = temp_path / "publisher-git"
+            fake_gh = temp_path / "publisher-gh"
+            write_executable(
+                fake_git,
+                f"""#!{sys.executable}
+from pathlib import Path
+Path({str(fake_calls)!r}).write_text("publisher git should not run\\n", encoding="utf-8")
+raise SystemExit(9)
+""",
+            )
+            write_executable(
+                fake_gh,
+                f"""#!{sys.executable}
+from pathlib import Path
+Path({str(fake_calls)!r}).write_text("publisher gh should not run\\n", encoding="utf-8")
+raise SystemExit(9)
+""",
+            )
+            recipe = successful_recipe(temp_path, repo, checkout, fake_git, fake_gh)
+            recipe["review_cycles"] = [
+                {
+                    "status": "findings-addressed",
+                    "reviews": [
+                        {
+                            "role": "correctness",
+                            "status": "request-changes",
+                            "summary": "Please address the review findings before merge.",
+                            "requires_response": True,
+                            "response": {"status": "addressed", "summary": "Addressed on the PR."},
+                        }
+                    ],
+                }
+            ]
+            recipe["tracker"] = {
+                "terminal_decision": {
+                    "status": "merged",
+                    "merge_commit": "deadbeef",
+                    "pr_url": "https://github.example/pr/123",
+                }
+            }
+
+            completed = run_afk(
+                "run-workstream",
+                "--workstream-id",
+                "central-lve.9",
+                "--input",
+                json.dumps(recipe),
+                "--ledger",
+                str(ledger),
+                env_overrides={
+                    "GIT_ALLOW_PROTOCOL": "file",
+                    "GIT_AUTHOR_NAME": "AFK Test",
+                    "GIT_AUTHOR_EMAIL": "afk-test@example.test",
+                    "GIT_COMMITTER_NAME": "AFK Test",
+                    "GIT_COMMITTER_EMAIL": "afk-test@example.test",
+                },
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            result = json.loads((ledger / summary["result_path"]).read_text(encoding="utf-8"))
+
+            self.assertFalse(fake_calls.exists())
             self.assertEqual(summary["status"], "closed")
             self.assertEqual(result["publication"]["status"], "tracker-closed")
             self.assertEqual(result["tracker"]["status"], "closed")
             self.assertTrue(result["tracker"]["close_source_item"])
             self.assertEqual(result["tracker"]["close_reason"], "merged via deadbeef")
-            self.assertEqual(
-                result["tracker"]["comment"],
-                "PR merged; close the source Beads item with the recorded merge commit.",
-            )
 
     def test_workstream_accepts_empty_tracker_terminal_decision_as_unset(self):
         with tempfile.TemporaryDirectory() as temp_dir:

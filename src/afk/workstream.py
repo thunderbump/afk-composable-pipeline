@@ -243,7 +243,9 @@ def run_workstream(
                 if tracker_terminal_decision_allows_close(normalized):
                     publication = tracker_terminal_decision_publication()
                 else:
-                    publication = tracker_close_blocked_publication()
+                    publication = tracker_close_blocked_publication(
+                        reason=tracker_terminal_decision_close_block_reason(normalized)
+                    )
             else:
                 publication = publish_terminal_pr(
                     normalized["publisher"],
@@ -2939,13 +2941,35 @@ def tracker_terminal_decision_present(normalized: dict[str, Any]) -> bool:
     return bool(isinstance(decision, dict) and decision.get("status"))
 
 
-def tracker_terminal_decision_allows_close(normalized: dict[str, Any]) -> bool:
+def review_cycles_recorded(review_cycles: Any) -> bool:
+    return isinstance(review_cycles, list) and bool(review_cycles)
+
+
+def tracker_terminal_decision_close_block_reason(normalized: dict[str, Any]) -> str:
     decision = normalized.get("tracker", {}).get("terminal_decision", {})
     if not isinstance(decision, dict) or not decision.get("status"):
-        return False
-    if not review_cycles_require_response(normalized.get("review_cycles")):
-        return True
-    return terminal_review_feedback_status(decision) in TERMINAL_REVIEW_FEEDBACK_STATUSES
+        return "terminal tracker decision is not recorded"
+    review_feedback_status = terminal_review_feedback_status(decision)
+    review_cycles = normalized.get("review_cycles")
+    if not review_cycles_recorded(review_cycles):
+        if review_feedback_status == "waived":
+            return ""
+        return (
+            "terminal tracker decision recorded, but source item closure requires recorded review cycle "
+            "evidence or review_feedback_status of waived"
+        )
+    if not review_cycles_require_response(review_cycles):
+        return ""
+    if review_feedback_status in TERMINAL_REVIEW_FEEDBACK_STATUSES:
+        return ""
+    return (
+        "terminal tracker decision recorded, but unresolved review feedback still requires an explicit "
+        "review_feedback_status of resolved or waived before the source item can close"
+    )
+
+
+def tracker_terminal_decision_allows_close(normalized: dict[str, Any]) -> bool:
+    return not tracker_terminal_decision_close_block_reason(normalized)
 
 
 def tracker_close_blocked_publication(
@@ -3019,11 +3043,14 @@ def terminal_decision_comment(
     decision_status: str,
     review_feedback_status: str,
     review_feedback_requires_response: bool,
+    review_cycle_evidence_recorded: bool,
 ) -> str:
     if decision_status == "merged":
         base = "PR merged; close the source Beads item with the recorded merge commit."
     else:
         base = "A terminal no-merge decision was recorded; close the source Beads item with this reason."
+    if not review_cycle_evidence_recorded and review_feedback_status == "waived":
+        return f"{base} Review cycle evidence was explicitly waived before closure."
     if not review_feedback_requires_response:
         return base
     if review_feedback_status == "resolved":
@@ -3041,6 +3068,7 @@ def tracker_record(
     decision = effective_tracker_terminal_decision(normalized, publication)
     decision_pr_url = redact_text(decision.get("pr_url") or "")
     decision_review_feedback_status = terminal_review_feedback_status(decision)
+    review_cycle_evidence_recorded = review_cycles_recorded(normalized.get("review_cycles"))
     review_feedback_requires_response = review_cycles_require_response(normalized.get("review_cycles"))
     review = state.get("review") if isinstance(state.get("review"), dict) else {}
     record = {
@@ -3076,6 +3104,11 @@ def tracker_record(
                     "PR merged and the terminal decision is recorded, but source item closure failed; keep the "
                     "source Beads item open until the recorded tracker_close failure is remediated."
                 )
+            elif not review_cycle_evidence_recorded:
+                record["comment"] = (
+                    "A terminal merge decision is recorded, but keep the source Beads item open until review "
+                    "cycle evidence is recorded or explicitly waived."
+                )
             else:
                 record["comment"] = (
                     "A terminal merge decision is recorded, but publication did not reach the tracker-closing "
@@ -3089,6 +3122,7 @@ def tracker_record(
             "merged",
             decision_review_feedback_status,
             review_feedback_requires_response,
+            review_cycle_evidence_recorded,
         )
         return record
     if decision_status == "blocked":
@@ -3111,10 +3145,16 @@ def tracker_record(
             record["pr_url"] = decision_pr_url
             return record
         if publication.get("status") != "tracker-closed":
-            record["comment"] = (
-                "A terminal no-merge decision is recorded, but publication did not reach the tracker-closing "
-                "terminal state; keep the source Beads item open."
-            )
+            if not review_cycle_evidence_recorded:
+                record["comment"] = (
+                    "A terminal no-merge decision is recorded, but keep the source Beads item open until review "
+                    "cycle evidence is recorded or explicitly waived."
+                )
+            else:
+                record["comment"] = (
+                    "A terminal no-merge decision is recorded, but publication did not reach the tracker-closing "
+                    "terminal state; keep the source Beads item open."
+                )
             record["pr_url"] = decision_pr_url
             return record
         record["status"] = "closed"
@@ -3124,6 +3164,7 @@ def tracker_record(
             "no-merge",
             decision_review_feedback_status,
             review_feedback_requires_response,
+            review_cycle_evidence_recorded,
         )
         record["pr_url"] = decision_pr_url
         return record
