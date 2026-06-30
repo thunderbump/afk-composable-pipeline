@@ -6823,6 +6823,150 @@ sys.exit(0)
                 },
             )
 
+    def test_workstream_later_implement_job_capsule_uses_following_validate_context(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repo = temp_path / "repo-src"
+            checkout = temp_path / "checkout"
+            second_checkout = temp_path / "checkout-two"
+            ledger = temp_path / "ledger"
+            fake_git = temp_path / "publisher-git"
+            fake_gh = temp_path / "publisher-gh"
+            first_worker_home = temp_path / "worker-home-first"
+            second_worker_home = temp_path / "worker-home-second"
+            first_validation_stack_path = temp_path / "mounts" / "first-validation-stack"
+            second_validation_stack_path = temp_path / "mounts" / "second-validation-stack"
+            init_repo(repo)
+            second_agent_code = textwrap.dedent(
+                """
+                import json
+                import subprocess
+                from pathlib import Path
+
+                Path("implemented-second.txt").write_text("central-lve.10\\n", encoding="utf-8")
+                subprocess.run(["git", "add", "implemented-second.txt"], check=True)
+                subprocess.run(["git", "commit", "-m", "implement central-lve.10"], check=True)
+                Path("agent-result.json").write_text(
+                    json.dumps({"status": "completed", "summary": "implemented second work item"}),
+                    encoding="utf-8",
+                )
+                """
+            ).strip()
+            recipe = successful_recipe(temp_path, repo, checkout, fake_git, fake_gh)
+            recipe["publisher"] = {"enabled": False}
+            recipe["steps"][2]["input"]["validation"] = {"profile": "tier1", "commands": []}
+            recipe["steps"][3]["input"]["validation"] = {
+                "profile": "tier1",
+                "dry_run": False,
+                "timeout_seconds": 3600,
+                "commands": [["make", "first-validate"]],
+                "worker_home": str(first_worker_home),
+                "stack": {
+                    "role": "validation",
+                    "path": str(first_validation_stack_path),
+                },
+            }
+            recipe["steps"] = recipe["steps"][:4] + [
+                {
+                    "name": "select-work",
+                    "input": {
+                        "target_ids": ["central-lve.10"],
+                        "required_labels": ["afk:ready"],
+                        "sources": [
+                            {
+                                "type": "fixture",
+                                "id": "fixture",
+                                "items": [selected_fixture_item("central-lve.10")],
+                            }
+                        ],
+                    },
+                },
+                {
+                    "name": "prepare-checkout",
+                    "input": {
+                        "repo_url": str(repo),
+                        "base_ref": "main",
+                        "checkout_root": str(temp_path),
+                        "checkout_path": str(second_checkout),
+                    },
+                },
+                {
+                    "name": "implement",
+                    "input": {
+                        "guardrails": ["stay within checkout"],
+                        "validation": {"profile": "tier1", "commands": []},
+                        "agent": {
+                            "type": "fake-pi-command",
+                            "command": [sys.executable, "-c", second_agent_code],
+                            "result_path": "agent-result.json",
+                        },
+                    },
+                },
+                {
+                    "name": "validate",
+                    "profile": "tier1",
+                    "input": {
+                        "validation": {
+                            "dry_run": False,
+                            "timeout_seconds": 3600,
+                            "commands": [["make", "second-validate"]],
+                            "worker_home": str(second_worker_home),
+                            "stack": {
+                                "role": "validation",
+                                "path": str(second_validation_stack_path),
+                            },
+                        },
+                        "worker": dict(recipe["steps"][3]["input"]["worker"]),
+                    },
+                },
+            ]
+
+            completed = run_afk(
+                "run-workstream",
+                "--workstream-id",
+                "central-lve.9",
+                "--input",
+                json.dumps(recipe),
+                "--ledger",
+                str(ledger),
+                env_overrides={
+                    "GIT_ALLOW_PROTOCOL": "file",
+                    "GIT_AUTHOR_NAME": "AFK Test",
+                    "GIT_AUTHOR_EMAIL": "afk-test@example.test",
+                    "GIT_COMMITTER_NAME": "AFK Test",
+                    "GIT_COMMITTER_EMAIL": "afk-test@example.test",
+                },
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            result = json.loads((ledger / summary["result_path"]).read_text(encoding="utf-8"))
+            implement_steps = [step for step in result["steps"] if step["name"] == "implement"]
+            second_implement_step = implement_steps[1]
+            second_job_capsule = json.loads(
+                (ledger / "runs" / second_implement_step["run_id"] / "job-capsule.json").read_text(encoding="utf-8")
+            )["capsule"]
+
+            self.assertEqual(
+                second_job_capsule["validation"],
+                {
+                    "profile": "tier1",
+                    "commands": [["make", "second-validate"]],
+                    "available_profiles": [],
+                    "worker_home": str(second_worker_home),
+                    "stack": {
+                        "role": "validation",
+                        "path": str(second_validation_stack_path),
+                    },
+                    "run_commands_during_implementation": True,
+                    "pipeline_validate_step_runs_stack": True,
+                    "implementation_instructions": [
+                        "Run validation.commands during implementation before finishing when your changes affect them.",
+                        "Leave stack validation to the pipeline validate step; do not guess alternate validation stack paths.",
+                    ],
+                },
+            )
+
     def test_workstream_implement_job_capsule_preserves_explicit_suppression_of_validation_commands(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
@@ -7051,6 +7195,72 @@ sys.exit(0)
 
         self.assertEqual(normalized["status"], "valid")
         self.assertEqual(normalized["validation"]["worker_home"], "/tmp/implement-worker-home")
+
+    def test_merged_implement_validation_input_uses_following_validate_step_for_later_implement(self):
+        merged = merged_implement_validation_input(
+            {"profile": "tier1", "commands": []},
+            [
+                {
+                    "name": "implement",
+                    "input": {
+                        "validation": {
+                            "profile": "tier1",
+                            "commands": [],
+                        }
+                    },
+                },
+                {
+                    "name": "validate",
+                    "profile": "tier1",
+                    "input": {
+                        "validation": {
+                            "profile": "tier1",
+                            "commands": [["make", "first-validate"]],
+                            "worker_home": "/tmp/first-worker-home",
+                            "stack": {
+                                "role": "validation",
+                                "path": "/tmp/first-validation-stack",
+                            },
+                        }
+                    },
+                },
+                {
+                    "name": "implement",
+                    "input": {
+                        "validation": {
+                            "profile": "tier1",
+                            "commands": [],
+                        }
+                    },
+                },
+                {
+                    "name": "validate",
+                    "profile": "tier1",
+                    "input": {
+                        "validation": {
+                            "profile": "tier1",
+                            "commands": [["make", "second-validate"]],
+                            "worker_home": "/tmp/second-worker-home",
+                            "stack": {
+                                "role": "validation",
+                                "path": "/tmp/second-validation-stack",
+                            },
+                        }
+                    },
+                },
+            ],
+            step_index=2,
+        )
+
+        self.assertEqual(merged["commands"], [["make", "second-validate"]])
+        self.assertEqual(merged["worker_home"], "/tmp/second-worker-home")
+        self.assertEqual(
+            merged["stack"],
+            {
+                "role": "validation",
+                "path": "/tmp/second-validation-stack",
+            },
+        )
 
     def test_implement_normalize_validation_accepts_validation_worker_home_alias_and_default_stack_role(self):
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -187,7 +187,7 @@ def run_workstream(
             if blocked_reason:
                 state["blocked_reason"] = blocked_reason
                 break
-            step_input = composed_step_input(step_spec, normalized, state, ledger_dir)
+            step_input = composed_step_input(step_spec, normalized, state, ledger_dir, step_index=index)
             auth_target = pi_auth_target_for_step(step_name, step_input)
             if auth_target is not None and pi_auth_preflight_status.get(auth_target["target"]) == "deferred":
                 auth_result = run_pi_auth_preflight_target(auth_target, cwd=checkout_path_from_state(state))
@@ -421,6 +421,8 @@ def composed_step_input(
     normalized: dict[str, Any],
     state: dict[str, Any],
     ledger_dir: Path,
+    *,
+    step_index: int | None = None,
 ) -> dict[str, Any]:
     step_name = step_spec["name"]
     input_data = dict(step_spec["input"])
@@ -452,6 +454,7 @@ def composed_step_input(
         input_data["validation"] = merged_implement_validation_input(
             input_data.get("validation"),
             normalized["steps"],
+            step_index=step_index,
         )
     elif step_name == "validate":
         if state.get("checkout") is not None:
@@ -485,12 +488,14 @@ def composed_step_input(
 def merged_implement_validation_input(
     implement_validation: Any,
     steps: list[dict[str, Any]],
+    *,
+    step_index: int | None = None,
 ) -> dict[str, Any]:
     if isinstance(implement_validation, dict):
         merged = dict(implement_validation)
     else:
         merged = {}
-    validate_context = validate_step_implement_context(steps)
+    validate_context = validate_step_implement_context(steps, implement_step_index=step_index)
     if "profile" not in merged and isinstance(validate_context.get("profile"), str):
         merged["profile"] = validate_context["profile"]
     validate_commands = validate_context.get("commands", [])
@@ -513,8 +518,16 @@ def merged_implement_validation_input(
     return merged
 
 
-def validate_step_implement_context(steps: list[dict[str, Any]]) -> dict[str, Any]:
-    for step in steps:
+def validate_step_implement_context(
+    steps: list[dict[str, Any]],
+    *,
+    implement_step_index: int | None = None,
+) -> dict[str, Any]:
+    if implement_step_index is None:
+        candidate_steps = steps
+    else:
+        candidate_steps = steps[implement_step_index + 1 :]
+    for step in candidate_steps:
         if step.get("name") != "validate":
             continue
         input_data = step.get("input")
