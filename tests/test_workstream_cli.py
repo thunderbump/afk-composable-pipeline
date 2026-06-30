@@ -7026,6 +7026,32 @@ sys.exit(0)
 
         self.assertEqual(merged["commands"], [["make", "test"]])
 
+    def test_merged_implement_validation_input_preserves_implement_worker_home_alias_over_validate_step(self):
+        merged = merged_implement_validation_input(
+            {
+                "profile": "tier1",
+                "commands": [],
+                "workerHome": "/tmp/implement-worker-home",
+            },
+            [
+                {
+                    "name": "validate",
+                    "profile": "tier1",
+                    "input": {
+                        "validation": {
+                            "profile": "tier1",
+                            "worker_home": "/tmp/validate-worker-home",
+                        }
+                    },
+                }
+            ],
+        )
+
+        normalized = normalize_implement_validation(merged, None, checkout_path=Path("/tmp/checkout"))
+
+        self.assertEqual(normalized["status"], "valid")
+        self.assertEqual(normalized["validation"]["worker_home"], "/tmp/implement-worker-home")
+
     def test_implement_normalize_validation_accepts_validation_worker_home_alias_and_default_stack_role(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)

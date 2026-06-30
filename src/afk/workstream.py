@@ -503,8 +503,13 @@ def merged_implement_validation_input(
     if should_backfill_commands:
         merged["commands"] = validate_commands
     for field in ("worker_home", "stack"):
-        if field not in merged and field in validate_context:
-            merged[field] = validate_context[field]
+        if field not in validate_context:
+            continue
+        if field == "worker_home" and ("worker_home" in merged or "workerHome" in merged):
+            continue
+        if field in merged:
+            continue
+        merged[field] = validate_context[field]
     return merged
 
 
