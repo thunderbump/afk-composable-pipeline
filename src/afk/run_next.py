@@ -110,6 +110,7 @@ def build_selection_request(
     ready_tag: str,
 ) -> dict[str, Any]:
     required_labels = list(project_contract.beads_labels) + [ready_tag]
+    tracker_artifact_root = str(Path.cwd())
     sources = [
         {
             "type": "beads",
@@ -118,6 +119,7 @@ def build_selection_request(
             "workspace_kind": "central",
             "labels": required_labels,
             "status": "open",
+            "tracker_artifact_roots": [tracker_artifact_root],
         }
     ]
     github_repo = github_repo_from_repo_url(project_contract.repo_url)

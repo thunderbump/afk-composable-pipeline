@@ -657,6 +657,10 @@ def normalize_beads_issue(source_id: str, source: dict[str, Any], issue: dict[st
     issue_type = issue.get("issue_type")
     if issue_type:
         normalized["issue_type"] = str(issue_type)
+    if not source.get("target_ids"):
+        selection_skip_reason = open_afk_pr_skip_reason(source, normalized["external_id"])
+        if selection_skip_reason:
+            normalized["selection_skip_reason"] = selection_skip_reason
     return normalized
 
 
@@ -699,6 +703,87 @@ def beads_afk_metadata(metadata: dict[str, Any], labels: list[str]) -> dict[str,
     if active_run_id:
         afk["active_run_id"] = str(active_run_id)
     return afk
+
+
+def open_afk_pr_skip_reason(source: dict[str, Any], external_id: str) -> str | None:
+    tracker_record = latest_open_tracker_record(source, external_id)
+    if tracker_record is None:
+        return None
+    details = []
+    workstream_id = tracker_record.get("workstream_id")
+    if is_non_blank_string(workstream_id):
+        details.append(f"workstream={workstream_id.strip()}")
+    pr_url = tracker_record.get("pr_url")
+    if is_non_blank_string(pr_url):
+        details.append(f"pr_url={pr_url.strip()}")
+    if not details:
+        return "open_afk_pr_exists"
+    return f"open_afk_pr_exists:{','.join(details)}"
+
+
+def latest_open_tracker_record(source: dict[str, Any], external_id: str) -> dict[str, str] | None:
+    records: list[dict[str, str]] = []
+    for root in tracker_artifact_roots(source):
+        for tracker_path in sorted(root.glob("ledger*/workstreams/*/tracker-result.json")):
+            record = tracker_record_for_source_item(tracker_path, external_id)
+            if record is not None:
+                records.append(record)
+    if not records:
+        return None
+    return sorted(records, key=lambda record: (record["run_id"], record["tracker_path"]))[-1]
+
+
+def tracker_artifact_roots(source: dict[str, Any]) -> list[Path]:
+    value = source.get("tracker_artifact_roots")
+    if not isinstance(value, list):
+        return []
+    roots: list[Path] = []
+    seen: set[str] = set()
+    for item in value:
+        if not is_non_blank_string(item):
+            continue
+        try:
+            root = Path(item.strip()).resolve(strict=True)
+        except OSError:
+            continue
+        if not root.is_dir():
+            continue
+        root_key = str(root)
+        if root_key in seen:
+            continue
+        seen.add(root_key)
+        roots.append(root)
+    return roots
+
+
+def tracker_record_for_source_item(tracker_path: Path, external_id: str) -> dict[str, str] | None:
+    try:
+        payload = json.loads(tracker_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if str(payload.get("status") or "").strip() != "awaiting-review":
+        return None
+    if str(payload.get("source_item_external_id") or "").strip() != external_id:
+        return None
+    return {
+        "run_id": tracker_path.parent.name,
+        "tracker_path": str(tracker_path),
+        "workstream_id": tracker_workstream_id(tracker_path.parent),
+        "pr_url": str(payload.get("pr_url") or "").strip(),
+    }
+
+
+def tracker_workstream_id(workstream_dir: Path) -> str:
+    workstream_path = workstream_dir / "workstream-result.json"
+    try:
+        payload = json.loads(workstream_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    return str(payload.get("workstream_id") or "").strip()
 
 
 def metadata_bool(value: Any) -> bool:

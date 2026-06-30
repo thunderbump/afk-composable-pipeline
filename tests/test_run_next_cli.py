@@ -1263,6 +1263,125 @@ else:
             )
             self.assertEqual(validate["input"]["worker"]["type"], "local-command")
 
+    def test_run_next_skips_beads_item_when_local_tracker_artifact_shows_open_afk_pr(self):
+        with tempfile.TemporaryDirectory() as temp_dir, tempfile.TemporaryDirectory(
+            dir=ROOT,
+            prefix="ledger-open-pr-skip-",
+        ) as artifact_root:
+            temp_path = Path(temp_dir)
+            artifact_path = Path(artifact_root) / "workstreams" / "20260629T173653866624Z-89b72c97"
+            fake_bin = temp_path / "bin"
+            beads_workspace = temp_path / "beads"
+            checkout_root = temp_path / "checkouts"
+            checkout_path = checkout_root / "bump-EQEmu"
+            secret_dir = beads_workspace / "secrets"
+            secret_dir.mkdir(parents=True)
+            secret_dir.joinpath("dolt_beads_password.txt").write_text("beads-secret", encoding="utf-8")
+            artifact_path.mkdir(parents=True)
+            (artifact_path / "tracker-result.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "status": "awaiting-review",
+                        "source_item_external_id": "central-zwk",
+                        "pr_url": "https://github.example/pr/31",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (artifact_path / "workstream-result.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "workstream_id": "central-zwk",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            fake_bin.mkdir()
+            write_executable(
+                fake_bin / "gh",
+                f"""#!{sys.executable}
+import sys
+
+if sys.argv[1:3] == ["auth", "status"]:
+    sys.exit(1)
+raise SystemExit(9)
+""",
+            )
+            write_executable(
+                fake_bin / "bd",
+                f"""#!{sys.executable}
+import json
+import sys
+
+if sys.argv[1:2] == ["list"]:
+    print(json.dumps([{{"id": "central-zwk"}}, {{"id": "central-next.1"}}]))
+elif sys.argv[1:3] == ["show", "central-zwk"]:
+    print(json.dumps({{
+        "id": "central-zwk",
+        "title": "Already published source Bead",
+        "status": "open",
+        "labels": ["project:bump-eqemu", "ready-for-agent"],
+        "metadata": {{"afk.ready": True, "workstream": "central-zwk"}},
+        "acceptance_criteria": ["Should be skipped while PR stays open"],
+        "dependencies": [],
+    }}))
+elif sys.argv[1:3] == ["show", "central-next.1"]:
+    print(json.dumps({{
+        "id": "central-next.1",
+        "title": "Fresh source Bead",
+        "status": "open",
+        "labels": ["project:bump-eqemu", "ready-for-agent"],
+        "metadata": {{"afk.ready": True, "workstream": "central-next"}},
+        "acceptance_criteria": ["Should still be selected"],
+        "dependencies": [],
+    }}))
+else:
+    raise SystemExit(9)
+""",
+            )
+
+            completed = run_afk(
+                "run-next",
+                "--project",
+                "bump-eqemu",
+                "--contracts-dir",
+                "project-contracts",
+                "--beads-workspace",
+                str(beads_workspace),
+                "--checkout-root",
+                str(checkout_root),
+                "--checkout-path",
+                str(checkout_path),
+                "--validation-profile",
+                "tier1",
+                "--role-profile",
+                "fake-local",
+                env={"GH_TOKEN": None, "GITHUB_TOKEN": None, "PATH": str(fake_bin)},
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            payload = json.loads(completed.stdout)
+
+            self.assertEqual(
+                payload["selection_request"]["sources"][0]["tracker_artifact_roots"],
+                [str(ROOT)],
+            )
+            self.assertEqual(payload["selector"]["selected"]["external_id"], "central-next.1")
+            self.assertEqual(
+                [
+                    (item["candidate"]["external_id"], item["reason"])
+                    for item in payload["selection_result"]["skipped_candidates"]
+                ],
+                [
+                    (
+                        "central-zwk",
+                        "open_afk_pr_exists:workstream=central-zwk,pr_url=https://github.example/pr/31",
+                    )
+                ],
+            )
+
     def test_run_next_preview_emits_project_worker_validation_when_requested(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
