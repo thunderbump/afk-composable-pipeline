@@ -6,7 +6,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from afk.contracts import load_project_contract
 from afk.pi_workers import PONYTAIL_EXTENSION_SOURCE, build_pi_print_command
+from afk.recipes import generate_workstream_recipe
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -1503,6 +1505,50 @@ class GenerateRecipeCliTest(unittest.TestCase):
                 },
             )
             self.assertNotIn("worker", validate_step["input"])
+
+    def test_generate_recipe_copies_validate_step_commands_into_implement_validation(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repo = temp_path / "repo-src"
+            beads_workspace = temp_path / "central-beads"
+            checkout_root = temp_path / "checkouts"
+            checkout_path = checkout_root / "demo"
+            contract_path = temp_path / "project-contracts" / "bump-eqemu.json"
+            init_repo(repo)
+            beads_workspace.mkdir()
+            contract_path.parent.mkdir()
+            write_contract(contract_path, project_slug="bump-eqemu", repo_url=repo.as_uri())
+
+            recipe = generate_workstream_recipe(
+                workstream_id="central-anh.6",
+                project_contract=load_project_contract("bump-eqemu", contract_path.parent, cwd=ROOT),
+                beads_workspace=beads_workspace,
+                checkout_root=checkout_root,
+                checkout_path=checkout_path,
+                validation_profile="tier1",
+                validation_input={
+                    "validation": {
+                        "profile": "tier1",
+                        "dry_run": False,
+                        "timeout_seconds": 3600,
+                        "commands": [["make", "test"], ["pytest", "-q"]],
+                        "worker_home": str(checkout_root / ".validation-worker" / "demo"),
+                        "stack": {
+                            "role": "validation",
+                            "path": str(checkout_root / "bump-akk-stack-validation"),
+                        },
+                    }
+                },
+            )
+
+            self.assertEqual(
+                recipe["steps"][2]["input"]["validation"]["commands"],
+                [["make", "test"], ["pytest", "-q"]],
+            )
+            self.assertEqual(
+                recipe["steps"][3]["input"]["validation"]["commands"],
+                [["make", "test"], ["pytest", "-q"]],
+            )
 
     def test_generate_recipe_derives_project_worker_stack_from_checkout_parent(self):
         with tempfile.TemporaryDirectory() as temp_dir:

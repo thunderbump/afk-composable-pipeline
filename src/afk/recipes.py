@@ -231,6 +231,9 @@ def implement_validation_input(
     validation = validation_input.get("validation")
     if not isinstance(validation, dict):
         return implement_validation
+    commands = validation.get("commands")
+    if isinstance(commands, list) and all(isinstance(command, list) and all(isinstance(part, str) for part in command) for command in commands):
+        implement_validation["commands"] = [list(command) for command in commands]
     worker_home = validation.get("worker_home")
     if not isinstance(worker_home, str) or not worker_home.strip():
         worker_home = validation.get("workerHome")

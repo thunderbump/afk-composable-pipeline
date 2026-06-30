@@ -494,7 +494,7 @@ def merged_implement_validation_input(
     if "profile" not in merged and isinstance(validate_context.get("profile"), str):
         merged["profile"] = validate_context["profile"]
     if "commands" not in merged:
-        merged["commands"] = []
+        merged["commands"] = validate_context.get("commands", [])
     for field in ("worker_home", "stack"):
         if field not in merged and field in validate_context:
             merged[field] = validate_context[field]
@@ -515,6 +515,9 @@ def validate_step_implement_context(steps: list[dict[str, Any]]) -> dict[str, An
         profile = string_field(validation, "profile") or string_field(step, "profile")
         if profile:
             context["profile"] = profile
+        commands = validation.get("commands")
+        if isinstance(commands, list) and all(_is_string_list(command) for command in commands):
+            context["commands"] = [list(command) for command in commands]
         worker_home = string_field(validation, "worker_home") or string_field(validation, "workerHome")
         if worker_home:
             context["worker_home"] = worker_home
