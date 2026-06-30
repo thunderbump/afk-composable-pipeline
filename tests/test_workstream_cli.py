@@ -6765,7 +6765,7 @@ sys.exit(0)
             init_repo(repo)
             recipe = successful_recipe(temp_path, repo, checkout, fake_git, fake_gh)
             recipe["publisher"] = {"enabled": False}
-            recipe["steps"][2]["input"]["validation"] = {"profile": "tier1"}
+            recipe["steps"][2]["input"]["validation"] = {"profile": "tier1", "commands": []}
             recipe["steps"][3]["input"]["validation"] = {
                 "profile": "tier1",
                 "dry_run": False,
@@ -6841,6 +6841,25 @@ sys.exit(0)
         )
 
         self.assertEqual(merged["commands"], [["bin", "explicit"]])
+
+    def test_merged_implement_validation_input_backfills_empty_commands_from_validate_step(self):
+        merged = merged_implement_validation_input(
+            {"profile": "tier1", "commands": []},
+            [
+                {
+                    "name": "validate",
+                    "profile": "tier1",
+                    "input": {
+                        "validation": {
+                            "profile": "tier1",
+                            "commands": [["make", "test"]],
+                        }
+                    },
+                }
+            ],
+        )
+
+        self.assertEqual(merged["commands"], [["make", "test"]])
 
     def test_implement_normalize_validation_accepts_validation_worker_home_alias_and_default_stack_role(self):
         with tempfile.TemporaryDirectory() as temp_dir:

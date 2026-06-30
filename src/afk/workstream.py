@@ -493,8 +493,12 @@ def merged_implement_validation_input(
     validate_context = validate_step_implement_context(steps)
     if "profile" not in merged and isinstance(validate_context.get("profile"), str):
         merged["profile"] = validate_context["profile"]
-    if "commands" not in merged:
-        merged["commands"] = validate_context.get("commands", [])
+    validate_commands = validate_context.get("commands", [])
+    should_backfill_commands = "commands" not in merged or (
+        merged.get("commands") == [] and bool(validate_commands)
+    )
+    if should_backfill_commands:
+        merged["commands"] = validate_commands
     for field in ("worker_home", "stack"):
         if field not in merged and field in validate_context:
             merged[field] = validate_context[field]
