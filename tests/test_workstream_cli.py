@@ -3425,6 +3425,86 @@ raise SystemExit(9)
             self.assertEqual(result["artifacts"]["retrospective_follow_up_stdout"], "retrospective-follow-up-stdout.log")
             self.assertEqual(result["artifacts"]["retrospective_follow_up_stderr"], "retrospective-follow-up-stderr.log")
 
+    def test_workstream_records_enabled_beads_retrospective_follow_up_skip_without_recommendations(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repo = temp_path / "repo-src"
+            checkout = temp_path / "checkout"
+            ledger = temp_path / "ledger"
+            fake_calls = temp_path / "fake-calls.jsonl"
+            beads_workspace = temp_path / "beads"
+            fake_bin = temp_path / "bin"
+            fake_bin.mkdir()
+            (beads_workspace / "secrets").mkdir(parents=True)
+            (beads_workspace / "secrets" / "dolt_beads_password.txt").write_text("test-password\n", encoding="utf-8")
+            init_repo(repo)
+            fake_git = temp_path / "publisher-git"
+            fake_gh = temp_path / "publisher-gh"
+            fake_bd = fake_bin / "bd"
+            write_executable(
+                fake_git,
+                f"""#!{sys.executable}
+raise SystemExit(9)
+""",
+            )
+            write_executable(
+                fake_gh,
+                f"""#!{sys.executable}
+raise SystemExit(9)
+""",
+            )
+            write_executable(
+                fake_bd,
+                f"""#!{sys.executable}
+from pathlib import Path
+Path({str(fake_calls)!r}).open("a", encoding="utf-8").write("bd called\\n")
+raise SystemExit(9)
+""",
+            )
+            recipe = merged_recipe_with_retrospective(temp_path, repo, checkout, fake_git, fake_gh)
+            recipe["retrospective_follow_up"] = {
+                "enabled": True,
+                "creator": "beads",
+                "beads_workspace": str(beads_workspace),
+                "labels": ["ready-for-agent"],
+            }
+
+            completed = run_afk(
+                "run-workstream",
+                "--workstream-id",
+                "central-lve.9",
+                "--input",
+                json.dumps(recipe),
+                "--ledger",
+                str(ledger),
+                env_overrides={
+                    "GIT_ALLOW_PROTOCOL": "file",
+                    "GIT_AUTHOR_NAME": "AFK Test",
+                    "GIT_AUTHOR_EMAIL": "afk-test@example.test",
+                    "GIT_COMMITTER_NAME": "AFK Test",
+                    "GIT_COMMITTER_EMAIL": "afk-test@example.test",
+                    "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+                },
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertFalse(fake_calls.exists())
+            summary = json.loads(completed.stdout)
+            result = json.loads((ledger / summary["result_path"]).read_text(encoding="utf-8"))
+            creation = result["pipeline_retrospective"]["follow_up"]["creation"]
+
+            self.assertEqual(creation["enabled"], True)
+            self.assertEqual(creation["status"], "skipped")
+            self.assertEqual(creation["classification"], "no_recommendations")
+            self.assertEqual(creation["creator"]["type"], "beads")
+            self.assertEqual(creation["creator"]["workspace"], str(beads_workspace))
+            self.assertEqual(creation["creator"]["labels"], ["ready-for-agent"])
+            self.assertEqual(creation["creator"]["dedupe"], "fingerprint")
+            self.assertEqual(result["artifacts"]["retrospective_follow_up_request"], "retrospective-follow-up-request.json")
+            self.assertEqual(result["artifacts"]["retrospective_follow_up_result"], "retrospective-follow-up-result.json")
+            self.assertEqual(result["artifacts"]["retrospective_follow_up_stdout"], "retrospective-follow-up-stdout.log")
+            self.assertEqual(result["artifacts"]["retrospective_follow_up_stderr"], "retrospective-follow-up-stderr.log")
+
     def test_workstream_recommendation_only_retrospective_follow_up_beads_config_does_not_call_bd(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
@@ -3736,6 +3816,127 @@ raise SystemExit(9)
             self.assertEqual(result["pipeline_retrospective"]["follow_up"]["created"][0]["id"], "central-existing")
             self.assertEqual(result["pipeline_retrospective"]["follow_up"]["recommended"], [])
 
+    def test_workstream_sanitizes_beads_dedupe_stdout_artifact(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repo = temp_path / "repo-src"
+            checkout = temp_path / "checkout"
+            ledger = temp_path / "ledger"
+            fake_calls = temp_path / "fake-calls.jsonl"
+            beads_workspace = temp_path / "beads"
+            fake_bin = temp_path / "bin"
+            fake_bin.mkdir()
+            (beads_workspace / "secrets").mkdir(parents=True)
+            (beads_workspace / "secrets" / "dolt_beads_password.txt").write_text("test-password\n", encoding="utf-8")
+            init_repo(repo)
+            fake_git = temp_path / "publisher-git"
+            fake_gh = temp_path / "publisher-gh"
+            fake_bd = fake_bin / "bd"
+            fingerprint = _retrospective_follow_up_fingerprint(
+                "retrospective-judge",
+                "Review and address retrospective judge findings before treating the run as complete.",
+                ["afk:follow-up", "area:workstream", "project:afk-composable-pipeline"],
+            )
+            leaked_description = "Sensitive unrelated description from central Beads."
+            leaked_notes = "Private operator notes must not land in artifacts."
+            write_executable(
+                fake_git,
+                f"""#!{sys.executable}
+raise SystemExit(9)
+""",
+            )
+            write_executable(
+                fake_gh,
+                f"""#!{sys.executable}
+raise SystemExit(9)
+""",
+            )
+            write_executable(
+                fake_bd,
+                f"""#!{sys.executable}
+import json
+import sys
+from pathlib import Path
+
+Path({str(fake_calls)!r}).open("a", encoding="utf-8").write(json.dumps(sys.argv[1:]) + "\\n")
+if sys.argv[1:3] == ["list", "--json"]:
+    print(
+        json.dumps(
+            [
+                {{
+                    "id": "central-existing",
+                    "title": "Review and address retrospective judge findings before treating the run as complete.",
+                    "description": {leaked_description!r},
+                    "notes": {leaked_notes!r},
+                    "labels": ["project:afk-composable-pipeline", "afk:follow-up", "area:workstream", "ready-for-agent"],
+                    "metadata": {{
+                        "afk.retrospective_follow_up.fingerprint": "{fingerprint}",
+                        "afk.retrospective_follow_up.category": "retrospective-judge",
+                        "afk.retrospective_follow_up.severity": "error",
+                    }},
+                }},
+                {{
+                    "id": "central-unrelated",
+                    "title": "Unrelated central bead",
+                    "description": {leaked_description!r},
+                    "notes": {leaked_notes!r},
+                    "labels": ["project:afk-composable-pipeline"],
+                    "metadata": {{}},
+                }},
+            ]
+        )
+    )
+    raise SystemExit(0)
+if sys.argv[1] == "create":
+    raise SystemExit("bd create should not run for duplicate fingerprints")
+raise SystemExit(9)
+""",
+            )
+            recipe = merged_recipe_with_retrospective(temp_path, repo, checkout, fake_git, fake_gh)
+            recipe["retrospective_judge"] = {
+                "enabled": True,
+                "type": "local-command",
+                "command": [sys.executable, "-c", "import sys; print('judge failed'); raise SystemExit(7)"],
+                "timeout_seconds": 10,
+            }
+            recipe["retrospective_follow_up"] = {
+                "enabled": True,
+                "creator": "beads",
+                "beads_workspace": str(beads_workspace),
+                "labels": ["ready-for-agent"],
+            }
+
+            completed = run_afk(
+                "run-workstream",
+                "--workstream-id",
+                "central-lve.9",
+                "--input",
+                json.dumps(recipe),
+                "--ledger",
+                str(ledger),
+                env_overrides={
+                    "GIT_ALLOW_PROTOCOL": "file",
+                    "GIT_AUTHOR_NAME": "AFK Test",
+                    "GIT_AUTHOR_EMAIL": "afk-test@example.test",
+                    "GIT_COMMITTER_NAME": "AFK Test",
+                    "GIT_COMMITTER_EMAIL": "afk-test@example.test",
+                    "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+                },
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            result_dir = ledger / "workstreams" / summary["run_id"]
+            stdout_artifact = (result_dir / "retrospective-follow-up-stdout.log").read_text(encoding="utf-8")
+
+            self.assertNotIn(leaked_description, stdout_artifact)
+            self.assertNotIn(leaked_notes, stdout_artifact)
+            self.assertNotIn('"description"', stdout_artifact)
+            self.assertNotIn('"notes"', stdout_artifact)
+            self.assertIn("Matched 1 existing retrospective follow-up Beads by fingerprint.", stdout_artifact)
+            self.assertIn("central-existing", stdout_artifact)
+            self.assertIn(fingerprint, stdout_artifact)
+
     def test_retrospective_follow_up_bead_labels_include_project_fallback(self):
         labels = _retrospective_follow_up_bead_labels(
             {"summary": "Configured follow-up", "labels": ["area:retro"]},
@@ -3745,6 +3946,15 @@ raise SystemExit(9)
         self.assertEqual(
             labels,
             ["area:retro", "project:afk-composable-pipeline", "ready-for-agent"],
+        )
+
+    def test_retrospective_follow_up_fingerprint_includes_kind(self):
+        summary = "Same follow-up summary"
+        labels = ["afk:follow-up", "project:afk-composable-pipeline"]
+
+        self.assertNotEqual(
+            _retrospective_follow_up_fingerprint("retrospective-judge", summary, labels),
+            _retrospective_follow_up_fingerprint("publisher-failure", summary, labels),
         )
 
     def test_workstream_terminal_no_merge_decision_closes_tracker_without_republishing(self):

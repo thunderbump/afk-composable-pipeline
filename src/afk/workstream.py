@@ -3944,12 +3944,12 @@ def _run_retrospective_follow_up(
             classification="no_recommendations",
             summary="No retrospective follow-up recommendations required.",
             created=[],
-            adapter=_retrospective_follow_up_adapter_record(follow_up_config, None, False),
             request_path=request_path,
             result_path=result_path,
             stdout_path=stdout_path,
             stderr_path=stderr_path,
         )
+        normalized_result.update(_retrospective_follow_up_runtime_record(follow_up_config, None, False))
         _write_retrospective_follow_up_result(result_path, ledger.run_id, normalized_result)
         return normalized_result
     if follow_up_config.get("creator") == "beads":
@@ -4293,7 +4293,11 @@ def _load_existing_retrospective_follow_up_beads(
         fingerprint = string_field(metadata, "afk.retrospective_follow_up.fingerprint") or ""
         if fingerprint and fingerprint not in existing_by_fingerprint:
             existing_by_fingerprint[fingerprint] = item
-    return existing_by_fingerprint, redact_text(completed.stdout, exact_secrets=exact_secrets)
+    return existing_by_fingerprint, _retrospective_follow_up_beads_list_audit(
+        payload,
+        project_label=project_label,
+        exact_secrets=exact_secrets,
+    )
 
 
 def _retrospective_follow_up_existing_bead_item(
@@ -4399,7 +4403,66 @@ def _create_retrospective_follow_up_bead(
             stdout=completed.stdout,
             stderr=completed.stderr,
         )
-    return bead_id, redact_text(completed.stdout, exact_secrets=exact_secrets)
+    return bead_id, _retrospective_follow_up_beads_create_audit(
+        bead_id=bead_id,
+        recommendation=recommendation,
+        exact_secrets=exact_secrets,
+    )
+
+
+def _retrospective_follow_up_beads_list_audit(
+    payload: list[Any],
+    *,
+    project_label: str,
+    exact_secrets: set[str],
+) -> str:
+    lines = [f"Scanned {len(payload)} Beads for retrospective follow-up dedupe."]
+    if project_label:
+        lines.append(f"Label filter: {redact_text(project_label, exact_secrets=exact_secrets)}")
+    matched_items = []
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+        fingerprint = string_field(metadata, "afk.retrospective_follow_up.fingerprint") or ""
+        if not fingerprint:
+            continue
+        matched_items.append(
+            {
+                "id": string_field(item, "id") or "",
+                "fingerprint": fingerprint,
+                "category": string_field(metadata, "afk.retrospective_follow_up.category") or "",
+                "severity": string_field(metadata, "afk.retrospective_follow_up.severity") or "",
+            }
+        )
+    lines.append(f"Matched {len(matched_items)} existing retrospective follow-up Beads by fingerprint.")
+    for item in matched_items:
+        parts = []
+        if item["id"]:
+            parts.append(f"id={redact_text(item['id'], exact_secrets=exact_secrets)}")
+        parts.append(f"fingerprint={redact_text(item['fingerprint'], exact_secrets=exact_secrets)}")
+        if item["category"]:
+            parts.append(f"category={redact_text(item['category'], exact_secrets=exact_secrets)}")
+        if item["severity"]:
+            parts.append(f"severity={redact_text(item['severity'], exact_secrets=exact_secrets)}")
+        lines.append("- " + " ".join(parts))
+    return "\n".join(lines) + "\n"
+
+
+def _retrospective_follow_up_beads_create_audit(
+    *,
+    bead_id: str,
+    recommendation: dict[str, Any],
+    exact_secrets: set[str],
+) -> str:
+    parts = [f"Created retrospective follow-up Bead {redact_text(bead_id, exact_secrets=exact_secrets)}."]
+    fingerprint = string_field(recommendation, "fingerprint") or ""
+    if fingerprint:
+        parts.append(f"fingerprint={redact_text(fingerprint, exact_secrets=exact_secrets)}")
+    summary = string_field(recommendation, "summary") or ""
+    if summary:
+        parts.append(f"summary={redact_text(summary, exact_secrets=exact_secrets)}")
+    return " ".join(parts) + "\n"
 
 
 def _retrospective_follow_up_bead_labels(
@@ -4791,6 +4854,29 @@ def _retrospective_follow_up_adapter_record(
     }
 
 
+def _retrospective_follow_up_runtime_record(
+    follow_up_config: dict[str, Any],
+    returncode: int | None,
+    timed_out: bool,
+) -> dict[str, Any]:
+    if follow_up_config.get("creator") == "beads":
+        return {
+            "creator": {
+                "type": "beads",
+                "workspace": follow_up_config["beads_workspace"],
+                "labels": redact_artifact_value(follow_up_config.get("labels", [])),
+                "dedupe": "fingerprint",
+            }
+        }
+    return {
+        "adapter": _retrospective_follow_up_adapter_record(
+            follow_up_config,
+            returncode,
+            timed_out,
+        )
+    }
+
+
 def _retrospective_follow_up_creation_public_record(creation: dict[str, Any]) -> dict[str, Any]:
     return {
         key: value
@@ -5138,6 +5224,7 @@ def _retrospective_follow_up_labels(labels: Any) -> list[str]:
 def _retrospective_follow_up_fingerprint(kind: str, summary: str, labels: list[str]) -> str:
     return "retro-follow-up:" + sha256_json(
         {
+            "kind": kind,
             "summary": summary,
             "labels": sorted(set(labels)),
         }
