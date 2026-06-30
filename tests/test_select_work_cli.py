@@ -1586,6 +1586,241 @@ sys.exit(9)
                 ],
             )
 
+    def test_beads_source_ignores_older_open_tracker_artifact_when_newer_tracker_is_closed(self):
+        secret = "beads-secret-value"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            fake_bin = temp_path / "bin"
+            workspace = temp_path / "beads"
+            older_artifact_dir = temp_path / "ledger-old" / "workstreams" / "20260629T173653866624Z-89b72c97"
+            newer_artifact_dir = temp_path / "ledger-new" / "workstreams" / "20260629T183653866624Z-89b72c98"
+            (workspace / "secrets").mkdir(parents=True)
+            (workspace / "secrets" / "dolt_beads_password.txt").write_text(secret, encoding="utf-8")
+            older_artifact_dir.mkdir(parents=True)
+            newer_artifact_dir.mkdir(parents=True)
+            (older_artifact_dir / "tracker-result.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "status": "awaiting-review",
+                        "source_item_external_id": "central-zwk",
+                        "pr_url": "https://github.example/pr/31",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (older_artifact_dir / "workstream-result.json").write_text(
+                json.dumps({"schema_version": 1, "workstream_id": "central-zwk"}),
+                encoding="utf-8",
+            )
+            (newer_artifact_dir / "tracker-result.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "status": "closed",
+                        "source_item_external_id": "central-zwk",
+                        "pr_url": "https://github.example/pr/31",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (newer_artifact_dir / "workstream-result.json").write_text(
+                json.dumps({"schema_version": 1, "workstream_id": "central-zwk"}),
+                encoding="utf-8",
+            )
+            fake_bin.mkdir()
+            write_executable(
+                fake_bin / "bd",
+                f"""#!{sys.executable}
+import json
+import os
+import sys
+
+if os.environ.get("BEADS_DOLT_PASSWORD") != "{secret}":
+    sys.exit(8)
+
+if len(sys.argv) > 1 and sys.argv[1] == "list":
+    print(json.dumps([{{"id": "central-zwk"}}]))
+    sys.exit(0)
+
+if len(sys.argv) > 2 and sys.argv[1] == "show" and sys.argv[2] == "central-zwk":
+    print(json.dumps({{
+        "id": "central-zwk",
+        "title": "Freshly re-opened Bead",
+        "acceptance_criteria": ["Latest closed tracker should not suppress selection"],
+        "status": "open",
+        "labels": ["project:afk-composable-pipeline", "ready-for-agent"],
+        "metadata": {{"workstream": "central-zwk", "afk.ready": True}},
+        "dependencies": [],
+    }}))
+    sys.exit(0)
+
+print("unexpected bd args: " + " ".join(sys.argv[1:]), file=sys.stderr)
+sys.exit(9)
+""",
+            )
+
+            request = {
+                "required_labels": ["project:afk-composable-pipeline", "ready-for-agent"],
+                "required_metadata": ["workstream", "acceptance_criteria", "afk.ready"],
+                "sources": [
+                    {
+                        "type": "beads",
+                        "id": "central-beads",
+                        "workspace": str(workspace),
+                        "workspace_kind": "mounted",
+                        "labels": ["project:afk-composable-pipeline", "ready-for-agent"],
+                        "status": "open",
+                        "tracker_artifact_roots": [str(temp_path)],
+                    }
+                ],
+            }
+            ledger = temp_path / "ledger"
+            completed = run_afk(
+                "run-step",
+                "select-work",
+                "--input",
+                json.dumps(request),
+                "--ledger",
+                str(ledger),
+                env={"PATH": str(fake_bin)},
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(
+                [item["external_id"] for item in result["output"]["selected_work"]],
+                ["central-zwk"],
+            )
+            self.assertEqual(result["output"]["skipped_candidates"], [])
+
+    def test_beads_source_skips_item_when_latest_tracker_artifact_keeps_source_open(self):
+        secret = "beads-secret-value"
+        for tracker_status in ("review-findings-open", "review-feedback-addressed"):
+            with self.subTest(tracker_status=tracker_status):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    temp_path = Path(temp_dir)
+                    fake_bin = temp_path / "bin"
+                    workspace = temp_path / "beads"
+                    artifact_dir = temp_path / "ledger-existing" / "workstreams" / "20260629T173653866624Z-89b72c97"
+                    (workspace / "secrets").mkdir(parents=True)
+                    (workspace / "secrets" / "dolt_beads_password.txt").write_text(secret, encoding="utf-8")
+                    artifact_dir.mkdir(parents=True)
+                    (artifact_dir / "tracker-result.json").write_text(
+                        json.dumps(
+                            {
+                                "schema_version": 1,
+                                "status": tracker_status,
+                                "source_item_external_id": "central-zwk",
+                                "pr_url": "https://github.example/pr/31",
+                            }
+                        ),
+                        encoding="utf-8",
+                    )
+                    (artifact_dir / "workstream-result.json").write_text(
+                        json.dumps(
+                            {
+                                "schema_version": 1,
+                                "workstream_id": "central-zwk",
+                            }
+                        ),
+                        encoding="utf-8",
+                    )
+                    fake_bin.mkdir()
+                    write_executable(
+                        fake_bin / "bd",
+                        f"""#!{sys.executable}
+import json
+import os
+import sys
+
+if os.environ.get("BEADS_DOLT_PASSWORD") != "{secret}":
+    sys.exit(8)
+
+if len(sys.argv) > 1 and sys.argv[1] == "list":
+    print(json.dumps([{{"id": "central-zwk"}}, {{"id": "central-next.1"}}]))
+    sys.exit(0)
+
+if len(sys.argv) > 2 and sys.argv[1] == "show" and sys.argv[2] == "central-zwk":
+    print(json.dumps({{
+        "id": "central-zwk",
+        "title": "Already published source Bead",
+        "acceptance_criteria": ["Should be skipped while tracker state stays open"],
+        "status": "open",
+        "labels": ["project:afk-composable-pipeline", "ready-for-agent"],
+        "metadata": {{"workstream": "central-zwk", "afk.ready": True}},
+        "dependencies": [],
+    }}))
+    sys.exit(0)
+
+if len(sys.argv) > 2 and sys.argv[1] == "show" and sys.argv[2] == "central-next.1":
+    print(json.dumps({{
+        "id": "central-next.1",
+        "title": "Fresh source Bead",
+        "acceptance_criteria": ["Should still be selectable"],
+        "status": "open",
+        "labels": ["project:afk-composable-pipeline", "ready-for-agent"],
+        "metadata": {{"workstream": "central-next", "afk.ready": True}},
+        "dependencies": [],
+    }}))
+    sys.exit(0)
+
+print("unexpected bd args: " + " ".join(sys.argv[1:]), file=sys.stderr)
+sys.exit(9)
+""",
+                    )
+
+                    request = {
+                        "required_labels": ["project:afk-composable-pipeline", "ready-for-agent"],
+                        "required_metadata": ["workstream", "acceptance_criteria", "afk.ready"],
+                        "sources": [
+                            {
+                                "type": "beads",
+                                "id": "central-beads",
+                                "workspace": str(workspace),
+                                "workspace_kind": "mounted",
+                                "labels": ["project:afk-composable-pipeline", "ready-for-agent"],
+                                "status": "open",
+                                "tracker_artifact_roots": [str(temp_path)],
+                            }
+                        ],
+                    }
+                    ledger = temp_path / "ledger"
+                    completed = run_afk(
+                        "run-step",
+                        "select-work",
+                        "--input",
+                        json.dumps(request),
+                        "--ledger",
+                        str(ledger),
+                        env={"PATH": str(fake_bin)},
+                    )
+
+                    self.assertEqual(completed.returncode, 0, completed.stderr)
+                    summary = json.loads(completed.stdout)
+                    run_dir = ledger / "runs" / summary["run_id"]
+                    result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+
+                    self.assertEqual(
+                        [item["external_id"] for item in result["output"]["selected_work"]],
+                        ["central-next.1"],
+                    )
+                    self.assertEqual(
+                        [
+                            (item["candidate"]["external_id"], item["reason"])
+                            for item in result["output"]["skipped_candidates"]
+                        ],
+                        [
+                            (
+                                "central-zwk",
+                                "open_afk_pr_exists:workstream=central-zwk,pr_url=https://github.example/pr/31",
+                            )
+                        ],
+                    )
+
     def test_beads_source_explicit_target_id_bypasses_open_afk_pr_skip(self):
         secret = "beads-secret-value"
         with tempfile.TemporaryDirectory() as temp_dir:

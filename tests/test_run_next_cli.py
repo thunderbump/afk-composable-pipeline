@@ -1382,6 +1382,85 @@ else:
                 ],
             )
 
+    def test_run_next_uses_contract_root_for_tracker_artifacts_even_when_invoked_from_other_cwd(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repo_root = temp_path / "repo-root"
+            launch_cwd = temp_path / "launch-cwd"
+            contracts_dir = repo_root / "project-contracts"
+            fake_bin = temp_path / "bin"
+            beads_workspace = temp_path / "beads"
+            checkout_root = temp_path / "checkouts"
+            checkout_path = checkout_root / "bump-EQEmu"
+            contracts_dir.mkdir(parents=True)
+            launch_cwd.mkdir()
+            beads_workspace.mkdir()
+            fake_bin.mkdir()
+            write_contract(
+                contracts_dir / "bump-eqemu.json",
+                project_slug="bump-eqemu",
+                repo_url="https://github.com/thunderbump/bump-EQEmu",
+            )
+            write_executable(
+                fake_bin / "gh",
+                f"""#!{sys.executable}
+import sys
+
+if sys.argv[1:3] == ["auth", "status"]:
+    sys.exit(1)
+raise SystemExit(9)
+""",
+            )
+            write_executable(
+                fake_bin / "bd",
+                f"""#!{sys.executable}
+raise SystemExit(9)
+""",
+            )
+
+            run_env = os.environ.copy()
+            run_env["PYTHONPATH"] = str(ROOT / "src")
+            run_env["PATH"] = str(fake_bin)
+            run_env.pop("GH_TOKEN", None)
+            run_env.pop("GITHUB_TOKEN", None)
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "afk",
+                    "run-next",
+                    "--project",
+                    "bump-eqemu",
+                    "--contracts-dir",
+                    str(contracts_dir),
+                    "--beads-workspace",
+                    str(beads_workspace),
+                    "--checkout-root",
+                    str(checkout_root),
+                    "--checkout-path",
+                    str(checkout_path),
+                    "--validation-profile",
+                    "tier1",
+                    "--role-profile",
+                    "fake-local",
+                    "--ledger",
+                    str(temp_path / "ledger"),
+                ],
+                cwd=launch_cwd,
+                env=run_env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            payload = json.loads(completed.stdout)
+            self.assertEqual(
+                payload["selection_request"]["sources"][0]["tracker_artifact_roots"],
+                [str(repo_root)],
+            )
+
     def test_run_next_preview_emits_project_worker_validation_when_requested(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)

@@ -38,12 +38,14 @@ def run_next(
     execute: bool = False,
     ledger_dir: Path | None = None,
     workstream_runner: Callable[..., Any] | None = None,
+    tracker_artifact_root: Path | None = None,
 ) -> dict[str, Any]:
     workspace = validate_beads_workspace(beads_workspace)
     selection_request = build_selection_request(
         project_contract,
         beads_workspace=workspace,
         ready_tag=ready_tag,
+        tracker_artifact_root=tracker_artifact_root,
     )
     selection_result = select_work(selection_request, project_contract=project_contract)
     chosen = choose_candidate(
@@ -108,9 +110,10 @@ def build_selection_request(
     *,
     beads_workspace: Path,
     ready_tag: str,
+    tracker_artifact_root: Path | None = None,
 ) -> dict[str, Any]:
     required_labels = list(project_contract.beads_labels) + [ready_tag]
-    tracker_artifact_root = str(Path.cwd())
+    tracker_root = (tracker_artifact_root or Path.cwd()).resolve(strict=False)
     sources = [
         {
             "type": "beads",
@@ -119,7 +122,7 @@ def build_selection_request(
             "workspace_kind": "central",
             "labels": required_labels,
             "status": "open",
-            "tracker_artifact_roots": [tracker_artifact_root],
+            "tracker_artifact_roots": [str(tracker_root)],
         }
     ]
     github_repo = github_repo_from_repo_url(project_contract.repo_url)

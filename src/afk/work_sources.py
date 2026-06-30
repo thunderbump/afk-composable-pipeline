@@ -10,6 +10,11 @@ from typing import Any
 
 
 SCHEMA_VERSION = 1
+OPEN_TRACKER_STATUSES = {
+    "awaiting-review",
+    "review-findings-open",
+    "review-feedback-addressed",
+}
 
 
 class SourceLoadError(RuntimeError):
@@ -517,6 +522,7 @@ def load_beads_issues(source: dict[str, Any]) -> list[dict[str, Any]]:
             normalized.append(normalize_beads_issue(str(source.get("id") or "beads"), source, issue))
         return normalized
 
+    tracker_records_by_external_id = latest_tracker_records_by_source_item(source)
     command = [
         "bd",
         "list",
@@ -546,7 +552,14 @@ def load_beads_issues(source: dict[str, Any]) -> list[dict[str, Any]]:
         if not is_non_blank_string(issue_id):
             raise SourceLoadError("failed_invalid_payload", "bd list returned issue without id")
         issue = load_beads_issue(issue_id.strip(), workspace=workspace, env=env)
-        normalized.append(normalize_beads_issue(str(source.get("id") or "beads"), source, issue))
+        normalized.append(
+            normalize_beads_issue(
+                str(source.get("id") or "beads"),
+                source,
+                issue,
+                tracker_records_by_external_id=tracker_records_by_external_id,
+            )
+        )
     return normalized
 
 
@@ -626,7 +639,13 @@ def missing_beads_target(issue_id: str) -> dict[str, Any]:
     }
 
 
-def normalize_beads_issue(source_id: str, source: dict[str, Any], issue: dict[str, Any]) -> dict[str, Any]:
+def normalize_beads_issue(
+    source_id: str,
+    source: dict[str, Any],
+    issue: dict[str, Any],
+    *,
+    tracker_records_by_external_id: dict[str, dict[str, str]] | None = None,
+) -> dict[str, Any]:
     issue_id = issue.get("id")
     if not is_non_blank_string(issue_id):
         raise SourceLoadError("failed_invalid_payload", "bd show returned issue without stable id")
@@ -658,7 +677,10 @@ def normalize_beads_issue(source_id: str, source: dict[str, Any], issue: dict[st
     if issue_type:
         normalized["issue_type"] = str(issue_type)
     if not source.get("target_ids"):
-        selection_skip_reason = open_afk_pr_skip_reason(source, normalized["external_id"])
+        selection_skip_reason = open_afk_pr_skip_reason(
+            normalized["external_id"],
+            tracker_records_by_external_id=tracker_records_by_external_id or {},
+        )
         if selection_skip_reason:
             normalized["selection_skip_reason"] = selection_skip_reason
     return normalized
@@ -705,8 +727,15 @@ def beads_afk_metadata(metadata: dict[str, Any], labels: list[str]) -> dict[str,
     return afk
 
 
-def open_afk_pr_skip_reason(source: dict[str, Any], external_id: str) -> str | None:
-    tracker_record = latest_open_tracker_record(source, external_id)
+def open_afk_pr_skip_reason(
+    external_id: str,
+    *,
+    tracker_records_by_external_id: dict[str, dict[str, str]],
+) -> str | None:
+    tracker_record = latest_open_tracker_record(
+        external_id,
+        tracker_records_by_external_id=tracker_records_by_external_id,
+    )
     if tracker_record is None:
         return None
     details = []
@@ -721,16 +750,31 @@ def open_afk_pr_skip_reason(source: dict[str, Any], external_id: str) -> str | N
     return f"open_afk_pr_exists:{','.join(details)}"
 
 
-def latest_open_tracker_record(source: dict[str, Any], external_id: str) -> dict[str, str] | None:
-    records: list[dict[str, str]] = []
+def latest_open_tracker_record(
+    external_id: str,
+    *,
+    tracker_records_by_external_id: dict[str, dict[str, str]],
+) -> dict[str, str] | None:
+    record = tracker_records_by_external_id.get(external_id)
+    if record is None:
+        return None
+    if record.get("status") not in OPEN_TRACKER_STATUSES:
+        return None
+    return record
+
+
+def latest_tracker_records_by_source_item(source: dict[str, Any]) -> dict[str, dict[str, str]]:
+    records_by_external_id: dict[str, dict[str, str]] = {}
     for root in tracker_artifact_roots(source):
         for tracker_path in sorted(root.glob("ledger*/workstreams/*/tracker-result.json")):
-            record = tracker_record_for_source_item(tracker_path, external_id)
-            if record is not None:
-                records.append(record)
-    if not records:
-        return None
-    return sorted(records, key=lambda record: (record["run_id"], record["tracker_path"]))[-1]
+            record = tracker_record_for_source_item(tracker_path)
+            if record is None:
+                continue
+            external_id = record["source_item_external_id"]
+            existing = records_by_external_id.get(external_id)
+            if existing is None or tracker_record_sort_key(existing) < tracker_record_sort_key(record):
+                records_by_external_id[external_id] = record
+    return records_by_external_id
 
 
 def tracker_artifact_roots(source: dict[str, Any]) -> list[Path]:
@@ -756,23 +800,28 @@ def tracker_artifact_roots(source: dict[str, Any]) -> list[Path]:
     return roots
 
 
-def tracker_record_for_source_item(tracker_path: Path, external_id: str) -> dict[str, str] | None:
+def tracker_record_for_source_item(tracker_path: Path) -> dict[str, str] | None:
     try:
         payload = json.loads(tracker_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
     if not isinstance(payload, dict):
         return None
-    if str(payload.get("status") or "").strip() != "awaiting-review":
-        return None
-    if str(payload.get("source_item_external_id") or "").strip() != external_id:
+    external_id = str(payload.get("source_item_external_id") or "").strip()
+    if not external_id:
         return None
     return {
+        "source_item_external_id": external_id,
+        "status": str(payload.get("status") or "").strip(),
         "run_id": tracker_path.parent.name,
         "tracker_path": str(tracker_path),
         "workstream_id": tracker_workstream_id(tracker_path.parent),
         "pr_url": str(payload.get("pr_url") or "").strip(),
     }
+
+
+def tracker_record_sort_key(record: dict[str, str]) -> tuple[str, str]:
+    return (record["run_id"], record["tracker_path"])
 
 
 def tracker_workstream_id(workstream_dir: Path) -> str:
