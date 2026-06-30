@@ -596,6 +596,103 @@ class ImplementCliTest(unittest.TestCase):
             )
             self.assertNotIn("{prompt}", json.dumps(rendered_prompt))
 
+    def test_implement_real_agent_prompt_keeps_worker_home_without_stack_guidance(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            checkout = temp_path / "checkout"
+            start_commit = init_checkout(checkout)
+            ledger = temp_path / "ledger"
+            codex_home = temp_path / "codex-home"
+            pi_config_home = temp_path / "pi-config"
+            config_home = temp_path / "xdg-config-explicit"
+            validation_worker_home = temp_path / "validation-worker-home"
+            codex_home.mkdir()
+            pi_config_home.mkdir()
+            config_home.mkdir()
+            agent_code = temp_path / "real_agent_worker_home_only.py"
+            agent_code.write_text(
+                textwrap.dedent(
+                    f"""
+                    import json
+                    import subprocess
+                    import sys
+                    from pathlib import Path
+
+                    prompt = sys.argv[1]
+                    request = json.loads(prompt)
+                    assert request["validation"]["run_commands_during_implementation"] is False, request
+                    assert request["validation"]["pipeline_validate_step_runs_stack"] is False, request
+                    assert request["validation"]["worker_home"] == {str(validation_worker_home)!r}, request
+                    assert "stack" not in request["validation"], request
+                    Path("agent-prompt.json").write_text(prompt, encoding="utf-8")
+                    Path("implemented.txt").write_text("worker home only", encoding="utf-8")
+                    subprocess.run(["git", "add", "implemented.txt"], check=True)
+                    subprocess.run(["git", "commit", "-m", "real adapter worker home only"], check=True)
+                    Path(__import__("os").environ["AFK_AGENT_RESULT_PATH"]).write_text(
+                        json.dumps({{"status": "completed", "summary": "real adapter worker home only"}}),
+                        encoding="utf-8",
+                    )
+                    """
+                ).strip(),
+                encoding="utf-8",
+            )
+
+            completed = run_afk(
+                "run-step",
+                "implement",
+                "--input",
+                json.dumps(
+                    {
+                        "work_selection": {"schema_version": 1, "selected_work": [selected_work()]},
+                        "checkout": {
+                            "status": "prepared",
+                            "checkout_path": str(checkout),
+                            "review_branch": "afk/test-work",
+                            "requested_ref": "main",
+                            "start_commit": start_commit,
+                        },
+                        "guardrails": [],
+                        "validation": {
+                            "profile": "tier1",
+                            "commands": [],
+                            "worker_home": str(validation_worker_home),
+                        },
+                        "agent": {
+                            "type": "real-agent-command",
+                            "command": [sys.executable, str(agent_code), "{prompt}"],
+                            "result_path": "agent-result.json",
+                            "timeout_seconds": 10,
+                            "codex_home": str(codex_home),
+                            "config_home": str(config_home),
+                            "env": {"PI_CONFIG_HOME": str(pi_config_home)},
+                        },
+                    }
+                ),
+                "--ledger",
+                str(ledger),
+                env_overrides={
+                    "GIT_AUTHOR_NAME": "AFK Test",
+                    "GIT_AUTHOR_EMAIL": "afk-test@example.test",
+                    "GIT_COMMITTER_NAME": "AFK Test",
+                    "GIT_COMMITTER_EMAIL": "afk-test@example.test",
+                },
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            rendered_prompt = json.loads((checkout / "agent-prompt.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(rendered_prompt["validation"]["worker_home"], str(validation_worker_home))
+            self.assertFalse(rendered_prompt["validation"]["pipeline_validate_step_runs_stack"])
+            self.assertEqual(
+                rendered_prompt["validation"]["implementation_instructions"],
+                [
+                    "No implementation-time validation commands were provided.",
+                ],
+            )
+            self.assertNotIn("stack", rendered_prompt["validation"])
+
     def test_implement_preserves_secret_redaction_for_rendered_real_agent_prompt(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)

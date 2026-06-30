@@ -463,6 +463,7 @@ def normalize_validation(validation: Any, project_contract: Any, *, checkout_pat
     available_profiles = []
     if project_contract is not None:
         available_profiles = list(project_contract.validation_profiles)
+    has_pipeline_stack = stack["stack"] is not None
     normalized_validation = {
         "status": "valid",
         "validation": {
@@ -470,10 +471,10 @@ def normalize_validation(validation: Any, project_contract: Any, *, checkout_pat
             "commands": normalized_commands,
             "available_profiles": available_profiles,
             "run_commands_during_implementation": normalized_run_commands,
-            "pipeline_validate_step_runs_stack": bool(worker_home["path"] or stack["stack"] is not None),
+            "pipeline_validate_step_runs_stack": has_pipeline_stack,
             "implementation_instructions": validation_implementation_instructions(
                 commands=normalized_commands,
-                has_pipeline_stack=bool(worker_home["path"] or stack["stack"] is not None),
+                has_pipeline_stack=has_pipeline_stack,
             ),
         },
     }

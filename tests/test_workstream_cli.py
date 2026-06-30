@@ -7304,6 +7304,41 @@ sys.exit(0)
                 },
             )
 
+    def test_implement_normalize_validation_keeps_worker_home_without_implying_stack_validation(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            checkout = temp_path / "checkout"
+            worker_home = temp_path / "worker-home"
+            checkout.mkdir()
+
+            normalized = normalize_implement_validation(
+                {
+                    "profile": "tier1",
+                    "commands": [],
+                    "worker_home": str(worker_home),
+                },
+                None,
+                checkout_path=checkout,
+            )
+
+            self.assertEqual(
+                normalized,
+                {
+                    "status": "valid",
+                    "validation": {
+                        "profile": "tier1",
+                        "commands": [],
+                        "available_profiles": [],
+                        "worker_home": str(worker_home),
+                        "run_commands_during_implementation": False,
+                        "pipeline_validate_step_runs_stack": False,
+                        "implementation_instructions": [
+                            "No implementation-time validation commands were provided.",
+                        ],
+                    },
+                },
+            )
+
     def test_implement_normalize_validation_rejects_non_empty_commands_with_false_marker(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             checkout = Path(temp_dir) / "checkout"
