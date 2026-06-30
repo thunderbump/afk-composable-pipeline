@@ -433,6 +433,23 @@ def normalize_validation(validation: Any, project_contract: Any, *, checkout_pat
         if not is_string_list(command):
             return {"status": "invalid", "message": "validation.commands must contain command lists"}
         normalized_commands.append(list(command))
+    run_commands_marker = validation.get("run_commands_during_implementation")
+    if run_commands_marker is not None and not isinstance(run_commands_marker, bool):
+        return {
+            "status": "invalid",
+            "message": "validation.run_commands_during_implementation must be a boolean",
+        }
+    if run_commands_marker is False and normalized_commands:
+        return {
+            "status": "invalid",
+            "message": "validation.run_commands_during_implementation=false contradicts non-empty validation.commands",
+        }
+    if run_commands_marker is True and not normalized_commands:
+        return {
+            "status": "invalid",
+            "message": "validation.run_commands_during_implementation=true requires non-empty validation.commands",
+        }
+    normalized_run_commands = run_commands_marker if isinstance(run_commands_marker, bool) else bool(normalized_commands)
     worker_home = normalize_optional_validation_path(
         string_field(validation, "worker_home") or string_field(validation, "workerHome"),
         field="validation.worker_home",
@@ -452,7 +469,7 @@ def normalize_validation(validation: Any, project_contract: Any, *, checkout_pat
             "profile": profile,
             "commands": normalized_commands,
             "available_profiles": available_profiles,
-            "run_commands_during_implementation": bool(normalized_commands),
+            "run_commands_during_implementation": normalized_run_commands,
             "pipeline_validate_step_runs_stack": bool(worker_home["path"] or stack["stack"] is not None),
             "implementation_instructions": validation_implementation_instructions(
                 commands=normalized_commands,

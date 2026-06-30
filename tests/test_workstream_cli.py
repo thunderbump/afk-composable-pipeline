@@ -6936,6 +6936,29 @@ sys.exit(0)
 
         self.assertEqual(merged["commands"], [["make", "test"]])
 
+    def test_merged_implement_validation_input_backfills_empty_commands_when_true_marker_matches_validate_step(self):
+        merged = merged_implement_validation_input(
+            {
+                "profile": "tier1",
+                "commands": [],
+                "run_commands_during_implementation": True,
+            },
+            [
+                {
+                    "name": "validate",
+                    "profile": "tier1",
+                    "input": {
+                        "validation": {
+                            "profile": "tier1",
+                            "commands": [["make", "test"]],
+                        }
+                    },
+                }
+            ],
+        )
+
+        self.assertEqual(merged["commands"], [["make", "test"]])
+
     def test_merged_implement_validation_input_preserves_explicit_suppression_of_empty_commands(self):
         merged = merged_implement_validation_input(
             {
@@ -6998,6 +7021,58 @@ sys.exit(0)
                             "Leave stack validation to the pipeline validate step; do not guess alternate validation stack paths.",
                         ],
                     },
+                },
+            )
+
+    def test_implement_normalize_validation_rejects_non_empty_commands_with_false_marker(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            checkout = Path(temp_dir) / "checkout"
+            checkout.mkdir()
+
+            normalized = normalize_implement_validation(
+                {
+                    "profile": "tier1",
+                    "commands": [["make", "test"]],
+                    "run_commands_during_implementation": False,
+                },
+                None,
+                checkout_path=checkout,
+            )
+
+            self.assertEqual(
+                normalized,
+                {
+                    "status": "invalid",
+                    "message": (
+                        "validation.run_commands_during_implementation=false contradicts "
+                        "non-empty validation.commands"
+                    ),
+                },
+            )
+
+    def test_implement_normalize_validation_rejects_empty_commands_with_true_marker(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            checkout = Path(temp_dir) / "checkout"
+            checkout.mkdir()
+
+            normalized = normalize_implement_validation(
+                {
+                    "profile": "tier1",
+                    "commands": [],
+                    "run_commands_during_implementation": True,
+                },
+                None,
+                checkout_path=checkout,
+            )
+
+            self.assertEqual(
+                normalized,
+                {
+                    "status": "invalid",
+                    "message": (
+                        "validation.run_commands_during_implementation=true requires "
+                        "non-empty validation.commands"
+                    ),
                 },
             )
 
