@@ -449,6 +449,10 @@ def composed_step_input(
             input_data["checkout"] = state["checkout"]
         else:
             input_data.pop("checkout", None)
+        input_data["validation"] = merged_implement_validation_input(
+            input_data.get("validation"),
+            normalized["steps"],
+        )
     elif step_name == "validate":
         if state.get("checkout") is not None:
             input_data["checkout"] = state["checkout"]
@@ -476,6 +480,52 @@ def composed_step_input(
         }
         input_data.setdefault("cleanup", {"status": "clean", "resources": []})
     return input_data
+
+
+def merged_implement_validation_input(
+    implement_validation: Any,
+    steps: list[dict[str, Any]],
+) -> dict[str, Any]:
+    if isinstance(implement_validation, dict):
+        merged = dict(implement_validation)
+    else:
+        merged = {}
+    validate_context = validate_step_implement_context(steps)
+    if "profile" not in merged and isinstance(validate_context.get("profile"), str):
+        merged["profile"] = validate_context["profile"]
+    if "commands" not in merged:
+        merged["commands"] = []
+    for field in ("worker_home", "stack"):
+        if field not in merged and field in validate_context:
+            merged[field] = validate_context[field]
+    return merged
+
+
+def validate_step_implement_context(steps: list[dict[str, Any]]) -> dict[str, Any]:
+    for step in steps:
+        if step.get("name") != "validate":
+            continue
+        input_data = step.get("input")
+        if not isinstance(input_data, dict):
+            continue
+        validation = input_data.get("validation")
+        if not isinstance(validation, dict):
+            continue
+        context: dict[str, Any] = {}
+        profile = string_field(validation, "profile") or string_field(step, "profile")
+        if profile:
+            context["profile"] = profile
+        worker_home = string_field(validation, "worker_home")
+        if worker_home:
+            context["worker_home"] = worker_home
+        stack = validation.get("stack")
+        if isinstance(stack, dict):
+            role = string_field(stack, "role")
+            path = string_field(stack, "path")
+            if role and path:
+                context["stack"] = {"role": role, "path": path}
+        return context
+    return {}
 
 
 def recipe_checkout_path(steps: list[dict[str, Any]]) -> Path | None:

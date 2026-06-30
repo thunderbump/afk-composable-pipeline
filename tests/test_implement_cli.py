@@ -486,31 +486,39 @@ class ImplementCliTest(unittest.TestCase):
             codex_home = temp_path / "codex-home"
             pi_config_home = temp_path / "pi-config"
             config_home = temp_path / "xdg-config-explicit"
+            validation_worker_home = temp_path / "validation-worker-home"
+            validation_stack_path = temp_path / "mounts" / "bump-akk-stack-validation"
             codex_home.mkdir()
             pi_config_home.mkdir()
             config_home.mkdir()
             agent_code = temp_path / "real_agent.py"
             agent_code.write_text(
                 textwrap.dedent(
-                    """
+                    f"""
                     import json
-                    import os
                     import subprocess
                     import sys
                     from pathlib import Path
 
                     prompt = sys.argv[1]
-                    if prompt == "{prompt}":
+                    if prompt == "{{prompt}}":
                         raise SystemExit("real prompt was not rendered")
                     request = json.loads(prompt)
                     if request["work_item"]["external_id"] != "central-lve.5":
                         raise SystemExit("unexpected work item in rendered prompt")
+                    assert request["validation"]["run_commands_during_implementation"] is False, request
+                    assert request["validation"]["pipeline_validate_step_runs_stack"] is True, request
+                    assert request["validation"]["worker_home"] == {str(validation_worker_home)!r}, request
+                    assert request["validation"]["stack"] == {{
+                        "role": "validation",
+                        "path": {str(validation_stack_path)!r},
+                    }}, request
                     Path("agent-prompt.json").write_text(prompt, encoding="utf-8")
                     Path("implemented.txt").write_text("real adapter with prompt", encoding="utf-8")
                     subprocess.run(["git", "add", "implemented.txt"], check=True)
                     subprocess.run(["git", "commit", "-m", "real adapter prompt smoke"], check=True)
-                    Path(os.environ["AFK_AGENT_RESULT_PATH"]).write_text(
-                        json.dumps({"status": "completed", "summary": "real adapter rendered prompt"}),
+                    Path(__import__("os").environ["AFK_AGENT_RESULT_PATH"]).write_text(
+                        json.dumps({{"status": "completed", "summary": "real adapter rendered prompt"}}),
                         encoding="utf-8",
                     )
                     """
@@ -533,7 +541,15 @@ class ImplementCliTest(unittest.TestCase):
                             "start_commit": start_commit,
                         },
                         "guardrails": [],
-                        "validation": {"profile": "tier1", "commands": []},
+                        "validation": {
+                            "profile": "tier1",
+                            "commands": [],
+                            "worker_home": str(validation_worker_home),
+                            "stack": {
+                                "role": "validation",
+                                "path": str(validation_stack_path),
+                            },
+                        },
                         "agent": {
                             "type": "real-agent-command",
                             "command": [sys.executable, str(agent_code), "{prompt}"],
@@ -566,6 +582,18 @@ class ImplementCliTest(unittest.TestCase):
             self.assertEqual(result["output"]["summary"], "real adapter rendered prompt")
             self.assertEqual(agent_result["result"]["adapter"]["type"], "real-agent-command")
             self.assertEqual(rendered_prompt["work_item"]["external_id"], "central-lve.5")
+            self.assertEqual(rendered_prompt["validation"]["worker_home"], str(validation_worker_home))
+            self.assertEqual(
+                rendered_prompt["validation"]["stack"],
+                {"role": "validation", "path": str(validation_stack_path)},
+            )
+            self.assertEqual(
+                rendered_prompt["validation"]["implementation_instructions"],
+                [
+                    "No implementation-time validation commands were provided.",
+                    "Leave stack validation to the pipeline validate step; do not guess alternate validation stack paths.",
+                ],
+            )
             self.assertNotIn("{prompt}", json.dumps(rendered_prompt))
 
     def test_implement_preserves_secret_redaction_for_rendered_real_agent_prompt(self):

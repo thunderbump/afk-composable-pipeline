@@ -81,8 +81,13 @@ PYTHONPATH=src python3 -m afk run-step implement \
 
 `implement` consumes the normalized `WorkSelection` item and checkout metadata,
 builds a `job-capsule.json` with work context, guardrails, checkout ref, and
-validation hints, invokes the configured fake/local Pi command, normalizes the
-adapter result into `agent-result.json`, and records post-run git metadata.
+validation hints. When the pipeline validate step is configured with a
+project-worker stack, the implement capsule also carries the non-secret
+`validation.worker_home` / `validation.stack` host evidence plus guidance about
+whether to run `validation.commands` during implementation or leave stack
+validation to the later `validate` step. It invokes the configured fake/local
+Pi command, normalizes the adapter result into `agent-result.json`, and records
+post-run git metadata.
 Adapter runtime failures, adapter protocol failures, and target-code failures
 are classified separately. Adapter stdout/stderr are redacted and written to
 the normal ledger logs.
@@ -378,7 +383,8 @@ emit `PI_CODING_AGENT_DIR` for Pi's agent auth lookup and will not emit
 other than the role profile defaults.
 
 For `--validation-mode project-worker`, the generator embeds the worker host
-contract into `steps[].input.validation`. By default that keeps
+contract into both `implement` and `validate` step `input.validation`. By
+default that keeps
 `validation.worker_home` under `checkout_root/.validation-worker/<checkout-name>`
 and derives `validation.stack.path` as a sibling of the checkout path
 (`checkout_path.parent / "bump-akk-stack-validation"`). If `checkout_root` is a

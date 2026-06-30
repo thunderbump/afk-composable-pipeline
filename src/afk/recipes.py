@@ -78,7 +78,10 @@ def generate_workstream_recipe(
                 "name": "implement",
                 "input": {
                     "guardrails": ["stay within the prepared checkout", "do not write secrets"],
-                    "validation": {"profile": validation_profile, "commands": []},
+                    "validation": implement_validation_input(
+                        validation_profile=validation_profile,
+                        validation_input=validate_step_input,
+                    ),
                     "agent": implement_agent,
                 },
             },
@@ -217,6 +220,27 @@ def real_local_recipe_agent(
     if timeout_seconds is not None:
         agent["timeout_seconds"] = timeout_seconds
     return agent
+
+
+def implement_validation_input(
+    *,
+    validation_profile: str,
+    validation_input: dict[str, Any],
+) -> dict[str, Any]:
+    implement_validation: dict[str, Any] = {"profile": validation_profile, "commands": []}
+    validation = validation_input.get("validation")
+    if not isinstance(validation, dict):
+        return implement_validation
+    worker_home = validation.get("worker_home")
+    if isinstance(worker_home, str) and worker_home.strip():
+        implement_validation["worker_home"] = worker_home
+    stack = validation.get("stack")
+    if isinstance(stack, dict):
+        role = stack.get("role")
+        path = stack.get("path")
+        if isinstance(role, str) and role.strip() and isinstance(path, str) and path.strip():
+            implement_validation["stack"] = {"role": role, "path": path}
+    return implement_validation
 
 
 def create_recipe_publisher(

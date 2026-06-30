@@ -1474,7 +1474,20 @@ class GenerateRecipeCliTest(unittest.TestCase):
             self.assertEqual(completed.returncode, 0, completed.stderr)
             recipe = json.loads(output.read_text(encoding="utf-8"))
 
+            implement_step = recipe["steps"][2]
             validate_step = recipe["steps"][3]
+            self.assertEqual(
+                implement_step["input"]["validation"],
+                {
+                    "profile": "tier1",
+                    "commands": [],
+                    "worker_home": str(checkout_root / ".validation-worker" / "demo"),
+                    "stack": {
+                        "role": "validation",
+                        "path": str(checkout_root / "bump-akk-stack-validation"),
+                    },
+                },
+            )
             self.assertEqual(validate_step["profile"], "tier1")
             self.assertEqual(
                 validate_step["input"]["validation"],

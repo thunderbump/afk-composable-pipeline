@@ -1532,8 +1532,21 @@ else:
 
             self.assertEqual(completed.returncode, 0, completed.stderr)
             payload = json.loads(completed.stdout)
+            implement = next(step for step in payload["recipe"]["steps"] if step["name"] == "implement")
             validate = next(step for step in payload["recipe"]["steps"] if step["name"] == "validate")
 
+            self.assertEqual(
+                implement["input"]["validation"],
+                {
+                    "profile": "tier1",
+                    "commands": [],
+                    "worker_home": str(checkout_root / ".validation-worker" / "bump-EQEmu"),
+                    "stack": {
+                        "role": "validation",
+                        "path": str(validation_stack_path),
+                    },
+                },
+            )
             self.assertEqual(
                 validate["input"]["validation"],
                 {
