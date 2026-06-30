@@ -1428,14 +1428,6 @@ def close_published_pr(
             stdout=json.dumps(merged_payload),
             stderr="",
         )
-    tracker_close = close_selected_source_item(
-        normalized=normalized,
-        state=state,
-        config=config,
-        checkout_path=checkout_path,
-        auth=auth,
-        close_reason=f"merged via {merge_commit}",
-    )
     terminal_decision = {
         "status": "merged",
         "merge_commit": merge_commit,
@@ -1443,6 +1435,28 @@ def close_published_pr(
         "pr_url": publisher_pr_url(merged_payload, fallback=pr_url),
         "review_feedback_status": "",
     }
+    try:
+        tracker_close = close_selected_source_item(
+            normalized=normalized,
+            state=state,
+            config=config,
+            checkout_path=checkout_path,
+            auth=auth,
+            close_reason=f"merged via {merge_commit}",
+        )
+    except PublisherError as exc:
+        return merged_terminal_tracker_close_failed_publication(
+            auth=auth_artifact,
+            pr_url=terminal_decision["pr_url"],
+            merge_commit=merge_commit,
+            terminal_decision=terminal_decision,
+            commands={
+                "gh_view": view_command,
+                "gh_merge": merge_command,
+                "gh_view_merged": merged_view_command,
+            },
+            exc=exc,
+        )
     return {
         "schema_version": SCHEMA_VERSION,
         "status": "tracker-closed",
@@ -1461,6 +1475,35 @@ def close_published_pr(
         },
         "tracker_close": tracker_close,
         "terminal_decision": terminal_decision,
+    }
+
+
+def merged_terminal_tracker_close_failed_publication(
+    *,
+    auth: dict[str, Any],
+    pr_url: str,
+    merge_commit: str,
+    terminal_decision: dict[str, Any],
+    commands: dict[str, list[str]],
+    exc: PublisherError,
+) -> dict[str, Any]:
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "status": "failed-needs-human",
+        "enabled": True,
+        "mode": "close",
+        "reason": "terminal PR merged, but source item closure failed",
+        "auth": auth,
+        "url": redact_text(pr_url),
+        "merge_commit": redact_text(merge_commit),
+        "next_allowed_command": "none",
+        "retry": (
+            "PR is already merged. Remediate the recorded source-item closure failure, then close the source item "
+            "with the recorded terminal decision evidence instead of attempting another PR merge."
+        ),
+        "commands": {key: redact_artifact_value(value) for key, value in commands.items()},
+        "terminal_decision": runtime_terminal_decision(terminal_decision),
+        "tracker_close": tracker_close_failure_artifact(exc),
     }
 
 
@@ -2919,6 +2962,23 @@ def tracker_close_blocked_publication(
     }
 
 
+def tracker_close_failure_artifact(exc: PublisherError) -> dict[str, Any]:
+    tool = redact_text(exc.command[0]) if exc.command else ""
+    return {
+        "status": "failed",
+        "tool": tool,
+        "reason": exc.message,
+        "command": redact_artifact_value(exc.command),
+        "returncode": exc.returncode,
+        "stdout_excerpt": redact_text(exc.stdout[-2000:]),
+        "stderr_excerpt": redact_text(exc.stderr[-2000:]),
+        "remediation": (
+            "The PR is already merged, but the source item remains open. Remediate the tracker/source close "
+            "failure and retry only the source closure, or close it manually with the recorded merge commit."
+        ),
+    }
+
+
 def tracker_terminal_decision_publication() -> dict[str, Any]:
     return {
         "schema_version": SCHEMA_VERSION,
@@ -2989,20 +3049,26 @@ def tracker_record(
     }
     decision_status = decision.get("status")
     if decision_status == "merged":
+        record["merge_commit"] = redact_text(decision["merge_commit"])
+        record["pr_url"] = decision_pr_url
         if review_feedback_requires_response and not decision_review_feedback_status:
             record["status"] = "review-findings-open"
             record["comment"] = (
                 "PR review cycles still require a response; the terminal decision is recorded, but keep the "
                 "source Beads item open until review_feedback_status is set to resolved or waived."
             )
-            record["pr_url"] = decision_pr_url
             return record
         if publication.get("status") != "tracker-closed":
-            record["comment"] = (
-                "A terminal merge decision is recorded, but publication did not reach the tracker-closing "
-                "terminal state; keep the source Beads item open."
-            )
-            record["pr_url"] = decision_pr_url
+            if publication_tracker_close_failed(publication):
+                record["comment"] = (
+                    "PR merged and the terminal decision is recorded, but source item closure failed; keep the "
+                    "source Beads item open until the recorded tracker_close failure is remediated."
+                )
+            else:
+                record["comment"] = (
+                    "A terminal merge decision is recorded, but publication did not reach the tracker-closing "
+                    "terminal state; keep the source Beads item open."
+                )
             return record
         record["status"] = "closed"
         record["close_source_item"] = True
@@ -3012,8 +3078,6 @@ def tracker_record(
             decision_review_feedback_status,
             review_feedback_requires_response,
         )
-        record["merge_commit"] = redact_text(decision["merge_commit"])
-        record["pr_url"] = decision_pr_url
         return record
     if decision_status == "blocked":
         if review_feedback_requires_response:
@@ -3087,6 +3151,11 @@ def effective_tracker_terminal_decision(normalized: dict[str, Any], publication:
     if decision.get("status"):
         return decision
     return runtime_terminal_decision(publication.get("terminal_decision"))
+
+
+def publication_tracker_close_failed(publication: dict[str, Any]) -> bool:
+    tracker_close = publication.get("tracker_close")
+    return isinstance(tracker_close, dict) and string_field(tracker_close, "status") == "failed"
 
 
 def tracker_progress_status(state: dict[str, Any]) -> str:
