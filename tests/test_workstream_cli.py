@@ -3816,6 +3816,118 @@ raise SystemExit(9)
             self.assertEqual(result["pipeline_retrospective"]["follow_up"]["created"][0]["id"], "central-existing")
             self.assertEqual(result["pipeline_retrospective"]["follow_up"]["recommended"], [])
 
+    def test_workstream_preserves_recommendation_fingerprint_when_existing_created_only_has_id(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repo = temp_path / "repo-src"
+            checkout = temp_path / "checkout"
+            ledger = temp_path / "ledger"
+            fake_calls = temp_path / "fake-calls.jsonl"
+            beads_workspace = temp_path / "beads"
+            fake_bin = temp_path / "bin"
+            fake_bin.mkdir()
+            (beads_workspace / "secrets").mkdir(parents=True)
+            (beads_workspace / "secrets" / "dolt_beads_password.txt").write_text("test-password\n", encoding="utf-8")
+            init_repo(repo)
+            fake_git = temp_path / "publisher-git"
+            fake_gh = temp_path / "publisher-gh"
+            fake_bd = fake_bin / "bd"
+            fingerprint = _retrospective_follow_up_fingerprint(
+                "retrospective-judge",
+                "Review and address retrospective judge findings before treating the run as complete.",
+                ["afk:follow-up", "area:workstream", "project:afk-composable-pipeline"],
+            )
+            write_executable(
+                fake_git,
+                f"""#!{sys.executable}
+raise SystemExit(9)
+""",
+            )
+            write_executable(
+                fake_gh,
+                f"""#!{sys.executable}
+raise SystemExit(9)
+""",
+            )
+            write_executable(
+                fake_bd,
+                f"""#!{sys.executable}
+import json
+import sys
+from pathlib import Path
+
+Path({str(fake_calls)!r}).open("a", encoding="utf-8").write(json.dumps(sys.argv[1:]) + "\\n")
+if sys.argv[1:3] == ["list", "--json"]:
+    print(
+        json.dumps(
+            [
+                {{
+                    "id": "central-existing",
+                    "title": "Review and address retrospective judge findings before treating the run as complete.",
+                    "labels": ["project:afk-composable-pipeline", "afk:follow-up", "area:workstream", "ready-for-agent"],
+                    "metadata": {{
+                        "afk.retrospective_follow_up.fingerprint": "{fingerprint}",
+                        "afk.retrospective_follow_up.category": "retrospective-judge",
+                        "afk.retrospective_follow_up.severity": "error",
+                    }},
+                }}
+            ]
+        )
+    )
+    raise SystemExit(0)
+if sys.argv[1] == "create":
+    raise SystemExit("bd create should not run for duplicate fingerprints")
+raise SystemExit(9)
+""",
+            )
+            recipe = merged_recipe_with_retrospective(temp_path, repo, checkout, fake_git, fake_gh)
+            recipe["retrospective"]["follow_up"] = {
+                "created": [{"id": "central-existing"}],
+            }
+            recipe["retrospective_judge"] = {
+                "enabled": True,
+                "type": "local-command",
+                "command": [sys.executable, "-c", "import sys; print('judge failed'); raise SystemExit(7)"],
+                "timeout_seconds": 10,
+            }
+            recipe["retrospective_follow_up"] = {
+                "enabled": True,
+                "creator": "beads",
+                "beads_workspace": str(beads_workspace),
+                "labels": ["ready-for-agent"],
+            }
+
+            completed = run_afk(
+                "run-workstream",
+                "--workstream-id",
+                "central-lve.9",
+                "--input",
+                json.dumps(recipe),
+                "--ledger",
+                str(ledger),
+                env_overrides={
+                    "GIT_ALLOW_PROTOCOL": "file",
+                    "GIT_AUTHOR_NAME": "AFK Test",
+                    "GIT_AUTHOR_EMAIL": "afk-test@example.test",
+                    "GIT_COMMITTER_NAME": "AFK Test",
+                    "GIT_COMMITTER_EMAIL": "afk-test@example.test",
+                    "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+                },
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            result = json.loads((ledger / summary["result_path"]).read_text(encoding="utf-8"))
+            calls = [json.loads(line) for line in fake_calls.read_text(encoding="utf-8").splitlines()]
+            creation = result["pipeline_retrospective"]["follow_up"]["creation"]
+            created = result["pipeline_retrospective"]["follow_up"]["created"]
+
+            self.assertEqual(calls, [["list", "--json", "--no-pager", "--limit", "0", "--label", "project:afk-composable-pipeline"]])
+            self.assertEqual(creation["enabled"], True)
+            self.assertEqual(creation["status"], "recorded")
+            self.assertEqual(created, [{"id": "central-existing", "fingerprint": fingerprint, "kind": "retrospective-judge", "summary": "Review and address retrospective judge findings before treating the run as complete.", "labels": ["project:afk-composable-pipeline", "afk:follow-up", "area:workstream", "ready-for-agent"]}])
+            self.assertEqual(result["pipeline_retrospective"]["follow_up"]["recommended"], [])
+
     def test_workstream_sanitizes_beads_dedupe_stdout_artifact(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)

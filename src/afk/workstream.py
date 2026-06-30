@@ -5183,7 +5183,10 @@ def _merge_retrospective_created_follow_up_item(existing: dict[str, Any], new: d
     new_labels = new.get("labels")
     if isinstance(new_labels, list) and new_labels:
         merged["labels"] = new_labels
-    if string_field(merged, "summary"):
+    fingerprint = string_field(new, "fingerprint") or string_field(existing, "fingerprint") or ""
+    if fingerprint:
+        merged["fingerprint"] = fingerprint
+    elif string_field(merged, "summary"):
         merged["fingerprint"] = _retrospective_follow_up_fingerprint(
             string_field(merged, "kind") or "created-follow-up",
             string_field(merged, "summary") or "",
