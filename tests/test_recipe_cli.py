@@ -1483,6 +1483,7 @@ class GenerateRecipeCliTest(unittest.TestCase):
                 {
                     "profile": "tier1",
                     "commands": [],
+                    "run_commands_during_implementation": False,
                     "worker_home": str(checkout_root / ".validation-worker" / "demo"),
                     "stack": {
                         "role": "validation",
@@ -1548,6 +1549,10 @@ class GenerateRecipeCliTest(unittest.TestCase):
             self.assertEqual(
                 recipe["steps"][3]["input"]["validation"]["commands"],
                 [["make", "test"], ["pytest", "-q"]],
+            )
+            self.assertNotIn(
+                "run_commands_during_implementation",
+                recipe["steps"][2]["input"]["validation"],
             )
 
     def test_generate_recipe_derives_project_worker_stack_from_checkout_parent(self):

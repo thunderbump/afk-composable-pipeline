@@ -234,6 +234,8 @@ def implement_validation_input(
     commands = validation.get("commands")
     if isinstance(commands, list) and all(isinstance(command, list) and all(isinstance(part, str) for part in command) for command in commands):
         implement_validation["commands"] = [list(command) for command in commands]
+    if not implement_validation["commands"]:
+        implement_validation["run_commands_during_implementation"] = False
     worker_home = validation.get("worker_home")
     if not isinstance(worker_home, str) or not worker_home.strip():
         worker_home = validation.get("workerHome")

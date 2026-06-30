@@ -1540,6 +1540,7 @@ else:
                 {
                     "profile": "tier1",
                     "commands": [],
+                    "run_commands_during_implementation": False,
                     "worker_home": str(checkout_root / ".validation-worker" / "bump-EQEmu"),
                     "stack": {
                         "role": "validation",
