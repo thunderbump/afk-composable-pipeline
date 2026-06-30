@@ -434,7 +434,7 @@ def normalize_validation(validation: Any, project_contract: Any, *, checkout_pat
             return {"status": "invalid", "message": "validation.commands must contain command lists"}
         normalized_commands.append(list(command))
     worker_home = normalize_optional_validation_path(
-        validation.get("worker_home"),
+        string_field(validation, "worker_home") or string_field(validation, "workerHome"),
         field="validation.worker_home",
         checkout_path=checkout_path,
     )
@@ -490,10 +490,8 @@ def normalize_validation_stack(value: Any, *, checkout_path: Path) -> dict[str, 
         return {"status": "valid", "stack": None}
     if not isinstance(value, dict):
         return {"status": "invalid", "message": "validation.stack must be an object"}
-    role = string_field(value, "role")
+    role = string_field(value, "role") or "validation"
     path = normalize_optional_validation_path(value.get("path"), field="validation.stack.path", checkout_path=checkout_path)
-    if not role:
-        return {"status": "invalid", "message": "validation.stack.role is required"}
     if path["status"] != "valid":
         return path
     if not path["path"]:

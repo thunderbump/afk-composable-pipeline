@@ -515,14 +515,14 @@ def validate_step_implement_context(steps: list[dict[str, Any]]) -> dict[str, An
         profile = string_field(validation, "profile") or string_field(step, "profile")
         if profile:
             context["profile"] = profile
-        worker_home = string_field(validation, "worker_home")
+        worker_home = string_field(validation, "worker_home") or string_field(validation, "workerHome")
         if worker_home:
             context["worker_home"] = worker_home
         stack = validation.get("stack")
         if isinstance(stack, dict):
-            role = string_field(stack, "role")
+            role = string_field(stack, "role") or "validation"
             path = string_field(stack, "path")
-            if role and path:
+            if path:
                 context["stack"] = {"role": role, "path": path}
         return context
     return {}

@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from afk.registry import StepResult  # noqa: E402
+from afk.implement import normalize_validation as normalize_implement_validation  # noqa: E402
 from afk.workstream import (  # noqa: E402
     WorkstreamLedger,
     composed_step_input,
@@ -6678,6 +6679,117 @@ sys.exit(0)
                         "No implementation-time validation commands were provided.",
                         "Leave stack validation to the pipeline validate step; do not guess alternate validation stack paths.",
                     ],
+                },
+            )
+
+    def test_workstream_implement_job_capsule_backfills_validation_aliases_from_validate_step(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repo = temp_path / "repo-src"
+            checkout = temp_path / "checkout"
+            ledger = temp_path / "ledger"
+            fake_git = temp_path / "publisher-git"
+            fake_gh = temp_path / "publisher-gh"
+            worker_home = temp_path / "worker-home"
+            validation_stack_path = temp_path / "mounts" / "bump-akk-stack-validation"
+            init_repo(repo)
+            recipe = successful_recipe(temp_path, repo, checkout, fake_git, fake_gh)
+            recipe["publisher"] = {"enabled": False}
+            recipe["steps"][2]["input"]["validation"] = {"profile": "tier1", "commands": []}
+            recipe["steps"][3]["input"]["validation"] = {
+                "profile": "tier1",
+                "dry_run": False,
+                "timeout_seconds": 3600,
+                "workerHome": str(worker_home),
+                "stack": {
+                    "path": str(validation_stack_path),
+                },
+            }
+
+            completed = run_afk(
+                "run-workstream",
+                "--workstream-id",
+                "central-lve.9",
+                "--input",
+                json.dumps(recipe),
+                "--ledger",
+                str(ledger),
+                env_overrides={
+                    "GIT_ALLOW_PROTOCOL": "file",
+                    "GIT_AUTHOR_NAME": "AFK Test",
+                    "GIT_AUTHOR_EMAIL": "afk-test@example.test",
+                    "GIT_COMMITTER_NAME": "AFK Test",
+                    "GIT_COMMITTER_EMAIL": "afk-test@example.test",
+                },
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            result = json.loads((ledger / summary["result_path"]).read_text(encoding="utf-8"))
+            implement_step = next(step for step in result["steps"] if step["name"] == "implement")
+            job_capsule = json.loads(
+                (ledger / "runs" / implement_step["run_id"] / "job-capsule.json").read_text(encoding="utf-8")
+            )["capsule"]
+
+            self.assertEqual(
+                job_capsule["validation"],
+                {
+                    "profile": "tier1",
+                    "commands": [],
+                    "available_profiles": [],
+                    "worker_home": str(worker_home),
+                    "stack": {
+                        "role": "validation",
+                        "path": str(validation_stack_path),
+                    },
+                    "run_commands_during_implementation": False,
+                    "pipeline_validate_step_runs_stack": True,
+                    "implementation_instructions": [
+                        "No implementation-time validation commands were provided.",
+                        "Leave stack validation to the pipeline validate step; do not guess alternate validation stack paths.",
+                    ],
+                },
+            )
+
+    def test_implement_normalize_validation_accepts_validation_worker_home_alias_and_default_stack_role(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            checkout = temp_path / "checkout"
+            worker_home = temp_path / "worker-home"
+            validation_stack_path = temp_path / "mounts" / "bump-akk-stack-validation"
+            checkout.mkdir()
+
+            normalized = normalize_implement_validation(
+                {
+                    "profile": "tier1",
+                    "commands": [],
+                    "workerHome": str(worker_home),
+                    "stack": {"path": str(validation_stack_path)},
+                },
+                None,
+                checkout_path=checkout,
+            )
+
+            self.assertEqual(
+                normalized,
+                {
+                    "status": "valid",
+                    "validation": {
+                        "profile": "tier1",
+                        "commands": [],
+                        "available_profiles": [],
+                        "worker_home": str(worker_home),
+                        "stack": {
+                            "role": "validation",
+                            "path": str(validation_stack_path),
+                        },
+                        "run_commands_during_implementation": False,
+                        "pipeline_validate_step_runs_stack": True,
+                        "implementation_instructions": [
+                            "No implementation-time validation commands were provided.",
+                            "Leave stack validation to the pipeline validate step; do not guess alternate validation stack paths.",
+                        ],
+                    },
                 },
             )
 

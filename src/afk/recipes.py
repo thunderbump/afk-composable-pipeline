@@ -232,14 +232,17 @@ def implement_validation_input(
     if not isinstance(validation, dict):
         return implement_validation
     worker_home = validation.get("worker_home")
+    if not isinstance(worker_home, str) or not worker_home.strip():
+        worker_home = validation.get("workerHome")
     if isinstance(worker_home, str) and worker_home.strip():
         implement_validation["worker_home"] = worker_home
     stack = validation.get("stack")
     if isinstance(stack, dict):
         role = stack.get("role")
         path = stack.get("path")
-        if isinstance(role, str) and role.strip() and isinstance(path, str) and path.strip():
-            implement_validation["stack"] = {"role": role, "path": path}
+        normalized_role = role if isinstance(role, str) and role.strip() else "validation"
+        if isinstance(path, str) and path.strip():
+            implement_validation["stack"] = {"role": normalized_role, "path": path}
     return implement_validation
 
 
