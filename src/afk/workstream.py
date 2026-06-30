@@ -226,7 +226,6 @@ def run_workstream(
     selected_work = []
     if state["blocked_reason"]:
         publication = blocked_publication(state["blocked_reason"], normalized, run_id)
-        status = publication["status"]
     else:
         publication_gate = publication_gate_reason(state)
         if publication_gate:
@@ -237,7 +236,6 @@ def run_workstream(
                 )
             else:
                 publication = blocked_publication(publication_gate, normalized, run_id)
-            status = publication["status"]
         else:
             if tracker_terminal_decision_present(normalized):
                 if tracker_terminal_decision_allows_close(normalized):
@@ -255,8 +253,8 @@ def run_workstream(
                     selected_work=selected_work_records(state),
                     ledger=ledger,
                 )
-            status = workstream_status_from_publication(publication)
     tracker = tracker_record(normalized, state, publication)
+    status = workstream_status_from_publication(publication, tracker)
     selected_work = selected_work_records(state)
     pipeline_retrospective = pipeline_retrospective_record(state, publication, tracker, normalized)
     retrospective_judge_skip_reason = ""
@@ -1344,6 +1342,9 @@ def close_published_pr(
     auth_artifact: dict[str, Any],
 ) -> dict[str, Any]:
     checkout_path = checkout_path_from_state(state)
+    configured_review_feedback_status = terminal_review_feedback_status(
+        normalized.get("tracker", {}).get("terminal_decision", {})
+    )
     view_payload, view_command = publisher_pr_view(
         config,
         checkout_path=checkout_path,
@@ -1351,6 +1352,22 @@ def close_published_pr(
         fields=["url", "state", "isDraft", "mergeStateStatus", "headRefOid"],
     )
     pr_url = publisher_pr_url(view_payload, fallback=config["pr"])
+    if not review_cycles_recorded(normalized.get("review_cycles")) and configured_review_feedback_status != "waived":
+        return tracker_close_blocked_publication(
+            reason=(
+                "terminal PR closure requires recorded review cycle evidence or review_feedback_status "
+                "of waived before merge"
+            ),
+            terminal_decision={
+                "status": "blocked",
+                "reason": "review cycle evidence is still required before terminal PR closure",
+                "pr_url": pr_url,
+                "review_feedback_status": configured_review_feedback_status,
+            },
+            mode="close",
+            url=pr_url,
+            commands={"gh_view": view_command},
+        )
     if review_cycles_require_response(normalized.get("review_cycles")):
         return tracker_close_blocked_publication(
             reason=(
@@ -1361,6 +1378,7 @@ def close_published_pr(
                 "status": "blocked",
                 "reason": "review cycle responses are still required before terminal PR closure",
                 "pr_url": pr_url,
+                "review_feedback_status": configured_review_feedback_status,
             },
             mode="close",
             url=pr_url,
@@ -1437,7 +1455,7 @@ def close_published_pr(
         "merge_commit": merge_commit,
         "reason": "",
         "pr_url": publisher_pr_url(merged_payload, fallback=pr_url),
-        "review_feedback_status": "",
+        "review_feedback_status": configured_review_feedback_status,
     }
     try:
         tracker_close = close_selected_source_item(
@@ -2508,6 +2526,19 @@ def normalize_tracker_terminal_decision(decision: Any) -> dict[str, str]:
     review_feedback_status = string_field(decision, "review_feedback_status") or ""
     if not status and not merge_commit and not reason and not pr_url and not review_feedback_status:
         return empty_terminal_decision()
+    if review_feedback_status and review_feedback_status not in TERMINAL_REVIEW_FEEDBACK_STATUSES:
+        allowed = ", ".join(sorted(TERMINAL_REVIEW_FEEDBACK_STATUSES))
+        raise WorkstreamError(f"tracker.terminal_decision.review_feedback_status must be one of: {allowed}")
+    if not status:
+        if merge_commit or reason or pr_url:
+            raise WorkstreamError("tracker.terminal_decision.status must be merged or no-merge")
+        return {
+            "status": "",
+            "merge_commit": "",
+            "reason": "",
+            "pr_url": "",
+            "review_feedback_status": review_feedback_status,
+        }
     if status not in {"merged", "no-merge"}:
         raise WorkstreamError("tracker.terminal_decision.status must be merged or no-merge")
     if status == "merged" and not merge_commit:
@@ -2518,9 +2549,6 @@ def normalize_tracker_terminal_decision(decision: Any) -> dict[str, str]:
         raise WorkstreamError("tracker.terminal_decision.reason is required for no-merge")
     if status == "no-merge" and not pr_url:
         raise WorkstreamError("tracker.terminal_decision.pr_url is required for no-merge")
-    if review_feedback_status and review_feedback_status not in TERMINAL_REVIEW_FEEDBACK_STATUSES:
-        allowed = ", ".join(sorted(TERMINAL_REVIEW_FEEDBACK_STATUSES))
-        raise WorkstreamError(f"tracker.terminal_decision.review_feedback_status must be one of: {allowed}")
     if status == "merged":
         reason = ""
     if status == "no-merge":
@@ -3126,13 +3154,19 @@ def tracker_record(
         )
         return record
     if decision_status == "blocked":
+        blocked_reason = redact_text(str(decision.get("reason") or publication.get("reason") or ""))
         if review_feedback_requires_response:
             record["status"] = "review-findings-open"
         elif normalized.get("review_cycles"):
             record["status"] = "review-feedback-addressed"
-        record["comment"] = (
-            "Terminal PR closure is blocked; keep the source Beads item open until the recorded blocker is cleared."
-        )
+        if blocked_reason:
+            record["comment"] = (
+                f"{blocked_reason}; keep the source Beads item open until the recorded blocker is cleared."
+            )
+        else:
+            record["comment"] = (
+                "Terminal PR closure is blocked; keep the source Beads item open until the recorded blocker is cleared."
+            )
         record["pr_url"] = decision_pr_url or redact_text(str(publication.get("url") or ""))
         return record
     if decision_status == "no-merge":
@@ -3244,7 +3278,7 @@ def pipeline_retrospective_record(
     follow_up = _retrospective_follow_up_record(signals, normalized, publication)
     return {
         "schema_version": SCHEMA_VERSION,
-        "status": workstream_status_from_publication(publication),
+        "status": workstream_status_from_publication(publication, tracker),
         "health": _retrospective_health(signals),
         "publication_status": redact_text(str(publication.get("status") or "")),
         "tracker_status": redact_text(str(tracker.get("status") or "")),
@@ -3428,7 +3462,7 @@ def _build_retrospective_judge_evidence_pack(
             "workstream_id": normalized["workstream_id"],
             "parent": normalized["parent"],
             "review_branch": normalized["review_branch"],
-            "status": workstream_status_from_publication(publication),
+            "status": workstream_status_from_publication(publication, tracker),
         },
         "selected_work": _retrospective_judge_prompt_selected_work(selected_work),
         "retrospective": redact_retrospective(effective_retrospective(normalized, publication)),
@@ -3919,7 +3953,7 @@ def _build_retrospective_follow_up_request(
             "workstream_id": normalized["workstream_id"],
             "parent": normalized["parent"],
             "review_branch": normalized["review_branch"],
-            "status": workstream_status_from_publication(publication),
+            "status": workstream_status_from_publication(publication, tracker),
         },
         "retrospective": redact_retrospective(effective_retrospective(normalized, publication)),
         "publication": {
@@ -5137,12 +5171,15 @@ def validated_unpublished_publication(reason: str, *, next_allowed_command: str)
     }
 
 
-def workstream_status_from_publication(publication: dict[str, Any]) -> str:
+def workstream_status_from_publication(publication: dict[str, Any], tracker: dict[str, Any] | None = None) -> str:
     if publication["status"] == "published":
         return "published"
     if publication["status"] == "validated-unpublished":
         return "validated-unpublished"
     if publication["status"] == "tracker-close-blocked":
+        tracker_status = string_field(tracker, "status") if isinstance(tracker, dict) else ""
+        if tracker_status:
+            return tracker_status
         return "review-findings-open"
     if publication["status"] == "tracker-closed":
         return "closed"

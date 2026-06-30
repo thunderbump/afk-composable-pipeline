@@ -789,6 +789,22 @@ class WorkstreamStatusMappingTest(unittest.TestCase):
             "closed",
         )
 
+    def test_workstream_status_from_tracker_close_blocked_uses_tracker_status_when_available(self):
+        self.assertEqual(
+            workstream_status_from_publication(
+                {"status": "tracker-close-blocked"},
+                {"status": "validated"},
+            ),
+            "validated",
+        )
+        self.assertEqual(
+            workstream_status_from_publication(
+                {"status": "tracker-close-blocked"},
+                {"status": "review-findings-open"},
+            ),
+            "review-findings-open",
+        )
+
     def test_workstream_status_from_publication_unknown_status_defaults(
         self,
     ):
