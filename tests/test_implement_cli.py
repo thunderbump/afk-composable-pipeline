@@ -2502,6 +2502,64 @@ class ImplementCliTest(unittest.TestCase):
             self.assertEqual(result["output"]["status"], "failed_runtime")
             self.assertEqual(result["output"]["summary"], "No API key for provider: openai-codex")
 
+    def test_implement_records_configured_timeout_and_elapsed_time_for_adapter_timeout(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            checkout = temp_path / "checkout"
+            start_commit = init_checkout(checkout)
+            ledger = temp_path / "ledger"
+            timeout_seconds = 0.2
+            agent_code = textwrap.dedent(
+                """
+                import time
+                print("starting adapter", flush=True)
+                time.sleep(5)
+                """
+            ).strip()
+
+            completed = run_afk(
+                "run-step",
+                "implement",
+                "--input",
+                json.dumps(
+                    {
+                        "work_selection": {"schema_version": 1, "selected_work": [selected_work()]},
+                        "checkout": {
+                            "status": "prepared",
+                            "checkout_path": str(checkout),
+                            "review_branch": "afk/test-work",
+                            "requested_ref": "main",
+                            "start_commit": start_commit,
+                        },
+                        "guardrails": [],
+                        "validation": {"profile": "tier1", "commands": []},
+                        "agent": {
+                            "type": "fake-pi-command",
+                            "command": [sys.executable, "-c", agent_code],
+                            "result_path": "agent-result.json",
+                            "timeout_seconds": timeout_seconds,
+                        },
+                    }
+                ),
+                "--ledger",
+                str(ledger),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+            agent_result = json.loads((run_dir / "agent-result.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(result["output"]["status"], "failed_runtime")
+            self.assertEqual(result["output"]["classification"], "runtime_failure")
+            self.assertEqual(agent_result["result"]["summary"], "agent command timed out")
+            self.assertEqual(agent_result["result"]["adapter"]["configured_timeout_seconds"], timeout_seconds)
+            self.assertGreaterEqual(agent_result["result"]["adapter"]["elapsed_seconds"], timeout_seconds)
+            self.assertTrue(agent_result["result"]["adapter"]["timed_out"])
+            self.assertEqual(result["output"]["git"]["before_commit"], start_commit)
+            self.assertEqual(result["output"]["git"]["after_commit"], start_commit)
+
     def test_implement_classifies_agent_reported_target_failure_separately(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)

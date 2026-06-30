@@ -249,6 +249,7 @@ class GenerateRecipeCliTest(unittest.TestCase):
                     "PI_CODING_AGENT_DIR": str(pi_coding_agent_dir),
                 },
             )
+            self.assertEqual(implement_agent["timeout_seconds"], 3600)
 
             reviewer = recipe["steps"][4]["input"]["reviewer"]
             self.assertEqual(reviewer["type"], "real-reviewer-command")
@@ -560,6 +561,69 @@ class GenerateRecipeCliTest(unittest.TestCase):
             self.assertEqual(implement_input["agent"]["wrapper_secret_files"], {"primary": str(wrapper_secret)})
             recipe_text = output.read_text(encoding="utf-8")
             self.assertNotIn("super-secret-token", recipe_text)
+
+    def test_generate_recipe_fake_local_real_local_mode_keeps_adapter_timeout_default(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            contracts_dir = temp_path / "contracts"
+            repo = temp_path / "repo-src"
+            output = temp_path / "recipe.json"
+            ledger = temp_path / "ledger"
+            beads_workspace = temp_path / "central-beads"
+            checkout_root = temp_path / "checkouts"
+            checkout_path = checkout_root / "demo"
+            codex_home = temp_path / "codex-home"
+            config_home = temp_path / "xdg-config"
+            pi_config_home = temp_path / "pi-config"
+            contracts_dir.mkdir()
+            init_repo(repo)
+            write_contract(contracts_dir / "demo.json", project_slug="demo", repo_url=str(repo))
+            beads_workspace.mkdir()
+            codex_home.mkdir()
+            config_home.mkdir()
+            pi_config_home.mkdir()
+
+            completed = run_afk(
+                "generate-recipe",
+                "--workstream-id",
+                "central-anh.6",
+                "--project",
+                "demo",
+                "--contracts-dir",
+                str(contracts_dir),
+                "--ledger",
+                str(ledger),
+                "--beads-workspace",
+                str(beads_workspace),
+                "--checkout-root",
+                str(checkout_root),
+                "--checkout-path",
+                str(checkout_path),
+                "--validation-profile",
+                "tier1",
+                "--role-profile",
+                "fake-local",
+                "--agent-mode",
+                "real-local",
+                "--agent-command-json",
+                json.dumps(["codex", "exec", "implement"]),
+                "--agent-codex-home",
+                str(codex_home),
+                "--agent-config-home",
+                str(config_home),
+                "--agent-pi-config-home",
+                str(pi_config_home),
+                "--output",
+                str(output),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            recipe = json.loads(output.read_text(encoding="utf-8"))
+            implement_agent = recipe["steps"][2]["input"]["agent"]
+
+            self.assertEqual(implement_agent["type"], "real-agent-command")
+            self.assertEqual(implement_agent["command"], ["codex", "exec", "implement"])
+            self.assertNotIn("timeout_seconds", implement_agent)
 
     def test_generate_recipe_writes_pi_coding_agent_dir_for_codex_subscription_auth(self):
         with tempfile.TemporaryDirectory() as temp_dir:

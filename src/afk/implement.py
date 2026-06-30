@@ -6,6 +6,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
@@ -36,12 +37,18 @@ class AgentRuntimeError(RuntimeError):
         stdout: str = "",
         stderr: str = "",
         returncode: int | None = None,
+        timed_out: bool = False,
+        configured_timeout_seconds: float | None = None,
+        elapsed_seconds: float | None = None,
     ):
         super().__init__(message)
         self.message = message
         self.stdout = stdout
         self.stderr = stderr
         self.returncode = returncode
+        self.timed_out = timed_out
+        self.configured_timeout_seconds = configured_timeout_seconds
+        self.elapsed_seconds = elapsed_seconds
 
 
 def implement_step(context: Any) -> dict[str, Any]:
@@ -73,7 +80,7 @@ def implement(
             summary=stale_result["message"],
             notes=[],
             failures=[{"type": "protocol", "message": stale_result["message"]}],
-            adapter={"type": request["agent"]["type"], "returncode": None},
+            adapter=adapter_metadata(request["agent"]["type"], returncode=None),
             stdout="",
             stderr="",
         )
@@ -87,7 +94,7 @@ def implement(
             summary=checkout_preflight["message"],
             notes=[],
             failures=[{"type": "protocol", "message": checkout_preflight["message"]}],
-            adapter={"type": request["agent"]["type"], "returncode": None},
+            adapter=adapter_metadata(request["agent"]["type"], returncode=None),
             stdout="",
             stderr="",
         )
@@ -101,7 +108,7 @@ def implement(
             summary=runtime_redaction["message"],
             notes=[],
             failures=[{"type": "protocol", "message": runtime_redaction["message"]}],
-            adapter={"type": request["agent"]["type"], "returncode": None},
+            adapter=adapter_metadata(request["agent"]["type"], returncode=None),
             stdout="",
             stderr="",
         )
@@ -122,7 +129,13 @@ def implement(
             summary=summary,
             notes=[],
             failures=[{"type": "runtime", "message": summary}],
-            adapter={"type": request["agent"]["type"], "returncode": exc.returncode},
+            adapter=adapter_metadata(
+                request["agent"]["type"],
+                returncode=exc.returncode,
+                timed_out=exc.timed_out,
+                configured_timeout_seconds=exc.configured_timeout_seconds,
+                elapsed_seconds=exc.elapsed_seconds,
+            ),
             stdout=stdout,
             stderr=stderr,
         )
@@ -144,7 +157,13 @@ def implement(
             request["agent"],
             agent_payload,
             after_metadata,
-            adapter={"type": request["agent"]["type"], "returncode": adapter_result["returncode"]},
+            adapter=adapter_metadata(
+                request["agent"]["type"],
+                returncode=adapter_result["returncode"],
+                timed_out=adapter_result.get("timed_out", False),
+                configured_timeout_seconds=adapter_result.get("configured_timeout_seconds"),
+                elapsed_seconds=adapter_result.get("elapsed_seconds"),
+            ),
             stdout=stdout,
             stderr=stderr,
         )
@@ -156,7 +175,13 @@ def implement(
             summary=agent_payload["message"],
             notes=[],
             failures=[{"type": "protocol", "message": agent_payload["message"]}],
-            adapter={"type": request["agent"]["type"], "returncode": adapter_result["returncode"]},
+            adapter=adapter_metadata(
+                request["agent"]["type"],
+                returncode=adapter_result["returncode"],
+                timed_out=adapter_result.get("timed_out", False),
+                configured_timeout_seconds=adapter_result.get("configured_timeout_seconds"),
+                elapsed_seconds=adapter_result.get("elapsed_seconds"),
+            ),
             stdout=stdout,
             stderr=stderr,
         )
@@ -165,18 +190,51 @@ def implement(
     after_metadata = safe_git_metadata(checkout_path, request["checkout"]["start_commit"])
     normalized = normalize_agent_payload(
         agent_payload["payload"],
-        adapter={"type": request["agent"]["type"], "returncode": adapter_result["returncode"]},
+        adapter=adapter_metadata(
+            request["agent"]["type"],
+            returncode=adapter_result["returncode"],
+            timed_out=adapter_result.get("timed_out", False),
+            configured_timeout_seconds=adapter_result.get("configured_timeout_seconds"),
+            elapsed_seconds=adapter_result.get("elapsed_seconds"),
+        ),
         stdout=stdout,
         stderr=stderr,
     )
     normalized = require_commit_for_implemented_result(
         normalized,
         after_metadata,
-        adapter={"type": request["agent"]["type"], "returncode": adapter_result["returncode"]},
+        adapter=adapter_metadata(
+            request["agent"]["type"],
+            returncode=adapter_result["returncode"],
+            timed_out=adapter_result.get("timed_out", False),
+            configured_timeout_seconds=adapter_result.get("configured_timeout_seconds"),
+            elapsed_seconds=adapter_result.get("elapsed_seconds"),
+        ),
         stdout=stdout,
         stderr=stderr,
     )
     return implement_output(capsule, normalized, after_metadata)
+
+
+def adapter_metadata(
+    agent_type: str,
+    *,
+    returncode: int | None,
+    timed_out: bool = False,
+    configured_timeout_seconds: float | None = None,
+    elapsed_seconds: float | None = None,
+) -> dict[str, Any]:
+    adapter = {
+        "type": agent_type,
+        "returncode": returncode,
+    }
+    if configured_timeout_seconds is not None:
+        adapter["configured_timeout_seconds"] = configured_timeout_seconds
+    if elapsed_seconds is not None:
+        adapter["elapsed_seconds"] = elapsed_seconds
+    if timed_out:
+        adapter["timed_out"] = True
+    return adapter
 
 
 def normalize_request(input_data: Any, *, project_contract: Any, run_id: str) -> dict[str, Any]:
@@ -786,6 +844,7 @@ def run_agent_command(
         env["AFK_JOB_CAPSULE"] = str(capsule_path)
         env["AFK_AGENT_RESULT_PATH"] = agent["result_path"]
         command = _render_agent_command(agent["command"], prompt=canonical_json(capsule))
+        started_at = time.monotonic()
         try:
             completed = subprocess.run(
                 command,
@@ -797,7 +856,13 @@ def run_agent_command(
                 timeout=agent["timeout_seconds"],
             )
         except OSError as exc:
-            raise AgentRuntimeError(str(exc), stderr=str(exc), returncode=None) from exc
+            raise AgentRuntimeError(
+                str(exc),
+                stderr=str(exc),
+                returncode=None,
+                configured_timeout_seconds=agent["timeout_seconds"],
+                elapsed_seconds=time.monotonic() - started_at,
+            ) from exc
         except subprocess.TimeoutExpired as exc:
             stdout = exc.stdout if isinstance(exc.stdout, str) else ""
             stderr = exc.stderr if isinstance(exc.stderr, str) else ""
@@ -806,6 +871,9 @@ def run_agent_command(
                 stdout=stdout,
                 stderr=stderr or "agent command timed out",
                 returncode=None,
+                timed_out=True,
+                configured_timeout_seconds=agent["timeout_seconds"],
+                elapsed_seconds=time.monotonic() - started_at,
             ) from exc
         if completed.returncode != 0:
             raise AgentRuntimeError(
@@ -813,11 +881,16 @@ def run_agent_command(
                 stdout=completed.stdout,
                 stderr=completed.stderr,
                 returncode=completed.returncode,
+                configured_timeout_seconds=agent["timeout_seconds"],
+                elapsed_seconds=time.monotonic() - started_at,
             )
     return {
         "returncode": completed.returncode,
         "stdout": completed.stdout,
         "stderr": completed.stderr,
+        "configured_timeout_seconds": agent["timeout_seconds"],
+        "elapsed_seconds": time.monotonic() - started_at,
+        "timed_out": False,
     }
 
 
