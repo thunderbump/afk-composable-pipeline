@@ -187,7 +187,7 @@ def run_workstream(
             if blocked_reason:
                 state["blocked_reason"] = blocked_reason
                 break
-            step_input = composed_step_input(step_spec, normalized, state, ledger_dir)
+            step_input = composed_step_input(step_spec, normalized, state, ledger_dir, step_index=index)
             auth_target = pi_auth_target_for_step(step_name, step_input)
             if auth_target is not None and pi_auth_preflight_status.get(auth_target["target"]) == "deferred":
                 auth_result = run_pi_auth_preflight_target(auth_target, cwd=checkout_path_from_state(state))
@@ -421,6 +421,8 @@ def composed_step_input(
     normalized: dict[str, Any],
     state: dict[str, Any],
     ledger_dir: Path,
+    *,
+    step_index: int | None = None,
 ) -> dict[str, Any]:
     step_name = step_spec["name"]
     input_data = dict(step_spec["input"])
@@ -449,6 +451,11 @@ def composed_step_input(
             input_data["checkout"] = state["checkout"]
         else:
             input_data.pop("checkout", None)
+        input_data["validation"] = merged_implement_validation_input(
+            input_data.get("validation"),
+            normalized["steps"],
+            step_index=step_index,
+        )
     elif step_name == "validate":
         if state.get("checkout") is not None:
             input_data["checkout"] = state["checkout"]
@@ -476,6 +483,97 @@ def composed_step_input(
         }
         input_data.setdefault("cleanup", {"status": "clean", "resources": []})
     return input_data
+
+
+def merged_implement_validation_input(
+    implement_validation: Any,
+    steps: list[dict[str, Any]],
+    *,
+    step_index: int | None = None,
+) -> dict[str, Any]:
+    if isinstance(implement_validation, dict):
+        merged = dict(implement_validation)
+    else:
+        merged = {}
+    validate_context = validate_step_implement_context(
+        steps,
+        implement_step_index=step_index,
+        preferred_profile=string_field(merged, "profile"),
+    )
+    if "profile" not in merged and isinstance(validate_context.get("profile"), str):
+        merged["profile"] = validate_context["profile"]
+    validate_commands = validate_context.get("commands", [])
+    explicitly_suppresses_commands = merged.get("run_commands_during_implementation") is False
+    should_backfill_commands = (
+        "commands" not in merged and not explicitly_suppresses_commands
+    ) or (
+        merged.get("commands") == [] and bool(validate_commands) and not explicitly_suppresses_commands
+    )
+    if should_backfill_commands:
+        merged["commands"] = validate_commands
+    for field in ("worker_home", "stack"):
+        if field not in validate_context:
+            continue
+        if field == "worker_home" and ("worker_home" in merged or "workerHome" in merged):
+            continue
+        if field in merged:
+            continue
+        merged[field] = validate_context[field]
+    return merged
+
+
+def validate_step_implement_context(
+    steps: list[dict[str, Any]],
+    *,
+    implement_step_index: int | None = None,
+    preferred_profile: str | None = None,
+) -> dict[str, Any]:
+    if implement_step_index is None:
+        candidate_steps = steps
+    else:
+        candidate_steps = steps[implement_step_index + 1 :]
+    fallback_context: dict[str, Any] | None = None
+    for step in candidate_steps:
+        if step.get("name") != "validate":
+            continue
+        context = validate_step_context(step)
+        if not context:
+            continue
+        if preferred_profile is None:
+            return context
+        if context.get("profile") == preferred_profile:
+            return context
+        if fallback_context is None:
+            fallback_context = context
+    if preferred_profile is not None:
+        return {}
+    return fallback_context or {}
+
+
+def validate_step_context(step: dict[str, Any]) -> dict[str, Any]:
+    input_data = step.get("input")
+    if not isinstance(input_data, dict):
+        return {}
+    validation = input_data.get("validation")
+    if not isinstance(validation, dict):
+        validation = {}
+    context: dict[str, Any] = {}
+    profile = string_field(validation, "profile") or string_field(step, "profile")
+    if profile:
+        context["profile"] = profile
+    commands = validation.get("commands")
+    if isinstance(commands, list) and all(_is_string_list(command) for command in commands):
+        context["commands"] = [list(command) for command in commands]
+    worker_home = string_field(validation, "worker_home") or string_field(validation, "workerHome")
+    if worker_home:
+        context["worker_home"] = worker_home
+    stack = validation.get("stack")
+    if isinstance(stack, dict):
+        role = string_field(stack, "role") or "validation"
+        path = string_field(stack, "path")
+        if path:
+            context["stack"] = {"role": role, "path": path}
+    return context
 
 
 def recipe_checkout_path(steps: list[dict[str, Any]]) -> Path | None:

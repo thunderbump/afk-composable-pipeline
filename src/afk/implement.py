@@ -259,7 +259,11 @@ def normalize_request(input_data: Any, *, project_contract: Any, run_id: str) ->
     if guardrails["status"] != "valid":
         return invalid_request(guardrails["message"])
 
-    validation = normalize_validation(input_data.get("validation", {}), project_contract)
+    validation = normalize_validation(
+        input_data.get("validation", {}),
+        project_contract,
+        checkout_path=Path(checkout["checkout"]["path"]),
+    )
     if validation["status"] != "valid":
         return invalid_request(validation["message"])
 
@@ -417,7 +421,7 @@ def normalize_checkout(checkout: Any) -> dict[str, Any]:
     return {"status": "valid", "checkout": normalized}
 
 
-def normalize_validation(validation: Any, project_contract: Any) -> dict[str, Any]:
+def normalize_validation(validation: Any, project_contract: Any, *, checkout_path: Path) -> dict[str, Any]:
     if not isinstance(validation, dict):
         return {"status": "invalid", "message": "validation must be an object"}
     profile = string_field(validation, "profile") or ""
@@ -429,17 +433,101 @@ def normalize_validation(validation: Any, project_contract: Any) -> dict[str, An
         if not is_string_list(command):
             return {"status": "invalid", "message": "validation.commands must contain command lists"}
         normalized_commands.append(list(command))
+    run_commands_marker = validation.get("run_commands_during_implementation")
+    if run_commands_marker is not None and not isinstance(run_commands_marker, bool):
+        return {
+            "status": "invalid",
+            "message": "validation.run_commands_during_implementation must be a boolean",
+        }
+    if run_commands_marker is False and normalized_commands:
+        return {
+            "status": "invalid",
+            "message": "validation.run_commands_during_implementation=false contradicts non-empty validation.commands",
+        }
+    if run_commands_marker is True and not normalized_commands:
+        return {
+            "status": "invalid",
+            "message": "validation.run_commands_during_implementation=true requires non-empty validation.commands",
+        }
+    normalized_run_commands = run_commands_marker if isinstance(run_commands_marker, bool) else bool(normalized_commands)
+    worker_home = normalize_optional_validation_path(
+        string_field(validation, "worker_home") or string_field(validation, "workerHome"),
+        field="validation.worker_home",
+        checkout_path=checkout_path,
+    )
+    if worker_home["status"] != "valid":
+        return {"status": "invalid", "message": worker_home["message"]}
+    stack = normalize_validation_stack(validation.get("stack"), checkout_path=checkout_path)
+    if stack["status"] != "valid":
+        return {"status": "invalid", "message": stack["message"]}
     available_profiles = []
     if project_contract is not None:
         available_profiles = list(project_contract.validation_profiles)
-    return {
+    has_pipeline_stack = stack["stack"] is not None
+    normalized_validation = {
         "status": "valid",
         "validation": {
             "profile": profile,
             "commands": normalized_commands,
             "available_profiles": available_profiles,
+            "run_commands_during_implementation": normalized_run_commands,
+            "pipeline_validate_step_runs_stack": has_pipeline_stack,
+            "implementation_instructions": validation_implementation_instructions(
+                commands=normalized_commands,
+                has_pipeline_stack=has_pipeline_stack,
+            ),
         },
     }
+    if worker_home["path"]:
+        normalized_validation["validation"]["worker_home"] = worker_home["path"]
+    if stack["stack"] is not None:
+        normalized_validation["validation"]["stack"] = stack["stack"]
+    return normalized_validation
+
+
+def normalize_optional_validation_path(
+    value: Any,
+    *,
+    field: str,
+    checkout_path: Path,
+) -> dict[str, Any]:
+    if value is None or value == "":
+        return {"status": "valid", "path": ""}
+    if not isinstance(value, str) or not value.strip():
+        return {"status": "invalid", "message": f"{field} must be an absolute path outside checkout"}
+    path = Path(value)
+    if not path.is_absolute():
+        return {"status": "invalid", "message": f"{field} must be absolute"}
+    if path_is_equal_to_or_inside(path, checkout_path):
+        return {"status": "invalid", "message": f"{field} must be outside checkout"}
+    return {"status": "valid", "path": str(path)}
+
+
+def normalize_validation_stack(value: Any, *, checkout_path: Path) -> dict[str, Any]:
+    if value is None:
+        return {"status": "valid", "stack": None}
+    if not isinstance(value, dict):
+        return {"status": "invalid", "message": "validation.stack must be an object"}
+    role = string_field(value, "role") or "validation"
+    path = normalize_optional_validation_path(value.get("path"), field="validation.stack.path", checkout_path=checkout_path)
+    if path["status"] != "valid":
+        return path
+    if not path["path"]:
+        return {"status": "invalid", "message": "validation.stack.path is required"}
+    return {"status": "valid", "stack": {"role": role, "path": path["path"]}}
+
+
+def validation_implementation_instructions(*, commands: list[list[str]], has_pipeline_stack: bool) -> list[str]:
+    instructions = []
+    if commands:
+        instructions.append("Run validation.commands during implementation before finishing when your changes affect them.")
+    else:
+        instructions.append("No implementation-time validation commands were provided.")
+    if has_pipeline_stack:
+        instructions.append(
+            "Leave stack validation to the pipeline validate step; do not guess alternate validation stack paths."
+        )
+    return instructions
 
 
 def normalize_agent(agent: Any, *, checkout_path: Path) -> dict[str, Any]:
