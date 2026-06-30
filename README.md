@@ -343,8 +343,10 @@ validation profile, production role defaults for Pi-backed implementation,
 review, and retrospective judging, and `"publisher": {"enabled": false}`.
 Without per-role override flags, `generate-recipe` now assumes
 `--role-profile production`, which uses `pi --provider openai-codex --model
-gpt-5.4` for those roles and requires the shared auth/config mounts shown
-above. Missing mounts fail fast with actionable `agent.*`, `reviewer.*`, or
+gpt-5.4` for those roles, emits a one-hour implementation timeout by default,
+and requires the shared auth/config mounts shown above. Override that with
+`--agent-timeout-seconds` when a workstream needs a different implementation
+budget. Missing mounts fail fast with actionable `agent.*`, `reviewer.*`, or
 `retrospective_judge.*` errors instead of silently falling back to fake roles.
 
 For tests, CI fixtures, or local smoke runs that should stay offline, pass
@@ -441,7 +443,9 @@ selection.
 
 Like `generate-recipe`, `run-next` defaults to `--role-profile production`.
 That means the emitted recipe uses Pi-backed implementation, reviewer, and
-retrospective-judge roles unless you override them explicitly. Preview-only
+retrospective-judge roles unless you override them explicitly, and the
+implementation role gets the same one-hour default timeout unless you pass
+`--agent-timeout-seconds`. Preview-only
 `run-next` still emits selection status plus a production-shaped recipe even
 when the Codex/Pi mount flags are absent, which keeps `source_statuses`,
 `no-candidates`, and recipe inspection usable in unprovisioned environments.

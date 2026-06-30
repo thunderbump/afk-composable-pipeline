@@ -249,6 +249,7 @@ class GenerateRecipeCliTest(unittest.TestCase):
                     "PI_CODING_AGENT_DIR": str(pi_coding_agent_dir),
                 },
             )
+            self.assertEqual(implement_agent["timeout_seconds"], 3600)
 
             reviewer = recipe["steps"][4]["input"]["reviewer"]
             self.assertEqual(reviewer["type"], "real-reviewer-command")

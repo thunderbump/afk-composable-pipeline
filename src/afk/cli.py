@@ -39,6 +39,7 @@ from afk.registry import (
 SCHEMA_VERSION = 1
 PRODUCTION_ROLE_PROFILE = "production"
 FAKE_LOCAL_ROLE_PROFILE = "fake-local"
+PRODUCTION_IMPLEMENTATION_TIMEOUT_SECONDS = 3600
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -624,6 +625,9 @@ def recipe_agent_from_args(
 
     if args.agent_timeout_seconds is not None and args.agent_timeout_seconds <= 0:
         raise ValueError("--agent-timeout-seconds must be greater than zero")
+    timeout_seconds = args.agent_timeout_seconds
+    if timeout_seconds is None and agent_mode in {"real-local", "pi"}:
+        timeout_seconds = PRODUCTION_IMPLEMENTATION_TIMEOUT_SECONDS
 
     if agent_mode == "real-local":
         return real_local_recipe_agent(
@@ -632,7 +636,7 @@ def recipe_agent_from_args(
             config_home=args.agent_config_home,
             pi_config_home=args.agent_pi_config_home,
             checkout_path=checkout_path,
-            timeout_seconds=args.agent_timeout_seconds,
+            timeout_seconds=timeout_seconds,
         )
     if agent_mode == "pi":
         ponytail_extension = None
@@ -660,7 +664,7 @@ def recipe_agent_from_args(
             ponytail_extension=ponytail_extension,
             ponytail_extension_source=ponytail_extension_source,
             wrapper_secret_file=args.agent_wrapper_secret_file,
-            timeout_seconds=args.agent_timeout_seconds,
+            timeout_seconds=timeout_seconds,
             require_mounts=require_pi_mounts,
         )
     raise ValueError(f"Unsupported --agent-mode: {agent_mode}")

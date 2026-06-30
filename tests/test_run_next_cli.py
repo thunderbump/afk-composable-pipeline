@@ -1668,6 +1668,7 @@ else:
                     "PI_CODING_AGENT_DIR": str(pi_coding_agent_dir),
                 },
             )
+            self.assertEqual(implement["timeout_seconds"], 3600)
             self.assertNotIn("agent-secret", json.dumps(payload["recipe"]))
 
     def test_run_next_execute_uses_project_worker_validation_input_when_requested(self):
@@ -2224,6 +2225,8 @@ raise SystemExit(1)
                 str(pi_config_home),
                 "--agent-pi-coding-agent-dir",
                 str(pi_coding_agent_dir),
+                "--agent-timeout-seconds",
+                "777",
                 "--reviewer-mode",
                 "pi",
                 "--reviewer-pi-bin",
@@ -2296,6 +2299,7 @@ raise SystemExit(1)
                     "PI_CODING_AGENT_DIR": str(pi_coding_agent_dir),
                 },
             )
+            self.assertEqual(implement["timeout_seconds"], 777)
 
             review_input = payload["recipe"]["steps"][4]["input"]["reviewer"]
             self.assertEqual(review_input["type"], "real-reviewer-command")
