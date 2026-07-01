@@ -415,7 +415,7 @@ class WorkstreamStatusMappingTest(unittest.TestCase):
             "Fix tier1 [validation]: python3.13: command not found token=[REDACTED]",
         )
 
-    def test_pipeline_retrospective_record_prefers_specific_validation_follow_up_over_judge_generic(self):
+    def test_pipeline_retrospective_record_keeps_judge_follow_up_when_validation_signal_targets_work(self):
         state = retrospective_state()
         state["validations"] = [
             {
@@ -462,13 +462,10 @@ class WorkstreamStatusMappingTest(unittest.TestCase):
         )
 
         self.assertEqual(record["signals"][0]["kind"], "validation-failure")
-        self.assertEqual(record["follow_up"]["recommended"][0]["kind"], "validation-failure")
-        self.assertIn("tier1", record["follow_up"]["recommended"][0]["summary"])
-        self.assertIn("compiler", record["follow_up"]["recommended"][0]["summary"])
-        self.assertIn("SetBotID is a private member of Bot", record["follow_up"]["recommended"][0]["summary"])
-        self.assertNotIn(
-            "Review and address retrospective judge findings before treating the run as complete.",
-            [item["summary"] for item in record["follow_up"]["recommended"]],
+        self.assertEqual(record["signals"][0]["scope"], "target-work")
+        self.assertEqual(
+            [item["kind"] for item in record["follow_up"]["recommended"]],
+            ["retrospective-judge"],
         )
 
     def test_pipeline_retrospective_record_keeps_retrospective_judge_follow_up_for_generic_publication_failure(self):
@@ -604,20 +601,293 @@ class WorkstreamStatusMappingTest(unittest.TestCase):
             retrospective_tracker("implemented"),
         )
 
+        self.assertEqual(record["follow_up"]["recommended"], [])
+        self.assertEqual(record["recommended_follow_up"], [])
+        self.assertEqual(record["signals"][1]["kind"], "retry-or-blocked")
+        self.assertEqual(record["signals"][1]["scope"], "target-work")
+
+    def test_pipeline_retrospective_record_treats_repaired_target_validation_failure_as_non_process_follow_up(self):
+        state = retrospective_state()
+        state["validations"] = [
+            {
+                "output": {
+                    "status": "failed_validation",
+                    "summary": "failed_validation",
+                    "actionable_failures": [
+                        {
+                            "name": "tier1",
+                            "category": "compiler",
+                            "reason": "command exited with status 1",
+                            "log_path": "/tmp/ledger/runs/validate/validation-evidence/logs/compiler.log",
+                            "excerpt": "zone/harness/zone_harness_runtime.cpp:98:9 error: SetBotID is a private member of Bot",
+                        }
+                    ],
+                    "checkout": {"start_commit": "abc123"},
+                    "validation": {"requested_profile": "tier1"},
+                },
+                "step_result_path": "/tmp/ledger/runs/validate/step-result.json",
+                "worker_result_path": "/tmp/ledger/runs/validate/worker-result.json",
+            },
+            {
+                "output": {
+                    "status": "validated",
+                    "summary": "tests passed",
+                    "checkout": {"start_commit": "def456"},
+                    "validation": {"requested_profile": "tier1"},
+                },
+                "step_result_path": "/tmp/ledger/runs/validate-repair/step-result.json",
+                "worker_result_path": "/tmp/ledger/runs/validate-repair/worker-result.json",
+            },
+        ]
+
+        record = pipeline_retrospective_record(
+            state,
+            {"status": "validated-unpublished", "reason": "validation passed after repair"},
+            retrospective_tracker("validated"),
+        )
+
+        self.assertEqual(record["health"], "healthy")
+        self.assertEqual(record["recommended_follow_up"], [])
+        self.assertEqual(record["follow_up"]["recommended"], [])
+        self.assertEqual(record["signals"][0]["scope"], "target-work")
+
+    def test_pipeline_retrospective_record_keeps_process_retry_follow_up_when_target_validation_was_repaired(self):
+        state = retrospective_state()
+        state["validations"] = [
+            {
+                "output": {
+                    "status": "failed_validation",
+                    "summary": "failed_validation",
+                    "actionable_failures": [
+                        {
+                            "name": "tier1",
+                            "category": "compiler",
+                            "reason": "command exited with status 1",
+                            "log_path": "/tmp/ledger/runs/validate/validation-evidence/logs/compiler.log",
+                            "excerpt": "zone/harness/zone_harness_runtime.cpp:98:9 error: SetBotID is a private member of Bot",
+                        }
+                    ],
+                    "checkout": {"start_commit": "abc123"},
+                    "validation": {"requested_profile": "tier1"},
+                },
+                "step_result_path": "/tmp/ledger/runs/validate/step-result.json",
+                "worker_result_path": "/tmp/ledger/runs/validate/worker-result.json",
+            },
+            {
+                "output": {
+                    "status": "validated",
+                    "summary": "tests passed",
+                    "checkout": {"start_commit": "def456"},
+                    "validation": {"requested_profile": "tier1"},
+                },
+                "step_result_path": "/tmp/ledger/runs/validate-repair/step-result.json",
+                "worker_result_path": "/tmp/ledger/runs/validate-repair/worker-result.json",
+            },
+        ]
+
+        record = pipeline_retrospective_record(
+            state,
+            {
+                "status": "blocked",
+                "reason": "retry checkout blocked: prior retry checkout is dirty and still needs cleanup",
+            },
+            retrospective_tracker("validated"),
+        )
+
+        self.assertEqual(record["signals"][0]["scope"], "target-work")
+        self.assertEqual(record["signals"][1]["kind"], "retry-or-blocked")
+        self.assertEqual(record["signals"][1]["scope"], "pipeline-process")
         self.assertEqual(
             [item["kind"] for item in record["follow_up"]["recommended"]],
-            ["validation-failure"],
+            ["retry-or-blocked"],
+        )
+
+    def test_pipeline_retrospective_record_keeps_judge_follow_up_when_target_validation_was_repaired(self):
+        state = retrospective_state()
+        state["validations"] = [
+            {
+                "output": {
+                    "status": "failed_validation",
+                    "summary": "failed_validation",
+                    "actionable_failures": [
+                        {
+                            "name": "tier1",
+                            "category": "compiler",
+                            "reason": "command exited with status 1",
+                            "log_path": "/tmp/ledger/runs/validate/validation-evidence/logs/compiler.log",
+                            "excerpt": "zone/harness/zone_harness_runtime.cpp:98:9 error: SetBotID is a private member of Bot",
+                        }
+                    ],
+                    "checkout": {"start_commit": "abc123"},
+                    "validation": {"requested_profile": "tier1"},
+                },
+                "step_result_path": "/tmp/ledger/runs/validate/step-result.json",
+                "worker_result_path": "/tmp/ledger/runs/validate/worker-result.json",
+            },
+            {
+                "output": {
+                    "status": "validated",
+                    "summary": "tests passed",
+                    "checkout": {"start_commit": "def456"},
+                    "validation": {"requested_profile": "tier1"},
+                },
+                "step_result_path": "/tmp/ledger/runs/validate-repair/step-result.json",
+                "worker_result_path": "/tmp/ledger/runs/validate-repair/worker-result.json",
+            },
+        ]
+
+        record = pipeline_retrospective_record(
+            state,
+            {"status": "validated-unpublished", "reason": "validation passed after repair"},
+            retrospective_tracker("validated"),
+        )
+
+        record = _apply_retrospective_judge(
+            record,
+            {
+                "enabled": True,
+                "status": "warning",
+                "summary": "review judge findings",
+                "evidence": {
+                    "request_path": "retrospective-judge-request.json",
+                    "result_path": "retrospective-judge-result.json",
+                    "stdout_path": "retrospective-judge-stdout.log",
+                    "stderr_path": "retrospective-judge-stderr.log",
+                },
+            },
+            normalized=None,
+            publication={"status": "validated-unpublished", "reason": "validation passed after repair"},
+        )
+
+        self.assertEqual(record["signals"][0]["scope"], "target-work")
+        self.assertEqual(record["signals"][1]["kind"], "retrospective-judge")
+        self.assertEqual(record["signals"][1]["severity"], "warning")
+        self.assertEqual(
+            [item["kind"] for item in record["follow_up"]["recommended"]],
+            ["retrospective-judge"],
+        )
+
+    def test_pipeline_retrospective_record_surfaces_validation_extraction_bug_as_process_follow_up(self):
+        state = retrospective_state()
+        state["validations"] = [
+            {
+                "output": {
+                    "status": "failed_missing_result",
+                    "classification": "missing_worker_result",
+                    "summary": "worker result file was not produced",
+                    "actionable_failures": [
+                        {
+                            "name": "worker",
+                            "status": "failed_missing_result",
+                            "category": "missing_result",
+                            "reason": "worker result file was not produced",
+                            "log_path": "/tmp/ledger/runs/validate/stdout.log",
+                            "excerpt": "worker result file was not produced",
+                        }
+                    ],
+                    "checkout": {"start_commit": "abc123"},
+                    "validation": {"requested_profile": "tier1"},
+                },
+                "step_result_path": "/tmp/ledger/runs/validate/step-result.json",
+                "worker_result_path": "/tmp/ledger/runs/validate/worker-result.json",
+            }
+        ]
+
+        record = pipeline_retrospective_record(
+            state,
+            {"status": "blocked", "reason": "validate did not reach validated: failed_missing_result"},
+            retrospective_tracker("implemented"),
+        )
+
+        self.assertEqual(record["health"], "failing")
+        self.assertEqual(record["signals"][0]["scope"], "pipeline-process")
+        self.assertEqual(record["signals"][0]["classification"], "missing_result")
+        self.assertEqual(
+            record["signals"][0]["evidence_paths"],
+            [
+                "/tmp/ledger/runs/validate/stdout.log",
+                "/tmp/ledger/runs/validate/step-result.json",
+                "/tmp/ledger/runs/validate/worker-result.json",
+            ],
         )
         self.assertEqual(
             record["recommended_follow_up"],
             [
                 {
-                    "summary": "Fix tier1 [compiler]: actor_action_queue_repository.h:355:5: error: no viable conversion from 'int' to 'std::string'",
+                    "summary": "Fix worker [missing_result]: worker result file was not produced",
                     "labels": ["afk:follow-up", "area:validation", "project:afk-composable-pipeline"],
                 }
             ],
         )
-        self.assertEqual(record["signals"][1]["kind"], "retry-or-blocked")
+
+    def test_pipeline_retrospective_record_surfaces_auth_preflight_failure_as_process_follow_up(self):
+        state = retrospective_state()
+        state["pi_auth_preflight"] = {
+            "schema_version": 1,
+            "status": "failed",
+            "reason": "Pi auth preflight failed for retrospective_judge: gh auth login required",
+            "results": [
+                {
+                    "target": "retrospective_judge",
+                    "provider": "openai-codex",
+                    "status": "failed",
+                    "summary": "gh auth login required",
+                    "stderr_excerpt": "gh auth login required",
+                }
+            ],
+        }
+
+        record = pipeline_retrospective_record(
+            state,
+            {"status": "blocked", "reason": "Pi auth preflight failed for retrospective_judge: gh auth login required"},
+            retrospective_tracker("implemented"),
+        )
+
+        self.assertEqual(record["health"], "failing")
+        self.assertEqual(record["signals"][0]["kind"], "auth-preflight")
+        self.assertEqual(record["signals"][0]["scope"], "pipeline-process")
+        self.assertEqual(record["signals"][0]["evidence_paths"], ["pi-auth-preflight.json"])
+        self.assertEqual(
+            record["recommended_follow_up"],
+            [
+                {
+                    "summary": "Restore Pi auth preflight for retrospective_judge before rerunning the workstream.",
+                    "labels": ["afk:follow-up", "area:workstream", "project:afk-composable-pipeline"],
+                }
+            ],
+        )
+
+    def test_pipeline_retrospective_record_treats_review_feedback_budget_block_as_target_work(self):
+        state = retrospective_state()
+        state["review"] = {
+            "status": "request_revision",
+            "summary": "review requested changes",
+            "reviewer_result": {
+                "findings": [
+                    {
+                        "classification": "correctness",
+                        "summary": "Handle the empty review cycle before publishing.",
+                    }
+                ]
+            },
+        }
+
+        record = pipeline_retrospective_record(
+            state,
+            {
+                "status": "blocked",
+                "reason": (
+                    "review feedback retry budget exhausted: 1 retries attempted, max_retries=1; "
+                    "review requested changes: Handle the empty review cycle before publishing."
+                ),
+            },
+            retrospective_tracker("validated"),
+        )
+
+        self.assertEqual(record["health"], "healthy")
+        self.assertEqual(record["signals"][0]["kind"], "retry-or-blocked")
+        self.assertEqual(record["signals"][0]["scope"], "target-work")
+        self.assertEqual(record["follow_up"]["recommended"], [])
 
     def test_pipeline_retrospective_record_surfaces_blocked_reason_without_retry_keyword(self):
         record = pipeline_retrospective_record(
