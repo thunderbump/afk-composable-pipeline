@@ -320,10 +320,6 @@ class WorkstreamStatusMappingTest(unittest.TestCase):
                 {
                     "summary": "Fix tier1 [validation]: python3.13: command not found token=[REDACTED]",
                     "labels": ["afk:follow-up", "area:validation", "project:afk-composable-pipeline"],
-                },
-                {
-                    "summary": "Address the blocked publication or retry evidence before rerunning the workstream.",
-                    "labels": ["afk:follow-up", "area:workstream", "project:afk-composable-pipeline"],
                 }
             ],
         )
@@ -473,6 +469,50 @@ class WorkstreamStatusMappingTest(unittest.TestCase):
             "Review and address retrospective judge findings before treating the run as complete.",
             [item["summary"] for item in record["follow_up"]["recommended"]],
         )
+
+    def test_pipeline_retrospective_record_omits_generic_retry_follow_up_when_specific_validation_failure_exists(self):
+        state = retrospective_state()
+        state["validations"] = [
+            {
+                "output": {
+                    "status": "failed_validation",
+                    "summary": "failed_validation",
+                    "actionable_failures": [
+                        {
+                            "name": "tier1",
+                            "category": "compiler",
+                            "reason": "command exited with status 1",
+                            "log_path": "/tmp/ledger/runs/validate/validation-evidence/logs/validation.log",
+                            "excerpt": "actor_action_queue_repository.h:355:5: error: no viable conversion from 'int' to 'std::string'",
+                        }
+                    ],
+                    "checkout": {"start_commit": "abc123"},
+                    "validation": {"requested_profile": "tier1"},
+                },
+                "step_result_path": "/tmp/ledger/runs/validate/step-result.json",
+                "worker_result_path": "/tmp/ledger/runs/validate/worker-result.json",
+            }
+        ]
+        record = pipeline_retrospective_record(
+            state,
+            {"status": "blocked", "reason": "validate did not reach validated: failed_validation"},
+            retrospective_tracker("implemented"),
+        )
+
+        self.assertEqual(
+            [item["kind"] for item in record["follow_up"]["recommended"]],
+            ["validation-failure"],
+        )
+        self.assertEqual(
+            record["recommended_follow_up"],
+            [
+                {
+                    "summary": "Fix tier1 [compiler]: actor_action_queue_repository.h:355:5: error: no viable conversion from 'int' to 'std::string'",
+                    "labels": ["afk:follow-up", "area:validation", "project:afk-composable-pipeline"],
+                }
+            ],
+        )
+        self.assertEqual(record["signals"][1]["kind"], "retry-or-blocked")
 
     def test_pipeline_retrospective_record_surfaces_blocked_reason_without_retry_keyword(self):
         record = pipeline_retrospective_record(

@@ -5149,9 +5149,12 @@ def _retrospective_follow_up_record(
                     if string_field(created_item, "fingerprint"):
                         created_fingerprints.add(created_item["fingerprint"])
                     created_identities.add(_retrospective_follow_up_identity_for_item(created_item))
-    suppress_judge_follow_up = any(_signal_has_specific_failure_details(signal) for signal in signals)
+    suppress_generic_retry_follow_up = any(_signal_has_specific_failure_details(signal) for signal in signals)
+    suppress_judge_follow_up = suppress_generic_retry_follow_up
     for signal in signals:
         if suppress_judge_follow_up and string_field(signal, "kind") == "retrospective-judge":
+            continue
+        if suppress_generic_retry_follow_up and string_field(signal, "kind") == "retry-or-blocked":
             continue
         follow_up_item = _follow_up_for_signal(signal)
         if (
@@ -5358,7 +5361,12 @@ def _subprocess_output_text(value: Any) -> str:
 
 def _signal_has_specific_failure_details(signal: dict[str, Any]) -> bool:
     kind = string_field(signal, "kind") or ""
-    return kind in {"validation-failure", "missing-tool-or-config"} and bool(
+    return kind in {
+        "validation-failure",
+        "missing-tool-or-config",
+        "publisher-auth",
+        "publisher-failure",
+    } and bool(
         string_field(signal, "excerpt") and signal.get("evidence_paths")
     )
 
