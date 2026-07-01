@@ -8797,6 +8797,77 @@ Path({str(fake_calls)!r}).write_text("gh should not run\\n", encoding="utf-8")
             self.assertEqual(result["retry_attempts"], [])
             self.assertIn("validate did not reach validated", result["publication"]["reason"])
 
+    def test_workstream_validation_feedback_does_not_retry_generic_path_setup_failures(self):
+        excerpts = [
+            "bash: /tmp/missing/script.sh: No such file or directory",
+            "ninja: fatal: chdir to /tmp/build: No such file or directory",
+            'CMake Error: The source directory "/tmp/missing" does not exist.',
+        ]
+        for excerpt in excerpts:
+            with self.subTest(excerpt=excerpt):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    temp_path = Path(temp_dir)
+                    repo = temp_path / "repo-src"
+                    checkout = temp_path / "checkout"
+                    ledger = temp_path / "ledger"
+                    init_repo(repo)
+                    fake_git = temp_path / "publisher-git"
+                    fake_gh = temp_path / "publisher-gh"
+                    write_executable(fake_git, f"#!{sys.executable}\nraise SystemExit(9)\n")
+                    write_executable(fake_gh, f"#!{sys.executable}\nraise SystemExit(9)\n")
+                    worker_code = textwrap.dedent(
+                        f"""
+                        import json
+                        import os
+                        import sys
+                        from pathlib import Path
+
+                        evidence_dir = Path(os.environ["AFK_WORKER_RESULT"]).parent
+                        log_dir = evidence_dir / "logs"
+                        log_dir.mkdir(parents=True, exist_ok=True)
+                        (log_dir / "validation.log").write_text({excerpt!r} + "\\n", encoding="utf-8")
+                        Path(os.environ["AFK_WORKER_RESULT"]).write_text(
+                            json.dumps({{"status": "failed", "summary": "failed_validation"}}),
+                            encoding="utf-8",
+                        )
+                        sys.exit(1)
+                        """
+                    ).strip()
+                    recipe = successful_recipe(temp_path, repo, checkout, fake_git, fake_gh)
+                    recipe["publisher"] = {"enabled": False}
+                    recipe["retry_policy"] = {"max_retries": 1}
+                    recipe["validation_feedback"] = {"enabled": True}
+                    recipe["steps"][3]["input"]["worker"]["command"] = [sys.executable, "-c", worker_code]
+
+                    completed = run_afk(
+                        "run-workstream",
+                        "--workstream-id",
+                        "central-lve.9",
+                        "--input",
+                        json.dumps(recipe),
+                        "--ledger",
+                        str(ledger),
+                        env_overrides={
+                            "GIT_ALLOW_PROTOCOL": "file",
+                            "GIT_AUTHOR_NAME": "AFK Test",
+                            "GIT_AUTHOR_EMAIL": "afk-test@example.test",
+                            "GIT_COMMITTER_NAME": "AFK Test",
+                            "GIT_COMMITTER_EMAIL": "afk-test@example.test",
+                        },
+                    )
+
+                    self.assertEqual(completed.returncode, 0, completed.stderr)
+                    summary = json.loads(completed.stdout)
+                    result = json.loads((ledger / summary["result_path"]).read_text(encoding="utf-8"))
+
+                    self.assertEqual(summary["status"], "blocked")
+                    self.assertEqual(
+                        [step["name"] for step in result["steps"]],
+                        ["select-work", "prepare-checkout", "implement", "validate"],
+                    )
+                    self.assertEqual(result["retry_attempts"], [])
+                    self.assertIn("validate did not reach validated", result["publication"]["reason"])
+
     def test_workstream_validation_feedback_retries_compiler_missing_header_failure(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)

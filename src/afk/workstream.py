@@ -5653,13 +5653,15 @@ def _retrospective_missing_tool_or_config_summary(text: str) -> str:
 
 def _validation_feedback_text_has_infra_or_setup_failure(text: str) -> bool:
     lowered = text.lower()
-    return any(
-        marker in lowered
-        for marker in (
-            "permission denied",
-            "starting zone harness",
-        )
-    )
+    if "permission denied" in lowered and "starting zone harness" in lowered:
+        return True
+    if "fatal: chdir" in lowered and "no such file or directory" in lowered:
+        return True
+    if "bash:" in lowered and "no such file or directory" in lowered:
+        return True
+    if "source directory" in lowered and "does not exist" in lowered:
+        return True
+    return False
 
 
 def _retrospective_text_has_missing_tool_or_config(text: str) -> bool:
