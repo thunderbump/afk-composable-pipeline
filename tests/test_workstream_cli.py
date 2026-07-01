@@ -8832,6 +8832,9 @@ Path({str(fake_calls)!r}).write_text("gh should not run\\n", encoding="utf-8")
             self.assertEqual(repair_output["repair_context"]["validation"]["classification"], "compiler")
             self.assertEqual(second_validate["status"], "validated")
             self.assertEqual(review_output["status"], "passed")
+            self.assertEqual(result["outcome"]["functional"]["status"], "validated-unpublished")
+            self.assertEqual(result["outcome"]["process_retrospective"]["status"], "clear")
+            self.assertEqual(result["pipeline_retrospective"]["follow_up"]["recommended"], [])
 
     def test_workstream_validation_feedback_does_not_retry_runtime_validation_failure(self):
         with tempfile.TemporaryDirectory() as temp_dir:

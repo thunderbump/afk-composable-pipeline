@@ -163,6 +163,7 @@ def run_workstream(
         "review_selection": [],
         "review_result_path": "",
         "cleanup": {"status": "unknown", "resources": []},
+        "pi_auth_preflight": {"schema_version": SCHEMA_VERSION, "status": "skipped", "results": []},
         "blocked_reason": "",
         "stop_reason": "",
         "next_allowed_command": "",
@@ -177,6 +178,7 @@ def run_workstream(
 
     if pi_auth_preflight["status"] != "skipped":
         ledger.write_json("pi-auth-preflight.json", pi_auth_preflight)
+    state["pi_auth_preflight"] = pi_auth_preflight
     if pi_auth_preflight["status"] == "failed":
         state["blocked_reason"] = pi_auth_preflight["reason"]
     else:
@@ -203,6 +205,7 @@ def run_workstream(
                 pi_auth_preflight = summarize_pi_auth_preflight(pi_auth_preflight["results"])
                 pi_auth_preflight_status[auth_target["target"]] = auth_result["status"]
                 ledger.write_json("pi-auth-preflight.json", pi_auth_preflight)
+                state["pi_auth_preflight"] = pi_auth_preflight
                 if auth_result["status"] == "failed":
                     state["blocked_reason"] = pi_auth_preflight_failure_reason(auth_result)
                     break
@@ -323,6 +326,7 @@ def run_workstream(
             pi_auth_preflight = summarize_pi_auth_preflight(pi_auth_preflight["results"])
             pi_auth_preflight_status[retrospective_judge_target["target"]] = auth_result["status"]
             ledger.write_json("pi-auth-preflight.json", pi_auth_preflight)
+            state["pi_auth_preflight"] = pi_auth_preflight
             if auth_result["status"] == "failed":
                 retrospective_judge_skip_reason = pi_auth_preflight_failure_reason(auth_result)
                 retrospective_judge_skip_classification = "auth_preflight_failed"
@@ -381,6 +385,17 @@ def run_workstream(
         "next_allowed_command": publication.get("next_allowed_command", ""),
         "publication": publication,
         "tracker": tracker,
+        "outcome": {
+            "functional": {
+                "status": status,
+                "publication_status": publication.get("status", ""),
+                "reason": publication.get("reason", ""),
+            },
+            "process_retrospective": {
+                "status": "action-needed" if pipeline_retrospective.get("health") in {"warning", "failing"} else "clear",
+                "health": pipeline_retrospective.get("health", "healthy"),
+            },
+        },
         "pipeline_retrospective": pipeline_retrospective,
         "artifacts": workstream_artifacts(ledger),
     }
@@ -3949,15 +3964,16 @@ def pipeline_retrospective_record(
 ) -> dict[str, Any]:
     signals = (
         _validation_retrospective_signals(state)
+        + _auth_preflight_retrospective_signals(state)
         + _publication_retrospective_signals(publication)
-        + _blocked_retrospective_signals(publication)
+        + _blocked_retrospective_signals(state, publication)
         + _cleanup_retrospective_signals(state)
     )
     follow_up = _retrospective_follow_up_record(signals, normalized, publication)
     return {
         "schema_version": SCHEMA_VERSION,
         "status": workstream_status_from_publication(publication, tracker),
-        "health": _retrospective_health(signals),
+        "health": _retrospective_health(_process_retrospective_signals(signals)),
         "publication_status": redact_text(str(publication.get("status") or "")),
         "tracker_status": redact_text(str(tracker.get("status") or "")),
         "signals": signals,
@@ -4000,7 +4016,7 @@ def _apply_retrospective_judge(
     if judge_signals:
         signals.extend(judge_signals)
     record["signals"] = signals
-    record["health"] = _retrospective_health(signals)
+    record["health"] = _retrospective_health(_process_retrospective_signals(signals))
     follow_up = _retrospective_follow_up_record(signals, normalized, publication)
     record["recommended_follow_up"] = _legacy_recommended_follow_up(follow_up["recommended"])
     record["follow_up"] = follow_up
@@ -5501,7 +5517,7 @@ def _validation_retrospective_signals(state: dict[str, Any]) -> list[dict[str, A
     if not isinstance(validations, list):
         return []
     signals = []
-    for validation in validations:
+    for index, validation in enumerate(validations):
         if not isinstance(validation, dict):
             continue
         output = validation.get("output") if isinstance(validation.get("output"), dict) else {}
@@ -5513,9 +5529,24 @@ def _validation_retrospective_signals(state: dict[str, Any]) -> list[dict[str, A
                 continue
             signal = _validation_failure_retrospective_signal(validation, output, failure)
             if signal is not None:
+                if (
+                    string_field(signal, "scope") == "target-work"
+                    and _validation_failure_consumed_by_repair(validations, index)
+                ):
+                    signal["consumed_by_repair"] = True
                 signals.append(signal)
                 break
     return signals
+
+
+def _validation_failure_consumed_by_repair(validations: list[Any], index: int) -> bool:
+    for later in validations[index + 1 :]:
+        if not isinstance(later, dict):
+            continue
+        output = later.get("output") if isinstance(later.get("output"), dict) else {}
+        if output.get("status") == "validated":
+            return True
+    return False
 
 
 def _validation_failure_retrospective_signal(
@@ -5530,11 +5561,13 @@ def _validation_failure_retrospective_signal(
     kind = "missing-tool-or-config" if _retrospective_text_has_missing_tool_or_config(excerpt) else "validation-failure"
     if not log_path and kind != "missing-tool-or-config":
         return None
+    scope = _validation_failure_retrospective_scope(output, failure, kind=kind)
     validation_info = output.get("validation") if isinstance(output.get("validation"), dict) else {}
     step = string_field(failure, "name") or string_field(validation_info, "requested_profile") or "validation"
     classification = string_field(failure, "category") or kind
     return {
         "kind": kind,
+        "scope": scope,
         "severity": "error",
         "summary": redact_text(excerpt),
         "step": redact_text(step),
@@ -5546,6 +5579,41 @@ def _validation_failure_retrospective_signal(
             string_field(validation, "worker_result_path") or "",
         ),
     }
+
+
+def _validation_failure_retrospective_scope(output: dict[str, Any], failure: dict[str, Any], *, kind: str) -> str:
+    if kind == "missing-tool-or-config":
+        return "pipeline-process"
+    category = string_field(failure, "category") or string_field(output, "classification") or ""
+    if category in {"runtime", "protocol", "timeout", "missing_result", "prerequisite_skip", "worker_failure"}:
+        return "pipeline-process"
+    return "target-work"
+
+
+def _auth_preflight_retrospective_signals(state: dict[str, Any]) -> list[dict[str, Any]]:
+    preflight = state.get("pi_auth_preflight")
+    if not isinstance(preflight, dict) or preflight.get("status") != "failed":
+        return []
+    results = preflight.get("results")
+    if not isinstance(results, list):
+        return []
+    failed = next((item for item in results if isinstance(item, dict) and item.get("status") == "failed"), None)
+    if failed is None:
+        return []
+    target = string_field(failed, "target") or "pi-auth-preflight"
+    excerpt = string_field(failed, "summary") or string_field(preflight, "reason") or "Pi auth preflight failed"
+    return [
+        {
+            "kind": "auth-preflight",
+            "scope": "pipeline-process",
+            "severity": "error",
+            "summary": redact_text(excerpt),
+            "step": redact_text(target),
+            "classification": "auth-preflight",
+            "excerpt": redact_text(excerpt),
+            "evidence_paths": _retrospective_evidence_paths("pi-auth-preflight.json"),
+        }
+    ]
 
 
 def _publication_retrospective_signals(publication: dict[str, Any]) -> list[dict[str, Any]]:
@@ -5569,6 +5637,7 @@ def _publication_retrospective_signals(publication: dict[str, Any]) -> list[dict
     return [
         {
             "kind": kind,
+            "scope": "pipeline-process",
             "severity": "error",
             "summary": redact_text(excerpt),
             "step": redact_text(step),
@@ -5579,18 +5648,44 @@ def _publication_retrospective_signals(publication: dict[str, Any]) -> list[dict
     ]
 
 
-def _blocked_retrospective_signals(publication: dict[str, Any]) -> list[dict[str, Any]]:
+def _blocked_retrospective_signals(state: dict[str, Any], publication: dict[str, Any]) -> list[dict[str, Any]]:
     reason = string_field(publication, "reason") or ""
     if publication.get("status") != "blocked" or not reason:
         return []
     return [
         {
             "kind": "retry-or-blocked",
+            "scope": "target-work" if _blocked_reason_targets_work_item(state, reason) else "pipeline-process",
             "severity": "error",
             "summary": redact_text(reason),
             "evidence_paths": [],
         }
     ]
+
+
+def _blocked_reason_targets_work_item(state: dict[str, Any], reason: str) -> bool:
+    if reason.startswith("Pi auth preflight failed for "):
+        return False
+    if reason.startswith("validate did not reach validated:") or reason.startswith("required final validation evidence did not pass:"):
+        validation = latest_validation_record(state)
+        if validation is None:
+            return False
+        output = validation.get("output") if isinstance(validation.get("output"), dict) else {}
+        failure = first_validation_failure(output) or {}
+        return _validation_failure_retrospective_scope(output, failure, kind="validation-failure") == "target-work"
+    if reason.startswith("review did not reach passed: request_revision"):
+        return True
+    if reason.startswith("retry budget exhausted:"):
+        review = state.get("review") if isinstance(state.get("review"), dict) else {}
+        if string_field(review, "status") == "request_revision":
+            return True
+        validation = latest_validation_record(state)
+        if validation is None:
+            return False
+        output = validation.get("output") if isinstance(validation.get("output"), dict) else {}
+        failure = first_validation_failure(output) or {}
+        return _validation_failure_retrospective_scope(output, failure, kind="validation-failure") == "target-work"
+    return False
 
 
 def _cleanup_retrospective_signals(state: dict[str, Any]) -> list[dict[str, Any]]:
@@ -5603,6 +5698,7 @@ def _cleanup_retrospective_signals(state: dict[str, Any]) -> list[dict[str, Any]
     return [
         {
             "kind": "dirty-cleanup",
+            "scope": "pipeline-process",
             "severity": "warning",
             "summary": redact_text(f"Cleanup left resources behind: {cleanup.get('status') or 'unknown'}"),
             "evidence_paths": _retrospective_evidence_paths(
@@ -5621,6 +5717,7 @@ def _retrospective_follow_up_record(
     normalized: dict[str, Any] | None,
     publication: dict[str, Any],
 ) -> dict[str, Any]:
+    process_signals = _process_retrospective_signals(signals)
     recommended = []
     created = []
     recommended_fingerprints: set[str] = set()
@@ -5661,7 +5758,7 @@ def _retrospective_follow_up_record(
                     created_identities.add(_retrospective_follow_up_identity_for_item(created_item))
     suppress_generic_retry_follow_up = any(_signal_replaces_generic_retry_follow_up(signal) for signal in signals)
     suppress_judge_follow_up = any(_signal_replaces_judge_follow_up(signal) for signal in signals)
-    for signal in signals:
+    for signal in process_signals:
         if suppress_judge_follow_up and string_field(signal, "kind") == "retrospective-judge":
             continue
         if suppress_generic_retry_follow_up and string_field(signal, "kind") == "retry-or-blocked":
@@ -5873,7 +5970,7 @@ def _signal_replaces_generic_retry_follow_up(signal: dict[str, Any]) -> bool:
     kind = string_field(signal, "kind") or ""
     if kind in {"validation-failure", "missing-tool-or-config"}:
         return bool(string_field(signal, "excerpt") and signal.get("evidence_paths"))
-    if kind == "publisher-auth":
+    if kind in {"publisher-auth", "auth-preflight"}:
         return bool(signal.get("evidence_paths"))
     return False
 
@@ -5883,6 +5980,7 @@ def _signal_replaces_judge_follow_up(signal: dict[str, Any]) -> bool:
     return kind in {
         "validation-failure",
         "missing-tool-or-config",
+        "auth-preflight",
     } and bool(
         string_field(signal, "excerpt") and signal.get("evidence_paths")
     )
@@ -5905,6 +6003,8 @@ def _signal_targets_publication(signal: dict[str, Any]) -> bool:
 
 
 def _follow_up_for_signal(signal: dict[str, Any]) -> dict[str, Any] | None:
+    if string_field(signal, "scope") == "target-work":
+        return None
     kind = string_field(signal, "kind") or ""
     if kind == "missing-tool-or-config":
         summary = "Fix the missing tool or configuration in validation evidence before rerunning the workstream."
@@ -5930,6 +6030,12 @@ def _follow_up_for_signal(signal: dict[str, Any]) -> dict[str, Any] | None:
             kind=kind,
             summary="Repair GitHub publisher authentication evidence before rerunning terminal publication.",
             labels=["afk:follow-up", "area:publication"],
+        )
+    if kind == "auth-preflight":
+        return _retrospective_follow_up_item(
+            kind=kind,
+            summary=f"Restore Pi auth preflight for {string_field(signal, 'step') or 'the failing target'} before rerunning the workstream.",
+            labels=["afk:follow-up", "area:workstream"],
         )
     if kind == "publisher-failure":
         return _retrospective_follow_up_item(
@@ -5965,6 +6071,14 @@ def _retrospective_health(signals: list[dict[str, Any]]) -> str:
     if "warning" in severities:
         return "warning"
     return "healthy"
+
+
+def _process_retrospective_signals(signals: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        signal
+        for signal in signals
+        if isinstance(signal, dict) and string_field(signal, "scope") != "target-work"
+    ]
 
 
 def _retrospective_missing_tool_or_config_summary(text: str) -> str:
