@@ -470,6 +470,110 @@ class WorkstreamStatusMappingTest(unittest.TestCase):
             [item["summary"] for item in record["follow_up"]["recommended"]],
         )
 
+    def test_pipeline_retrospective_record_keeps_retrospective_judge_follow_up_for_generic_publication_failure(self):
+        publication = {
+            "status": "failed-needs-human",
+            "reason": "git command failed",
+            "command": ["git", "push", "origin", "HEAD"],
+            "stderr_excerpt": "fatal: unable to access https://github.example/repo.git/",
+        }
+        record = pipeline_retrospective_record(
+            retrospective_state(),
+            publication,
+            retrospective_tracker("validated"),
+        )
+
+        record = _apply_retrospective_judge(
+            record,
+            {
+                "enabled": True,
+                "status": "failed",
+                "summary": "review judge findings",
+                "evidence": {
+                    "request_path": "retrospective-judge-request.json",
+                    "result_path": "retrospective-judge-result.json",
+                    "stdout_path": "retrospective-judge-stdout.log",
+                    "stderr_path": "retrospective-judge-stderr.log",
+                },
+            },
+            normalized=None,
+            publication=publication,
+        )
+
+        self.assertEqual(
+            [item["kind"] for item in record["follow_up"]["recommended"]],
+            ["publisher-failure", "retrospective-judge"],
+        )
+
+    def test_pipeline_retrospective_record_keeps_retrospective_judge_follow_up_for_publisher_auth_failure(self):
+        publication = {
+            "status": "failed-needs-human",
+            "reason": "gh command failed",
+            "command": ["gh", "auth", "status", "--hostname", "github.com"],
+            "stderr_excerpt": "gh auth status failed token=ghp_auth_secret_1234567890",
+        }
+        record = pipeline_retrospective_record(
+            retrospective_state(),
+            publication,
+            retrospective_tracker("validated"),
+        )
+
+        record = _apply_retrospective_judge(
+            record,
+            {
+                "enabled": True,
+                "status": "failed",
+                "summary": "review judge findings",
+                "evidence": {
+                    "request_path": "retrospective-judge-request.json",
+                    "result_path": "retrospective-judge-result.json",
+                    "stdout_path": "retrospective-judge-stdout.log",
+                    "stderr_path": "retrospective-judge-stderr.log",
+                },
+            },
+            normalized=None,
+            publication=publication,
+        )
+
+        self.assertEqual(
+            [item["kind"] for item in record["follow_up"]["recommended"]],
+            ["publisher-auth", "retrospective-judge"],
+        )
+
+    def test_pipeline_retrospective_record_omits_retrospective_judge_follow_up_for_publication_missing_tool_failure(self):
+        publication = {
+            "status": "failed-needs-human",
+            "reason": "publisher.gh.auth.config_dir must be outside checkout token=ghp_publication_secret_1234567890",
+            "command": ["gh", "pr", "create"],
+        }
+        record = pipeline_retrospective_record(
+            retrospective_state(),
+            publication,
+            retrospective_tracker("validated"),
+        )
+
+        record = _apply_retrospective_judge(
+            record,
+            {
+                "enabled": True,
+                "status": "failed",
+                "summary": "review judge findings",
+                "evidence": {
+                    "request_path": "retrospective-judge-request.json",
+                    "result_path": "retrospective-judge-result.json",
+                    "stdout_path": "retrospective-judge-stdout.log",
+                    "stderr_path": "retrospective-judge-stderr.log",
+                },
+            },
+            normalized=None,
+            publication=publication,
+        )
+
+        self.assertEqual(
+            [item["kind"] for item in record["follow_up"]["recommended"]],
+            ["missing-tool-or-config"],
+        )
+
     def test_pipeline_retrospective_record_omits_generic_retry_follow_up_when_specific_validation_failure_exists(self):
         state = retrospective_state()
         state["validations"] = [
