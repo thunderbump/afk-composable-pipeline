@@ -174,6 +174,8 @@ class GenerateRecipeCliTest(unittest.TestCase):
 
             self.assertEqual(recipe["steps"][3]["profile"], "tier1")
             self.assertEqual(recipe["steps"][3]["input"]["validation"]["profile"], "tier1")
+            self.assertEqual(recipe["validation_feedback"], {"enabled": True})
+            self.assertEqual(recipe["retry_policy"], {"max_retries": 1})
             self.assertEqual(recipe["publisher"], {"enabled": False})
             reviewer = recipe["steps"][4]["input"]["reviewer"]
             self.assertEqual(reviewer["type"], "fake-reviewer-command")

@@ -280,6 +280,7 @@ def normalize_request(input_data: Any, *, project_contract: Any, run_id: str) ->
         "guardrails": guardrails["items"],
         "validation": validation["validation"],
         "agent": agent["agent"],
+        "repair_context": normalize_repair_context(input_data.get("repair_context")),
         "run_id": run_id,
     }
 
@@ -290,6 +291,12 @@ def invalid_request(message: str) -> dict[str, Any]:
         "status": "failed_invalid_payload",
         "message": message,
     }
+
+
+def normalize_repair_context(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    return redact_artifact_value(value)
 
 
 def selected_work_item(work_selection: Any, work_index: Any) -> dict[str, Any]:
@@ -889,7 +896,7 @@ def build_job_capsule(request: dict[str, Any], *, run_id: str) -> dict[str, Any]
     ]
     if commit_required:
         instructions.append("Commit successful code changes on the review branch before exiting.")
-    return {
+    capsule = {
         "schema_version": SCHEMA_VERSION,
         "run_id": run_id,
         "work_item": request["work_item"],
@@ -913,6 +920,9 @@ def build_job_capsule(request: dict[str, Any], *, run_id: str) -> dict[str, Any]
             "instructions": instructions,
         },
     }
+    if request.get("repair_context"):
+        capsule["repair_context"] = request["repair_context"]
+    return capsule
 
 
 def run_agent_command(
@@ -1322,7 +1332,7 @@ def implement_output(
     agent_result: dict[str, Any],
     metadata: dict[str, Any],
 ) -> dict[str, Any]:
-    return {
+    output = {
         "schema_version": SCHEMA_VERSION,
         "status": agent_result["status"],
         "classification": agent_result["classification"],
@@ -1335,6 +1345,9 @@ def implement_output(
         "job_capsule": capsule,
         "artifacts": {"job_capsule": "job-capsule.json", "agent_result": "agent-result.json"},
     }
+    if capsule.get("repair_context"):
+        output["repair_context"] = capsule["repair_context"]
+    return output
 
 
 def validate_checkout_provenance(checkout_path: Path, start_commit: str) -> dict[str, Any]:

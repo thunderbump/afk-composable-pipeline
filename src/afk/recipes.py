@@ -49,6 +49,8 @@ def generate_workstream_recipe(
         "workstream_id": workstream_id,
         "parent": parent_from_workstream_id(workstream_id),
         "review_branch": review_branch,
+        "validation_feedback": {"enabled": True},
+        "retry_policy": {"max_retries": 1},
         "steps": [
             {
                 "name": "select-work",

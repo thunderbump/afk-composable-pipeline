@@ -8545,6 +8545,514 @@ Path({str(fake_calls)!r}).write_text("gh should not run\\n", encoding="utf-8")
             self.assertFalse(retry_checkout.exists())
             self.assertFalse(fake_calls.exists())
 
+    def test_workstream_validation_feedback_retries_target_failure_and_continues_to_review(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repo = temp_path / "repo-src"
+            checkout = temp_path / "checkout"
+            ledger = temp_path / "ledger"
+            init_repo(repo)
+            fake_git = temp_path / "publisher-git"
+            fake_gh = temp_path / "publisher-gh"
+            write_executable(fake_git, f"#!{sys.executable}\nraise SystemExit(9)\n")
+            write_executable(fake_gh, f"#!{sys.executable}\nraise SystemExit(9)\n")
+            validate_count = temp_path / "validate-count.txt"
+            agent_code = textwrap.dedent(
+                f"""
+                import json
+                import os
+                import subprocess
+                from pathlib import Path
+
+                capsule = json.loads(Path(os.environ["AFK_JOB_CAPSULE"]).read_text(encoding="utf-8"))
+                repair = capsule.get("repair_context")
+                if repair:
+                    assert repair["attempt"] == 1
+                    assert repair["trigger"] == "validation_feedback"
+                    assert repair["validation"]["status"] == "failed_validation"
+                    assert repair["validation"]["classification"] == "compiler"
+                    assert "SetBotID is a private member of Bot" in repair["validation"]["root_excerpt"]
+                    assert any(path.endswith("compiler.log") for path in repair["validation"]["evidence_paths"])
+                    assert any(path.endswith("step-result.json") for path in repair["validation"]["evidence_paths"])
+                    assert any(path.endswith("worker-result.json") for path in repair["validation"]["evidence_paths"])
+                    assert repair["previous_implementation"]["commit"]
+                    assert "implemented.txt" in repair["previous_implementation"]["changed_files"]
+                    assert repair["acceptance_criteria"] == capsule["acceptance_criteria"]
+                    Path("repair.txt").write_text("repair\\n", encoding="utf-8")
+                    subprocess.run(["git", "add", "repair.txt"], check=True)
+                    subprocess.run(["git", "commit", "-m", "repair validation failure"], check=True)
+                else:
+                    Path("implemented.txt").write_text("initial\\n", encoding="utf-8")
+                    subprocess.run(["git", "add", "implemented.txt"], check=True)
+                    subprocess.run(["git", "commit", "-m", "initial implementation"], check=True)
+                Path("agent-result.json").write_text(
+                    json.dumps({{"status": "completed", "summary": "implementation complete"}}),
+                    encoding="utf-8",
+                )
+                """
+            ).strip()
+            worker_code = textwrap.dedent(
+                f"""
+                import json
+                import os
+                from pathlib import Path
+
+                result_path = Path(os.environ["AFK_WORKER_RESULT"])
+                evidence_dir = result_path.parent
+                count_path = Path({str(validate_count)!r})
+                prior = int(count_path.read_text(encoding="utf-8")) if count_path.exists() else 0
+                count_path.write_text(str(prior + 1), encoding="utf-8")
+                request = json.loads(Path(os.environ["AFK_WORKER_REQUEST"]).read_text(encoding="utf-8"))
+                if prior == 0:
+                    (evidence_dir / "compiler.log").write_text(
+                        "zone/harness/zone_harness_runtime.cpp:98:9 error: SetBotID is a private member of Bot\\n",
+                        encoding="utf-8",
+                    )
+                    payload = {{
+                        "profile": request["profile"],
+                        "status": "fail",
+                        "summary": "compile failed",
+                        "failures": [
+                            {{
+                                "name": "build",
+                                "status": "fail",
+                                "category": "compiler",
+                                "reason": "zone/harness/zone_harness_runtime.cpp:98:9 error: SetBotID is a private member of Bot",
+                                "command": "ninja test",
+                                "exitCode": 1,
+                                "log": "compiler.log",
+                            }}
+                        ],
+                    }}
+                else:
+                    payload = {{
+                        "profile": request["profile"],
+                        "status": "pass",
+                        "summary": "tests passed",
+                        "steps": [{{"name": "unit", "status": "pass"}}],
+                    }}
+                result_path.write_text(json.dumps(payload), encoding="utf-8")
+                """
+            ).strip()
+            recipe = successful_recipe(temp_path, repo, checkout, fake_git, fake_gh)
+            recipe["publisher"] = {"enabled": False}
+            recipe["retry_policy"] = {"max_retries": 1}
+            recipe["validation_feedback"] = {"enabled": True}
+            recipe["steps"][2]["input"]["agent"]["command"] = [sys.executable, "-c", agent_code]
+            recipe["steps"][3]["input"]["worker"]["command"] = [sys.executable, "-c", worker_code]
+
+            completed = run_afk(
+                "run-workstream",
+                "--workstream-id",
+                "central-lve.9",
+                "--input",
+                json.dumps(recipe),
+                "--ledger",
+                str(ledger),
+                env_overrides={
+                    "GIT_ALLOW_PROTOCOL": "file",
+                    "GIT_AUTHOR_NAME": "AFK Test",
+                    "GIT_AUTHOR_EMAIL": "afk-test@example.test",
+                    "GIT_COMMITTER_NAME": "AFK Test",
+                    "GIT_COMMITTER_EMAIL": "afk-test@example.test",
+                },
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            result = json.loads((ledger / summary["result_path"]).read_text(encoding="utf-8"))
+
+            self.assertEqual(summary["status"], "validated-unpublished")
+            self.assertEqual(
+                [step["name"] for step in result["steps"]],
+                [
+                    "select-work",
+                    "prepare-checkout",
+                    "implement",
+                    "validate",
+                    "prepare-checkout",
+                    "implement",
+                    "validate",
+                    "review",
+                ],
+            )
+            repair_output = json.loads((ledger / result["steps"][5]["result_path"]).read_text(encoding="utf-8"))["output"]
+            second_validate = json.loads((ledger / result["steps"][6]["result_path"]).read_text(encoding="utf-8"))["output"]
+            review_output = json.loads((ledger / result["steps"][7]["result_path"]).read_text(encoding="utf-8"))["output"]
+            self.assertEqual(repair_output["repair_context"]["attempt"], 1)
+            self.assertEqual(repair_output["repair_context"]["validation"]["classification"], "compiler")
+            self.assertEqual(second_validate["status"], "validated")
+            self.assertEqual(review_output["status"], "passed")
+
+    def test_workstream_validation_feedback_does_not_retry_runtime_validation_failure(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repo = temp_path / "repo-src"
+            checkout = temp_path / "checkout"
+            ledger = temp_path / "ledger"
+            init_repo(repo)
+            fake_git = temp_path / "publisher-git"
+            fake_gh = temp_path / "publisher-gh"
+            write_executable(fake_git, f"#!{sys.executable}\nraise SystemExit(9)\n")
+            write_executable(fake_gh, f"#!{sys.executable}\nraise SystemExit(9)\n")
+            recipe = successful_recipe(temp_path, repo, checkout, fake_git, fake_gh)
+            recipe["publisher"] = {"enabled": False}
+            recipe["retry_policy"] = {"max_retries": 1}
+            recipe["validation_feedback"] = {"enabled": True}
+            recipe["steps"][3]["input"]["worker"]["command"] = [sys.executable, "-c", "import sys; sys.exit(7)"]
+
+            completed = run_afk(
+                "run-workstream",
+                "--workstream-id",
+                "central-lve.9",
+                "--input",
+                json.dumps(recipe),
+                "--ledger",
+                str(ledger),
+                env_overrides={
+                    "GIT_ALLOW_PROTOCOL": "file",
+                    "GIT_AUTHOR_NAME": "AFK Test",
+                    "GIT_AUTHOR_EMAIL": "afk-test@example.test",
+                    "GIT_COMMITTER_NAME": "AFK Test",
+                    "GIT_COMMITTER_EMAIL": "afk-test@example.test",
+                },
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            result = json.loads((ledger / summary["result_path"]).read_text(encoding="utf-8"))
+
+            self.assertEqual(summary["status"], "blocked")
+            self.assertEqual(
+                [step["name"] for step in result["steps"]],
+                ["select-work", "prepare-checkout", "implement", "validate"],
+            )
+            self.assertEqual(result["retry_attempts"], [])
+            self.assertIn("validate did not reach validated", result["publication"]["reason"])
+
+    def test_workstream_validation_feedback_does_not_retry_worker_setup_failure(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repo = temp_path / "repo-src"
+            checkout = temp_path / "checkout"
+            ledger = temp_path / "ledger"
+            init_repo(repo)
+            fake_git = temp_path / "publisher-git"
+            fake_gh = temp_path / "publisher-gh"
+            write_executable(fake_git, f"#!{sys.executable}\nraise SystemExit(9)\n")
+            write_executable(fake_gh, f"#!{sys.executable}\nraise SystemExit(9)\n")
+            worker_code = textwrap.dedent(
+                """
+                import json
+                import os
+                import sys
+                from pathlib import Path
+
+                evidence_dir = Path(os.environ["AFK_WORKER_RESULT"]).parent
+                log_dir = evidence_dir / "logs"
+                log_dir.mkdir(parents=True, exist_ok=True)
+                (log_dir / "validation.log").write_text(
+                    "permission denied while starting zone harness\\n",
+                    encoding="utf-8",
+                )
+                Path(os.environ["AFK_WORKER_RESULT"]).write_text(
+                    json.dumps({"status": "failed", "summary": "failed_validation"}),
+                    encoding="utf-8",
+                )
+                sys.exit(1)
+                """
+            ).strip()
+            recipe = successful_recipe(temp_path, repo, checkout, fake_git, fake_gh)
+            recipe["publisher"] = {"enabled": False}
+            recipe["retry_policy"] = {"max_retries": 1}
+            recipe["validation_feedback"] = {"enabled": True}
+            recipe["steps"][3]["input"]["worker"]["command"] = [sys.executable, "-c", worker_code]
+
+            completed = run_afk(
+                "run-workstream",
+                "--workstream-id",
+                "central-lve.9",
+                "--input",
+                json.dumps(recipe),
+                "--ledger",
+                str(ledger),
+                env_overrides={
+                    "GIT_ALLOW_PROTOCOL": "file",
+                    "GIT_AUTHOR_NAME": "AFK Test",
+                    "GIT_AUTHOR_EMAIL": "afk-test@example.test",
+                    "GIT_COMMITTER_NAME": "AFK Test",
+                    "GIT_COMMITTER_EMAIL": "afk-test@example.test",
+                },
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            result = json.loads((ledger / summary["result_path"]).read_text(encoding="utf-8"))
+
+            self.assertEqual(summary["status"], "blocked")
+            self.assertEqual(
+                [step["name"] for step in result["steps"]],
+                ["select-work", "prepare-checkout", "implement", "validate"],
+            )
+            self.assertEqual(result["retry_attempts"], [])
+            self.assertIn("validate did not reach validated", result["publication"]["reason"])
+
+    def test_workstream_validation_feedback_does_not_retry_generic_path_setup_failures(self):
+        excerpts = [
+            "bash: /tmp/missing/script.sh: No such file or directory",
+            "ninja: fatal: chdir to /tmp/build: No such file or directory",
+            'CMake Error: The source directory "/tmp/missing" does not exist.',
+        ]
+        for excerpt in excerpts:
+            with self.subTest(excerpt=excerpt):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    temp_path = Path(temp_dir)
+                    repo = temp_path / "repo-src"
+                    checkout = temp_path / "checkout"
+                    ledger = temp_path / "ledger"
+                    init_repo(repo)
+                    fake_git = temp_path / "publisher-git"
+                    fake_gh = temp_path / "publisher-gh"
+                    write_executable(fake_git, f"#!{sys.executable}\nraise SystemExit(9)\n")
+                    write_executable(fake_gh, f"#!{sys.executable}\nraise SystemExit(9)\n")
+                    worker_code = textwrap.dedent(
+                        f"""
+                        import json
+                        import os
+                        import sys
+                        from pathlib import Path
+
+                        evidence_dir = Path(os.environ["AFK_WORKER_RESULT"]).parent
+                        log_dir = evidence_dir / "logs"
+                        log_dir.mkdir(parents=True, exist_ok=True)
+                        (log_dir / "validation.log").write_text({excerpt!r} + "\\n", encoding="utf-8")
+                        Path(os.environ["AFK_WORKER_RESULT"]).write_text(
+                            json.dumps({{"status": "failed", "summary": "failed_validation"}}),
+                            encoding="utf-8",
+                        )
+                        sys.exit(1)
+                        """
+                    ).strip()
+                    recipe = successful_recipe(temp_path, repo, checkout, fake_git, fake_gh)
+                    recipe["publisher"] = {"enabled": False}
+                    recipe["retry_policy"] = {"max_retries": 1}
+                    recipe["validation_feedback"] = {"enabled": True}
+                    recipe["steps"][3]["input"]["worker"]["command"] = [sys.executable, "-c", worker_code]
+
+                    completed = run_afk(
+                        "run-workstream",
+                        "--workstream-id",
+                        "central-lve.9",
+                        "--input",
+                        json.dumps(recipe),
+                        "--ledger",
+                        str(ledger),
+                        env_overrides={
+                            "GIT_ALLOW_PROTOCOL": "file",
+                            "GIT_AUTHOR_NAME": "AFK Test",
+                            "GIT_AUTHOR_EMAIL": "afk-test@example.test",
+                            "GIT_COMMITTER_NAME": "AFK Test",
+                            "GIT_COMMITTER_EMAIL": "afk-test@example.test",
+                        },
+                    )
+
+                    self.assertEqual(completed.returncode, 0, completed.stderr)
+                    summary = json.loads(completed.stdout)
+                    result = json.loads((ledger / summary["result_path"]).read_text(encoding="utf-8"))
+
+                    self.assertEqual(summary["status"], "blocked")
+                    self.assertEqual(
+                        [step["name"] for step in result["steps"]],
+                        ["select-work", "prepare-checkout", "implement", "validate"],
+                    )
+                    self.assertEqual(result["retry_attempts"], [])
+                    self.assertIn("validate did not reach validated", result["publication"]["reason"])
+
+    def test_workstream_validation_feedback_retries_compiler_missing_header_failure(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repo = temp_path / "repo-src"
+            checkout = temp_path / "checkout"
+            ledger = temp_path / "ledger"
+            init_repo(repo)
+            fake_git = temp_path / "publisher-git"
+            fake_gh = temp_path / "publisher-gh"
+            write_executable(fake_git, f"#!{sys.executable}\nraise SystemExit(9)\n")
+            write_executable(fake_gh, f"#!{sys.executable}\nraise SystemExit(9)\n")
+            validate_count = temp_path / "validate-count.txt"
+            agent_code = textwrap.dedent(
+                f"""
+                import json
+                import os
+                import subprocess
+                from pathlib import Path
+
+                capsule = json.loads(Path(os.environ["AFK_JOB_CAPSULE"]).read_text(encoding="utf-8"))
+                repair = capsule.get("repair_context")
+                if repair:
+                    assert repair["attempt"] == 1
+                    assert repair["validation"]["classification"] == "compiler"
+                    assert "missing_header.h: No such file or directory" in repair["validation"]["root_excerpt"]
+                    Path("repair.txt").write_text("repair\\n", encoding="utf-8")
+                    subprocess.run(["git", "add", "repair.txt"], check=True)
+                    subprocess.run(["git", "commit", "-m", "repair missing header"], check=True)
+                else:
+                    Path("implemented.txt").write_text("initial\\n", encoding="utf-8")
+                    subprocess.run(["git", "add", "implemented.txt"], check=True)
+                    subprocess.run(["git", "commit", "-m", "initial implementation"], check=True)
+                Path("agent-result.json").write_text(
+                    json.dumps({{"status": "completed", "summary": "implementation complete"}}),
+                    encoding="utf-8",
+                )
+                """
+            ).strip()
+            worker_code = textwrap.dedent(
+                f"""
+                import json
+                import os
+                from pathlib import Path
+
+                result_path = Path(os.environ["AFK_WORKER_RESULT"])
+                count_path = Path({str(validate_count)!r})
+                prior = int(count_path.read_text(encoding="utf-8")) if count_path.exists() else 0
+                count_path.write_text(str(prior + 1), encoding="utf-8")
+                request = json.loads(Path(os.environ["AFK_WORKER_REQUEST"]).read_text(encoding="utf-8"))
+                if prior == 0:
+                    payload = {{
+                        "profile": request["profile"],
+                        "status": "fail",
+                        "summary": "compile failed",
+                        "failures": [
+                            {{
+                                "name": "build",
+                                "status": "fail",
+                                "category": "compiler",
+                                "reason": "src/generated/foo.cpp:10: fatal error: missing_header.h: No such file or directory",
+                                "command": "ninja test",
+                                "exitCode": 1,
+                            }}
+                        ],
+                    }}
+                else:
+                    payload = {{
+                        "profile": request["profile"],
+                        "status": "pass",
+                        "summary": "tests passed",
+                        "steps": [{{"name": "unit", "status": "pass"}}],
+                    }}
+                result_path.write_text(json.dumps(payload), encoding="utf-8")
+                """
+            ).strip()
+            recipe = successful_recipe(temp_path, repo, checkout, fake_git, fake_gh)
+            recipe["publisher"] = {"enabled": False}
+            recipe["retry_policy"] = {"max_retries": 1}
+            recipe["validation_feedback"] = {"enabled": True}
+            recipe["steps"][2]["input"]["agent"]["command"] = [sys.executable, "-c", agent_code]
+            recipe["steps"][3]["input"]["worker"]["command"] = [sys.executable, "-c", worker_code]
+
+            completed = run_afk(
+                "run-workstream",
+                "--workstream-id",
+                "central-lve.9",
+                "--input",
+                json.dumps(recipe),
+                "--ledger",
+                str(ledger),
+                env_overrides={
+                    "GIT_ALLOW_PROTOCOL": "file",
+                    "GIT_AUTHOR_NAME": "AFK Test",
+                    "GIT_AUTHOR_EMAIL": "afk-test@example.test",
+                    "GIT_COMMITTER_NAME": "AFK Test",
+                    "GIT_COMMITTER_EMAIL": "afk-test@example.test",
+                },
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            result = json.loads((ledger / summary["result_path"]).read_text(encoding="utf-8"))
+
+            self.assertEqual(summary["status"], "validated-unpublished")
+            self.assertEqual(
+                [step["name"] for step in result["steps"]],
+                [
+                    "select-work",
+                    "prepare-checkout",
+                    "implement",
+                    "validate",
+                    "prepare-checkout",
+                    "implement",
+                    "validate",
+                    "review",
+                ],
+            )
+            repair_output = json.loads((ledger / result["steps"][5]["result_path"]).read_text(encoding="utf-8"))["output"]
+            self.assertIn("missing_header.h: No such file or directory", repair_output["repair_context"]["validation"]["root_excerpt"])
+
+    def test_workstream_validation_feedback_reports_exhausted_retry_budget(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repo = temp_path / "repo-src"
+            checkout = temp_path / "checkout"
+            ledger = temp_path / "ledger"
+            init_repo(repo)
+            fake_git = temp_path / "publisher-git"
+            fake_gh = temp_path / "publisher-gh"
+            write_executable(fake_git, f"#!{sys.executable}\nraise SystemExit(9)\n")
+            write_executable(fake_gh, f"#!{sys.executable}\nraise SystemExit(9)\n")
+            worker_code = textwrap.dedent(
+                """
+                import json
+                import os
+                from pathlib import Path
+
+                request = json.loads(Path(os.environ["AFK_WORKER_REQUEST"]).read_text(encoding="utf-8"))
+                Path(os.environ["AFK_WORKER_RESULT"]).write_text(
+                    json.dumps(
+                        {
+                            "profile": request["profile"],
+                            "status": "fail",
+                            "summary": "compile failed",
+                            "failures": [{"name": "build", "status": "fail", "category": "compiler", "reason": "compile failed"}],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                """
+            ).strip()
+            recipe = successful_recipe(temp_path, repo, checkout, fake_git, fake_gh)
+            recipe["publisher"] = {"enabled": False}
+            recipe["retry_policy"] = {"max_retries": 0}
+            recipe["validation_feedback"] = {"enabled": True}
+            recipe["steps"][3]["input"]["worker"]["command"] = [sys.executable, "-c", worker_code]
+
+            completed = run_afk(
+                "run-workstream",
+                "--workstream-id",
+                "central-lve.9",
+                "--input",
+                json.dumps(recipe),
+                "--ledger",
+                str(ledger),
+                env_overrides={
+                    "GIT_ALLOW_PROTOCOL": "file",
+                    "GIT_AUTHOR_NAME": "AFK Test",
+                    "GIT_AUTHOR_EMAIL": "afk-test@example.test",
+                    "GIT_COMMITTER_NAME": "AFK Test",
+                    "GIT_COMMITTER_EMAIL": "afk-test@example.test",
+                },
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            result = json.loads((ledger / summary["result_path"]).read_text(encoding="utf-8"))
+
+            self.assertEqual(summary["status"], "blocked")
+            self.assertEqual(
+                [step["name"] for step in result["steps"]],
+                ["select-work", "prepare-checkout", "implement", "validate"],
+            )
+            self.assertIn("retry budget exhausted", result["publication"]["reason"])
+
     def test_workstream_retry_reuses_implemented_review_branch_after_validation_failure(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)

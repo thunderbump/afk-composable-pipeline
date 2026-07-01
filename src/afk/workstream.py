@@ -6,6 +6,7 @@ import re
 import subprocess
 import tempfile
 import uuid
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -155,6 +156,8 @@ def run_workstream(
         "implementation_result_path": "",
         "attempted_work_aliases": [],
         "validations": [],
+        "pending_repair_context": None,
+        "repair_history": [],
         "review": None,
         "review_selection": [],
         "review_result_path": "",
@@ -176,9 +179,12 @@ def run_workstream(
     if pi_auth_preflight["status"] == "failed":
         state["blocked_reason"] = pi_auth_preflight["reason"]
     else:
-        for index, step_spec in enumerate(normalized["steps"]):
+        steps_queue = [deepcopy(step) for step in normalized["steps"]]
+        index = 0
+        while index < len(steps_queue):
+            step_spec = steps_queue[index]
             step_name = step_spec["name"]
-            remaining_steps = normalized["steps"][index + 1 :]
+            remaining_steps = steps_queue[index + 1 :]
             stop_reason = terminal_stop_reason(step_spec, state)
             if stop_reason:
                 state["stop_reason"] = stop_reason
@@ -216,10 +222,26 @@ def run_workstream(
             )
             steps.append(step_record)
             update_state_from_step(state, step_name, result, ledger_dir)
+            if step_name == "validate":
+                repair_steps, repair_blocked_reason = validation_feedback_follow_up(
+                    normalized=normalized,
+                    state=state,
+                    step_spec=step_spec,
+                    ledger_dir=ledger_dir,
+                )
+                if repair_blocked_reason:
+                    state["blocked_reason"] = repair_blocked_reason
+                    break
+                if repair_steps:
+                    state["pending_repair_context"] = build_validation_repair_context(state, repair_attempt=retry_attempt_count(state) + 1)
+                    steps_queue[index + 1 : index + 1] = repair_steps
+                    index += 1
+                    continue
             blocked_reason = blocking_reason_for_step(step_name, result, remaining_steps)
             if blocked_reason:
                 state["blocked_reason"] = blocked_reason
                 break
+            index += 1
 
     state["cleanup"] = final_cleanup_state(state)
 
@@ -391,6 +413,7 @@ def normalize_recipe(
     review_branch = string_field(recipe, "review_branch") or review_branch_for_workstream(resolved_workstream_id)
     publisher = recipe.get("publisher", {"enabled": False})
     retry_policy = normalize_retry_policy(recipe.get("retry_policy"))
+    validation_feedback = normalize_validation_feedback(recipe.get("validation_feedback"))
     tracker = normalize_tracker_config(recipe.get("tracker"))
     review_cycles = normalize_review_cycles(recipe.get("review_cycles"))
     retrospective = normalize_retrospective(recipe.get("retrospective"))
@@ -409,6 +432,7 @@ def normalize_recipe(
         "steps": normalized_steps,
         "publisher": publisher,
         "retry_policy": retry_policy,
+        "validation_feedback": validation_feedback,
         "tracker": tracker,
         "review_cycles": review_cycles,
         "retrospective": retrospective,
@@ -478,6 +502,11 @@ def composed_step_input(
             input_data["checkout"] = state["checkout"]
         else:
             input_data.pop("checkout", None)
+        repair_context = pending_repair_context(state)
+        if repair_context is not None:
+            input_data["repair_context"] = repair_context
+        else:
+            input_data.pop("repair_context", None)
         input_data["validation"] = merged_implement_validation_input(
             input_data.get("validation"),
             normalized["steps"],
@@ -955,6 +984,7 @@ def update_state_from_step(
         state["implementation"] = output
         state["implementation_selection"] = output_selected_work(output, state)
         state["implementation_result_path"] = f"runs/{result.run_id}/step-result.json"
+        state["pending_repair_context"] = None
         state["checkout"] = checkout_after_implementation(state.get("checkout"), output)
         update_checkout_attempt_after_implementation(state, output)
         if output.get("status") != "implemented":
@@ -1070,6 +1100,51 @@ def implementation_work_selection(implementation: dict[str, Any], state: dict[st
     if isinstance(work_item, dict):
         return {"schema_version": SCHEMA_VERSION, "selected_work": [dict(work_item)]}
     return {"schema_version": SCHEMA_VERSION, "selected_work": snapshot_selected_work(state)}
+
+
+def pending_repair_context(state: dict[str, Any]) -> dict[str, Any] | None:
+    repair_context = state.get("pending_repair_context")
+    return dict(repair_context) if isinstance(repair_context, dict) else None
+
+
+def build_validation_repair_context(state: dict[str, Any], *, repair_attempt: int) -> dict[str, Any] | None:
+    if repair_attempt <= 0:
+        return None
+    validation = latest_validation_record(state)
+    if validation is None:
+        return None
+    output = validation.get("output") if isinstance(validation.get("output"), dict) else {}
+    if not validation_feedback_repairable(output):
+        return None
+    implementation = state.get("implementation") if isinstance(state.get("implementation"), dict) else {}
+    git_info = implementation.get("git") if isinstance(implementation.get("git"), dict) else {}
+    work_item = implementation.get("work_item") if isinstance(implementation.get("work_item"), dict) else {}
+    failure = first_validation_failure(output) or {}
+    evidence_paths = []
+    for path in (
+        string_field(failure, "log_path") or "",
+        string_field(validation, "step_result_path") or "",
+        string_field(validation, "worker_result_path") or "",
+    ):
+        if path and path not in evidence_paths:
+            evidence_paths.append(path)
+    return {
+        "attempt": repair_attempt,
+        "trigger": "validation_feedback",
+        "validation": {
+            "status": string_field(output, "status") or "",
+            "classification": string_field(failure, "category") or string_field(output, "classification") or "",
+            "summary": string_field(output, "summary") or "",
+            "root_excerpt": string_field(failure, "excerpt") or string_field(failure, "reason") or string_field(output, "summary") or "",
+            "evidence_paths": evidence_paths,
+        },
+        "previous_implementation": {
+            "commit": string_field(git_info, "after_commit") or "",
+            "changed_files": list(git_info.get("changed_files")) if isinstance(git_info.get("changed_files"), list) else [],
+            "step_result_path": state.get("implementation_result_path") or "",
+        },
+        "acceptance_criteria": list(work_item.get("acceptance_criteria")) if isinstance(work_item.get("acceptance_criteria"), list) else [],
+    }
 
 
 def current_selected_work_selection_identity(state: dict[str, Any]) -> str:
@@ -1210,6 +1285,8 @@ def reset_cycle_state_for_new_selection(state: dict[str, Any]) -> None:
     state["implementation_selection"] = []
     state["implementation_result_path"] = ""
     state["validations"] = []
+    state["pending_repair_context"] = None
+    state["repair_history"] = []
     state["review"] = None
     state["review_selection"] = []
     state["review_result_path"] = ""
@@ -1282,6 +1359,103 @@ def blocking_reason_for_step(
 
 def validation_failure_reselects(output: dict[str, Any]) -> bool:
     return output.get("status") == "failed_validation" or output.get("classification") == "worker_failure"
+
+
+def validation_feedback_follow_up(
+    *,
+    normalized: dict[str, Any],
+    state: dict[str, Any],
+    step_spec: dict[str, Any],
+    ledger_dir: Path,
+) -> tuple[list[dict[str, Any]], str]:
+    if not normalized["validation_feedback"]["enabled"]:
+        return [], ""
+    validation = latest_validation_record(state)
+    if validation is None:
+        return [], ""
+    output = validation.get("output") if isinstance(validation.get("output"), dict) else {}
+    if not validation_feedback_repairable(output):
+        return [], ""
+    attempted_retries = retry_attempt_count(state)
+    max_retries = normalized["retry_policy"]["max_retries"]
+    if attempted_retries >= max_retries:
+        return [], (
+            "retry budget exhausted: "
+            f"{attempted_retries} retries attempted, max_retries={max_retries}"
+        )
+    repair_attempt = attempted_retries + 1
+    if repair_attempt_already_recorded(state, repair_attempt):
+        return [], ""
+    record_repair_attempt(state, repair_attempt)
+    return validation_feedback_repair_steps(normalized, step_spec), ""
+
+
+def validation_feedback_repairable(output: dict[str, Any]) -> bool:
+    if not validation_failure_reselects(output):
+        return False
+    failure = first_validation_failure(output)
+    if failure is None:
+        return True
+    category = string_field(failure, "category") or ""
+    excerpt = string_field(failure, "excerpt") or string_field(failure, "reason") or ""
+    if category in {"runtime", "protocol", "timeout", "missing_result", "prerequisite_skip"}:
+        return False
+    if _retrospective_text_has_missing_tool_or_config(excerpt):
+        return False
+    if _validation_feedback_text_has_infra_or_setup_failure(excerpt):
+        return False
+    return True
+
+
+def validation_feedback_repair_steps(
+    normalized: dict[str, Any],
+    validate_step: dict[str, Any],
+) -> list[dict[str, Any]]:
+    prepare_step = recipe_step_template(normalized["steps"], "prepare-checkout")
+    implement_step = recipe_step_template(normalized["steps"], "implement")
+    if prepare_step is None or implement_step is None:
+        return []
+    return [prepare_step, implement_step, deepcopy(validate_step)]
+
+
+def recipe_step_template(steps: list[dict[str, Any]], name: str) -> dict[str, Any] | None:
+    for step in steps:
+        if step.get("name") == name:
+            return deepcopy(step)
+    return None
+
+
+def latest_validation_record(state: dict[str, Any]) -> dict[str, Any] | None:
+    validations = state.get("validations")
+    if not isinstance(validations, list) or not validations:
+        return None
+    latest = validations[-1]
+    return latest if isinstance(latest, dict) else None
+
+
+def first_validation_failure(output: dict[str, Any]) -> dict[str, Any] | None:
+    failures = output.get("actionable_failures")
+    if not isinstance(failures, list):
+        return None
+    for failure in failures:
+        if isinstance(failure, dict):
+            return failure
+    return None
+
+
+def repair_attempt_already_recorded(state: dict[str, Any], attempt: int) -> bool:
+    history = state.get("repair_history")
+    if not isinstance(history, list):
+        return False
+    return attempt in history
+
+
+def record_repair_attempt(state: dict[str, Any], attempt: int) -> None:
+    history = state.get("repair_history")
+    values = list(history) if isinstance(history, list) else []
+    if attempt not in values:
+        values.append(attempt)
+    state["repair_history"] = values
 
 
 def validation_artifact_refs(state: dict[str, Any], ledger_dir: Path) -> list[dict[str, str]]:
@@ -2650,6 +2824,20 @@ def normalize_retry_policy(retry_policy: Any) -> dict[str, int]:
     if isinstance(max_retries, bool) or not isinstance(max_retries, int) or max_retries < 0:
         raise WorkstreamError("retry_policy.max_retries must be a non-negative integer")
     return {"max_retries": max_retries}
+
+
+def normalize_validation_feedback(validation_feedback: Any) -> dict[str, bool]:
+    if validation_feedback is None:
+        return {"enabled": False}
+    if not isinstance(validation_feedback, dict):
+        raise WorkstreamError("validation_feedback must be an object")
+    unsupported = [key for key in validation_feedback if key != "enabled"]
+    if unsupported:
+        raise WorkstreamError("validation_feedback only supports enabled")
+    enabled = validation_feedback.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise WorkstreamError("validation_feedback.enabled must be a boolean")
+    return {"enabled": enabled}
 
 
 def normalize_tracker_config(tracker: Any) -> dict[str, Any]:
@@ -5461,6 +5649,19 @@ def _retrospective_missing_tool_or_config_summary(text: str) -> str:
     if not _retrospective_text_has_missing_tool_or_config(text):
         return ""
     return redact_text(text)
+
+
+def _validation_feedback_text_has_infra_or_setup_failure(text: str) -> bool:
+    lowered = text.lower()
+    if "permission denied" in lowered and "starting zone harness" in lowered:
+        return True
+    if "fatal: chdir" in lowered and "no such file or directory" in lowered:
+        return True
+    if "bash:" in lowered and "no such file or directory" in lowered:
+        return True
+    if "source directory" in lowered and "does not exist" in lowered:
+        return True
+    return False
 
 
 def _retrospective_text_has_missing_tool_or_config(text: str) -> bool:
