@@ -498,6 +498,7 @@ else:
                 ),
             )
             self.assertEqual(retrospective_judge["timeout_seconds"], 120)
+            self.assertEqual(payload["recipe"]["review_feedback"], {"enabled": True})
 
     def test_run_next_preview_preserves_production_recipe_without_pi_auth_mounts(self):
         with tempfile.TemporaryDirectory() as temp_dir:
