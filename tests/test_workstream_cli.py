@@ -337,6 +337,31 @@ class WorkstreamCliTest(unittest.TestCase):
 
         self.assertFalse(select_work_proves_different_item(input_data, state))
 
+    def test_select_work_step_input_does_not_auto_exclude_explicit_targets(self):
+        state = {
+            "attempted_work_aliases": [
+                "central-lve.10",
+                "central-lve.12",
+                "fixture:central-lve.12",
+                "fixture:fixture:central-lve.12",
+            ]
+        }
+
+        step_input = composed_step_input(
+            {
+                "name": "select-work",
+                "input": {
+                    "target_ids": ["central-lve.12"],
+                    "exclude_ids": ["central-lve.10"],
+                },
+            },
+            {"review_branch": "afk/test"},
+            state,
+            Path("/ledger"),
+        )
+
+        self.assertEqual(step_input["exclude_ids"], ["central-lve.10"])
+
     def test_select_work_source_qualified_target_ids_can_prove_same_external_id_is_different(self):
         state = {
             "selected_work": [

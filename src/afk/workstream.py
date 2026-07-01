@@ -429,6 +429,23 @@ def composed_step_input(
     input_data = dict(step_spec["input"])
     if step_name == "select-work":
         exclude_ids = attempted_work_aliases(state)
+        target_ids = input_data.get("target_ids")
+        if exclude_ids and isinstance(target_ids, list):
+            explicit_target_suffixes: set[str] = set()
+            for item in target_ids:
+                if not isinstance(item, str):
+                    continue
+                target_id = item.strip()
+                if not target_id:
+                    continue
+                explicit_target_suffixes.add(target_id)
+                explicit_target_suffixes.add(target_id.rsplit(":", 1)[-1])
+            exclude_ids = {
+                item
+                for item in exclude_ids
+                if item not in explicit_target_suffixes
+                and not any(item.endswith(f":{suffix}") for suffix in explicit_target_suffixes)
+            }
         if exclude_ids:
             request_exclude_ids = input_data.get("exclude_ids")
             if isinstance(request_exclude_ids, list):
