@@ -497,7 +497,7 @@ def normalize_github_issue(
         "acceptance_criteria": extract_acceptance_criteria(issue.get("body")),
         "dependencies": dependencies,
         "blockers": [],
-        "afk": github_afk_metadata(labels),
+        "afk": github_afk_metadata(source, labels),
         "raw": {"github": {"repo": repo, "number": number}},
     }
 
@@ -514,8 +514,8 @@ def github_label_names(labels: list[Any]) -> list[str]:
     return names
 
 
-def github_afk_metadata(labels: list[str]) -> dict[str, Any]:
-    metadata: dict[str, Any] = {"ready": "afk:ready" in labels}
+def github_afk_metadata(source: dict[str, Any], labels: list[str]) -> dict[str, Any]:
+    metadata: dict[str, Any] = {"ready": ready_from_labels(source, labels)}
     active_run_id = label_value(labels, "afk:active-run:")
     if active_run_id:
         metadata["active_run_id"] = active_run_id
@@ -689,7 +689,7 @@ def normalize_beads_issue(
         "acceptance_criteria": extract_beads_acceptance_criteria(issue),
         "dependencies": beads_dependencies(issue.get("dependencies") or []),
         "blockers": [],
-        "afk": beads_afk_metadata(metadata, labels),
+        "afk": beads_afk_metadata(source, metadata, labels),
         "raw": {"beads": {"id": issue_id.strip()}},
     }
     description = bounded_issue_description(issue)
@@ -743,13 +743,41 @@ def beads_dependencies(dependencies: list[Any]) -> list[dict[str, str]]:
     return normalized
 
 
-def beads_afk_metadata(metadata: dict[str, Any], labels: list[str]) -> dict[str, Any]:
-    ready = metadata.get("afk.ready", metadata.get("afk_ready", "afk:ready" in labels))
+def beads_afk_metadata(source: dict[str, Any], metadata: dict[str, Any], labels: list[str]) -> dict[str, Any]:
+    ready = metadata.get("afk.ready", metadata.get("afk_ready", ready_from_labels(source, labels)))
     afk: dict[str, Any] = {"ready": metadata_bool(ready)}
     active_run_id = metadata.get("active_run_id") or metadata.get("afk_active_run_id")
     if active_run_id:
         afk["active_run_id"] = str(active_run_id)
     return afk
+
+
+def ready_from_labels(source: dict[str, Any], labels: list[str]) -> bool:
+    label_set = set(labels)
+    ready_labels = configured_ready_labels(source)
+    ready_labels.add("afk:ready")
+    return any(label in label_set for label in ready_labels)
+
+
+def configured_ready_labels(source: dict[str, Any]) -> set[str]:
+    configured: set[str] = set()
+    ready_label = source.get("ready_label")
+    if is_non_blank_string(ready_label):
+        configured.add(str(ready_label).strip())
+    ready_labels = source.get("ready_labels")
+    if isinstance(ready_labels, list):
+        for label in ready_labels:
+            if is_non_blank_string(label):
+                configured.add(str(label).strip())
+    if configured:
+        return configured
+    for label in source.get("labels") or []:
+        if not is_non_blank_string(label):
+            continue
+        normalized = str(label).strip()
+        if "ready" in normalized.lower():
+            configured.add(normalized)
+    return configured
 
 
 def open_afk_pr_skip_reason(

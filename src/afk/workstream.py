@@ -957,7 +957,7 @@ def update_state_from_step(
                 "worker_result_path": str((ledger_dir / "runs" / result.run_id / "worker-result.json").resolve(strict=False)),
             }
         )
-        if output.get("status") != "validated":
+        if validation_failure_reselects(output):
             record_attempted_selected_work(state, state.get("implementation_selection"))
         update_checkout_attempt_after_validation(state, output)
     elif step_name == "review":
@@ -1249,13 +1249,22 @@ def blocking_reason_for_step(
     }.get(step_name)
     if step_name == "implement" and status != expected and implementation_failure_allows_retry_follow_up(remaining_steps):
         return ""
-    if step_name == "validate" and status != expected and validation_failure_allows_retry_follow_up(remaining_steps):
+    if (
+        step_name == "validate"
+        and status != expected
+        and validation_failure_reselects(output)
+        and validation_failure_allows_retry_follow_up(remaining_steps)
+    ):
         return ""
     if step_name == "review" and status != expected and review_failure_allows_retry_follow_up(remaining_steps):
         return ""
     if expected and status != expected:
         return f"{step_name} did not reach {expected}: {status or 'missing status'}"
     return ""
+
+
+def validation_failure_reselects(output: dict[str, Any]) -> bool:
+    return output.get("status") == "failed_validation" or output.get("classification") == "worker_failure"
 
 
 def validation_artifact_refs(state: dict[str, Any], ledger_dir: Path) -> list[dict[str, str]]:

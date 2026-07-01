@@ -122,6 +122,7 @@ def build_selection_request(
             "id": "central-beads",
             "workspace": str(beads_workspace),
             "workspace_kind": "central",
+            "ready_label": ready_tag,
             "labels": required_labels,
             "status": "open",
             "tracker_artifact_roots": [str(tracker_root)],
@@ -134,6 +135,7 @@ def build_selection_request(
                 "type": "github_issues",
                 "id": "github",
                 "repo": github_repo,
+                "ready_label": ready_tag,
                 "labels": required_labels,
                 "query": f"label:{ready_tag} is:open",
             }
