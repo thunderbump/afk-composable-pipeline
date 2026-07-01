@@ -381,6 +381,43 @@ class WorkstreamStatusMappingTest(unittest.TestCase):
             "Fix tier1 [validation]: python3.13: command not found token=[REDACTED]",
         )
 
+    def test_pipeline_retrospective_record_skips_ignorable_validation_failure_before_missing_tool_signal(self):
+        state = retrospective_state()
+        state["validations"] = [
+            {
+                "output": {
+                    "status": "failed_validation",
+                    "summary": "failed_validation",
+                    "actionable_failures": [
+                        {
+                            "category": "validation",
+                            "reason": "command exited with status 1",
+                        },
+                        {
+                            "category": "validation",
+                            "reason": "python3.13: command not found",
+                            "excerpt": "python3.13: command not found token=ghp_validation_secret_1234567890",
+                        },
+                    ],
+                    "checkout": {"start_commit": "abc123"},
+                    "validation": {"requested_profile": "tier1"},
+                },
+                "step_result_path": "/tmp/ledger/runs/validate/step-result.json",
+                "worker_result_path": "/tmp/ledger/runs/validate/worker-result.json",
+            }
+        ]
+        record = pipeline_retrospective_record(
+            state,
+            {"status": "blocked", "reason": "required final validation evidence did not pass: tier1"},
+            retrospective_tracker("selected"),
+        )
+
+        self.assertEqual(record["signals"][0]["kind"], "missing-tool-or-config")
+        self.assertEqual(
+            record["recommended_follow_up"][0]["summary"],
+            "Fix tier1 [validation]: python3.13: command not found token=[REDACTED]",
+        )
+
     def test_pipeline_retrospective_record_prefers_specific_validation_follow_up_over_judge_generic(self):
         state = retrospective_state()
         state["validations"] = [

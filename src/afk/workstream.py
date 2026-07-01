@@ -4937,7 +4937,7 @@ def _validation_retrospective_signals(state: dict[str, Any]) -> list[dict[str, A
             signal = _validation_failure_retrospective_signal(validation, output, failure)
             if signal is not None:
                 signals.append(signal)
-            break
+                break
     return signals
 
 
