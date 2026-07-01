@@ -1646,12 +1646,12 @@ def adapter_failure_excerpt(
 def best_evidence_excerpt(evidence_dir: Path, *, summary: str) -> tuple[str, str] | None:
     candidates: list[tuple[str, str, int]] = []
     for relative_path, source_rank in (
-        ("logs/stack.log", 0),
         ("logs/validation.log", 0),
-        ("logs/submodule.log", 0),
-        ("logs/fetch.log", 0),
-        ("logs/lock.log", 0),
-        ("logs/request.log", 0),
+        ("logs/stack.log", 1),
+        ("logs/submodule.log", 1),
+        ("logs/fetch.log", 1),
+        ("logs/lock.log", 1),
+        ("logs/request.log", 1),
         ("result.json", 2),
         ("worker-output.json", 2),
     ):
@@ -1762,7 +1762,7 @@ def actionable_line_kind(line: str) -> str | None:
         "timed out" in lowered
         or "permission denied" in lowered
         or "no such file or directory" in lowered
-        or re.search(r"(^|[\s\[(])exception([\s:.)\]]|$)", lowered)
+        or re.search(r"(^|[\s\[(])(?:[a-z_][a-z0-9_:]*exception)([\s:.)\]]|$)", lowered)
     ):
         return "generic"
     if " failed" in lowered or lowered.startswith("failed "):
