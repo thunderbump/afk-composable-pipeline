@@ -16,6 +16,7 @@ from afk.registry import StepResult  # noqa: E402
 from afk.implement import normalize_validation as normalize_implement_validation  # noqa: E402
 from afk.workstream import (  # noqa: E402
     WorkstreamLedger,
+    _retrospective_follow_up_bead_description,
     _retrospective_follow_up_bead_labels,
     _retrospective_follow_up_fingerprint,
     composed_step_input,
@@ -4068,6 +4069,47 @@ raise SystemExit(9)
             _retrospective_follow_up_fingerprint("retrospective-judge", summary, labels),
             _retrospective_follow_up_fingerprint("publisher-failure", summary, labels),
         )
+
+    def test_retrospective_follow_up_bead_description_includes_specific_failure_details(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            ledger = WorkstreamLedger(temp_path, "test-run")
+            ledger.prepare()
+            description = _retrospective_follow_up_bead_description(
+                normalized={
+                    "workstream_id": "central-ymjv",
+                    "parent": "central",
+                },
+                pipeline_retrospective={
+                    "signals": [
+                        {
+                            "kind": "validation-failure",
+                            "severity": "error",
+                            "step": "tier1",
+                            "classification": "compiler",
+                            "excerpt": "zone/harness/zone_harness_runtime.cpp:98:9 error: SetBotID is a private member of Bot",
+                            "evidence_paths": [
+                                "validation-evidence/logs/validation.log",
+                                "step-result.json",
+                                "worker-result.json",
+                            ],
+                        }
+                    ]
+                },
+                recommendation={
+                    "kind": "validation-failure",
+                    "summary": "Fix tier1 [compiler]: zone/harness/zone_harness_runtime.cpp:98:9 error: SetBotID is a private member of Bot",
+                    "fingerprint": "retro-follow-up:test",
+                },
+                ledger=ledger,
+                request_path=ledger.path / "retrospective-follow-up-request.json",
+                result_path=ledger.path / "retrospective-follow-up-result.json",
+            )
+
+            self.assertIn("Step: tier1", description)
+            self.assertIn("Classification: compiler", description)
+            self.assertIn("SetBotID is a private member of Bot", description)
+            self.assertIn("validation-evidence/logs/validation.log", description)
 
     def test_workstream_terminal_no_merge_decision_closes_tracker_without_republishing(self):
         with tempfile.TemporaryDirectory() as temp_dir:
