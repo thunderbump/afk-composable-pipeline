@@ -19,7 +19,7 @@ from afk.recipes import (
     real_local_recipe_agent,
     write_recipe,
 )
-from afk.run_next import run_next
+from afk.run_next import run_next, validate_beads_workspace
 from afk.pi_workers import (
     PONYTAIL_EXTENSION_SOURCE,
     build_pi_mount_config,
@@ -234,9 +234,15 @@ def main(argv: list[str] | None = None) -> int:
                 checkout_path=Path(args.checkout_path),
                 require_pi_mounts=args.execute,
             )
+            beads_workspace = (
+                validate_beads_workspace(Path(args.beads_workspace))
+                if args.retrospective_follow_up_mode == "beads"
+                else Path(args.beads_workspace)
+            )
             retrospective_follow_up = recipe_retrospective_follow_up_from_args(
                 args,
                 project_contract=project_contract,
+                beads_workspace=beads_workspace,
             )
             recipe_publisher_factory = recipe_publisher_factory_from_args(
                 args,
@@ -820,6 +826,7 @@ def recipe_retrospective_follow_up_from_args(
     args: argparse.Namespace,
     *,
     project_contract: ProjectContract,
+    beads_workspace: Path,
 ) -> dict[str, Any] | None:
     if args.retrospective_follow_up_mode == "disabled":
         return None
@@ -832,7 +839,7 @@ def recipe_retrospective_follow_up_from_args(
     return {
         "enabled": True,
         "creator": "beads",
-        "beads_workspace": str(Path(args.beads_workspace)),
+        "beads_workspace": str(beads_workspace),
         "labels": labels,
     }
 
