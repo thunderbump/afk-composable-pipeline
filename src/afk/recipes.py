@@ -50,6 +50,7 @@ def generate_workstream_recipe(
         "parent": parent_from_workstream_id(workstream_id),
         "review_branch": review_branch,
         "validation_feedback": {"enabled": True},
+        "review_feedback": {"enabled": False},
         "retry_policy": {"max_retries": 1},
         "steps": [
             {

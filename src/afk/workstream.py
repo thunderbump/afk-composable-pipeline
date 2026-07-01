@@ -158,6 +158,7 @@ def run_workstream(
         "validations": [],
         "pending_repair_context": None,
         "repair_history": [],
+        "runtime_review_cycles": [],
         "review": None,
         "review_selection": [],
         "review_result_path": "",
@@ -234,6 +235,24 @@ def run_workstream(
                     break
                 if repair_steps:
                     state["pending_repair_context"] = build_validation_repair_context(state, repair_attempt=retry_attempt_count(state) + 1)
+                    steps_queue[index + 1 : index + 1] = repair_steps
+                    index += 1
+                    continue
+            if step_name == "review":
+                repair_steps, repair_blocked_reason = review_feedback_follow_up(
+                    normalized=normalized,
+                    state=state,
+                    step_spec=step_spec,
+                )
+                if repair_blocked_reason:
+                    state["blocked_reason"] = repair_blocked_reason
+                    break
+                if repair_steps:
+                    state["pending_repair_context"] = build_review_repair_context(
+                        state,
+                        step_spec=step_spec,
+                        repair_attempt=retry_attempt_count(state) + 1,
+                    )
                     steps_queue[index + 1 : index + 1] = repair_steps
                     index += 1
                     continue
@@ -350,7 +369,7 @@ def run_workstream(
         "parent": normalized["parent"],
         "review_branch": normalized["review_branch"],
         "status": status,
-        "review_cycles": redact_review_cycles(normalized["review_cycles"]),
+        "review_cycles": redact_review_cycles(effective_review_cycles(normalized, state)),
         "retrospective": redact_retrospective(terminal_retrospective),
         "steps": steps,
         "selected_work": selected_work,
@@ -414,6 +433,7 @@ def normalize_recipe(
     publisher = recipe.get("publisher", {"enabled": False})
     retry_policy = normalize_retry_policy(recipe.get("retry_policy"))
     validation_feedback = normalize_validation_feedback(recipe.get("validation_feedback"))
+    review_feedback = normalize_review_feedback(recipe.get("review_feedback"))
     tracker = normalize_tracker_config(recipe.get("tracker"))
     review_cycles = normalize_review_cycles(recipe.get("review_cycles"))
     retrospective = normalize_retrospective(recipe.get("retrospective"))
@@ -433,6 +453,7 @@ def normalize_recipe(
         "publisher": publisher,
         "retry_policy": retry_policy,
         "validation_feedback": validation_feedback,
+        "review_feedback": review_feedback,
         "tracker": tracker,
         "review_cycles": review_cycles,
         "retrospective": retrospective,
@@ -1287,6 +1308,7 @@ def reset_cycle_state_for_new_selection(state: dict[str, Any]) -> None:
     state["validations"] = []
     state["pending_repair_context"] = None
     state["repair_history"] = []
+    state["runtime_review_cycles"] = []
     state["review"] = None
     state["review_selection"] = []
     state["review_result_path"] = ""
@@ -1456,6 +1478,277 @@ def record_repair_attempt(state: dict[str, Any], attempt: int) -> None:
     if attempt not in values:
         values.append(attempt)
     state["repair_history"] = values
+
+
+def review_feedback_follow_up(
+    *,
+    normalized: dict[str, Any],
+    state: dict[str, Any],
+    step_spec: dict[str, Any],
+) -> tuple[list[dict[str, Any]], str]:
+    if not normalized["review_feedback"]["enabled"]:
+        return [], ""
+    review = state.get("review") if isinstance(state.get("review"), dict) else {}
+    review_status = string_field(review, "status") or ""
+    if review_status == "passed":
+        finalize_latest_runtime_review_cycle(state)
+        append_runtime_review_cycle(state, build_runtime_review_cycle(state, step_spec=step_spec))
+        return [], ""
+    if review_status != "request_revision":
+        return [], ""
+
+    append_runtime_review_cycle(state, build_runtime_review_cycle(state, step_spec=step_spec))
+    repairable_findings = review_feedback_repairable_findings(review)
+    if not repairable_findings:
+        return [], review_feedback_blocked_reason(review)
+    attempted_retries = retry_attempt_count(state)
+    max_retries = normalized["retry_policy"]["max_retries"]
+    if attempted_retries >= max_retries:
+        return [], (
+            "review feedback retry budget exhausted: "
+            f"{attempted_retries} retries attempted, max_retries={max_retries}; "
+            f"{review_feedback_blocked_reason(review)}"
+        )
+    repair_attempt = attempted_retries + 1
+    if repair_attempt_already_recorded(state, repair_attempt):
+        return [], ""
+    record_repair_attempt(state, repair_attempt)
+    return review_feedback_repair_steps(normalized, step_spec), ""
+
+
+def review_feedback_repair_steps(
+    normalized: dict[str, Any],
+    review_step: dict[str, Any],
+) -> list[dict[str, Any]]:
+    prepare_step = recipe_step_template(normalized["steps"], "prepare-checkout")
+    implement_step = recipe_step_template(normalized["steps"], "implement")
+    validate_step = recipe_step_template(normalized["steps"], "validate")
+    if prepare_step is None or implement_step is None or validate_step is None:
+        return []
+    return [prepare_step, implement_step, validate_step, deepcopy(review_step)]
+
+
+def build_review_repair_context(
+    state: dict[str, Any],
+    *,
+    step_spec: dict[str, Any],
+    repair_attempt: int,
+) -> dict[str, Any] | None:
+    if repair_attempt <= 0:
+        return None
+    review = state.get("review") if isinstance(state.get("review"), dict) else {}
+    if string_field(review, "status") != "request_revision":
+        return None
+    repairable_findings = review_feedback_repairable_findings(review)
+    if not repairable_findings:
+        return None
+    implementation = state.get("implementation") if isinstance(state.get("implementation"), dict) else {}
+    git_info = implementation.get("git") if isinstance(implementation.get("git"), dict) else {}
+    work_item = implementation.get("work_item") if isinstance(implementation.get("work_item"), dict) else {}
+    validation = latest_validation_record(state)
+    validation_output = validation.get("output") if isinstance(validation, dict) and isinstance(validation.get("output"), dict) else {}
+    validation_paths = []
+    for path in (
+        string_field(validation, "step_result_path") or "",
+        string_field(validation, "worker_result_path") or "",
+    ):
+        if path and path not in validation_paths:
+            validation_paths.append(path)
+    return {
+        "attempt": repair_attempt,
+        "trigger": "review_feedback",
+        "review": {
+            "role": review_feedback_role(step_spec, review),
+            "status": string_field(review, "status") or "",
+            "summary": string_field(review, "summary") or "",
+            "findings": repairable_findings,
+        },
+        "current_implementation": {
+            "summary": string_field(implementation, "summary") or "",
+            "commit": string_field(git_info, "after_commit") or "",
+            "changed_files": list(git_info.get("changed_files")) if isinstance(git_info.get("changed_files"), list) else [],
+            "step_result_path": state.get("implementation_result_path") or "",
+        },
+        "validation": {
+            "status": string_field(validation_output, "status") or "",
+            "classification": string_field(validation_output, "classification") or "",
+            "summary": string_field(validation_output, "summary") or "",
+            "evidence_paths": validation_paths,
+        },
+        "acceptance_criteria": list(work_item.get("acceptance_criteria")) if isinstance(work_item.get("acceptance_criteria"), list) else [],
+    }
+
+
+def build_runtime_review_cycle(state: dict[str, Any], *, step_spec: dict[str, Any]) -> dict[str, Any]:
+    review = state.get("review") if isinstance(state.get("review"), dict) else {}
+    cycle_status = runtime_review_cycle_status(string_field(review, "status") or "")
+    review_record: dict[str, Any] = {
+        "role": review_feedback_role(step_spec, review),
+        "status": cycle_status,
+        "summary": string_field(review, "summary") or cycle_status,
+        "requires_response": cycle_status == "request-changes",
+    }
+    pipeline_follow_up = review_feedback_pipeline_follow_up(review)
+    if pipeline_follow_up:
+        review_record["pipeline_follow_up"] = pipeline_follow_up
+    runtime_cycles = state.get("runtime_review_cycles")
+    cycle_number = len(runtime_cycles) + 1 if isinstance(runtime_cycles, list) else 1
+    return {"cycle": cycle_number, "status": cycle_status, "reviews": [review_record]}
+
+
+def append_runtime_review_cycle(state: dict[str, Any], cycle: dict[str, Any]) -> None:
+    runtime_cycles = state.get("runtime_review_cycles")
+    cycles = list(runtime_cycles) if isinstance(runtime_cycles, list) else []
+    cycles.append(cycle)
+    state["runtime_review_cycles"] = cycles
+
+
+def finalize_latest_runtime_review_cycle(state: dict[str, Any]) -> None:
+    runtime_cycles = state.get("runtime_review_cycles")
+    if not isinstance(runtime_cycles, list) or not runtime_cycles:
+        return
+    latest_cycle = runtime_cycles[-1]
+    if not isinstance(latest_cycle, dict):
+        return
+    reviews = latest_cycle.get("reviews")
+    if not isinstance(reviews, list) or not reviews:
+        return
+    latest_review = reviews[-1]
+    if not isinstance(latest_review, dict) or latest_review.get("response"):
+        return
+    if string_field(latest_review, "status") != "request-changes":
+        return
+    validation = latest_validation_record(state)
+    validation_output = validation.get("output") if isinstance(validation, dict) and isinstance(validation.get("output"), dict) else {}
+    implementation = state.get("implementation") if isinstance(state.get("implementation"), dict) else {}
+    git_info = implementation.get("git") if isinstance(implementation.get("git"), dict) else {}
+    response: dict[str, Any] = {
+        "status": "addressed",
+        "summary": string_field(implementation, "summary") or "Addressed in follow-up implementation.",
+        "implementation_commit": string_field(git_info, "after_commit") or "",
+        "implementation_step_result_path": state.get("implementation_result_path") or "",
+        "validation_status": string_field(validation_output, "status") or "",
+        "validation_summary": string_field(validation_output, "summary") or "",
+        "validation_step_result_path": string_field(validation, "step_result_path") or "",
+        "validation_worker_result_path": string_field(validation, "worker_result_path") or "",
+        "follow_up_review_status": string_field(state.get("review") if isinstance(state.get("review"), dict) else {}, "status") or "",
+        "follow_up_review_summary": string_field(state.get("review") if isinstance(state.get("review"), dict) else {}, "summary") or "",
+        "follow_up_review_result_path": state.get("review_result_path") or "",
+    }
+    pipeline_follow_up = latest_review.get("pipeline_follow_up")
+    if isinstance(pipeline_follow_up, list) and pipeline_follow_up:
+        response["pipeline_follow_up"] = pipeline_follow_up
+    latest_review["response"] = response
+    latest_cycle["status"] = "findings-addressed"
+
+
+def runtime_review_cycle_status(review_status: str) -> str:
+    if review_status == "request_revision":
+        return "request-changes"
+    if review_status == "passed":
+        return "passed"
+    return "findings-open"
+
+
+def review_feedback_role(step_spec: dict[str, Any], review: dict[str, Any]) -> str:
+    input_data = step_spec.get("input") if isinstance(step_spec.get("input"), dict) else {}
+    return string_field(input_data, "role") or string_field(review, "role") or "reviewer"
+
+
+def review_feedback_repairable_findings(review: dict[str, Any]) -> list[dict[str, Any]]:
+    reviewer_result = review.get("reviewer_result") if isinstance(review.get("reviewer_result"), dict) else {}
+    findings = reviewer_result.get("findings")
+    if not isinstance(findings, list):
+        return []
+    repairable = []
+    for finding in findings:
+        if not isinstance(finding, dict) or review_finding_is_pipeline_failure(finding):
+            continue
+        repairable.append(
+            {
+                "severity": review_finding_severity(finding),
+                "file": review_finding_file(finding),
+                "line": review_finding_line(finding),
+                "required_fix": review_finding_required_fix(finding),
+                "summary": string_field(finding, "summary") or string_field(finding, "title") or "",
+            }
+        )
+    return repairable
+
+
+def review_feedback_pipeline_follow_up(review: dict[str, Any]) -> list[dict[str, Any]]:
+    reviewer_result = review.get("reviewer_result") if isinstance(review.get("reviewer_result"), dict) else {}
+    findings = reviewer_result.get("findings")
+    if not isinstance(findings, list):
+        return []
+    follow_up = []
+    for finding in findings:
+        if not isinstance(finding, dict) or not review_finding_is_pipeline_failure(finding):
+            continue
+        follow_up.append(
+            {
+                "classification": string_field(finding, "classification") or string_field(finding, "category") or "pipeline_failure",
+                "severity": review_finding_severity(finding),
+                "summary": string_field(finding, "summary") or string_field(finding, "title") or "",
+            }
+        )
+    return follow_up
+
+
+def review_feedback_blocked_reason(review: dict[str, Any]) -> str:
+    repairable = review_feedback_repairable_findings(review)
+    if repairable:
+        required_fix = string_field(repairable[0], "required_fix") or string_field(repairable[0], "summary") or "review finding"
+        return f"review requested changes: {required_fix}"
+    pipeline_follow_up = review_feedback_pipeline_follow_up(review)
+    if pipeline_follow_up:
+        return f"review requested pipeline follow-up: {string_field(pipeline_follow_up[0], 'summary') or 'pipeline issue'}"
+    return string_field(review, "summary") or "review requested changes"
+
+
+def review_finding_is_pipeline_failure(finding: dict[str, Any]) -> bool:
+    classification = (string_field(finding, "classification") or string_field(finding, "category") or "").lower()
+    return classification in {
+        "pipeline_failure",
+        "tool_failure",
+        "validation_evidence_incomplete",
+        "runtime_failure",
+        "protocol_failure",
+    }
+
+
+def review_finding_severity(finding: dict[str, Any]) -> str:
+    severity = string_field(finding, "severity")
+    if severity:
+        return severity
+    status = string_field(finding, "status") or ""
+    return "high" if status in {"request_revision", "fail", "failed"} else "medium"
+
+
+def review_finding_file(finding: dict[str, Any]) -> str:
+    return (
+        string_field(finding, "file")
+        or string_field(finding, "path")
+        or string_field(finding, "filename")
+        or ""
+    )
+
+
+def review_finding_line(finding: dict[str, Any]) -> int | None:
+    value = finding.get("line")
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return None
+    return value
+
+
+def review_finding_required_fix(finding: dict[str, Any]) -> str:
+    return (
+        string_field(finding, "required_fix")
+        or string_field(finding, "summary")
+        or string_field(finding, "details")
+        or string_field(finding, "title")
+        or "Address the review finding."
+    )
 
 
 def validation_artifact_refs(state: dict[str, Any], ledger_dir: Path) -> list[dict[str, str]]:
@@ -2840,6 +3133,20 @@ def normalize_validation_feedback(validation_feedback: Any) -> dict[str, bool]:
     return {"enabled": enabled}
 
 
+def normalize_review_feedback(review_feedback: Any) -> dict[str, bool]:
+    if review_feedback is None:
+        return {"enabled": False}
+    if not isinstance(review_feedback, dict):
+        raise WorkstreamError("review_feedback must be an object")
+    unsupported = [key for key in review_feedback if key != "enabled"]
+    if unsupported:
+        raise WorkstreamError("review_feedback only supports enabled")
+    enabled = review_feedback.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise WorkstreamError("review_feedback.enabled must be a boolean")
+    return {"enabled": enabled}
+
+
 def normalize_tracker_config(tracker: Any) -> dict[str, Any]:
     if tracker is None:
         return {"terminal_decision": empty_terminal_decision()}
@@ -3325,6 +3632,15 @@ def tracker_terminal_decision_present(normalized: dict[str, Any]) -> bool:
     return bool(isinstance(decision, dict) and decision.get("status"))
 
 
+def effective_review_cycles(normalized: dict[str, Any], state: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    configured = normalized.get("review_cycles")
+    runtime = state.get("runtime_review_cycles") if isinstance(state, dict) else []
+    cycles = list(configured) if isinstance(configured, list) else []
+    if isinstance(runtime, list):
+        cycles.extend(cycle for cycle in runtime if isinstance(cycle, dict))
+    return cycles
+
+
 def review_cycles_recorded(review_cycles: Any) -> bool:
     return isinstance(review_cycles, list) and bool(review_cycles)
 
@@ -3452,8 +3768,9 @@ def tracker_record(
     decision = effective_tracker_terminal_decision(normalized, publication)
     decision_pr_url = redact_text(decision.get("pr_url") or "")
     decision_review_feedback_status = terminal_review_feedback_status(decision)
-    review_cycle_evidence_recorded = review_cycles_recorded(normalized.get("review_cycles"))
-    review_feedback_requires_response = review_cycles_require_response(normalized.get("review_cycles"))
+    review_cycles = effective_review_cycles(normalized, state)
+    review_cycle_evidence_recorded = review_cycles_recorded(review_cycles)
+    review_feedback_requires_response = review_cycles_require_response(review_cycles)
     review = state.get("review") if isinstance(state.get("review"), dict) else {}
     record = {
         "schema_version": SCHEMA_VERSION,
@@ -3467,7 +3784,7 @@ def tracker_record(
         "review_status": string_field(review, "status") or "",
         "review_summary": string_field(review, "summary") or "",
         "review_findings": tracker_review_findings(review),
-        "review_cycles": redact_review_cycles(normalized.get("review_cycles") or []),
+        "review_cycles": redact_review_cycles(review_cycles),
         "retrospective": redact_retrospective(effective_retrospective(normalized, publication)),
         "terminal_decision": redact_artifact_value(decision),
     }
@@ -3513,7 +3830,7 @@ def tracker_record(
         blocked_reason = redact_text(str(decision.get("reason") or publication.get("reason") or ""))
         if review_feedback_requires_response:
             record["status"] = "review-findings-open"
-        elif normalized.get("review_cycles"):
+        elif review_cycles:
             record["status"] = "review-feedback-addressed"
         if blocked_reason:
             record["comment"] = (
@@ -3564,7 +3881,7 @@ def tracker_record(
         if publication.get("status") == "published":
             record["pr_url"] = redact_text(str(publication.get("url") or ""))
         return record
-    if normalized.get("review_cycles"):
+    if review_cycles:
         record["status"] = "review-feedback-addressed"
         record["comment"] = (
             "PR review cycle evidence is present and all response-required findings are addressed; keep the source "
