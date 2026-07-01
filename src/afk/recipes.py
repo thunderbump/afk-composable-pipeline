@@ -30,6 +30,7 @@ def generate_workstream_recipe(
     sources: list[dict[str, Any]] | None = None,
     required_labels: list[str] | None = None,
     required_metadata: list[str] | None = None,
+    enable_review_feedback: bool = False,
 ) -> dict[str, Any]:
     if url_has_secret_material(project_contract.repo_url):
         raise ValueError("project contract repo_url must not contain embedded credentials or query parameters")
@@ -50,7 +51,7 @@ def generate_workstream_recipe(
         "parent": parent_from_workstream_id(workstream_id),
         "review_branch": review_branch,
         "validation_feedback": {"enabled": True},
-        "review_feedback": {"enabled": False},
+        "review_feedback": {"enabled": enable_review_feedback},
         "retry_policy": {"max_retries": 1},
         "steps": [
             {

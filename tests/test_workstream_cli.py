@@ -12,6 +12,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+from afk.contracts import ProjectContract, ProjectContractIdentity  # noqa: E402
+from afk.recipes import generate_workstream_recipe  # noqa: E402
 from afk.registry import StepResult  # noqa: E402
 from afk.implement import normalize_validation as normalize_implement_validation  # noqa: E402
 from afk.workstream import (  # noqa: E402
@@ -9419,10 +9421,31 @@ Path({str(fake_calls)!r}).write_text("gh should not run\\n", encoding="utf-8")
                 Path(os.environ["AFK_REVIEWER_RESULT"]).write_text(json.dumps(payload), encoding="utf-8")
                 """
             ).strip()
-            recipe = successful_recipe(temp_path, repo, checkout, fake_git, fake_gh)
+            project_contract = ProjectContract(
+                project_slug="test-project",
+                repo_url=str(repo),
+                base_branch="main",
+                beads_labels=("project:test-project",),
+                validation_profiles=("tier1",),
+                validation_profile_requests={"tier1": {"profile": "tier1"}},
+                artifact_retention={"ledger_days": 30, "log_days": 30},
+                pr_target={"remote": "origin", "branch": "main"},
+                identity=ProjectContractIdentity(path="test-project.json", sha256="deadbeef"),
+            )
+            recipe = generate_workstream_recipe(
+                workstream_id="central-lve.9",
+                project_contract=project_contract,
+                beads_workspace=temp_path,
+                checkout_root=temp_path,
+                checkout_path=checkout,
+                validation_profile="tier1",
+                sources=[{"type": "fixture", "id": "fixture", "items": [selected_fixture_item()]}],
+                required_labels=["afk:ready"],
+                enable_review_feedback=True,
+            )
+            recipe["steps"][0]["input"]["required_metadata"] = []
             recipe["publisher"] = {"enabled": False}
             recipe["retry_policy"] = {"max_retries": 1}
-            recipe["review_feedback"] = {"enabled": True}
             recipe["steps"][2]["input"]["agent"]["command"] = [sys.executable, "-c", agent_code]
             recipe["steps"][3]["input"]["worker"]["command"] = [sys.executable, "-c", worker_code]
             recipe["steps"][4]["input"]["role"] = "correctness"
@@ -9449,6 +9472,7 @@ Path({str(fake_calls)!r}).write_text("gh should not run\\n", encoding="utf-8")
             summary = json.loads(completed.stdout)
             result = json.loads((ledger / summary["result_path"]).read_text(encoding="utf-8"))
 
+            self.assertEqual(recipe["review_feedback"], {"enabled": True})
             self.assertEqual(summary["status"], "validated-unpublished")
             self.assertEqual(
                 [step["name"] for step in result["steps"]],

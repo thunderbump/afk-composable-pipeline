@@ -498,6 +498,7 @@ else:
                 ),
             )
             self.assertEqual(retrospective_judge["timeout_seconds"], 120)
+            self.assertEqual(payload["recipe"]["review_feedback"], {"enabled": True})
 
     def test_run_next_preview_preserves_production_recipe_without_pi_auth_mounts(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -721,6 +722,7 @@ else:
             self.assertEqual(payload["recipe"]["steps"][2]["input"]["agent"]["type"], "fake-pi-command")
             self.assertEqual(payload["recipe"]["steps"][4]["input"]["reviewer"]["type"], "fake-reviewer-command")
             self.assertNotIn("retrospective_judge", payload["recipe"])
+            self.assertEqual(payload["recipe"]["review_feedback"], {"enabled": False})
             implement = next(step for step in payload["recipe"]["steps"] if step["name"] == "implement")
             validate = next(step for step in payload["recipe"]["steps"] if step["name"] == "validate")
             self.assertEqual(implement["input"]["validation"]["profile"], "tier1")
@@ -1004,6 +1006,7 @@ else:
         self.assertEqual(runner_ledger_dir, ledger_dir)
         self.assertEqual(runner_contract, contract)
         self.assertEqual(implement_agent["type"], "real-agent-command")
+        self.assertEqual(runner_payload["review_feedback"], {"enabled": False})
         self.assertEqual(
             implement_agent["command"],
             [
@@ -1022,6 +1025,139 @@ else:
         self.assertNotIn(agent_secret, json.dumps(runner_payload))
         self.assertNotIn(agent_secret, json.dumps(payload["recipe"]))
         self.assertNotIn(agent_secret, json.dumps(payload["workstream_result"]))
+
+    def test_run_next_direct_calls_leave_review_feedback_disabled_by_default(self):
+        contract = load_project_contract("bump-eqemu", ROOT / "project-contracts", cwd=ROOT)
+        selection_result = {
+            "schema_version": 1,
+            "source_statuses": [{"source_id": "central-beads", "source_type": "beads", "status": "selected"}],
+            "selected_work": [
+                {
+                    "source_id": "central-beads",
+                    "source_type": "beads",
+                    "external_id": "central-lve.11",
+                    "title": "Rank work from Beads metadata",
+                    "status": "open",
+                    "labels": ["project:bump-eqemu", "ready-for-agent"],
+                    "workstream": "central-lve",
+                    "acceptance_criteria": ["Carry priority into run-next"],
+                    "priority": 2,
+                    "issue_type": "task",
+                    "description": "Implement the selector context.",
+                    "dependencies": [],
+                    "blockers": [],
+                    "dependency_status": "clear",
+                    "afk": {"ready": True},
+                    "raw": {"beads": {"id": "central-lve.11"}},
+                }
+            ],
+            "skipped_candidates": [],
+        }
+
+        original_select_work = run_next.__globals__["select_work"]
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                temp_path = Path(temp_dir)
+                beads_workspace = temp_path / "beads"
+                checkout_root = temp_path / "checkouts"
+                checkout_path = checkout_root / "bump-EQEmu"
+                beads_workspace.mkdir()
+                checkout_root.mkdir(parents=True)
+                checkout_path.mkdir(parents=True)
+
+                run_next.__globals__["select_work"] = lambda request, project_contract=None: selection_result
+                payload = run_next(
+                    project_contract=contract,
+                    beads_workspace=beads_workspace,
+                    checkout_root=checkout_root,
+                    checkout_path=checkout_path,
+                    validation_profile="tier1",
+                    selector_mode="deterministic",
+                    selector_model=None,
+                    selector_choice_json=None,
+                )
+        finally:
+            run_next.__globals__["select_work"] = original_select_work
+
+        self.assertEqual(payload["recipe"]["review_feedback"], {"enabled": False})
+
+    def test_run_next_execute_mode_with_fake_local_recipe_keeps_review_feedback_disabled(self):
+        contract = load_project_contract("bump-eqemu", ROOT / "project-contracts", cwd=ROOT)
+        selection_result = {
+            "schema_version": 1,
+            "source_statuses": [{"source_id": "central-beads", "source_type": "beads", "status": "selected"}],
+            "selected_work": [
+                {
+                    "source_id": "central-beads",
+                    "source_type": "beads",
+                    "external_id": "central-lve.11",
+                    "title": "Rank work from Beads metadata",
+                    "status": "open",
+                    "labels": ["project:bump-eqemu", "ready-for-agent"],
+                    "workstream": "central-lve",
+                    "acceptance_criteria": ["Carry priority into run-next"],
+                    "priority": 2,
+                    "issue_type": "task",
+                    "description": "Implement the selector context.",
+                    "dependencies": [],
+                    "blockers": [],
+                    "dependency_status": "clear",
+                    "afk": {"ready": True},
+                    "raw": {"beads": {"id": "central-lve.11"}},
+                }
+            ],
+            "skipped_candidates": [],
+        }
+        runner_calls: list[tuple[object, object, object]] = []
+
+        def fake_workstream_runner(recipe_input, *, ledger_dir, project_contract):
+            runner_calls.append((recipe_input, ledger_dir, project_contract))
+            return {
+                "run_id": "run-789",
+                "workstream_id": "central-lve.11",
+                "parent": "central-lve",
+                "status": "succeeded",
+                "result_path": "runs/run-789/workstream-result.json",
+                "publication_status": "published",
+            }
+
+        original_select_work = run_next.__globals__["select_work"]
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                temp_path = Path(temp_dir)
+                beads_workspace = temp_path / "beads"
+                checkout_root = temp_path / "checkouts"
+                checkout_path = checkout_root / "bump-EQEmu"
+                ledger_dir = temp_path / "ledger"
+                beads_workspace.mkdir()
+                checkout_root.mkdir(parents=True)
+                checkout_path.mkdir(parents=True)
+                ledger_dir.mkdir()
+
+                run_next.__globals__["select_work"] = lambda request, project_contract=None: selection_result
+                payload = run_next(
+                    project_contract=contract,
+                    beads_workspace=beads_workspace,
+                    checkout_root=checkout_root,
+                    checkout_path=checkout_path,
+                    validation_profile="tier1",
+                    selector_mode="deterministic",
+                    selector_model=None,
+                    selector_choice_json=None,
+                    enable_review_feedback=False,
+                    execute=True,
+                    ledger_dir=ledger_dir,
+                    workstream_runner=fake_workstream_runner,
+                )
+        finally:
+            run_next.__globals__["select_work"] = original_select_work
+
+        self.assertEqual(len(runner_calls), 1)
+        runner_payload, runner_ledger_dir, runner_contract = runner_calls[0]
+        self.assertEqual(runner_payload["review_feedback"], {"enabled": False})
+        self.assertEqual(payload["recipe"]["review_feedback"], {"enabled": False})
+        self.assertEqual(runner_ledger_dir, ledger_dir)
+        self.assertEqual(runner_contract, contract)
 
     def test_run_next_execute_mode_does_not_run_without_candidates(self):
         contract = load_project_contract("bump-eqemu", ROOT / "project-contracts", cwd=ROOT)

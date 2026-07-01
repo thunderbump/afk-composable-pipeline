@@ -181,6 +181,7 @@ def main(argv: list[str] | None = None) -> int:
                 reviewer=reviewer,
                 retrospective_judge=retrospective_judge,
                 publisher=recipe_publisher,
+                enable_review_feedback=args.role_profile == PRODUCTION_ROLE_PROFILE,
             )
         except ValueError as exc:
             parser.error(str(exc))
@@ -262,6 +263,7 @@ def main(argv: list[str] | None = None) -> int:
                 selector_mode=args.selector_mode,
                 selector_model=args.selector_model,
                 selector_choice_json=args.selector_choice_json,
+                enable_review_feedback=args.role_profile == PRODUCTION_ROLE_PROFILE,
                 execute=args.execute,
                 ledger_dir=Path(args.ledger) if args.ledger else None,
                 workstream_runner=workstream_runner,
