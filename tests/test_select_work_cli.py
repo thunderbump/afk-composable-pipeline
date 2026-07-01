@@ -614,6 +614,81 @@ raise SystemExit(9)
             self.assertEqual(result["output"]["source_statuses"][0]["candidate_count"], 4)
             self.assertEqual(result["output"]["source_statuses"][0]["selected_count"], 1)
 
+    def test_fixture_filtering_treats_ready_label_without_afk_ready_as_not_runnable(self):
+        request = {
+            "required_labels": ["project:afk-composable-pipeline", "ready-for-agent"],
+            "required_metadata": ["workstream", "acceptance_criteria", "afk.ready"],
+            "sources": [
+                {
+                    "type": "fixture",
+                    "id": "fixture",
+                    "items": [
+                        {
+                            "external_id": "central-lve.false-ready",
+                            "title": "Ready label without AFK readiness",
+                            "status": "open",
+                            "labels": ["project:afk-composable-pipeline", "ready-for-agent"],
+                            "workstream": "central-lve",
+                            "acceptance_criteria": ["This should not run."],
+                            "dependencies": [{"id": "central-lve.1", "status": "closed"}],
+                            "afk": {"ready": False},
+                        },
+                        {
+                            "external_id": "central-lve.blocked",
+                            "title": "Blocked dependency",
+                            "status": "open",
+                            "labels": ["project:afk-composable-pipeline", "ready-for-agent"],
+                            "workstream": "central-lve",
+                            "acceptance_criteria": ["This stays blocked."],
+                            "dependencies": [{"id": "central-lve.2", "status": "open"}],
+                            "afk": {"ready": True},
+                        },
+                        {
+                            "external_id": "central-lve.ready",
+                            "title": "Runnable candidate",
+                            "status": "open",
+                            "labels": ["project:afk-composable-pipeline", "ready-for-agent"],
+                            "workstream": "central-lve",
+                            "acceptance_criteria": ["This is the only runnable item."],
+                            "dependencies": [{"id": "central-lve.3", "status": "closed"}],
+                            "afk": {"ready": True},
+                        },
+                    ],
+                }
+            ],
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ledger = Path(temp_dir) / "ledger"
+            completed = run_afk(
+                "run-step",
+                "select-work",
+                "--input",
+                json.dumps(request),
+                "--ledger",
+                str(ledger),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(
+                [candidate["external_id"] for candidate in result["output"]["selected_work"]],
+                ["central-lve.ready"],
+            )
+            self.assertEqual(
+                [
+                    (item["candidate"]["external_id"], item["reason"])
+                    for item in result["output"]["skipped_candidates"]
+                ],
+                [
+                    ("central-lve.false-ready", "missing_metadata:afk.ready"),
+                    ("central-lve.blocked", "blocked"),
+                ],
+            )
+
     def test_candidate_status_is_normalized_before_filtering(self):
         request = {
             "sources": [
@@ -1373,6 +1448,88 @@ sys.exit(9)
                 ["central-lve.9"],
             )
 
+    def test_beads_target_ids_treat_required_ready_label_as_afk_ready_when_metadata_is_absent(self):
+        secret = "beads-secret-value"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            fake_bin = temp_path / "bin"
+            workspace = temp_path / "beads"
+            (workspace / "secrets").mkdir(parents=True)
+            (workspace / "secrets" / "dolt_beads_password.txt").write_text(secret, encoding="utf-8")
+            fake_bin.mkdir()
+            write_executable(
+                fake_bin / "bd",
+                f"""#!{sys.executable}
+import json
+import os
+import sys
+
+if os.environ.get("BEADS_DOLT_PASSWORD") != "{secret}":
+    sys.exit(8)
+
+if len(sys.argv) > 1 and sys.argv[1] == "list":
+    raise SystemExit("bd list should not be used for explicit target_ids")
+
+if len(sys.argv) > 2 and sys.argv[1] == "show" and sys.argv[2] == "central-next.1":
+    print(json.dumps({{
+        "id": "central-next.1",
+        "title": "Legacy ready label stays runnable",
+        "acceptance_criteria": ["Direct target lookup keeps ready-for-agent compatibility"],
+        "status": "open",
+        "labels": ["project:afk-composable-pipeline", "ready-for-agent"],
+        "parent": "central-next",
+        "metadata": {{"workstream": "central-next"}},
+        "dependencies": [],
+    }}))
+    sys.exit(0)
+
+print("unexpected bd args: " + " ".join(sys.argv[1:]), file=sys.stderr)
+sys.exit(9)
+""",
+            )
+
+            request = {
+                "target_ids": ["central-next.1"],
+                "required_labels": ["project:afk-composable-pipeline", "ready-for-agent"],
+                "required_metadata": ["workstream", "acceptance_criteria", "afk.ready"],
+                "sources": [
+                    {
+                        "type": "beads",
+                        "id": "central-beads",
+                        "ready_label": "ready-for-agent",
+                        "workspace": str(workspace),
+                        "workspace_kind": "mounted",
+                        "labels": ["project:afk-composable-pipeline", "ready-for-agent"],
+                        "status": "open",
+                    }
+                ],
+            }
+            ledger = temp_path / "ledger"
+            completed = run_afk(
+                "run-step",
+                "select-work",
+                "--input",
+                json.dumps(request),
+                "--ledger",
+                str(ledger),
+                env={"PATH": str(fake_bin)},
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(result["output"]["skipped_candidates"], [])
+            self.assertEqual(
+                result["output"]["selected_work"][0]["afk"],
+                {"ready": True},
+            )
+            self.assertEqual(
+                [item["external_id"] for item in result["output"]["selected_work"]],
+                ["central-next.1"],
+            )
+
     def test_beads_source_records_missing_target_id_without_dropping_loaded_targets(self):
         secret = "beads-secret-value"
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1452,15 +1609,81 @@ sys.exit(9)
                 [item["external_id"] for item in result["output"]["selected_work"]],
                 ["central-lve.9"],
             )
-            self.assertEqual(result["output"]["source_statuses"][0]["status"], "selected")
-            self.assertEqual(result["output"]["source_statuses"][0]["candidate_count"], 2)
-            self.assertEqual(
-                [
-                    (item["candidate"]["external_id"], item["reason"])
-                    for item in result["output"]["skipped_candidates"]
-                ],
-                [("central-lve.missing", "missing_target_id")],
+
+    def test_github_source_treats_required_ready_label_as_afk_ready_when_metadata_is_absent(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            fake_bin = temp_path / "bin"
+            fake_bin.mkdir()
+            write_executable(
+                fake_bin / "gh",
+                f"""#!{sys.executable}
+import json
+import sys
+
+if sys.argv[1:3] == ["auth", "status"]:
+    sys.exit(0)
+if sys.argv[1:3] == ["issue", "list"]:
+    print(json.dumps([{{
+        "number": 17,
+        "url": "https://api.github.com/repos/thunderbump/afk-composable-pipeline/issues/17",
+        "title": "Legacy ready label stays runnable",
+        "state": "OPEN",
+        "body": "## Acceptance Criteria\\n- Keep ready-for-agent compatibility",
+        "labels": [
+            {{"name": "project:afk-composable-pipeline"}},
+            {{"name": "ready-for-agent"}}
+        ],
+    }}]))
+    sys.exit(0)
+if sys.argv[1:3] == ["api", "repos/thunderbump/afk-composable-pipeline/issues/17/dependencies/blocked_by"]:
+    print(json.dumps([]))
+    sys.exit(0)
+raise SystemExit(9)
+""",
             )
+
+            request = {
+                "required_labels": ["project:afk-composable-pipeline", "ready-for-agent"],
+                "required_metadata": ["acceptance_criteria", "afk.ready"],
+                "sources": [
+                    {
+                        "type": "github_issues",
+                        "id": "github",
+                        "repo": "thunderbump/afk-composable-pipeline",
+                        "ready_label": "ready-for-agent",
+                        "labels": ["project:afk-composable-pipeline", "ready-for-agent"],
+                        "query": "label:ready-for-agent is:open",
+                    }
+                ],
+            }
+            ledger = temp_path / "ledger"
+            completed = run_afk(
+                "run-step",
+                "select-work",
+                "--input",
+                json.dumps(request),
+                "--ledger",
+                str(ledger),
+                env={"PATH": str(fake_bin), "GH_TOKEN": "test-token"},
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(result["output"]["skipped_candidates"], [])
+            self.assertEqual(
+                [item["external_id"] for item in result["output"]["selected_work"]],
+                ["thunderbump/afk-composable-pipeline#17"],
+            )
+            self.assertEqual(
+                result["output"]["selected_work"][0]["afk"],
+                {"ready": True},
+            )
+            self.assertEqual(result["output"]["source_statuses"][0]["status"], "selected")
+            self.assertEqual(result["output"]["source_statuses"][0]["candidate_count"], 1)
 
     def test_beads_source_skips_item_when_local_tracker_artifact_shows_open_afk_pr(self):
         secret = "beads-secret-value"

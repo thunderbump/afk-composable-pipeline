@@ -153,6 +153,7 @@ def run_workstream(
         "implementation": None,
         "implementation_selection": [],
         "implementation_result_path": "",
+        "attempted_work_aliases": [],
         "validations": [],
         "review": None,
         "review_selection": [],
@@ -426,7 +427,33 @@ def composed_step_input(
 ) -> dict[str, Any]:
     step_name = step_spec["name"]
     input_data = dict(step_spec["input"])
-    if step_name == "prepare-checkout":
+    if step_name == "select-work":
+        exclude_ids = attempted_work_aliases(state)
+        target_ids = input_data.get("target_ids")
+        if exclude_ids and isinstance(target_ids, list):
+            explicit_target_suffixes: set[str] = set()
+            for item in target_ids:
+                if not isinstance(item, str):
+                    continue
+                target_id = item.strip()
+                if not target_id:
+                    continue
+                explicit_target_suffixes.add(target_id)
+                explicit_target_suffixes.add(target_id.rsplit(":", 1)[-1])
+            exclude_ids = {
+                item
+                for item in exclude_ids
+                if item not in explicit_target_suffixes
+                and not any(item.endswith(f":{suffix}") for suffix in explicit_target_suffixes)
+            }
+        if exclude_ids:
+            request_exclude_ids = input_data.get("exclude_ids")
+            if isinstance(request_exclude_ids, list):
+                exclude_ids.update(
+                    item.strip() for item in request_exclude_ids if isinstance(item, str) and item.strip()
+                )
+            input_data["exclude_ids"] = sorted(exclude_ids)
+    elif step_name == "prepare-checkout":
         input_data["review_branch"] = normalized["review_branch"]
         checkout = state.get("checkout")
         if isinstance(checkout, dict):
@@ -930,6 +957,8 @@ def update_state_from_step(
         state["implementation_result_path"] = f"runs/{result.run_id}/step-result.json"
         state["checkout"] = checkout_after_implementation(state.get("checkout"), output)
         update_checkout_attempt_after_implementation(state, output)
+        if output.get("status") != "implemented":
+            record_attempted_selected_work(state, state.get("implementation_selection"))
         state["review"] = None
         state["review_selection"] = []
         state["review_result_path"] = ""
@@ -945,6 +974,8 @@ def update_state_from_step(
                 "worker_result_path": str((ledger_dir / "runs" / result.run_id / "worker-result.json").resolve(strict=False)),
             }
         )
+        if validation_failure_reselects(output):
+            record_attempted_selected_work(state, state.get("implementation_selection"))
         update_checkout_attempt_after_validation(state, output)
     elif step_name == "review":
         state["review"] = output
@@ -1079,6 +1110,19 @@ def work_item_aliases(item: dict[str, Any]) -> set[str]:
     if external_id:
         aliases.add(external_id)
     return aliases
+
+
+def attempted_work_aliases(state: dict[str, Any]) -> set[str]:
+    value = state.get("attempted_work_aliases")
+    if not isinstance(value, list):
+        return set()
+    return {item for item in value if isinstance(item, str) and item}
+
+
+def record_attempted_selected_work(state: dict[str, Any], selected_work: Any | None = None) -> None:
+    attempted = attempted_work_aliases(state)
+    attempted.update(selected_work_aliases(state.get("selected_work") if selected_work is None else selected_work))
+    state["attempted_work_aliases"] = sorted(attempted)
 
 
 def select_work_proves_different_item(input_data: Any, state: dict[str, Any]) -> bool:
@@ -1220,13 +1264,24 @@ def blocking_reason_for_step(
         "validate": "validated",
         "review": "passed",
     }.get(step_name)
-    if step_name == "validate" and status != expected and validation_failure_allows_retry_follow_up(remaining_steps):
+    if step_name == "implement" and status != expected and implementation_failure_allows_retry_follow_up(remaining_steps):
+        return ""
+    if (
+        step_name == "validate"
+        and status != expected
+        and validation_failure_reselects(output)
+        and validation_failure_allows_retry_follow_up(remaining_steps)
+    ):
         return ""
     if step_name == "review" and status != expected and review_failure_allows_retry_follow_up(remaining_steps):
         return ""
     if expected and status != expected:
         return f"{step_name} did not reach {expected}: {status or 'missing status'}"
     return ""
+
+
+def validation_failure_reselects(output: dict[str, Any]) -> bool:
+    return output.get("status") == "failed_validation" or output.get("classification") == "worker_failure"
 
 
 def validation_artifact_refs(state: dict[str, Any], ledger_dir: Path) -> list[dict[str, str]]:
@@ -2795,6 +2850,18 @@ def validation_failure_allows_retry_follow_up(remaining_steps: list[dict[str, An
         if name in {"prepare-checkout", "select-work"}:
             return True
         if name in {"review", "validate"}:
+            return False
+    return False
+
+
+def implementation_failure_allows_retry_follow_up(remaining_steps: list[dict[str, Any]]) -> bool:
+    for step in remaining_steps:
+        if not isinstance(step, dict):
+            continue
+        name = step.get("name")
+        if name in {"prepare-checkout", "select-work"}:
+            return True
+        if name in {"review", "validate", "implement"}:
             return False
     return False
 
