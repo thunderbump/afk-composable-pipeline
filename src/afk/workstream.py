@@ -280,11 +280,11 @@ def run_workstream(
                 publication = blocked_publication(publication_gate, normalized, run_id)
         else:
             if tracker_terminal_decision_present(normalized):
-                if tracker_terminal_decision_allows_close(normalized):
+                if tracker_terminal_decision_allows_close(normalized, state):
                     publication = tracker_terminal_decision_publication()
                 else:
                     publication = tracker_close_blocked_publication(
-                        reason=tracker_terminal_decision_close_block_reason(normalized)
+                        reason=tracker_terminal_decision_close_block_reason(normalized, state)
                     )
             else:
                 publication = publish_terminal_pr(
@@ -1972,7 +1972,8 @@ def close_published_pr(
         fields=["url", "state", "isDraft", "mergeStateStatus", "headRefOid"],
     )
     pr_url = publisher_pr_url(view_payload, fallback=config["pr"])
-    if not review_cycles_recorded(normalized.get("review_cycles")) and configured_review_feedback_status != "waived":
+    review_cycles = effective_review_cycles(normalized, state)
+    if not review_cycles_recorded(review_cycles) and configured_review_feedback_status != "waived":
         return tracker_close_blocked_publication(
             reason=(
                 "terminal PR closure requires recorded review cycle evidence or review_feedback_status "
@@ -1989,7 +1990,7 @@ def close_published_pr(
             commands={"gh_view": view_command},
         )
     if (
-        review_cycles_require_response(normalized.get("review_cycles"))
+        review_cycles_require_response(review_cycles)
         and configured_review_feedback_status not in TERMINAL_REVIEW_FEEDBACK_STATUSES
     ):
         return tracker_close_blocked_publication(
@@ -3645,12 +3646,14 @@ def review_cycles_recorded(review_cycles: Any) -> bool:
     return isinstance(review_cycles, list) and bool(review_cycles)
 
 
-def tracker_terminal_decision_close_block_reason(normalized: dict[str, Any]) -> str:
+def tracker_terminal_decision_close_block_reason(
+    normalized: dict[str, Any], state: dict[str, Any] | None = None
+) -> str:
     decision = normalized.get("tracker", {}).get("terminal_decision", {})
     if not isinstance(decision, dict) or not decision.get("status"):
         return "terminal tracker decision is not recorded"
     review_feedback_status = terminal_review_feedback_status(decision)
-    review_cycles = normalized.get("review_cycles")
+    review_cycles = effective_review_cycles(normalized, state)
     if not review_cycles_recorded(review_cycles):
         if review_feedback_status == "waived":
             return ""
@@ -3668,8 +3671,10 @@ def tracker_terminal_decision_close_block_reason(normalized: dict[str, Any]) -> 
     )
 
 
-def tracker_terminal_decision_allows_close(normalized: dict[str, Any]) -> bool:
-    return not tracker_terminal_decision_close_block_reason(normalized)
+def tracker_terminal_decision_allows_close(
+    normalized: dict[str, Any], state: dict[str, Any] | None = None
+) -> bool:
+    return not tracker_terminal_decision_close_block_reason(normalized, state)
 
 
 def tracker_close_blocked_publication(
