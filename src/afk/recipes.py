@@ -26,6 +26,7 @@ def generate_workstream_recipe(
     agent: dict[str, Any] | None = None,
     reviewer: dict[str, Any] | None = None,
     retrospective_judge: dict[str, Any] | None = None,
+    retrospective_follow_up: dict[str, Any] | None = None,
     publisher: dict[str, Any] | None = None,
     sources: list[dict[str, Any]] | None = None,
     required_labels: list[str] | None = None,
@@ -114,6 +115,8 @@ def generate_workstream_recipe(
 
     if retrospective_judge is not None:
         recipe["retrospective_judge"] = retrospective_judge
+    if retrospective_follow_up is not None:
+        recipe["retrospective_follow_up"] = retrospective_follow_up
 
     return recipe
 

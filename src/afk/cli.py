@@ -234,6 +234,10 @@ def main(argv: list[str] | None = None) -> int:
                 checkout_path=Path(args.checkout_path),
                 require_pi_mounts=args.execute,
             )
+            retrospective_follow_up = recipe_retrospective_follow_up_from_args(
+                args,
+                project_contract=project_contract,
+            )
             recipe_publisher_factory = recipe_publisher_factory_from_args(
                 args,
                 checkout_path=Path(args.checkout_path),
@@ -258,6 +262,7 @@ def main(argv: list[str] | None = None) -> int:
                 agent=recipe_agent,
                 reviewer=reviewer,
                 retrospective_judge=retrospective_judge,
+                retrospective_follow_up=retrospective_follow_up,
                 publisher_factory=recipe_publisher_factory,
                 ready_tag=args.ready_tag,
                 selector_mode=args.selector_mode,
@@ -415,6 +420,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_implementation_agent_flags(run_next_parser)
     add_reviewer_flags(run_next_parser)
     add_retrospective_judge_flags(run_next_parser)
+    add_retrospective_follow_up_flags(run_next_parser)
     add_publisher_flags(run_next_parser)
 
     return parser
@@ -567,6 +573,21 @@ def add_retrospective_judge_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--retrospective-judge-ponytail-extension-source",
         help="Retrospective judge ponytail extension source string for pi mode",
+    )
+
+
+def add_retrospective_follow_up_flags(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--retrospective-follow-up-mode",
+        choices=("disabled", "beads"),
+        default="disabled",
+        help="Optional retrospective follow-up creator to embed in generated run-next recipes",
+    )
+    parser.add_argument(
+        "--retrospective-follow-up-label",
+        action="append",
+        default=[],
+        help="Extra label to add to retrospective follow-up Beads; repeat to add more",
     )
 
 
@@ -793,6 +814,27 @@ def recipe_retrospective_judge_from_args(
             ),
         }
     raise ValueError(f"Unsupported --retrospective-judge-mode: {retrospective_judge_mode}")
+
+
+def recipe_retrospective_follow_up_from_args(
+    args: argparse.Namespace,
+    *,
+    project_contract: ProjectContract,
+) -> dict[str, Any] | None:
+    if args.retrospective_follow_up_mode == "disabled":
+        return None
+    if args.retrospective_follow_up_mode != "beads":
+        raise ValueError(f"Unsupported --retrospective-follow-up-mode: {args.retrospective_follow_up_mode}")
+    labels: list[str] = []
+    for label in [*project_contract.beads_labels, args.ready_tag, *args.retrospective_follow_up_label]:
+        if label and label not in labels:
+            labels.append(label)
+    return {
+        "enabled": True,
+        "creator": "beads",
+        "beads_workspace": str(Path(args.beads_workspace)),
+        "labels": labels,
+    }
 
 
 def recipe_validation_input_from_args(args: argparse.Namespace, *, project_contract: ProjectContract) -> dict[str, Any]:
