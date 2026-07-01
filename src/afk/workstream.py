@@ -301,7 +301,6 @@ def run_workstream(
     tracker = tracker_record(normalized, state, publication)
     status = workstream_status_from_publication(publication, tracker)
     selected_work = selected_work_records(state)
-    pipeline_retrospective = pipeline_retrospective_record(state, publication, tracker, normalized)
     retrospective_judge_skip_reason = ""
     retrospective_judge_skip_classification = "auth_preflight_failed"
     if state["blocked_reason"].startswith("Pi auth preflight failed for "):
@@ -330,6 +329,7 @@ def run_workstream(
             if auth_result["status"] == "failed":
                 retrospective_judge_skip_reason = pi_auth_preflight_failure_reason(auth_result)
                 retrospective_judge_skip_classification = "auth_preflight_failed"
+    pipeline_retrospective = pipeline_retrospective_record(state, publication, tracker, normalized)
     retrospective_judge = _run_retrospective_judge(
         normalized=normalized,
         state=state,
@@ -5666,6 +5666,11 @@ def _blocked_retrospective_signals(state: dict[str, Any], publication: dict[str,
 def _blocked_reason_targets_work_item(state: dict[str, Any], reason: str) -> bool:
     if reason.startswith("Pi auth preflight failed for "):
         return False
+    review = state.get("review") if isinstance(state.get("review"), dict) else {}
+    if reason.startswith("review feedback retry budget exhausted:"):
+        return string_field(review, "status") == "request_revision"
+    if reason.startswith("review requested changes:"):
+        return True
     if reason.startswith("validate did not reach validated:") or reason.startswith("required final validation evidence did not pass:"):
         validation = latest_validation_record(state)
         if validation is None:
@@ -5676,7 +5681,6 @@ def _blocked_reason_targets_work_item(state: dict[str, Any], reason: str) -> boo
     if reason.startswith("review did not reach passed: request_revision"):
         return True
     if reason.startswith("retry budget exhausted:"):
-        review = state.get("review") if isinstance(state.get("review"), dict) else {}
         if string_field(review, "status") == "request_revision":
             return True
         validation = latest_validation_record(state)

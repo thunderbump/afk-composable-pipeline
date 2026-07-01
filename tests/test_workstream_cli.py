@@ -1617,6 +1617,109 @@ raise SystemExit(9)
             self.assertIn("no prepared checkout", result["pipeline_retrospective"]["judge"]["summary"])
             self.assertFalse(checkout.exists())
 
+    def test_workstream_records_deferred_retrospective_judge_preflight_failure_in_process_outcome(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repo = temp_path / "repo-src"
+            checkout = temp_path / "checkout"
+            ledger = temp_path / "ledger"
+            codex_home = temp_path / "codex-home"
+            config_home = temp_path / "xdg-config"
+            pi_config_home = temp_path / "pi-config"
+            pi_coding_agent_dir = temp_path / "pi-coding-agent"
+            judge_marker = temp_path / "judge-ran.txt"
+            init_repo(repo)
+            codex_home.mkdir()
+            config_home.mkdir()
+            pi_config_home.mkdir()
+            pi_coding_agent_dir.mkdir()
+            repo_bin = repo / "bin"
+            repo_bin.mkdir()
+            write_executable(
+                repo_bin / "pi",
+                f"""#!{sys.executable}
+import json
+import os
+import sys
+from pathlib import Path
+
+if os.environ.get("AFK_PI_AUTH_PREFLIGHT") == "1":
+    sys.stderr.write("checkout-local judge auth missing\\n")
+    raise SystemExit(7)
+Path({str(judge_marker)!r}).write_text("judge ran\\n", encoding="utf-8")
+Path(os.environ["AFK_RETROSPECTIVE_JUDGE_RESULT"]).write_text(
+    json.dumps({{"status": "pass", "summary": "judge should not have run", "findings": []}}),
+    encoding="utf-8",
+)
+""",
+            )
+            git(repo, "add", "bin/pi")
+            git(repo, "commit", "-m", "add failing checkout-local judge pi adapter")
+            fake_git = temp_path / "publisher-git"
+            fake_gh = temp_path / "publisher-gh"
+            write_executable(fake_git, f"#!{sys.executable}\nraise SystemExit(9)\n")
+            write_executable(fake_gh, f"#!{sys.executable}\nraise SystemExit(9)\n")
+            recipe = successful_recipe(temp_path, repo, checkout, fake_git, fake_gh)
+            recipe["publisher"] = {"enabled": False}
+            recipe["retrospective_judge"] = {
+                "enabled": True,
+                "type": "local-command",
+                "command": [
+                    "bash",
+                    "-lc",
+                    "exec ./bin/pi -p '{prompt}' --provider openai-codex --model gpt-5.4-mini",
+                ],
+                "timeout_seconds": 10,
+                "codex_home": str(codex_home),
+                "config_home": str(config_home),
+                "env": {
+                    "PI_CONFIG_HOME": str(pi_config_home),
+                    "PI_CODING_AGENT_DIR": str(pi_coding_agent_dir),
+                },
+            }
+
+            completed = run_afk(
+                "run-workstream",
+                "--workstream-id",
+                "central-lve.9",
+                "--input",
+                json.dumps(recipe),
+                "--ledger",
+                str(ledger),
+                env_overrides={
+                    "GIT_ALLOW_PROTOCOL": "file",
+                    "GIT_AUTHOR_NAME": "AFK Test",
+                    "GIT_AUTHOR_EMAIL": "afk-test@example.test",
+                    "GIT_COMMITTER_NAME": "AFK Test",
+                    "GIT_COMMITTER_EMAIL": "afk-test@example.test",
+                },
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            result_path = ledger / summary["result_path"]
+            result = json.loads(result_path.read_text(encoding="utf-8"))
+            preflight = json.loads((result_path.parent / "pi-auth-preflight.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(result["status"], "validated-unpublished")
+            self.assertEqual(preflight["status"], "failed")
+            self.assertEqual([item["status"] for item in preflight["results"]], ["deferred", "failed"])
+            self.assertEqual(result["pipeline_retrospective"]["health"], "failing")
+            self.assertEqual(result["outcome"]["process_retrospective"]["status"], "action-needed")
+            self.assertEqual(result["pipeline_retrospective"]["judge"]["status"], "skipped")
+            self.assertEqual(result["pipeline_retrospective"]["judge"]["classification"], "auth_preflight_failed")
+            self.assertEqual(result["pipeline_retrospective"]["signals"][0]["kind"], "auth-preflight")
+            self.assertEqual(
+                result["pipeline_retrospective"]["recommended_follow_up"],
+                [
+                    {
+                        "summary": "Restore Pi auth preflight for retrospective_judge before rerunning the workstream.",
+                        "labels": ["afk:follow-up", "area:workstream", "project:afk-composable-pipeline"],
+                    }
+                ],
+            )
+            self.assertFalse(judge_marker.exists())
+
     def test_workstream_pi_auth_preflight_preserves_implement_wrapper_secret_metadata_in_job_capsule(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)

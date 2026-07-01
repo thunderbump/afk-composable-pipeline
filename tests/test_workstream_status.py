@@ -738,6 +738,38 @@ class WorkstreamStatusMappingTest(unittest.TestCase):
             ],
         )
 
+    def test_pipeline_retrospective_record_treats_review_feedback_budget_block_as_target_work(self):
+        state = retrospective_state()
+        state["review"] = {
+            "status": "request_revision",
+            "summary": "review requested changes",
+            "reviewer_result": {
+                "findings": [
+                    {
+                        "classification": "correctness",
+                        "summary": "Handle the empty review cycle before publishing.",
+                    }
+                ]
+            },
+        }
+
+        record = pipeline_retrospective_record(
+            state,
+            {
+                "status": "blocked",
+                "reason": (
+                    "review feedback retry budget exhausted: 1 retries attempted, max_retries=1; "
+                    "review requested changes: Handle the empty review cycle before publishing."
+                ),
+            },
+            retrospective_tracker("validated"),
+        )
+
+        self.assertEqual(record["health"], "healthy")
+        self.assertEqual(record["signals"][0]["kind"], "retry-or-blocked")
+        self.assertEqual(record["signals"][0]["scope"], "target-work")
+        self.assertEqual(record["follow_up"]["recommended"], [])
+
     def test_pipeline_retrospective_record_surfaces_blocked_reason_without_retry_keyword(self):
         record = pipeline_retrospective_record(
             retrospective_state(),
