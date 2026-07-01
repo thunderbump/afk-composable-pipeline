@@ -1,0 +1,8 @@
+time="2026-06-20T22:22:40-07:00" level=warning msg="No services to build"
+time="2026-06-20T22:22:40-07:00" level=warning msg="No services to build"
+CMake Error: The current CMakeCache.txt directory /tmp/build is different than the directory /expected/build where CMakeCache.txt was created.
+CMake Error: The source "/tmp/CMakeLists.txt" does not match the source "/expected/CMakeLists.txt" used to generate cache.
+
+Preset CMake variables:
+  CMAKE_BUILD_TYPE="Debug"
+  EQEMU_BUILD_TESTS="ON"

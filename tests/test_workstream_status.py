@@ -8,6 +8,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from afk.workstream import (  # noqa: E402
+    _apply_retrospective_judge,
     WorkstreamError,
     normalize_retrospective_follow_up_config,
     normalize_retrospective_judge,
@@ -317,7 +318,7 @@ class WorkstreamStatusMappingTest(unittest.TestCase):
             record["recommended_follow_up"],
             [
                 {
-                    "summary": "Fix the missing tool or configuration in validation evidence before rerunning the workstream.",
+                    "summary": "Fix tier1 [validation]: python3.13: command not found token=[REDACTED]",
                     "labels": ["afk:follow-up", "area:validation", "project:afk-composable-pipeline"],
                 },
                 {
@@ -329,13 +330,69 @@ class WorkstreamStatusMappingTest(unittest.TestCase):
         self.assertEqual(record["follow_up"]["recommended"][0]["kind"], "missing-tool-or-config")
         self.assertEqual(
             record["follow_up"]["recommended"][0]["summary"],
-            "Fix the missing tool or configuration in validation evidence before rerunning the workstream.",
+            "Fix tier1 [validation]: python3.13: command not found token=[REDACTED]",
         )
         self.assertEqual(
             record["follow_up"]["recommended"][0]["labels"],
             ["afk:follow-up", "area:validation", "project:afk-composable-pipeline"],
         )
         self.assertTrue(record["follow_up"]["recommended"][0]["fingerprint"].startswith("retro-follow-up:"))
+
+    def test_pipeline_retrospective_record_prefers_specific_validation_follow_up_over_judge_generic(self):
+        state = retrospective_state()
+        state["validations"] = [
+            {
+                "output": {
+                    "status": "failed_validation",
+                    "summary": "failed_validation",
+                    "actionable_failures": [
+                        {
+                            "name": "tier1",
+                            "category": "compiler",
+                            "reason": "command exited with status 1",
+                            "log_path": "/tmp/ledger/runs/validate/validation-evidence/logs/validation.log",
+                            "excerpt": "zone/harness/zone_harness_runtime.cpp:98:9 error: SetBotID is a private member of Bot",
+                        }
+                    ],
+                    "checkout": {"start_commit": "abc123"},
+                    "validation": {"requested_profile": "tier1"},
+                },
+                "step_result_path": "/tmp/ledger/runs/validate/step-result.json",
+                "worker_result_path": "/tmp/ledger/runs/validate/worker-result.json",
+            }
+        ]
+        record = pipeline_retrospective_record(
+            state,
+            {"status": "blocked", "reason": "required final validation evidence did not pass: tier1"},
+            retrospective_tracker("selected"),
+        )
+
+        record = _apply_retrospective_judge(
+            record,
+            {
+                "enabled": True,
+                "status": "failed",
+                "summary": "review judge findings",
+                "evidence": {
+                    "request_path": "retrospective-judge-request.json",
+                    "result_path": "retrospective-judge-result.json",
+                    "stdout_path": "retrospective-judge-stdout.log",
+                    "stderr_path": "retrospective-judge-stderr.log",
+                },
+            },
+            normalized=None,
+            publication={"status": "blocked", "reason": "required final validation evidence did not pass: tier1"},
+        )
+
+        self.assertEqual(record["signals"][0]["kind"], "validation-failure")
+        self.assertEqual(record["follow_up"]["recommended"][0]["kind"], "validation-failure")
+        self.assertIn("tier1", record["follow_up"]["recommended"][0]["summary"])
+        self.assertIn("compiler", record["follow_up"]["recommended"][0]["summary"])
+        self.assertIn("SetBotID is a private member of Bot", record["follow_up"]["recommended"][0]["summary"])
+        self.assertNotIn(
+            "Review and address retrospective judge findings before treating the run as complete.",
+            [item["summary"] for item in record["follow_up"]["recommended"]],
+        )
 
     def test_pipeline_retrospective_record_surfaces_blocked_reason_without_retry_keyword(self):
         record = pipeline_retrospective_record(

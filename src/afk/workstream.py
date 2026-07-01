@@ -4527,6 +4527,12 @@ def _retrospective_follow_up_bead_description(
         f"Severity: {signal_details['severity']}",
         f"Fingerprint: {string_field(recommendation, 'fingerprint') or ''}",
     ]
+    if signal_details["step"]:
+        lines.append(f"Step: {signal_details['step']}")
+    if signal_details["classification"]:
+        lines.append(f"Classification: {signal_details['classification']}")
+    if signal_details["excerpt"]:
+        lines.extend(["", "Root failure excerpt:", signal_details["excerpt"]])
     if evidence_paths:
         lines.extend(["", "Evidence paths:"])
         for path in evidence_paths:
@@ -4543,17 +4549,29 @@ def _retrospective_follow_up_signal_details(
     signals = pipeline_retrospective.get("signals") if isinstance(pipeline_retrospective.get("signals"), list) else []
     severity = ""
     evidence_paths: list[str] = []
+    step = ""
+    classification = ""
+    excerpt = ""
     for signal in signals:
         if not isinstance(signal, dict) or string_field(signal, "kind") != kind:
             continue
         if not severity:
             severity = string_field(signal, "severity") or ""
+        if not step:
+            step = string_field(signal, "step") or ""
+        if not classification:
+            classification = string_field(signal, "classification") or ""
+        if not excerpt:
+            excerpt = string_field(signal, "excerpt") or string_field(signal, "summary") or ""
         for path in signal.get("evidence_paths") if isinstance(signal.get("evidence_paths"), list) else []:
             if isinstance(path, str) and path and path not in evidence_paths:
                 evidence_paths.append(path)
     return {
         "category": kind,
         "severity": severity or "unknown",
+        "step": step,
+        "classification": classification,
+        "excerpt": excerpt,
         "evidence_paths": evidence_paths,
     }
 
@@ -4916,24 +4934,41 @@ def _validation_retrospective_signals(state: dict[str, Any]) -> list[dict[str, A
         for failure in actionable_failures:
             if not isinstance(failure, dict):
                 continue
-            summary = _retrospective_missing_tool_or_config_summary(
-                string_field(failure, "excerpt") or string_field(failure, "reason") or string_field(output, "summary") or ""
-            )
-            if not summary:
-                continue
-            signals.append(
-                {
-                    "kind": "missing-tool-or-config",
-                    "severity": "error",
-                    "summary": summary,
-                    "evidence_paths": _retrospective_evidence_paths(
-                        string_field(failure, "log_path") or "",
-                        string_field(validation, "step_result_path") or "",
-                        string_field(validation, "worker_result_path") or "",
-                    ),
-                }
-            )
+            signal = _validation_failure_retrospective_signal(validation, output, failure)
+            if signal is not None:
+                signals.append(signal)
+            break
     return signals
+
+
+def _validation_failure_retrospective_signal(
+    validation: dict[str, Any],
+    output: dict[str, Any],
+    failure: dict[str, Any],
+) -> dict[str, Any] | None:
+    excerpt = (
+        string_field(failure, "excerpt") or string_field(failure, "reason") or string_field(output, "summary") or ""
+    )
+    log_path = string_field(failure, "log_path") or ""
+    if not log_path:
+        return None
+    kind = "missing-tool-or-config" if _retrospective_text_has_missing_tool_or_config(excerpt) else "validation-failure"
+    validation_info = output.get("validation") if isinstance(output.get("validation"), dict) else {}
+    step = string_field(failure, "name") or string_field(validation_info, "requested_profile") or "validation"
+    classification = string_field(failure, "category") or kind
+    return {
+        "kind": kind,
+        "severity": "error",
+        "summary": redact_text(excerpt),
+        "step": redact_text(step),
+        "classification": redact_text(classification),
+        "excerpt": redact_text(excerpt),
+        "evidence_paths": _retrospective_evidence_paths(
+            log_path,
+            string_field(validation, "step_result_path") or "",
+            string_field(validation, "worker_result_path") or "",
+        ),
+    }
 
 
 def _publication_retrospective_signals(publication: dict[str, Any]) -> list[dict[str, Any]]:
@@ -5053,9 +5088,11 @@ def _retrospective_follow_up_record(
                     if string_field(created_item, "fingerprint"):
                         created_fingerprints.add(created_item["fingerprint"])
                     created_identities.add(_retrospective_follow_up_identity_for_item(created_item))
+    suppress_judge_follow_up = any(_signal_has_specific_failure_details(signal) for signal in signals)
     for signal in signals:
-        kind = string_field(signal, "kind") or ""
-        follow_up_item = _follow_up_for_signal(kind)
+        if suppress_judge_follow_up and string_field(signal, "kind") == "retrospective-judge":
+            continue
+        follow_up_item = _follow_up_for_signal(signal)
         if (
             follow_up_item
             and follow_up_item["fingerprint"] not in recommended_fingerprints
@@ -5258,11 +5295,39 @@ def _subprocess_output_text(value: Any) -> str:
     return ""
 
 
-def _follow_up_for_signal(kind: str) -> dict[str, Any] | None:
+def _signal_has_specific_failure_details(signal: dict[str, Any]) -> bool:
+    kind = string_field(signal, "kind") or ""
+    return kind in {"validation-failure", "missing-tool-or-config"} and bool(
+        string_field(signal, "excerpt") and signal.get("evidence_paths")
+    )
+
+
+def _follow_up_summary_for_signal(signal: dict[str, Any], prefix: str) -> str:
+    step = string_field(signal, "step") or ""
+    classification = string_field(signal, "classification") or string_field(signal, "kind") or "failure"
+    excerpt = string_field(signal, "excerpt") or string_field(signal, "summary") or ""
+    if step and excerpt:
+        return f"{prefix} {step} [{classification}]: {excerpt}"
+    if excerpt:
+        return f"{prefix} [{classification}]: {excerpt}"
+    return prefix
+
+
+def _follow_up_for_signal(signal: dict[str, Any]) -> dict[str, Any] | None:
+    kind = string_field(signal, "kind") or ""
     if kind == "missing-tool-or-config":
+        summary = "Fix the missing tool or configuration in validation evidence before rerunning the workstream."
+        if _signal_has_specific_failure_details(signal):
+            summary = _follow_up_summary_for_signal(signal, "Fix")
         return _retrospective_follow_up_item(
             kind=kind,
-            summary="Fix the missing tool or configuration in validation evidence before rerunning the workstream.",
+            summary=summary,
+            labels=["afk:follow-up", "area:validation"],
+        )
+    if kind == "validation-failure":
+        return _retrospective_follow_up_item(
+            kind=kind,
+            summary=_follow_up_summary_for_signal(signal, "Fix"),
             labels=["afk:follow-up", "area:validation"],
         )
     if kind == "publisher-auth":
@@ -5271,7 +5336,13 @@ def _follow_up_for_signal(kind: str) -> dict[str, Any] | None:
             summary="Repair GitHub publisher authentication evidence before rerunning terminal publication.",
             labels=["afk:follow-up", "area:publication"],
         )
-    if kind in {"publisher-failure", "retry-or-blocked"}:
+    if kind == "publisher-failure":
+        return _retrospective_follow_up_item(
+            kind=kind,
+            summary="Address the blocked publication or retry evidence before rerunning the workstream.",
+            labels=["afk:follow-up", "area:workstream"],
+        )
+    if kind == "retry-or-blocked":
         return _retrospective_follow_up_item(
             kind=kind,
             summary="Address the blocked publication or retry evidence before rerunning the workstream.",

@@ -74,6 +74,8 @@ def run_dir_text(run_dir):
 
 
 class ValidateCliTest(unittest.TestCase):
+    COMPILER_LOG_FIXTURE = (ROOT / "tests" / "fixtures" / "validation-compiler-error.log").read_text(encoding="utf-8")
+
     def test_validate_default_project_worker_uses_absolute_artifact_paths_with_relative_ledger(self):
         with tempfile.TemporaryDirectory(dir=ROOT) as temp_dir:
             temp_path = Path(temp_dir)
@@ -2949,18 +2951,7 @@ class ValidateCliTest(unittest.TestCase):
                 tier1_log = steps_dir / "tier1.log"
                 tier3_log = steps_dir / "tier3_harness.log"
                 tier1_log.write_text(
-                    "\\n".join(
-                        [
-                            'time="2026-06-20T22:22:40-07:00" level=warning msg="No services to build"',
-                            'time="2026-06-20T22:22:40-07:00" level=warning msg="No services to build"',
-                            "CMake Error: The current CMakeCache.txt directory /tmp/build is different than the directory /expected/build where CMakeCache.txt was created.",
-                            'CMake Error: The source "/tmp/CMakeLists.txt" does not match the source "/expected/CMakeLists.txt" used to generate cache.',
-                            "",
-                            "Preset CMake variables:",
-                            '  CMAKE_BUILD_TYPE="Debug"',
-                            '  EQEMU_BUILD_TESTS="ON"',
-                        ]
-                    ),
+                    __COMPILER_LOG__,
                     encoding="utf-8",
                 )
                 tier3_log.write_text(
@@ -3006,7 +2997,7 @@ class ValidateCliTest(unittest.TestCase):
                     encoding="utf-8",
                 )
                 """
-            ).strip()
+            ).strip().replace("__COMPILER_LOG__", repr(self.COMPILER_LOG_FIXTURE))
 
             completed = run_afk(
                 "run-step",
