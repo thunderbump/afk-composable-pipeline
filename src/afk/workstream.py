@@ -5149,9 +5149,12 @@ def _retrospective_follow_up_record(
                     if string_field(created_item, "fingerprint"):
                         created_fingerprints.add(created_item["fingerprint"])
                     created_identities.add(_retrospective_follow_up_identity_for_item(created_item))
-    suppress_judge_follow_up = any(_signal_has_specific_failure_details(signal) for signal in signals)
+    suppress_generic_retry_follow_up = any(_signal_replaces_generic_retry_follow_up(signal) for signal in signals)
+    suppress_judge_follow_up = any(_signal_replaces_judge_follow_up(signal) for signal in signals)
     for signal in signals:
         if suppress_judge_follow_up and string_field(signal, "kind") == "retrospective-judge":
+            continue
+        if suppress_generic_retry_follow_up and string_field(signal, "kind") == "retry-or-blocked":
             continue
         follow_up_item = _follow_up_for_signal(signal)
         if (
@@ -5356,9 +5359,21 @@ def _subprocess_output_text(value: Any) -> str:
     return ""
 
 
-def _signal_has_specific_failure_details(signal: dict[str, Any]) -> bool:
+def _signal_replaces_generic_retry_follow_up(signal: dict[str, Any]) -> bool:
     kind = string_field(signal, "kind") or ""
-    return kind in {"validation-failure", "missing-tool-or-config"} and bool(
+    if kind in {"validation-failure", "missing-tool-or-config"}:
+        return bool(string_field(signal, "excerpt") and signal.get("evidence_paths"))
+    if kind == "publisher-auth":
+        return bool(signal.get("evidence_paths"))
+    return False
+
+
+def _signal_replaces_judge_follow_up(signal: dict[str, Any]) -> bool:
+    kind = string_field(signal, "kind") or ""
+    return kind in {
+        "validation-failure",
+        "missing-tool-or-config",
+    } and bool(
         string_field(signal, "excerpt") and signal.get("evidence_paths")
     )
 
@@ -5387,7 +5402,7 @@ def _follow_up_for_signal(signal: dict[str, Any]) -> dict[str, Any] | None:
         if _signal_targets_publication(signal):
             summary = "Fix the missing tool or configuration in publication evidence before rerunning the workstream."
             labels = ["afk:follow-up", "area:publication"]
-        if _signal_has_specific_failure_details(signal):
+        if _signal_replaces_judge_follow_up(signal):
             summary = _follow_up_summary_for_signal(signal, "Fix")
         return _retrospective_follow_up_item(
             kind=kind,
