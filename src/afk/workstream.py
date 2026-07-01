@@ -346,6 +346,7 @@ def run_workstream(
         retrospective_judge,
         normalized=normalized,
         publication=publication,
+        state=state,
     )
     retrospective_follow_up_creation = _run_retrospective_follow_up(
         normalized=normalized,
@@ -4006,13 +4007,19 @@ def _apply_retrospective_judge(
     *,
     normalized: dict[str, Any] | None,
     publication: dict[str, Any],
+    state: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     record = dict(pipeline_retrospective)
     if not judge:
         record["judge"] = _disabled_retrospective_judge_record()
         return record
     signals = list(record.get("signals", [])) if isinstance(record.get("signals"), list) else []
-    judge_signals = _retrospective_judge_signals(judge)
+    judge_signals = _retrospective_judge_signals(
+        judge,
+        existing_signals=signals,
+        publication=publication,
+        state=state,
+    )
     if judge_signals:
         signals.extend(judge_signals)
     record["signals"] = signals
@@ -4024,7 +4031,13 @@ def _apply_retrospective_judge(
     return record
 
 
-def _retrospective_judge_signals(judge: dict[str, Any]) -> list[dict[str, Any]]:
+def _retrospective_judge_signals(
+    judge: dict[str, Any],
+    *,
+    existing_signals: list[dict[str, Any]],
+    publication: dict[str, Any],
+    state: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
     if not isinstance(judge, dict) or not judge.get("enabled"):
         return []
     status = string_field(judge, "status") or ""
@@ -4037,6 +4050,12 @@ def _retrospective_judge_signals(judge: dict[str, Any]) -> list[dict[str, Any]]:
     return [
         {
             "kind": "retrospective-judge",
+            "scope": _retrospective_judge_signal_scope(
+                judge,
+                existing_signals=existing_signals,
+                publication=publication,
+                state=state,
+            ),
             "severity": severity,
             "summary": redact_text(string_field(judge, "summary") or status or "retrospective judge reported an issue"),
             "evidence_paths": _retrospective_evidence_paths(
@@ -4047,6 +4066,43 @@ def _retrospective_judge_signals(judge: dict[str, Any]) -> list[dict[str, Any]]:
             ),
         }
     ]
+
+
+def _retrospective_judge_signal_scope(
+    judge: dict[str, Any],
+    *,
+    existing_signals: list[dict[str, Any]],
+    publication: dict[str, Any],
+    state: dict[str, Any] | None = None,
+) -> str:
+    if publication.get("status") != "blocked":
+        return "pipeline-process"
+    reason = string_field(publication, "reason") or ""
+    if not (
+        reason.startswith("review did not reach passed: request_revision")
+        or reason.startswith("review feedback retry budget exhausted:")
+        or reason.startswith("review requested changes:")
+    ):
+        return "pipeline-process"
+    review = state.get("review") if isinstance(state, dict) and isinstance(state.get("review"), dict) else {}
+    if review_feedback_pipeline_follow_up(review):
+        return "pipeline-process"
+    if any(
+        isinstance(signal, dict)
+        and string_field(signal, "scope") != "target-work"
+        for signal in existing_signals
+    ):
+        return "pipeline-process"
+    if not any(
+        isinstance(signal, dict)
+        and string_field(signal, "kind") == "retry-or-blocked"
+        and string_field(signal, "scope") == "target-work"
+        for signal in existing_signals
+    ):
+        return "pipeline-process"
+    if string_field(judge, "classification") not in {"judge_failure", "judge_warning"}:
+        return "pipeline-process"
+    return "target-work"
 
 
 def _run_retrospective_judge(
