@@ -5307,16 +5307,25 @@ def _follow_up_summary_for_signal(signal: dict[str, Any], prefix: str) -> str:
     return prefix
 
 
+def _signal_targets_publication(signal: dict[str, Any]) -> bool:
+    evidence_paths = signal.get("evidence_paths")
+    return isinstance(evidence_paths, list) and "publication-result.json" in evidence_paths
+
+
 def _follow_up_for_signal(signal: dict[str, Any]) -> dict[str, Any] | None:
     kind = string_field(signal, "kind") or ""
     if kind == "missing-tool-or-config":
         summary = "Fix the missing tool or configuration in validation evidence before rerunning the workstream."
+        labels = ["afk:follow-up", "area:validation"]
+        if _signal_targets_publication(signal):
+            summary = "Fix the missing tool or configuration in publication evidence before rerunning the workstream."
+            labels = ["afk:follow-up", "area:publication"]
         if _signal_has_specific_failure_details(signal):
             summary = _follow_up_summary_for_signal(signal, "Fix")
         return _retrospective_follow_up_item(
             kind=kind,
             summary=summary,
-            labels=["afk:follow-up", "area:validation"],
+            labels=labels,
         )
     if kind == "validation-failure":
         return _retrospective_follow_up_item(

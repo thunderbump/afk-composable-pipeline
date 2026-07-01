@@ -569,6 +569,10 @@ class WorkstreamStatusMappingTest(unittest.TestCase):
         self.assertEqual(record["signals"][0]["classification"], "missing-tool-or-config")
         self.assertIn("publisher.gh.auth.config_dir must be outside checkout", record["signals"][0]["excerpt"])
         self.assertEqual(record["signals"][0]["evidence_paths"], ["publication-result.json"])
+        self.assertEqual(
+            record["recommended_follow_up"][0]["labels"],
+            ["afk:follow-up", "area:publication", "project:afk-composable-pipeline"],
+        )
 
     def test_pipeline_retrospective_record_surfaces_publisher_auth_failure(self):
         record = pipeline_retrospective_record(
