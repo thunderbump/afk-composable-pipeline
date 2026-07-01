@@ -158,6 +158,18 @@ The recipe schema is intentionally small:
   values.
 - `retry_policy.max_retries` is optional and defaults to `0`. It bounds how many
   same-item retry checkout cycles may start after a failed validation.
+- `validation_feedback.enabled` is optional. When true, repairable validation
+  failures inject a bounded `prepare-checkout -> implement -> validate` retry
+  loop that passes validation evidence back into `implement` as
+  `repair_context`.
+- `review_feedback.enabled` is optional and defaults to `false`. When true,
+  `request_revision` / request-changes review results inject a bounded
+  `prepare-checkout -> implement -> validate -> review` retry loop. The repair
+  context carries the reviewer role, severity, file/line when present, required
+  fix, current implementation summary, and final validation evidence. Addressed
+  findings are appended to `review_cycles` with response evidence, while
+  pipeline/tool-only findings stay out of target-code repair and are recorded as
+  pipeline follow-up evidence on the review cycle response.
 - `review_cycles` is optional while a PR is still open, but terminal tracker
   close guidance requires recorded review-cycle evidence unless the terminal
   decision explicitly documents a waiver with

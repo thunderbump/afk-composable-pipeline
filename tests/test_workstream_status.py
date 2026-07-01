@@ -13,6 +13,7 @@ from afk.workstream import (  # noqa: E402
     normalize_retrospective_follow_up_config,
     normalize_retrospective_judge,
     pipeline_retrospective_record,
+    tracker_terminal_decision_close_block_reason,
     tracker_record,
     workstream_status_from_publication,
 )
@@ -1442,6 +1443,41 @@ class WorkstreamStatusMappingTest(unittest.TestCase):
         self.assertEqual(record["status"], "closed")
         self.assertTrue(record["close_source_item"])
         self.assertEqual(record["close_reason"], "merged via deadbeef")
+
+    def test_tracker_terminal_decision_close_block_reason_uses_runtime_review_cycles(self):
+        reason = tracker_terminal_decision_close_block_reason(
+            {
+                "workstream_id": "central-afk-pr.17",
+                "tracker": {
+                    "terminal_decision": {
+                        "status": "merged",
+                        "merge_commit": "deadbeef",
+                        "pr_url": "https://github.example/pr/17",
+                        "review_feedback_status": "resolved",
+                    }
+                },
+                "review_cycles": [],
+            },
+            {
+                "runtime_review_cycles": [
+                    {
+                        "cycle": 1,
+                        "status": "findings-addressed",
+                        "reviews": [
+                            {
+                                "role": "correctness",
+                                "status": "request-changes",
+                                "summary": "Please tighten the close guidance.",
+                                "requires_response": True,
+                                "response": {"status": "addressed", "summary": "Fixed in follow-up."},
+                            }
+                        ],
+                    }
+                ]
+            },
+        )
+
+        self.assertEqual(reason, "")
 
     def test_tracker_record_closes_terminal_merge_when_missing_review_cycles_are_explicitly_waived(self):
         record = tracker_record(
