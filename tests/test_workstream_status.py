@@ -496,11 +496,11 @@ class WorkstreamStatusMappingTest(unittest.TestCase):
                 "enabled": True,
                 "status": "failed",
                 "classification": "judge_failure",
-                "summary": "Fail: review is not yet passing.",
+                "summary": "Needs attention.",
                 "findings": [
                     {
                         "severity": "medium",
-                        "summary": "There are unresolved review findings.",
+                        "summary": "Outstanding issue remains.",
                     }
                 ],
                 "evidence": {
@@ -514,7 +514,53 @@ class WorkstreamStatusMappingTest(unittest.TestCase):
             publication=publication,
         )
 
-        self.assertEqual(record["health"], "healthy")
+        self.assertEqual(record["signals"][0]["scope"], "target-work")
+        self.assertEqual(record["signals"][1]["kind"], "retrospective-judge")
+        self.assertEqual(record["signals"][1]["scope"], "target-work")
+        self.assertEqual(record["follow_up"]["recommended"], [])
+        self.assertEqual(record["recommended_follow_up"], [])
+
+    def test_pipeline_retrospective_record_classifies_plain_review_requested_changes_judge_failure_as_target_work(self):
+        state = retrospective_state()
+        state["review"] = {
+            "status": "request_revision",
+            "summary": "review requested changes",
+            "reviewer_result": {
+                "findings": [
+                    {
+                        "classification": "correctness",
+                        "summary": "Fix the target bug before publishing.",
+                    }
+                ]
+            },
+        }
+        publication = {"status": "blocked", "reason": "review requested changes: Fix the target bug before publishing."}
+
+        record = pipeline_retrospective_record(
+            state,
+            publication,
+            retrospective_tracker("validated"),
+        )
+
+        record = _apply_retrospective_judge(
+            record,
+            {
+                "enabled": True,
+                "status": "failed",
+                "classification": "judge_failure",
+                "summary": "Needs attention.",
+                "findings": [{"severity": "medium", "summary": "Outstanding issue remains."}],
+                "evidence": {
+                    "request_path": "retrospective-judge-request.json",
+                    "result_path": "retrospective-judge-result.json",
+                    "stdout_path": "retrospective-judge-stdout.log",
+                    "stderr_path": "retrospective-judge-stderr.log",
+                },
+            },
+            normalized=None,
+            publication=publication,
+        )
+
         self.assertEqual(record["signals"][0]["scope"], "target-work")
         self.assertEqual(record["signals"][1]["kind"], "retrospective-judge")
         self.assertEqual(record["signals"][1]["scope"], "target-work")
@@ -1084,8 +1130,8 @@ class WorkstreamStatusMappingTest(unittest.TestCase):
                 "enabled": True,
                 "status": "failed",
                 "classification": "judge_failure",
-                "summary": "Fail: review is still not passing.",
-                "findings": [{"severity": "medium", "summary": "The review blocker remains unresolved."}],
+                "summary": "Needs attention.",
+                "findings": [{"severity": "medium", "summary": "Outstanding issue remains."}],
                 "evidence": {
                     "request_path": "retrospective-judge-request.json",
                     "result_path": "retrospective-judge-result.json",

@@ -4071,6 +4071,7 @@ def _retrospective_judge_signal_scope(
     if not (
         reason.startswith("review did not reach passed: request_revision")
         or reason.startswith("review feedback retry budget exhausted:")
+        or reason.startswith("review requested changes:")
     ):
         return "pipeline-process"
     if any(
