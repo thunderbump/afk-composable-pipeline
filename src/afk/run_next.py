@@ -31,6 +31,7 @@ def run_next(
     agent: dict[str, Any] | None = None,
     reviewer: dict[str, Any] | None = None,
     retrospective_judge: dict[str, Any] | None = None,
+    retrospective_follow_up: dict[str, Any] | None = None,
     publisher_factory: Callable[[str], dict[str, Any] | None] | None = None,
     ready_tag: str = READY_TAG,
     selector_mode: str = "deterministic",
@@ -70,6 +71,7 @@ def run_next(
             agent=agent,
             reviewer=reviewer,
             retrospective_judge=retrospective_judge,
+            retrospective_follow_up=retrospective_follow_up,
             publisher=publisher_factory(chosen["external_id"]) if publisher_factory is not None else None,
             sources=selection_request["sources"],
             required_labels=selection_request["required_labels"],
@@ -102,6 +104,8 @@ def validate_beads_workspace(beads_workspace: Path) -> Path:
         resolved_workspace = beads_workspace.resolve(strict=True)
     except OSError as exc:
         raise ValueError(f"beads workspace is not available: {beads_workspace}") from exc
+    if ".beads" in resolved_workspace.parts:
+        raise ValueError("project-local .beads workspace is not allowed")
     if not resolved_workspace.is_dir():
         raise ValueError(f"beads workspace is not available: {beads_workspace}")
     if not os.access(resolved_workspace, os.R_OK | os.X_OK):
