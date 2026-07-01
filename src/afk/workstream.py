@@ -1402,6 +1402,8 @@ def validation_feedback_repairable(output: dict[str, Any]) -> bool:
         return False
     if _retrospective_text_has_missing_tool_or_config(excerpt):
         return False
+    if _validation_feedback_text_has_infra_or_setup_failure(excerpt):
+        return False
     return True
 
 
@@ -5647,6 +5649,18 @@ def _retrospective_missing_tool_or_config_summary(text: str) -> str:
     if not _retrospective_text_has_missing_tool_or_config(text):
         return ""
     return redact_text(text)
+
+
+def _validation_feedback_text_has_infra_or_setup_failure(text: str) -> bool:
+    lowered = text.lower()
+    return any(
+        marker in lowered
+        for marker in (
+            "permission denied",
+            "no such file or directory",
+            "starting zone harness",
+        )
+    )
 
 
 def _retrospective_text_has_missing_tool_or_config(text: str) -> bool:
