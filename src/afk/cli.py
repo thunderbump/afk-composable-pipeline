@@ -181,6 +181,7 @@ def main(argv: list[str] | None = None) -> int:
                 reviewer=reviewer,
                 retrospective_judge=retrospective_judge,
                 publisher=recipe_publisher,
+                enable_review_feedback=args.role_profile == PRODUCTION_ROLE_PROFILE,
             )
         except ValueError as exc:
             parser.error(str(exc))

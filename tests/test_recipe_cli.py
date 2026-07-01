@@ -255,6 +255,7 @@ class GenerateRecipeCliTest(unittest.TestCase):
                 },
             )
             self.assertEqual(implement_agent["timeout_seconds"], 3600)
+            self.assertEqual(recipe["review_feedback"], {"enabled": True})
 
             reviewer = recipe["steps"][4]["input"]["reviewer"]
             self.assertEqual(reviewer["type"], "real-reviewer-command")
@@ -324,6 +325,7 @@ class GenerateRecipeCliTest(unittest.TestCase):
             recipe = json.loads(output.read_text(encoding="utf-8"))
             self.assertEqual(recipe["steps"][2]["input"]["agent"]["type"], "fake-pi-command")
             self.assertEqual(recipe["steps"][4]["input"]["reviewer"]["type"], "fake-reviewer-command")
+            self.assertEqual(recipe["review_feedback"], {"enabled": False})
             self.assertNotIn("retrospective_judge", recipe)
 
     def test_generate_recipe_production_default_fails_fast_without_pi_auth_mounts(self):
