@@ -8797,6 +8797,126 @@ Path({str(fake_calls)!r}).write_text("gh should not run\\n", encoding="utf-8")
             self.assertEqual(result["retry_attempts"], [])
             self.assertIn("validate did not reach validated", result["publication"]["reason"])
 
+    def test_workstream_validation_feedback_retries_compiler_missing_header_failure(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repo = temp_path / "repo-src"
+            checkout = temp_path / "checkout"
+            ledger = temp_path / "ledger"
+            init_repo(repo)
+            fake_git = temp_path / "publisher-git"
+            fake_gh = temp_path / "publisher-gh"
+            write_executable(fake_git, f"#!{sys.executable}\nraise SystemExit(9)\n")
+            write_executable(fake_gh, f"#!{sys.executable}\nraise SystemExit(9)\n")
+            validate_count = temp_path / "validate-count.txt"
+            agent_code = textwrap.dedent(
+                f"""
+                import json
+                import os
+                import subprocess
+                from pathlib import Path
+
+                capsule = json.loads(Path(os.environ["AFK_JOB_CAPSULE"]).read_text(encoding="utf-8"))
+                repair = capsule.get("repair_context")
+                if repair:
+                    assert repair["attempt"] == 1
+                    assert repair["validation"]["classification"] == "compiler"
+                    assert "missing_header.h: No such file or directory" in repair["validation"]["root_excerpt"]
+                    Path("repair.txt").write_text("repair\\n", encoding="utf-8")
+                    subprocess.run(["git", "add", "repair.txt"], check=True)
+                    subprocess.run(["git", "commit", "-m", "repair missing header"], check=True)
+                else:
+                    Path("implemented.txt").write_text("initial\\n", encoding="utf-8")
+                    subprocess.run(["git", "add", "implemented.txt"], check=True)
+                    subprocess.run(["git", "commit", "-m", "initial implementation"], check=True)
+                Path("agent-result.json").write_text(
+                    json.dumps({{"status": "completed", "summary": "implementation complete"}}),
+                    encoding="utf-8",
+                )
+                """
+            ).strip()
+            worker_code = textwrap.dedent(
+                f"""
+                import json
+                import os
+                from pathlib import Path
+
+                result_path = Path(os.environ["AFK_WORKER_RESULT"])
+                count_path = Path({str(validate_count)!r})
+                prior = int(count_path.read_text(encoding="utf-8")) if count_path.exists() else 0
+                count_path.write_text(str(prior + 1), encoding="utf-8")
+                request = json.loads(Path(os.environ["AFK_WORKER_REQUEST"]).read_text(encoding="utf-8"))
+                if prior == 0:
+                    payload = {{
+                        "profile": request["profile"],
+                        "status": "fail",
+                        "summary": "compile failed",
+                        "failures": [
+                            {{
+                                "name": "build",
+                                "status": "fail",
+                                "category": "compiler",
+                                "reason": "src/generated/foo.cpp:10: fatal error: missing_header.h: No such file or directory",
+                                "command": "ninja test",
+                                "exitCode": 1,
+                            }}
+                        ],
+                    }}
+                else:
+                    payload = {{
+                        "profile": request["profile"],
+                        "status": "pass",
+                        "summary": "tests passed",
+                        "steps": [{{"name": "unit", "status": "pass"}}],
+                    }}
+                result_path.write_text(json.dumps(payload), encoding="utf-8")
+                """
+            ).strip()
+            recipe = successful_recipe(temp_path, repo, checkout, fake_git, fake_gh)
+            recipe["publisher"] = {"enabled": False}
+            recipe["retry_policy"] = {"max_retries": 1}
+            recipe["validation_feedback"] = {"enabled": True}
+            recipe["steps"][2]["input"]["agent"]["command"] = [sys.executable, "-c", agent_code]
+            recipe["steps"][3]["input"]["worker"]["command"] = [sys.executable, "-c", worker_code]
+
+            completed = run_afk(
+                "run-workstream",
+                "--workstream-id",
+                "central-lve.9",
+                "--input",
+                json.dumps(recipe),
+                "--ledger",
+                str(ledger),
+                env_overrides={
+                    "GIT_ALLOW_PROTOCOL": "file",
+                    "GIT_AUTHOR_NAME": "AFK Test",
+                    "GIT_AUTHOR_EMAIL": "afk-test@example.test",
+                    "GIT_COMMITTER_NAME": "AFK Test",
+                    "GIT_COMMITTER_EMAIL": "afk-test@example.test",
+                },
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            result = json.loads((ledger / summary["result_path"]).read_text(encoding="utf-8"))
+
+            self.assertEqual(summary["status"], "validated-unpublished")
+            self.assertEqual(
+                [step["name"] for step in result["steps"]],
+                [
+                    "select-work",
+                    "prepare-checkout",
+                    "implement",
+                    "validate",
+                    "prepare-checkout",
+                    "implement",
+                    "validate",
+                    "review",
+                ],
+            )
+            repair_output = json.loads((ledger / result["steps"][5]["result_path"]).read_text(encoding="utf-8"))["output"]
+            self.assertIn("missing_header.h: No such file or directory", repair_output["repair_context"]["validation"]["root_excerpt"])
+
     def test_workstream_validation_feedback_reports_exhausted_retry_budget(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)

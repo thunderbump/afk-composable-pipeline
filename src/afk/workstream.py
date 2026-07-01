@@ -5657,7 +5657,6 @@ def _validation_feedback_text_has_infra_or_setup_failure(text: str) -> bool:
         marker in lowered
         for marker in (
             "permission denied",
-            "no such file or directory",
             "starting zone harness",
         )
     )
