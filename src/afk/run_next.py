@@ -73,6 +73,7 @@ def run_next(
             sources=selection_request["sources"],
             required_labels=selection_request["required_labels"],
             required_metadata=selection_request["required_metadata"],
+            enable_review_feedback=True,
         )
         if execute:
             if ledger_dir is None:

@@ -9441,6 +9441,7 @@ Path({str(fake_calls)!r}).write_text("gh should not run\\n", encoding="utf-8")
                 validation_profile="tier1",
                 sources=[{"type": "fixture", "id": "fixture", "items": [selected_fixture_item()]}],
                 required_labels=["afk:ready"],
+                enable_review_feedback=True,
             )
             recipe["steps"][0]["input"]["required_metadata"] = []
             recipe["publisher"] = {"enabled": False}

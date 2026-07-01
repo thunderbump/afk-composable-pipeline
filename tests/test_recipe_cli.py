@@ -1558,6 +1558,31 @@ class GenerateRecipeCliTest(unittest.TestCase):
                 recipe["steps"][2]["input"]["validation"],
             )
 
+    def test_generate_workstream_recipe_can_explicitly_enable_review_feedback(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repo = temp_path / "repo-src"
+            beads_workspace = temp_path / "central-beads"
+            checkout_root = temp_path / "checkouts"
+            checkout_path = checkout_root / "demo"
+            contract_path = temp_path / "project-contracts" / "bump-eqemu.json"
+            init_repo(repo)
+            beads_workspace.mkdir()
+            contract_path.parent.mkdir()
+            write_contract(contract_path, project_slug="bump-eqemu", repo_url=repo.as_uri())
+
+            recipe = generate_workstream_recipe(
+                workstream_id="central-anh.6",
+                project_contract=load_project_contract("bump-eqemu", contract_path.parent, cwd=ROOT),
+                beads_workspace=beads_workspace,
+                checkout_root=checkout_root,
+                checkout_path=checkout_path,
+                validation_profile="tier1",
+                enable_review_feedback=True,
+            )
+
+            self.assertEqual(recipe["review_feedback"], {"enabled": True})
+
     def test_generate_recipe_derives_project_worker_stack_from_checkout_parent(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
