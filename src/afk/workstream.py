@@ -4950,9 +4950,9 @@ def _validation_failure_retrospective_signal(
         string_field(failure, "excerpt") or string_field(failure, "reason") or string_field(output, "summary") or ""
     )
     log_path = string_field(failure, "log_path") or ""
-    if not log_path:
-        return None
     kind = "missing-tool-or-config" if _retrospective_text_has_missing_tool_or_config(excerpt) else "validation-failure"
+    if not log_path and kind != "missing-tool-or-config":
+        return None
     validation_info = output.get("validation") if isinstance(output.get("validation"), dict) else {}
     step = string_field(failure, "name") or string_field(validation_info, "requested_profile") or "validation"
     classification = string_field(failure, "category") or kind
@@ -4972,40 +4972,34 @@ def _validation_failure_retrospective_signal(
 
 
 def _publication_retrospective_signals(publication: dict[str, Any]) -> list[dict[str, Any]]:
-    reason = string_field(publication, "reason") or ""
-    if not reason:
+    if publication.get("status") != "failed-needs-human":
         return []
-    redacted_reason = redact_text(reason)
-    signals = []
-    if publication.get("status") == "failed-needs-human":
-        if _publisher_auth_failure_reason(reason):
-            signals.append(
-                {
-                    "kind": "publisher-auth",
-                    "severity": "error",
-                    "summary": redacted_reason,
-                    "evidence_paths": [],
-                }
-            )
-        elif _retrospective_missing_tool_or_config_summary(reason):
-            signals.append(
-                {
-                    "kind": "missing-tool-or-config",
-                    "severity": "error",
-                    "summary": redacted_reason,
-                    "evidence_paths": [],
-                }
-            )
-        else:
-            signals.append(
-                {
-                    "kind": "publisher-failure",
-                    "severity": "error",
-                    "summary": redacted_reason,
-                    "evidence_paths": [],
-                }
-            )
-    return signals
+    reason = string_field(publication, "reason") or ""
+    stdout_excerpt = string_field(publication, "stdout_excerpt") or ""
+    stderr_excerpt = string_field(publication, "stderr_excerpt") or ""
+    failure_text = "\n".join(part for part in (reason, stderr_excerpt, stdout_excerpt) if part)
+    if not failure_text:
+        return []
+    excerpt = runtime_failure_excerpt(stderr_excerpt) or runtime_failure_excerpt(stdout_excerpt) or reason
+    step = _publication_failure_step(publication)
+    evidence_paths = _retrospective_evidence_paths("publication-result.json")
+    if _publisher_auth_failure_reason(failure_text):
+        kind = "publisher-auth"
+    elif _retrospective_text_has_missing_tool_or_config(failure_text):
+        kind = "missing-tool-or-config"
+    else:
+        kind = "publisher-failure"
+    return [
+        {
+            "kind": kind,
+            "severity": "error",
+            "summary": redact_text(excerpt),
+            "step": redact_text(step),
+            "classification": redact_text(kind),
+            "excerpt": redact_text(excerpt),
+            "evidence_paths": evidence_paths,
+        }
+    ]
 
 
 def _blocked_retrospective_signals(publication: dict[str, Any]) -> list[dict[str, Any]]:
@@ -5396,6 +5390,23 @@ def _retrospective_text_has_missing_tool_or_config(text: str) -> bool:
 def _publisher_auth_failure_reason(reason: str) -> bool:
     lowered = reason.lower()
     return "gh auth status failed" in lowered or "authentication failed" in lowered
+
+
+def _publication_failure_step(publication: dict[str, Any]) -> str:
+    command = publication.get("command")
+    if not isinstance(command, list):
+        return "publisher"
+    max_parts = 3 if command and command[0] == "gh" else 2
+    parts = []
+    for part in command:
+        if not isinstance(part, str) or not part:
+            continue
+        if part.startswith("-"):
+            break
+        parts.append(part)
+        if len(parts) == max_parts:
+            break
+    return " ".join(parts) or "publisher"
 
 
 def _retrospective_evidence_paths(*paths: str) -> list[str]:

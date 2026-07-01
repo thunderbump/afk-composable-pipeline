@@ -338,6 +338,49 @@ class WorkstreamStatusMappingTest(unittest.TestCase):
         )
         self.assertTrue(record["follow_up"]["recommended"][0]["fingerprint"].startswith("retro-follow-up:"))
 
+    def test_pipeline_retrospective_record_surfaces_missing_tool_validation_signal_without_log_path(self):
+        state = retrospective_state()
+        state["validations"] = [
+            {
+                "output": {
+                    "status": "failed_validation",
+                    "summary": "failed_validation",
+                    "actionable_failures": [
+                        {
+                            "category": "validation",
+                            "reason": "python3.13: command not found",
+                            "excerpt": "python3.13: command not found token=ghp_validation_secret_1234567890",
+                        }
+                    ],
+                    "checkout": {"start_commit": "abc123"},
+                    "validation": {"requested_profile": "tier1"},
+                },
+                "step_result_path": "/tmp/ledger/runs/validate/step-result.json",
+                "worker_result_path": "/tmp/ledger/runs/validate/worker-result.json",
+            }
+        ]
+        record = pipeline_retrospective_record(
+            state,
+            {"status": "blocked", "reason": "required final validation evidence did not pass: tier1"},
+            retrospective_tracker("selected"),
+        )
+
+        self.assertEqual(record["signals"][0]["kind"], "missing-tool-or-config")
+        self.assertEqual(record["signals"][0]["step"], "tier1")
+        self.assertEqual(record["signals"][0]["classification"], "validation")
+        self.assertIn("python3.13: command not found", record["signals"][0]["excerpt"])
+        self.assertEqual(
+            record["signals"][0]["evidence_paths"],
+            [
+                "/tmp/ledger/runs/validate/step-result.json",
+                "/tmp/ledger/runs/validate/worker-result.json",
+            ],
+        )
+        self.assertEqual(
+            record["recommended_follow_up"][0]["summary"],
+            "Fix tier1 [validation]: python3.13: command not found token=[REDACTED]",
+        )
+
     def test_pipeline_retrospective_record_prefers_specific_validation_follow_up_over_judge_generic(self):
         state = retrospective_state()
         state["validations"] = [
@@ -475,6 +518,7 @@ class WorkstreamStatusMappingTest(unittest.TestCase):
             {
                 "status": "failed-needs-human",
                 "reason": "publisher.gh.auth.config_dir must be outside checkout token=ghp_publication_secret_1234567890",
+                "command": ["gh", "pr", "create"],
             },
             retrospective_tracker("validated"),
         )
@@ -484,14 +528,19 @@ class WorkstreamStatusMappingTest(unittest.TestCase):
         self.assertEqual(record["signals"][0]["severity"], "error")
         self.assertIn("publisher.gh.auth.config_dir must be outside checkout", record["signals"][0]["summary"])
         self.assertIn("[REDACTED]", record["signals"][0]["summary"])
-        self.assertEqual(record["signals"][0]["evidence_paths"], [])
+        self.assertEqual(record["signals"][0]["step"], "gh pr create")
+        self.assertEqual(record["signals"][0]["classification"], "missing-tool-or-config")
+        self.assertIn("publisher.gh.auth.config_dir must be outside checkout", record["signals"][0]["excerpt"])
+        self.assertEqual(record["signals"][0]["evidence_paths"], ["publication-result.json"])
 
     def test_pipeline_retrospective_record_surfaces_publisher_auth_failure(self):
         record = pipeline_retrospective_record(
             retrospective_state(),
             {
                 "status": "failed-needs-human",
-                "reason": "gh auth status failed token=ghp_auth_secret_1234567890",
+                "reason": "gh command failed",
+                "command": ["gh", "auth", "status", "--hostname", "github.com"],
+                "stderr_excerpt": "gh auth status failed token=ghp_auth_secret_1234567890",
             },
             retrospective_tracker("validated"),
         )
@@ -499,8 +548,12 @@ class WorkstreamStatusMappingTest(unittest.TestCase):
         self.assertEqual(record["health"], "failing")
         self.assertEqual(record["signals"][0]["kind"], "publisher-auth")
         self.assertEqual(record["signals"][0]["severity"], "error")
+        self.assertEqual(record["signals"][0]["step"], "gh auth status")
+        self.assertEqual(record["signals"][0]["classification"], "publisher-auth")
         self.assertIn("gh auth status failed", record["signals"][0]["summary"])
         self.assertIn("[REDACTED]", record["signals"][0]["summary"])
+        self.assertIn("gh auth status failed", record["signals"][0]["excerpt"])
+        self.assertEqual(record["signals"][0]["evidence_paths"], ["publication-result.json"])
         self.assertEqual(
             record["recommended_follow_up"],
             [
@@ -510,6 +563,37 @@ class WorkstreamStatusMappingTest(unittest.TestCase):
                 }
             ],
         )
+
+    def test_pipeline_retrospective_record_keeps_generic_publisher_follow_up_fingerprint_compatible(self):
+        record = pipeline_retrospective_record(
+            retrospective_state(),
+            {
+                "status": "failed-needs-human",
+                "reason": "git command failed",
+                "command": ["git", "push", "origin", "HEAD"],
+                "stderr_excerpt": "fatal: unable to access https://github.example/repo.git/",
+            },
+            retrospective_tracker("validated"),
+            normalized={
+                "retrospective": {
+                    "follow_up": {
+                        "created": [
+                            {
+                                "summary": "Address the blocked publication or retry evidence before rerunning the workstream.",
+                                "labels": ["afk:follow-up", "area:workstream"],
+                            }
+                        ]
+                    }
+                }
+            },
+        )
+
+        self.assertEqual(record["signals"][0]["kind"], "publisher-failure")
+        self.assertEqual(record["signals"][0]["step"], "git push")
+        self.assertEqual(record["signals"][0]["classification"], "publisher-failure")
+        self.assertIn("fatal: unable to access", record["signals"][0]["excerpt"])
+        self.assertEqual(record["signals"][0]["evidence_paths"], ["publication-result.json"])
+        self.assertEqual(record["recommended_follow_up"], [])
 
     def test_pipeline_retrospective_record_surfaces_retry_block_and_dirty_cleanup(self):
         state = retrospective_state()
