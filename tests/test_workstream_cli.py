@@ -9680,6 +9680,164 @@ Path({str(fake_calls)!r}).write_text("gh should not run\\n", encoding="utf-8")
             self.assertTrue((second_checkout / "implemented-second.txt").exists())
             self.assertFalse(fake_calls.exists())
 
+    def test_workstream_reselects_from_same_candidate_set_after_validation_failure(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repo = temp_path / "repo-src"
+            checkout = temp_path / "checkout"
+            second_checkout = temp_path / "checkout-two"
+            ledger = temp_path / "ledger"
+            fake_calls = temp_path / "fake-calls.jsonl"
+            init_repo(repo)
+            fake_git = temp_path / "publisher-git"
+            fake_gh = temp_path / "publisher-gh"
+            write_executable(
+                fake_git,
+                f"""#!{sys.executable}
+from pathlib import Path
+Path({str(fake_calls)!r}).write_text("git should not run\\n", encoding="utf-8")
+""",
+            )
+            write_executable(
+                fake_gh,
+                f"""#!{sys.executable}
+from pathlib import Path
+Path({str(fake_calls)!r}).write_text("gh should not run\\n", encoding="utf-8")
+""",
+            )
+            candidate_set = [
+                {
+                    **selected_fixture_item("central-lve.10", "Ready label without AFK readiness"),
+                    "labels": ["project:afk-composable-pipeline", "ready-for-agent"],
+                    "afk": {"ready": False},
+                },
+                {
+                    **selected_fixture_item("central-lve.11", "Dependency-blocked candidate"),
+                    "labels": ["project:afk-composable-pipeline", "ready-for-agent"],
+                    "dependencies": [{"id": "central-lve.99", "status": "open"}],
+                },
+                {
+                    **selected_fixture_item("central-lve.12", "First runnable candidate"),
+                    "labels": ["project:afk-composable-pipeline", "ready-for-agent"],
+                },
+                {
+                    **selected_fixture_item("central-lve.13", "Fallback runnable candidate"),
+                    "labels": ["project:afk-composable-pipeline", "ready-for-agent"],
+                },
+            ]
+            second_agent_code = textwrap.dedent(
+                """
+                import json
+                import subprocess
+                from pathlib import Path
+
+                Path("implemented-second.txt").write_text("central-lve.13\\n", encoding="utf-8")
+                subprocess.run(["git", "add", "implemented-second.txt"], check=True)
+                subprocess.run(["git", "commit", "-m", "implement central-lve.13"], check=True)
+                Path("agent-result.json").write_text(
+                    json.dumps({"status": "completed", "summary": "implemented replacement work item"}),
+                    encoding="utf-8",
+                )
+                """
+            ).strip()
+            recipe = successful_recipe(temp_path, repo, checkout, fake_git, fake_gh)
+            recipe["publisher"] = {"enabled": False}
+            recipe["steps"][0]["input"] = {
+                "required_labels": ["project:afk-composable-pipeline", "ready-for-agent"],
+                "required_metadata": ["workstream", "acceptance_criteria", "afk.ready"],
+                "selection_limit": 1,
+                "sources": [{"type": "fixture", "id": "fixture", "items": candidate_set}],
+            }
+            failing_worker_code = textwrap.dedent(
+                """
+                import sys
+
+                print("python3.13: command not found")
+                sys.exit(127)
+                """
+            ).strip()
+            recipe["steps"][3]["input"]["worker"]["command"] = [sys.executable, "-c", failing_worker_code]
+            recipe["steps"] = recipe["steps"][:4] + [
+                recipe["steps"][0],
+                {
+                    "name": "prepare-checkout",
+                    "input": {
+                        "repo_url": str(repo),
+                        "base_ref": "main",
+                        "checkout_root": str(temp_path),
+                        "checkout_path": str(second_checkout),
+                    },
+                },
+                {
+                    "name": "implement",
+                    "input": {
+                        "guardrails": ["stay within checkout"],
+                        "validation": {"profile": "tier1", "commands": []},
+                        "agent": {
+                            "type": "fake-pi-command",
+                            "command": [sys.executable, "-c", second_agent_code],
+                            "result_path": "agent-result.json",
+                        },
+                    },
+                },
+            ]
+
+            completed = run_afk(
+                "run-workstream",
+                "--workstream-id",
+                "central-lve.9",
+                "--input",
+                json.dumps(recipe),
+                "--ledger",
+                str(ledger),
+                env_overrides={
+                    "GIT_ALLOW_PROTOCOL": "file",
+                    "GIT_AUTHOR_NAME": "AFK Test",
+                    "GIT_AUTHOR_EMAIL": "afk-test@example.test",
+                    "GIT_COMMITTER_NAME": "AFK Test",
+                    "GIT_COMMITTER_EMAIL": "afk-test@example.test",
+                },
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            result = json.loads((ledger / summary["result_path"]).read_text(encoding="utf-8"))
+            reselection = json.loads(Path(result["steps"][4]["result_abspath"]).read_text(encoding="utf-8"))
+
+            self.assertEqual(summary["status"], "blocked")
+            self.assertEqual(result["publication"]["status"], "blocked")
+            self.assertEqual(
+                [step["name"] for step in result["steps"]],
+                [
+                    "select-work",
+                    "prepare-checkout",
+                    "implement",
+                    "validate",
+                    "select-work",
+                    "prepare-checkout",
+                    "implement",
+                ],
+            )
+            self.assertEqual(result["selected_work"][0]["external_id"], "central-lve.13")
+            self.assertEqual(result["selected_work"][0]["result"], "blocked")
+            self.assertEqual(
+                [item["external_id"] for item in reselection["output"]["selected_work"]],
+                ["central-lve.13"],
+            )
+            self.assertEqual(
+                [
+                    (item["candidate"]["external_id"], item["reason"])
+                    for item in reselection["output"]["skipped_candidates"]
+                ],
+                [
+                    ("central-lve.10", "missing_metadata:afk.ready"),
+                    ("central-lve.11", "blocked"),
+                    ("central-lve.12", "attempted_in_run"),
+                ],
+            )
+            self.assertTrue((second_checkout / "implemented-second.txt").exists())
+            self.assertFalse(fake_calls.exists())
+
     def test_workstream_update_mode_edits_existing_terminal_pr(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)

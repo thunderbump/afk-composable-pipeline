@@ -10,7 +10,8 @@ from typing import Any, Callable
 from urllib.parse import urlsplit
 
 from afk.contracts import ProjectContract
-from afk.recipes import generate_workstream_recipe
+from afk.recipes import RUNNABLE_REQUIRED_METADATA, generate_workstream_recipe
+from afk.selection import deterministic_candidate
 from afk.work_sources import select_work
 
 
@@ -71,6 +72,7 @@ def run_next(
             publisher=publisher_factory(chosen["external_id"]) if publisher_factory is not None else None,
             sources=selection_request["sources"],
             required_labels=selection_request["required_labels"],
+            required_metadata=selection_request["required_metadata"],
         )
         if execute:
             if ledger_dir is None:
@@ -138,6 +140,7 @@ def build_selection_request(
         )
     return {
         "required_labels": required_labels,
+        "required_metadata": list(RUNNABLE_REQUIRED_METADATA),
         "sources": sources,
     }
 
@@ -191,37 +194,6 @@ def selector_result(
             "rationale": chosen.get("selector_rationale", "deterministic default"),
         },
     }
-
-
-def deterministic_candidate(candidates: list[dict[str, Any]]) -> dict[str, Any]:
-    return sorted(candidates, key=candidate_sort_key)[0]
-
-
-def candidate_sort_key(candidate: dict[str, Any]) -> tuple[int, tuple[int, int], str, str]:
-    source_type_priority = 0 if candidate.get("source_type") == "beads" else 1
-    priority_sort_key = candidate_priority_sort_key(candidate)
-    return (
-        source_type_priority,
-        priority_sort_key,
-        str(candidate.get("external_id") or ""),
-        str(candidate.get("title") or ""),
-    )
-
-
-def candidate_priority_sort_key(candidate: dict[str, Any]) -> tuple[int, int]:
-    if candidate.get("source_type") != "beads":
-        return (1, 0)
-    priority = candidate.get("priority")
-    if isinstance(priority, bool):
-        priority = None
-    if isinstance(priority, int):
-        return (0, priority)
-    if isinstance(priority, str):
-        stripped = priority.strip()
-        if stripped.isdigit():
-            return (0, int(stripped))
-    return (1, 0)
-
 
 def parse_selector_choice(
     selector_model: str | None,

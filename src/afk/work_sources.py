@@ -8,6 +8,7 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+from afk.selection import deterministic_candidates
 
 SCHEMA_VERSION = 1
 OPEN_TRACKER_STATUSES = {
@@ -45,6 +46,8 @@ def select_work(input_data: Any, *, project_contract: Any = None) -> dict[str, A
     required_metadata = list(request.get("required_metadata", []))
     allowed_statuses = set(request.get("allowed_statuses", ["open"]))
     target_ids = set(request.get("target_ids", []))
+    exclude_ids = set(request.get("exclude_ids", []))
+    selection_limit = request.get("selection_limit")
 
     source_statuses: list[dict[str, Any]] = []
     selected_work: list[dict[str, Any]] = []
@@ -127,6 +130,7 @@ def select_work(input_data: Any, *, project_contract: Any = None) -> dict[str, A
                 required_metadata,
                 allowed_statuses,
                 target_ids,
+                exclude_ids,
             )
             if rejection is not None:
                 skipped_candidates.append({"candidate": candidate, "reason": rejection})
@@ -150,6 +154,11 @@ def select_work(input_data: Any, *, project_contract: Any = None) -> dict[str, A
                 selected_message(selected_count),
             )
         )
+
+    if isinstance(selection_limit, int) and not isinstance(selection_limit, bool) and selection_limit >= 0:
+        selected_work, overflow = limited_selected_work(selected_work, selection_limit)
+        for candidate in overflow:
+            skipped_candidates.append({"candidate": candidate, "reason": "selection_limit_exceeded"})
 
     return {
         "schema_version": SCHEMA_VERSION,
@@ -178,12 +187,28 @@ def invalid_request_result(message: str) -> dict[str, Any]:
 
 
 def request_payload_error(request: dict[str, Any]) -> str | None:
-    for key in ("required_labels", "required_metadata", "allowed_statuses", "target_ids"):
+    for key in ("required_labels", "required_metadata", "allowed_statuses", "target_ids", "exclude_ids"):
         if key in request and not is_string_list(request[key]):
             return f"{key} must be a list of strings"
+    if "selection_limit" in request:
+        selection_limit = request["selection_limit"]
+        if isinstance(selection_limit, bool) or not isinstance(selection_limit, int) or selection_limit < 0:
+            return "selection_limit must be a non-negative integer"
     if "sources" in request and not isinstance(request["sources"], list):
         return "sources must be a list"
     return None
+
+
+def limited_selected_work(
+    selected_work: list[dict[str, Any]],
+    selection_limit: int,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    if selection_limit >= len(selected_work):
+        return selected_work, []
+    limited = deterministic_candidates(selected_work, limit=selection_limit)
+    selected_identities = {duplicate_key(candidate) for candidate in limited}
+    overflow = [candidate for candidate in selected_work if duplicate_key(candidate) not in selected_identities]
+    return limited, overflow
 
 
 def is_string_list(value: Any) -> bool:
@@ -1125,6 +1150,7 @@ def rejection_reason(
     required_metadata: list[str],
     allowed_statuses: set[str],
     target_ids: set[str],
+    exclude_ids: set[str],
 ) -> str | None:
     if candidate["status"] not in allowed_statuses:
         return "status_not_allowed"
@@ -1132,6 +1158,8 @@ def rejection_reason(
         return "missing_identity"
     if target_ids and candidate["external_id"] not in target_ids:
         return "target_id_mismatch"
+    if candidate["external_id"] in exclude_ids or duplicate_key(candidate) in exclude_ids:
+        return "attempted_in_run"
     missing_labels = sorted(set(required_labels) - set(candidate["labels"]))
     if missing_labels:
         return f"missing_labels:{','.join(missing_labels)}"

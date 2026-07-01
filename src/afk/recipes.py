@@ -11,6 +11,7 @@ from afk.implement import agent_command_secret_error
 
 
 SCHEMA_VERSION = 1
+RUNNABLE_REQUIRED_METADATA = ["afk.ready"]
 
 
 def generate_workstream_recipe(
@@ -28,12 +29,16 @@ def generate_workstream_recipe(
     publisher: dict[str, Any] | None = None,
     sources: list[dict[str, Any]] | None = None,
     required_labels: list[str] | None = None,
+    required_metadata: list[str] | None = None,
 ) -> dict[str, Any]:
     if url_has_secret_material(project_contract.repo_url):
         raise ValueError("project contract repo_url must not contain embedded credentials or query parameters")
 
     review_branch = review_branch_for_workstream(workstream_id)
     recipe_required_labels = required_labels if required_labels is not None else list(project_contract.beads_labels)
+    recipe_required_metadata = (
+        list(required_metadata) if required_metadata is not None else list(RUNNABLE_REQUIRED_METADATA)
+    )
     implement_agent = agent if agent is not None else default_recipe_agent()
     validate_step_input = validation_input if validation_input is not None else default_validation_input(validation_profile)
     recipe_publisher = publisher if publisher is not None else {"enabled": False}
@@ -50,6 +55,7 @@ def generate_workstream_recipe(
                 "input": {
                     "target_ids": [workstream_id],
                     "required_labels": recipe_required_labels,
+                    "required_metadata": recipe_required_metadata,
                     "allowed_statuses": ["open", "in_progress"],
                     "sources": sources
                     if sources is not None

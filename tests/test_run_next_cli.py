@@ -212,6 +212,10 @@ raise SystemExit(9)
                 ["project:bump-eqemu", "ready-for-agent"],
             )
             self.assertEqual(
+                payload["selection_request"]["required_metadata"],
+                ["afk.ready"],
+            )
+            self.assertEqual(
                 [source["type"] for source in payload["selection_request"]["sources"]],
                 ["beads", "github_issues"],
             )
@@ -1248,6 +1252,10 @@ else:
             self.assertEqual(
                 payload["recipe"]["steps"][0]["input"]["required_labels"],
                 ["project:bump-eqemu", "ready-for-agent"],
+            )
+            self.assertEqual(
+                payload["recipe"]["steps"][0]["input"]["required_metadata"],
+                ["afk.ready"],
             )
             self.assertEqual(
                 [source["type"] for source in payload["recipe"]["steps"][0]["input"]["sources"]],
