@@ -477,6 +477,61 @@ else:
             )
             self.assertNotIn("beads-secret", completed.stdout)
 
+    def test_run_next_rejects_project_local_beads_workspace_before_github_fallback_recipe_emission(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            contracts_dir = temp_path / "contracts"
+            contracts_dir.mkdir()
+            repo = temp_path / "repo-src"
+            init_repo(repo)
+            project_local_beads = repo / ".beads"
+            project_local_beads.mkdir()
+            write_contract(
+                contracts_dir / "dogfood.json",
+                project_slug="dogfood",
+                repo_url="https://github.com/example/dogfood",
+            )
+            fake_bin = temp_path / "bin"
+            checkout_root = temp_path / "checkouts"
+            checkout_path = checkout_root / "dogfood"
+            fake_bin.mkdir()
+            write_executable(
+                fake_bin / "gh",
+                f"""#!{sys.executable}
+raise SystemExit("gh should not be called when project-local .beads is rejected early")
+""",
+            )
+            write_executable(
+                fake_bin / "bd",
+                f"""#!{sys.executable}
+raise SystemExit("bd should not be called when project-local .beads is rejected early")
+""",
+            )
+
+            completed = run_afk(
+                "run-next",
+                "--project",
+                "dogfood",
+                "--contracts-dir",
+                str(contracts_dir),
+                "--beads-workspace",
+                str(project_local_beads),
+                "--checkout-root",
+                str(checkout_root),
+                "--checkout-path",
+                str(checkout_path),
+                "--validation-profile",
+                "tier1",
+                "--role-profile",
+                "fake-local",
+                "--retrospective-follow-up-mode",
+                "beads",
+                env={"GH_TOKEN": "fixture-token", "PATH": str(fake_bin)},
+            )
+
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("project-local .beads workspace is not allowed", completed.stderr)
+
     def test_run_next_preview_leaves_retrospective_follow_up_disabled_by_default(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
