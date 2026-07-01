@@ -2695,6 +2695,80 @@ class ValidateCliTest(unittest.TestCase):
             )
             self.assertIn("permission denied", actionable[0]["excerpt"])
 
+    def test_validate_prefers_compiler_failure_in_validation_log_over_setup_binding_log(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            checkout = temp_path / "checkout"
+            start_commit = init_checkout(checkout)
+            ledger = temp_path / "ledger"
+            worker_code = textwrap.dedent(
+                f"""
+                import json
+                import os
+                import sys
+                from pathlib import Path
+
+                evidence_dir = Path(os.environ["AFK_WORKER_RESULT"]).parent
+                log_dir = evidence_dir / "logs"
+                log_dir.mkdir(parents=True, exist_ok=True)
+                (log_dir / "stack.log").write_text(
+                    "2026-07-01T00:46:50Z binding validation stack /tmp/stack code to /tmp/checkout\\n",
+                    encoding="utf-8",
+                )
+                (log_dir / "validation.log").write_text(
+                    "* boost-throw-exception:x64-linux@1.89.0\\n"
+                    "/home/eqemu/code/world/../common/repositories/actor_action_queue_repository.h:355:5: error: call to consteval function 'fmt::fstring<std::basic_string<char>, const long &, std::basic_string<char>, const long &, const long &, unsigned long &>::fstring<383UL>' is not a constant expression\\n"
+                    "/home/eqemu/code/build/vcpkg_installed/x64-linux/include/fmt/base.h:894:5: note: in call to '&fmt::fstring<...>::checker(...).context_->do_check_arg_id(6)'\\n",
+                    encoding="utf-8",
+                )
+                Path(os.environ["AFK_WORKER_RESULT"]).write_text(
+                    json.dumps({{"status": "failed", "summary": "failed_validation"}}),
+                    encoding="utf-8",
+                )
+                sys.exit(1)
+                """
+            ).strip()
+
+            completed = run_afk(
+                "run-step",
+                "validate",
+                "--profile",
+                "tier3-harness",
+                "--input",
+                json.dumps(
+                    {
+                        "checkout": {
+                            "status": "prepared",
+                            "checkout_path": str(checkout),
+                            "review_branch": "afk/validate",
+                            "requested_ref": "main",
+                            "start_commit": start_commit,
+                        },
+                        "worker": {
+                            "type": "local-command",
+                            "command": [sys.executable, "-c", worker_code],
+                        },
+                    }
+                ),
+                "--ledger",
+                str(ledger),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+            worker_result = json.loads((run_dir / "worker-result.json").read_text(encoding="utf-8"))
+            actionable = worker_result["result"]["normalized"]["actionable_failures"]
+
+            self.assertEqual(
+                actionable[0]["log_path"],
+                str(run_dir / "validation-evidence" / "logs" / "validation.log"),
+            )
+            self.assertIn("actor_action_queue_repository.h:355:5: error:", actionable[0]["excerpt"])
+            self.assertIn("validation.log", result["output"]["summary"])
+            self.assertIn("actor_action_queue_repository.h:355:5: error:", result["output"]["summary"])
+
     def test_validate_uses_protocol_evidence_artifact_when_worker_result_is_missing(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)

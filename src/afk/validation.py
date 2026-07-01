@@ -1758,7 +1758,12 @@ def actionable_line_kind(line: str) -> str | None:
         return "compiler"
     if any(token in lowered for token in ("traceback (most recent call last):", "assertionerror", "failed:", "fail:")):
         return "test"
-    if any(token in lowered for token in ("timed out", "exception", "permission denied", "no such file or directory")):
+    if (
+        "timed out" in lowered
+        or "permission denied" in lowered
+        or "no such file or directory" in lowered
+        or re.search(r"(^|[\s\[(])exception([\s:.)\]]|$)", lowered)
+    ):
         return "generic"
     if " failed" in lowered or lowered.startswith("failed "):
         return "test"
