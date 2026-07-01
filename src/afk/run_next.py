@@ -36,7 +36,7 @@ def run_next(
     selector_mode: str = "deterministic",
     selector_model: str | None = None,
     selector_choice_json: str | None = None,
-    enable_review_feedback: bool = True,
+    enable_review_feedback: bool = False,
     execute: bool = False,
     ledger_dir: Path | None = None,
     workstream_runner: Callable[..., Any] | None = None,
