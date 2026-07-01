@@ -36,6 +36,7 @@ def run_next(
     selector_mode: str = "deterministic",
     selector_model: str | None = None,
     selector_choice_json: str | None = None,
+    enable_review_feedback: bool = True,
     execute: bool = False,
     ledger_dir: Path | None = None,
     workstream_runner: Callable[..., Any] | None = None,
@@ -73,7 +74,7 @@ def run_next(
             sources=selection_request["sources"],
             required_labels=selection_request["required_labels"],
             required_metadata=selection_request["required_metadata"],
-            enable_review_feedback=True,
+            enable_review_feedback=enable_review_feedback,
         )
         if execute:
             if ledger_dir is None:

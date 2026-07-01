@@ -262,6 +262,7 @@ def main(argv: list[str] | None = None) -> int:
                 selector_mode=args.selector_mode,
                 selector_model=args.selector_model,
                 selector_choice_json=args.selector_choice_json,
+                enable_review_feedback=args.role_profile == PRODUCTION_ROLE_PROFILE,
                 execute=args.execute,
                 ledger_dir=Path(args.ledger) if args.ledger else None,
                 workstream_runner=workstream_runner,
