@@ -9455,6 +9455,92 @@ Path({str(fake_calls)!r}).write_text("gh should not run\\n", encoding="utf-8")
             self.assertIn("review feedback retry budget exhausted", result["publication"]["reason"])
             self.assertIn("Handle the empty review cycle before publishing.", result["publication"]["reason"])
 
+    def test_workstream_review_feedback_blocks_pipeline_only_request_revision_without_repair(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repo = temp_path / "repo-src"
+            checkout = temp_path / "checkout"
+            ledger = temp_path / "ledger"
+            init_repo(repo)
+            fake_git = temp_path / "publisher-git"
+            fake_gh = temp_path / "publisher-gh"
+            write_executable(fake_git, f"#!{sys.executable}\nraise SystemExit(9)\n")
+            write_executable(fake_gh, f"#!{sys.executable}\nraise SystemExit(9)\n")
+            reviewer_code = textwrap.dedent(
+                """
+                import json
+                import os
+                from pathlib import Path
+
+                Path(os.environ["AFK_REVIEWER_RESULT"]).write_text(
+                    json.dumps(
+                        {
+                            "status": "request_revision",
+                            "summary": "review requested pipeline follow-up",
+                            "findings": [
+                                {
+                                    "status": "request_revision",
+                                    "classification": "pipeline_failure",
+                                    "severity": "medium",
+                                    "summary": "Reviewer adapter timed out once in CI; capture a pipeline follow-up.",
+                                },
+                                {
+                                    "status": "request_revision",
+                                    "classification": "tool_failure",
+                                    "severity": "low",
+                                    "summary": "Formatter tool was unavailable in the review container.",
+                                },
+                            ],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                """
+            ).strip()
+            recipe = successful_recipe(temp_path, repo, checkout, fake_git, fake_gh)
+            recipe["publisher"] = {"enabled": False}
+            recipe["retry_policy"] = {"max_retries": 1}
+            recipe["review_feedback"] = {"enabled": True}
+            recipe["steps"][4]["input"]["role"] = "correctness"
+            recipe["steps"][4]["input"]["reviewer"]["command"] = [sys.executable, "-c", reviewer_code]
+
+            completed = run_afk(
+                "run-workstream",
+                "--workstream-id",
+                "central-lve.9",
+                "--input",
+                json.dumps(recipe),
+                "--ledger",
+                str(ledger),
+                env_overrides={
+                    "GIT_ALLOW_PROTOCOL": "file",
+                    "GIT_AUTHOR_NAME": "AFK Test",
+                    "GIT_AUTHOR_EMAIL": "afk-test@example.test",
+                    "GIT_COMMITTER_NAME": "AFK Test",
+                    "GIT_COMMITTER_EMAIL": "afk-test@example.test",
+                },
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            result = json.loads((ledger / summary["result_path"]).read_text(encoding="utf-8"))
+
+            self.assertEqual(summary["status"], "blocked")
+            self.assertEqual(
+                [step["name"] for step in result["steps"]],
+                ["select-work", "prepare-checkout", "implement", "validate", "review"],
+            )
+            self.assertEqual(result["review_cycles"][0]["status"], "request-changes")
+            self.assertEqual(result["review_cycles"][0]["reviews"][0]["role"], "correctness")
+            self.assertEqual(
+                [item["classification"] for item in result["review_cycles"][0]["reviews"][0]["pipeline_follow_up"]],
+                ["pipeline_failure", "tool_failure"],
+            )
+            self.assertEqual(result["tracker"]["review_cycles"], result["review_cycles"])
+            self.assertEqual(result["tracker"]["status"], "review-findings-open")
+            self.assertIn("review requested pipeline follow-up", result["publication"]["reason"])
+            self.assertIn("Reviewer adapter timed out once in CI", result["publication"]["reason"])
+
     def test_workstream_retry_reuses_implemented_review_branch_after_validation_failure(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
