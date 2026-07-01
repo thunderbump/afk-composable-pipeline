@@ -4067,6 +4067,12 @@ def _retrospective_judge_signal_scope(
 ) -> str:
     if publication.get("status") != "blocked":
         return "pipeline-process"
+    reason = string_field(publication, "reason") or ""
+    if not (
+        reason.startswith("review did not reach passed: request_revision")
+        or reason.startswith("review feedback retry budget exhausted:")
+    ):
+        return "pipeline-process"
     if any(
         isinstance(signal, dict)
         and string_field(signal, "scope") != "target-work"
@@ -4082,27 +4088,7 @@ def _retrospective_judge_signal_scope(
         return "pipeline-process"
     if string_field(judge, "classification") not in {"judge_failure", "judge_warning"}:
         return "pipeline-process"
-    text = "\n".join(
-        [
-            string_field(judge, "summary") or "",
-            *[
-                string_field(finding, "summary") or ""
-                for finding in judge.get("findings", [])
-                if isinstance(finding, dict)
-            ],
-        ]
-    ).lower()
-    if any(
-        marker in text
-        for marker in (
-            "review requested revision",
-            "review requested changes",
-            "validated review finding",
-            "did not reach passed review status",
-        )
-    ):
-        return "target-work"
-    return "pipeline-process"
+    return "target-work"
 
 
 def _run_retrospective_judge(
