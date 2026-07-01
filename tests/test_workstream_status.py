@@ -1148,6 +1148,67 @@ class WorkstreamStatusMappingTest(unittest.TestCase):
         self.assertEqual(record["signals"][1]["scope"], "target-work")
         self.assertEqual(record["follow_up"]["recommended"], [])
 
+    def test_pipeline_retrospective_record_keeps_judge_follow_up_for_mixed_review_feedback_budget_block(self):
+        state = retrospective_state()
+        state["review"] = {
+            "status": "request_revision",
+            "summary": "review requested changes",
+            "reviewer_result": {
+                "findings": [
+                    {
+                        "classification": "correctness",
+                        "summary": "Handle the empty review cycle before publishing.",
+                    },
+                    {
+                        "classification": "tool_failure",
+                        "summary": "Formatter tool was unavailable in the review container.",
+                    },
+                ]
+            },
+        }
+        publication = {
+            "status": "blocked",
+            "reason": (
+                "review feedback retry budget exhausted: 1 retries attempted, max_retries=1; "
+                "review requested changes: Handle the empty review cycle before publishing."
+            ),
+        }
+
+        record = pipeline_retrospective_record(
+            state,
+            publication,
+            retrospective_tracker("validated"),
+        )
+
+        record = _apply_retrospective_judge(
+            record,
+            {
+                "enabled": True,
+                "status": "failed",
+                "classification": "judge_failure",
+                "summary": "Needs attention.",
+                "findings": [{"severity": "medium", "summary": "Outstanding issue remains."}],
+                "evidence": {
+                    "request_path": "retrospective-judge-request.json",
+                    "result_path": "retrospective-judge-result.json",
+                    "stdout_path": "retrospective-judge-stdout.log",
+                    "stderr_path": "retrospective-judge-stderr.log",
+                },
+            },
+            normalized=None,
+            publication=publication,
+            state=state,
+        )
+
+        self.assertEqual(record["signals"][0]["kind"], "retry-or-blocked")
+        self.assertEqual(record["signals"][0]["scope"], "target-work")
+        self.assertEqual(record["signals"][1]["kind"], "retrospective-judge")
+        self.assertEqual(record["signals"][1]["scope"], "pipeline-process")
+        self.assertEqual(
+            [item["kind"] for item in record["follow_up"]["recommended"]],
+            ["retrospective-judge"],
+        )
+
     def test_pipeline_retrospective_record_surfaces_blocked_reason_without_retry_keyword(self):
         record = pipeline_retrospective_record(
             retrospective_state(),

@@ -346,6 +346,7 @@ def run_workstream(
         retrospective_judge,
         normalized=normalized,
         publication=publication,
+        state=state,
     )
     retrospective_follow_up_creation = _run_retrospective_follow_up(
         normalized=normalized,
@@ -4006,13 +4007,19 @@ def _apply_retrospective_judge(
     *,
     normalized: dict[str, Any] | None,
     publication: dict[str, Any],
+    state: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     record = dict(pipeline_retrospective)
     if not judge:
         record["judge"] = _disabled_retrospective_judge_record()
         return record
     signals = list(record.get("signals", [])) if isinstance(record.get("signals"), list) else []
-    judge_signals = _retrospective_judge_signals(judge, existing_signals=signals, publication=publication)
+    judge_signals = _retrospective_judge_signals(
+        judge,
+        existing_signals=signals,
+        publication=publication,
+        state=state,
+    )
     if judge_signals:
         signals.extend(judge_signals)
     record["signals"] = signals
@@ -4029,6 +4036,7 @@ def _retrospective_judge_signals(
     *,
     existing_signals: list[dict[str, Any]],
     publication: dict[str, Any],
+    state: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     if not isinstance(judge, dict) or not judge.get("enabled"):
         return []
@@ -4046,6 +4054,7 @@ def _retrospective_judge_signals(
                 judge,
                 existing_signals=existing_signals,
                 publication=publication,
+                state=state,
             ),
             "severity": severity,
             "summary": redact_text(string_field(judge, "summary") or status or "retrospective judge reported an issue"),
@@ -4064,6 +4073,7 @@ def _retrospective_judge_signal_scope(
     *,
     existing_signals: list[dict[str, Any]],
     publication: dict[str, Any],
+    state: dict[str, Any] | None = None,
 ) -> str:
     if publication.get("status") != "blocked":
         return "pipeline-process"
@@ -4073,6 +4083,9 @@ def _retrospective_judge_signal_scope(
         or reason.startswith("review feedback retry budget exhausted:")
         or reason.startswith("review requested changes:")
     ):
+        return "pipeline-process"
+    review = state.get("review") if isinstance(state, dict) and isinstance(state.get("review"), dict) else {}
+    if review_feedback_pipeline_follow_up(review):
         return "pipeline-process"
     if any(
         isinstance(signal, dict)
