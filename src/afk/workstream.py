@@ -5971,6 +5971,8 @@ def _subprocess_output_text(value: Any) -> str:
 
 
 def _signal_replaces_generic_retry_follow_up(signal: dict[str, Any]) -> bool:
+    if string_field(signal, "scope") == "target-work":
+        return False
     kind = string_field(signal, "kind") or ""
     if kind in {"validation-failure", "missing-tool-or-config"}:
         return bool(string_field(signal, "excerpt") and signal.get("evidence_paths"))
@@ -5980,6 +5982,8 @@ def _signal_replaces_generic_retry_follow_up(signal: dict[str, Any]) -> bool:
 
 
 def _signal_replaces_judge_follow_up(signal: dict[str, Any]) -> bool:
+    if string_field(signal, "scope") == "target-work":
+        return False
     kind = string_field(signal, "kind") or ""
     return kind in {
         "validation-failure",

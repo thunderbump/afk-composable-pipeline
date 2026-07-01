@@ -415,7 +415,7 @@ class WorkstreamStatusMappingTest(unittest.TestCase):
             "Fix tier1 [validation]: python3.13: command not found token=[REDACTED]",
         )
 
-    def test_pipeline_retrospective_record_prefers_specific_validation_follow_up_over_judge_generic(self):
+    def test_pipeline_retrospective_record_keeps_judge_follow_up_when_validation_signal_targets_work(self):
         state = retrospective_state()
         state["validations"] = [
             {
@@ -463,7 +463,10 @@ class WorkstreamStatusMappingTest(unittest.TestCase):
 
         self.assertEqual(record["signals"][0]["kind"], "validation-failure")
         self.assertEqual(record["signals"][0]["scope"], "target-work")
-        self.assertEqual(record["follow_up"]["recommended"], [])
+        self.assertEqual(
+            [item["kind"] for item in record["follow_up"]["recommended"]],
+            ["retrospective-judge"],
+        )
 
     def test_pipeline_retrospective_record_keeps_retrospective_judge_follow_up_for_generic_publication_failure(self):
         publication = {
@@ -647,6 +650,122 @@ class WorkstreamStatusMappingTest(unittest.TestCase):
         self.assertEqual(record["recommended_follow_up"], [])
         self.assertEqual(record["follow_up"]["recommended"], [])
         self.assertEqual(record["signals"][0]["scope"], "target-work")
+
+    def test_pipeline_retrospective_record_keeps_process_retry_follow_up_when_target_validation_was_repaired(self):
+        state = retrospective_state()
+        state["validations"] = [
+            {
+                "output": {
+                    "status": "failed_validation",
+                    "summary": "failed_validation",
+                    "actionable_failures": [
+                        {
+                            "name": "tier1",
+                            "category": "compiler",
+                            "reason": "command exited with status 1",
+                            "log_path": "/tmp/ledger/runs/validate/validation-evidence/logs/compiler.log",
+                            "excerpt": "zone/harness/zone_harness_runtime.cpp:98:9 error: SetBotID is a private member of Bot",
+                        }
+                    ],
+                    "checkout": {"start_commit": "abc123"},
+                    "validation": {"requested_profile": "tier1"},
+                },
+                "step_result_path": "/tmp/ledger/runs/validate/step-result.json",
+                "worker_result_path": "/tmp/ledger/runs/validate/worker-result.json",
+            },
+            {
+                "output": {
+                    "status": "validated",
+                    "summary": "tests passed",
+                    "checkout": {"start_commit": "def456"},
+                    "validation": {"requested_profile": "tier1"},
+                },
+                "step_result_path": "/tmp/ledger/runs/validate-repair/step-result.json",
+                "worker_result_path": "/tmp/ledger/runs/validate-repair/worker-result.json",
+            },
+        ]
+
+        record = pipeline_retrospective_record(
+            state,
+            {
+                "status": "blocked",
+                "reason": "retry checkout blocked: prior retry checkout is dirty and still needs cleanup",
+            },
+            retrospective_tracker("validated"),
+        )
+
+        self.assertEqual(record["signals"][0]["scope"], "target-work")
+        self.assertEqual(record["signals"][1]["kind"], "retry-or-blocked")
+        self.assertEqual(record["signals"][1]["scope"], "pipeline-process")
+        self.assertEqual(
+            [item["kind"] for item in record["follow_up"]["recommended"]],
+            ["retry-or-blocked"],
+        )
+
+    def test_pipeline_retrospective_record_keeps_judge_follow_up_when_target_validation_was_repaired(self):
+        state = retrospective_state()
+        state["validations"] = [
+            {
+                "output": {
+                    "status": "failed_validation",
+                    "summary": "failed_validation",
+                    "actionable_failures": [
+                        {
+                            "name": "tier1",
+                            "category": "compiler",
+                            "reason": "command exited with status 1",
+                            "log_path": "/tmp/ledger/runs/validate/validation-evidence/logs/compiler.log",
+                            "excerpt": "zone/harness/zone_harness_runtime.cpp:98:9 error: SetBotID is a private member of Bot",
+                        }
+                    ],
+                    "checkout": {"start_commit": "abc123"},
+                    "validation": {"requested_profile": "tier1"},
+                },
+                "step_result_path": "/tmp/ledger/runs/validate/step-result.json",
+                "worker_result_path": "/tmp/ledger/runs/validate/worker-result.json",
+            },
+            {
+                "output": {
+                    "status": "validated",
+                    "summary": "tests passed",
+                    "checkout": {"start_commit": "def456"},
+                    "validation": {"requested_profile": "tier1"},
+                },
+                "step_result_path": "/tmp/ledger/runs/validate-repair/step-result.json",
+                "worker_result_path": "/tmp/ledger/runs/validate-repair/worker-result.json",
+            },
+        ]
+
+        record = pipeline_retrospective_record(
+            state,
+            {"status": "validated-unpublished", "reason": "validation passed after repair"},
+            retrospective_tracker("validated"),
+        )
+
+        record = _apply_retrospective_judge(
+            record,
+            {
+                "enabled": True,
+                "status": "warning",
+                "summary": "review judge findings",
+                "evidence": {
+                    "request_path": "retrospective-judge-request.json",
+                    "result_path": "retrospective-judge-result.json",
+                    "stdout_path": "retrospective-judge-stdout.log",
+                    "stderr_path": "retrospective-judge-stderr.log",
+                },
+            },
+            normalized=None,
+            publication={"status": "validated-unpublished", "reason": "validation passed after repair"},
+        )
+
+        self.assertEqual(record["signals"][0]["scope"], "target-work")
+        self.assertEqual(record["signals"][1]["kind"], "retrospective-judge")
+        self.assertEqual(record["signals"][1]["severity"], "warning")
+        self.assertEqual(
+            [item["kind"] for item in record["follow_up"]["recommended"]],
+            ["retrospective-judge"],
+        )
 
     def test_pipeline_retrospective_record_surfaces_validation_extraction_bug_as_process_follow_up(self):
         state = retrospective_state()
