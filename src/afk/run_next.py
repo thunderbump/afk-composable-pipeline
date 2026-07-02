@@ -93,7 +93,8 @@ def run_next(
         "command": "run-next",
         "project": project_contract.project_slug,
         "selection_request": selection_request,
-        "selection_result": selection_result,
+        "selection_result": annotate_selection_result(selection_result),
+        "chosen_work": selected_work_snapshot(chosen),
         "selector": selector_result(chosen, selector_mode=selector_mode, selector_model=selector_model),
         "recipe": recipe,
         "workstream_result": workstream_result,
@@ -203,6 +204,19 @@ def selector_result(
             "rationale": chosen.get("selector_rationale", "deterministic default"),
         },
     }
+
+
+def annotate_selection_result(selection_result: dict[str, Any]) -> dict[str, Any]:
+    annotated = dict(selection_result)
+    annotated["selected_work_kind"] = "candidate_list"
+    return annotated
+
+
+def selected_work_snapshot(chosen: dict[str, Any] | None) -> dict[str, Any] | None:
+    if chosen is None:
+        return None
+    return dict(chosen)
+
 
 def parse_selector_choice(
     selector_model: str | None,

@@ -2030,6 +2030,105 @@ raise SystemExit(9)
         self.assertEqual(runner_ledger_dir, ledger_dir)
         self.assertEqual(runner_contract, contract)
 
+    def test_run_next_execute_output_exposes_final_chosen_work_when_selector_picks_nonfirst_candidate(self):
+        contract = load_project_contract("bump-eqemu", ROOT / "project-contracts", cwd=ROOT)
+        first_candidate = {
+            "source_id": "central-beads",
+            "source_type": "beads",
+            "external_id": "central-lhy.15",
+            "title": "First candidate in list",
+            "status": "open",
+            "labels": ["project:bump-eqemu", "ready-for-agent"],
+            "workstream": "central-lhy",
+            "acceptance_criteria": ["Candidate list stays intact"],
+            "priority": 2,
+            "issue_type": "task",
+            "description": "First available candidate.",
+            "dependencies": [],
+            "blockers": [],
+            "dependency_status": "clear",
+            "afk": {"ready": True},
+            "raw": {"beads": {"id": "central-lhy.15"}},
+        }
+        chosen_candidate = {
+            "source_id": "central-beads",
+            "source_type": "beads",
+            "external_id": "central-lhy.14",
+            "title": "Model-selected candidate",
+            "status": "open",
+            "labels": ["project:bump-eqemu", "ready-for-agent"],
+            "workstream": "central-lhy",
+            "acceptance_criteria": ["Chosen work is explicit"],
+            "priority": 4,
+            "issue_type": "bug",
+            "description": "Selected by explicit selector choice.",
+            "dependencies": [],
+            "blockers": [],
+            "dependency_status": "clear",
+            "afk": {"ready": True},
+            "raw": {"beads": {"id": "central-lhy.14"}},
+        }
+        selection_result = {
+            "schema_version": 1,
+            "source_statuses": [{"source_id": "central-beads", "source_type": "beads", "status": "selected"}],
+            "selected_work": [first_candidate, chosen_candidate],
+            "skipped_candidates": [],
+        }
+        runner_calls: list[tuple[object, object, object]] = []
+
+        def fake_workstream_runner(recipe_input, *, ledger_dir, project_contract):
+            runner_calls.append((recipe_input, ledger_dir, project_contract))
+            return {
+                "run_id": "run-456",
+                "workstream_id": "central-lhy.14",
+                "parent": "central-lhy",
+                "status": "succeeded",
+                "result_path": "runs/run-456/workstream-result.json",
+                "publication_status": "published",
+            }
+
+        original_select_work = run_next.__globals__["select_work"]
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                temp_path = Path(temp_dir)
+                beads_workspace = temp_path / "beads"
+                checkout_root = temp_path / "checkouts"
+                checkout_path = checkout_root / "bump-EQEmu"
+                ledger_dir = temp_path / "ledger"
+                beads_workspace.mkdir()
+                checkout_root.mkdir(parents=True)
+                checkout_path.mkdir(parents=True)
+                ledger_dir.mkdir()
+
+                run_next.__globals__["select_work"] = lambda request, project_contract=None: selection_result
+                payload = run_next(
+                    project_contract=contract,
+                    beads_workspace=beads_workspace,
+                    checkout_root=checkout_root,
+                    checkout_path=checkout_path,
+                    validation_profile="tier1",
+                    selector_mode="model",
+                    selector_model="gpt-5.4-mini",
+                    selector_choice_json=json.dumps(
+                        {"external_id": "central-lhy.14", "rationale": "dogfood chose this item"}
+                    ),
+                    execute=True,
+                    ledger_dir=ledger_dir,
+                    workstream_runner=fake_workstream_runner,
+                )
+        finally:
+            run_next.__globals__["select_work"] = original_select_work
+
+        self.assertEqual(payload["selection_result"]["selected_work"][0]["external_id"], "central-lhy.15")
+        self.assertEqual(payload["selection_result"]["selected_work"][1]["external_id"], "central-lhy.14")
+        self.assertEqual(payload["selection_result"]["selected_work_kind"], "candidate_list")
+        self.assertEqual(payload["chosen_work"]["external_id"], "central-lhy.14")
+        self.assertEqual(payload["chosen_work"]["selector_rationale"], "dogfood chose this item")
+        self.assertEqual(payload["selector"]["selected"]["external_id"], "central-lhy.14")
+        self.assertEqual(payload["recipe"]["workstream_id"], "central-lhy.14")
+        self.assertEqual(payload["workstream_result"]["workstream_id"], "central-lhy.14")
+        self.assertEqual(runner_calls[0][0]["workstream_id"], "central-lhy.14")
+
     def test_run_next_execute_mode_does_not_run_without_candidates(self):
         contract = load_project_contract("bump-eqemu", ROOT / "project-contracts", cwd=ROOT)
         selection_result = {
