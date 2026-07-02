@@ -1145,7 +1145,7 @@ def review_implementation_input(state: dict[str, Any]) -> dict[str, Any]:
         return implementation
     checkout = state.get("checkout") if isinstance(state.get("checkout"), dict) else {}
     checkout_path = Path(string_field(checkout, "checkout_path") or "")
-    base_commit = string_field(checkout, "base_commit") or string_field(checkout, "start_commit")
+    base_commit = string_field(checkout, "base_commit")
     if not base_commit or not checkout_path:
         return implementation
     cumulative_git = safe_git_metadata(checkout_path, base_commit)

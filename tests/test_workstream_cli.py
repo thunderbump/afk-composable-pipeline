@@ -315,6 +315,53 @@ class WorkstreamCliTest(unittest.TestCase):
 
             self.assertEqual(result, state["implementation"])
 
+    def test_review_implementation_input_preserves_existing_cumulative_git_when_retry_base_commit_is_missing(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repo = temp_path / "checkout"
+            init_repo(repo)
+            start_commit = git(repo, "rev-parse", "HEAD")
+            (repo / "file-a.txt").write_text("initial\n", encoding="utf-8")
+            git(repo, "add", "file-a.txt")
+            git(repo, "commit", "-m", "initial implementation")
+            (repo / "file-b.txt").write_text("repair\n", encoding="utf-8")
+            git(repo, "add", "file-b.txt")
+            git(repo, "commit", "-m", "repair implementation")
+            repair_head = git(repo, "rev-parse", "HEAD")
+            state = {
+                "checkout": {
+                    "checkout_path": str(repo),
+                    "start_commit": repair_head,
+                },
+                "implementation": {
+                    "status": "implemented",
+                    "summary": "repair implementation complete",
+                    "git": {
+                        "before_commit": start_commit,
+                        "after_commit": repair_head,
+                        "changed_files": ["file-a.txt", "file-b.txt"],
+                        "commits": [
+                            {"commit": repair_head, "subject": "repair implementation"},
+                            {"commit": "initial", "subject": "initial implementation"},
+                        ],
+                        "dirty": False,
+                        "dirty_status": [],
+                    },
+                    "latest_repair": {
+                        "before_commit": git(repo, "rev-parse", "HEAD^"),
+                        "after_commit": repair_head,
+                        "changed_files": ["file-b.txt"],
+                        "commits": [{"commit": repair_head, "subject": "repair implementation"}],
+                        "dirty": False,
+                        "dirty_status": [],
+                    },
+                },
+            }
+
+            result = review_implementation_input(state)
+
+            self.assertEqual(result, state["implementation"])
+
     def test_select_work_proves_different_item_with_fixture_enumerated_candidates(self):
         state = {"selected_work": [selected_fixture_item("central-lve.9")]}
         input_data = {
