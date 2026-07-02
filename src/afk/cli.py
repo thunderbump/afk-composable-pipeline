@@ -741,11 +741,13 @@ def recipe_reviewer_from_args(
             ponytail_extension=ponytail_extension,
             ponytail_extension_source=ponytail_extension_source,
         )
-        reviewer_timeout = (
-            PRODUCTION_REVIEW_TIMEOUT_SECONDS
-            if args.reviewer_timeout_seconds is None
-            else args.reviewer_timeout_seconds
-        )
+        reviewer_timeout = args.reviewer_timeout_seconds
+        if reviewer_timeout is None:
+            reviewer_timeout = (
+                PRODUCTION_REVIEW_TIMEOUT_SECONDS
+                if args.role_profile == PRODUCTION_ROLE_PROFILE
+                else 30
+            )
         if reviewer_timeout <= 0:
             raise ValueError("--reviewer-timeout-seconds must be greater than zero")
         return {
