@@ -1214,6 +1214,10 @@ raise SystemExit(9)
             self.assertEqual(payload["recipe"]["steps"][4]["input"]["reviewer"]["type"], "fake-reviewer-command")
             self.assertNotIn("retrospective_judge", payload["recipe"])
             self.assertEqual(payload["recipe"]["review_feedback"], {"enabled": False})
+            self.assertEqual(
+                payload["recipe"]["validation_expectations"],
+                {"generated_smoke_dry_run_expected": True},
+            )
             implement = next(step for step in payload["recipe"]["steps"] if step["name"] == "implement")
             validate = next(step for step in payload["recipe"]["steps"] if step["name"] == "validate")
             self.assertEqual(implement["input"]["validation"]["profile"], "tier1")

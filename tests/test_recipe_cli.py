@@ -326,6 +326,10 @@ class GenerateRecipeCliTest(unittest.TestCase):
             self.assertEqual(recipe["steps"][2]["input"]["agent"]["type"], "fake-pi-command")
             self.assertEqual(recipe["steps"][4]["input"]["reviewer"]["type"], "fake-reviewer-command")
             self.assertEqual(recipe["review_feedback"], {"enabled": False})
+            self.assertEqual(
+                recipe["validation_expectations"],
+                {"generated_smoke_dry_run_expected": True},
+            )
             self.assertNotIn("retrospective_judge", recipe)
 
     def test_generate_recipe_production_default_fails_fast_without_pi_auth_mounts(self):
