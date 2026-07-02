@@ -222,6 +222,10 @@ def main(argv: list[str] | None = None) -> int:
         if args.execute and not args.ledger:
             parser.error("--ledger is required when --execute is set")
         try:
+            args.effective_validation_mode = effective_run_next_validation_mode(
+                args,
+                project_contract=project_contract,
+            )
             validation_input = recipe_validation_input_from_args(args, project_contract=project_contract)
             recipe_agent = recipe_agent_from_args(
                 args,
@@ -280,7 +284,7 @@ def main(argv: list[str] | None = None) -> int:
                 selector_choice_json=args.selector_choice_json,
                 enable_review_feedback=args.role_profile == PRODUCTION_ROLE_PROFILE,
                 expect_generated_smoke_dry_run=(
-                    args.role_profile == FAKE_LOCAL_ROLE_PROFILE and args.validation_mode == "fake"
+                    args.role_profile == FAKE_LOCAL_ROLE_PROFILE and args.effective_validation_mode == "fake"
                 ),
                 execute=args.execute,
                 ledger_dir=Path(args.ledger) if args.ledger else None,
@@ -389,7 +393,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_next_parser.add_argument(
         "--validation-mode",
         choices=("fake", "project-worker"),
-        default="fake",
+        default=None,
         help="Validation adapter mode to embed in the generated recipe",
     )
     run_next_parser.add_argument(
@@ -617,6 +621,21 @@ def add_publisher_flags(parser: argparse.ArgumentParser) -> None:
         "--publisher-gh-config-dir",
         help="Absolute mounted gh config dir for publisher create mode",
     )
+
+
+def effective_run_next_validation_mode(args: argparse.Namespace, *, project_contract: ProjectContract) -> str:
+    requested_mode = args.validation_mode or "fake"
+    if args.role_profile == FAKE_LOCAL_ROLE_PROFILE:
+        return requested_mode
+    if args.validation_mode is not None:
+        return requested_mode
+    if not args.execute:
+        return requested_mode
+    if not project_contract_has_default_worker(project_contract):
+        return requested_mode
+    if args.validation_profile not in project_contract.validation_profile_requests:
+        return requested_mode
+    return "project-worker"
 
 
 def resolved_role_mode(
@@ -858,10 +877,11 @@ def recipe_retrospective_follow_up_from_args(
 
 
 def recipe_validation_input_from_args(args: argparse.Namespace, *, project_contract: ProjectContract) -> dict[str, Any]:
+    validation_mode = getattr(args, "effective_validation_mode", args.validation_mode or "fake")
     timeout_seconds = args.validation_timeout_seconds
     if timeout_seconds is not None and timeout_seconds <= 0:
         raise ValueError("--validation-timeout-seconds must be greater than 0")
-    if args.validation_mode == "fake":
+    if validation_mode == "fake":
         timeout_seconds = 30 if timeout_seconds is None else timeout_seconds
         return {
             "validation": {
@@ -886,6 +906,11 @@ def recipe_validation_input_from_args(args: argparse.Namespace, *, project_contr
         args,
         checkout_path=checkout_path,
     )
+    if getattr(args, "execute", False) and not validation_stack_path.is_dir():
+        raise ValueError(
+            "project-worker validation requires an existing validation stack directory: "
+            f"{validation_stack_path}"
+        )
     return {
         "validation": {
             "profile": args.validation_profile,
