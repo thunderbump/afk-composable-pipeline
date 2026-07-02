@@ -14,12 +14,14 @@ sys.path.insert(0, str(ROOT / "src"))
 from afk.contracts import load_project_contract  # noqa: E402
 
 
-def run_afk(*args):
+def run_afk(*args, cwd=None, env_overrides=None):
     env = os.environ.copy()
     env["PYTHONPATH"] = str(ROOT / "src")
+    if env_overrides:
+        env.update(env_overrides)
     return subprocess.run(
         [sys.executable, "-m", "afk", *args],
-        cwd=ROOT,
+        cwd=cwd or ROOT,
         env=env,
         text=True,
         capture_output=True,
@@ -28,6 +30,70 @@ def run_afk(*args):
 
 
 class NoopCliTest(unittest.TestCase):
+    def test_run_step_defaults_ledger_to_ledgers_directory(self):
+        input_json = (FIXTURES / "noop-input.json").read_text(encoding="utf-8")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+
+            completed = run_afk(
+                "run-step",
+                "noop",
+                "--input",
+                input_json,
+                cwd=temp_path,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = temp_path / "ledgers" / "runs" / summary["run_id"]
+            self.assertTrue(run_dir.is_dir())
+
+    def test_run_step_uses_afk_ledger_dir_when_flag_is_absent(self):
+        input_json = (FIXTURES / "noop-input.json").read_text(encoding="utf-8")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            ledger = temp_path / "env-ledgers"
+
+            completed = run_afk(
+                "run-step",
+                "noop",
+                "--input",
+                input_json,
+                cwd=temp_path,
+                env_overrides={"AFK_LEDGER_DIR": str(ledger)},
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            self.assertTrue((ledger / "runs" / summary["run_id"]).is_dir())
+            self.assertFalse((temp_path / "ledgers").exists())
+
+    def test_run_step_ledger_flag_overrides_afk_ledger_dir(self):
+        input_json = (FIXTURES / "noop-input.json").read_text(encoding="utf-8")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            env_ledger = temp_path / "env-ledgers"
+            explicit_ledger = temp_path / "explicit-ledgers"
+
+            completed = run_afk(
+                "run-step",
+                "noop",
+                "--input",
+                input_json,
+                "--ledger",
+                str(explicit_ledger),
+                cwd=temp_path,
+                env_overrides={"AFK_LEDGER_DIR": str(env_ledger)},
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            self.assertTrue((explicit_ledger / "runs" / summary["run_id"]).is_dir())
+            self.assertFalse(env_ledger.exists())
+
     def test_bump_eqemu_contract_matches_current_project_defaults(self):
         contract = load_project_contract(
             "bump-eqemu",

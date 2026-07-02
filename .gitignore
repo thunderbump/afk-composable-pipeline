@@ -6,4 +6,5 @@ __pycache__/
 build/
 dist/
 ledger/
+/ledgers/
 .pytest_cache/

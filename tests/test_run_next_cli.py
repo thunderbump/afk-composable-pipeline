@@ -17,7 +17,7 @@ from afk.run_next import choose_candidate, github_repo_from_repo_url, run_next, 
 from afk.workstream import WorkstreamResult
 
 
-def run_afk(*args, env=None):
+def run_afk(*args, env=None, cwd=None):
     run_env = os.environ.copy()
     run_env["PYTHONPATH"] = str(ROOT / "src")
     if env:
@@ -28,7 +28,7 @@ def run_afk(*args, env=None):
                 run_env[key] = value
     return subprocess.run(
         [sys.executable, "-m", "afk", *args],
-        cwd=ROOT,
+        cwd=cwd or ROOT,
         env=run_env,
         text=True,
         capture_output=True,
@@ -189,7 +189,7 @@ raise SystemExit(9)
                 "--project",
                 "bump-eqemu",
                 "--contracts-dir",
-                "project-contracts",
+                str(ROOT / "project-contracts"),
                 "--beads-workspace",
                 str(beads_workspace),
                 "--checkout-root",
@@ -233,6 +233,55 @@ raise SystemExit(9)
                 [status["status"] for status in payload["selection_result"]["source_statuses"]],
                 ["skipped_no_auth", "skipped_no_auth"],
             )
+
+    def test_run_next_preview_does_not_create_default_ledgers_directory(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            fake_bin = temp_path / "bin"
+            beads_workspace = temp_path / "beads"
+            checkout_root = temp_path / "checkouts"
+            checkout_path = checkout_root / "bump-EQEmu"
+            beads_workspace.mkdir()
+            fake_bin.mkdir()
+            write_executable(
+                fake_bin / "gh",
+                f"""#!{sys.executable}
+import sys
+
+if sys.argv[1:3] == ["auth", "status"]:
+    sys.exit(1)
+raise SystemExit(9)
+""",
+            )
+            write_executable(
+                fake_bin / "bd",
+                f"""#!{sys.executable}
+raise SystemExit(9)
+""",
+            )
+
+            completed = run_afk(
+                "run-next",
+                "--project",
+                "bump-eqemu",
+                "--contracts-dir",
+                str(ROOT / "project-contracts"),
+                "--beads-workspace",
+                str(beads_workspace),
+                "--checkout-root",
+                str(checkout_root),
+                "--checkout-path",
+                str(checkout_path),
+                "--validation-profile",
+                "tier1",
+                "--role-profile",
+                "fake-local",
+                env={"GH_TOKEN": None, "GITHUB_TOKEN": None, "PATH": str(fake_bin)},
+                cwd=temp_path,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertFalse((temp_path / "ledgers").exists())
 
     def test_run_next_production_preview_preserves_no_candidate_selection_output_without_pi_auth_mounts(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -743,6 +792,89 @@ raise SystemExit(9)
             self.assertIn("pi-auth-preflight.json", description)
             self.assertEqual(create_call["password"], "test-password")
             self.assertNotIn("test-password", completed.stdout)
+
+    def test_run_next_execute_defaults_ledger_to_ledgers_directory(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            contracts_dir = temp_path / "contracts"
+            contracts_dir.mkdir()
+            repo = temp_path / "repo-src"
+            init_repo(repo)
+            write_contract(
+                contracts_dir / "dogfood.json",
+                project_slug="dogfood",
+                repo_url=repo.as_uri(),
+            )
+            fake_bin = temp_path / "bin"
+            beads_workspace = temp_path / "beads"
+            checkout_root = temp_path / "checkouts"
+            checkout_path = checkout_root / "dogfood"
+            fake_bin.mkdir()
+            (beads_workspace / "secrets").mkdir(parents=True)
+            (beads_workspace / "secrets" / "dolt_beads_password.txt").write_text("test-password\n", encoding="utf-8")
+            write_executable(
+                fake_bin / "gh",
+                f"""#!{sys.executable}
+import sys
+
+if sys.argv[1:3] == ["auth", "status"]:
+    sys.exit(1)
+raise SystemExit(9)
+""",
+            )
+            write_executable(
+                fake_bin / "bd",
+                f"""#!{sys.executable}
+import json
+import sys
+
+if sys.argv[1:2] == ["list"]:
+    print(json.dumps([{{"id": "central-df.3"}}]))
+    raise SystemExit(0)
+if sys.argv[1:3] == ["show", "central-df.3"]:
+    print(json.dumps({{
+        "id": "central-df.3",
+        "title": "Create auth-preflight follow-up bead",
+        "status": "open",
+        "labels": ["project:dogfood", "ready-for-agent"],
+        "metadata": {{"afk.ready": True, "workstream": "central-df.3"}},
+        "acceptance_criteria": ["run-next execute creates follow-up bead"],
+        "dependencies": [],
+    }}))
+    raise SystemExit(0)
+raise SystemExit(9)
+""",
+            )
+
+            completed = run_afk(
+                "run-next",
+                "--project",
+                "dogfood",
+                "--contracts-dir",
+                str(contracts_dir),
+                "--beads-workspace",
+                str(beads_workspace),
+                "--checkout-root",
+                str(checkout_root),
+                "--checkout-path",
+                str(checkout_path),
+                "--validation-profile",
+                "tier1",
+                "--execute",
+                "--role-profile",
+                "fake-local",
+                env={
+                    "GH_TOKEN": None,
+                    "GITHUB_TOKEN": None,
+                    "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+                    "GIT_ALLOW_PROTOCOL": "file",
+                },
+                cwd=temp_path,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            payload = json.loads(completed.stdout)
+            self.assertTrue((temp_path / "ledgers" / payload["workstream_result"]["result_path"]).is_file())
 
     def test_run_next_execute_resolves_relative_beads_workspace_for_retrospective_follow_up(self):
         with tempfile.TemporaryDirectory() as temp_dir:

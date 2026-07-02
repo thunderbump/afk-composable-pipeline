@@ -286,6 +286,43 @@ def merged_recipe_with_retrospective(temp_path, repo, checkout, fake_git, fake_g
 
 
 class WorkstreamCliTest(unittest.TestCase):
+    def test_run_workstream_defaults_ledger_to_ledgers_directory(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+
+            completed = run_afk(
+                "run-workstream",
+                "--workstream-id",
+                "central-lve.9",
+                "--input",
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "workstream_id": "central-lve.9",
+                        "steps": [
+                            {
+                                "name": "select-work",
+                                "input": {
+                                    "required_labels": ["afk:ready"],
+                                    "sources": [
+                                        {
+                                            "type": "fixture",
+                                            "id": "fixture",
+                                            "items": [selected_fixture_item("central-lve.9")],
+                                        }
+                                    ],
+                                },
+                            }
+                        ],
+                    }
+                ),
+                cwd=temp_path,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            self.assertTrue((temp_path / "ledgers" / summary["result_path"]).is_file())
+
     def test_review_implementation_input_preserves_existing_git_when_cumulative_metadata_fails(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
