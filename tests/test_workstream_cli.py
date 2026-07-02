@@ -27,6 +27,7 @@ from afk.workstream import (  # noqa: E402
     normalize_recipe,
     pr_body_markdown,
     publish_terminal_pr,
+    review_implementation_input,
     selected_work_records,
     select_work_proves_different_item,
     update_state_from_step,
@@ -285,6 +286,35 @@ def merged_recipe_with_retrospective(temp_path, repo, checkout, fake_git, fake_g
 
 
 class WorkstreamCliTest(unittest.TestCase):
+    def test_review_implementation_input_preserves_existing_git_when_cumulative_metadata_fails(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            checkout = temp_path / "not-a-git-checkout"
+            checkout.mkdir()
+            state = {
+                "checkout": {
+                    "checkout_path": str(checkout),
+                    "base_commit": "abc123",
+                    "start_commit": "abc123",
+                },
+                "implementation": {
+                    "status": "implemented",
+                    "summary": "repair implementation complete",
+                    "git": {
+                        "before_commit": "def456",
+                        "after_commit": "fedcba",
+                        "changed_files": ["file-b.txt"],
+                        "commits": [{"commit": "fedcba", "subject": "repair implementation"}],
+                        "dirty": False,
+                        "dirty_status": [],
+                    },
+                },
+            }
+
+            result = review_implementation_input(state)
+
+            self.assertEqual(result, state["implementation"])
+
     def test_select_work_proves_different_item_with_fixture_enumerated_candidates(self):
         state = {"selected_work": [selected_fixture_item("central-lve.9")]}
         input_data = {

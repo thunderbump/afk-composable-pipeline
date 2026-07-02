@@ -1149,6 +1149,8 @@ def review_implementation_input(state: dict[str, Any]) -> dict[str, Any]:
     if not base_commit or not checkout_path:
         return implementation
     cumulative_git = safe_git_metadata(checkout_path, base_commit)
+    if cumulative_git.get("metadata_status") == "failed":
+        return implementation
     latest_git = implementation.get("git") if isinstance(implementation.get("git"), dict) else {}
     merged = dict(implementation)
     merged["git"] = cumulative_git
