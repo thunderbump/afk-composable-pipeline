@@ -27,6 +27,7 @@ from afk.workstream import (  # noqa: E402
     normalize_recipe,
     pr_body_markdown,
     publish_terminal_pr,
+    review_implementation_input,
     selected_work_records,
     select_work_proves_different_item,
     update_state_from_step,
@@ -285,6 +286,82 @@ def merged_recipe_with_retrospective(temp_path, repo, checkout, fake_git, fake_g
 
 
 class WorkstreamCliTest(unittest.TestCase):
+    def test_review_implementation_input_preserves_existing_git_when_cumulative_metadata_fails(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            checkout = temp_path / "not-a-git-checkout"
+            checkout.mkdir()
+            state = {
+                "checkout": {
+                    "checkout_path": str(checkout),
+                    "base_commit": "abc123",
+                    "start_commit": "abc123",
+                },
+                "implementation": {
+                    "status": "implemented",
+                    "summary": "repair implementation complete",
+                    "git": {
+                        "before_commit": "def456",
+                        "after_commit": "fedcba",
+                        "changed_files": ["file-b.txt"],
+                        "commits": [{"commit": "fedcba", "subject": "repair implementation"}],
+                        "dirty": False,
+                        "dirty_status": [],
+                    },
+                },
+            }
+
+            result = review_implementation_input(state)
+
+            self.assertEqual(result, state["implementation"])
+
+    def test_review_implementation_input_preserves_existing_cumulative_git_when_retry_base_commit_is_missing(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repo = temp_path / "checkout"
+            init_repo(repo)
+            start_commit = git(repo, "rev-parse", "HEAD")
+            (repo / "file-a.txt").write_text("initial\n", encoding="utf-8")
+            git(repo, "add", "file-a.txt")
+            git(repo, "commit", "-m", "initial implementation")
+            (repo / "file-b.txt").write_text("repair\n", encoding="utf-8")
+            git(repo, "add", "file-b.txt")
+            git(repo, "commit", "-m", "repair implementation")
+            repair_head = git(repo, "rev-parse", "HEAD")
+            state = {
+                "checkout": {
+                    "checkout_path": str(repo),
+                    "start_commit": repair_head,
+                },
+                "implementation": {
+                    "status": "implemented",
+                    "summary": "repair implementation complete",
+                    "git": {
+                        "before_commit": start_commit,
+                        "after_commit": repair_head,
+                        "changed_files": ["file-a.txt", "file-b.txt"],
+                        "commits": [
+                            {"commit": repair_head, "subject": "repair implementation"},
+                            {"commit": "initial", "subject": "initial implementation"},
+                        ],
+                        "dirty": False,
+                        "dirty_status": [],
+                    },
+                    "latest_repair": {
+                        "before_commit": git(repo, "rev-parse", "HEAD^"),
+                        "after_commit": repair_head,
+                        "changed_files": ["file-b.txt"],
+                        "commits": [{"commit": repair_head, "subject": "repair implementation"}],
+                        "dirty": False,
+                        "dirty_status": [],
+                    },
+                },
+            }
+
+            result = review_implementation_input(state)
+
+            self.assertEqual(result, state["implementation"])
+
     def test_select_work_proves_different_item_with_fixture_enumerated_candidates(self):
         state = {"selected_work": [selected_fixture_item("central-lve.9")]}
         input_data = {
@@ -9508,6 +9585,172 @@ Path({str(fake_calls)!r}).write_text("gh should not run\\n", encoding="utf-8")
             self.assertEqual(result["review_cycles"][1]["reviews"][0]["role"], "correctness")
             self.assertEqual(result["tracker"]["review_cycles"], result["review_cycles"])
             self.assertEqual(result["tracker"]["status"], "review-feedback-addressed")
+
+    def test_workstream_review_feedback_retry_review_uses_cumulative_branch_diff_and_latest_repair_context(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repo = temp_path / "repo-src"
+            checkout = temp_path / "checkout"
+            ledger = temp_path / "ledger"
+            init_repo(repo)
+            fake_git = temp_path / "publisher-git"
+            fake_gh = temp_path / "publisher-gh"
+            write_executable(fake_git, f"#!{sys.executable}\nraise SystemExit(9)\n")
+            write_executable(fake_gh, f"#!{sys.executable}\nraise SystemExit(9)\n")
+            review_count = temp_path / "review-count.txt"
+            agent_code = textwrap.dedent(
+                """
+                import json
+                import os
+                import subprocess
+                from pathlib import Path
+
+                capsule = json.loads(Path(os.environ["AFK_JOB_CAPSULE"]).read_text(encoding="utf-8"))
+                if capsule.get("repair_context"):
+                    Path("file-b.txt").write_text("repair\\n", encoding="utf-8")
+                    subprocess.run(["git", "add", "file-b.txt"], check=True)
+                    subprocess.run(["git", "commit", "-m", "repair implementation"], check=True)
+                else:
+                    Path("file-a.txt").write_text("initial\\n", encoding="utf-8")
+                    subprocess.run(["git", "add", "file-a.txt"], check=True)
+                    subprocess.run(["git", "commit", "-m", "initial implementation"], check=True)
+                Path("agent-result.json").write_text(
+                    json.dumps({"status": "completed", "summary": "implementation complete"}),
+                    encoding="utf-8",
+                )
+                """
+            ).strip()
+            worker_code = textwrap.dedent(
+                """
+                import json
+                import os
+                from pathlib import Path
+
+                request = json.loads(Path(os.environ["AFK_WORKER_REQUEST"]).read_text(encoding="utf-8"))
+                Path(os.environ["AFK_WORKER_RESULT"]).write_text(
+                    json.dumps(
+                        {
+                            "profile": request["profile"],
+                            "status": "pass",
+                            "summary": "tests passed",
+                            "steps": [{"name": "unit", "status": "pass"}],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                """
+            ).strip()
+            reviewer_code = textwrap.dedent(
+                f"""
+                import json
+                import os
+                from pathlib import Path
+
+                count_path = Path({str(review_count)!r})
+                prior = int(count_path.read_text(encoding="utf-8")) if count_path.exists() else 0
+                count_path.write_text(str(prior + 1), encoding="utf-8")
+                request = json.loads(Path(os.environ["AFK_REVIEWER_REQUEST"]).read_text(encoding="utf-8"))
+                implementation = request["evidence_pack"]["implementation"]
+                if prior == 0:
+                    payload = {{
+                        "status": "request_revision",
+                        "summary": "review requested changes",
+                        "findings": [
+                            {{
+                                "status": "request_revision",
+                                "severity": "high",
+                                "file": "file-b.txt",
+                                "line": 1,
+                                "required_fix": "Add the repair change.",
+                                "summary": "Repair commit is still missing.",
+                            }}
+                        ],
+                    }}
+                else:
+                    assert implementation["git"]["changed_files"] == ["file-a.txt", "file-b.txt"], implementation
+                    assert [commit["subject"] for commit in implementation["git"]["commits"]] == [
+                        "repair implementation",
+                        "initial implementation",
+                    ], implementation
+                    latest_repair = implementation["latest_repair"]
+                    assert latest_repair["changed_files"] == ["file-b.txt"], latest_repair
+                    assert [commit["subject"] for commit in latest_repair["commits"]] == [
+                        "repair implementation"
+                    ], latest_repair
+                    payload = {{
+                        "status": "pass",
+                        "summary": "review passed after cumulative diff check",
+                        "findings": [],
+                    }}
+                Path(os.environ["AFK_REVIEWER_RESULT"]).write_text(json.dumps(payload), encoding="utf-8")
+                """
+            ).strip()
+            project_contract = ProjectContract(
+                project_slug="test-project",
+                repo_url=str(repo),
+                base_branch="main",
+                beads_labels=("project:test-project",),
+                validation_profiles=("tier1",),
+                validation_profile_requests={"tier1": {"profile": "tier1"}},
+                artifact_retention={"ledger_days": 30, "log_days": 30},
+                pr_target={"remote": "origin", "branch": "main"},
+                identity=ProjectContractIdentity(path="test-project.json", sha256="deadbeef"),
+            )
+            recipe = generate_workstream_recipe(
+                workstream_id="central-lve.9",
+                project_contract=project_contract,
+                beads_workspace=temp_path,
+                checkout_root=temp_path,
+                checkout_path=checkout,
+                validation_profile="tier1",
+                sources=[{"type": "fixture", "id": "fixture", "items": [selected_fixture_item()]}],
+                required_labels=["afk:ready"],
+                enable_review_feedback=True,
+            )
+            recipe["steps"][0]["input"]["required_metadata"] = []
+            recipe["publisher"] = {"enabled": False}
+            recipe["retry_policy"] = {"max_retries": 1}
+            recipe["steps"][2]["input"]["agent"]["command"] = [sys.executable, "-c", agent_code]
+            recipe["steps"][3]["input"]["worker"]["command"] = [sys.executable, "-c", worker_code]
+            recipe["steps"][4]["input"]["role"] = "correctness"
+            recipe["steps"][4]["input"]["reviewer"]["command"] = [sys.executable, "-c", reviewer_code]
+
+            completed = run_afk(
+                "run-workstream",
+                "--workstream-id",
+                "central-lve.9",
+                "--input",
+                json.dumps(recipe),
+                "--ledger",
+                str(ledger),
+                env_overrides={
+                    "GIT_ALLOW_PROTOCOL": "file",
+                    "GIT_AUTHOR_NAME": "AFK Test",
+                    "GIT_AUTHOR_EMAIL": "afk-test@example.test",
+                    "GIT_COMMITTER_NAME": "AFK Test",
+                    "GIT_COMMITTER_EMAIL": "afk-test@example.test",
+                },
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            result = json.loads((ledger / summary["result_path"]).read_text(encoding="utf-8"))
+
+            self.assertEqual(summary["status"], "validated-unpublished")
+            self.assertEqual(
+                [step["name"] for step in result["steps"]],
+                [
+                    "select-work",
+                    "prepare-checkout",
+                    "implement",
+                    "validate",
+                    "review",
+                    "prepare-checkout",
+                    "implement",
+                    "validate",
+                    "review",
+                ],
+            )
 
     def test_workstream_review_feedback_blocks_when_repair_budget_is_exhausted(self):
         with tempfile.TemporaryDirectory() as temp_dir:
