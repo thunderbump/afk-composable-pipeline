@@ -297,15 +297,35 @@ def normalize_implementation(implementation: Any, checkout_path: Path) -> dict[s
     git_metadata = implementation.get("git")
     if not isinstance(git_metadata, dict):
         git_metadata = infer_git_metadata(checkout_path)
-    changed_files = string_list_field(git_metadata, "changed_files")
-    if changed_files is None:
-        return {"status": "invalid", "message": "implementation.git.changed_files must be a list of strings"}
-    commits = git_metadata.get("commits", [])
-    if not isinstance(commits, list):
-        return {"status": "invalid", "message": "implementation.git.commits must be a list"}
+    normalized_git = normalize_implementation_git(git_metadata, field_name="implementation.git")
+    if normalized_git["status"] != "valid":
+        return normalized_git
     normalized = {
         "status": string_field(implementation, "status") or "",
         "summary": string_field(implementation, "summary") or "",
+        "git": normalized_git["git"],
+    }
+    latest_repair = implementation.get("latest_repair")
+    if isinstance(latest_repair, dict):
+        normalized_latest_repair = normalize_implementation_git(
+            latest_repair,
+            field_name="implementation.latest_repair",
+        )
+        if normalized_latest_repair["status"] != "valid":
+            return normalized_latest_repair
+        normalized["latest_repair"] = normalized_latest_repair["git"]
+    return {"status": "valid", "implementation": redact_artifact_value(normalized)}
+
+
+def normalize_implementation_git(git_metadata: dict[str, Any], *, field_name: str) -> dict[str, Any]:
+    changed_files = string_list_field(git_metadata, "changed_files")
+    if changed_files is None:
+        return {"status": "invalid", "message": f"{field_name}.changed_files must be a list of strings"}
+    commits = git_metadata.get("commits", [])
+    if not isinstance(commits, list):
+        return {"status": "invalid", "message": f"{field_name}.commits must be a list"}
+    return {
+        "status": "valid",
         "git": {
             "before_commit": string_field(git_metadata, "before_commit") or "",
             "after_commit": string_field(git_metadata, "after_commit") or "",
@@ -315,7 +335,6 @@ def normalize_implementation(implementation: Any, checkout_path: Path) -> dict[s
             "dirty_status": string_list_field(git_metadata, "dirty_status") or [],
         },
     }
-    return {"status": "valid", "implementation": redact_artifact_value(normalized)}
 
 
 def infer_git_metadata(checkout_path: Path) -> dict[str, Any]:

@@ -14,7 +14,7 @@ from typing import Any, Callable
 from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
 from afk.contracts import ProjectContract
-from afk.implement import runtime_failure_excerpt
+from afk.implement import runtime_failure_excerpt, safe_git_metadata
 from afk.jsonutil import canonical_json, sha256_json
 from afk.pi_workers import (
     non_openai_pi_mount_error,
@@ -566,7 +566,7 @@ def composed_step_input(
         if state.get("checkout") is not None:
             input_data["checkout"] = state["checkout"]
         if state.get("implementation") is not None:
-            input_data["implementation"] = state["implementation"]
+            input_data["implementation"] = review_implementation_input(state)
         validation = input_data.get("validation", {})
         if not isinstance(validation, dict):
             validation = {}
@@ -1137,6 +1137,26 @@ def implementation_work_selection(implementation: dict[str, Any], state: dict[st
     if isinstance(work_item, dict):
         return {"schema_version": SCHEMA_VERSION, "selected_work": [dict(work_item)]}
     return {"schema_version": SCHEMA_VERSION, "selected_work": snapshot_selected_work(state)}
+
+
+def review_implementation_input(state: dict[str, Any]) -> dict[str, Any]:
+    implementation = state.get("implementation") if isinstance(state.get("implementation"), dict) else {}
+    if implementation.get("status") != "implemented":
+        return implementation
+    checkout = state.get("checkout") if isinstance(state.get("checkout"), dict) else {}
+    checkout_path = Path(string_field(checkout, "checkout_path") or "")
+    base_commit = string_field(checkout, "base_commit") or string_field(checkout, "start_commit")
+    if not base_commit or not checkout_path:
+        return implementation
+    cumulative_git = safe_git_metadata(checkout_path, base_commit)
+    latest_git = implementation.get("git") if isinstance(implementation.get("git"), dict) else {}
+    merged = dict(implementation)
+    merged["git"] = cumulative_git
+    if latest_git and latest_git != cumulative_git:
+        merged["latest_repair"] = latest_git
+    else:
+        merged.pop("latest_repair", None)
+    return merged
 
 
 def pending_repair_context(state: dict[str, Any]) -> dict[str, Any] | None:
