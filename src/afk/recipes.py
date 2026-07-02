@@ -32,6 +32,7 @@ def generate_workstream_recipe(
     required_labels: list[str] | None = None,
     required_metadata: list[str] | None = None,
     enable_review_feedback: bool = False,
+    expect_generated_smoke_dry_run: bool = False,
 ) -> dict[str, Any]:
     if url_has_secret_material(project_contract.repo_url):
         raise ValueError("project contract repo_url must not contain embedded credentials or query parameters")
@@ -117,6 +118,8 @@ def generate_workstream_recipe(
         recipe["retrospective_judge"] = retrospective_judge
     if retrospective_follow_up is not None:
         recipe["retrospective_follow_up"] = retrospective_follow_up
+    if expect_generated_smoke_dry_run:
+        recipe["validation_expectations"] = {"generated_smoke_dry_run_expected": True}
 
     return recipe
 

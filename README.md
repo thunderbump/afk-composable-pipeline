@@ -490,6 +490,7 @@ PYTHONPATH=src python3 -m afk run-next \
   --project bump-eqemu \
   --contracts-dir project-contracts \
   --beads-workspace /home/bump/Projects/beads \
+  --ledger ledger \
   --checkout-root /work \
   --checkout-path /work/bump-EQEmu \
   --validation-profile tier1 \
@@ -525,8 +526,10 @@ PYTHONPATH=src python3 -m afk run-next \
 ```
 
 That recipe intentionally leaves validation on the generated dry-run smoke
-adapter. Use it when you want quick pipeline exercise, not when you need real
-project validation evidence.
+adapter and explicitly marks that smoke mode as expected. Use it when you want
+quick pipeline exercise, not when you need real project validation evidence. If
+you also want to execute that fake-local recipe, add `--execute --ledger
+<ledger>`.
 
 When using Pi-backed roles, all worker model flags are validated with the same
 cap: `gpt-5.4` or lower. The production role profile defaults to `gpt-5.4` for

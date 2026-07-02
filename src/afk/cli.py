@@ -183,6 +183,9 @@ def main(argv: list[str] | None = None) -> int:
                 retrospective_judge=retrospective_judge,
                 publisher=recipe_publisher,
                 enable_review_feedback=args.role_profile == PRODUCTION_ROLE_PROFILE,
+                expect_generated_smoke_dry_run=(
+                    args.role_profile == FAKE_LOCAL_ROLE_PROFILE and args.validation_mode == "fake"
+                ),
             )
         except ValueError as exc:
             parser.error(str(exc))
@@ -276,6 +279,9 @@ def main(argv: list[str] | None = None) -> int:
                 selector_model=args.selector_model,
                 selector_choice_json=args.selector_choice_json,
                 enable_review_feedback=args.role_profile == PRODUCTION_ROLE_PROFILE,
+                expect_generated_smoke_dry_run=(
+                    args.role_profile == FAKE_LOCAL_ROLE_PROFILE and args.validation_mode == "fake"
+                ),
                 execute=args.execute,
                 ledger_dir=Path(args.ledger) if args.ledger else None,
                 workstream_runner=workstream_runner,

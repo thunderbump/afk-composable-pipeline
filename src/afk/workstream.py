@@ -449,6 +449,7 @@ def normalize_recipe(
     publisher = recipe.get("publisher", {"enabled": False})
     retry_policy = normalize_retry_policy(recipe.get("retry_policy"))
     validation_feedback = normalize_validation_feedback(recipe.get("validation_feedback"))
+    validation_expectations = normalize_validation_expectations(recipe.get("validation_expectations"))
     review_feedback = normalize_review_feedback(recipe.get("review_feedback"))
     tracker = normalize_tracker_config(recipe.get("tracker"))
     review_cycles = normalize_review_cycles(recipe.get("review_cycles"))
@@ -469,6 +470,7 @@ def normalize_recipe(
         "publisher": publisher,
         "retry_policy": retry_policy,
         "validation_feedback": validation_feedback,
+        "validation_expectations": validation_expectations,
         "review_feedback": review_feedback,
         "tracker": tracker,
         "review_cycles": review_cycles,
@@ -3172,6 +3174,20 @@ def normalize_validation_feedback(validation_feedback: Any) -> dict[str, bool]:
     return {"enabled": enabled}
 
 
+def normalize_validation_expectations(validation_expectations: Any) -> dict[str, bool]:
+    if validation_expectations is None:
+        return {"generated_smoke_dry_run_expected": False}
+    if not isinstance(validation_expectations, dict):
+        raise WorkstreamError("validation_expectations must be an object")
+    unsupported = [key for key in validation_expectations if key != "generated_smoke_dry_run_expected"]
+    if unsupported:
+        raise WorkstreamError("validation_expectations only supports generated_smoke_dry_run_expected")
+    expected = validation_expectations.get("generated_smoke_dry_run_expected", False)
+    if not isinstance(expected, bool):
+        raise WorkstreamError("validation_expectations.generated_smoke_dry_run_expected must be a boolean")
+    return {"generated_smoke_dry_run_expected": expected}
+
+
 def normalize_review_feedback(review_feedback: Any) -> dict[str, bool]:
     if review_feedback is None:
         return {"enabled": False}
@@ -3986,7 +4002,7 @@ def pipeline_retrospective_record(
     normalized: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     signals = (
-        _validation_retrospective_signals(state)
+        _validation_retrospective_signals(state, normalized)
         + _auth_preflight_retrospective_signals(state)
         + _publication_retrospective_signals(publication)
         + _blocked_retrospective_signals(state, publication)
@@ -5590,7 +5606,10 @@ def _write_retrospective_follow_up_result(path: Path, run_id: str, creation: dic
     )
 
 
-def _validation_retrospective_signals(state: dict[str, Any]) -> list[dict[str, Any]]:
+def _validation_retrospective_signals(
+    state: dict[str, Any],
+    normalized: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
     validations = state.get("validations")
     if not isinstance(validations, list):
         return []
@@ -5599,7 +5618,7 @@ def _validation_retrospective_signals(state: dict[str, Any]) -> list[dict[str, A
         if not isinstance(validation, dict):
             continue
         output = validation.get("output") if isinstance(validation.get("output"), dict) else {}
-        smoke_signal = _dry_run_smoke_validation_retrospective_signal(validation, output)
+        smoke_signal = _dry_run_smoke_validation_retrospective_signal(validation, output, normalized)
         if smoke_signal is not None:
             signals.append(smoke_signal)
         actionable_failures = output.get("actionable_failures")
@@ -5623,8 +5642,11 @@ def _validation_retrospective_signals(state: dict[str, Any]) -> list[dict[str, A
 def _dry_run_smoke_validation_retrospective_signal(
     validation: dict[str, Any],
     output: dict[str, Any],
+    normalized: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     if output.get("status") != "validated":
+        return None
+    if _generated_smoke_dry_run_expected(normalized):
         return None
     validation_info = output.get("validation") if isinstance(output.get("validation"), dict) else {}
     if validation_info.get("dry_run") is not True:
@@ -5653,6 +5675,16 @@ def _dry_run_smoke_validation_retrospective_signal(
 
 def _is_generated_smoke_validation_step(step: Any) -> bool:
     return isinstance(step, dict) and string_field(step, "name") == "generated-recipe-smoke"
+
+
+def _generated_smoke_dry_run_expected(normalized: dict[str, Any] | None) -> bool:
+    if not isinstance(normalized, dict):
+        return False
+    validation_expectations = normalized.get("validation_expectations")
+    return (
+        isinstance(validation_expectations, dict)
+        and validation_expectations.get("generated_smoke_dry_run_expected") is True
+    )
 
 
 def _validation_failure_consumed_by_repair(validations: list[Any], index: int) -> bool:

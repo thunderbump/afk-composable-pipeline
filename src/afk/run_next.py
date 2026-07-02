@@ -40,6 +40,7 @@ def run_next(
     selector_model: str | None = None,
     selector_choice_json: str | None = None,
     enable_review_feedback: bool = False,
+    expect_generated_smoke_dry_run: bool = False,
     execute: bool = False,
     ledger_dir: Path | None = None,
     workstream_runner: Callable[..., Any] | None = None,
@@ -79,6 +80,7 @@ def run_next(
             required_labels=selection_request["required_labels"],
             required_metadata=selection_request["required_metadata"],
             enable_review_feedback=enable_review_feedback,
+            expect_generated_smoke_dry_run=expect_generated_smoke_dry_run,
         )
         if execute:
             if ledger_dir is None:
