@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -41,6 +42,7 @@ PRODUCTION_ROLE_PROFILE = "production"
 FAKE_LOCAL_ROLE_PROFILE = "fake-local"
 PRODUCTION_IMPLEMENTATION_TIMEOUT_SECONDS = 3600
 PRODUCTION_REVIEW_TIMEOUT_SECONDS = 300
+DEFAULT_LEDGER_DIR = "ledgers"
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -80,7 +82,7 @@ def main(argv: list[str] | None = None) -> int:
                 parser.error(str(exc))
 
         try:
-            result = run_step(args.step, input_data, Path(args.ledger), project_contract)
+            result = run_step(args.step, input_data, resolve_ledger_dir(args.ledger), project_contract)
         except UnknownStepError as exc:
             parser.error(str(exc))
         print(
@@ -117,7 +119,7 @@ def main(argv: list[str] | None = None) -> int:
         try:
             result = run_workstream(
                 input_data,
-                ledger_dir=Path(args.ledger),
+                ledger_dir=resolve_ledger_dir(args.ledger),
                 step_runner=run_step,
                 parent=args.parent,
                 workstream_id=args.workstream_id,
@@ -219,8 +221,6 @@ def main(argv: list[str] | None = None) -> int:
         path_error = checkout_path_error(args.checkout_root, args.checkout_path)
         if path_error is not None:
             parser.error(path_error)
-        if args.execute and not args.ledger:
-            parser.error("--ledger is required when --execute is set")
         try:
             args.effective_validation_mode = effective_run_next_validation_mode(
                 args,
@@ -287,7 +287,7 @@ def main(argv: list[str] | None = None) -> int:
                     args.role_profile == FAKE_LOCAL_ROLE_PROFILE and args.effective_validation_mode == "fake"
                 ),
                 execute=args.execute,
-                ledger_dir=Path(args.ledger) if args.ledger else None,
+                ledger_dir=resolve_ledger_dir(args.ledger),
                 workstream_runner=workstream_runner,
                 tracker_artifact_root=Path(args.contracts_dir).resolve().parent,
             )
@@ -308,7 +308,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_step_parser.add_argument("step")
     run_step_parser.add_argument("--input", required=True, help="JSON input payload")
     run_step_parser.add_argument("--profile", help="Validation profile for profile-aware steps")
-    run_step_parser.add_argument("--ledger", required=True, help="Ledger output directory")
+    run_step_parser.add_argument("--ledger", help="Ledger output directory")
     run_step_parser.add_argument("--project", help="Project slug for contract resolution")
     run_step_parser.add_argument(
         "--contracts-dir",
@@ -321,7 +321,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run a declarative workstream recipe and terminal PR publisher",
     )
     run_workstream_parser.add_argument("--input", required=True, help="JSON workstream recipe")
-    run_workstream_parser.add_argument("--ledger", required=True, help="Ledger output directory")
+    run_workstream_parser.add_argument("--ledger", help="Ledger output directory")
     run_workstream_parser.add_argument("--parent", help="Parent workstream or issue id")
     run_workstream_parser.add_argument("--workstream-id", help="Workstream id")
     run_workstream_parser.add_argument("--project", help="Project slug for contract resolution")
@@ -441,6 +441,15 @@ def build_parser() -> argparse.ArgumentParser:
     add_publisher_flags(run_next_parser)
 
     return parser
+
+
+def resolve_ledger_dir(cli_value: str | None) -> Path:
+    if cli_value:
+        return Path(cli_value)
+    env_value = os.environ.get("AFK_LEDGER_DIR")
+    if env_value:
+        return Path(env_value)
+    return Path(DEFAULT_LEDGER_DIR)
 
 
 def add_role_profile_flag(parser: argparse.ArgumentParser) -> None:

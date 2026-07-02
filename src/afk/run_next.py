@@ -83,16 +83,12 @@ def run_next(
             expect_generated_smoke_dry_run=expect_generated_smoke_dry_run,
         )
         if execute:
-            if ledger_dir is None:
-                raise ValueError("--ledger is required when --execute is set")
             if workstream_runner is None:
                 raise ValueError("workstream_runner is required when --execute is set")
             workstream_result = normalize_workstream_result(
                 workstream_runner(recipe, ledger_dir=ledger_dir, project_contract=project_contract),
                 ledger_dir=ledger_dir,
             )
-    elif execute and ledger_dir is None:
-        raise ValueError("--ledger is required when --execute is set")
     return {
         "command": "run-next",
         "project": project_contract.project_slug,

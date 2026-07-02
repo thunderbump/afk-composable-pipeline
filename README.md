@@ -8,17 +8,22 @@ interface runs a no-op step and records evidence under a ledger directory.
 Run through the installed console script:
 
 ```sh
-afk run-step noop --input '{"message":"hello"}' --ledger ledger
+afk run-step noop --input '{"message":"hello"}'
 ```
 
 Run through the module fallback from a checkout:
 
 ```sh
-PYTHONPATH=src python3 -m afk run-step noop --input '{"message":"hello"}' --ledger ledger
+PYTHONPATH=src python3 -m afk run-step noop --input '{"message":"hello"}'
 ```
 
 The CLI prints a JSON summary containing the `run_id`, step, status, and result
 path.
+
+When `--ledger` is omitted, AFK resolves ledger output with this precedence:
+`--ledger` > `AFK_LEDGER_DIR` > `./ledgers`. Preview-only `run-next` does not
+create `./ledgers`; the directory is only created when execution actually writes
+artifacts.
 
 Project contracts can be resolved by slug. The contract records stable project
 facts and its resolved path/hash are written to the ledger:
@@ -27,8 +32,7 @@ facts and its resolved path/hash are written to the ledger:
 PYTHONPATH=src python3 -m afk run-step noop \
   --project bump-eqemu \
   --contracts-dir project-contracts \
-  --input '{"message":"hello"}' \
-  --ledger ledger
+  --input '{"message":"hello"}'
 ```
 
 Step names are dispatched through the fixed Python registry. Unknown steps fail
@@ -150,6 +154,9 @@ PYTHONPATH=src python3 -m afk run-workstream \
   --input '{"workstream_id":"central-lve.9","review_branch":"afk/central-lve-9","steps":[{"name":"select-work","input":{"sources":[]}},{"name":"prepare-checkout","input":{"repo_url":"git@github.com:thunderbump/afk-composable-pipeline.git","base_ref":"afk/central-lve-8-final-review","checkout_root":"/work","checkout_path":"/work/afk-composable-pipeline"}},{"name":"implement","input":{"guardrails":[],"validation":{"profile":"tier1","commands":[]},"agent":{"type":"fake-pi-command","command":["python3","agent.py"]}}},{"name":"validate","profile":"tier1","input":{"validation":{"dry_run":false},"worker":{"type":"local-command","command":["python3","validate.py"]}}},{"name":"review","input":{"guardrails":[],"cleanup":{"status":"clean","resources":[]},"reviewer":{"type":"fake-reviewer-command","command":["python3","review.py"]}}}],"publisher":{"enabled":true,"mode":"create","repo":"thunderbump/afk-composable-pipeline","base":"afk/central-lve-8-final-review","head":"afk/central-lve-9","title":"central-lve.9: Workstream publisher","git":{"push":true,"remote":"origin"},"gh":{"auth":{"config_dir":"/work/mounts/gh-config"}}}}' \
   --ledger ledger
 ```
+
+Omit `--ledger` here to write under `./ledgers`, or set `AFK_LEDGER_DIR` when a
+runner should direct artifacts somewhere else without changing every command.
 
 The recipe schema is intentionally small:
 
@@ -483,7 +490,8 @@ not available.
 `run-next` defaults to preview mode. It writes the generated recipe to stdout and
 does not execute it unless `--execute` is set. For a safe dogfood run, validate
 the preview payload in CI or locally first, then add `--execute` in a controlled
-runner.
+runner. When you do add `--execute`, ledger precedence is still `--ledger` >
+`AFK_LEDGER_DIR` > `./ledgers`.
 
 For honest `bump-eqemu` production dogfood, let `run-next --execute` take the
 production defaults and mount the real validation stack next to the checkout:
@@ -493,7 +501,6 @@ PYTHONPATH=src python3 -m afk run-next \
   --project bump-eqemu \
   --contracts-dir project-contracts \
   --beads-workspace /home/bump/Projects/beads \
-  --ledger ledger \
   --checkout-root /work \
   --checkout-path /work/bump-EQEmu \
   --validation-profile tier1 \
@@ -522,7 +529,6 @@ PYTHONPATH=src python3 -m afk run-next \
   --project bump-eqemu \
   --contracts-dir project-contracts \
   --beads-workspace /home/bump/Projects/beads \
-  --ledger ledger \
   --checkout-root /work \
   --checkout-path /work/bump-EQEmu \
   --validation-profile tier1 \
@@ -559,8 +565,7 @@ The pipeline has a docs-safe dogfood path:
 
    ```sh
    PYTHONPATH=src python3 -m afk run-step noop \
-     --input '{"message":"dogfood no-op"}' \
-     --ledger ledger
+     --input '{"message":"dogfood no-op"}'
    ```
 
 2. For docs-only runs, include or update the doc-card marker in the PR body

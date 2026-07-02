@@ -286,6 +286,88 @@ def merged_recipe_with_retrospective(temp_path, repo, checkout, fake_git, fake_g
 
 
 class WorkstreamCliTest(unittest.TestCase):
+    @staticmethod
+    def _minimal_workstream_recipe() -> dict[str, object]:
+        return {
+            "schema_version": 1,
+            "workstream_id": "central-lve.9",
+            "steps": [
+                {
+                    "name": "select-work",
+                    "input": {
+                        "required_labels": ["afk:ready"],
+                        "sources": [
+                            {
+                                "type": "fixture",
+                                "id": "fixture",
+                                "items": [selected_fixture_item("central-lve.9")],
+                            }
+                        ],
+                    },
+                }
+            ],
+        }
+
+    def test_run_workstream_defaults_ledger_to_ledgers_directory(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+
+            completed = run_afk(
+                "run-workstream",
+                "--workstream-id",
+                "central-lve.9",
+                "--input",
+                json.dumps(self._minimal_workstream_recipe()),
+                cwd=temp_path,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            self.assertTrue((temp_path / "ledgers" / summary["result_path"]).is_file())
+
+    def test_run_workstream_uses_afk_ledger_dir_when_flag_is_absent(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            ledger = temp_path / "env-ledgers"
+
+            completed = run_afk(
+                "run-workstream",
+                "--workstream-id",
+                "central-lve.9",
+                "--input",
+                json.dumps(self._minimal_workstream_recipe()),
+                cwd=temp_path,
+                env_overrides={"AFK_LEDGER_DIR": str(ledger)},
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            self.assertTrue((ledger / summary["result_path"]).is_file())
+            self.assertFalse((temp_path / "ledgers").exists())
+
+    def test_run_workstream_ledger_flag_overrides_afk_ledger_dir(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            env_ledger = temp_path / "env-ledgers"
+            explicit_ledger = temp_path / "explicit-ledgers"
+
+            completed = run_afk(
+                "run-workstream",
+                "--workstream-id",
+                "central-lve.9",
+                "--input",
+                json.dumps(self._minimal_workstream_recipe()),
+                "--ledger",
+                str(explicit_ledger),
+                cwd=temp_path,
+                env_overrides={"AFK_LEDGER_DIR": str(env_ledger)},
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            self.assertTrue((explicit_ledger / summary["result_path"]).is_file())
+            self.assertFalse(env_ledger.exists())
+
     def test_review_implementation_input_preserves_existing_git_when_cumulative_metadata_fails(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
