@@ -96,6 +96,87 @@ def write_contract(path: Path, *, project_slug: str, repo_url: str) -> None:
     )
 
 
+def run_next_execute_dogfood(temp_path: Path, *, extra_args: list[str] | None = None, env: dict[str, str | None] | None = None):
+    contracts_dir = temp_path / "contracts"
+    contracts_dir.mkdir()
+    repo = temp_path / "repo-src"
+    init_repo(repo)
+    write_contract(
+        contracts_dir / "dogfood.json",
+        project_slug="dogfood",
+        repo_url=repo.as_uri(),
+    )
+    fake_bin = temp_path / "bin"
+    beads_workspace = temp_path / "beads"
+    checkout_root = temp_path / "checkouts"
+    checkout_path = checkout_root / "dogfood"
+    fake_bin.mkdir()
+    (beads_workspace / "secrets").mkdir(parents=True)
+    (beads_workspace / "secrets" / "dolt_beads_password.txt").write_text("test-password\n", encoding="utf-8")
+    write_executable(
+        fake_bin / "gh",
+        f"""#!{sys.executable}
+import sys
+
+if sys.argv[1:3] == ["auth", "status"]:
+    sys.exit(1)
+raise SystemExit(9)
+""",
+    )
+    write_executable(
+        fake_bin / "bd",
+        f"""#!{sys.executable}
+import json
+import sys
+
+if sys.argv[1:2] == ["list"]:
+    print(json.dumps([{{"id": "central-df.3"}}]))
+    raise SystemExit(0)
+if sys.argv[1:3] == ["show", "central-df.3"]:
+    print(json.dumps({{
+        "id": "central-df.3",
+        "title": "Create auth-preflight follow-up bead",
+        "status": "open",
+        "labels": ["project:dogfood", "ready-for-agent"],
+        "metadata": {{"afk.ready": True, "workstream": "central-df.3"}},
+        "acceptance_criteria": ["run-next execute creates follow-up bead"],
+        "dependencies": [],
+    }}))
+    raise SystemExit(0)
+raise SystemExit(9)
+""",
+    )
+
+    completed = run_afk(
+        "run-next",
+        "--project",
+        "dogfood",
+        "--contracts-dir",
+        str(contracts_dir),
+        "--beads-workspace",
+        str(beads_workspace),
+        "--checkout-root",
+        str(checkout_root),
+        "--checkout-path",
+        str(checkout_path),
+        "--validation-profile",
+        "tier1",
+        "--execute",
+        "--role-profile",
+        "fake-local",
+        *(extra_args or []),
+        env={
+            "GH_TOKEN": None,
+            "GITHUB_TOKEN": None,
+            "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+            "GIT_ALLOW_PROTOCOL": "file",
+            **(env or {}),
+        },
+        cwd=temp_path,
+    )
+    return completed
+
+
 class RunNextCliTest(unittest.TestCase):
     def test_run_next_help_mentions_publisher_flags(self):
         completed = run_afk("run-next", "--help")
@@ -796,85 +877,43 @@ raise SystemExit(9)
     def test_run_next_execute_defaults_ledger_to_ledgers_directory(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
-            contracts_dir = temp_path / "contracts"
-            contracts_dir.mkdir()
-            repo = temp_path / "repo-src"
-            init_repo(repo)
-            write_contract(
-                contracts_dir / "dogfood.json",
-                project_slug="dogfood",
-                repo_url=repo.as_uri(),
-            )
-            fake_bin = temp_path / "bin"
-            beads_workspace = temp_path / "beads"
-            checkout_root = temp_path / "checkouts"
-            checkout_path = checkout_root / "dogfood"
-            fake_bin.mkdir()
-            (beads_workspace / "secrets").mkdir(parents=True)
-            (beads_workspace / "secrets" / "dolt_beads_password.txt").write_text("test-password\n", encoding="utf-8")
-            write_executable(
-                fake_bin / "gh",
-                f"""#!{sys.executable}
-import sys
-
-if sys.argv[1:3] == ["auth", "status"]:
-    sys.exit(1)
-raise SystemExit(9)
-""",
-            )
-            write_executable(
-                fake_bin / "bd",
-                f"""#!{sys.executable}
-import json
-import sys
-
-if sys.argv[1:2] == ["list"]:
-    print(json.dumps([{{"id": "central-df.3"}}]))
-    raise SystemExit(0)
-if sys.argv[1:3] == ["show", "central-df.3"]:
-    print(json.dumps({{
-        "id": "central-df.3",
-        "title": "Create auth-preflight follow-up bead",
-        "status": "open",
-        "labels": ["project:dogfood", "ready-for-agent"],
-        "metadata": {{"afk.ready": True, "workstream": "central-df.3"}},
-        "acceptance_criteria": ["run-next execute creates follow-up bead"],
-        "dependencies": [],
-    }}))
-    raise SystemExit(0)
-raise SystemExit(9)
-""",
-            )
-
-            completed = run_afk(
-                "run-next",
-                "--project",
-                "dogfood",
-                "--contracts-dir",
-                str(contracts_dir),
-                "--beads-workspace",
-                str(beads_workspace),
-                "--checkout-root",
-                str(checkout_root),
-                "--checkout-path",
-                str(checkout_path),
-                "--validation-profile",
-                "tier1",
-                "--execute",
-                "--role-profile",
-                "fake-local",
-                env={
-                    "GH_TOKEN": None,
-                    "GITHUB_TOKEN": None,
-                    "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
-                    "GIT_ALLOW_PROTOCOL": "file",
-                },
-                cwd=temp_path,
-            )
+            completed = run_next_execute_dogfood(temp_path)
 
             self.assertEqual(completed.returncode, 0, completed.stderr)
             payload = json.loads(completed.stdout)
             self.assertTrue((temp_path / "ledgers" / payload["workstream_result"]["result_path"]).is_file())
+
+    def test_run_next_execute_uses_afk_ledger_dir_when_flag_is_absent(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            ledger = temp_path / "env-ledgers"
+
+            completed = run_next_execute_dogfood(
+                temp_path,
+                env={"AFK_LEDGER_DIR": str(ledger)},
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            payload = json.loads(completed.stdout)
+            self.assertTrue((ledger / payload["workstream_result"]["result_path"]).is_file())
+            self.assertFalse((temp_path / "ledgers").exists())
+
+    def test_run_next_execute_ledger_flag_overrides_afk_ledger_dir(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            env_ledger = temp_path / "env-ledgers"
+            explicit_ledger = temp_path / "explicit-ledgers"
+
+            completed = run_next_execute_dogfood(
+                temp_path,
+                extra_args=["--ledger", str(explicit_ledger)],
+                env={"AFK_LEDGER_DIR": str(env_ledger)},
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            payload = json.loads(completed.stdout)
+            self.assertTrue((explicit_ledger / payload["workstream_result"]["result_path"]).is_file())
+            self.assertFalse(env_ledger.exists())
 
     def test_run_next_execute_resolves_relative_beads_workspace_for_retrospective_follow_up(self):
         with tempfile.TemporaryDirectory() as temp_dir:
