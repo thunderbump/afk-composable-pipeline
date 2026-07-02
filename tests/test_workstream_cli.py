@@ -1,5 +1,6 @@
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -7629,7 +7630,7 @@ Path({str(fake_calls)!r}).write_text("gh should not run\\n", encoding="utf-8")
             self.assertIn("validated terminal state", result["terminal_reason"])
             self.assertEqual(
                 result["next_allowed_command"],
-                "afk run-workstream --workstream-id central-lve.9 --ledger <ledger> --input <recipe>",
+                f"afk run-workstream --workstream-id central-lve.9 --ledger {ledger} --input <recipe>",
             )
             self.assertFalse(fake_calls.exists())
 
@@ -7707,7 +7708,7 @@ Path({str(fake_calls)!r}).write_text("gh should not run\\n", encoding="utf-8")
             self.assertIn("validated terminal state", result["terminal_reason"])
             self.assertEqual(
                 result["next_allowed_command"],
-                "afk run-workstream --workstream-id central-lve.9 --ledger <ledger> --input <recipe>",
+                f"afk run-workstream --workstream-id central-lve.9 --ledger {ledger} --input <recipe>",
             )
             self.assertFalse(fake_calls.exists())
 
@@ -13623,6 +13624,224 @@ Path({str(fake_calls)!r}).open("a", encoding="utf-8").write("gh should not run\\
             self.assertEqual([call["tool"] for call in calls], ["gh", "git"])
             self.assertEqual(calls[0]["argv"][0:3], ["auth", "status", "--hostname"])
 
+    def test_workstream_omits_ledger_flag_in_blocked_retry_when_using_default_ledger(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repo = temp_path / "repo-src"
+            checkout = temp_path / "checkout"
+            ledger = temp_path / "ledgers"
+            fake_calls = temp_path / "fake-calls.jsonl"
+            init_repo(repo)
+            fake_git = temp_path / "publisher-git"
+            fake_gh = temp_path / "publisher-gh"
+            write_executable(
+                fake_git,
+                f"""#!{sys.executable}
+import json
+import os
+import sys
+from pathlib import Path
+
+Path({str(fake_calls)!r}).open("a", encoding="utf-8").write(
+    json.dumps({{"tool": "git", "cwd": os.getcwd(), "argv": sys.argv[1:]}}) + "\\n"
+)
+print("push rejected", file=sys.stderr)
+sys.exit(9)
+""",
+            )
+            write_executable(
+                fake_gh,
+                f"""#!{sys.executable}
+import json
+import sys
+from pathlib import Path
+
+Path({str(fake_calls)!r}).open("a", encoding="utf-8").write(
+    json.dumps({{"tool": "gh", "argv": sys.argv[1:]}}) + "\\n"
+)
+if sys.argv[1:4] == ["auth", "status", "--hostname"]:
+    sys.exit(0)
+Path({str(fake_calls)!r}).open("a", encoding="utf-8").write("gh should not run\\n")
+""",
+            )
+            recipe = successful_recipe(temp_path, repo, checkout, fake_git, fake_gh)
+
+            completed = run_afk(
+                "run-workstream",
+                "--workstream-id",
+                "central-lve.9",
+                "--input",
+                json.dumps(recipe),
+                cwd=temp_path,
+                env_overrides={
+                    "GIT_ALLOW_PROTOCOL": "file",
+                    "GIT_AUTHOR_NAME": "AFK Test",
+                    "GIT_AUTHOR_EMAIL": "afk-test@example.test",
+                    "GIT_COMMITTER_NAME": "AFK Test",
+                    "GIT_COMMITTER_EMAIL": "afk-test@example.test",
+                },
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            result = json.loads((ledger / summary["result_path"]).read_text(encoding="utf-8"))
+
+            self.assertIn(result["publication"]["status"], {"blocked", "failed-needs-human"})
+            self.assertEqual(
+                result["next_allowed_command"],
+                "afk run-workstream --workstream-id central-lve.9 --input <recipe>",
+            )
+            self.assertIn(
+                "afk run-workstream --workstream-id central-lve.9 --input <recipe>",
+                result["retry"],
+            )
+            self.assertNotIn("--ledger", result["retry"])
+
+    def test_workstream_preserves_explicit_ledger_path_in_blocked_retry_command(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repo = temp_path / "repo-src"
+            checkout = temp_path / "checkout"
+            ledger = temp_path / "explicit ledger"
+            fake_calls = temp_path / "fake-calls.jsonl"
+            init_repo(repo)
+            fake_git = temp_path / "publisher-git"
+            fake_gh = temp_path / "publisher-gh"
+            write_executable(
+                fake_git,
+                f"""#!{sys.executable}
+import json
+import os
+import sys
+from pathlib import Path
+
+Path({str(fake_calls)!r}).open("a", encoding="utf-8").write(
+    json.dumps({{"tool": "git", "cwd": os.getcwd(), "argv": sys.argv[1:]}}) + "\\n"
+)
+print("push rejected", file=sys.stderr)
+sys.exit(9)
+""",
+            )
+            write_executable(
+                fake_gh,
+                f"""#!{sys.executable}
+import json
+import sys
+from pathlib import Path
+
+Path({str(fake_calls)!r}).open("a", encoding="utf-8").write(
+    json.dumps({{"tool": "gh", "argv": sys.argv[1:]}}) + "\\n"
+)
+if sys.argv[1:4] == ["auth", "status", "--hostname"]:
+    sys.exit(0)
+Path({str(fake_calls)!r}).open("a", encoding="utf-8").write("gh should not run\\n")
+""",
+            )
+            recipe = successful_recipe(temp_path, repo, checkout, fake_git, fake_gh)
+
+            completed = run_afk(
+                "run-workstream",
+                "--workstream-id",
+                "central-lve.9",
+                "--input",
+                json.dumps(recipe),
+                "--ledger",
+                str(ledger),
+                env_overrides={
+                    "GIT_ALLOW_PROTOCOL": "file",
+                    "GIT_AUTHOR_NAME": "AFK Test",
+                    "GIT_AUTHOR_EMAIL": "afk-test@example.test",
+                    "GIT_COMMITTER_NAME": "AFK Test",
+                    "GIT_COMMITTER_EMAIL": "afk-test@example.test",
+                },
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            result = json.loads((ledger / summary["result_path"]).read_text(encoding="utf-8"))
+            expected = (
+                "afk run-workstream --workstream-id central-lve.9 "
+                f"--ledger {shlex.quote(str(ledger))} --input <recipe>"
+            )
+
+            self.assertEqual(result["publication"]["status"], "failed-needs-human")
+            self.assertEqual(result["next_allowed_command"], expected)
+            self.assertIn(expected, result["retry"])
+            self.assertEqual(result["publication"]["next_allowed_command"], expected)
+
+    def test_workstream_preserves_afk_ledger_dir_argument_in_blocked_retry_command(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repo = temp_path / "repo-src"
+            checkout = temp_path / "checkout"
+            ledger_arg = "relative ledger"
+            ledger = temp_path / ledger_arg
+            fake_calls = temp_path / "fake-calls.jsonl"
+            init_repo(repo)
+            fake_git = temp_path / "publisher-git"
+            fake_gh = temp_path / "publisher-gh"
+            write_executable(
+                fake_git,
+                f"""#!{sys.executable}
+import json
+import os
+import sys
+from pathlib import Path
+
+Path({str(fake_calls)!r}).open("a", encoding="utf-8").write(
+    json.dumps({{"tool": "git", "cwd": os.getcwd(), "argv": sys.argv[1:]}}) + "\\n"
+)
+print("push rejected", file=sys.stderr)
+sys.exit(9)
+""",
+            )
+            write_executable(
+                fake_gh,
+                f"""#!{sys.executable}
+import json
+import sys
+from pathlib import Path
+
+Path({str(fake_calls)!r}).open("a", encoding="utf-8").write(
+    json.dumps({{"tool": "gh", "argv": sys.argv[1:]}}) + "\\n"
+)
+if sys.argv[1:4] == ["auth", "status", "--hostname"]:
+    sys.exit(0)
+Path({str(fake_calls)!r}).open("a", encoding="utf-8").write("gh should not run\\n")
+""",
+            )
+            recipe = successful_recipe(temp_path, repo, checkout, fake_git, fake_gh)
+
+            completed = run_afk(
+                "run-workstream",
+                "--workstream-id",
+                "central-lve.9",
+                "--input",
+                json.dumps(recipe),
+                cwd=temp_path,
+                env_overrides={
+                    "AFK_LEDGER_DIR": ledger_arg,
+                    "GIT_ALLOW_PROTOCOL": "file",
+                    "GIT_AUTHOR_NAME": "AFK Test",
+                    "GIT_AUTHOR_EMAIL": "afk-test@example.test",
+                    "GIT_COMMITTER_NAME": "AFK Test",
+                    "GIT_COMMITTER_EMAIL": "afk-test@example.test",
+                },
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            result = json.loads((ledger / summary["result_path"]).read_text(encoding="utf-8"))
+            expected = (
+                "afk run-workstream --workstream-id central-lve.9 "
+                f"--ledger {shlex.quote(ledger_arg)} --input <recipe>"
+            )
+
+            self.assertEqual(result["publication"]["status"], "blocked")
+            self.assertEqual(result["next_allowed_command"], expected)
+            self.assertIn(expected, result["retry"])
+            self.assertEqual(result["publication"]["next_allowed_command"], expected)
+
     def test_workstream_disabled_publisher_does_not_advertise_absent_pr_body(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
@@ -13676,7 +13895,7 @@ Path({str(fake_calls)!r}).write_text("gh should not run\\n", encoding="utf-8")
             self.assertEqual(result["publication"]["status"], "validated-unpublished")
             self.assertEqual(
                 result["next_allowed_command"],
-                "afk run-workstream --workstream-id central-lve.9 --ledger <ledger> --input <recipe>",
+                f"afk run-workstream --workstream-id central-lve.9 --ledger {ledger} --input <recipe>",
             )
             self.assertNotIn("pr_body", result["artifacts"])
             self.assertFalse(result_path.parent.joinpath("pr-body.md").exists())
