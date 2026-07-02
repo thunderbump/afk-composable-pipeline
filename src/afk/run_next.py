@@ -309,6 +309,11 @@ def load_workstream_result_summary(result_path: Any, *, ledger_dir: Path | None)
     if not isinstance(result_path, str) or not result_path or ledger_dir is None:
         return {}
     payload_path = ledger_dir / result_path
+    ledger_root = ledger_dir.resolve()
+    try:
+        payload_path.resolve(strict=False).relative_to(ledger_root)
+    except ValueError:
+        return {}
     try:
         payload = json.loads(payload_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):

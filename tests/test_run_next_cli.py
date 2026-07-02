@@ -1519,6 +1519,85 @@ raise SystemExit(9)
         self.assertNotIn("steps", payload["workstream_result"])
         self.assertNotIn(runner_secret, json.dumps(payload["workstream_result"]))
 
+    def test_run_next_execute_mode_ignores_workstream_result_paths_outside_ledger(self):
+        contract = load_project_contract("bump-eqemu", ROOT / "project-contracts", cwd=ROOT)
+        selection_result = {
+            "schema_version": 1,
+            "source_statuses": [{"source_id": "central-beads", "source_type": "beads", "status": "selected"}],
+            "selected_work": [
+                {
+                    "source_id": "central-beads",
+                    "source_type": "beads",
+                    "external_id": "central-lve.11",
+                    "title": "Keep run-next ledger reads contained",
+                    "status": "open",
+                    "labels": ["project:bump-eqemu", "ready-for-agent"],
+                    "workstream": "central-lve",
+                    "acceptance_criteria": ["Ignore escaped workstream result paths"],
+                    "priority": 2,
+                    "issue_type": "bug",
+                    "description": "Do not load escaped workstream result summaries.",
+                    "dependencies": [],
+                    "blockers": [],
+                    "dependency_status": "clear",
+                    "afk": {"ready": True},
+                    "raw": {"beads": {"id": "central-lve.11"}},
+                }
+            ],
+            "skipped_candidates": [],
+        }
+
+        original_select_work = run_next.__globals__["select_work"]
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                temp_path = Path(temp_dir)
+                beads_workspace = temp_path / "beads"
+                ledger_dir = temp_path / "ledger"
+                outside_path = temp_path / "outside.json"
+                sentinel = "sentinel-secret-do-not-leak"
+                beads_workspace.mkdir()
+                ledger_dir.mkdir()
+                outside_path.write_text(
+                    json.dumps(
+                        {
+                            "publication": {"status": "blocked", "reason": sentinel},
+                            "tracker": {"status": sentinel},
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                run_next.__globals__["select_work"] = lambda request, project_contract=None: selection_result
+
+                for result_path in ("../outside.json", str(outside_path.resolve())):
+                    with self.subTest(result_path=result_path):
+                        payload = run_next(
+                            project_contract=contract,
+                            beads_workspace=beads_workspace,
+                            checkout_root=ROOT / "project-contracts",
+                            checkout_path=ROOT / "project-contracts",
+                            validation_profile="tier1",
+                            selector_mode="deterministic",
+                            selector_model=None,
+                            selector_choice_json=None,
+                            execute=True,
+                            ledger_dir=ledger_dir,
+                            workstream_runner=lambda recipe_input, *, ledger_dir, project_contract: WorkstreamResult(
+                                run_id="run-789",
+                                workstream_id="central-lve.11",
+                                parent="central-lve",
+                                status="blocked",
+                                result_path=result_path,
+                                publication_status="blocked",
+                            ),
+                        )
+
+                        self.assertEqual(payload["workstream_result"]["result_path"], result_path)
+                        self.assertNotIn("publication", payload["workstream_result"])
+                        self.assertNotIn("tracker", payload["workstream_result"])
+                        self.assertNotIn(sentinel, json.dumps(payload["workstream_result"]))
+        finally:
+            run_next.__globals__["select_work"] = original_select_work
+
     def test_run_next_execute_mode_with_pi_agent_passes_redacted_payload_to_runner(self):
         contract = load_project_contract("bump-eqemu", ROOT / "project-contracts", cwd=ROOT)
         selection_result = {
