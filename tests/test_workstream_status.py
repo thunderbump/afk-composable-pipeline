@@ -1420,6 +1420,50 @@ class WorkstreamStatusMappingTest(unittest.TestCase):
             ],
         )
 
+    def test_pipeline_retrospective_record_surfaces_reviewer_timeout_follow_up(self):
+        state = retrospective_state()
+        state["review"]["status"] = "failed_runtime"
+        state["review"]["summary"] = "reviewer command timed out"
+        state["review"]["reviewer_result"] = {
+            "status": "failed_runtime",
+            "classification": "runtime_failure",
+            "summary": "reviewer command timed out",
+            "adapter": {
+                "type": "real-reviewer-command",
+                "returncode": None,
+                "timed_out": True,
+            },
+            "evidence": {
+                "stderr_excerpt": "reviewer command timed out",
+                "stdout_excerpt": "",
+            },
+            "findings": [],
+        }
+        record = pipeline_retrospective_record(
+            state,
+            {
+                "status": "blocked",
+                "reason": "review did not reach passed: failed_runtime",
+            },
+            retrospective_tracker("validated"),
+        )
+
+        self.assertEqual(record["health"], "failing")
+        self.assertEqual(record["signals"][0]["kind"], "reviewer-timeout")
+        self.assertEqual(record["signals"][0]["classification"], "reviewer-timeout")
+        self.assertEqual(record["signals"][0]["step"], "review")
+        self.assertEqual(record["signals"][0]["excerpt"], "reviewer command timed out")
+        self.assertEqual(record["signals"][0]["evidence_paths"], ["runs/review/step-result.json"])
+        self.assertEqual(
+            record["recommended_follow_up"],
+            [
+                {
+                    "summary": "Increase or override the reviewer timeout before rerunning the workstream; reviewer command timed out.",
+                    "labels": ["afk:follow-up", "area:review", "project:afk-composable-pipeline"],
+                }
+            ],
+        )
+
     def test_pipeline_retrospective_record_includes_redacted_configured_follow_up(self):
         record = pipeline_retrospective_record(
             retrospective_state(),
