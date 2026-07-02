@@ -460,7 +460,11 @@ and pass `--beads-workspace /work/mounts/beads`.
 labels plus the observed `ready-for-agent` tag, tries both Beads and GitHub
 Issues sources when the contract can name a GitHub repo, and chooses a stable
 default candidate from the valid results. The selection envelope records the
-request, source statuses, chosen id/source, and the emitted recipe preview.
+request, source statuses, the candidate list in
+`selection_result.selected_work`, the final selector decision in top-level
+`chosen_work`, and the emitted recipe preview. `selection_result.selected_work`
+is annotated with `selected_work_kind: "candidate_list"` so downstream
+summaries do not confuse candidate ordering with the executed item.
 With `--selector-mode model`, the command invokes `codex exec` and accepts only
 the lightweight model names `gpt-5.3-codex-spark` and `gpt-5.4-mini`; if the
 model call fails or returns an invalid choice, it falls back to deterministic
