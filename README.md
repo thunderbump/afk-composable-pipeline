@@ -294,6 +294,11 @@ facts: workstream identity, selected work, changed files, commits, validation
 artifact refs/statuses, review result, cleanup, retry status, and artifact
 paths.
 
+When the original execution used the implicit default ledger, rerun guidance
+omits `--ledger` and falls back to `./ledgers` again. When execution used
+`--ledger` or `AFK_LEDGER_DIR`, rerun guidance preserves that resolved ledger
+path in the command text.
+
 ### GitHub PR Smoke
 
 Real smoke against a disposable/private repository with an intentional mounted

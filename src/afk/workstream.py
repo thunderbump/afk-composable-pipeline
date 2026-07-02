@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import subprocess
 import tempfile
 import uuid
@@ -124,12 +125,14 @@ def run_workstream(
     recipe: Any,
     *,
     ledger_dir: Path,
+    rerun_ledger_arg: str | None = None,
     step_runner: StepRunner,
     parent: str | None = None,
     workstream_id: str | None = None,
     project_contract: ProjectContract | None = None,
 ) -> WorkstreamResult:
     normalized = normalize_recipe(recipe, parent=parent, workstream_id=workstream_id)
+    normalized["rerun_ledger_arg"] = rerun_ledger_arg
     run_id = new_run_id()
     ledger = WorkstreamLedger(ledger_dir, run_id)
     ledger.prepare()
@@ -6998,10 +7001,12 @@ def retry_instructions(normalized: dict[str, Any], run_id: str, auth_hint: bool 
 
 
 def rerun_workstream_command(normalized: dict[str, Any]) -> str:
-    return (
-        f"afk run-workstream --workstream-id {normalized['workstream_id']} --ledger <ledger> "
-        "--input <recipe>"
-    )
+    command = f"afk run-workstream --workstream-id {normalized['workstream_id']}"
+    rerun_ledger_arg = string_field(normalized, "rerun_ledger_arg")
+    if rerun_ledger_arg:
+        command += f" --ledger {shlex.quote(rerun_ledger_arg)}"
+    command += " --input <recipe>"
+    return command
 
 
 def checkout_path_from_state(state: dict[str, Any]) -> Path:

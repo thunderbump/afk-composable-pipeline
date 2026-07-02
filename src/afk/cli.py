@@ -120,6 +120,7 @@ def main(argv: list[str] | None = None) -> int:
             result = run_workstream(
                 input_data,
                 ledger_dir=resolve_ledger_dir(args.ledger),
+                rerun_ledger_arg=rerun_ledger_argument(args.ledger),
                 step_runner=run_step,
                 parent=args.parent,
                 workstream_id=args.workstream_id,
@@ -263,6 +264,7 @@ def main(argv: list[str] | None = None) -> int:
                 workstream_runner = lambda recipe, *, ledger_dir, project_contract: run_workstream(
                     recipe,
                     ledger_dir=ledger_dir,
+                    rerun_ledger_arg=rerun_ledger_argument(args.ledger),
                     step_runner=run_step,
                     project_contract=project_contract,
                 )
@@ -450,6 +452,15 @@ def resolve_ledger_dir(cli_value: str | None) -> Path:
     if env_value:
         return Path(env_value)
     return Path(DEFAULT_LEDGER_DIR)
+
+
+def rerun_ledger_argument(cli_value: str | None) -> str | None:
+    if cli_value:
+        return cli_value
+    env_value = os.environ.get("AFK_LEDGER_DIR")
+    if env_value:
+        return env_value
+    return None
 
 
 def add_role_profile_flag(parser: argparse.ArgumentParser) -> None:
