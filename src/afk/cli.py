@@ -40,6 +40,7 @@ SCHEMA_VERSION = 1
 PRODUCTION_ROLE_PROFILE = "production"
 FAKE_LOCAL_ROLE_PROFILE = "fake-local"
 PRODUCTION_IMPLEMENTATION_TIMEOUT_SECONDS = 3600
+PRODUCTION_REVIEW_TIMEOUT_SECONDS = 300
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -740,7 +741,11 @@ def recipe_reviewer_from_args(
             ponytail_extension=ponytail_extension,
             ponytail_extension_source=ponytail_extension_source,
         )
-        reviewer_timeout = 30 if args.reviewer_timeout_seconds is None else args.reviewer_timeout_seconds
+        reviewer_timeout = (
+            PRODUCTION_REVIEW_TIMEOUT_SECONDS
+            if args.reviewer_timeout_seconds is None
+            else args.reviewer_timeout_seconds
+        )
         if reviewer_timeout <= 0:
             raise ValueError("--reviewer-timeout-seconds must be greater than zero")
         return {

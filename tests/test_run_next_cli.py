@@ -976,7 +976,7 @@ raise SystemExit(9)
                     model="gpt-5.4",
                 ),
             )
-            self.assertEqual(reviewer["timeout_seconds"], 30)
+            self.assertEqual(reviewer["timeout_seconds"], 300)
 
             retrospective_judge = payload["recipe"]["retrospective_judge"]
             self.assertEqual(

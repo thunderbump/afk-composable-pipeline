@@ -267,7 +267,7 @@ class GenerateRecipeCliTest(unittest.TestCase):
                     model="gpt-5.4",
                 ),
             )
-            self.assertEqual(reviewer["timeout_seconds"], 30)
+            self.assertEqual(reviewer["timeout_seconds"], 300)
 
             retrospective_judge = recipe["retrospective_judge"]
             self.assertEqual(retrospective_judge["enabled"], True)

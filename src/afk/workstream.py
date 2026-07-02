@@ -5708,6 +5708,9 @@ def _blocked_retrospective_signals(state: dict[str, Any], publication: dict[str,
     reason = string_field(publication, "reason") or ""
     if publication.get("status") != "blocked" or not reason:
         return []
+    reviewer_timeout_signal = _reviewer_timeout_retrospective_signal(state, reason)
+    if reviewer_timeout_signal is not None:
+        return [reviewer_timeout_signal]
     return [
         {
             "kind": "retry-or-blocked",
@@ -5717,6 +5720,37 @@ def _blocked_retrospective_signals(state: dict[str, Any], publication: dict[str,
             "evidence_paths": [],
         }
     ]
+
+
+def _reviewer_timeout_retrospective_signal(state: dict[str, Any], reason: str) -> dict[str, Any] | None:
+    if reason != "review did not reach passed: failed_runtime":
+        return None
+    review = state.get("review")
+    if not isinstance(review, dict):
+        return None
+    reviewer_result = review.get("reviewer_result")
+    if not isinstance(reviewer_result, dict):
+        return None
+    adapter = reviewer_result.get("adapter")
+    if not isinstance(adapter, dict) or adapter.get("timed_out") is not True:
+        return None
+    evidence = reviewer_result.get("evidence") if isinstance(reviewer_result.get("evidence"), dict) else {}
+    excerpt = (
+        string_field(reviewer_result, "summary")
+        or string_field(evidence, "stderr_excerpt")
+        or string_field(evidence, "stdout_excerpt")
+        or "reviewer command timed out"
+    )
+    return {
+        "kind": "reviewer-timeout",
+        "scope": "pipeline-process",
+        "severity": "error",
+        "summary": redact_text(excerpt),
+        "step": "review",
+        "classification": "reviewer-timeout",
+        "excerpt": redact_text(excerpt),
+        "evidence_paths": _retrospective_evidence_paths(string_field(state, "review_result_path") or ""),
+    }
 
 
 def _blocked_reason_targets_work_item(state: dict[str, Any], reason: str) -> bool:
@@ -6094,6 +6128,13 @@ def _follow_up_for_signal(signal: dict[str, Any]) -> dict[str, Any] | None:
             kind=kind,
             summary="Repair GitHub publisher authentication evidence before rerunning terminal publication.",
             labels=["afk:follow-up", "area:publication"],
+        )
+    if kind == "reviewer-timeout":
+        excerpt = string_field(signal, "excerpt") or "reviewer command timed out"
+        return _retrospective_follow_up_item(
+            kind=kind,
+            summary=f"Increase or override the reviewer timeout before rerunning the workstream; {excerpt}.",
+            labels=["afk:follow-up", "area:review"],
         )
     if kind == "auth-preflight":
         return _retrospective_follow_up_item(
