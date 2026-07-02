@@ -297,9 +297,11 @@ paths.
 When the original execution used the implicit default ledger, rerun guidance
 omits `--ledger`. That is only safe when the rerun starts from the same cwd as
 the original run, so `./ledgers` resolves to the same tree; otherwise rerun
-from the original cwd or pass an explicit `--ledger` path. When execution used
-`--ledger` or `AFK_LEDGER_DIR`, rerun guidance preserves the provided ledger
-argument string in shell-quoted form inside the command text.
+from the original cwd or pass an explicit absolute `--ledger` path. When
+execution used `--ledger` or `AFK_LEDGER_DIR`, rerun guidance preserves the
+provided ledger argument string in shell-quoted form inside the command text.
+Relative values remain cwd-sensitive on rerun for the same reason, so use an
+absolute ledger path when the rerun might start elsewhere.
 
 ### GitHub PR Smoke
 
