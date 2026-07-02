@@ -482,6 +482,52 @@ does not execute it unless `--execute` is set. For a safe dogfood run, validate
 the preview payload in CI or locally first, then add `--execute` in a controlled
 runner.
 
+For honest `bump-eqemu` production dogfood, opt validation into the project
+worker instead of the generated smoke adapter:
+
+```sh
+PYTHONPATH=src python3 -m afk run-next \
+  --project bump-eqemu \
+  --contracts-dir project-contracts \
+  --beads-workspace /home/bump/Projects/beads \
+  --checkout-root /work \
+  --checkout-path /work/bump-EQEmu \
+  --validation-profile tier1 \
+  --validation-mode project-worker \
+  --validation-stack-path /work/bump-akk-stack-validation \
+  --agent-codex-home /work/mounts/codex-home \
+  --agent-config-home /work/mounts/xdg-config \
+  --agent-pi-config-home /work/mounts/pi-config \
+  --agent-pi-coding-agent-dir /work/mounts/pi-coding-agent \
+  --execute
+```
+
+That path keeps `validation.dry_run=false`, writes the validation worker host
+contract into the recipe, and runs the project validation stack from the host
+path you passed with `--validation-stack-path`. If a production-shaped run still
+reaches validation through `dry_run=true` plus the generated
+`generated-recipe-smoke` adapter, the workstream result now records a
+pipeline-scoped retrospective warning and follow-up recommendation instead of
+reporting a clean dogfood run.
+
+Keep the fake path explicit for offline smoke tests, fixture runs, and local
+contract checks:
+
+```sh
+PYTHONPATH=src python3 -m afk run-next \
+  --project bump-eqemu \
+  --contracts-dir project-contracts \
+  --beads-workspace /home/bump/Projects/beads \
+  --checkout-root /work \
+  --checkout-path /work/bump-EQEmu \
+  --validation-profile tier1 \
+  --role-profile fake-local
+```
+
+That recipe intentionally leaves validation on the generated dry-run smoke
+adapter. Use it when you want quick pipeline exercise, not when you need real
+project validation evidence.
+
 When using Pi-backed roles, all worker model flags are validated with the same
 cap: `gpt-5.4` or lower. The production role profile defaults to `gpt-5.4` for
 implementation, review, and retrospective judge. The lightweight selector path

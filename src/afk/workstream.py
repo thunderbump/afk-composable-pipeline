@@ -5599,6 +5599,9 @@ def _validation_retrospective_signals(state: dict[str, Any]) -> list[dict[str, A
         if not isinstance(validation, dict):
             continue
         output = validation.get("output") if isinstance(validation.get("output"), dict) else {}
+        smoke_signal = _dry_run_smoke_validation_retrospective_signal(validation, output)
+        if smoke_signal is not None:
+            signals.append(smoke_signal)
         actionable_failures = output.get("actionable_failures")
         if output.get("status") == "validated" or not isinstance(actionable_failures, list):
             continue
@@ -5615,6 +5618,41 @@ def _validation_retrospective_signals(state: dict[str, Any]) -> list[dict[str, A
                 signals.append(signal)
                 break
     return signals
+
+
+def _dry_run_smoke_validation_retrospective_signal(
+    validation: dict[str, Any],
+    output: dict[str, Any],
+) -> dict[str, Any] | None:
+    if output.get("status") != "validated":
+        return None
+    validation_info = output.get("validation") if isinstance(output.get("validation"), dict) else {}
+    if validation_info.get("dry_run") is not True:
+        return None
+    worker_result = output.get("worker_result") if isinstance(output.get("worker_result"), dict) else {}
+    raw_result = worker_result.get("raw") if isinstance(worker_result.get("raw"), dict) else {}
+    steps = raw_result.get("steps")
+    if not isinstance(steps, list) or not any(_is_generated_smoke_validation_step(step) for step in steps):
+        return None
+    step = string_field(validation_info, "requested_profile") or "validation"
+    excerpt = "Validation used dry-run generated smoke coverage instead of project worker evidence."
+    return {
+        "kind": "validation-smoke",
+        "scope": "pipeline-process",
+        "severity": "warning",
+        "summary": excerpt,
+        "step": redact_text(step),
+        "classification": "dry-run-smoke-validation",
+        "excerpt": excerpt,
+        "evidence_paths": _retrospective_evidence_paths(
+            string_field(validation, "step_result_path") or "",
+            string_field(validation, "worker_result_path") or "",
+        ),
+    }
+
+
+def _is_generated_smoke_validation_step(step: Any) -> bool:
+    return isinstance(step, dict) and string_field(step, "name") == "generated-recipe-smoke"
 
 
 def _validation_failure_consumed_by_repair(validations: list[Any], index: int) -> bool:
@@ -6143,6 +6181,12 @@ def _follow_up_for_signal(signal: dict[str, Any]) -> dict[str, Any] | None:
         return _retrospective_follow_up_item(
             kind=kind,
             summary=_follow_up_summary_for_signal(signal, "Fix"),
+            labels=["afk:follow-up", "area:validation"],
+        )
+    if kind == "validation-smoke":
+        return _retrospective_follow_up_item(
+            kind=kind,
+            summary="Switch validation to project-worker or another non-dry-run adapter before treating the run as honest dogfood evidence.",
             labels=["afk:follow-up", "area:validation"],
         )
     if kind == "publisher-auth":
