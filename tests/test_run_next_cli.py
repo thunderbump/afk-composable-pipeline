@@ -1097,9 +1097,11 @@ raise SystemExit(9)
             beads_workspace = temp_path / "beads"
             checkout_root = temp_path / "checkouts"
             checkout_path = checkout_root / "bump-EQEmu"
+            validation_stack_path = checkout_root / "bump-akk-stack-validation"
             ledger = temp_path / "ledger"
             checkout_root.mkdir()
             checkout_path.mkdir()
+            validation_stack_path.mkdir()
             beads_workspace.mkdir()
             fake_bin.mkdir()
             secret_dir = beads_workspace / "secrets"
@@ -2541,6 +2543,7 @@ else:
             ledger = temp_path / "ledger"
 
             contracts_dir.mkdir()
+            validation_stack_path.mkdir(parents=True)
             init_repo(repo)
             worker_script = repo / "scripts" / "validation-worker.sh"
             worker_script.parent.mkdir()
@@ -2687,6 +2690,438 @@ else:
                 (validate_run / "stdout.log").read_text(encoding="utf-8"),
             )
             self.assertIn(f"stack_dir={validation_stack_path}", (validate_run / "stdout.log").read_text(encoding="utf-8"))
+
+    def test_run_next_execute_production_defaults_to_project_worker_validation_when_stack_is_available(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            contracts_dir = temp_path / "contracts"
+            repo = temp_path / "repo-src"
+            fake_bin = temp_path / "bin"
+            beads_workspace = temp_path / "beads"
+            checkout_root = temp_path / "checkouts"
+            checkout_path = checkout_root / "bump-EQEmu"
+            validation_stack_path = checkout_root / "bump-akk-stack-validation"
+            ledger = temp_path / "ledger"
+
+            contracts_dir.mkdir()
+            validation_stack_path.mkdir(parents=True)
+            init_repo(repo)
+            worker_script = repo / "scripts" / "validation-worker.sh"
+            worker_script.parent.mkdir()
+            worker_script.write_text(
+                textwrap.dedent(
+                    f"""\
+                    #!/usr/bin/env bash
+                    set -euo pipefail
+                    [[ "${{1:-}}" == "run" ]]
+                    [[ "${{2:-}}" == "--request" ]]
+                    python3 - "$3" <<'PY'
+                    import json
+                    import sys
+                    from pathlib import Path
+
+                    request = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+                    assert request["profile"] == "tier1", request
+                    assert request["worker_home"] == {str(checkout_root / ".validation-worker" / "bump-EQEmu")!r}, request
+                    assert request["stack"] == {{
+                        "role": "validation",
+                        "path": {str(validation_stack_path)!r},
+                    }}, request
+                    evidence_dir = Path(request["evidence_dir"])
+                    evidence_dir.mkdir(parents=True, exist_ok=True)
+                    (evidence_dir / "result.json").write_text(
+                        json.dumps(
+                            {{
+                                "profile": request["profile"],
+                                "status": "pass",
+                                "repo": request["repo"],
+                                "checkout": {{
+                                    "requestedRef": request["ref"],
+                                    "requestedCommit": request["commit"],
+                                    "resolvedCommit": request["commit"],
+                                }},
+                                "metadata": {{
+                                    "workerHome": request["worker_home"],
+                                    "stackDir": request["stack"]["path"],
+                                }},
+                                "steps": [],
+                            }}
+                        ),
+                        encoding="utf-8",
+                    )
+                    PY
+                    """
+                ),
+                encoding="utf-8",
+            )
+            worker_script.chmod(0o755)
+            git(repo, "add", "scripts/validation-worker.sh")
+            git(repo, "commit", "-m", "add validation worker")
+            write_contract(contracts_dir / "bump-eqemu.json", project_slug="bump-eqemu", repo_url=str(repo))
+
+            secret_dir = beads_workspace / "secrets"
+            secret_dir.mkdir(parents=True)
+            secret_dir.joinpath("dolt_beads_password.txt").write_text("beads-secret", encoding="utf-8")
+            fake_bin.mkdir()
+            write_executable(
+                fake_bin / "gh",
+                f"""#!{sys.executable}
+import sys
+
+if sys.argv[1:3] == ["auth", "status"]:
+    sys.exit(1)
+raise SystemExit(9)
+""",
+            )
+            write_executable(
+                fake_bin / "bd",
+                f"""#!{sys.executable}
+import json
+import sys
+
+if sys.argv[1:2] == ["list"]:
+    print(json.dumps([{{"id": "central-next.1"}}]))
+elif sys.argv[1:3] == ["show", "central-next.1"]:
+    print(json.dumps({{
+        "id": "central-next.1",
+        "title": "Autonomous next item",
+        "status": "open",
+        "labels": ["project:bump-eqemu", "ready-for-agent"],
+        "metadata": {{"afk.ready": True, "workstream": "central-next"}},
+        "acceptance_criteria": ["ready to run"],
+        "dependencies": [],
+    }}))
+else:
+    raise SystemExit(9)
+""",
+            )
+
+            completed = run_afk(
+                "run-next",
+                "--project",
+                "bump-eqemu",
+                "--contracts-dir",
+                str(contracts_dir),
+                "--beads-workspace",
+                str(beads_workspace),
+                "--checkout-root",
+                str(checkout_root),
+                "--checkout-path",
+                str(checkout_path),
+                "--validation-profile",
+                "tier1",
+                "--agent-mode",
+                "fake",
+                "--reviewer-mode",
+                "fake",
+                "--retrospective-judge-mode",
+                "disabled",
+                "--ledger",
+                str(ledger),
+                "--execute",
+                env={
+                    "GH_TOKEN": None,
+                    "GITHUB_TOKEN": None,
+                    "PATH": os.pathsep.join([str(fake_bin), os.environ.get("PATH", "")]),
+                },
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            payload = json.loads(completed.stdout)
+            validate = next(step for step in payload["recipe"]["steps"] if step["name"] == "validate")
+
+            self.assertEqual(
+                validate["input"]["validation"],
+                {
+                    "profile": "tier1",
+                    "dry_run": False,
+                    "timeout_seconds": 3600,
+                    "worker_home": str(checkout_root / ".validation-worker" / "bump-EQEmu"),
+                    "stack": {
+                        "role": "validation",
+                        "path": str(validation_stack_path),
+                    },
+                },
+            )
+            self.assertNotIn("worker", validate["input"])
+
+    def test_run_next_execute_production_allows_explicit_fake_validation_opt_in(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            contracts_dir = temp_path / "contracts"
+            repo = temp_path / "repo-src"
+            fake_bin = temp_path / "bin"
+            beads_workspace = temp_path / "beads"
+            checkout_root = temp_path / "checkouts"
+            checkout_path = checkout_root / "bump-EQEmu"
+            ledger = temp_path / "ledger"
+
+            contracts_dir.mkdir()
+            init_repo(repo)
+            write_contract(contracts_dir / "bump-eqemu.json", project_slug="bump-eqemu", repo_url=str(repo))
+
+            secret_dir = beads_workspace / "secrets"
+            secret_dir.mkdir(parents=True)
+            secret_dir.joinpath("dolt_beads_password.txt").write_text("beads-secret", encoding="utf-8")
+            fake_bin.mkdir()
+            write_executable(
+                fake_bin / "gh",
+                f"""#!{sys.executable}
+import sys
+
+if sys.argv[1:3] == ["auth", "status"]:
+    sys.exit(1)
+raise SystemExit(9)
+""",
+            )
+            write_executable(
+                fake_bin / "bd",
+                f"""#!{sys.executable}
+import json
+import sys
+
+if sys.argv[1:2] == ["list"]:
+    print(json.dumps([{{"id": "central-next.1"}}]))
+elif sys.argv[1:3] == ["show", "central-next.1"]:
+    print(json.dumps({{
+        "id": "central-next.1",
+        "title": "Autonomous next item",
+        "status": "open",
+        "labels": ["project:bump-eqemu", "ready-for-agent"],
+        "metadata": {{"afk.ready": True, "workstream": "central-next"}},
+        "acceptance_criteria": ["ready to run"],
+        "dependencies": [],
+    }}))
+else:
+    raise SystemExit(9)
+""",
+            )
+
+            completed = run_afk(
+                "run-next",
+                "--project",
+                "bump-eqemu",
+                "--contracts-dir",
+                str(contracts_dir),
+                "--beads-workspace",
+                str(beads_workspace),
+                "--checkout-root",
+                str(checkout_root),
+                "--checkout-path",
+                str(checkout_path),
+                "--validation-profile",
+                "tier1",
+                "--validation-mode",
+                "fake",
+                "--agent-mode",
+                "fake",
+                "--reviewer-mode",
+                "fake",
+                "--retrospective-judge-mode",
+                "disabled",
+                "--ledger",
+                str(ledger),
+                "--execute",
+                env={
+                    "GH_TOKEN": None,
+                    "GITHUB_TOKEN": None,
+                    "PATH": os.pathsep.join([str(fake_bin), os.environ.get("PATH", "")]),
+                },
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            payload = json.loads(completed.stdout)
+            validate = next(step for step in payload["recipe"]["steps"] if step["name"] == "validate")
+
+            self.assertEqual(
+                validate["input"]["validation"],
+                {
+                    "profile": "tier1",
+                    "dry_run": True,
+                    "timeout_seconds": 30,
+                },
+            )
+            self.assertEqual(validate["input"]["worker"]["type"], "local-command")
+
+    def test_run_next_execute_fake_local_keeps_fake_validation_without_real_stack(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            contracts_dir = temp_path / "contracts"
+            repo = temp_path / "repo-src"
+            fake_bin = temp_path / "bin"
+            beads_workspace = temp_path / "beads"
+            checkout_root = temp_path / "checkouts"
+            checkout_path = checkout_root / "bump-EQEmu"
+            ledger = temp_path / "ledger"
+
+            contracts_dir.mkdir()
+            init_repo(repo)
+            write_contract(contracts_dir / "bump-eqemu.json", project_slug="bump-eqemu", repo_url=str(repo))
+
+            secret_dir = beads_workspace / "secrets"
+            secret_dir.mkdir(parents=True)
+            secret_dir.joinpath("dolt_beads_password.txt").write_text("beads-secret", encoding="utf-8")
+            fake_bin.mkdir()
+            write_executable(
+                fake_bin / "gh",
+                f"""#!{sys.executable}
+import sys
+
+if sys.argv[1:3] == ["auth", "status"]:
+    sys.exit(1)
+raise SystemExit(9)
+""",
+            )
+            write_executable(
+                fake_bin / "bd",
+                f"""#!{sys.executable}
+import json
+import sys
+
+if sys.argv[1:2] == ["list"]:
+    print(json.dumps([{{"id": "central-next.1"}}]))
+elif sys.argv[1:3] == ["show", "central-next.1"]:
+    print(json.dumps({{
+        "id": "central-next.1",
+        "title": "Autonomous next item",
+        "status": "open",
+        "labels": ["project:bump-eqemu", "ready-for-agent"],
+        "metadata": {{"afk.ready": True, "workstream": "central-next"}},
+        "acceptance_criteria": ["ready to run"],
+        "dependencies": [],
+    }}))
+else:
+    raise SystemExit(9)
+""",
+            )
+
+            completed = run_afk(
+                "run-next",
+                "--project",
+                "bump-eqemu",
+                "--contracts-dir",
+                str(contracts_dir),
+                "--beads-workspace",
+                str(beads_workspace),
+                "--checkout-root",
+                str(checkout_root),
+                "--checkout-path",
+                str(checkout_path),
+                "--validation-profile",
+                "tier1",
+                "--role-profile",
+                "fake-local",
+                "--ledger",
+                str(ledger),
+                "--execute",
+                env={
+                    "GH_TOKEN": None,
+                    "GITHUB_TOKEN": None,
+                    "PATH": os.pathsep.join([str(fake_bin), os.environ.get("PATH", "")]),
+                },
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            payload = json.loads(completed.stdout)
+            validate = next(step for step in payload["recipe"]["steps"] if step["name"] == "validate")
+
+            self.assertEqual(
+                validate["input"]["validation"],
+                {
+                    "profile": "tier1",
+                    "dry_run": True,
+                    "timeout_seconds": 30,
+                },
+            )
+            self.assertEqual(validate["input"]["worker"]["type"], "local-command")
+
+    def test_run_next_execute_production_errors_when_real_validation_stack_is_missing(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            contracts_dir = temp_path / "contracts"
+            repo = temp_path / "repo-src"
+            fake_bin = temp_path / "bin"
+            beads_workspace = temp_path / "beads"
+            checkout_root = temp_path / "checkouts"
+            checkout_path = checkout_root / "bump-EQEmu"
+            ledger = temp_path / "ledger"
+
+            contracts_dir.mkdir()
+            init_repo(repo)
+            write_contract(contracts_dir / "bump-eqemu.json", project_slug="bump-eqemu", repo_url=str(repo))
+
+            secret_dir = beads_workspace / "secrets"
+            secret_dir.mkdir(parents=True)
+            secret_dir.joinpath("dolt_beads_password.txt").write_text("beads-secret", encoding="utf-8")
+            fake_bin.mkdir()
+            write_executable(
+                fake_bin / "gh",
+                f"""#!{sys.executable}
+import sys
+
+if sys.argv[1:3] == ["auth", "status"]:
+    sys.exit(1)
+raise SystemExit(9)
+""",
+            )
+            write_executable(
+                fake_bin / "bd",
+                f"""#!{sys.executable}
+import json
+import sys
+
+if sys.argv[1:2] == ["list"]:
+    print(json.dumps([{{"id": "central-next.1"}}]))
+elif sys.argv[1:3] == ["show", "central-next.1"]:
+    print(json.dumps({{
+        "id": "central-next.1",
+        "title": "Autonomous next item",
+        "status": "open",
+        "labels": ["project:bump-eqemu", "ready-for-agent"],
+        "metadata": {{"afk.ready": True, "workstream": "central-next"}},
+        "acceptance_criteria": ["ready to run"],
+        "dependencies": [],
+    }}))
+else:
+    raise SystemExit(9)
+""",
+            )
+
+            completed = run_afk(
+                "run-next",
+                "--project",
+                "bump-eqemu",
+                "--contracts-dir",
+                str(contracts_dir),
+                "--beads-workspace",
+                str(beads_workspace),
+                "--checkout-root",
+                str(checkout_root),
+                "--checkout-path",
+                str(checkout_path),
+                "--validation-profile",
+                "tier1",
+                "--agent-mode",
+                "fake",
+                "--reviewer-mode",
+                "fake",
+                "--retrospective-judge-mode",
+                "disabled",
+                "--ledger",
+                str(ledger),
+                "--execute",
+                env={
+                    "GH_TOKEN": None,
+                    "GITHUB_TOKEN": None,
+                    "PATH": os.pathsep.join([str(fake_bin), os.environ.get("PATH", "")]),
+                },
+            )
+
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn(
+                "project-worker validation requires an existing validation stack directory",
+                completed.stderr,
+            )
 
     def test_run_next_rejects_disallowed_pi_model(self):
         with tempfile.TemporaryDirectory() as temp_dir:

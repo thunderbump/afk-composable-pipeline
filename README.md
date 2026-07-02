@@ -468,7 +468,10 @@ implementation role gets the same one-hour default timeout unless you pass
 when the Codex/Pi mount flags are absent, which keeps `source_statuses`,
 `no-candidates`, and recipe inspection usable in unprovisioned environments.
 When you add `--execute`, `run-next` validates the required mounts up front and
-fails fast with a direct mount-validation error if they are missing. Use
+fails fast with a direct mount-validation error if they are missing. For
+`bump-eqemu`, production `run-next --execute` also defaults validation to the
+real project worker when the contract requests that profile and the sibling
+validation stack mount is present. Use `--validation-mode fake` or
 `--role-profile fake-local` for offline smoke runs, fixture tests, and other
 cases where fake adapters are still the right default.
 
@@ -482,8 +485,8 @@ does not execute it unless `--execute` is set. For a safe dogfood run, validate
 the preview payload in CI or locally first, then add `--execute` in a controlled
 runner.
 
-For honest `bump-eqemu` production dogfood, opt validation into the project
-worker instead of the generated smoke adapter:
+For honest `bump-eqemu` production dogfood, let `run-next --execute` take the
+production defaults and mount the real validation stack next to the checkout:
 
 ```sh
 PYTHONPATH=src python3 -m afk run-next \
@@ -494,8 +497,6 @@ PYTHONPATH=src python3 -m afk run-next \
   --checkout-root /work \
   --checkout-path /work/bump-EQEmu \
   --validation-profile tier1 \
-  --validation-mode project-worker \
-  --validation-stack-path /work/bump-akk-stack-validation \
   --agent-codex-home /work/mounts/codex-home \
   --agent-config-home /work/mounts/xdg-config \
   --agent-pi-config-home /work/mounts/pi-config \
@@ -504,9 +505,11 @@ PYTHONPATH=src python3 -m afk run-next \
 ```
 
 That path keeps `validation.dry_run=false`, writes the validation worker host
-contract into the recipe, and runs the project validation stack from the host
-path you passed with `--validation-stack-path`. If a production-shaped run still
-reaches validation through `dry_run=true` plus the generated
+contract into the recipe, and runs the project validation stack from the
+default sibling host path `/work/bump-akk-stack-validation`. If your runner
+mounts the validation stack somewhere else, add
+`--validation-stack-path /absolute/path/outside/checkout`. If a production-shaped
+run still reaches validation through `dry_run=true` plus the generated
 `generated-recipe-smoke` adapter, the workstream result now records a
 pipeline-scoped retrospective warning and follow-up recommendation instead of
 reporting a clean dogfood run.
@@ -519,17 +522,17 @@ PYTHONPATH=src python3 -m afk run-next \
   --project bump-eqemu \
   --contracts-dir project-contracts \
   --beads-workspace /home/bump/Projects/beads \
+  --ledger ledger \
   --checkout-root /work \
   --checkout-path /work/bump-EQEmu \
   --validation-profile tier1 \
-  --role-profile fake-local
+  --role-profile fake-local \
+  --execute
 ```
 
 That recipe intentionally leaves validation on the generated dry-run smoke
 adapter and explicitly marks that smoke mode as expected. Use it when you want
-quick pipeline exercise, not when you need real project validation evidence. If
-you also want to execute that fake-local recipe, add `--execute --ledger
-<ledger>`.
+quick pipeline exercise, not when you need real project validation evidence.
 
 When using Pi-backed roles, all worker model flags are validated with the same
 cap: `gpt-5.4` or lower. The production role profile defaults to `gpt-5.4` for
