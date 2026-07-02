@@ -18,6 +18,8 @@ from afk.work_sources import select_work
 READY_TAG = "ready-for-agent"
 ALLOWED_SELECTOR_MODELS = {"gpt-5.3-codex-spark", "gpt-5.4-mini"}
 SELECTOR_TIMEOUT_SECONDS = 60
+WORKSTREAM_RESULT_FIELDS = ("run_id", "workstream_id", "parent", "status", "result_path", "publication_status")
+WORKSTREAM_RESULT_SUMMARY_FIELDS = ("publication", "tracker", "artifacts", "pipeline_retrospective")
 
 
 def run_next(
@@ -84,7 +86,8 @@ def run_next(
             if workstream_runner is None:
                 raise ValueError("workstream_runner is required when --execute is set")
             workstream_result = normalize_workstream_result(
-                workstream_runner(recipe, ledger_dir=ledger_dir, project_contract=project_contract)
+                workstream_runner(recipe, ledger_dir=ledger_dir, project_contract=project_contract),
+                ledger_dir=ledger_dir,
             )
     elif execute and ledger_dir is None:
         raise ValueError("--ledger is required when --execute is set")
@@ -290,17 +293,34 @@ def selector_prompt(candidates: list[dict[str, Any]]) -> str:
     )
 
 
-def normalize_workstream_result(result: Any) -> dict[str, Any] | None:
+def normalize_workstream_result(result: Any, *, ledger_dir: Path | None = None) -> dict[str, Any] | None:
     if result is None:
         return None
     if isinstance(result, dict):
         return dict(result)
-    fields = ("run_id", "workstream_id", "parent", "status", "result_path", "publication_status")
-    if all(hasattr(result, field) for field in fields):
-        return {field: getattr(result, field) for field in fields}
-    if hasattr(result, "__dict__"):
-        return dict(result.__dict__)
+    if all(hasattr(result, field) for field in WORKSTREAM_RESULT_FIELDS):
+        normalized = {field: getattr(result, field) for field in WORKSTREAM_RESULT_FIELDS}
+        normalized.update(load_workstream_result_summary(normalized["result_path"], ledger_dir=ledger_dir))
+        return normalized
     return {"result": result}
+
+
+def load_workstream_result_summary(result_path: Any, *, ledger_dir: Path | None) -> dict[str, Any]:
+    if not isinstance(result_path, str) or not result_path or ledger_dir is None:
+        return {}
+    payload_path = ledger_dir / result_path
+    ledger_root = ledger_dir.resolve()
+    try:
+        payload_path.resolve(strict=False).relative_to(ledger_root)
+    except ValueError:
+        return {}
+    try:
+        payload = json.loads(payload_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    return {field: payload[field] for field in WORKSTREAM_RESULT_SUMMARY_FIELDS if field in payload}
 
 
 def github_repo_from_repo_url(repo_url: str) -> str | None:

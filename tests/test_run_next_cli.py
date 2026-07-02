@@ -14,6 +14,7 @@ from afk.contracts import load_project_contract  # noqa: E402
 from afk.pi_workers import PONYTAIL_EXTENSION_SOURCE, build_pi_real_worker_agent  # noqa: E402
 from afk.pi_workers import build_pi_print_command
 from afk.run_next import choose_candidate, github_repo_from_repo_url, run_next, selector_prompt, selector_result
+from afk.workstream import WorkstreamResult
 
 
 def run_afk(*args, env=None):
@@ -1393,6 +1394,209 @@ raise SystemExit(9)
         self.assertEqual(runner_calls[0][0], recipe)
         self.assertEqual(runner_calls[0][1], ROOT / "project-contracts")
         self.assertEqual(runner_calls[0][2], contract)
+
+    def test_run_next_execute_mode_preserves_blocked_workstream_summary_from_ledger(self):
+        contract = load_project_contract("bump-eqemu", ROOT / "project-contracts", cwd=ROOT)
+        selection_result = {
+            "schema_version": 1,
+            "source_statuses": [{"source_id": "central-beads", "source_type": "beads", "status": "selected"}],
+            "selected_work": [
+                {
+                    "source_id": "central-beads",
+                    "source_type": "beads",
+                    "external_id": "central-lve.11",
+                    "title": "Preserve blocked workstream details",
+                    "status": "open",
+                    "labels": ["project:bump-eqemu", "ready-for-agent"],
+                    "workstream": "central-lve",
+                    "acceptance_criteria": ["Carry blocked workstream details into run-next"],
+                    "priority": 2,
+                    "issue_type": "bug",
+                    "description": "Expose safe blocked workstream details in run-next output.",
+                    "dependencies": [],
+                    "blockers": [],
+                    "dependency_status": "clear",
+                    "afk": {"ready": True},
+                    "raw": {"beads": {"id": "central-lve.11"}},
+                }
+            ],
+            "skipped_candidates": [],
+        }
+        recipe = {"schema_version": 1, "workstream_id": "central-lve.11", "steps": []}
+        runner_secret = "ghp_runner_secret_1234567890"
+
+        def fake_workstream_runner(recipe_input, *, ledger_dir, project_contract):
+            self.assertEqual(recipe_input, recipe)
+            self.assertEqual(project_contract, contract)
+            result_dir = ledger_dir / "workstreams" / "run-789"
+            result_dir.mkdir(parents=True)
+            (result_dir / "workstream-result.json").write_text(
+                json.dumps(
+                    {
+                        "run_id": "run-789",
+                        "workstream_id": "central-lve.11",
+                        "parent": "central-lve",
+                        "status": "blocked",
+                        "publication": {
+                            "status": "blocked",
+                            "reason": "required final validation evidence did not pass: tier1",
+                            "url": "",
+                        },
+                        "tracker": {
+                            "status": "awaiting-review",
+                            "comment": "Review feedback still open",
+                            "close_source_item": False,
+                            "close_reason": "",
+                            "pr_url": "https://github.example/pr/17",
+                            "merge_commit": "",
+                        },
+                        "artifacts": {
+                            "workstream_result": "workstream-result.json",
+                            "publication": "publication-result.json",
+                            "tracker": "tracker-result.json",
+                            "pipeline_retrospective": "pipeline-retrospective.json",
+                            "retrospective_follow_up_result": "retrospective-follow-up-result.json",
+                        },
+                        "pipeline_retrospective": {
+                            "health": "failing",
+                            "summary": "Retry blocked until review feedback is resolved.",
+                            "follow_up": {
+                                "created": [{"id": "central-ppoe.2", "type": "beads"}],
+                                "creation": {"status": "created", "summary": "Created Beads follow-up"},
+                            },
+                        },
+                        "steps": [{"stderr": runner_secret}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            return WorkstreamResult(
+                run_id="run-789",
+                workstream_id="central-lve.11",
+                parent="central-lve",
+                status="blocked",
+                result_path="workstreams/run-789/workstream-result.json",
+                publication_status="blocked",
+            )
+
+        original_select_work = run_next.__globals__["select_work"]
+        original_generate_recipe = run_next.__globals__["generate_workstream_recipe"]
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                temp_path = Path(temp_dir)
+                beads_workspace = temp_path / "beads"
+                beads_workspace.mkdir()
+                run_next.__globals__["select_work"] = lambda request, project_contract=None: selection_result
+                run_next.__globals__["generate_workstream_recipe"] = lambda **kwargs: recipe
+                payload = run_next(
+                    project_contract=contract,
+                    beads_workspace=beads_workspace,
+                    checkout_root=ROOT / "project-contracts",
+                    checkout_path=ROOT / "project-contracts",
+                    validation_profile="tier1",
+                    selector_mode="deterministic",
+                    selector_model=None,
+                    selector_choice_json=None,
+                    execute=True,
+                    ledger_dir=temp_path / "ledger",
+                    workstream_runner=fake_workstream_runner,
+                )
+        finally:
+            run_next.__globals__["select_work"] = original_select_work
+            run_next.__globals__["generate_workstream_recipe"] = original_generate_recipe
+
+        self.assertEqual(payload["workstream_result"]["status"], "blocked")
+        self.assertEqual(payload["workstream_result"]["publication"]["status"], "blocked")
+        self.assertEqual(payload["workstream_result"]["tracker"]["status"], "awaiting-review")
+        self.assertEqual(
+            payload["workstream_result"]["artifacts"]["retrospective_follow_up_result"],
+            "retrospective-follow-up-result.json",
+        )
+        self.assertEqual(
+            payload["workstream_result"]["pipeline_retrospective"]["follow_up"]["created"][0]["id"],
+            "central-ppoe.2",
+        )
+        self.assertNotIn("steps", payload["workstream_result"])
+        self.assertNotIn(runner_secret, json.dumps(payload["workstream_result"]))
+
+    def test_run_next_execute_mode_ignores_workstream_result_paths_outside_ledger(self):
+        contract = load_project_contract("bump-eqemu", ROOT / "project-contracts", cwd=ROOT)
+        selection_result = {
+            "schema_version": 1,
+            "source_statuses": [{"source_id": "central-beads", "source_type": "beads", "status": "selected"}],
+            "selected_work": [
+                {
+                    "source_id": "central-beads",
+                    "source_type": "beads",
+                    "external_id": "central-lve.11",
+                    "title": "Keep run-next ledger reads contained",
+                    "status": "open",
+                    "labels": ["project:bump-eqemu", "ready-for-agent"],
+                    "workstream": "central-lve",
+                    "acceptance_criteria": ["Ignore escaped workstream result paths"],
+                    "priority": 2,
+                    "issue_type": "bug",
+                    "description": "Do not load escaped workstream result summaries.",
+                    "dependencies": [],
+                    "blockers": [],
+                    "dependency_status": "clear",
+                    "afk": {"ready": True},
+                    "raw": {"beads": {"id": "central-lve.11"}},
+                }
+            ],
+            "skipped_candidates": [],
+        }
+
+        original_select_work = run_next.__globals__["select_work"]
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                temp_path = Path(temp_dir)
+                beads_workspace = temp_path / "beads"
+                ledger_dir = temp_path / "ledger"
+                outside_path = temp_path / "outside.json"
+                sentinel = "sentinel-secret-do-not-leak"
+                beads_workspace.mkdir()
+                ledger_dir.mkdir()
+                outside_path.write_text(
+                    json.dumps(
+                        {
+                            "publication": {"status": "blocked", "reason": sentinel},
+                            "tracker": {"status": sentinel},
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                run_next.__globals__["select_work"] = lambda request, project_contract=None: selection_result
+
+                for result_path in ("../outside.json", str(outside_path.resolve())):
+                    with self.subTest(result_path=result_path):
+                        payload = run_next(
+                            project_contract=contract,
+                            beads_workspace=beads_workspace,
+                            checkout_root=ROOT / "project-contracts",
+                            checkout_path=ROOT / "project-contracts",
+                            validation_profile="tier1",
+                            selector_mode="deterministic",
+                            selector_model=None,
+                            selector_choice_json=None,
+                            execute=True,
+                            ledger_dir=ledger_dir,
+                            workstream_runner=lambda recipe_input, *, ledger_dir, project_contract: WorkstreamResult(
+                                run_id="run-789",
+                                workstream_id="central-lve.11",
+                                parent="central-lve",
+                                status="blocked",
+                                result_path=result_path,
+                                publication_status="blocked",
+                            ),
+                        )
+
+                        self.assertEqual(payload["workstream_result"]["result_path"], result_path)
+                        self.assertNotIn("publication", payload["workstream_result"])
+                        self.assertNotIn("tracker", payload["workstream_result"])
+                        self.assertNotIn(sentinel, json.dumps(payload["workstream_result"]))
+        finally:
+            run_next.__globals__["select_work"] = original_select_work
 
     def test_run_next_execute_mode_with_pi_agent_passes_redacted_payload_to_runner(self):
         contract = load_project_contract("bump-eqemu", ROOT / "project-contracts", cwd=ROOT)
