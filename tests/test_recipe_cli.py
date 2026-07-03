@@ -269,18 +269,7 @@ class GenerateRecipeCliTest(unittest.TestCase):
             )
             self.assertEqual(reviewer["timeout_seconds"], 300)
 
-            retrospective_judge = recipe["retrospective_judge"]
-            self.assertEqual(retrospective_judge["enabled"], True)
-            self.assertEqual(retrospective_judge["type"], "local-command")
-            self.assertEqual(
-                retrospective_judge["command"],
-                build_pi_print_command(
-                    pi_bin="pi",
-                    provider="openai-codex",
-                    model="gpt-5.4",
-                ),
-            )
-            self.assertEqual(retrospective_judge["timeout_seconds"], 120)
+            self.assertNotIn("retrospective_judge", recipe)
 
     def test_generate_recipe_fake_local_role_profile_preserves_fake_adapters(self):
         with tempfile.TemporaryDirectory() as temp_dir:

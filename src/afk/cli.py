@@ -822,7 +822,7 @@ def recipe_retrospective_judge_from_args(
     retrospective_judge_mode = resolved_role_mode(
         args.retrospective_judge_mode,
         role_profile=args.role_profile,
-        production_mode="pi",
+        production_mode="disabled",
         fake_local_mode="disabled",
     )
     if retrospective_judge_mode == "disabled":

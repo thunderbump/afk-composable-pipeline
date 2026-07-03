@@ -196,12 +196,12 @@ The recipe schema is intentionally small:
   optional note-path lists under `notes.personal_work` and `notes.spikes`.
   Keep retrospective note paths free of secrets; AFK redacts sensitive-looking
   values before writing ledger outputs.
-- `retrospective_follow_up` is optional top-level configuration for creating or
-  recording Beads after the deterministic retrospective is built. By default
-  AFK stays in recommendation-only mode. When enabled, it runs a local or fake
-  command against a redacted request and records the normalized result under
-  `pipeline_retrospective.follow_up.creation` without changing publication or
-  tracker status.
+- Runtime workstreams stay data-only after the deterministic retrospective is
+  built. `pipeline_retrospective.follow_up.creation` remains a
+  recommendation-only record in the minimal pipeline; any future
+  self-improvement worker or Beads creation should run as an external concern
+  against the emitted retrospective evidence instead of inside
+  `run-workstream`.
 - `tracker.terminal_decision` is optional. Leave it unset while a PR is open or
   under review. Set `{"status":"merged","merge_commit":"<sha>","pr_url":"<url>"}`
   only after the PR merges, or
@@ -373,14 +373,14 @@ The generated recipe is inspectable JSON for `afk run-workstream --input`.
 It uses the contract repo URL/base branch, explicit Beads workspace and checkout
 mounts, a `target_ids` selector for the requested Beads item, the named
 validation profile, production role defaults for Pi-backed implementation,
-review, and retrospective judging, and `"publisher": {"enabled": false}`.
+and review, plus `"publisher": {"enabled": false}`.
 Without per-role override flags, `generate-recipe` now assumes
 `--role-profile production`, which uses `pi --provider openai-codex --model
 gpt-5.4` for those roles, emits a one-hour implementation timeout by default,
 and requires the shared auth/config mounts shown above. Override that with
 `--agent-timeout-seconds` when a workstream needs a different implementation
-budget. Missing mounts fail fast with actionable `agent.*`, `reviewer.*`, or
-`retrospective_judge.*` errors instead of silently falling back to fake roles.
+budget. Missing mounts fail fast with actionable `agent.*` or `reviewer.*`
+errors instead of silently falling back to fake roles.
 
 For tests, CI fixtures, or local smoke runs that should stay offline, pass
 `--role-profile fake-local`. That preserves fake implementation/review adapters
@@ -917,27 +917,12 @@ tracker status, derived signals, and recommended follow-up without changing the
 functional publication or tracker outcome. `pipeline_retrospective.follow_up`
 contains Beads-shaped `recommended` entries with `kind`, `summary`, `labels`,
 and stable redacted `fingerprint` values, plus any `created` Beads and a
-`creation` record describing recommendation-only mode or an optional creator
-adapter run. The legacy `recommended_follow_up` list is preserved for
-compatibility.
-An optional top-level `retrospective_judge` recipe block can add a disabled-by-
-default post-pass that runs a local command against a redacted evidence pack
-built from the deterministic pipeline retrospective, tracker/publication
-summary, selected work, cleanup state, and redacted terminal retrospective
-evidence. Judge findings are recorded under `pipeline_retrospective.judge` and
-may add retrospective signals, but they do not change the functional
-publication or tracker status.
-When `retrospective_follow_up.enabled` is true, AFK writes a redacted
-`retrospective-follow-up-request.json`, runs the configured local or fake
-command in a minimal environment, and records the normalized outcome in
-`retrospective-follow-up-result.json` plus stdout/stderr logs. Command failures
-are kept inside `pipeline_retrospective.follow_up.creation` and do not alter
-the functional publication or tracker result.
-Set `retrospective_follow_up.creator: "beads"` for a deterministic local Beads
-creator instead of the command adapter. This mode stays opt-in, reads the Dolt
-password from `<beads_workspace>/secrets/dolt_beads_password.txt`, creates
-Beads with the recommendation labels plus any configured extra `labels`, writes
-stable fingerprint/category/severity metadata for dedupe, and records evidence
+`creation` record describing recommendation-only mode. The legacy
+`recommended_follow_up` list is preserved for compatibility.
+The minimal runtime does not execute a retrospective judge or create follow-up
+Beads. Future self-improvement workers should consume
+`pipeline-retrospective.json` outside the workstream lifecycle if that behavior
+is needed.
 paths in the created Bead description. Duplicate fingerprints already present
 in Beads are recorded without creating a second item, so recommendation-only
 mode remains available by leaving `enabled: false`.

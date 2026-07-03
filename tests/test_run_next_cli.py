@@ -863,15 +863,10 @@ raise SystemExit(9)
             creation = result["pipeline_retrospective"]["follow_up"]["creation"]
             created = result["pipeline_retrospective"]["follow_up"]["created"]
             calls = [json.loads(line) for line in fake_calls.read_text(encoding="utf-8").splitlines()]
-            create_call = next(call for call in calls if call["argv"][0] == "create")
-            metadata = json.loads(create_call["argv"][create_call["argv"].index("--metadata") + 1])
-            description = create_call["argv"][create_call["argv"].index("--description") + 1]
 
-            self.assertEqual(creation["status"], "created")
-            self.assertEqual(created[0]["id"], "central-new")
-            self.assertIn("afk.retrospective_follow_up.fingerprint", metadata)
-            self.assertIn("pi-auth-preflight.json", description)
-            self.assertEqual(create_call["password"], "test-password")
+            self.assertEqual(creation["status"], "recommendation-only")
+            self.assertEqual(created, [])
+            self.assertFalse(any(call["argv"][0] == "create" for call in calls))
             self.assertNotIn("test-password", completed.stdout)
 
     def test_run_next_execute_defaults_ledger_to_ledgers_directory(self):
@@ -1043,11 +1038,9 @@ raise SystemExit(9)
             result = json.loads(result_path.read_text(encoding="utf-8"))
             creation = result["pipeline_retrospective"]["follow_up"]["creation"]
             calls = [json.loads(line) for line in fake_calls.read_text(encoding="utf-8").splitlines()]
-            create_call = next(call for call in calls if call["argv"][0] == "create")
 
-            self.assertEqual(creation["status"], "created")
-            self.assertEqual(creation["creator"]["workspace"], str(beads_workspace.resolve()))
-            self.assertEqual(create_call["cwd"], str(beads_workspace.resolve()))
+            self.assertEqual(creation["status"], "recommendation-only")
+            self.assertFalse(any(call["argv"][0] == "create" for call in calls))
 
     def test_run_next_defaults_to_production_pi_roles_when_mounts_are_present(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1150,16 +1143,7 @@ raise SystemExit(9)
             )
             self.assertEqual(reviewer["timeout_seconds"], 300)
 
-            retrospective_judge = payload["recipe"]["retrospective_judge"]
-            self.assertEqual(
-                retrospective_judge["command"],
-                build_pi_print_command(
-                    pi_bin="pi",
-                    provider="openai-codex",
-                    model="gpt-5.4",
-                ),
-            )
-            self.assertEqual(retrospective_judge["timeout_seconds"], 120)
+            self.assertNotIn("retrospective_judge", payload["recipe"])
             self.assertEqual(payload["recipe"]["review_feedback"], {"enabled": True})
 
     def test_run_next_preview_preserves_production_recipe_without_pi_auth_mounts(self):
@@ -1248,18 +1232,7 @@ raise SystemExit(9)
             self.assertNotIn("config_home", reviewer)
             self.assertNotIn("env", reviewer)
 
-            retrospective_judge = payload["recipe"]["retrospective_judge"]
-            self.assertEqual(
-                retrospective_judge["command"],
-                build_pi_print_command(
-                    pi_bin="pi",
-                    provider="openai-codex",
-                    model="gpt-5.4",
-                ),
-            )
-            self.assertNotIn("codex_home", retrospective_judge)
-            self.assertNotIn("config_home", retrospective_judge)
-            self.assertNotIn("env", retrospective_judge)
+            self.assertNotIn("retrospective_judge", payload["recipe"])
 
     def test_run_next_execute_production_defaults_fail_without_pi_auth_mounts(self):
         with tempfile.TemporaryDirectory() as temp_dir:
