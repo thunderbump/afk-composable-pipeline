@@ -376,7 +376,7 @@ validation profile, production role defaults for Pi-backed implementation,
 and review, plus `"publisher": {"enabled": false}`.
 Without per-role override flags, `generate-recipe` now assumes
 `--role-profile production`, which uses `pi --provider openai-codex --model
-gpt-5.4` for those roles, emits a one-hour implementation timeout by default,
+gpt-5.4` for implementation and review, emits a one-hour implementation timeout by default,
 and requires the shared auth/config mounts shown above. Override that with
 `--agent-timeout-seconds` when a workstream needs a different implementation
 budget. Missing mounts fail fast with actionable `agent.*` or `reviewer.*`
@@ -407,8 +407,10 @@ the usual `--agent-codex-home`, `--agent-config-home`, and legacy
 `--agent-pi-coding-agent-dir /path/outside/checkout`. The generated recipe will
 emit `PI_CODING_AGENT_DIR` for Pi's agent auth lookup and will not emit
 `--api-key`, `OPENAI_API_KEY`, or token values. Override `--agent-mode`,
-`--reviewer-mode`, or `--retrospective-judge-mode` only when you need something
-other than the role profile defaults.
+or `--reviewer-mode` only when you need something other than the role profile
+defaults. Legacy `--retrospective-judge-mode` output remains compatibility-only:
+`run-workstream` ignores runtime retrospective judge blocks and keeps
+retrospective handling data-only.
 
 For `--validation-mode project-worker`, the generator embeds the worker host
 contract into both `implement` and `validate` step `input.validation`. By
@@ -480,8 +482,8 @@ model call fails or returns an invalid choice, it falls back to deterministic
 selection.
 
 Like `generate-recipe`, `run-next` defaults to `--role-profile production`.
-That means the emitted recipe uses Pi-backed implementation, reviewer, and
-retrospective-judge roles unless you override them explicitly, and the
+That means the emitted recipe uses Pi-backed implementation and reviewer roles
+unless you override them explicitly, and the
 implementation role gets the same one-hour default timeout unless you pass
 `--agent-timeout-seconds`. Preview-only
 `run-next` still emits selection status plus a production-shaped recipe even
@@ -555,14 +557,16 @@ quick pipeline exercise, not when you need real project validation evidence.
 
 When using Pi-backed roles, all worker model flags are validated with the same
 cap: `gpt-5.4` or lower. The production role profile defaults to `gpt-5.4` for
-implementation, review, and retrospective judge. The lightweight selector path
-stays limited to `gpt-5.3-codex-spark` and `gpt-5.4-mini`.
+implementation and review. The lightweight selector path stays limited to
+`gpt-5.3-codex-spark` and `gpt-5.4-mini`.
 
 `--agent-ponytail`, `--reviewer-ponytail`, and
 `--retrospective-judge-ponytail` all map to the same bundled extension source
 `git:github.com/DietrichGebert/ponytail`; explicit `--*-ponytail-extension`
 or `--*-ponytail-extension-source` values are accepted when the corresponding
-`--*ponytail` shortcut is not used.
+`--*ponytail` shortcut is not used. The retrospective-judge flags are retained
+for compatibility with older recipe payloads; the minimal runtime ignores those
+blocks and leaves any retrospective follow-up creation to external tooling.
 
 Publisher mode uses absolute mount paths only. Use `--publisher-mode create`,
 `--publisher-repo`, `--publisher-base`, and `--publisher-gh-config-dir` to
@@ -866,10 +870,6 @@ ledger/
       pipeline-retrospective.json
       pr-body.md
       publication-result.json
-      retrospective-follow-up-request.json
-      retrospective-follow-up-result.json
-      retrospective-follow-up-stderr.log
-      retrospective-follow-up-stdout.log
       retrospective.json
       tracker-result.json
       workstream-result.json
@@ -916,16 +916,13 @@ completed workstream run. It summarizes retrospective health, publication and
 tracker status, derived signals, and recommended follow-up without changing the
 functional publication or tracker outcome. `pipeline_retrospective.follow_up`
 contains Beads-shaped `recommended` entries with `kind`, `summary`, `labels`,
-and stable redacted `fingerprint` values, plus any `created` Beads and a
-`creation` record describing recommendation-only mode. The legacy
-`recommended_follow_up` list is preserved for compatibility.
+and stable redacted `fingerprint` values plus a `creation` record describing
+recommendation-only mode. The legacy `recommended_follow_up` list is preserved
+for compatibility.
 The minimal runtime does not execute a retrospective judge or create follow-up
 Beads. Future self-improvement workers should consume
 `pipeline-retrospective.json` outside the workstream lifecycle if that behavior
 is needed.
-paths in the created Bead description. Duplicate fingerprints already present
-in Beads are recorded without creating a second item, so recommendation-only
-mode remains available by leaving `enabled: false`.
 `retrospective.json`, when present, stores the user-supplied terminal
 retrospective evidence separately from the derived pipeline retrospective.
 `review_cycles` evidence, when supplied, is included in both

@@ -131,7 +131,12 @@ def run_workstream(
     workstream_id: str | None = None,
     project_contract: ProjectContract | None = None,
 ) -> WorkstreamResult:
-    normalized = normalize_recipe(recipe, parent=parent, workstream_id=workstream_id)
+    normalization_input = recipe
+    if isinstance(recipe, dict):
+        normalization_input = dict(recipe)
+        normalization_input.pop("retrospective_judge", None)
+        normalization_input.pop("retrospective_follow_up", None)
+    normalized = normalize_recipe(normalization_input, parent=parent, workstream_id=workstream_id)
     normalized["rerun_ledger_arg"] = rerun_ledger_arg
     run_id = new_run_id()
     ledger = WorkstreamLedger(ledger_dir, run_id)
