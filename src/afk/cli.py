@@ -164,7 +164,6 @@ def main(argv: list[str] | None = None) -> int:
             validation_input = recipe_validation_input_from_args(args, project_contract=project_contract)
             recipe_agent = recipe_agent_from_args(args, checkout_path=Path(args.checkout_path))
             reviewer = recipe_reviewer_from_args(args, checkout_path=Path(args.checkout_path))
-            retrospective_judge = recipe_retrospective_judge_from_args(args, checkout_path=Path(args.checkout_path))
             recipe_publisher = recipe_publisher_from_args(
                 args,
                 review_branch=f"afk/{branch_slug(args.workstream_id)}",
@@ -183,7 +182,6 @@ def main(argv: list[str] | None = None) -> int:
                 validation_input=validation_input,
                 agent=recipe_agent,
                 reviewer=reviewer,
-                retrospective_judge=retrospective_judge,
                 publisher=recipe_publisher,
                 enable_review_feedback=args.role_profile == PRODUCTION_ROLE_PROFILE,
                 expect_generated_smoke_dry_run=(
@@ -238,21 +236,6 @@ def main(argv: list[str] | None = None) -> int:
                 checkout_path=Path(args.checkout_path),
                 require_pi_mounts=args.execute,
             )
-            retrospective_judge = recipe_retrospective_judge_from_args(
-                args,
-                checkout_path=Path(args.checkout_path),
-                require_pi_mounts=args.execute,
-            )
-            beads_workspace = (
-                validate_beads_workspace(Path(args.beads_workspace))
-                if args.retrospective_follow_up_mode == "beads"
-                else Path(args.beads_workspace)
-            )
-            retrospective_follow_up = recipe_retrospective_follow_up_from_args(
-                args,
-                project_contract=project_contract,
-                beads_workspace=beads_workspace,
-            )
             recipe_publisher_factory = recipe_publisher_factory_from_args(
                 args,
                 checkout_path=Path(args.checkout_path),
@@ -277,8 +260,6 @@ def main(argv: list[str] | None = None) -> int:
                 validation_input=validation_input,
                 agent=recipe_agent,
                 reviewer=reviewer,
-                retrospective_judge=retrospective_judge,
-                retrospective_follow_up=retrospective_follow_up,
                 publisher_factory=recipe_publisher_factory,
                 ready_tag=args.ready_tag,
                 selector_mode=args.selector_mode,
@@ -470,7 +451,7 @@ def add_role_profile_flag(parser: argparse.ArgumentParser) -> None:
         default=PRODUCTION_ROLE_PROFILE,
         help=(
             "Role defaults for generated recipes: production uses Pi-backed implementation, "
-            "review, and retrospective judge; fake-local preserves local fake adapters."
+            "and review; fake-local preserves local fake adapters."
         ),
     )
 
@@ -572,44 +553,44 @@ def add_retrospective_judge_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--retrospective-judge-mode",
         choices=("disabled", "pi"),
-        help="Retrospective judge mode to embed in generated recipe",
+        help="Deprecated no-op compatibility flag; generated recipes no longer embed runtime retrospective judge blocks",
     )
     parser.add_argument(
         "--retrospective-judge-timeout-seconds",
         type=int,
-        help="Optional retrospective judge timeout in seconds",
+        help="Deprecated no-op compatibility flag",
     )
     parser.add_argument(
         "--retrospective-judge-pi-bin",
         default="pi",
-        help="Retrospective judge Pi binary for pi mode",
+        help="Deprecated no-op compatibility flag",
     )
     parser.add_argument(
         "--retrospective-judge-pi-provider",
         default="openai-codex",
-        help="Retrospective judge Pi provider for pi mode",
+        help="Deprecated no-op compatibility flag",
     )
     parser.add_argument(
         "--retrospective-judge-pi-model",
         default="gpt-5.4",
-        help="Retrospective judge Pi model for pi mode (gpt-5.4 or lower)",
+        help="Deprecated no-op compatibility flag",
     )
     parser.add_argument(
         "--retrospective-judge-pi-thinking",
-        help="Optional retrospective judge Pi thinking level",
+        help="Deprecated no-op compatibility flag",
     )
     parser.add_argument(
         "--retrospective-judge-ponytail",
         action="store_true",
-        help="Enable default ponytail extension for retrospective judge pi mode",
+        help="Deprecated no-op compatibility flag",
     )
     parser.add_argument(
         "--retrospective-judge-ponytail-extension",
-        help="Retrospective judge ponytail extension package name for pi mode",
+        help="Deprecated no-op compatibility flag",
     )
     parser.add_argument(
         "--retrospective-judge-ponytail-extension-source",
-        help="Retrospective judge ponytail extension source string for pi mode",
+        help="Deprecated no-op compatibility flag",
     )
 
 
@@ -618,13 +599,13 @@ def add_retrospective_follow_up_flags(parser: argparse.ArgumentParser) -> None:
         "--retrospective-follow-up-mode",
         choices=("disabled", "beads"),
         default="disabled",
-        help="Optional retrospective follow-up creator to embed in generated run-next recipes",
+        help="Deprecated no-op compatibility flag; generated recipes no longer embed runtime retrospective follow-up blocks",
     )
     parser.add_argument(
         "--retrospective-follow-up-label",
         action="append",
         default=[],
-        help="Extra label to add to retrospective follow-up Beads; repeat to add more",
+        help="Deprecated no-op compatibility flag",
     )
 
 
@@ -819,59 +800,7 @@ def recipe_retrospective_judge_from_args(
     checkout_path: Path,
     require_pi_mounts: bool = True,
 ) -> dict[str, Any] | None:
-    retrospective_judge_mode = resolved_role_mode(
-        args.retrospective_judge_mode,
-        role_profile=args.role_profile,
-        production_mode="pi",
-        fake_local_mode="disabled",
-    )
-    if retrospective_judge_mode == "disabled":
-        return None
-    if retrospective_judge_mode == "pi":
-        if args.retrospective_judge_ponytail and (
-            args.retrospective_judge_ponytail_extension is not None
-            or args.retrospective_judge_ponytail_extension_source is not None
-        ):
-            raise ValueError(
-                "--retrospective-judge-ponytail cannot be combined with explicit ponytail extension values"
-            )
-        ponytail_extension = None
-        ponytail_extension_source = None
-        if args.retrospective_judge_ponytail:
-            ponytail_extension_source = PONYTAIL_EXTENSION_SOURCE
-        else:
-            ponytail_extension = args.retrospective_judge_ponytail_extension
-            ponytail_extension_source = args.retrospective_judge_ponytail_extension_source
-            if ponytail_extension is not None and ponytail_extension_source is not None:
-                raise ValueError("Specify ponytail-extension or ponytail-extension-source, not both")
-        command = build_pi_print_command(
-            pi_bin=args.retrospective_judge_pi_bin,
-            provider=args.retrospective_judge_pi_provider,
-            model=args.retrospective_judge_pi_model,
-            thinking=args.retrospective_judge_pi_thinking,
-            ponytail_extension=ponytail_extension,
-            ponytail_extension_source=ponytail_extension_source,
-        )
-        judge_timeout = 120 if args.retrospective_judge_timeout_seconds is None else args.retrospective_judge_timeout_seconds
-        if judge_timeout <= 0:
-            raise ValueError("--retrospective-judge-timeout-seconds must be greater than zero")
-        return {
-            "enabled": True,
-            "type": "local-command",
-            "command": command,
-            "timeout_seconds": judge_timeout,
-            **build_provider_pi_mount_config(
-                provider=args.retrospective_judge_pi_provider,
-                codex_home=args.agent_codex_home,
-                config_home=args.agent_config_home,
-                pi_config_home=args.agent_pi_config_home,
-                pi_coding_agent_dir=args.agent_pi_coding_agent_dir,
-                checkout_path=checkout_path,
-                field_prefix="retrospective_judge",
-                require_mounts=require_pi_mounts,
-            ),
-        }
-    raise ValueError(f"Unsupported --retrospective-judge-mode: {retrospective_judge_mode}")
+    return None
 
 
 def recipe_retrospective_follow_up_from_args(
@@ -880,20 +809,7 @@ def recipe_retrospective_follow_up_from_args(
     project_contract: ProjectContract,
     beads_workspace: Path,
 ) -> dict[str, Any] | None:
-    if args.retrospective_follow_up_mode == "disabled":
-        return None
-    if args.retrospective_follow_up_mode != "beads":
-        raise ValueError(f"Unsupported --retrospective-follow-up-mode: {args.retrospective_follow_up_mode}")
-    labels: list[str] = []
-    for label in [*project_contract.beads_labels, args.ready_tag, *args.retrospective_follow_up_label]:
-        if label and label not in labels:
-            labels.append(label)
-    return {
-        "enabled": True,
-        "creator": "beads",
-        "beads_workspace": str(beads_workspace),
-        "labels": labels,
-    }
+    return None
 
 
 def recipe_validation_input_from_args(args: argparse.Namespace, *, project_contract: ProjectContract) -> dict[str, Any]:

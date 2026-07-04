@@ -131,7 +131,12 @@ def run_workstream(
     workstream_id: str | None = None,
     project_contract: ProjectContract | None = None,
 ) -> WorkstreamResult:
-    normalized = normalize_recipe(recipe, parent=parent, workstream_id=workstream_id)
+    normalization_input = recipe
+    if isinstance(recipe, dict):
+        normalization_input = dict(recipe)
+        normalization_input.pop("retrospective_judge", None)
+        normalization_input.pop("retrospective_follow_up", None)
+    normalized = normalize_recipe(normalization_input, parent=parent, workstream_id=workstream_id)
     normalized["rerun_ledger_arg"] = rerun_ledger_arg
     run_id = new_run_id()
     ledger = WorkstreamLedger(ledger_dir, run_id)
@@ -304,65 +309,7 @@ def run_workstream(
     tracker = tracker_record(normalized, state, publication)
     status = workstream_status_from_publication(publication, tracker)
     selected_work = selected_work_records(state)
-    retrospective_judge_skip_reason = ""
-    retrospective_judge_skip_classification = "auth_preflight_failed"
-    if state["blocked_reason"].startswith("Pi auth preflight failed for "):
-        retrospective_judge_skip_reason = state["blocked_reason"]
-    else:
-        retrospective_judge_target = pi_auth_preflight_target("retrospective_judge", normalized.get("retrospective_judge"))
-        if retrospective_judge_target is not None and pi_auth_preflight_status.get(retrospective_judge_target["target"]) == "deferred":
-            checkout_path = prepared_checkout_path_from_state(state)
-            if checkout_path is None:
-                auth_result = deferred_pi_auth_preflight_result(
-                    retrospective_judge_target,
-                    summary="checkout-local Pi auth preflight remains deferred because no prepared checkout is available",
-                )
-                retrospective_judge_skip_reason = auth_result["summary"]
-                retrospective_judge_skip_classification = "checkout_unavailable"
-            else:
-                auth_result = run_pi_auth_preflight_target(
-                    retrospective_judge_target,
-                    cwd=checkout_path,
-                )
-            pi_auth_preflight["results"].append(auth_result)
-            pi_auth_preflight = summarize_pi_auth_preflight(pi_auth_preflight["results"])
-            pi_auth_preflight_status[retrospective_judge_target["target"]] = auth_result["status"]
-            ledger.write_json("pi-auth-preflight.json", pi_auth_preflight)
-            state["pi_auth_preflight"] = pi_auth_preflight
-            if auth_result["status"] == "failed":
-                retrospective_judge_skip_reason = pi_auth_preflight_failure_reason(auth_result)
-                retrospective_judge_skip_classification = "auth_preflight_failed"
     pipeline_retrospective = pipeline_retrospective_record(state, publication, tracker, normalized)
-    retrospective_judge = _run_retrospective_judge(
-        normalized=normalized,
-        state=state,
-        publication=publication,
-        tracker=tracker,
-        selected_work=selected_work,
-        pipeline_retrospective=pipeline_retrospective,
-        ledger=ledger,
-        skip_reason=retrospective_judge_skip_reason,
-        skip_classification=retrospective_judge_skip_classification,
-    )
-    pipeline_retrospective = _apply_retrospective_judge(
-        pipeline_retrospective,
-        retrospective_judge,
-        normalized=normalized,
-        publication=publication,
-        state=state,
-    )
-    retrospective_follow_up_creation = _run_retrospective_follow_up(
-        normalized=normalized,
-        state=state,
-        publication=publication,
-        tracker=tracker,
-        pipeline_retrospective=pipeline_retrospective,
-        ledger=ledger,
-    )
-    pipeline_retrospective = _apply_retrospective_follow_up_creation(
-        pipeline_retrospective,
-        retrospective_follow_up_creation,
-    )
 
     ledger.write_json("publication-result.json", publication)
     ledger.write_json("tracker-result.json", tracker)

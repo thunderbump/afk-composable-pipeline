@@ -96,6 +96,10 @@ class GenerateRecipeCliTest(unittest.TestCase):
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertIn("--validation-stack-path", completed.stdout)
         self.assertIn("Overrides the default host sibling contract", completed.stdout)
+        self.assertIn("production uses", completed.stdout)
+        self.assertIn("Pi-backed implementation, and review", completed.stdout)
+        self.assertNotIn("production uses Pi-backed implementation, review, and retrospective judge", completed.stdout)
+        self.assertIn("Deprecated no-op compatibility flag", completed.stdout)
 
     def test_generate_recipe_writes_complete_single_item_workstream_recipe_from_project_contract(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -269,18 +273,7 @@ class GenerateRecipeCliTest(unittest.TestCase):
             )
             self.assertEqual(reviewer["timeout_seconds"], 300)
 
-            retrospective_judge = recipe["retrospective_judge"]
-            self.assertEqual(retrospective_judge["enabled"], True)
-            self.assertEqual(retrospective_judge["type"], "local-command")
-            self.assertEqual(
-                retrospective_judge["command"],
-                build_pi_print_command(
-                    pi_bin="pi",
-                    provider="openai-codex",
-                    model="gpt-5.4",
-                ),
-            )
-            self.assertEqual(retrospective_judge["timeout_seconds"], 120)
+            self.assertNotIn("retrospective_judge", recipe)
 
     def test_generate_recipe_fake_local_role_profile_preserves_fake_adapters(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -983,7 +976,7 @@ class GenerateRecipeCliTest(unittest.TestCase):
             self.assertIn("Pi worker model must be gpt-5.4 or lower", completed.stderr)
             self.assertFalse(output.exists())
 
-    def test_generate_recipe_writes_pi_reviewer_and_pi_retrospective_judge_modes(self):
+    def test_generate_recipe_writes_pi_reviewer_and_omits_retrospective_judge_block(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
             contracts_dir = temp_path / "contracts"
@@ -1011,8 +1004,6 @@ class GenerateRecipeCliTest(unittest.TestCase):
             reviewer_pi_model = "gpt-5.4-mini"
             reviewer_ponytail = PONYTAIL_EXTENSION_SOURCE
             reviewer_timeout = 90
-            judge_pi_model = "gpt-5.4"
-            judge_timeout = 130
             completed = run_afk(
                 "generate-recipe",
                 "--workstream-id",
@@ -1055,18 +1046,6 @@ class GenerateRecipeCliTest(unittest.TestCase):
                 str(pi_config_home),
                 "--agent-pi-coding-agent-dir",
                 str(pi_coding_agent_dir),
-                "--retrospective-judge-mode",
-                "pi",
-                "--retrospective-judge-pi-bin",
-                reviewer_pi_bin,
-                "--retrospective-judge-pi-provider",
-                "openai-codex",
-                "--retrospective-judge-pi-model",
-                judge_pi_model,
-                "--retrospective-judge-timeout-seconds",
-                str(judge_timeout),
-                "--retrospective-judge-ponytail-extension-source",
-                reviewer_ponytail,
                 "--output",
                 str(output),
             )
@@ -1094,30 +1073,9 @@ class GenerateRecipeCliTest(unittest.TestCase):
                     "PI_CODING_AGENT_DIR": str(pi_coding_agent_dir),
                 },
             )
-            retrospective_judge = recipe["retrospective_judge"]
-            self.assertEqual(retrospective_judge["enabled"], True)
-            self.assertEqual(
-                retrospective_judge["command"],
-                build_pi_print_command(
-                    pi_bin=reviewer_pi_bin,
-                    provider="openai-codex",
-                    model=judge_pi_model,
-                    ponytail_extension_source=reviewer_ponytail,
-                ),
-            )
-            self.assertEqual(retrospective_judge["type"], "local-command")
-            self.assertEqual(retrospective_judge["timeout_seconds"], judge_timeout)
-            self.assertEqual(retrospective_judge["codex_home"], str(codex_home))
-            self.assertEqual(retrospective_judge["config_home"], str(config_home))
-            self.assertEqual(
-                retrospective_judge["env"],
-                {
-                    "PI_CONFIG_HOME": str(pi_config_home),
-                    "PI_CODING_AGENT_DIR": str(pi_coding_agent_dir),
-                },
-            )
+            self.assertNotIn("retrospective_judge", recipe)
 
-    def test_generate_recipe_does_not_copy_shared_agent_mounts_to_non_openai_pi_reviewer_or_judge(self):
+    def test_generate_recipe_does_not_copy_shared_agent_mounts_to_non_openai_pi_reviewer(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
             contracts_dir = temp_path / "contracts"
@@ -1168,12 +1126,6 @@ class GenerateRecipeCliTest(unittest.TestCase):
                 "anthropic",
                 "--reviewer-pi-model",
                 "gpt-5.4-mini",
-                "--retrospective-judge-mode",
-                "pi",
-                "--retrospective-judge-pi-provider",
-                "anthropic",
-                "--retrospective-judge-pi-model",
-                "gpt-5.4-mini",
                 "--agent-codex-home",
                 str(codex_home),
                 "--agent-config-home",
@@ -1189,14 +1141,11 @@ class GenerateRecipeCliTest(unittest.TestCase):
             self.assertEqual(completed.returncode, 0, completed.stderr)
             recipe = json.loads(output.read_text(encoding="utf-8"))
             reviewer = recipe["steps"][4]["input"]["reviewer"]
-            retrospective_judge = recipe["retrospective_judge"]
 
             self.assertNotIn("codex_home", reviewer)
             self.assertNotIn("config_home", reviewer)
             self.assertNotIn("env", reviewer)
-            self.assertNotIn("codex_home", retrospective_judge)
-            self.assertNotIn("config_home", retrospective_judge)
-            self.assertNotIn("env", retrospective_judge)
+            self.assertNotIn("retrospective_judge", recipe)
 
     def test_generate_recipe_rejects_disallowed_pi_reviewer_model(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1263,7 +1212,7 @@ class GenerateRecipeCliTest(unittest.TestCase):
             self.assertIn("Pi worker model must be gpt-5.4 or lower", completed.stderr)
             self.assertFalse(output.exists())
 
-    def test_generate_recipe_rejects_disallowed_pi_retrospective_judge_model(self):
+    def test_generate_recipe_ignores_deprecated_retrospective_judge_flags(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
             contracts_dir = temp_path / "contracts"
@@ -1312,9 +1261,37 @@ class GenerateRecipeCliTest(unittest.TestCase):
                 str(output),
             )
 
-            self.assertNotEqual(completed.returncode, 0, completed.stdout)
-            self.assertIn("Pi worker model must be gpt-5.4 or lower", completed.stderr)
-            self.assertFalse(output.exists())
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            recipe = json.loads(output.read_text(encoding="utf-8"))
+            self.assertNotIn("retrospective_judge", recipe)
+
+    def test_generate_workstream_recipe_omits_deprecated_retrospective_blocks_from_python_api(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            contracts_dir = temp_path / "contracts"
+            repo = temp_path / "repo-src"
+            beads_workspace = temp_path / "central-beads"
+            checkout_root = temp_path / "checkouts"
+            checkout_path = checkout_root / "demo"
+            contracts_dir.mkdir()
+            init_repo(repo)
+            write_contract(contracts_dir / "demo.json", project_slug="demo", repo_url=str(repo))
+            beads_workspace.mkdir()
+            checkout_root.mkdir()
+
+            recipe = generate_workstream_recipe(
+                workstream_id="central-anh.6",
+                project_contract=load_project_contract("demo", contracts_dir),
+                beads_workspace=beads_workspace,
+                checkout_root=checkout_root,
+                checkout_path=checkout_path,
+                validation_profile="tier1",
+                retrospective_judge={"enabled": True},
+                retrospective_follow_up={"enabled": True, "creator": "beads"},
+            )
+
+            self.assertNotIn("retrospective_judge", recipe)
+            self.assertNotIn("retrospective_follow_up", recipe)
 
     def test_generate_recipe_rejects_openai_codex_pi_reviewer_without_pi_coding_agent_dir(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1381,7 +1358,7 @@ class GenerateRecipeCliTest(unittest.TestCase):
             self.assertIn("reviewer.env.PI_CODING_AGENT_DIR is required", completed.stderr)
             self.assertFalse(output.exists())
 
-    def test_generate_recipe_rejects_openai_codex_pi_retrospective_judge_without_pi_coding_agent_dir(self):
+    def test_generate_recipe_ignores_deprecated_retrospective_judge_mount_flags(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
             contracts_dir = temp_path / "contracts"
@@ -1442,9 +1419,9 @@ class GenerateRecipeCliTest(unittest.TestCase):
                 str(output),
             )
 
-            self.assertNotEqual(completed.returncode, 0, completed.stdout)
-            self.assertIn("retrospective_judge.env.PI_CODING_AGENT_DIR is required", completed.stderr)
-            self.assertFalse(output.exists())
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            recipe = json.loads(output.read_text(encoding="utf-8"))
+            self.assertNotIn("retrospective_judge", recipe)
 
     def test_generate_recipe_writes_project_worker_validation_when_requested(self):
         with tempfile.TemporaryDirectory() as temp_dir:
