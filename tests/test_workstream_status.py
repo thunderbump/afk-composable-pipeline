@@ -170,8 +170,24 @@ class WorkstreamStatusMappingTest(unittest.TestCase):
                         }
                     )
 
+    def test_normalize_retrospective_follow_up_config_rejects_split_bearer_token_with_padding_in_command(self):
+        with self.assertRaisesRegex(WorkstreamError, "secret-looking values"):
+            normalize_retrospective_follow_up_config(
+                {
+                    "enabled": True,
+                    "type": "fake-follow-up-command",
+                    "command": [
+                        "curl",
+                        "-H",
+                        "Authorization: Bearer",
+                        "abcdefghijklmnop==",
+                        "https://example.invalid",
+                    ],
+                }
+            )
+
     def test_normalize_retrospective_follow_up_config_allows_bearer_auth_failure_prose_in_command(self):
-        for value in ("authorizationfailed", "missingcredential"):
+        for value in ("unauthorized", "authorizationfailed", "missingcredential"):
             with self.subTest(value=value):
                 config = normalize_retrospective_follow_up_config(
                     {
@@ -195,6 +211,30 @@ class WorkstreamStatusMappingTest(unittest.TestCase):
                         "https://example.invalid",
                     ],
                 )
+
+    def test_normalize_retrospective_follow_up_config_allows_www_authenticate_bearer_parameters_in_command(self):
+        config = normalize_retrospective_follow_up_config(
+            {
+                "enabled": True,
+                "type": "fake-follow-up-command",
+                "command": [
+                    "curl",
+                    "-H",
+                    "WWW-Authenticate: Bearer authorization_uri=https://login.example/token, error=invalid_token",
+                    "https://example.invalid",
+                ],
+            }
+        )
+
+        self.assertEqual(
+            config["command"],
+            [
+                "curl",
+                "-H",
+                "WWW-Authenticate: Bearer authorization_uri=https://login.example/token, error=invalid_token",
+                "https://example.invalid",
+            ],
+        )
 
     def test_normalize_retrospective_follow_up_config_rejects_auth_env_keys(self):
         with self.assertRaisesRegex(WorkstreamError, "retrospective_follow_up.env is not supported"):
@@ -265,6 +305,22 @@ class WorkstreamStatusMappingTest(unittest.TestCase):
                             ],
                         }
                     )
+
+    def test_normalize_retrospective_judge_rejects_split_bearer_token_with_padding_in_command(self):
+        with self.assertRaisesRegex(WorkstreamError, "secret-looking values"):
+            normalize_retrospective_judge(
+                {
+                    "enabled": True,
+                    "type": "fake-judge-command",
+                    "command": [
+                        "curl",
+                        "-H",
+                        "Authorization: Bearer",
+                        "abcdefghijklmnop==",
+                        "https://example.invalid",
+                    ],
+                }
+            )
 
     def test_normalize_retrospective_judge_rejects_non_pi_mounts_without_checkout_path(self):
         with self.subTest("existing absolute paths"), self.assertRaisesRegex(

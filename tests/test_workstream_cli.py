@@ -9565,113 +9565,115 @@ Path({str(temp_path / "publisher-calls.txt")!r}).write_text("gh should not run\\
             )
 
     def test_workstream_redacts_bearer_secret_in_selected_auth_failure_line(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            temp_path = Path(temp_dir)
-            repo = temp_path / "repo-src"
-            checkout = temp_path / "checkout"
-            ledger = temp_path / "ledger"
-            codex_home = temp_path / "codex-home"
-            config_home = temp_path / "xdg-config"
-            pi_config_home = temp_path / "pi-config"
-            pi_coding_agent_dir = temp_path / "pi-coding-agent"
-            init_repo(repo)
-            codex_home.mkdir()
-            config_home.mkdir()
-            pi_config_home.mkdir()
-            pi_coding_agent_dir.mkdir()
-            fake_git = temp_path / "publisher-git"
-            fake_gh = temp_path / "publisher-gh"
-            write_executable(
-                fake_git,
-                f"""#!{sys.executable}
+        for token in ("A1b2C3d4E5f6G7h8", "abcdefghijklmnop=="):
+            with self.subTest(token=token):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    temp_path = Path(temp_dir)
+                    repo = temp_path / "repo-src"
+                    checkout = temp_path / "checkout"
+                    ledger = temp_path / "ledger"
+                    codex_home = temp_path / "codex-home"
+                    config_home = temp_path / "xdg-config"
+                    pi_config_home = temp_path / "pi-config"
+                    pi_coding_agent_dir = temp_path / "pi-coding-agent"
+                    init_repo(repo)
+                    codex_home.mkdir()
+                    config_home.mkdir()
+                    pi_config_home.mkdir()
+                    pi_coding_agent_dir.mkdir()
+                    fake_git = temp_path / "publisher-git"
+                    fake_gh = temp_path / "publisher-gh"
+                    write_executable(
+                        fake_git,
+                        f"""#!{sys.executable}
 from pathlib import Path
 Path({str(temp_path / "publisher-calls.txt")!r}).write_text("git should not run\\n", encoding="utf-8")
 """,
-            )
-            write_executable(
-                fake_gh,
-                f"""#!{sys.executable}
+                    )
+                    write_executable(
+                        fake_gh,
+                        f"""#!{sys.executable}
 from pathlib import Path
 Path({str(temp_path / "publisher-calls.txt")!r}).write_text("gh should not run\\n", encoding="utf-8")
 """,
-            )
-            recipe = successful_recipe(temp_path, repo, checkout, fake_git, fake_gh)
-            failing_agent_code = textwrap.dedent(
-                """
-                import sys
+                    )
+                    recipe = successful_recipe(temp_path, repo, checkout, fake_git, fake_gh)
+                    failing_agent_code = textwrap.dedent(
+                        f"""
+                        import sys
 
-                print("Authentication failed: Bearer A1b2C3d4E5f6G7h8", file=sys.stderr)
-                sys.exit(1)
-                """
-            ).strip()
-            recipe["publisher"] = {"enabled": False}
-            recipe["steps"][2]["input"]["agent"] = {
-                "type": "real-agent-command",
-                "provider": "openai-codex",
-                "command": [sys.executable, "-c", failing_agent_code],
-                "result_path": "agent-result.json",
-                "timeout_seconds": 10,
-                "codex_home": str(codex_home),
-                "config_home": str(config_home),
-                "env": {
-                    "PI_CONFIG_HOME": str(pi_config_home),
-                    "PI_CODING_AGENT_DIR": str(pi_coding_agent_dir),
-                },
-            }
+                        print("Authentication failed: Bearer {token}", file=sys.stderr)
+                        sys.exit(1)
+                        """
+                    ).strip()
+                    recipe["publisher"] = {"enabled": False}
+                    recipe["steps"][2]["input"]["agent"] = {
+                        "type": "real-agent-command",
+                        "provider": "openai-codex",
+                        "command": [sys.executable, "-c", failing_agent_code],
+                        "result_path": "agent-result.json",
+                        "timeout_seconds": 10,
+                        "codex_home": str(codex_home),
+                        "config_home": str(config_home),
+                        "env": {
+                            "PI_CONFIG_HOME": str(pi_config_home),
+                            "PI_CODING_AGENT_DIR": str(pi_coding_agent_dir),
+                        },
+                    }
 
-            completed = run_afk(
-                "run-workstream",
-                "--workstream-id",
-                "central-lve.9",
-                "--input",
-                json.dumps(recipe),
-                "--ledger",
-                str(ledger),
-                env_overrides={
-                    "GIT_ALLOW_PROTOCOL": "file",
-                    "GIT_AUTHOR_NAME": "AFK Test",
-                    "GIT_AUTHOR_EMAIL": "afk-test@example.test",
-                    "GIT_COMMITTER_NAME": "AFK Test",
-                    "GIT_COMMITTER_EMAIL": "afk-test@example.test",
-                },
-            )
+                    completed = run_afk(
+                        "run-workstream",
+                        "--workstream-id",
+                        "central-lve.9",
+                        "--input",
+                        json.dumps(recipe),
+                        "--ledger",
+                        str(ledger),
+                        env_overrides={
+                            "GIT_ALLOW_PROTOCOL": "file",
+                            "GIT_AUTHOR_NAME": "AFK Test",
+                            "GIT_AUTHOR_EMAIL": "afk-test@example.test",
+                            "GIT_COMMITTER_NAME": "AFK Test",
+                            "GIT_COMMITTER_EMAIL": "afk-test@example.test",
+                        },
+                    )
 
-            self.assertEqual(completed.returncode, 0, completed.stderr)
-            summary = json.loads(completed.stdout)
-            result = json.loads((ledger / summary["result_path"]).read_text(encoding="utf-8"))
-            implement_step = result["steps"][2]
+                    self.assertEqual(completed.returncode, 0, completed.stderr)
+                    summary = json.loads(completed.stdout)
+                    result = json.loads((ledger / summary["result_path"]).read_text(encoding="utf-8"))
+                    implement_step = result["steps"][2]
 
-            self.assertEqual(summary["status"], "blocked")
-            self.assertEqual(result["publication"]["status"], "blocked")
-            self.assertEqual(
-                result["pipeline_retrospective"]["signals"],
-                [
-                    {
-                        "kind": "implementation-auth",
-                        "scope": "pipeline-process",
-                        "severity": "error",
-                        "summary": "Authentication failed: Bearer [REDACTED]",
-                        "step": "implement",
-                        "classification": "agent-auth",
-                        "excerpt": "Authentication failed: Bearer [REDACTED]",
-                        "evidence_paths": [
-                            f"runs/{implement_step['run_id']}/step-result.json",
-                            f"runs/{implement_step['run_id']}/agent-result.json",
+                    self.assertEqual(summary["status"], "blocked")
+                    self.assertEqual(result["publication"]["status"], "blocked")
+                    self.assertEqual(
+                        result["pipeline_retrospective"]["signals"],
+                        [
+                            {
+                                "kind": "implementation-auth",
+                                "scope": "pipeline-process",
+                                "severity": "error",
+                                "summary": "Authentication failed: Bearer [REDACTED]",
+                                "step": "implement",
+                                "classification": "agent-auth",
+                                "excerpt": "Authentication failed: Bearer [REDACTED]",
+                                "evidence_paths": [
+                                    f"runs/{implement_step['run_id']}/step-result.json",
+                                    f"runs/{implement_step['run_id']}/agent-result.json",
+                                ],
+                            }
                         ],
-                    }
-                ],
-            )
-            self.assertEqual(
-                result["pipeline_retrospective"]["recommended_follow_up"],
-                [
-                    {
-                        "summary": "Fix implement [agent-auth]: Authentication failed: Bearer [REDACTED]",
-                        "labels": ["afk:follow-up", "area:implementation", "project:afk-composable-pipeline"],
-                    }
-                ],
-            )
-            retrospective_text = json.dumps(result["pipeline_retrospective"])
-            self.assertNotIn("A1b2C3d4E5f6G7h8", retrospective_text)
+                    )
+                    self.assertEqual(
+                        result["pipeline_retrospective"]["recommended_follow_up"],
+                        [
+                            {
+                                "summary": "Fix implement [agent-auth]: Authentication failed: Bearer [REDACTED]",
+                                "labels": ["afk:follow-up", "area:implementation", "project:afk-composable-pipeline"],
+                            }
+                        ],
+                    )
+                    retrospective_text = json.dumps(result["pipeline_retrospective"])
+                    self.assertNotIn(token, retrospective_text)
 
     def test_workstream_update_mode_edits_existing_terminal_pr(self):
         with tempfile.TemporaryDirectory() as temp_dir:

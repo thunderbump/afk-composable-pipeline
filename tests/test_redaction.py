@@ -220,6 +220,11 @@ class RedactionTest(unittest.TestCase):
                     "Authentication failed: Bearer [REDACTED]",
                 )
 
+    def test_redacts_opaque_lowercase_bearer_tokens_with_padding_in_text(self):
+        text = "Authentication failed: Bearer abcdefghijklmnop=="
+
+        self.assertEqual(redact_text(text), "Authentication failed: Bearer [REDACTED]")
+
     def test_preserves_www_authenticate_bearer_parameters(self):
         text = "WWW-Authenticate: Bearer authorization_uri=https://login.example/token, error=invalid_token"
 

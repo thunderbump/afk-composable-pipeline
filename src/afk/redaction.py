@@ -168,15 +168,16 @@ def bearer_secret_present(value: str) -> bool:
 
 
 def is_bearer_secret_value(value: str) -> bool:
-    if len(value) < 12:
+    unpadded = value.rstrip("=")
+    if len(unpadded) < 12:
         return False
-    if "=" in value.rstrip("="):
+    if "=" in unpadded:
         return False
-    if value.isalpha() and value.islower() and value in SAFE_BEARER_WORDS:
+    if unpadded.isalpha() and unpadded.islower() and unpadded in SAFE_BEARER_WORDS:
         return False
-    return any(char.isdigit() for char in value) or any(char.isupper() for char in value) or any(
-        char in "./+~_-" for char in value
-    ) or value.isalpha()
+    return any(char.isdigit() for char in unpadded) or any(char.isupper() for char in unpadded) or any(
+        char in "./+~_-" for char in unpadded
+    ) or unpadded.isalpha()
 
 
 def redact_bearer_secret(match: re.Match[str]) -> str:
