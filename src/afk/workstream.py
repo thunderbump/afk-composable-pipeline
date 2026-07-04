@@ -25,6 +25,7 @@ from afk.pi_workers import (
 )
 from afk.redaction import (
     bearer_secret_present,
+    is_bearer_secret_value,
     is_secret_command_flag,
     is_secret_key,
     is_secret_value,
@@ -6627,11 +6628,18 @@ def _is_string_list(value: Any) -> bool:
 
 
 def _command_secret_error_message(command: list[str], *, field_name: str) -> str | None:
-    for part in command:
+    for index, part in enumerate(command):
+        stripped_part = part.strip()
         if is_secret_command_flag(part):
             flag = part.strip().split("=", 1)[0].lower()
             return f"{field_name} must not include credential flag {flag}"
         if is_secret_value(part) or bearer_secret_present(part):
+            return f"{field_name} must not include secret-looking values"
+        if (
+            re.search(r"(?:^|[\s:])Bearer\s*$", stripped_part, re.IGNORECASE)
+            and index + 1 < len(command)
+            and is_bearer_secret_value(command[index + 1].strip())
+        ):
             return f"{field_name} must not include secret-looking values"
     return None
 

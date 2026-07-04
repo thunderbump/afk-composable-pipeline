@@ -152,6 +152,24 @@ class WorkstreamStatusMappingTest(unittest.TestCase):
                         }
                     )
 
+    def test_normalize_retrospective_follow_up_config_rejects_split_bearer_token_with_url_safe_separator_in_command(self):
+        for token in ("abcdefgh_ijkl", "abcdefgh-ijkl"):
+            with self.subTest(token=token):
+                with self.assertRaisesRegex(WorkstreamError, "secret-looking values"):
+                    normalize_retrospective_follow_up_config(
+                        {
+                            "enabled": True,
+                            "type": "fake-follow-up-command",
+                            "command": [
+                                "curl",
+                                "-H",
+                                "Authorization: Bearer",
+                                token,
+                                "https://example.invalid",
+                            ],
+                        }
+                    )
+
     def test_normalize_retrospective_follow_up_config_allows_bearer_auth_failure_prose_in_command(self):
         for value in ("authorizationfailed", "missingcredential"):
             with self.subTest(value=value):
@@ -225,6 +243,24 @@ class WorkstreamStatusMappingTest(unittest.TestCase):
                                 "curl",
                                 "-H",
                                 f"Authorization: Bearer {token}",
+                                "https://example.invalid",
+                            ],
+                        }
+                    )
+
+    def test_normalize_retrospective_judge_rejects_split_bearer_token_with_url_safe_separator_in_command(self):
+        for token in ("abcdefgh_ijkl", "abcdefgh-ijkl"):
+            with self.subTest(token=token):
+                with self.assertRaisesRegex(WorkstreamError, "secret-looking values"):
+                    normalize_retrospective_judge(
+                        {
+                            "enabled": True,
+                            "type": "fake-judge-command",
+                            "command": [
+                                "curl",
+                                "-H",
+                                "Authorization: Bearer",
+                                token,
                                 "https://example.invalid",
                             ],
                         }
