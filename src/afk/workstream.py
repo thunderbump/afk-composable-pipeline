@@ -23,7 +23,16 @@ from afk.pi_workers import (
     openai_codex_pi_mount_error,
     validate_absolute_dir,
 )
-from afk.redaction import is_secret_command_flag, is_secret_key, is_secret_value, redact_artifact_value, redact_text
+from afk.redaction import (
+    bearer_secret_present,
+    is_bearer_secret_value,
+    is_secret_command_flag,
+    is_secret_key,
+    is_secret_value,
+    normalize_bearer_secret_value,
+    redact_artifact_value,
+    redact_text,
+)
 from afk.recipes import review_branch_for_workstream
 from afk.registry import StepResult
 from afk.workstream_lifecycle import (
@@ -53,7 +62,6 @@ REVIEW_CYCLE_STATUSES = {"passed", "findings-open", "findings-addressed", "reque
 REVIEW_CYCLE_OPEN_STATUSES = {"findings-open", "request-changes"}
 REVIEW_CYCLE_RESPONSE_STATUSES = {"addressed", "findings-addressed"}
 TERMINAL_REVIEW_FEEDBACK_STATUSES = {"resolved", "waived"}
-COMMAND_BEARER_SECRET_PATTERN = re.compile(r"\bBearer\s+[A-Za-z0-9._~+/=-]{12,}", re.IGNORECASE)
 PI_JUDGE_PROMPT_PLACEHOLDER = "{prompt}"
 PI_JUDGE_REQUEST_PATH_PLACEHOLDER = "{request_path}"
 PI_JUDGE_RESULT_PATH_PLACEHOLDER = "{result_path}"
@@ -5168,6 +5176,9 @@ def _blocked_retrospective_signals(state: dict[str, Any], publication: dict[str,
     reason = string_field(publication, "reason") or ""
     if publication.get("status") != "blocked" or not reason:
         return []
+    implementation_auth_signal = _implementation_auth_retrospective_signal(state, reason)
+    if implementation_auth_signal is not None:
+        return [implementation_auth_signal]
     reviewer_timeout_signal = _reviewer_timeout_retrospective_signal(state, reason)
     if reviewer_timeout_signal is not None:
         return [reviewer_timeout_signal]
@@ -5183,6 +5194,88 @@ def _blocked_retrospective_signals(state: dict[str, Any], publication: dict[str,
             "evidence_paths": [],
         }
     ]
+
+
+def _implementation_auth_retrospective_signal(state: dict[str, Any], reason: str) -> dict[str, Any] | None:
+    if reason != "implement did not reach implemented: failed_runtime":
+        return None
+    implementation = state.get("implementation")
+    if not isinstance(implementation, dict):
+        return None
+    summary = string_field(implementation, "summary") or ""
+    agent_result = implementation.get("agent_result") if isinstance(implementation.get("agent_result"), dict) else {}
+    evidence = agent_result.get("evidence") if isinstance(agent_result.get("evidence"), dict) else {}
+    stderr_excerpt = string_field(evidence, "stderr_excerpt") or ""
+    stdout_excerpt = string_field(evidence, "stdout_excerpt") or ""
+    auth_excerpt = _implementation_auth_failure_excerpt(summary, stderr_excerpt, stdout_excerpt)
+    classification = _implementation_auth_failure_classification(summary, stderr_excerpt, stdout_excerpt)
+    if not classification:
+        return None
+    excerpt = auth_excerpt or runtime_failure_excerpt(stderr_excerpt) or runtime_failure_excerpt(stdout_excerpt) or summary
+    implementation_result_path = string_field(state, "implementation_result_path") or ""
+    agent_result_path = str(Path(implementation_result_path).with_name("agent-result.json")) if implementation_result_path else ""
+    return {
+        "kind": "implementation-auth",
+        "scope": "pipeline-process",
+        "severity": "error",
+        "summary": redact_text(excerpt),
+        "step": "implement",
+        "classification": classification,
+        "excerpt": redact_text(excerpt),
+        "evidence_paths": _retrospective_evidence_paths(
+            implementation_result_path,
+            agent_result_path,
+        ),
+    }
+
+
+def _implementation_auth_failure_excerpt(*texts: str) -> str:
+    explicit_excerpts: list[str] = []
+    for text in texts[1:]:
+        explicit_excerpts.extend(_explicit_auth_failure_lines(text))
+    for text in texts:
+        explicit_excerpts.extend(_explicit_auth_failure_lines(text))
+    for excerpt in explicit_excerpts:
+        if "openai-codex" in excerpt.lower():
+            return excerpt
+    return explicit_excerpts[0] if explicit_excerpts else ""
+
+
+def _implementation_auth_failure_classification(*texts: str) -> str:
+    excerpt = _implementation_auth_failure_excerpt(*texts)
+    if not excerpt:
+        return ""
+    lowered = excerpt.lower()
+    if "openai-codex" in lowered:
+        return "openai-codex-auth"
+    return "agent-auth"
+
+
+def _is_explicit_auth_failure_excerpt(excerpt: str) -> bool:
+    if not excerpt:
+        return False
+    lowered = excerpt.lower()
+    return (
+        "no api key" in lowered
+        or "api key not found" in lowered
+        or "missing api key" in lowered
+        or "oauth refresh failed" in lowered
+        or "expired oauth credential" in lowered
+        or "credential expired" in lowered
+        or "expired credential" in lowered
+        or "authentication failed" in lowered
+        or "login failed" in lowered
+        or ("credential" in lowered and ("missing" in lowered or "failed" in lowered or "expired" in lowered))
+    )
+
+
+def _explicit_auth_failure_lines(text: str) -> list[str]:
+    lines: list[str] = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if _is_explicit_auth_failure_excerpt(line):
+            lines.append(line)
+    return lines
 
 
 def _reviewer_timeout_retrospective_signal(state: dict[str, Any], reason: str) -> dict[str, Any] | None:
@@ -5651,6 +5744,12 @@ def _follow_up_for_signal(signal: dict[str, Any]) -> dict[str, Any] | None:
             kind=kind,
             summary="Repair GitHub publisher authentication evidence before rerunning terminal publication.",
             labels=["afk:follow-up", "area:publication"],
+        )
+    if kind == "implementation-auth":
+        return _retrospective_follow_up_item(
+            kind=kind,
+            summary=_follow_up_summary_for_signal(signal, "Fix"),
+            labels=["afk:follow-up", "area:implementation"],
         )
     if kind == "reviewer-timeout":
         excerpt = string_field(signal, "excerpt") or "reviewer command timed out"
@@ -6530,11 +6629,18 @@ def _is_string_list(value: Any) -> bool:
 
 
 def _command_secret_error_message(command: list[str], *, field_name: str) -> str | None:
-    for part in command:
+    for index, part in enumerate(command):
+        stripped_part = part.strip()
         if is_secret_command_flag(part):
             flag = part.strip().split("=", 1)[0].lower()
             return f"{field_name} must not include credential flag {flag}"
-        if is_secret_value(part) or COMMAND_BEARER_SECRET_PATTERN.search(part):
+        if is_secret_value(part) or bearer_secret_present(part):
+            return f"{field_name} must not include secret-looking values"
+        if (
+            re.search(r"(?:^|[\s:])Bearer\s*$", stripped_part, re.IGNORECASE)
+            and index + 1 < len(command)
+            and is_bearer_secret_value(normalize_bearer_secret_value(command[index + 1]))
+        ):
             return f"{field_name} must not include secret-looking values"
     return None
 

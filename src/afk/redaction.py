@@ -35,6 +35,12 @@ SECRET_TOKEN_VALUE_PATTERN = re.compile(
     r"AIza[A-Za-z0-9_-]{20,}"
     r")\b"
 )
+BEARER_SECRET_PATTERN = re.compile(
+    r"(?P<prefix>\bBearer\s+)"
+    r"(?P<value>(?P<quote>(?:\\)?[\"'])?[A-Za-z0-9._~+/=-]{12,}(?(quote)(?P=quote)))",
+    re.IGNORECASE,
+)
+SAFE_BEARER_WORDS = {"unauthorized", "authorizationfailed", "missingcredential"}
 MIN_EXACT_SECRET_LENGTH = 4
 
 
@@ -134,6 +140,7 @@ def redact_text(value: str, *, exact_secrets: set[str] | None = None) -> str:
     redacted = JSON_SECRET_STRING_PATTERN.sub(redact_json_secret_string, redacted)
     redacted = SECRET_ASSIGNMENT_PATTERN.sub(redact_secret_assignment, redacted)
     redacted = SECRET_TOKEN_VALUE_PATTERN.sub("[REDACTED]", redacted)
+    redacted = BEARER_SECRET_PATTERN.sub(redact_bearer_secret, redacted)
     return redact_exact_secret_values(redacted, exact_secrets=exact_secrets)
 
 
@@ -158,6 +165,39 @@ def normalize_exact_secrets(values: set[str] | None) -> set[str]:
             continue
         normalized.add(stripped)
     return normalized
+
+
+def bearer_secret_present(value: str) -> bool:
+    return any(is_bearer_secret_value(match.group("value")) for match in BEARER_SECRET_PATTERN.finditer(value))
+
+
+def is_bearer_secret_value(value: str) -> bool:
+    normalized = normalize_bearer_secret_value(value)
+    unpadded = normalized.rstrip("=")
+    if len(unpadded) < 12:
+        return False
+    if "=" in unpadded:
+        return False
+    if unpadded.isalpha() and unpadded.islower() and unpadded in SAFE_BEARER_WORDS:
+        return False
+    return any(char.isdigit() for char in unpadded) or any(char.isupper() for char in unpadded) or any(
+        char in "./+~_-" for char in unpadded
+    ) or unpadded.isalpha()
+
+
+def normalize_bearer_secret_value(value: str) -> str:
+    normalized = value.strip()
+    if len(normalized) >= 4 and normalized[:2] == normalized[-2:] and normalized[:2] in {r"\"", r"\'"}:
+        return normalized[2:-2].strip()
+    if len(normalized) >= 2 and normalized[0] == normalized[-1] and normalized[0] in "\"'":
+        return normalized[1:-1].strip()
+    return normalized
+
+
+def redact_bearer_secret(match: re.Match[str]) -> str:
+    if not is_bearer_secret_value(match.group("value")):
+        return match.group(0)
+    return f"{match.group('prefix')}[REDACTED]"
 
 
 def redact_json_secret_string(match: re.Match[str]) -> str:

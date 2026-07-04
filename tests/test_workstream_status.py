@@ -120,6 +120,157 @@ class WorkstreamStatusMappingTest(unittest.TestCase):
                 }
             )
 
+    def test_normalize_retrospective_follow_up_config_rejects_lowercase_bearer_token_in_command(self):
+        with self.assertRaisesRegex(WorkstreamError, "secret-looking values"):
+            normalize_retrospective_follow_up_config(
+                {
+                    "enabled": True,
+                    "type": "fake-follow-up-command",
+                    "command": [
+                        "curl",
+                        "-H",
+                        "Authorization: Bearer abcdefghijklmnop",
+                        "https://example.invalid",
+                    ],
+                }
+            )
+
+    def test_normalize_retrospective_follow_up_config_rejects_lowercase_bearer_token_with_url_safe_separator_in_command(self):
+        for token in ("abcdefgh_ijkl", "abcdefgh-ijkl"):
+            with self.subTest(token=token):
+                with self.assertRaisesRegex(WorkstreamError, "secret-looking values"):
+                    normalize_retrospective_follow_up_config(
+                        {
+                            "enabled": True,
+                            "type": "fake-follow-up-command",
+                            "command": [
+                                "curl",
+                                "-H",
+                                f"Authorization: Bearer {token}",
+                                "https://example.invalid",
+                            ],
+                        }
+                    )
+
+    def test_normalize_retrospective_follow_up_config_rejects_split_bearer_token_with_url_safe_separator_in_command(self):
+        for token in ("abcdefgh_ijkl", "abcdefgh-ijkl"):
+            with self.subTest(token=token):
+                with self.assertRaisesRegex(WorkstreamError, "secret-looking values"):
+                    normalize_retrospective_follow_up_config(
+                        {
+                            "enabled": True,
+                            "type": "fake-follow-up-command",
+                            "command": [
+                                "curl",
+                                "-H",
+                                "Authorization: Bearer",
+                                token,
+                                "https://example.invalid",
+                            ],
+                        }
+                    )
+
+    def test_normalize_retrospective_follow_up_config_rejects_split_bearer_token_with_padding_in_command(self):
+        with self.assertRaisesRegex(WorkstreamError, "secret-looking values"):
+            normalize_retrospective_follow_up_config(
+                {
+                    "enabled": True,
+                    "type": "fake-follow-up-command",
+                    "command": [
+                        "curl",
+                        "-H",
+                        "Authorization: Bearer",
+                        "abcdefghijklmnop==",
+                        "https://example.invalid",
+                    ],
+                }
+            )
+
+    def test_normalize_retrospective_follow_up_config_rejects_split_quoted_bearer_token_in_command(self):
+        for token in ('"abcdefghijklmnop=="', "'abcdefghijklmnop'"):
+            with self.subTest(token=token):
+                with self.assertRaisesRegex(WorkstreamError, "secret-looking values"):
+                    normalize_retrospective_follow_up_config(
+                        {
+                            "enabled": True,
+                            "type": "fake-follow-up-command",
+                            "command": [
+                                "curl",
+                                "-H",
+                                "Authorization: Bearer",
+                                token,
+                                "https://example.invalid",
+                            ],
+                        }
+                    )
+
+    def test_normalize_retrospective_follow_up_config_rejects_backslash_escaped_quoted_bearer_token_in_command(self):
+        for token in (r"\"abcdefghijklmnop==\"", r"\'abcdefghijklmnop\'"):
+            with self.subTest(token=token):
+                with self.assertRaisesRegex(WorkstreamError, "secret-looking values"):
+                    normalize_retrospective_follow_up_config(
+                        {
+                            "enabled": True,
+                            "type": "fake-follow-up-command",
+                            "command": [
+                                "curl",
+                                "-H",
+                                f"Authorization: Bearer {token}",
+                                "https://example.invalid",
+                            ],
+                        }
+                    )
+
+    def test_normalize_retrospective_follow_up_config_allows_bearer_auth_failure_prose_in_command(self):
+        for value in ("unauthorized", "authorizationfailed", "missingcredential"):
+            with self.subTest(value=value):
+                config = normalize_retrospective_follow_up_config(
+                    {
+                        "enabled": True,
+                        "type": "fake-follow-up-command",
+                        "command": [
+                            "curl",
+                            "-H",
+                            f"Authorization: Bearer {value}",
+                            "https://example.invalid",
+                        ],
+                    }
+                )
+
+                self.assertEqual(
+                    config["command"],
+                    [
+                        "curl",
+                        "-H",
+                        f"Authorization: Bearer {value}",
+                        "https://example.invalid",
+                    ],
+                )
+
+    def test_normalize_retrospective_follow_up_config_allows_www_authenticate_bearer_parameters_in_command(self):
+        config = normalize_retrospective_follow_up_config(
+            {
+                "enabled": True,
+                "type": "fake-follow-up-command",
+                "command": [
+                    "curl",
+                    "-H",
+                    "WWW-Authenticate: Bearer authorization_uri=https://login.example/token, error=invalid_token",
+                    "https://example.invalid",
+                ],
+            }
+        )
+
+        self.assertEqual(
+            config["command"],
+            [
+                "curl",
+                "-H",
+                "WWW-Authenticate: Bearer authorization_uri=https://login.example/token, error=invalid_token",
+                "https://example.invalid",
+            ],
+        )
+
     def test_normalize_retrospective_follow_up_config_rejects_auth_env_keys(self):
         with self.assertRaisesRegex(WorkstreamError, "retrospective_follow_up.env is not supported"):
             normalize_retrospective_follow_up_config(
@@ -154,6 +305,93 @@ class WorkstreamStatusMappingTest(unittest.TestCase):
                     ],
                 }
             )
+
+    def test_normalize_retrospective_judge_rejects_lowercase_bearer_token_with_url_safe_separator_in_command(self):
+        for token in ("abcdefgh_ijkl", "abcdefgh-ijkl"):
+            with self.subTest(token=token):
+                with self.assertRaisesRegex(WorkstreamError, "secret-looking values"):
+                    normalize_retrospective_judge(
+                        {
+                            "enabled": True,
+                            "type": "fake-judge-command",
+                            "command": [
+                                "curl",
+                                "-H",
+                                f"Authorization: Bearer {token}",
+                                "https://example.invalid",
+                            ],
+                        }
+                    )
+
+    def test_normalize_retrospective_judge_rejects_split_bearer_token_with_url_safe_separator_in_command(self):
+        for token in ("abcdefgh_ijkl", "abcdefgh-ijkl"):
+            with self.subTest(token=token):
+                with self.assertRaisesRegex(WorkstreamError, "secret-looking values"):
+                    normalize_retrospective_judge(
+                        {
+                            "enabled": True,
+                            "type": "fake-judge-command",
+                            "command": [
+                                "curl",
+                                "-H",
+                                "Authorization: Bearer",
+                                token,
+                                "https://example.invalid",
+                            ],
+                        }
+                    )
+
+    def test_normalize_retrospective_judge_rejects_split_bearer_token_with_padding_in_command(self):
+        with self.assertRaisesRegex(WorkstreamError, "secret-looking values"):
+            normalize_retrospective_judge(
+                {
+                    "enabled": True,
+                    "type": "fake-judge-command",
+                    "command": [
+                        "curl",
+                        "-H",
+                        "Authorization: Bearer",
+                        "abcdefghijklmnop==",
+                        "https://example.invalid",
+                    ],
+                }
+            )
+
+    def test_normalize_retrospective_judge_rejects_split_quoted_bearer_token_in_command(self):
+        for token in ('"abcdefghijklmnop=="', "'abcdefghijklmnop'"):
+            with self.subTest(token=token):
+                with self.assertRaisesRegex(WorkstreamError, "secret-looking values"):
+                    normalize_retrospective_judge(
+                        {
+                            "enabled": True,
+                            "type": "fake-judge-command",
+                            "command": [
+                                "curl",
+                                "-H",
+                                "Authorization: Bearer",
+                                token,
+                                "https://example.invalid",
+                            ],
+                        }
+                    )
+
+    def test_normalize_retrospective_judge_rejects_split_backslash_escaped_quoted_bearer_token_in_command(self):
+        for token in (r"\"abcdefghijklmnop==\"", r"\'abcdefghijklmnop\'"):
+            with self.subTest(token=token):
+                with self.assertRaisesRegex(WorkstreamError, "secret-looking values"):
+                    normalize_retrospective_judge(
+                        {
+                            "enabled": True,
+                            "type": "fake-judge-command",
+                            "command": [
+                                "curl",
+                                "-H",
+                                "Authorization: Bearer",
+                                token,
+                                "https://example.invalid",
+                            ],
+                        }
+                    )
 
     def test_normalize_retrospective_judge_rejects_non_pi_mounts_without_checkout_path(self):
         with self.subTest("existing absolute paths"), self.assertRaisesRegex(
@@ -1184,6 +1422,114 @@ class WorkstreamStatusMappingTest(unittest.TestCase):
         self.assertEqual(record["signals"][0]["kind"], "retry-or-blocked")
         self.assertEqual(record["signals"][0]["severity"], "error")
         self.assertIn("required final validation evidence is missing", record["signals"][0]["summary"])
+
+    def test_pipeline_retrospective_record_redacts_lowercase_bearer_token_in_implementation_auth_signal(self):
+        state = retrospective_state()
+        state["implementation"]["summary"] = "implement did not reach implemented: failed_runtime"
+        state["implementation"]["agent_result"] = {
+            "evidence": {
+                "stderr_excerpt": "Authentication failed: Bearer abcdefghijklmnop",
+                "stdout_excerpt": "",
+            }
+        }
+
+        record = pipeline_retrospective_record(
+            state,
+            {"status": "blocked", "reason": "implement did not reach implemented: failed_runtime"},
+            retrospective_tracker("selected"),
+        )
+
+        self.assertEqual(record["signals"][0]["kind"], "implementation-auth")
+        self.assertEqual(record["signals"][0]["summary"], "Authentication failed: Bearer [REDACTED]")
+        self.assertEqual(record["signals"][0]["excerpt"], "Authentication failed: Bearer [REDACTED]")
+
+    def test_pipeline_retrospective_record_redacts_lowercase_bearer_token_with_url_safe_separator_in_implementation_auth_signal(self):
+        for token in ("abcdefgh_ijkl", "abcdefgh-ijkl"):
+            with self.subTest(token=token):
+                state = retrospective_state()
+                state["implementation"]["summary"] = "implement did not reach implemented: failed_runtime"
+                state["implementation"]["agent_result"] = {
+                    "evidence": {
+                        "stderr_excerpt": f"Authentication failed: Bearer {token}",
+                        "stdout_excerpt": "",
+                    }
+                }
+
+                record = pipeline_retrospective_record(
+                    state,
+                    {"status": "blocked", "reason": "implement did not reach implemented: failed_runtime"},
+                    retrospective_tracker("selected"),
+                )
+
+                self.assertEqual(record["signals"][0]["kind"], "implementation-auth")
+                self.assertEqual(record["signals"][0]["summary"], "Authentication failed: Bearer [REDACTED]")
+                self.assertEqual(record["signals"][0]["excerpt"], "Authentication failed: Bearer [REDACTED]")
+
+    def test_pipeline_retrospective_record_redacts_quoted_bearer_token_in_implementation_auth_signal(self):
+        for token in ('"abcdefghijklmnop=="', "'abcdefghijklmnop'"):
+            with self.subTest(token=token):
+                state = retrospective_state()
+                state["implementation"]["summary"] = "implement did not reach implemented: failed_runtime"
+                state["implementation"]["agent_result"] = {
+                    "evidence": {
+                        "stderr_excerpt": f'Authentication failed: Bearer {token}',
+                        "stdout_excerpt": "",
+                    }
+                }
+
+                record = pipeline_retrospective_record(
+                    state,
+                    {"status": "blocked", "reason": "implement did not reach implemented: failed_runtime"},
+                    retrospective_tracker("selected"),
+                )
+
+                self.assertEqual(record["signals"][0]["kind"], "implementation-auth")
+                self.assertEqual(record["signals"][0]["summary"], "Authentication failed: Bearer [REDACTED]")
+                self.assertEqual(record["signals"][0]["excerpt"], "Authentication failed: Bearer [REDACTED]")
+
+    def test_pipeline_retrospective_record_redacts_backslash_escaped_quoted_bearer_token_in_implementation_auth_signal(self):
+        for token in (r"\"abcdefghijklmnop==\"", r"\'abcdefghijklmnop\'"):
+            with self.subTest(token=token):
+                state = retrospective_state()
+                state["implementation"]["summary"] = "implement did not reach implemented: failed_runtime"
+                state["implementation"]["agent_result"] = {
+                    "evidence": {
+                        "stderr_excerpt": f"Authentication failed: Bearer {token}",
+                        "stdout_excerpt": "",
+                    }
+                }
+
+                record = pipeline_retrospective_record(
+                    state,
+                    {"status": "blocked", "reason": "implement did not reach implemented: failed_runtime"},
+                    retrospective_tracker("selected"),
+                )
+
+                self.assertEqual(record["signals"][0]["kind"], "implementation-auth")
+                self.assertEqual(record["signals"][0]["summary"], "Authentication failed: Bearer [REDACTED]")
+                self.assertEqual(record["signals"][0]["excerpt"], "Authentication failed: Bearer [REDACTED]")
+
+    def test_pipeline_retrospective_record_preserves_bearer_auth_failure_prose(self):
+        for value in ("authorizationfailed", "missingcredential"):
+            with self.subTest(value=value):
+                state = retrospective_state()
+                state["implementation"]["summary"] = "implement did not reach implemented: failed_runtime"
+                state["implementation"]["agent_result"] = {
+                    "evidence": {
+                        "stderr_excerpt": f"Authentication failed: Bearer {value}",
+                        "stdout_excerpt": "",
+                    }
+                }
+
+                record = pipeline_retrospective_record(
+                    state,
+                    {"status": "blocked", "reason": "implement did not reach implemented: failed_runtime"},
+                    retrospective_tracker("selected"),
+                )
+
+                self.assertEqual(record["signals"][0]["kind"], "implementation-auth")
+                self.assertEqual(record["signals"][0]["summary"], f"Authentication failed: Bearer {value}")
+                self.assertEqual(record["signals"][0]["excerpt"], f"Authentication failed: Bearer {value}")
 
     def test_pipeline_retrospective_record_turns_dirty_checkout_block_into_cleanup_follow_up(self):
         state = retrospective_state()
