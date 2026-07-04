@@ -3754,6 +3754,7 @@ def tracker_record(
     publication: dict[str, Any],
 ) -> dict[str, Any]:
     decision = effective_tracker_terminal_decision(normalized, publication)
+    recorded_terminal_decision = recorded_tracker_terminal_decision(normalized, publication)
     decision_pr_url = redact_text(decision.get("pr_url") or "")
     decision_review_feedback_status = terminal_review_feedback_status(decision)
     review_cycles = effective_review_cycles(normalized, state)
@@ -3774,7 +3775,7 @@ def tracker_record(
         "review_findings": tracker_review_findings(review),
         "review_cycles": redact_review_cycles(review_cycles),
         "retrospective": redact_retrospective(effective_retrospective(normalized, publication)),
-        "terminal_decision": redact_artifact_value(decision),
+        "terminal_decision": redact_artifact_value(recorded_terminal_decision),
     }
     decision_status = decision.get("status")
     if decision_status == "merged":
@@ -3896,6 +3897,13 @@ def tracker_record(
 
 def effective_tracker_terminal_decision(normalized: dict[str, Any], publication: dict[str, Any]) -> dict[str, str]:
     return runtime_terminal_decision(publication.get("terminal_decision"))
+
+
+def recorded_tracker_terminal_decision(normalized: dict[str, Any], publication: dict[str, Any]) -> dict[str, str]:
+    publication_decision = runtime_terminal_decision(publication.get("terminal_decision"))
+    if publication_decision.get("status"):
+        return publication_decision
+    return runtime_terminal_decision(normalized.get("tracker", {}).get("terminal_decision"))
 
 
 def publication_tracker_close_failed(publication: dict[str, Any]) -> bool:

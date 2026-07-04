@@ -2840,6 +2840,91 @@ sys.exit(0)
             self.assertEqual(result["tracker"]["status"], "awaiting-review")
             self.assertFalse(result["tracker"]["close_source_item"])
 
+    def test_workstream_create_mode_preserves_configured_terminal_decision_metadata_without_closing(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repo = temp_path / "repo-src"
+            checkout = temp_path / "checkout"
+            ledger = temp_path / "ledger"
+            fake_calls = temp_path / "fake-calls.jsonl"
+            init_repo(repo)
+            fake_git = temp_path / "publisher-git"
+            fake_gh = temp_path / "publisher-gh"
+            write_executable(
+                fake_git,
+                f"""#!{sys.executable}
+import json
+import sys
+from pathlib import Path
+Path({str(fake_calls)!r}).open("a", encoding="utf-8").write(json.dumps({{"tool": "git", "argv": sys.argv[1:]}}) + "\\n")
+sys.exit(0)
+""",
+            )
+            write_executable(
+                fake_gh,
+                f"""#!{sys.executable}
+import json
+import sys
+from pathlib import Path
+Path({str(fake_calls)!r}).open("a", encoding="utf-8").write(json.dumps({{"tool": "gh", "argv": sys.argv[1:]}}) + "\\n")
+if sys.argv[1:4] == ["auth", "status", "--hostname"]:
+    sys.exit(0)
+print("https://github.example/pr/123")
+sys.exit(0)
+""",
+            )
+            recipe = successful_recipe(temp_path, repo, checkout, fake_git, fake_gh)
+            recipe["tracker"] = {
+                "terminal_decision": {
+                    "status": "no-merge",
+                    "reason": "Hand off to external closer",
+                    "pr_url": "https://github.example/pr/123",
+                }
+            }
+
+            completed = run_afk(
+                "run-workstream",
+                "--workstream-id",
+                "central-lve.9",
+                "--input",
+                json.dumps(recipe),
+                "--ledger",
+                str(ledger),
+                env_overrides={
+                    "GIT_ALLOW_PROTOCOL": "file",
+                    "GIT_AUTHOR_NAME": "AFK Test",
+                    "GIT_AUTHOR_EMAIL": "afk-test@example.test",
+                    "GIT_COMMITTER_NAME": "AFK Test",
+                    "GIT_COMMITTER_EMAIL": "afk-test@example.test",
+                },
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            result_path = ledger / summary["result_path"]
+            result = json.loads(result_path.read_text(encoding="utf-8"))
+            tracker = json.loads((result_path.parent / "tracker-result.json").read_text(encoding="utf-8"))
+            expected_decision = {
+                "status": "no-merge",
+                "merge_commit": "",
+                "reason": "Hand off to external closer",
+                "pr_url": "https://github.example/pr/123",
+                "review_feedback_status": "",
+            }
+
+            self.assertEqual(summary["status"], "published")
+            self.assertEqual(result["publication"]["status"], "published")
+            self.assertEqual(result["tracker"]["terminal_decision"], expected_decision)
+            self.assertEqual(tracker["terminal_decision"], expected_decision)
+            self.assertFalse(result["tracker"]["close_source_item"])
+            self.assertFalse(tracker["close_source_item"])
+            self.assertEqual(result["tracker"]["close_reason"], "")
+            self.assertEqual(tracker["close_reason"], "")
+
+            calls = [json.loads(line) for line in fake_calls.read_text(encoding="utf-8").splitlines()]
+            self.assertFalse(any(call["argv"][:2] == ["pr", "merge"] for call in calls if call["tool"] == "gh"))
+            self.assertFalse(any(call["argv"][:2] == ["issue", "close"] for call in calls if call["tool"] == "gh"))
+
     def test_workstream_rejects_terminal_decision_without_pr_url(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
