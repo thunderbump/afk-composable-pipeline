@@ -145,7 +145,7 @@ normalized to `passed`, `failed`, or `request_revision`. The step refuses to
 pass before invoking the reviewer when any required final validation artifact is
 missing, skipped, failed, malformed, or otherwise not `validated`.
 
-Run a shared-branch workstream recipe and terminal PR publisher:
+Run a shared-branch workstream recipe and publish a PR:
 
 ```sh
 PYTHONPATH=src python3 -m afk run-workstream \
@@ -177,10 +177,7 @@ The recipe schema is intentionally small:
   findings are appended to `review_cycles` with response evidence, while
   pipeline/tool-only findings stay out of target-code repair and are recorded as
   pipeline follow-up evidence on the review cycle response.
-- `review_cycles` is optional while a PR is still open, but terminal tracker
-  close guidance requires recorded review-cycle evidence unless the terminal
-  decision explicitly documents a waiver with
-  `review_feedback_status: "waived"`. Each cycle records reviewer roles such as
+- `review_cycles` is optional while a PR is still open. Each cycle records reviewer roles such as
   `correctness` and `bug-risk`, review status, summary, optional PR comment
   URL, whether a response is required, and optional response evidence.
   Accepted cycle/review statuses are `passed`, `findings-open`,
@@ -188,7 +185,7 @@ The recipe schema is intentionally small:
   `status: "addressed"` or `status: "findings-addressed"`; a non-empty
   response string is also accepted as freeform addressed evidence. Repeated
   cycles are preserved so findings from earlier passes are not overwritten.
-- `retrospective` is optional terminal evidence for a merged or explicit
+- `retrospective` is optional external terminal evidence for a merged or explicit
   `no-merge` tracker decision. It carries a concise summary plus optional
   `changes`, `validation`, `review`, `unresolved_risks`, and
   `process_findings` string lists, optional `follow_up.recommended` /
@@ -202,18 +199,9 @@ The recipe schema is intentionally small:
   self-improvement worker or Beads creation should run as an external concern
   against the emitted retrospective evidence instead of inside
   `run-workstream`.
-- `tracker.terminal_decision` is optional. Leave it unset while a PR is open or
-  under review. Set `{"status":"merged","merge_commit":"<sha>","pr_url":"<url>"}`
-  only after the PR merges, or
-  `{"status":"no-merge","reason":"<why>","pr_url":"<url>"}` when the branch is
-  intentionally not going to merge and the source Beads item should close with
-  that reason. `pr_url` is required for merged/no-merge terminal decisions. When
-  no `review_cycles` have been recorded, set
-  `review_feedback_status: "waived"` to document the explicit waiver before AFK
-  will emit close guidance. When recorded `review_cycles` still contain
-  response-required findings, add `review_feedback_status: "resolved"` or
-  `"waived"` before AFK will emit close guidance for a terminal merge/no-merge
-  decision.
+- `tracker.terminal_decision` is optional metadata for a future external closer
+  or retrospective worker. `run-workstream` does not merge/close PRs or close
+  source tracker items on the minimal path.
 - `steps` is an ordered list of existing step names: `select-work`,
   `prepare-checkout`, `implement`, `validate`, and `review`. Each step has an
   explicit `input` object, plus optional `profile` for `validate`.
@@ -221,20 +209,16 @@ The recipe schema is intentionally small:
   into `implement`, checkout and profile into `validate`, and work item,
   checkout, implementation, final validation artifacts, and cleanup into
   `review`.
-- `publisher` supports `mode: "create"` with `gh pr create`, `mode: "update"`
-  with `gh pr edit`, or `mode: "close"` for an already-published PR. Close mode
-  requires `publisher.pr`, verifies the published PR state with `gh pr view`,
-  merges it with `gh pr merge` only when the PR is open, non-draft, and
-  `mergeStateStatus == "CLEAN"`, records a runtime terminal decision, closes the
-  selected Beads or GitHub issue source item, and then lets the retrospective
-  pass run against the closed state. If `gh pr edit` fails on the GitHub
+- `publisher` supports `mode: "create"` with `gh pr create` or `mode: "update"`
+  with `gh pr edit`. If `gh pr edit` fails on the GitHub
   Projects classic GraphQL deprecation path, AFK falls back to
   `gh api --method PATCH repos/<owner>/<repo>/pulls/<number> --input <json>`.
   `git.path`/`gh.path` may point at fake command shims for offline tests.
   `git.push: true` pushes `HEAD` to the configured PR head before invoking `gh`
-  in create/update mode.
-- AFK always runs `gh auth status --hostname github.com` before any `git push`,
-  `gh pr create/edit`, or `gh pr view/merge` close-mode attempt. Publisher auth
+  in create/update mode. Terminal merge/close automation belongs to a separate
+  future worker if it is still needed.
+- AFK always runs `gh auth status --hostname github.com` before any `git push`
+  or `gh pr create/edit` attempt. Publisher auth
   stays on the minimal scrubbed environment by default, so missing GitHub auth
   blocks publication before push with terminal evidence and retry instructions.
   To publish a real GitHub PR deliberately, mount a GitHub CLI config directory
@@ -899,13 +883,11 @@ terminal PR publication status, and tracker-close guidance. Dirty retry
 checkouts are surfaced through `cleanup.resources` with path, branch, commit,
 and status so failed retry attempts stay visible without spawning more sibling
 checkouts.
-`publication-result.json` records one of six explicit terminal states:
-`blocked`, `validated-unpublished`, `failed-needs-human`, `published`,
-`tracker-close-blocked`, or `tracker-closed`.
+`publication-result.json` records one of four explicit terminal states:
+`blocked`, `validated-unpublished`, `failed-needs-human`, or `published`.
 `tracker-result.json` records whether the source Beads item stays open, whether
-it is ready to close, the PR URL when one was opened, any carried-forward review
-findings, and the merge commit or explicit no-merge close reason when one is
-recorded.
+it is still open, the PR URL when one was opened, any carried-forward review
+findings, and any externally supplied terminal metadata when one is recorded.
 `pipeline-retrospective.json` records deterministic pipeline feedback for every
 completed workstream run. It summarizes retrospective health, publication and
 tracker status, derived signals, and recommended follow-up without changing the
@@ -925,13 +907,10 @@ retrospective evidence separately from the derived pipeline retrospective.
 cycle findings keep the tracker state at `review-findings-open` until the
 relevant review record carries addressed evidence. Once review cycle evidence is
 present and all response-required findings are addressed, the tracker state
-advances to `review-feedback-addressed` and still keeps the source item open
-until merge or no-merge. AFK only treats a response object as addressed when
-its `status` is `addressed` or `findings-addressed`; a non-empty response
-string is the freeform addressed evidence path. Terminal merge/no-merge close
-guidance is blocked when no review-cycle evidence is recorded unless
-`tracker.terminal_decision.review_feedback_status` is explicitly set to
-`waived`.
+advances to `review-feedback-addressed` and still keeps the source item open.
+AFK only treats a response object as addressed when its `status` is `addressed`
+or `findings-addressed`; a non-empty response string is the freeform addressed
+evidence path.
 `retrospective` evidence, when supplied, is also included in both
 `workstream-result.json` and `tracker-result.json`, while
 `pipeline_retrospective` is always included in `workstream-result.json`. Use
@@ -954,15 +933,8 @@ workstream runs.
 `validated-unpublished` means the current HEAD is terminally validated but AFK
 did not publish a PR in that run; only the subset with a passed final review is
 immediately eligible for PR publication on a follow-up rerun.
-`published` means the PR exists but the source Beads item is still
-`awaiting-review`; it stays open until the PR merges or
-`tracker.terminal_decision.status == "no-merge"` is recorded.
-`tracker-close-blocked` means a terminal merge/no-merge decision was recorded,
-but AFK still needs either recorded review-cycle evidence or an explicit waiver,
-or unresolved review feedback still requires `review_feedback_status:
-"resolved"` or `"waived"` before AFK can close the source item.
-`tracker-closed` means a terminal merge or no-merge decision was recorded, so
-AFK skipped publisher commands and emitted tracker close guidance instead.
+`published` means the PR exists and the source Beads item is still
+`awaiting-review`; the minimal runtime stops there.
 `pr-body.md` is written before terminal PR commands run, so fake/offline
 publisher tests can inspect the exact body.
 

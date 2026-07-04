@@ -298,7 +298,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     run_workstream_parser = subcommands.add_parser(
         "run-workstream",
-        help="Run a declarative workstream recipe and terminal PR publisher",
+        help="Run a declarative workstream recipe and publish or update a PR",
     )
     run_workstream_parser.add_argument("--input", required=True, help="JSON workstream recipe")
     run_workstream_parser.add_argument("--ledger", help="Ledger output directory")
