@@ -36,6 +36,7 @@ SECRET_TOKEN_VALUE_PATTERN = re.compile(
     r")\b"
 )
 BEARER_SECRET_PATTERN = re.compile(r"(?P<prefix>\bBearer\s+)(?P<value>[A-Za-z0-9._~+/=-]{12,})", re.IGNORECASE)
+SAFE_BEARER_WORDS = {"unauthorized"}
 MIN_EXACT_SECRET_LENGTH = 4
 
 
@@ -171,11 +172,11 @@ def is_bearer_secret_value(value: str) -> bool:
         return False
     if "=" in value.rstrip("="):
         return False
-    if value.isalpha() and value.islower():
+    if value.isalpha() and value.islower() and value in SAFE_BEARER_WORDS:
         return False
     return any(char.isdigit() for char in value) or any(char.isupper() for char in value) or any(
         char in "./+~" for char in value
-    )
+    ) or value.isalpha()
 
 
 def redact_bearer_secret(match: re.Match[str]) -> str:
