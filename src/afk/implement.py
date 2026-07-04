@@ -153,22 +153,6 @@ def implement(
     )
     if agent_payload["status"] != "valid":
         after_metadata = safe_git_metadata(checkout_path, request["checkout"]["start_commit"])
-        recovered = recover_missing_real_agent_payload(
-            request["agent"],
-            agent_payload,
-            after_metadata,
-            adapter=adapter_metadata(
-                request["agent"]["type"],
-                returncode=adapter_result["returncode"],
-                timed_out=adapter_result.get("timed_out", False),
-                configured_timeout_seconds=adapter_result.get("configured_timeout_seconds"),
-                elapsed_seconds=adapter_result.get("elapsed_seconds"),
-            ),
-            stdout=stdout,
-            stderr=stderr,
-        )
-        if recovered is not None:
-            return implement_output(capsule, recovered, after_metadata)
         normalized = normalized_agent_result(
             status="failed_protocol",
             classification="protocol_failure",
@@ -1129,90 +1113,6 @@ def normalize_agent_payload(
         adapter=adapter,
         stdout=stdout,
         stderr=stderr,
-    )
-
-
-def recover_missing_real_agent_payload(
-    agent: dict[str, Any],
-    payload_status: dict[str, Any],
-    metadata: dict[str, Any],
-    *,
-    adapter: dict[str, Any],
-    stdout: str,
-    stderr: str,
-) -> dict[str, Any] | None:
-    if agent.get("type") != "real-agent-command":
-        return None
-    if payload_status.get("message") != "agent result file was not produced":
-        return None
-    if not stdout.strip():
-        return None
-    if not stdout_has_recovery_success_signal(stdout):
-        return None
-    if metadata.get("metadata_status") == "failed" or metadata.get("dirty"):
-        return None
-    if metadata.get("before_commit") == metadata.get("after_commit") or not metadata.get("commits"):
-        return None
-    return normalized_agent_result(
-        status="implemented",
-        classification="success",
-        summary=stdout_summary(stdout),
-        notes=["agent-result.json missing; recovered implemented result from stdout and clean git commit"],
-        failures=[],
-        adapter=adapter,
-        stdout=stdout,
-        stderr=stderr,
-    )
-
-
-def stdout_summary(stdout: str) -> str:
-    for raw_line in stdout.splitlines():
-        stripped = raw_line.strip()
-        if stripped and not stdout_summary_is_git_chatter(raw_line):
-            return stripped
-    return "implemented"
-
-
-def stdout_summary_is_git_chatter(line: str) -> bool:
-    stripped = line.strip()
-    return (
-        bool(re.match(r"^\[[^\]]+ [0-9a-f]{7,}\] ", stripped))
-        or line.startswith(" ")
-        or " file changed" in stripped
-        or " files changed" in stripped
-        or stripped.startswith("create mode ")
-        or stripped.startswith("delete mode ")
-        or stripped.startswith("On branch ")
-        or stripped.startswith("Your branch is ")
-    )
-
-
-def stdout_has_recovery_success_signal(stdout: str) -> bool:
-    informative_lines = [
-        line.strip()
-        for line in stdout.splitlines()
-        if line.strip() and not stdout_summary_is_git_chatter(line)
-    ]
-    lowered_lines = [line.lower() for line in informative_lines]
-    if any(stdout_line_reports_failure(line) for line in lowered_lines):
-        return False
-    return any(stdout_line_reports_success(line) for line in lowered_lines)
-
-
-def stdout_line_reports_failure(line: str) -> bool:
-    return bool(
-        re.search(r"\b(error|exception|traceback)\b", line)
-        or re.search(r"\b(failed|failure)\b", line)
-        and not re.search(r"\b0\s+failed\b", line)
-    )
-
-
-def stdout_line_reports_success(line: str) -> bool:
-    return bool(
-        re.match(r"^(implemented|completed|code updated)\b", line)
-        or re.match(r"^(done|all changes committed)\b", line)
-        or re.search(r'"result"\s*:\s*"code updated"', line)
-        or re.search(r'"status"\s*:\s*"completed"', line)
     )
 
 

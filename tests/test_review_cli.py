@@ -1042,7 +1042,7 @@ Path(os.environ["AFK_REVIEWER_RESULT"]).write_text(
             self.assertEqual(result["status"], "failed")
             self.assertEqual(result["output"]["status"], "failed_protocol")
 
-    def test_review_accepts_reviewer_json_from_stdout_when_result_file_is_absent(self):
+    def test_review_requires_result_file_when_reviewer_stdout_json_is_present(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
             checkout = temp_path / "checkout"
@@ -1097,16 +1097,16 @@ Path(os.environ["AFK_REVIEWER_RESULT"]).write_text(
             result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
             reviewer_result = json.loads((run_dir / "reviewer-result.json").read_text(encoding="utf-8"))
 
-            self.assertEqual(summary["status"], "succeeded")
-            self.assertEqual(result["status"], "succeeded")
-            self.assertEqual(result["output"]["status"], "request_revision")
-            self.assertEqual(result["output"]["classification"], "review_revision_requested")
-            self.assertEqual(reviewer_result["result"]["status"], "request_revision")
-            self.assertEqual(reviewer_result["result"]["findings"][0]["title"], "Need another validation pass")
-            self.assertEqual(reviewer_result["result"]["evidence"]["result_source"], "stdout_fallback")
+            self.assertEqual(summary["status"], "failed")
+            self.assertEqual(result["status"], "failed")
+            self.assertEqual(result["output"]["status"], "failed_protocol")
+            self.assertEqual(result["output"]["classification"], "protocol_failure")
+            self.assertEqual(result["output"]["summary"], "reviewer result file was not produced")
+            self.assertEqual(reviewer_result["result"]["status"], "failed_protocol")
+            self.assertEqual(reviewer_result["result"]["evidence"]["result_source"], "reviewer_result_file")
             self.assertEqual(reviewer_result["result"]["evidence"]["result_file_present"], False)
 
-    def test_review_accepts_bare_reviewer_stdout_json_when_result_file_is_absent(self):
+    def test_review_requires_result_file_when_bare_stdout_json_is_present(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
             checkout = temp_path / "checkout"
@@ -1160,14 +1160,13 @@ Path(os.environ["AFK_REVIEWER_RESULT"]).write_text(
             result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
             reviewer_result = json.loads((run_dir / "reviewer-result.json").read_text(encoding="utf-8"))
 
-            self.assertEqual(summary["status"], "succeeded")
-            self.assertEqual(result["status"], "succeeded")
-            self.assertEqual(result["output"]["status"], "request_revision")
-            self.assertEqual(result["output"]["classification"], "review_revision_requested")
-            self.assertEqual(result["output"]["summary"], "stdout requested changes")
-            self.assertEqual(reviewer_result["result"]["status"], "request_revision")
-            self.assertEqual(reviewer_result["result"]["findings"][0]["title"], "Need another validation pass")
-            self.assertEqual(reviewer_result["result"]["evidence"]["result_source"], "stdout_fallback")
+            self.assertEqual(summary["status"], "failed")
+            self.assertEqual(result["status"], "failed")
+            self.assertEqual(result["output"]["status"], "failed_protocol")
+            self.assertEqual(result["output"]["classification"], "protocol_failure")
+            self.assertEqual(result["output"]["summary"], "reviewer result file was not produced")
+            self.assertEqual(reviewer_result["result"]["status"], "failed_protocol")
+            self.assertEqual(reviewer_result["result"]["evidence"]["result_source"], "reviewer_result_file")
             self.assertEqual(reviewer_result["result"]["evidence"]["result_file_present"], False)
 
     def test_review_records_real_reviewer_adapter_type_for_pi_like_reviewers(self):
@@ -1211,10 +1210,10 @@ Path(os.environ["AFK_REVIEWER_RESULT"]).write_text(
             result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
             reviewer_result = json.loads((run_dir / "reviewer-result.json").read_text(encoding="utf-8"))
 
-            self.assertEqual(summary["status"], "succeeded")
-            self.assertEqual(result["output"]["status"], "passed")
+            self.assertEqual(summary["status"], "failed")
+            self.assertEqual(result["output"]["status"], "failed_protocol")
             self.assertEqual(reviewer_result["result"]["adapter"]["type"], "real-reviewer-command")
-            self.assertEqual(reviewer_result["result"]["evidence"]["result_source"], "stdout_fallback")
+            self.assertEqual(reviewer_result["result"]["evidence"]["result_source"], "reviewer_result_file")
             self.assertEqual(reviewer_result["result"]["evidence"]["result_file_present"], False)
 
     def test_review_rejects_status_only_stdout_json_when_result_file_is_absent(self):
@@ -1261,8 +1260,8 @@ Path(os.environ["AFK_REVIEWER_RESULT"]).write_text(
             self.assertEqual(result["status"], "failed")
             self.assertEqual(result["output"]["status"], "failed_protocol")
             self.assertEqual(result["output"]["classification"], "protocol_failure")
-            self.assertEqual(result["output"]["summary"], "reviewer stdout JSON must match the reviewer result schema")
-            self.assertEqual(reviewer_result["result"]["evidence"]["result_source"], "stdout_fallback")
+            self.assertEqual(result["output"]["summary"], "reviewer result file was not produced")
+            self.assertEqual(reviewer_result["result"]["evidence"]["result_source"], "reviewer_result_file")
             self.assertEqual(reviewer_result["result"]["evidence"]["result_file_present"], False)
 
     def test_review_rejects_stdout_json_when_findings_is_not_a_list(self):
@@ -1309,8 +1308,8 @@ Path(os.environ["AFK_REVIEWER_RESULT"]).write_text(
             self.assertEqual(result["status"], "failed")
             self.assertEqual(result["output"]["status"], "failed_protocol")
             self.assertEqual(result["output"]["classification"], "protocol_failure")
-            self.assertEqual(result["output"]["summary"], "reviewer stdout JSON must match the reviewer result schema")
-            self.assertEqual(reviewer_result["result"]["evidence"]["result_source"], "stdout_fallback")
+            self.assertEqual(result["output"]["summary"], "reviewer result file was not produced")
+            self.assertEqual(reviewer_result["result"]["evidence"]["result_source"], "reviewer_result_file")
             self.assertEqual(reviewer_result["result"]["evidence"]["result_file_present"], False)
 
     def test_review_rejects_generic_stdout_json_when_result_file_is_absent(self):
@@ -1359,9 +1358,9 @@ Path(os.environ["AFK_REVIEWER_RESULT"]).write_text(
             self.assertEqual(result["output"]["classification"], "protocol_failure")
             self.assertEqual(
                 result["output"]["summary"],
-                "reviewer stdout JSON must match the reviewer result schema",
+                "reviewer result file was not produced",
             )
-            self.assertEqual(reviewer_result["result"]["evidence"]["result_source"], "stdout_fallback")
+            self.assertEqual(reviewer_result["result"]["evidence"]["result_source"], "reviewer_result_file")
             self.assertEqual(reviewer_result["result"]["evidence"]["result_file_present"], False)
 
     def test_review_reports_malformed_stdout_when_result_file_is_absent(self):
@@ -1406,8 +1405,8 @@ Path(os.environ["AFK_REVIEWER_RESULT"]).write_text(
             self.assertEqual(result["status"], "failed")
             self.assertEqual(result["output"]["status"], "failed_protocol")
             self.assertEqual(result["output"]["classification"], "protocol_failure")
-            self.assertEqual(result["output"]["summary"], "reviewer stdout is not valid JSON")
-            self.assertEqual(reviewer_result["result"]["evidence"]["result_source"], "stdout_fallback")
+            self.assertEqual(result["output"]["summary"], "reviewer result file was not produced")
+            self.assertEqual(reviewer_result["result"]["evidence"]["result_source"], "reviewer_result_file")
             self.assertEqual(reviewer_result["result"]["evidence"]["result_file_present"], False)
             self.assertIn("reviewer: starting up", reviewer_result["result"]["evidence"]["stdout_excerpt"])
 
@@ -1455,7 +1454,7 @@ Path(os.environ["AFK_REVIEWER_RESULT"]).write_text(
             self.assertEqual(result["output"]["classification"], "protocol_failure")
             self.assertEqual(result["output"]["summary"], "reviewer result file was not produced")
             self.assertEqual(reviewer_result["result"]["summary"], "reviewer result file was not produced")
-            self.assertEqual(reviewer_result["result"]["evidence"]["result_source"], "stdout_fallback")
+            self.assertEqual(reviewer_result["result"]["evidence"]["result_source"], "reviewer_result_file")
             self.assertEqual(reviewer_result["result"]["evidence"]["result_file_present"], False)
 
     def test_review_prefers_valid_result_file_over_noisy_stdout(self):
