@@ -6663,7 +6663,9 @@ def review_gate_entry(review: Any) -> dict[str, Any] | None:
 
 
 def pr_body_validation_line(validation: dict[str, Any], index: int) -> str:
-    return pr_body_value(evidence_gate.validation_summary_line(validation_gate_entry(validation), index))
+    gate_entry = validation_gate_entry(validation)
+    gate_entry["name"] = validation_name_for_body(validation, index)
+    return pr_body_value(evidence_gate.validation_summary_line(gate_entry, index))
 
 
 def validation_name_for_body(validation: dict[str, Any], index: int) -> str:
