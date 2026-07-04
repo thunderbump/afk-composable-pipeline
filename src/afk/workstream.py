@@ -5199,10 +5199,11 @@ def _implementation_auth_retrospective_signal(state: dict[str, Any], reason: str
     evidence = agent_result.get("evidence") if isinstance(agent_result.get("evidence"), dict) else {}
     stderr_excerpt = string_field(evidence, "stderr_excerpt") or ""
     stdout_excerpt = string_field(evidence, "stdout_excerpt") or ""
+    auth_excerpt = _implementation_auth_failure_excerpt(summary, stderr_excerpt, stdout_excerpt)
     classification = _implementation_auth_failure_classification(summary, stderr_excerpt, stdout_excerpt)
     if not classification:
         return None
-    excerpt = runtime_failure_excerpt(stderr_excerpt) or runtime_failure_excerpt(stdout_excerpt) or summary
+    excerpt = auth_excerpt or runtime_failure_excerpt(stderr_excerpt) or runtime_failure_excerpt(stdout_excerpt) or summary
     implementation_result_path = string_field(state, "implementation_result_path") or ""
     agent_result_path = str(Path(implementation_result_path).with_name("agent-result.json")) if implementation_result_path else ""
     return {
@@ -5220,18 +5221,32 @@ def _implementation_auth_retrospective_signal(state: dict[str, Any], reason: str
     }
 
 
-def _implementation_auth_failure_classification(*texts: str) -> str:
-    excerpt = ""
+def _implementation_auth_failure_excerpt(*texts: str) -> str:
     for text in texts[1:]:
         excerpt = runtime_failure_excerpt(text)
-        if excerpt:
-            break
-    if not excerpt:
-        excerpt = next((text for text in texts if text), "")
+        if _is_explicit_auth_failure_excerpt(excerpt):
+            return excerpt
+    for text in texts:
+        if _is_explicit_auth_failure_excerpt(text):
+            return text
+    return ""
+
+
+def _implementation_auth_failure_classification(*texts: str) -> str:
+    excerpt = _implementation_auth_failure_excerpt(*texts)
     if not excerpt:
         return ""
     lowered = excerpt.lower()
-    explicit_auth_failure = (
+    if "openai-codex" in lowered:
+        return "openai-codex-auth"
+    return "agent-auth"
+
+
+def _is_explicit_auth_failure_excerpt(excerpt: str) -> bool:
+    if not excerpt:
+        return False
+    lowered = excerpt.lower()
+    return (
         "no api key" in lowered
         or "api key not found" in lowered
         or "missing api key" in lowered
@@ -5243,11 +5258,6 @@ def _implementation_auth_failure_classification(*texts: str) -> str:
         or "login failed" in lowered
         or ("credential" in lowered and ("missing" in lowered or "failed" in lowered or "expired" in lowered))
     )
-    if not explicit_auth_failure:
-        return ""
-    if "openai-codex" in lowered:
-        return "openai-codex-auth"
-    return "agent-auth"
 
 
 def _reviewer_timeout_retrospective_signal(state: dict[str, Any], reason: str) -> dict[str, Any] | None:
