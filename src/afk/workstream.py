@@ -290,22 +290,14 @@ def run_workstream(
             else:
                 publication = blocked_publication(publication_gate, normalized, run_id)
         else:
-            if tracker_terminal_decision_present(normalized):
-                if tracker_terminal_decision_allows_close(normalized, state):
-                    publication = tracker_terminal_decision_publication()
-                else:
-                    publication = tracker_close_blocked_publication(
-                        reason=tracker_terminal_decision_close_block_reason(normalized, state)
-                    )
-            else:
-                publication = publish_terminal_pr(
-                    normalized["publisher"],
-                    normalized=normalized,
-                    state=state,
-                    steps=steps,
-                    selected_work=selected_work_records(state),
-                    ledger=ledger,
-                )
+            publication = publish_terminal_pr(
+                normalized["publisher"],
+                normalized=normalized,
+                state=state,
+                steps=steps,
+                selected_work=selected_work_records(state),
+                ledger=ledger,
+            )
     tracker = tracker_record(normalized, state, publication)
     status = workstream_status_from_publication(publication, tracker)
     selected_work = selected_work_records(state)
@@ -1846,15 +1838,6 @@ def publish_terminal_pr(
             auth=auth,
             message_on_failure="gh auth status failed",
         )
-        if config["mode"] == "close":
-            return close_published_pr(
-                config,
-                normalized=normalized,
-                state=state,
-                ledger=ledger,
-                auth=auth,
-                auth_artifact=auth_artifact,
-            )
         body = pr_body_markdown(normalized, state, steps, selected_work, ledger)
         ledger.write_text("pr-body.md", body)
         pr_body_path = (ledger.path / "pr-body.md").resolve(strict=False)
@@ -2845,8 +2828,8 @@ def pr_number_for_rest_update(
 
 def normalize_publisher_config(publisher: dict[str, Any], normalized: dict[str, Any]) -> dict[str, Any]:
     mode = string_field(publisher, "mode") or "create"
-    if mode not in {"create", "update", "close"}:
-        raise WorkstreamError("publisher.mode must be create, update or close")
+    if mode not in {"create", "update"}:
+        raise WorkstreamError("publisher.mode must be create or update")
     gh = publisher.get("gh", {})
     git = publisher.get("git", {})
     if not isinstance(gh, dict) or not isinstance(git, dict):
@@ -2863,10 +2846,6 @@ def normalize_publisher_config(publisher: dict[str, Any], normalized: dict[str, 
         raise WorkstreamError("publisher.repo is required")
     if mode == "create" and not base:
         raise WorkstreamError("publisher.base is required for create")
-    if mode == "close" and not raw_pr:
-        raise WorkstreamError("publisher.pr is required for close")
-    if mode == "close":
-        pr = raw_pr
     gh_auth = normalize_publisher_gh_auth(gh)
     return {
         "mode": mode,
@@ -3775,6 +3754,7 @@ def tracker_record(
     publication: dict[str, Any],
 ) -> dict[str, Any]:
     decision = effective_tracker_terminal_decision(normalized, publication)
+    recorded_terminal_decision = recorded_tracker_terminal_decision(normalized, publication)
     decision_pr_url = redact_text(decision.get("pr_url") or "")
     decision_review_feedback_status = terminal_review_feedback_status(decision)
     review_cycles = effective_review_cycles(normalized, state)
@@ -3795,7 +3775,7 @@ def tracker_record(
         "review_findings": tracker_review_findings(review),
         "review_cycles": redact_review_cycles(review_cycles),
         "retrospective": redact_retrospective(effective_retrospective(normalized, publication)),
-        "terminal_decision": redact_artifact_value(decision),
+        "terminal_decision": redact_artifact_value(recorded_terminal_decision),
     }
     decision_status = decision.get("status")
     if decision_status == "merged":
@@ -3916,10 +3896,14 @@ def tracker_record(
 
 
 def effective_tracker_terminal_decision(normalized: dict[str, Any], publication: dict[str, Any]) -> dict[str, str]:
-    decision = normalized["tracker"]["terminal_decision"]
-    if decision.get("status"):
-        return decision
     return runtime_terminal_decision(publication.get("terminal_decision"))
+
+
+def recorded_tracker_terminal_decision(normalized: dict[str, Any], publication: dict[str, Any]) -> dict[str, str]:
+    publication_decision = runtime_terminal_decision(publication.get("terminal_decision"))
+    if publication_decision.get("status"):
+        return publication_decision
+    return runtime_terminal_decision(normalized.get("tracker", {}).get("terminal_decision"))
 
 
 def publication_tracker_close_failed(publication: dict[str, Any]) -> bool:

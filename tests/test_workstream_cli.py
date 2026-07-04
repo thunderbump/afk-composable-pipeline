@@ -1181,7 +1181,7 @@ Path({str(fake_calls)!r}).write_text("gh should not run\\n", encoding="utf-8")
             self.assertEqual(review_result["result"]["evidence"]["result_file_present"], False)
             self.assertFalse(fake_calls.exists())
 
-    def test_workstream_terminal_merge_decision_closes_tracker_without_republishing(self):
+    def test_workstream_terminal_merge_decision_does_not_skip_minimal_pr_publication(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
             repo = temp_path / "repo-src"
@@ -1195,16 +1195,20 @@ Path({str(fake_calls)!r}).write_text("gh should not run\\n", encoding="utf-8")
                 fake_git,
                 f"""#!{sys.executable}
 from pathlib import Path
-Path({str(fake_calls)!r}).write_text("publisher git should not run\\n", encoding="utf-8")
-raise SystemExit(9)
+Path({str(fake_calls)!r}).open("a", encoding="utf-8").write("git\\n")
+raise SystemExit(0)
 """,
             )
             write_executable(
                 fake_gh,
                 f"""#!{sys.executable}
+import sys
 from pathlib import Path
-Path({str(fake_calls)!r}).write_text("publisher gh should not run\\n", encoding="utf-8")
-raise SystemExit(9)
+Path({str(fake_calls)!r}).open("a", encoding="utf-8").write(" ".join(sys.argv[1:]) + "\\n")
+if sys.argv[1:4] == ["auth", "status", "--hostname"]:
+    raise SystemExit(0)
+print("https://github.example/pr/123")
+raise SystemExit(0)
 """,
             )
             recipe = successful_recipe(temp_path, repo, checkout, fake_git, fake_gh)
@@ -1238,17 +1242,14 @@ raise SystemExit(9)
             summary = json.loads(completed.stdout)
             result = json.loads((ledger / summary["result_path"]).read_text(encoding="utf-8"))
 
-            self.assertFalse(fake_calls.exists())
-            self.assertEqual(summary["status"], "closed")
-            self.assertEqual(result["publication"]["status"], "tracker-closed")
-            self.assertIn("terminal tracker decision", result["publication"]["reason"])
-            self.assertEqual(result["tracker"]["status"], "closed")
-            self.assertTrue(result["tracker"]["close_source_item"])
-            self.assertEqual(result["tracker"]["merge_commit"], "deadbeef")
+            self.assertTrue(fake_calls.exists())
+            self.assertEqual(summary["status"], "published")
+            self.assertEqual(result["publication"]["status"], "published")
+            self.assertEqual(result["tracker"]["status"], "awaiting-review")
+            self.assertFalse(result["tracker"]["close_source_item"])
             self.assertEqual(result["tracker"]["pr_url"], "https://github.example/pr/123")
             self.assertEqual([item["result"] for item in result["selected_work"]], ["passed"])
             tracker_result = json.loads((ledger / summary["result_path"]).parent.joinpath("tracker-result.json").read_text(encoding="utf-8"))
-            self.assertEqual(tracker_result["merge_commit"], "deadbeef")
             self.assertEqual(tracker_result["pr_url"], "https://github.example/pr/123")
 
     def test_workstream_includes_redacted_retrospective_for_terminal_merge_decision(self):
@@ -1264,16 +1265,18 @@ raise SystemExit(9)
             write_executable(
                 fake_git,
                 f"""#!{sys.executable}
-from pathlib import Path
-Path({str(fake_calls)!r}).write_text("publisher git should not run\\n", encoding="utf-8")
-raise SystemExit(9)
+raise SystemExit(0)
 """,
             )
             write_executable(
                 fake_gh,
                 f"""#!{sys.executable}
-from pathlib import Path
-Path({str(fake_calls)!r}).write_text("publisher gh should not run\\n", encoding="utf-8")
+import sys
+if sys.argv[1:4] == ["auth", "status", "--hostname"]:
+    raise SystemExit(0)
+if sys.argv[1:3] == ["pr", "create"]:
+    print("https://github.example/pr/123")
+    raise SystemExit(0)
 raise SystemExit(9)
 """,
             )
@@ -1372,10 +1375,10 @@ raise SystemExit(9)
                 result["retrospective"]["notes"]["spikes"],
                 ["~/Documents/rmd/Ceremonies/Personal Work/spikes/2026-06-27-retrospective.md"],
             )
-            self.assertEqual(result["pipeline_retrospective"]["status"], "closed")
+            self.assertEqual(result["pipeline_retrospective"]["status"], "published")
             self.assertEqual(result["pipeline_retrospective"]["health"], "healthy")
-            self.assertEqual(result["pipeline_retrospective"]["publication_status"], "tracker-closed")
-            self.assertEqual(result["pipeline_retrospective"]["tracker_status"], "closed")
+            self.assertEqual(result["pipeline_retrospective"]["publication_status"], "published")
+            self.assertEqual(result["pipeline_retrospective"]["tracker_status"], "awaiting-review")
             self.assertEqual(result["pipeline_retrospective"]["signals"], [])
             self.assertEqual(
                 json.loads((result_path.parent / "retrospective.json").read_text(encoding="utf-8")),
@@ -1454,12 +1457,18 @@ raise SystemExit(9)
             write_executable(
                 fake_git,
                 f"""#!{sys.executable}
-raise SystemExit(9)
+raise SystemExit(0)
 """,
             )
             write_executable(
                 fake_gh,
                 f"""#!{sys.executable}
+import sys
+if sys.argv[1:4] == ["auth", "status", "--hostname"]:
+    raise SystemExit(0)
+if sys.argv[1:3] == ["pr", "create"]:
+    print("https://github.example/pr/123")
+    raise SystemExit(0)
 raise SystemExit(9)
 """,
             )
@@ -1507,7 +1516,7 @@ raise SystemExit(9)
             result = json.loads((ledger / summary["result_path"]).read_text(encoding="utf-8"))
             self.assertFalse(judge_ran.exists())
             self.assertFalse(creator_ran.exists())
-            self.assertEqual(result["status"], "closed")
+            self.assertEqual(result["status"], "published")
             self.assertEqual(result["pipeline_retrospective"]["signals"], [])
             self.assertEqual(result["pipeline_retrospective"]["judge"], {"enabled": False, "status": "disabled"})
             self.assertEqual(
@@ -1536,12 +1545,18 @@ raise SystemExit(9)
             write_executable(
                 fake_git,
                 f"""#!{sys.executable}
-raise SystemExit(9)
+raise SystemExit(0)
 """,
             )
             write_executable(
                 fake_gh,
                 f"""#!{sys.executable}
+import sys
+if sys.argv[1:4] == ["auth", "status", "--hostname"]:
+    raise SystemExit(0)
+if sys.argv[1:3] == ["pr", "create"]:
+    print("https://github.example/pr/123")
+    raise SystemExit(0)
 raise SystemExit(9)
 """,
             )
@@ -1569,7 +1584,7 @@ raise SystemExit(9)
             self.assertEqual(completed.returncode, 0, completed.stderr)
             summary = json.loads(completed.stdout)
             result = json.loads((ledger / summary["result_path"]).read_text(encoding="utf-8"))
-            self.assertEqual(result["status"], "closed")
+            self.assertEqual(result["status"], "published")
             self.assertEqual(result["pipeline_retrospective"]["judge"], {"enabled": False, "status": "disabled"})
             self.assertEqual(
                 result["pipeline_retrospective"]["follow_up"]["creation"],
@@ -2116,7 +2131,7 @@ Path(result_env).write_text(
             calls = [json.loads(line) for line in pi_calls.read_text(encoding="utf-8").splitlines()]
             preflight_calls = [call for call in calls if call["preflight"]]
 
-            self.assertEqual(result["status"], "closed")
+            self.assertEqual(result["status"], "published")
             self.assertEqual([step["name"] for step in result["steps"]], ["select-work", "prepare-checkout", "implement", "validate", "review"])
             self.assertEqual(result["pipeline_retrospective"]["judge"]["status"], "disabled")
             self.assertEqual({call["target"] for call in preflight_calls}, {"reviewer"})
@@ -2186,6 +2201,7 @@ Path(result_env).write_text(
             self.assertIn("SetBotID is a private member of Bot", description)
             self.assertIn("validation-evidence/logs/validation.log", description)
 
+    @unittest.skip("terminal closure moved out of the minimal run-workstream path")
     def test_workstream_terminal_no_merge_decision_closes_tracker_without_republishing(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
@@ -2279,7 +2295,7 @@ raise SystemExit(9)
                 result["tracker"]["close_reason"],
                 "Superseded by follow-up PR",
             )
-            self.assertEqual(result["tracker"]["pr_url"], "https://github.example/pr/123")
+            self.assertEqual(result["tracker"]["pr_url"], "")
             self.assertEqual([item["result"] for item in result["selected_work"]], ["passed"])
             self.assertEqual(result["retrospective"], tracker["retrospective"])
             self.assertEqual(result["tracker"]["retrospective"], tracker["retrospective"])
@@ -2308,6 +2324,7 @@ raise SystemExit(9)
                 result["pipeline_retrospective"],
             )
 
+    @unittest.skip("terminal closure moved out of the minimal run-workstream path")
     def test_workstream_terminal_merge_decision_stays_open_when_review_feedback_is_unresolved(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
@@ -2383,8 +2400,9 @@ raise SystemExit(9)
             self.assertIn("review_feedback_status", result["publication"]["reason"])
             self.assertEqual(result["tracker"]["status"], "review-findings-open")
             self.assertFalse(result["tracker"]["close_source_item"])
-            self.assertEqual(result["tracker"]["pr_url"], "https://github.example/pr/123")
+            self.assertEqual(result["tracker"]["pr_url"], "")
 
+    @unittest.skip("terminal closure moved out of the minimal run-workstream path")
     def test_workstream_terminal_merge_decision_closes_when_review_feedback_is_explicitly_resolved(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
@@ -2466,6 +2484,7 @@ raise SystemExit(9)
             )
             self.assertIn("resolved before closure", result["tracker"]["comment"])
 
+    @unittest.skip("terminal closure moved out of the minimal run-workstream path")
     def test_workstream_terminal_merge_decision_requires_recorded_review_cycles_or_waiver(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
@@ -2532,6 +2551,7 @@ raise SystemExit(9)
             self.assertFalse(result["tracker"]["close_source_item"])
             self.assertIn("review cycle evidence", result["tracker"]["comment"])
 
+    @unittest.skip("terminal closure moved out of the minimal run-workstream path")
     def test_workstream_terminal_merge_decision_closes_when_review_cycles_are_recorded_and_addressed(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
@@ -2609,6 +2629,7 @@ raise SystemExit(9)
             self.assertTrue(result["tracker"]["close_source_item"])
             self.assertEqual(result["tracker"]["close_reason"], "merged via deadbeef")
 
+    @unittest.skip("terminal closure moved out of the minimal run-workstream path")
     def test_workstream_terminal_merge_decision_uses_runtime_review_cycles_after_review_feedback_repair(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
@@ -2818,6 +2839,91 @@ sys.exit(0)
             self.assertEqual(summary["status"], "published")
             self.assertEqual(result["tracker"]["status"], "awaiting-review")
             self.assertFalse(result["tracker"]["close_source_item"])
+
+    def test_workstream_create_mode_preserves_configured_terminal_decision_metadata_without_closing(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repo = temp_path / "repo-src"
+            checkout = temp_path / "checkout"
+            ledger = temp_path / "ledger"
+            fake_calls = temp_path / "fake-calls.jsonl"
+            init_repo(repo)
+            fake_git = temp_path / "publisher-git"
+            fake_gh = temp_path / "publisher-gh"
+            write_executable(
+                fake_git,
+                f"""#!{sys.executable}
+import json
+import sys
+from pathlib import Path
+Path({str(fake_calls)!r}).open("a", encoding="utf-8").write(json.dumps({{"tool": "git", "argv": sys.argv[1:]}}) + "\\n")
+sys.exit(0)
+""",
+            )
+            write_executable(
+                fake_gh,
+                f"""#!{sys.executable}
+import json
+import sys
+from pathlib import Path
+Path({str(fake_calls)!r}).open("a", encoding="utf-8").write(json.dumps({{"tool": "gh", "argv": sys.argv[1:]}}) + "\\n")
+if sys.argv[1:4] == ["auth", "status", "--hostname"]:
+    sys.exit(0)
+print("https://github.example/pr/123")
+sys.exit(0)
+""",
+            )
+            recipe = successful_recipe(temp_path, repo, checkout, fake_git, fake_gh)
+            recipe["tracker"] = {
+                "terminal_decision": {
+                    "status": "no-merge",
+                    "reason": "Hand off to external closer",
+                    "pr_url": "https://github.example/pr/123",
+                }
+            }
+
+            completed = run_afk(
+                "run-workstream",
+                "--workstream-id",
+                "central-lve.9",
+                "--input",
+                json.dumps(recipe),
+                "--ledger",
+                str(ledger),
+                env_overrides={
+                    "GIT_ALLOW_PROTOCOL": "file",
+                    "GIT_AUTHOR_NAME": "AFK Test",
+                    "GIT_AUTHOR_EMAIL": "afk-test@example.test",
+                    "GIT_COMMITTER_NAME": "AFK Test",
+                    "GIT_COMMITTER_EMAIL": "afk-test@example.test",
+                },
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            result_path = ledger / summary["result_path"]
+            result = json.loads(result_path.read_text(encoding="utf-8"))
+            tracker = json.loads((result_path.parent / "tracker-result.json").read_text(encoding="utf-8"))
+            expected_decision = {
+                "status": "no-merge",
+                "merge_commit": "",
+                "reason": "Hand off to external closer",
+                "pr_url": "https://github.example/pr/123",
+                "review_feedback_status": "",
+            }
+
+            self.assertEqual(summary["status"], "published")
+            self.assertEqual(result["publication"]["status"], "published")
+            self.assertEqual(result["tracker"]["terminal_decision"], expected_decision)
+            self.assertEqual(tracker["terminal_decision"], expected_decision)
+            self.assertFalse(result["tracker"]["close_source_item"])
+            self.assertFalse(tracker["close_source_item"])
+            self.assertEqual(result["tracker"]["close_reason"], "")
+            self.assertEqual(tracker["close_reason"], "")
+
+            calls = [json.loads(line) for line in fake_calls.read_text(encoding="utf-8").splitlines()]
+            self.assertFalse(any(call["argv"][:2] == ["pr", "merge"] for call in calls if call["tool"] == "gh"))
+            self.assertFalse(any(call["argv"][:2] == ["issue", "close"] for call in calls if call["tool"] == "gh"))
 
     def test_workstream_rejects_terminal_decision_without_pr_url(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -6581,7 +6687,7 @@ Path({str(fake_calls)!r}).write_text("gh should not run\\n", encoding="utf-8")
             self.assertEqual(result["tracker"]["status"], "implemented")
             self.assertFalse(result["tracker"]["close_source_item"])
             self.assertEqual(result["tracker"]["close_reason"], "")
-            self.assertEqual(result["tracker"]["pr_url"], "https://github.example/pr/123")
+            self.assertEqual(result["tracker"]["pr_url"], "")
             self.assertFalse(fake_calls.exists())
 
     def test_workstream_blocks_validation_before_implementation(self):
@@ -9467,6 +9573,7 @@ sys.exit(9)
             )
             self.assertEqual(calls[3]["argv"][3], "repos/thunderbump/afk-composable-pipeline/pulls/987")
 
+    @unittest.skip("publisher close mode moved out of the minimal run-workstream path")
     def test_workstream_close_mode_merges_existing_pr_closes_bead_and_runs_retrospective_afterward(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
@@ -9664,6 +9771,7 @@ Path(os.environ["AFK_RETROSPECTIVE_FOLLOW_UP_RESULT"]).write_text(
                 "recommendation-only",
             )
 
+    @unittest.skip("publisher close mode moved out of the minimal run-workstream path")
     def test_workstream_close_mode_records_merged_terminal_decision_when_bead_close_fails(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
@@ -9828,7 +9936,7 @@ raise SystemExit(9)
             )
             self.assertEqual(result["tracker"]["terminal_decision"]["status"], "merged")
             self.assertEqual(result["tracker"]["merge_commit"], "deadbeef")
-            self.assertEqual(result["tracker"]["pr_url"], "https://github.example/pr/123")
+            self.assertEqual(result["tracker"]["pr_url"], "")
             self.assertFalse(result["tracker"]["close_source_item"])
             self.assertIn("closure failed", result["tracker"]["comment"])
             self.assertNotIn("test-password", json.dumps(result))
@@ -9838,6 +9946,7 @@ raise SystemExit(9)
             )
             self.assertEqual(calls[-1]["argv"][0:2], ["close", "central-lve.9"])
 
+    @unittest.skip("publisher close mode moved out of the minimal run-workstream path")
     def test_workstream_close_mode_records_blocked_terminal_decision_without_closing_bead(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
@@ -10007,6 +10116,7 @@ raise SystemExit(9)
             self.assertFalse((ledger / "workstreams" / summary["run_id"] / "retrospective-follow-up-result.json").exists())
             self.assertEqual([call["tool"] for call in calls], ["bd", "bd", "gh", "gh"])
 
+    @unittest.skip("publisher close mode moved out of the minimal run-workstream path")
     def test_workstream_close_mode_requires_recorded_review_cycles_or_explicit_waiver(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
@@ -10137,6 +10247,7 @@ raise SystemExit(9)
             self.assertIn("review cycle evidence", result["tracker"]["comment"])
             self.assertEqual([call["tool"] for call in calls], ["bd", "bd", "gh", "gh"])
 
+    @unittest.skip("publisher close mode moved out of the minimal run-workstream path")
     def test_workstream_close_mode_allows_explicit_waiver_without_recorded_review_cycles(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
@@ -10276,6 +10387,7 @@ raise SystemExit(9)
                 ["bd", "bd", "gh", "gh", "gh", "gh", "bd"],
             )
 
+    @unittest.skip("publisher close mode moved out of the minimal run-workstream path")
     def test_workstream_close_mode_allows_explicitly_resolved_review_feedback(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
@@ -10427,6 +10539,7 @@ raise SystemExit(9)
                 ["bd", "bd", "gh", "gh", "gh", "gh", "bd"],
             )
 
+    @unittest.skip("publisher close mode moved out of the minimal run-workstream path")
     def test_workstream_close_mode_uses_runtime_review_cycles_after_review_feedback_repair(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
@@ -10650,6 +10763,7 @@ raise SystemExit(9)
                 ["bd", "bd", "gh", "gh", "gh", "gh", "bd"],
             )
 
+    @unittest.skip("publisher close mode moved out of the minimal run-workstream path")
     def test_workstream_close_mode_blocks_unresolved_review_feedback_without_explicit_status(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
@@ -10791,7 +10905,7 @@ raise SystemExit(9)
             self.assertEqual(result["tracker"]["terminal_decision"]["pr_url"], "https://github.example/pr/123")
             self.assertEqual([call["tool"] for call in calls], ["bd", "bd", "gh", "gh"])
 
-    def test_workstream_close_mode_requires_explicit_publisher_pr(self):
+    def test_workstream_rejects_close_mode(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
             repo = temp_path / "repo-src"
@@ -10814,7 +10928,6 @@ raise SystemExit(0)
             )
             recipe = successful_recipe(temp_path, repo, checkout, fake_git, fake_gh)
             recipe["publisher"]["mode"] = "close"
-            recipe["publisher"].pop("pr", None)
             recipe["publisher"]["git"]["push"] = False
 
             completed = run_afk(
@@ -10833,7 +10946,7 @@ raise SystemExit(0)
 
             self.assertEqual(summary["status"], "failed-needs-human")
             self.assertEqual(result["publication"]["status"], "failed-needs-human")
-            self.assertEqual(result["publication"]["reason"], "publisher.pr is required for close")
+            self.assertEqual(result["publication"]["reason"], "publisher.mode must be create or update")
 
     def test_workstream_pr_body_redacts_validation_worker_command_secret_args(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -11082,7 +11195,7 @@ Path({str(fake_calls)!r}).write_text("gh should not run\\n", encoding="utf-8")
             self.assertEqual(result["tracker"]["status"], "validated")
             self.assertFalse(result["tracker"]["close_source_item"])
             self.assertEqual(result["tracker"]["close_reason"], "")
-            self.assertEqual(result["tracker"]["pr_url"], "https://github.example/pr/123")
+            self.assertEqual(result["tracker"]["pr_url"], "")
             self.assertFalse(fake_calls.exists())
 
     def test_workstream_records_cleanup_and_retry_when_publication_fails_before_pr(self):
@@ -11794,7 +11907,7 @@ Path({str(fake_calls)!r}).write_text("gh should not run\\n", encoding="utf-8")
             (
                 "invalid_mode",
                 lambda publisher: publisher.__setitem__("mode", "delete"),
-                "publisher.mode must be create, update or close",
+                    "publisher.mode must be create or update",
             ),
         ]
         for case_name, mutate_publisher, expected_reason in cases:
