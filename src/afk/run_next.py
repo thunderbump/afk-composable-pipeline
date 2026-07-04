@@ -149,17 +149,19 @@ def choose_candidate(
         return None
     return deterministic_candidate(candidates)
 
+
 def selector_result(chosen: dict[str, Any] | None) -> dict[str, Any]:
     if chosen is None:
         return {"mode": "deterministic", "model": None, "selected": None, "rationale": "no candidates"}
+    selected = selected_work_snapshot(chosen)
     return {
         "mode": "deterministic",
         "model": None,
         "selected": {
-            "source_id": chosen["source_id"],
-            "source_type": chosen["source_type"],
-            "external_id": chosen["external_id"],
-            "rationale": chosen.get("selector_rationale", "deterministic default"),
+            "source_id": selected["source_id"],
+            "source_type": selected["source_type"],
+            "external_id": selected["external_id"],
+            "rationale": "deterministic default",
         },
     }
 
@@ -173,7 +175,7 @@ def annotate_selection_result(selection_result: dict[str, Any]) -> dict[str, Any
 def selected_work_snapshot(chosen: dict[str, Any] | None) -> dict[str, Any] | None:
     if chosen is None:
         return None
-    return dict(chosen)
+    return {key: value for key, value in chosen.items() if not key.startswith("selector_")}
 
 
 def normalize_workstream_result(result: Any, *, ledger_dir: Path | None = None) -> dict[str, Any] | None:

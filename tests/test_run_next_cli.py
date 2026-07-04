@@ -13,7 +13,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from afk.contracts import load_project_contract  # noqa: E402
 from afk.pi_workers import PONYTAIL_EXTENSION_SOURCE, build_pi_real_worker_agent  # noqa: E402
 from afk.pi_workers import build_pi_print_command
-from afk.run_next import choose_candidate, github_repo_from_repo_url, run_next, selector_result
+from afk.run_next import choose_candidate, github_repo_from_repo_url, run_next, selected_work_snapshot, selector_result
 from afk.workstream import WorkstreamResult
 
 
@@ -1408,6 +1408,42 @@ raise SystemExit(9)
                 },
             },
         )
+
+    def test_deterministic_selector_ignores_candidate_selector_fields(self):
+        candidates = [
+            {
+                "source_id": "fixture",
+                "source_type": "fixture",
+                "external_id": "x",
+                "title": "X",
+                "status": "open",
+                "labels": ["project:demo", "ready-for-agent"],
+                "selector_rationale": "stale rationale",
+                "selector_mode": "model",
+                "selector_model": "gpt-5.4-mini",
+            }
+        ]
+
+        chosen = choose_candidate(candidates)
+
+        self.assertEqual(
+            selector_result(chosen),
+            {
+                "mode": "deterministic",
+                "model": None,
+                "selected": {
+                    "source_id": "fixture",
+                    "source_type": "fixture",
+                    "external_id": "x",
+                    "rationale": "deterministic default",
+                },
+            },
+        )
+        snapshot = selected_work_snapshot(chosen)
+        self.assertNotIn("selector_rationale", snapshot)
+        self.assertNotIn("selector_mode", snapshot)
+        self.assertNotIn("selector_model", snapshot)
+        self.assertEqual(snapshot["title"], "X")
 
     def test_direct_python_selector_kwargs_are_rejected(self):
         contract = load_project_contract("bump-eqemu", ROOT / "project-contracts", cwd=ROOT)
