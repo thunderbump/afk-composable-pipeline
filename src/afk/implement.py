@@ -530,7 +530,15 @@ def normalize_agent(agent: Any, *, checkout_path: Path) -> dict[str, Any]:
     fake_agent = agent_type == "fake-pi-command"
     forbidden_keys = ("credentials_path", "auth_file", "token", "api_key")
     if fake_agent:
-        forbidden_keys = (*forbidden_keys, "env", "codex_home", "config_home", "wrapper_secret_files", "secret_refs")
+        forbidden_keys = (
+            *forbidden_keys,
+            "env",
+            "codex_home",
+            "config_home",
+            "provider",
+            "wrapper_secret_files",
+            "secret_refs",
+        )
     for forbidden_key in forbidden_keys:
         if forbidden_key in agent:
             return {"status": "invalid", "message": f"agent.{forbidden_key} is not supported"}
@@ -551,6 +559,7 @@ def normalize_agent(agent: Any, *, checkout_path: Path) -> dict[str, Any]:
         "command": list(command),
         "result_path": result_path,
         "timeout_seconds": float(timeout_seconds),
+        "provider": "",
         "env": {},
         "codex_home": "",
         "config_home": "",
@@ -558,10 +567,17 @@ def normalize_agent(agent: Any, *, checkout_path: Path) -> dict[str, Any]:
         "secret_refs": {},
     }
     if not fake_agent:
+        provider = agent.get("provider")
+        if provider is not None and (not isinstance(provider, str) or not provider.strip()):
+            return {"status": "invalid", "message": "agent.provider must be a non-empty string"}
+        normalized_provider = provider.strip() if isinstance(provider, str) else ""
+        required_env_keys = {"PI_CONFIG_HOME"}
+        if normalized_provider == "openai-codex":
+            required_env_keys.add("PI_CODING_AGENT_DIR")
         env = normalize_agent_env(
             agent.get("env", {}),
             checkout_path=checkout_path,
-            required_keys={"PI_CONFIG_HOME"},
+            required_keys=required_env_keys,
         )
         if env["status"] != "valid":
             return {"status": "invalid", "message": env["message"]}
@@ -590,6 +606,7 @@ def normalize_agent(agent: Any, *, checkout_path: Path) -> dict[str, Any]:
         secret_refs = normalize_secret_refs(agent.get("secret_refs", {}))
         if secret_refs["status"] != "valid":
             return {"status": "invalid", "message": secret_refs["message"]}
+        normalized_agent["provider"] = normalized_provider
         normalized_agent["env"] = env["env"]
         normalized_agent["codex_home"] = codex_home["path"]
         normalized_agent["config_home"] = config_home["path"]

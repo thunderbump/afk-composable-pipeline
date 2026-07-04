@@ -20,7 +20,6 @@ from afk.jsonutil import canonical_json, sha256_json
 from afk.pi_workers import (
     non_openai_pi_mount_error,
     openai_codex_pi_mount_error,
-    pi_command_provider,
     validate_absolute_dir,
 )
 from afk.redaction import is_secret_command_flag, is_secret_key, is_secret_value, redact_artifact_value, redact_text
@@ -6147,11 +6146,21 @@ def normalize_retrospective_judge(
         key
         for key in retrospective_judge
         if key
-        not in {"enabled", "type", "command", "timeout_seconds", "timeoutSeconds", "codex_home", "config_home", "env"}
+        not in {
+            "enabled",
+            "type",
+            "command",
+            "timeout_seconds",
+            "timeoutSeconds",
+            "provider",
+            "codex_home",
+            "config_home",
+            "env",
+        }
     ]
     if unsupported:
         raise WorkstreamError(
-            "retrospective_judge only supports enabled, type, command, timeout_seconds, codex_home, config_home, env"
+            "retrospective_judge only supports enabled, type, command, timeout_seconds, provider, codex_home, config_home, env"
         )
     enabled = retrospective_judge.get("enabled", False)
     if not isinstance(enabled, bool):
@@ -6181,6 +6190,11 @@ def normalize_retrospective_judge(
         "command": list(command),
         "timeout_seconds": float(timeout_seconds),
     }
+    provider = retrospective_judge.get("provider")
+    if provider is not None:
+        if not isinstance(provider, str) or not provider.strip():
+            raise WorkstreamError("retrospective_judge.provider must be a non-empty string")
+        normalized["provider"] = provider.strip()
     checkout_mount_boundaries = checkout_paths or ([checkout_path] if checkout_path is not None else [])
     for field_name in ("codex_home", "config_home"):
         raw_value = retrospective_judge.get(field_name)
@@ -6220,7 +6234,7 @@ def normalize_retrospective_judge(
                 raise WorkstreamError(str(exc)) from exc
         normalized["env"] = normalized_env
     mount_error = openai_codex_pi_mount_error(
-        command=normalized["command"],
+        provider=normalized.get("provider"),
         codex_home=normalized.get("codex_home"),
         config_home=normalized.get("config_home"),
         env=normalized.get("env"),
@@ -6229,7 +6243,7 @@ def normalize_retrospective_judge(
     if mount_error:
         raise WorkstreamError(mount_error)
     mount_rejection = non_openai_pi_mount_error(
-        command=normalized["command"],
+        provider=normalized.get("provider"),
         codex_home=normalized.get("codex_home"),
         config_home=normalized.get("config_home"),
         env=normalized.get("env"),

@@ -158,7 +158,7 @@ class WorkstreamStatusMappingTest(unittest.TestCase):
     def test_normalize_retrospective_judge_rejects_non_pi_mounts_without_checkout_path(self):
         with self.subTest("existing absolute paths"), self.assertRaisesRegex(
             WorkstreamError,
-            "only supported when retrospective_judge.command uses pi --provider openai-codex",
+            "only supported when retrospective_judge.provider is openai-codex",
         ):
             with tempfile.TemporaryDirectory() as temp_dir:
                 temp_path = Path(temp_dir)

@@ -588,6 +588,11 @@ def normalize_reviewer(reviewer: Any, *, checkout_path: Path) -> dict[str, Any]:
         "command": list(command),
         "timeout_seconds": float(timeout_seconds),
     }
+    provider = reviewer.get("provider")
+    if provider is not None:
+        if not isinstance(provider, str) or not provider.strip():
+            return {"status": "invalid", "message": "reviewer.provider must be a non-empty string"}
+        normalized_reviewer["provider"] = provider.strip()
     for field_name in ("codex_home", "config_home"):
         raw_value = reviewer.get(field_name)
         if raw_value is None:
@@ -625,7 +630,7 @@ def normalize_reviewer(reviewer: Any, *, checkout_path: Path) -> dict[str, Any]:
                 return {"status": "invalid", "message": str(exc)}
         normalized_reviewer["env"] = normalized_env
     mount_error = openai_codex_pi_mount_error(
-        command=normalized_reviewer["command"],
+        provider=normalized_reviewer.get("provider"),
         codex_home=normalized_reviewer.get("codex_home"),
         config_home=normalized_reviewer.get("config_home"),
         env=normalized_reviewer.get("env"),
@@ -634,7 +639,7 @@ def normalize_reviewer(reviewer: Any, *, checkout_path: Path) -> dict[str, Any]:
     if mount_error:
         return {"status": "invalid", "message": mount_error}
     mount_rejection = non_openai_pi_mount_error(
-        command=normalized_reviewer["command"],
+        provider=normalized_reviewer.get("provider"),
         codex_home=normalized_reviewer.get("codex_home"),
         config_home=normalized_reviewer.get("config_home"),
         env=normalized_reviewer.get("env"),

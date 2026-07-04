@@ -1807,6 +1807,7 @@ Path(result_env).write_text(
             recipe = merged_recipe_with_retrospective(temp_path, repo, checkout, fake_git, fake_gh)
             recipe["steps"][4]["input"]["reviewer"] = {
                 "type": "fake-reviewer-command",
+                "provider": "openai-codex",
                 "command": [
                     str(pi_bin),
                     "-p",
