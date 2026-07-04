@@ -9,6 +9,8 @@ import unittest
 from unittest import mock
 from pathlib import Path
 
+from afk import validation
+
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -298,6 +300,57 @@ class ValidateCliTest(unittest.TestCase):
                 "fake validation worker complete",
                 (run_dir / "stdout.log").read_text(encoding="utf-8"),
             )
+
+    def test_run_command_adapter_allows_repeated_runs_with_same_evidence_dir(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            checkout = temp_path / "checkout"
+            checkout.mkdir()
+            evidence_dir = temp_path / "validation-evidence"
+            request_path = temp_path / "worker-request.json"
+            result_path = temp_path / "worker-result.json"
+            request_path.write_text(json.dumps({"profile": "tier3-harness"}), encoding="utf-8")
+            worker = {
+                "type": "local-command",
+                "command": [
+                    sys.executable,
+                    "-c",
+                    textwrap.dedent(
+                        """
+                        import json
+                        import os
+                        from pathlib import Path
+
+                        Path(os.environ["AFK_WORKER_RESULT"]).write_text(
+                            json.dumps({"status": "pass", "steps": []}),
+                            encoding="utf-8",
+                        )
+                        """
+                    ).strip(),
+                ],
+                "timeout_seconds": 5,
+                "env": {},
+            }
+
+            first = validation.run_command_adapter(
+                worker,
+                checkout_path=checkout,
+                request_path=request_path,
+                result_path=result_path,
+                evidence_dir=evidence_dir,
+                profile="tier3-harness",
+            )
+            second = validation.run_command_adapter(
+                worker,
+                checkout_path=checkout,
+                request_path=request_path,
+                result_path=result_path,
+                evidence_dir=evidence_dir,
+                profile="tier3-harness",
+            )
+
+        self.assertEqual(first["returncode"], 0)
+        self.assertEqual(second["returncode"], 0)
 
     def test_validate_remote_command_adapter_builds_fetchable_repo_request(self):
         with tempfile.TemporaryDirectory() as temp_dir:

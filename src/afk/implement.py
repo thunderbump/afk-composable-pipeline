@@ -20,6 +20,15 @@ from afk.redaction import (
     redact_artifact_value,
     redact_text,
 )
+from afk.role_adapters import (
+    RoleAdapterRuntimeError,
+    execute_role_command,
+    minimal_command_environment,
+    read_json_result_file,
+    redact_adapter_streams,
+    render_command,
+    write_adapter_logs,
+)
 
 
 SCHEMA_VERSION = 1
@@ -29,26 +38,7 @@ MIN_RUNTIME_SECRET_LENGTH = 4
 PI_JOB_PROMPT_PLACEHOLDER = "{prompt}"
 
 
-class AgentRuntimeError(RuntimeError):
-    def __init__(
-        self,
-        message: str,
-        *,
-        stdout: str = "",
-        stderr: str = "",
-        returncode: int | None = None,
-        timed_out: bool = False,
-        configured_timeout_seconds: float | None = None,
-        elapsed_seconds: float | None = None,
-    ):
-        super().__init__(message)
-        self.message = message
-        self.stdout = stdout
-        self.stderr = stderr
-        self.returncode = returncode
-        self.timed_out = timed_out
-        self.configured_timeout_seconds = configured_timeout_seconds
-        self.elapsed_seconds = elapsed_seconds
+AgentRuntimeError = RoleAdapterRuntimeError
 
 
 def implement_step(context: Any) -> dict[str, Any]:
@@ -118,8 +108,11 @@ def implement(
     try:
         adapter_result = run_agent_command(request["agent"], checkout_path, capsule)
     except AgentRuntimeError as exc:
-        stdout = redact_text(exc.stdout, exact_secrets=exact_secrets)
-        stderr = redact_text(exc.stderr or exc.message, exact_secrets=exact_secrets)
+        stdout, stderr = redact_adapter_streams(
+            stdout=exc.stdout,
+            stderr=exc.stderr or exc.message,
+            exact_secrets=exact_secrets,
+        )
         write_adapter_logs(stdout, stderr)
         after_metadata = safe_git_metadata(checkout_path, request["checkout"]["start_commit"])
         summary = runtime_failure_summary(exc.message, stdout=stdout, stderr=stderr)
@@ -141,8 +134,11 @@ def implement(
         )
         return implement_output(capsule, normalized, after_metadata)
 
-    stdout = redact_text(adapter_result["stdout"], exact_secrets=exact_secrets)
-    stderr = redact_text(adapter_result["stderr"], exact_secrets=exact_secrets)
+    stdout, stderr = redact_adapter_streams(
+        stdout=adapter_result["stdout"],
+        stderr=adapter_result["stderr"],
+        exact_secrets=exact_secrets,
+    )
     write_adapter_logs(stdout, stderr)
 
     agent_payload = read_agent_payload(
@@ -935,87 +931,22 @@ def run_agent_command(
         temp_path = Path(temp_dir)
         capsule_path = temp_path / "job-capsule.json"
         capsule_path.write_text(canonical_json(capsule) + "\n", encoding="utf-8")
-        env = minimal_agent_environment(temp_path, config_home=agent.get("config_home") or "")
+        env = minimal_command_environment(temp_path, config_home=agent.get("config_home") or "")
         add_git_identity_fallback(env, checkout_path)
         env.update(agent.get("env") or {})
         if agent.get("codex_home"):
             env["CODEX_HOME"] = agent["codex_home"]
         env["AFK_JOB_CAPSULE"] = str(capsule_path)
         env["AFK_AGENT_RESULT_PATH"] = agent["result_path"]
-        command = _render_agent_command(agent["command"], prompt=canonical_json(capsule))
-        started_at = time.monotonic()
-        try:
-            completed = subprocess.run(
-                command,
-                cwd=checkout_path,
-                env=env,
-                text=True,
-                capture_output=True,
-                check=False,
-                timeout=agent["timeout_seconds"],
-            )
-        except OSError as exc:
-            raise AgentRuntimeError(
-                str(exc),
-                stderr=str(exc),
-                returncode=None,
-                configured_timeout_seconds=agent["timeout_seconds"],
-                elapsed_seconds=time.monotonic() - started_at,
-            ) from exc
-        except subprocess.TimeoutExpired as exc:
-            stdout = exc.stdout if isinstance(exc.stdout, str) else ""
-            stderr = exc.stderr if isinstance(exc.stderr, str) else ""
-            raise AgentRuntimeError(
-                "agent command timed out",
-                stdout=stdout,
-                stderr=stderr or "agent command timed out",
-                returncode=None,
-                timed_out=True,
-                configured_timeout_seconds=agent["timeout_seconds"],
-                elapsed_seconds=time.monotonic() - started_at,
-            ) from exc
-        if completed.returncode != 0:
-            raise AgentRuntimeError(
-                "agent command failed",
-                stdout=completed.stdout,
-                stderr=completed.stderr,
-                returncode=completed.returncode,
-                configured_timeout_seconds=agent["timeout_seconds"],
-                elapsed_seconds=time.monotonic() - started_at,
-            )
-    return {
-        "returncode": completed.returncode,
-        "stdout": completed.stdout,
-        "stderr": completed.stderr,
-        "configured_timeout_seconds": agent["timeout_seconds"],
-        "elapsed_seconds": time.monotonic() - started_at,
-        "timed_out": False,
-    }
-
-
-def _render_agent_command(command: list[str], *, prompt: str) -> list[str]:
-    rendered: list[str] = []
-    for part in command:
-        rendered.append(part.replace(PI_JOB_PROMPT_PLACEHOLDER, prompt))
-    return rendered
-
-
-def minimal_agent_environment(temp_path: Path, *, config_home: str = "") -> dict[str, str]:
-    env: dict[str, str] = {}
-    for key in ("PATH", "LANG", "LC_ALL", "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL"):
-        value = os.environ.get(key)
-        if value is not None:
-            env[key] = value
-    home_path = temp_path / "home"
-    home_path.mkdir()
-    env["HOME"] = str(home_path)
-    if config_home:
-        env["XDG_CONFIG_HOME"] = config_home
-    else:
-        xdg_config_home = temp_path / "xdg-config"
-        xdg_config_home.mkdir()
-        env["XDG_CONFIG_HOME"] = str(xdg_config_home)
-    return env
+        command = render_command(agent["command"], {PI_JOB_PROMPT_PLACEHOLDER: canonical_json(capsule)})
+        return execute_role_command(
+            command=command,
+            cwd=checkout_path,
+            env=env,
+            timeout_seconds=agent["timeout_seconds"],
+            runtime_failure_message="agent command failed",
+            timeout_message="agent command timed out",
+        )
 
 
 def add_git_identity_fallback(env: dict[str, str], checkout_path: Path) -> None:
@@ -1082,22 +1013,17 @@ def read_agent_payload(
         return {"status": "invalid", "message": "agent result_path escaped checkout"}
     if path.is_symlink():
         return {"status": "invalid", "message": "agent result_path is a symlink"}
-    try:
-        raw = path.read_text(encoding="utf-8")
-    except OSError:
-        return {"status": "invalid", "message": "agent result file was not produced"}
-    if cleanup:
-        try:
-            path.unlink()
-        except OSError:
-            pass
-    try:
-        payload = json.loads(raw)
-    except json.JSONDecodeError:
-        return {"status": "invalid", "message": "agent result file is not valid JSON"}
-    if not isinstance(payload, dict):
-        return {"status": "invalid", "message": "agent result file must contain an object"}
-    return {"status": "valid", "payload": redact_artifact_value(payload, exact_secrets=exact_secrets)}
+    result = read_json_result_file(
+        path,
+        missing_message="agent result file was not produced",
+        invalid_json_message="agent result file is not valid JSON",
+        invalid_type_message="agent result file must contain an object",
+        exact_secrets=exact_secrets,
+        cleanup=cleanup,
+    )
+    if result["status"] == "missing":
+        return {"status": "invalid", "message": result["message"]}
+    return result
 
 
 def normalize_agent_payload(
@@ -1395,13 +1321,6 @@ def git(checkout_path: Path, args: list[str]) -> str:
             returncode=completed.returncode,
         )
     return completed.stdout.strip()
-
-
-def write_adapter_logs(stdout: str, stderr: str) -> None:
-    if stdout:
-        print(stdout, end="")
-    if stderr:
-        print(stderr, end="", file=sys.stderr)
 
 
 def result_path_error(result_path: str) -> str | None:

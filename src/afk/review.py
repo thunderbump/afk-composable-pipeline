@@ -2,9 +2,7 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import subprocess
-import sys
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -12,28 +10,22 @@ from typing import Any
 from afk.jsonutil import canonical_json
 from afk.pi_workers import non_openai_pi_mount_error, openai_codex_pi_mount_error, validate_absolute_dir
 from afk.redaction import is_secret_command_flag, redact_artifact_value, redact_text
+from afk.role_adapters import (
+    RoleAdapterRuntimeError,
+    execute_role_command,
+    minimal_command_environment,
+    read_json_result_file,
+    redact_adapter_streams,
+    render_command,
+    write_adapter_logs,
+)
 
 
 SCHEMA_VERSION = 1
 REVIEWER_COMMAND_TYPES = {"fake-reviewer-command", "real-reviewer-command"}
 
 
-class ReviewerRuntimeError(RuntimeError):
-    def __init__(
-        self,
-        message: str,
-        *,
-        stdout: str = "",
-        stderr: str = "",
-        returncode: int | None = None,
-        timed_out: bool = False,
-    ):
-        super().__init__(message)
-        self.message = message
-        self.stdout = stdout
-        self.stderr = stderr
-        self.returncode = returncode
-        self.timed_out = timed_out
+ReviewerRuntimeError = RoleAdapterRuntimeError
 
 
 def review_step(context: Any) -> dict[str, Any]:
@@ -81,7 +73,7 @@ def review(input_data: Any, *, run_id: str, run_dir: Path | None) -> dict[str, A
         return review_output(request, evidence_pack, normalized)
 
     try:
-        adapter_result, raw_result = run_fake_reviewer_command(
+        adapter_result, raw_payload = run_fake_reviewer_command(
             request["reviewer"],
             checkout_path=Path(request["checkout"]["path"]),
             reviewer_request=reviewer_request,
@@ -103,9 +95,10 @@ def review(input_data: Any, *, run_id: str, run_dir: Path | None) -> dict[str, A
         write_review_artifacts(run_dir, run_id, normalized)
         return review_output(request, evidence_pack, normalized)
 
-    raw_payload = read_reviewer_payload(raw_result, stdout=adapter_result["stdout"])
-    stdout = redact_text(adapter_result["stdout"])
-    stderr = redact_text(adapter_result["stderr"])
+    stdout, stderr = redact_adapter_streams(
+        stdout=adapter_result["stdout"],
+        stderr=adapter_result["stderr"],
+    )
     write_adapter_logs(stdout, stderr)
 
     if raw_payload["status"] != "valid":
@@ -773,11 +766,11 @@ def run_fake_reviewer_command(
     checkout_path: Path,
     reviewer_request: dict[str, Any],
     request_path: Path,
-) -> tuple[dict[str, Any], str | None]:
+) -> tuple[dict[str, Any], dict[str, Any]]:
     with tempfile.TemporaryDirectory() as temp_dir:
         temp_path = Path(temp_dir)
         result_path = temp_path / "reviewer-result.json"
-        env = minimal_reviewer_environment(temp_path, config_home=reviewer.get("config_home") or "")
+        env = minimal_command_environment(temp_path, config_home=reviewer.get("config_home") or "")
         env.update(reviewer.get("env") or {})
         if reviewer.get("codex_home"):
             env["CODEX_HOME"] = reviewer["codex_home"]
@@ -785,122 +778,32 @@ def run_fake_reviewer_command(
         env["AFK_REVIEWER_RESULT"] = str(result_path)
         command = render_command(
             reviewer["command"],
-            reviewer_request=reviewer_request,
-            request_path=request_path,
-            result_path=result_path,
+            {
+                "{prompt}": canonical_json(reviewer_request),
+                "{request_path}": str(request_path),
+                "{result_path}": str(result_path),
+            },
         )
-        try:
-            completed = subprocess.run(
-                command,
-                cwd=checkout_path,
-                env=env,
-                text=True,
-                capture_output=True,
-                check=False,
-                timeout=reviewer["timeout_seconds"],
-            )
-        except OSError as exc:
-            raise ReviewerRuntimeError(str(exc), stderr=str(exc), returncode=None) from exc
-        except subprocess.TimeoutExpired as exc:
-            stdout = exc.stdout if isinstance(exc.stdout, str) else ""
-            stderr = exc.stderr if isinstance(exc.stderr, str) else ""
-            raise ReviewerRuntimeError(
-                "reviewer command timed out",
-                stdout=stdout,
-                stderr=stderr or "reviewer command timed out",
-                returncode=None,
-                timed_out=True,
-            ) from exc
-        raw_payload = result_path.read_text(encoding="utf-8") if result_path.exists() else None
-    if completed.returncode != 0:
-        raise ReviewerRuntimeError(
-            "reviewer command failed",
-            stdout=completed.stdout,
-            stderr=completed.stderr,
-            returncode=completed.returncode,
+        adapter_result = execute_role_command(
+            command=command,
+            cwd=checkout_path,
+            env=env,
+            timeout_seconds=reviewer["timeout_seconds"],
+            runtime_failure_message="reviewer command failed",
+            timeout_message="reviewer command timed out",
         )
-    return {
-        "returncode": completed.returncode,
-        "stdout": completed.stdout,
-        "stderr": completed.stderr,
-    }, raw_payload
+        return adapter_result, read_reviewer_payload(result_path)
 
 
-def render_command(
-    command: list[str],
-    *,
-    reviewer_request: dict[str, Any],
-    request_path: Path,
-    result_path: Path,
-) -> list[str]:
-    replacements = {
-        "{prompt}": canonical_json(reviewer_request),
-        "{request_path}": str(request_path),
-        "{result_path}": str(result_path),
-    }
-    pattern = re.compile("|".join(sorted((re.escape(token) for token in replacements), key=len, reverse=True)))
-    rendered = []
-    for part in command:
-        rendered.append(pattern.sub(lambda match: replacements[match.group(0)], part))
-    return rendered
-
-
-def minimal_reviewer_environment(temp_path: Path, *, config_home: str = "") -> dict[str, str]:
-    env: dict[str, str] = {}
-    for key in (
-        "PATH",
-        "LANG",
-        "LC_ALL",
-        "GIT_AUTHOR_NAME",
-        "GIT_AUTHOR_EMAIL",
-        "GIT_COMMITTER_NAME",
-        "GIT_COMMITTER_EMAIL",
-    ):
-        value = os.environ.get(key)
-        if value is not None:
-            env[key] = value
-    home_path = temp_path / "home"
-    home_path.mkdir()
-    env["HOME"] = str(home_path)
-    if config_home:
-        env["XDG_CONFIG_HOME"] = config_home
-    else:
-        xdg_config_home = temp_path / "xdg-config"
-        xdg_config_home.mkdir()
-        env["XDG_CONFIG_HOME"] = str(xdg_config_home)
-    return env
-
-
-def read_reviewer_payload(raw: str | None, *, stdout: str) -> dict[str, Any]:
-    if raw is None:
-        return {
-            "status": "missing",
-            "message": "reviewer result file was not produced",
-            "result_source": "reviewer_result_file",
-            "result_file_present": False,
-        }
-    try:
-        payload = json.loads(raw)
-    except json.JSONDecodeError:
-        return {
-            "status": "invalid",
-            "message": "reviewer result file is not valid JSON",
-            "result_source": "reviewer_result_file",
-            "result_file_present": True,
-        }
-    if not isinstance(payload, dict):
-        return {
-            "status": "invalid",
-            "message": "reviewer result file must contain an object",
-            "result_source": "reviewer_result_file",
-            "result_file_present": True,
-        }
-    return {
-        "status": "valid",
-        "payload": redact_artifact_value(payload),
-        "result_source": "reviewer_result_file",
-        "result_file_present": True,
-    }
+def read_reviewer_payload(path: Path) -> dict[str, Any]:
+    result = read_json_result_file(
+        path,
+        missing_message="reviewer result file was not produced",
+        invalid_json_message="reviewer result file is not valid JSON",
+        invalid_type_message="reviewer result file must contain an object",
+    )
+    result["result_source"] = "reviewer_result_file"
+    return result
 
 
 def normalize_reviewer_payload(
@@ -1073,13 +976,6 @@ def git(checkout_path: Path, args: list[str]) -> str:
 
 def write_json(path: Path, payload: dict[str, Any]) -> None:
     path.write_text(canonical_json(redact_artifact_value(payload)) + "\n", encoding="utf-8")
-
-
-def write_adapter_logs(stdout: str, stderr: str) -> None:
-    if stdout:
-        print(stdout, end="")
-    if stderr:
-        print(stderr, end="", file=sys.stderr)
 
 
 def command_secret_error_message(command: list[str]) -> str | None:
