@@ -60,13 +60,13 @@ def minimal_command_environment(temp_path: Path, *, config_home: str = "") -> di
         if value is not None:
             env[key] = value
     home_path = temp_path / "home"
-    home_path.mkdir()
+    home_path.mkdir(exist_ok=True)
     env["HOME"] = str(home_path)
     if config_home:
         env["XDG_CONFIG_HOME"] = config_home
     else:
         xdg_config_home = temp_path / "xdg-config"
-        xdg_config_home.mkdir()
+        xdg_config_home.mkdir(exist_ok=True)
         env["XDG_CONFIG_HOME"] = str(xdg_config_home)
     return env
 
@@ -252,4 +252,3 @@ def temp_json_file(temp_path: Path, name: str, payload: dict[str, Any]) -> Path:
     path = temp_path / name
     path.write_text(canonical_json(payload) + "\n", encoding="utf-8")
     return path
-
