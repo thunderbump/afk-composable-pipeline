@@ -15,6 +15,7 @@ from typing import Any, Callable
 from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
 from afk.contracts import ProjectContract
+from afk import evidence_gate
 from afk.implement import runtime_failure_excerpt, safe_git_metadata
 from afk.jsonutil import canonical_json, sha256_json
 from afk.pi_workers import (
@@ -1453,34 +1454,18 @@ def validation_artifact_refs(state: dict[str, Any], ledger_dir: Path) -> list[di
 
 
 def publication_gate_reason(state: dict[str, Any]) -> str:
-    if not state["validations"]:
+    gate = evidence_gate.publication_gate(
+        validations=[validation_gate_entry(item) for item in state["validations"] if isinstance(item, dict)],
+        review=review_gate_entry(state.get("review")),
+        implemented_commit=implemented_after_commit(state),
+        incomplete_selected_work=incomplete_selected_work_ids(state),
+    )
+    if gate["passed"]:
+        return ""
+    reason = str(gate.get("reason") or "")
+    if reason == "required final validation evidence is not validated: required validation":
         return "required final validation evidence is missing"
-    failed_validations = [
-        validation for validation in state["validations"] if validation["output"].get("status") != "validated"
-    ]
-    if failed_validations:
-        names = ", ".join(validation_name(item) for item in failed_validations)
-        return f"required final validation evidence did not pass: {names}"
-    implemented_commit = implemented_after_commit(state)
-    stale_validations = [
-        validation
-        for validation in state["validations"]
-        if implemented_commit and validation_checkout_commit(validation) != implemented_commit
-    ]
-    if stale_validations:
-        names = ", ".join(validation_name(item) for item in stale_validations)
-        return f"required final validation evidence is stale for implemented HEAD: {names}"
-    review = state.get("review")
-    if not isinstance(review, dict):
-        return "required final review evidence is missing"
-    if review.get("status") != "passed":
-        return f"final review did not pass: {review.get('status') or 'missing status'}"
-    if implemented_commit and review_checkout_commit(review) != implemented_commit:
-        return "final review evidence is stale for implemented HEAD"
-    incomplete = incomplete_selected_work_ids(state)
-    if incomplete:
-        return "selected work items lack passed implementation, validation, and review evidence: " + ", ".join(incomplete)
-    return ""
+    return reason
 
 
 def validation_checkout_commit(validation: dict[str, Any]) -> str:
@@ -6644,20 +6629,37 @@ def validation_name(validation: dict[str, Any]) -> str:
     return string_field(info, "requested_profile") or string_field(info, "worker_profile") or "validation"
 
 
-def pr_body_validation_line(validation: dict[str, Any], index: int) -> str:
+def validation_gate_entry(validation: dict[str, Any]) -> dict[str, Any]:
     output = validation.get("output") if isinstance(validation.get("output"), dict) else {}
-    profile = validation_name_for_body(validation, index)
-    status = string_field(output, "status") or "missing"
-    evidence = validation_worker_evidence_for_body(output)
-    step_ref = ledger_relative_path(string_field(validation, "step_result_path") or "")
-    worker_ref = ledger_relative_path(string_field(validation, "worker_result_path") or "")
-    path_evidence = "; ".join(item for item in [step_ref, worker_ref] if item)
-    parts = [f"- {pr_body_value(profile)}: {pr_body_value(status)}"]
-    if evidence:
-        parts.append(pr_body_value(evidence))
-    if path_evidence:
-        parts.append(f"evidence: {pr_body_value(path_evidence)}")
-    return " - ".join(parts)
+    worker_result = output.get("worker_result") if isinstance(output.get("worker_result"), dict) else {}
+    worker_normalized = worker_result.get("normalized") if isinstance(worker_result.get("normalized"), dict) else {}
+    return {
+        "name": validation_name(validation),
+        "status": string_field(output, "status") or "missing",
+        "classification": string_field(output, "classification") or "",
+        "summary": string_field(output, "summary") or "",
+        "worker_status": string_field(worker_normalized, "status") or "missing",
+        "worker_classification": string_field(worker_normalized, "classification") or "",
+        "worker_summary": string_field(worker_normalized, "summary") or "",
+        "worker_result": worker_result,
+        "evidence_status": "valid",
+        "checkout_commit": validation_checkout_commit(validation),
+        "step_result_path": string_field(validation, "step_result_path") or "",
+        "worker_result_path": string_field(validation, "worker_result_path") or "",
+    }
+
+
+def review_gate_entry(review: Any) -> dict[str, Any] | None:
+    if not isinstance(review, dict):
+        return None
+    return {
+        "status": string_field(review, "status") or "",
+        "checkout_commit": review_checkout_commit(review),
+    }
+
+
+def pr_body_validation_line(validation: dict[str, Any], index: int) -> str:
+    return pr_body_value(evidence_gate.validation_summary_line(validation_gate_entry(validation), index))
 
 
 def validation_name_for_body(validation: dict[str, Any], index: int) -> str:
