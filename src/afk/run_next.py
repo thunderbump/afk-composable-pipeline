@@ -31,9 +31,6 @@ def run_next(
     retrospective_follow_up: dict[str, Any] | None = None,
     publisher_factory: Callable[[str], dict[str, Any] | None] | None = None,
     ready_tag: str = READY_TAG,
-    selector_mode: str = "deterministic",
-    selector_model: str | None = None,
-    selector_choice_json: str | None = None,
     enable_review_feedback: bool = False,
     expect_generated_smoke_dry_run: bool = False,
     execute: bool = False,
@@ -147,21 +144,12 @@ def build_selection_request(
 
 def choose_candidate(
     candidates: list[dict[str, Any]],
-    *,
-    selector_mode: str = "deterministic",
-    selector_model: str | None = None,
-    selector_choice_json: str | None = None,
 ) -> dict[str, Any] | None:
     if not candidates:
         return None
     return deterministic_candidate(candidates)
 
-def selector_result(
-    chosen: dict[str, Any] | None,
-    *,
-    selector_mode: str = "deterministic",
-    selector_model: str | None = None,
-) -> dict[str, Any]:
+def selector_result(chosen: dict[str, Any] | None) -> dict[str, Any]:
     if chosen is None:
         return {"mode": "deterministic", "model": None, "selected": None, "rationale": "no candidates"}
     return {

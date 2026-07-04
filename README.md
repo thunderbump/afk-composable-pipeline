@@ -552,8 +552,7 @@ quick pipeline exercise, not when you need real project validation evidence.
 
 When using Pi-backed roles, all worker model flags are validated with the same
 cap: `gpt-5.4` or lower. The production role profile defaults to `gpt-5.4` for
-implementation and review. The lightweight selector path stays limited to
-`gpt-5.3-codex-spark` and `gpt-5.4-mini`.
+implementation and review.
 
 `--agent-ponytail` and `--reviewer-ponytail` map to the same bundled extension
 source `git:github.com/DietrichGebert/ponytail`; explicit

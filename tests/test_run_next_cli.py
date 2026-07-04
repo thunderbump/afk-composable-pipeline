@@ -1392,16 +1392,11 @@ raise SystemExit(9)
             },
         ]
 
-        chosen = choose_candidate(
-            candidates,
-            selector_mode="deterministic",
-            selector_model=None,
-            selector_choice_json=None,
-        )
+        chosen = choose_candidate(candidates)
 
         self.assertEqual(chosen["external_id"], "central-aaa.1")
         self.assertEqual(
-            selector_result(chosen, selector_mode="deterministic", selector_model=None),
+            selector_result(chosen),
             {
                 "mode": "deterministic",
                 "model": None,
@@ -1413,6 +1408,27 @@ raise SystemExit(9)
                 },
             },
         )
+
+    def test_direct_python_selector_kwargs_are_rejected(self):
+        contract = load_project_contract("bump-eqemu", ROOT / "project-contracts", cwd=ROOT)
+        cases = (
+            lambda: choose_candidate([], selector_mode="deterministic"),
+            lambda: selector_result(None, selector_model="gpt-5.4-mini"),
+            lambda: run_next(
+                project_contract=contract,
+                beads_workspace=ROOT,
+                checkout_root=ROOT,
+                checkout_path=ROOT,
+                validation_profile="tier1",
+                selector_choice_json='{"external_id":"central-demo.1"}',
+            ),
+        )
+
+        for call in cases:
+            with self.subTest(call=call):
+                with self.assertRaises(TypeError) as exc:
+                    call()
+                self.assertIn("unexpected keyword argument", str(exc.exception))
 
     def test_deterministic_selector_prefers_lower_beads_priority_before_lexical_id(self):
         candidates = [
@@ -1434,12 +1450,7 @@ raise SystemExit(9)
             },
         ]
 
-        chosen = choose_candidate(
-            candidates,
-            selector_mode="deterministic",
-            selector_model=None,
-            selector_choice_json=None,
-        )
+        chosen = choose_candidate(candidates)
 
         self.assertEqual(chosen["external_id"], "central-lve.9")
 
@@ -1498,9 +1509,6 @@ raise SystemExit(9)
                     checkout_root=ROOT / "project-contracts",
                     checkout_path=ROOT / "project-contracts",
                     validation_profile="tier1",
-                    selector_mode="deterministic",
-                    selector_model=None,
-                    selector_choice_json=None,
                     execute=True,
                     ledger_dir=ROOT / "project-contracts",
                     workstream_runner=fake_workstream_runner,
@@ -1615,9 +1623,6 @@ raise SystemExit(9)
                     checkout_root=ROOT / "project-contracts",
                     checkout_path=ROOT / "project-contracts",
                     validation_profile="tier1",
-                    selector_mode="deterministic",
-                    selector_model=None,
-                    selector_choice_json=None,
                     execute=True,
                     ledger_dir=temp_path / "ledger",
                     workstream_runner=fake_workstream_runner,
@@ -1697,9 +1702,6 @@ raise SystemExit(9)
                             checkout_root=ROOT / "project-contracts",
                             checkout_path=ROOT / "project-contracts",
                             validation_profile="tier1",
-                            selector_mode="deterministic",
-                            selector_model=None,
-                            selector_choice_json=None,
                             execute=True,
                             ledger_dir=ledger_dir,
                             workstream_runner=lambda recipe_input, *, ledger_dir, project_contract: WorkstreamResult(
@@ -1803,9 +1805,6 @@ raise SystemExit(9)
                     checkout_root=checkout_root,
                     checkout_path=checkout_path,
                     validation_profile="tier1",
-                    selector_mode="deterministic",
-                    selector_model=None,
-                    selector_choice_json=None,
                     agent=pi_agent,
                     execute=True,
                     ledger_dir=ledger_dir,
@@ -1887,9 +1886,6 @@ raise SystemExit(9)
                     checkout_root=checkout_root,
                     checkout_path=checkout_path,
                     validation_profile="tier1",
-                    selector_mode="deterministic",
-                    selector_model=None,
-                    selector_choice_json=None,
                 )
         finally:
             run_next.__globals__["select_work"] = original_select_work
@@ -1956,9 +1952,6 @@ raise SystemExit(9)
                     checkout_root=checkout_root,
                     checkout_path=checkout_path,
                     validation_profile="tier1",
-                    selector_mode="deterministic",
-                    selector_model=None,
-                    selector_choice_json=None,
                     enable_review_feedback=False,
                     execute=True,
                     ledger_dir=ledger_dir,
@@ -2098,9 +2091,6 @@ raise SystemExit(9)
                     checkout_root=ROOT / "project-contracts",
                     checkout_path=ROOT / "project-contracts",
                     validation_profile="tier1",
-                    selector_mode="deterministic",
-                    selector_model=None,
-                    selector_choice_json=None,
                     execute=True,
                     ledger_dir=ROOT / "project-contracts",
                     workstream_runner=fake_workstream_runner,
