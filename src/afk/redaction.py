@@ -175,7 +175,7 @@ def is_bearer_secret_value(value: str) -> bool:
     if value.isalpha() and value.islower() and value in SAFE_BEARER_WORDS:
         return False
     return any(char.isdigit() for char in value) or any(char.isupper() for char in value) or any(
-        char in "./+~" for char in value
+        char in "./+~_-" for char in value
     ) or value.isalpha()
 
 
