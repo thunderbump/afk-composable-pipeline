@@ -5446,7 +5446,11 @@ def _blocked_reason_targets_work_item(state: dict[str, Any], reason: str) -> boo
         return string_field(review, "status") == "request_revision"
     if reason.startswith("review requested changes:"):
         return True
-    if reason.startswith("validate did not reach validated:") or reason.startswith("required final validation evidence did not pass:"):
+    if (
+        reason.startswith("validate did not reach validated:")
+        or reason.startswith("required final validation evidence did not pass:")
+        or reason.startswith("required final validation evidence is not validated:")
+    ):
         validation = latest_validation_record(state)
         if validation is None:
             return False

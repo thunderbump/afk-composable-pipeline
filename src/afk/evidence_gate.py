@@ -35,7 +35,7 @@ def publication_gate(
     if review.get("status") != "passed":
         return {"passed": False, "reason": f"final review did not pass: {review.get('status') or 'missing status'}"}
     review_commit = string_field(review, "checkout_commit")
-    if implemented_commit and review_commit and review_commit != implemented_commit:
+    if implemented_commit and review_commit != implemented_commit:
         return {"passed": False, "reason": "final review evidence is stale for implemented HEAD"}
     if incomplete_selected_work:
         return {
@@ -58,12 +58,13 @@ def validation_failures(required: list[dict[str, Any]], *, implemented_commit: s
         worker_status = string_field(item, "worker_status") or worker_result_status(item)
         evidence_status = string_field(item, "evidence_status") or "valid"
         checkout_commit = string_field(item, "checkout_commit")
-        if implemented_commit and checkout_commit and checkout_commit != implemented_commit:
+        if implemented_commit and checkout_commit != implemented_commit:
+            validated_for = checkout_commit or "missing checkout_commit"
             failures.append(
                 {
                     "status": "fail",
                     "title": f"{name} validation evidence is stale",
-                    "summary": f"{name} was validated for {checkout_commit}, not {implemented_commit}",
+                    "summary": f"{name} was validated for {validated_for}, not {implemented_commit}",
                     "validation": {"name": name, "status": status, "checkout_commit": checkout_commit},
                     "gate_reason": f"{name}",
                     "gate_reason_kind": "stale",

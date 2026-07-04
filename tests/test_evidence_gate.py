@@ -52,6 +52,52 @@ class EvidenceGateTest(unittest.TestCase):
             "required final validation evidence is stale for implemented HEAD: tier1",
         )
 
+    def test_required_validation_gate_rejects_missing_checkout_commit_for_implemented_head(self):
+        gate = evidence_gate.required_validation_gate(
+            [
+                {
+                    "name": "tier1",
+                    "status": "validated",
+                    "worker_status": "validated",
+                    "evidence_status": "valid",
+                    "step_result_path": "/tmp/ledger/runs/validate/step-result.json",
+                    "worker_result_path": "/tmp/ledger/runs/validate/worker-result.json",
+                }
+            ],
+            implemented_commit="new-head",
+        )
+
+        self.assertFalse(gate["passed"])
+        self.assertEqual(
+            gate["reason"],
+            "required final validation evidence is stale for implemented HEAD: tier1",
+        )
+        self.assertEqual(
+            gate["failures"][0]["summary"],
+            "tier1 was validated for missing checkout_commit, not new-head",
+        )
+
+    def test_publication_gate_rejects_missing_review_checkout_commit_for_implemented_head(self):
+        gate = evidence_gate.publication_gate(
+            validations=[
+                {
+                    "name": "tier1",
+                    "status": "validated",
+                    "worker_status": "validated",
+                    "evidence_status": "valid",
+                    "checkout_commit": "new-head",
+                    "step_result_path": "/tmp/ledger/runs/validate/step-result.json",
+                    "worker_result_path": "/tmp/ledger/runs/validate/worker-result.json",
+                }
+            ],
+            review={"status": "passed"},
+            implemented_commit="new-head",
+            incomplete_selected_work=[],
+        )
+
+        self.assertFalse(gate["passed"])
+        self.assertEqual(gate["reason"], "final review evidence is stale for implemented HEAD")
+
     def test_validation_summary_lines_preserve_pr_body_contract(self):
         lines = evidence_gate.validation_summary_lines(
             [
