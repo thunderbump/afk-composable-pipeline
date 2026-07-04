@@ -1040,7 +1040,7 @@ Path(os.environ["AFK_REVIEWER_RESULT"]).write_text(
             self.assertEqual(reviewer_result["result"]["evidence"]["result_source"], "reviewer_result_file")
             self.assertEqual(reviewer_result["result"]["evidence"]["result_file_present"], False)
 
-    def test_review_records_real_reviewer_adapter_type_for_pi_like_reviewers(self):
+    def test_review_accepts_real_reviewer_bare_stdout_json_when_result_file_is_absent(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
             checkout = temp_path / "checkout"
@@ -1081,10 +1081,14 @@ Path(os.environ["AFK_REVIEWER_RESULT"]).write_text(
             result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
             reviewer_result = json.loads((run_dir / "reviewer-result.json").read_text(encoding="utf-8"))
 
-            self.assertEqual(summary["status"], "failed")
-            self.assertEqual(result["output"]["status"], "failed_protocol")
+            self.assertEqual(summary["status"], "succeeded")
+            self.assertEqual(result["status"], "succeeded")
+            self.assertEqual(result["output"]["status"], "passed")
+            self.assertEqual(result["output"]["summary"], "pi review passed")
             self.assertEqual(reviewer_result["result"]["adapter"]["type"], "real-reviewer-command")
-            self.assertEqual(reviewer_result["result"]["evidence"]["result_source"], "reviewer_result_file")
+            self.assertEqual(reviewer_result["result"]["status"], "passed")
+            self.assertEqual(reviewer_result["result"]["summary"], "pi review passed")
+            self.assertEqual(reviewer_result["result"]["evidence"]["result_source"], "stdout_fallback")
             self.assertEqual(reviewer_result["result"]["evidence"]["result_file_present"], False)
 
     def test_review_rejects_status_only_stdout_json_when_result_file_is_absent(self):
