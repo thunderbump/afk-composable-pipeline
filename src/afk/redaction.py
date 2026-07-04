@@ -36,7 +36,8 @@ SECRET_TOKEN_VALUE_PATTERN = re.compile(
     r")\b"
 )
 BEARER_SECRET_PATTERN = re.compile(
-    r"(?P<prefix>\bBearer\s+)(?P<quote>[\"']?)(?P<value>[A-Za-z0-9._~+/=-]{12,})(?P=quote)",
+    r"(?P<prefix>\bBearer\s+)"
+    r"(?P<value>(?P<quote>(?:\\)?[\"'])?[A-Za-z0-9._~+/=-]{12,}(?(quote)(?P=quote)))",
     re.IGNORECASE,
 )
 SAFE_BEARER_WORDS = {"unauthorized", "authorizationfailed", "missingcredential"}
@@ -186,6 +187,8 @@ def is_bearer_secret_value(value: str) -> bool:
 
 def normalize_bearer_secret_value(value: str) -> str:
     normalized = value.strip()
+    if len(normalized) >= 4 and normalized[:2] == normalized[-2:] and normalized[:2] in {r"\"", r"\'"}:
+        return normalized[2:-2].strip()
     if len(normalized) >= 2 and normalized[0] == normalized[-1] and normalized[0] in "\"'":
         return normalized[1:-1].strip()
     return normalized

@@ -204,6 +204,23 @@ class WorkstreamStatusMappingTest(unittest.TestCase):
                         }
                     )
 
+    def test_normalize_retrospective_follow_up_config_rejects_backslash_escaped_quoted_bearer_token_in_command(self):
+        for token in (r"\"abcdefghijklmnop==\"", r"\'abcdefghijklmnop\'"):
+            with self.subTest(token=token):
+                with self.assertRaisesRegex(WorkstreamError, "secret-looking values"):
+                    normalize_retrospective_follow_up_config(
+                        {
+                            "enabled": True,
+                            "type": "fake-follow-up-command",
+                            "command": [
+                                "curl",
+                                "-H",
+                                f"Authorization: Bearer {token}",
+                                "https://example.invalid",
+                            ],
+                        }
+                    )
+
     def test_normalize_retrospective_follow_up_config_allows_bearer_auth_failure_prose_in_command(self):
         for value in ("unauthorized", "authorizationfailed", "missingcredential"):
             with self.subTest(value=value):
@@ -342,6 +359,24 @@ class WorkstreamStatusMappingTest(unittest.TestCase):
 
     def test_normalize_retrospective_judge_rejects_split_quoted_bearer_token_in_command(self):
         for token in ('"abcdefghijklmnop=="', "'abcdefghijklmnop'"):
+            with self.subTest(token=token):
+                with self.assertRaisesRegex(WorkstreamError, "secret-looking values"):
+                    normalize_retrospective_judge(
+                        {
+                            "enabled": True,
+                            "type": "fake-judge-command",
+                            "command": [
+                                "curl",
+                                "-H",
+                                "Authorization: Bearer",
+                                token,
+                                "https://example.invalid",
+                            ],
+                        }
+                    )
+
+    def test_normalize_retrospective_judge_rejects_split_backslash_escaped_quoted_bearer_token_in_command(self):
+        for token in (r"\"abcdefghijklmnop==\"", r"\'abcdefghijklmnop\'"):
             with self.subTest(token=token):
                 with self.assertRaisesRegex(WorkstreamError, "secret-looking values"):
                     normalize_retrospective_judge(
@@ -1438,6 +1473,28 @@ class WorkstreamStatusMappingTest(unittest.TestCase):
                 state["implementation"]["agent_result"] = {
                     "evidence": {
                         "stderr_excerpt": f'Authentication failed: Bearer {token}',
+                        "stdout_excerpt": "",
+                    }
+                }
+
+                record = pipeline_retrospective_record(
+                    state,
+                    {"status": "blocked", "reason": "implement did not reach implemented: failed_runtime"},
+                    retrospective_tracker("selected"),
+                )
+
+                self.assertEqual(record["signals"][0]["kind"], "implementation-auth")
+                self.assertEqual(record["signals"][0]["summary"], "Authentication failed: Bearer [REDACTED]")
+                self.assertEqual(record["signals"][0]["excerpt"], "Authentication failed: Bearer [REDACTED]")
+
+    def test_pipeline_retrospective_record_redacts_backslash_escaped_quoted_bearer_token_in_implementation_auth_signal(self):
+        for token in (r"\"abcdefghijklmnop==\"", r"\'abcdefghijklmnop\'"):
+            with self.subTest(token=token):
+                state = retrospective_state()
+                state["implementation"]["summary"] = "implement did not reach implemented: failed_runtime"
+                state["implementation"]["agent_result"] = {
+                    "evidence": {
+                        "stderr_excerpt": f"Authentication failed: Bearer {token}",
                         "stdout_excerpt": "",
                     }
                 }
