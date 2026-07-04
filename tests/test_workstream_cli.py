@@ -1130,8 +1130,13 @@ Path({str(fake_calls)!r}).write_text("gh should not run\\n", encoding="utf-8")
             reviewer_code = textwrap.dedent(
                 """
                 import json
+                import os
+                from pathlib import Path
 
-                print(json.dumps({"status": "pass", "summary": "stdout review passed", "findings": []}))
+                Path(os.environ["AFK_REVIEWER_RESULT"]).write_text(
+                    json.dumps({"status": "pass", "summary": "stdout review passed", "findings": []}),
+                    encoding="utf-8",
+                )
                 """
             ).strip()
             recipe = successful_recipe(temp_path, repo, checkout, fake_git, fake_gh)
@@ -1177,8 +1182,8 @@ Path({str(fake_calls)!r}).write_text("gh should not run\\n", encoding="utf-8")
             self.assertEqual(result["selected_work"][0]["result"], "passed")
             self.assertEqual(review_result["result"]["status"], "passed")
             self.assertEqual(review_result["result"]["adapter"]["type"], "real-reviewer-command")
-            self.assertEqual(review_result["result"]["evidence"]["result_source"], "stdout_fallback")
-            self.assertEqual(review_result["result"]["evidence"]["result_file_present"], False)
+            self.assertEqual(review_result["result"]["evidence"]["result_source"], "reviewer_result_file")
+            self.assertEqual(review_result["result"]["evidence"]["result_file_present"], True)
             self.assertFalse(fake_calls.exists())
 
     def test_workstream_terminal_merge_decision_does_not_skip_minimal_pr_publication(self):

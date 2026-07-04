@@ -2804,7 +2804,7 @@ class ImplementCliTest(unittest.TestCase):
             self.assertEqual(agent_result["result"]["adapter"]["returncode"], 0)
             self.assertIn("no result produced", agent_result["result"]["evidence"]["stdout_excerpt"])
 
-    def test_implement_recovers_missing_real_agent_result_when_stdout_and_clean_commit_exist(self):
+    def test_implement_requires_real_agent_result_file_when_stdout_and_clean_commit_exist(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
             checkout = temp_path / "checkout"
@@ -2872,13 +2872,12 @@ class ImplementCliTest(unittest.TestCase):
             result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
             agent_result = json.loads((run_dir / "agent-result.json").read_text(encoding="utf-8"))
 
-            self.assertEqual(result["output"]["status"], "implemented")
-            self.assertEqual(result["output"]["classification"], "success")
-            self.assertEqual(result["output"]["summary"], "Implemented in commit.")
+            self.assertEqual(result["output"]["status"], "failed_protocol")
+            self.assertEqual(result["output"]["classification"], "protocol_failure")
+            self.assertEqual(result["output"]["summary"], "agent result file was not produced")
             self.assertEqual(result["output"]["git"]["dirty"], False)
             self.assertEqual(result["output"]["git"]["changed_files"], ["implemented.txt"])
-            self.assertEqual(agent_result["result"]["status"], "implemented")
-            self.assertIn("agent-result.json missing", agent_result["result"]["notes"][0])
+            self.assertEqual(agent_result["result"]["status"], "failed_protocol")
             self.assertIn("Validation: smoke passed.", agent_result["result"]["evidence"]["stdout_excerpt"])
 
     def test_implement_does_not_recover_missing_real_agent_result_with_dirty_checkout(self):
@@ -3011,7 +3010,7 @@ class ImplementCliTest(unittest.TestCase):
             self.assertEqual(result["output"]["git"]["changed_files"], ["implemented.txt"])
             self.assertIn("ERROR: something went wrong", agent_result["result"]["evidence"]["stdout_excerpt"])
 
-    def test_implement_recovered_stdout_summary_preserves_bracketed_human_line(self):
+    def test_implement_missing_real_agent_result_file_ignores_bracketed_stdout_summary(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
             checkout = temp_path / "checkout"
@@ -3079,8 +3078,8 @@ class ImplementCliTest(unittest.TestCase):
             run_dir = ledger / "runs" / summary["run_id"]
             result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
 
-            self.assertEqual(result["output"]["status"], "implemented")
-            self.assertEqual(result["output"]["summary"], "[done] all good")
+            self.assertEqual(result["output"]["status"], "failed_protocol")
+            self.assertEqual(result["output"]["summary"], "agent result file was not produced")
 
     def test_implement_does_not_recover_missing_real_agent_result_with_negated_success_word(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -3151,7 +3150,7 @@ class ImplementCliTest(unittest.TestCase):
             self.assertEqual(result["output"]["status"], "failed_protocol")
             self.assertEqual(result["output"]["summary"], "agent result file was not produced")
 
-    def test_implement_recovers_missing_real_agent_result_with_successful_test_summary(self):
+    def test_implement_requires_result_file_even_with_successful_test_summary_stdout(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
             checkout = temp_path / "checkout"
@@ -3218,10 +3217,10 @@ class ImplementCliTest(unittest.TestCase):
             run_dir = ledger / "runs" / summary["run_id"]
             result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
 
-            self.assertEqual(result["output"]["status"], "implemented")
-            self.assertEqual(result["output"]["summary"], "Implemented.")
+            self.assertEqual(result["output"]["status"], "failed_protocol")
+            self.assertEqual(result["output"]["summary"], "agent result file was not produced")
 
-    def test_implement_recovers_missing_real_agent_result_with_common_done_signal(self):
+    def test_implement_requires_result_file_even_with_common_done_signal_stdout(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
             checkout = temp_path / "checkout"
@@ -3288,10 +3287,10 @@ class ImplementCliTest(unittest.TestCase):
             run_dir = ledger / "runs" / summary["run_id"]
             result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
 
-            self.assertEqual(result["output"]["status"], "implemented")
-            self.assertEqual(result["output"]["summary"], "Done.")
+            self.assertEqual(result["output"]["status"], "failed_protocol")
+            self.assertEqual(result["output"]["summary"], "agent result file was not produced")
 
-    def test_implement_recovered_stdout_summary_skips_git_status_chatter(self):
+    def test_implement_missing_real_agent_result_file_ignores_git_status_chatter(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
             checkout = temp_path / "checkout"
@@ -3359,8 +3358,8 @@ class ImplementCliTest(unittest.TestCase):
             run_dir = ledger / "runs" / summary["run_id"]
             result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
 
-            self.assertEqual(result["output"]["status"], "implemented")
-            self.assertEqual(result["output"]["summary"], "Implemented.")
+            self.assertEqual(result["output"]["status"], "failed_protocol")
+            self.assertEqual(result["output"]["summary"], "agent result file was not produced")
 
     def test_implement_does_not_expose_ambient_secrets_to_adapter(self):
         with tempfile.TemporaryDirectory() as temp_dir:

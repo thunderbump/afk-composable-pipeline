@@ -868,7 +868,12 @@ def minimal_reviewer_environment(temp_path: Path, *, config_home: str = "") -> d
 
 def read_reviewer_payload(raw: str | None, *, stdout: str) -> dict[str, Any]:
     if raw is None:
-        return read_reviewer_payload_from_stdout(stdout)
+        return {
+            "status": "missing",
+            "message": "reviewer result file was not produced",
+            "result_source": "reviewer_result_file",
+            "result_file_present": False,
+        }
     try:
         payload = json.loads(raw)
     except json.JSONDecodeError:
@@ -891,58 +896,6 @@ def read_reviewer_payload(raw: str | None, *, stdout: str) -> dict[str, Any]:
         "result_source": "reviewer_result_file",
         "result_file_present": True,
     }
-
-
-def read_reviewer_payload_from_stdout(stdout: str) -> dict[str, Any]:
-    stripped_stdout = stdout.strip()
-    if not stripped_stdout:
-        return {
-            "status": "missing",
-            "message": "reviewer result file was not produced",
-            "result_source": "stdout_fallback",
-            "result_file_present": False,
-        }
-    try:
-        payload = json.loads(stripped_stdout)
-    except json.JSONDecodeError:
-        return {
-            "status": "invalid",
-            "message": "reviewer stdout is not valid JSON",
-            "result_source": "stdout_fallback",
-            "result_file_present": False,
-        }
-    if not isinstance(payload, dict):
-        return {
-            "status": "invalid",
-            "message": "reviewer stdout must contain a JSON object",
-            "result_source": "stdout_fallback",
-            "result_file_present": False,
-        }
-    if not stdout_payload_matches_schema(payload):
-        return {
-            "status": "invalid",
-            "message": "reviewer stdout JSON must match the reviewer result schema",
-            "result_source": "stdout_fallback",
-            "result_file_present": False,
-        }
-    return {
-        "status": "valid",
-        "payload": redact_artifact_value(payload),
-        "result_source": "stdout_fallback",
-        "result_file_present": False,
-    }
-
-
-def stdout_payload_matches_schema(payload: dict[str, Any]) -> bool:
-    artifact_type = string_field(payload, "artifact_type")
-    if artifact_type not in (None, "", "reviewer-result"):
-        return False
-    raw_status = string_field(payload, "status") or ""
-    if raw_status not in {"pass", "fail", "request_revision"}:
-        return False
-    if string_field(payload, "summary") is None:
-        return False
-    return isinstance(payload.get("findings"), list)
 
 
 def normalize_reviewer_payload(
