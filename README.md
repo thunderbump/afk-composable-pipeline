@@ -381,8 +381,18 @@ PYTHONPATH=src python3 -m afk generate-recipe \
   --checkout-path /work/bump-EQEmu \
   --validation-profile tier1 \
   --role-profile fake-local \
+  --publisher-mode create \
+  --publisher-repo thunderbump/afk-composable-pipeline \
+  --publisher-base main \
+  --publisher-gh-config-dir /tmp/afk-gh-config \
   --output recipes/central-afk-pr.1.json
 ```
+
+That fake-local generated recipe is still a full minimal runtime contract:
+explicit Beads selection, useful code change, validation, final review, PR
+create/update publication, and deterministic `pipeline-retrospective.json`
+evidence. Optional retrospective judge/follow-up creation and terminal
+close/merge/source-close automation stay outside this runtime path.
 
 For a real Pi implementation worker using Codex subscription auth, pass
 the usual `--agent-codex-home`, `--agent-config-home`, and legacy
