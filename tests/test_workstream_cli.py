@@ -9600,7 +9600,7 @@ Path({str(temp_path / "publisher-calls.txt")!r}).write_text("gh should not run\\
                 """
                 import sys
 
-                print("Authentication failed: Bearer abcdefghijklmnop", file=sys.stderr)
+                print("Authentication failed: Bearer A1b2C3d4E5f6G7h8", file=sys.stderr)
                 sys.exit(1)
                 """
             ).strip()
@@ -9671,7 +9671,7 @@ Path({str(temp_path / "publisher-calls.txt")!r}).write_text("gh should not run\\
                 ],
             )
             retrospective_text = json.dumps(result["pipeline_retrospective"])
-            self.assertNotIn("abcdefghijklmnop", retrospective_text)
+            self.assertNotIn("A1b2C3d4E5f6G7h8", retrospective_text)
 
     def test_workstream_update_mode_edits_existing_terminal_pr(self):
         with tempfile.TemporaryDirectory() as temp_dir:

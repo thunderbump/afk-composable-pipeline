@@ -195,9 +195,20 @@ class RedactionTest(unittest.TestCase):
                 self.assertEqual(redact_text(f"prefix {fake_token} suffix"), "prefix [REDACTED] suffix")
 
     def test_redacts_bearer_tokens_in_text(self):
-        text = "Authentication failed: Bearer abcdefghijklmnop"
+        text = "Authentication failed: Bearer A1b2C3d4E5f6G7h8"
 
         self.assertEqual(redact_text(text), "Authentication failed: Bearer [REDACTED]")
+
+    def test_preserves_non_secret_bearer_auth_failure_text(self):
+        self.assertEqual(
+            redact_text("Authentication failed: Bearer unauthorized"),
+            "Authentication failed: Bearer unauthorized",
+        )
+
+    def test_preserves_www_authenticate_bearer_parameters(self):
+        text = "WWW-Authenticate: Bearer authorization_uri=https://login.example/token, error=invalid_token"
+
+        self.assertEqual(redact_text(text), text)
 
     def test_artifact_redaction_still_removes_safe_url_query_strings(self):
         self.assertEqual(

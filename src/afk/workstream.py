@@ -23,7 +23,14 @@ from afk.pi_workers import (
     openai_codex_pi_mount_error,
     validate_absolute_dir,
 )
-from afk.redaction import is_secret_command_flag, is_secret_key, is_secret_value, redact_artifact_value, redact_text
+from afk.redaction import (
+    bearer_secret_present,
+    is_secret_command_flag,
+    is_secret_key,
+    is_secret_value,
+    redact_artifact_value,
+    redact_text,
+)
 from afk.recipes import review_branch_for_workstream
 from afk.registry import StepResult
 from afk.workstream_lifecycle import (
@@ -53,7 +60,6 @@ REVIEW_CYCLE_STATUSES = {"passed", "findings-open", "findings-addressed", "reque
 REVIEW_CYCLE_OPEN_STATUSES = {"findings-open", "request-changes"}
 REVIEW_CYCLE_RESPONSE_STATUSES = {"addressed", "findings-addressed"}
 TERMINAL_REVIEW_FEEDBACK_STATUSES = {"resolved", "waived"}
-COMMAND_BEARER_SECRET_PATTERN = re.compile(r"\bBearer\s+[A-Za-z0-9._~+/=-]{12,}", re.IGNORECASE)
 PI_JUDGE_PROMPT_PLACEHOLDER = "{prompt}"
 PI_JUDGE_REQUEST_PATH_PLACEHOLDER = "{request_path}"
 PI_JUDGE_RESULT_PATH_PLACEHOLDER = "{result_path}"
@@ -6625,7 +6631,7 @@ def _command_secret_error_message(command: list[str], *, field_name: str) -> str
         if is_secret_command_flag(part):
             flag = part.strip().split("=", 1)[0].lower()
             return f"{field_name} must not include credential flag {flag}"
-        if is_secret_value(part) or COMMAND_BEARER_SECRET_PATTERN.search(part):
+        if is_secret_value(part) or bearer_secret_present(part):
             return f"{field_name} must not include secret-looking values"
     return None
 

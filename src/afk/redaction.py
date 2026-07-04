@@ -135,7 +135,7 @@ def redact_text(value: str, *, exact_secrets: set[str] | None = None) -> str:
     redacted = JSON_SECRET_STRING_PATTERN.sub(redact_json_secret_string, redacted)
     redacted = SECRET_ASSIGNMENT_PATTERN.sub(redact_secret_assignment, redacted)
     redacted = SECRET_TOKEN_VALUE_PATTERN.sub("[REDACTED]", redacted)
-    redacted = BEARER_SECRET_PATTERN.sub(r"\g<prefix>[REDACTED]", redacted)
+    redacted = BEARER_SECRET_PATTERN.sub(redact_bearer_secret, redacted)
     return redact_exact_secret_values(redacted, exact_secrets=exact_secrets)
 
 
@@ -160,6 +160,28 @@ def normalize_exact_secrets(values: set[str] | None) -> set[str]:
             continue
         normalized.add(stripped)
     return normalized
+
+
+def bearer_secret_present(value: str) -> bool:
+    return any(is_bearer_secret_value(match.group("value")) for match in BEARER_SECRET_PATTERN.finditer(value))
+
+
+def is_bearer_secret_value(value: str) -> bool:
+    if len(value) < 12:
+        return False
+    if "=" in value.rstrip("="):
+        return False
+    if value.isalpha() and value.islower():
+        return False
+    return any(char.isdigit() for char in value) or any(char.isupper() for char in value) or any(
+        char in "./+~" for char in value
+    )
+
+
+def redact_bearer_secret(match: re.Match[str]) -> str:
+    if not is_bearer_secret_value(match.group("value")):
+        return match.group(0)
+    return f"{match.group('prefix')}[REDACTED]"
 
 
 def redact_json_secret_string(match: re.Match[str]) -> str:
