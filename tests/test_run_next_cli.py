@@ -2015,6 +2015,11 @@ raise SystemExit(9)
             "workstream": "central-lhy",
             "selector_rationale": "stale list rationale",
             "candidate_rank": 2,
+            "raw": {
+                "afk": {
+                    "selector_rationale": "preserve nested raw metadata",
+                }
+            },
         }
         chosen_candidate = {
             "source_id": "central-beads",
@@ -2039,6 +2044,11 @@ raise SystemExit(9)
                             "external_id": "central-lhy.15",
                             "selector_mode": "model",
                             "candidate_rank": 2,
+                            "raw": {
+                                "afk": {
+                                    "selector_mode": "preserve nested source metadata",
+                                }
+                            },
                         },
                         {
                             "external_id": "central-lhy.14",
@@ -2083,11 +2093,19 @@ raise SystemExit(9)
         self.assertNotIn("selector_rationale", selected_work[0])
         self.assertNotIn("selector_model", selected_work[1])
         self.assertEqual(selected_work[0]["candidate_rank"], 2)
+        self.assertEqual(
+            selected_work[0]["raw"]["afk"]["selector_rationale"],
+            "preserve nested raw metadata",
+        )
         source_selected_work = payload["selection_result"]["source_statuses"][0]["selected_work"]
         self.assertEqual([item["external_id"] for item in source_selected_work], ["central-lhy.15", "central-lhy.14"])
         self.assertNotIn("selector_mode", source_selected_work[0])
         self.assertNotIn("selector_rationale", source_selected_work[1])
         self.assertEqual(source_selected_work[1]["candidate_rank"], 1)
+        self.assertEqual(
+            source_selected_work[0]["raw"]["afk"]["selector_mode"],
+            "preserve nested source metadata",
+        )
         self.assertEqual(
             payload["selection_result"]["source_statuses"][0]["selection_evidence"]["selector_model"],
             "keep-non-selected-work-evidence",

@@ -195,11 +195,7 @@ def scrub_selected_work_value(value: Any) -> Any:
     if isinstance(value, list):
         return [scrub_selected_work_value(item) for item in value]
     if isinstance(value, dict):
-        return {
-            key: scrub_selected_work_value(item)
-            for key, item in value.items()
-            if not key.startswith("selector_")
-        }
+        return {key: item for key, item in value.items() if not key.startswith("selector_")}
     return value
 
 
