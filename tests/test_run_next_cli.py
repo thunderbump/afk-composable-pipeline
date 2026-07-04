@@ -13,7 +13,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from afk.contracts import load_project_contract  # noqa: E402
 from afk.pi_workers import PONYTAIL_EXTENSION_SOURCE, build_pi_real_worker_agent  # noqa: E402
 from afk.pi_workers import build_pi_print_command
-from afk.run_next import choose_candidate, github_repo_from_repo_url, run_next, selector_prompt, selector_result
+from afk.run_next import choose_candidate, github_repo_from_repo_url, run_next, selector_result
 from afk.workstream import WorkstreamResult
 
 
@@ -186,6 +186,9 @@ class RunNextCliTest(unittest.TestCase):
         self.assertIn("--publisher-repo", completed.stdout)
         self.assertIn("--publisher-base", completed.stdout)
         self.assertIn("--publisher-gh-config-dir", completed.stdout)
+        self.assertNotIn("--selector-mode", completed.stdout)
+        self.assertNotIn("--selector-model", completed.stdout)
+        self.assertNotIn("--selector-choice-json", completed.stdout)
         self.assertIn("Deprecated no-op compatibility flag", completed.stdout)
         self.assertNotIn("production uses Pi-backed implementation, review, and retrospective judge", completed.stdout)
 
@@ -1440,32 +1443,6 @@ raise SystemExit(9)
 
         self.assertEqual(chosen["external_id"], "central-lve.9")
 
-    def test_selector_prompt_includes_beads_context_for_comparison(self):
-        prompt = selector_prompt(
-            [
-                {
-                    "source_id": "central-beads",
-                    "source_type": "beads",
-                    "external_id": "central-lve.11",
-                    "title": "Rank work from Beads metadata",
-                    "labels": ["project:afk-composable-pipeline", "afk:ready"],
-                    "workstream": "central-lve",
-                    "priority": 2,
-                    "issue_type": "task",
-                    "description": "Implement the selector context.\n\nUseful background for selection.",
-                    "acceptance_criteria": [
-                        "Carry priority into run-next",
-                        "Parse acceptance criteria from description",
-                    ],
-                }
-            ]
-        )
-
-        self.assertIn('"priority": 2', prompt)
-        self.assertIn('"issue_type": "task"', prompt)
-        self.assertIn("Implement the selector context.", prompt)
-        self.assertIn("Carry priority into run-next", prompt)
-
     def test_run_next_execute_mode_runs_workstream_and_returns_summary(self):
         contract = load_project_contract("bump-eqemu", ROOT / "project-contracts", cwd=ROOT)
         selection_result = {
@@ -1997,7 +1974,7 @@ raise SystemExit(9)
         self.assertEqual(runner_ledger_dir, ledger_dir)
         self.assertEqual(runner_contract, contract)
 
-    def test_run_next_execute_output_exposes_final_chosen_work_when_selector_picks_nonfirst_candidate(self):
+    def test_run_next_execute_output_exposes_final_chosen_work_from_deterministic_selection(self):
         contract = load_project_contract("bump-eqemu", ROOT / "project-contracts", cwd=ROOT)
         first_candidate = {
             "source_id": "central-beads",
@@ -2021,14 +1998,14 @@ raise SystemExit(9)
             "source_id": "central-beads",
             "source_type": "beads",
             "external_id": "central-lhy.14",
-            "title": "Model-selected candidate",
+            "title": "Deterministically selected candidate",
             "status": "open",
             "labels": ["project:bump-eqemu", "ready-for-agent"],
             "workstream": "central-lhy",
             "acceptance_criteria": ["Chosen work is explicit"],
-            "priority": 4,
+            "priority": 1,
             "issue_type": "bug",
-            "description": "Selected by explicit selector choice.",
+            "description": "Selected by deterministic ordering.",
             "dependencies": [],
             "blockers": [],
             "dependency_status": "clear",
@@ -2074,11 +2051,6 @@ raise SystemExit(9)
                     checkout_root=checkout_root,
                     checkout_path=checkout_path,
                     validation_profile="tier1",
-                    selector_mode="model",
-                    selector_model="gpt-5.4-mini",
-                    selector_choice_json=json.dumps(
-                        {"external_id": "central-lhy.14", "rationale": "dogfood chose this item"}
-                    ),
                     execute=True,
                     ledger_dir=ledger_dir,
                     workstream_runner=fake_workstream_runner,
@@ -2090,7 +2062,7 @@ raise SystemExit(9)
         self.assertEqual(payload["selection_result"]["selected_work"][1]["external_id"], "central-lhy.14")
         self.assertEqual(payload["selection_result"]["selected_work_kind"], "candidate_list")
         self.assertEqual(payload["chosen_work"]["external_id"], "central-lhy.14")
-        self.assertEqual(payload["chosen_work"]["selector_rationale"], "dogfood chose this item")
+        self.assertNotIn("selector_rationale", payload["chosen_work"])
         self.assertEqual(payload["selector"]["selected"]["external_id"], "central-lhy.14")
         self.assertEqual(payload["recipe"]["workstream_id"], "central-lhy.14")
         self.assertEqual(payload["workstream_result"]["workstream_id"], "central-lhy.14")
@@ -2140,104 +2112,6 @@ raise SystemExit(9)
         self.assertIsNone(payload["recipe"])
         self.assertIsNone(payload["workstream_result"])
         self.assertEqual(runner_calls, [])
-
-    def test_model_selector_rejects_disallowed_models(self):
-        with self.assertRaisesRegex(
-            ValueError,
-            "selector model must be one of: gpt-5.3-codex-spark, gpt-5.4-mini",
-        ):
-            choose_candidate(
-                [],
-                selector_mode="model",
-                selector_model="gpt-4o",
-                selector_choice_json=None,
-            )
-
-    def test_model_selector_invokes_allowed_codex_model(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            fake_bin = Path(temp_dir) / "bin"
-            fake_bin.mkdir()
-            write_executable(
-                fake_bin / "codex",
-                f"""#!{sys.executable}
-import json
-import sys
-from pathlib import Path
-
-args = sys.argv[1:]
-assert args[:1] == ["exec"], args
-assert args[args.index("--model") + 1] == "gpt-5.4-mini", args
-output_path = Path(args[args.index("--output-last-message") + 1])
-output_path.write_text(json.dumps({{"external_id": "thunderbump/bump-EQEmu#9", "rationale": "best fit"}}), encoding="utf-8")
-""",
-            )
-            old_path = os.environ.get("PATH", "")
-            os.environ["PATH"] = str(fake_bin)
-            try:
-                candidates = [
-                    {
-                        "source_id": "central-beads",
-                        "source_type": "beads",
-                        "external_id": "central-aaa.1",
-                        "workstream": "central-aaa",
-                        "title": "Earlier bead",
-                    },
-                    {
-                        "source_id": "github",
-                        "source_type": "github_issues",
-                        "external_id": "thunderbump/bump-EQEmu#9",
-                        "workstream": "central-zzz",
-                        "title": "Model choice",
-                    },
-                ]
-
-                chosen = choose_candidate(
-                    candidates,
-                    selector_mode="model",
-                    selector_model="gpt-5.4-mini",
-                    selector_choice_json=None,
-                )
-            finally:
-                os.environ["PATH"] = old_path
-
-        self.assertEqual(chosen["external_id"], "thunderbump/bump-EQEmu#9")
-        self.assertEqual(chosen["selector_rationale"], "best fit")
-
-    def test_model_selector_falls_back_when_choice_json_is_invalid(self):
-        candidates = [
-            {
-                "source_id": "github",
-                "source_type": "github_issues",
-                "external_id": "thunderbump/bump-EQEmu#9",
-                "workstream": "central-zzz",
-                "title": "Later issue",
-            },
-            {
-                "source_id": "central-beads",
-                "source_type": "beads",
-                "external_id": "central-aaa.1",
-                "workstream": "central-aaa",
-                "title": "Earlier bead",
-            },
-        ]
-
-        chosen = choose_candidate(
-            candidates,
-            selector_mode="model",
-            selector_model="gpt-5.4-mini",
-            selector_choice_json="{not-json}",
-        )
-
-        self.assertEqual(chosen["external_id"], "central-aaa.1")
-
-    def test_selector_rejects_unknown_mode(self):
-        with self.assertRaisesRegex(ValueError, "selector mode must be deterministic or model"):
-            choose_candidate(
-                [],
-                selector_mode="typo",
-                selector_model=None,
-                selector_choice_json=None,
-            )
 
     def test_github_repo_parser_ignores_non_github_urls(self):
         self.assertEqual(

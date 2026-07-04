@@ -262,9 +262,6 @@ def main(argv: list[str] | None = None) -> int:
                 reviewer=reviewer,
                 publisher_factory=recipe_publisher_factory,
                 ready_tag=args.ready_tag,
-                selector_mode=args.selector_mode,
-                selector_model=args.selector_model,
-                selector_choice_json=args.selector_choice_json,
                 enable_review_feedback=args.role_profile == PRODUCTION_ROLE_PROFILE,
                 expect_generated_smoke_dry_run=(
                     args.role_profile == FAKE_LOCAL_ROLE_PROFILE and args.effective_validation_mode == "fake"
@@ -395,20 +392,6 @@ def build_parser() -> argparse.ArgumentParser:
         "--ready-tag",
         default="ready-for-agent",
         help="Ready tag required on issues considered for autonomous selection",
-    )
-    run_next_parser.add_argument(
-        "--selector-mode",
-        choices=("deterministic", "model"),
-        default="deterministic",
-        help="Selector policy for choosing among valid candidates",
-    )
-    run_next_parser.add_argument(
-        "--selector-model",
-        help="Optional lightweight selector model name",
-    )
-    run_next_parser.add_argument(
-        "--selector-choice-json",
-        help="Optional JSON selector choice payload for model mode",
     )
     run_next_parser.add_argument("--ledger", help="Optional ledger directory for downstream execution")
     run_next_parser.add_argument(

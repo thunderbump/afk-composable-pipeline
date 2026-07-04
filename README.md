@@ -475,10 +475,6 @@ request, source statuses, the candidate list in
 `chosen_work`, and the emitted recipe preview. `selection_result.selected_work`
 is annotated with `selected_work_kind: "candidate_list"` so downstream
 summaries do not confuse candidate ordering with the executed item.
-With `--selector-mode model`, the command invokes `codex exec` and accepts only
-the lightweight model names `gpt-5.3-codex-spark` and `gpt-5.4-mini`; if the
-model call fails or returns an invalid choice, it falls back to deterministic
-selection.
 
 Like `generate-recipe`, `run-next` defaults to `--role-profile production`.
 That means the emitted recipe uses Pi-backed implementation and reviewer roles
