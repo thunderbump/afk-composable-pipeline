@@ -168,6 +168,8 @@ def selector_result(chosen: dict[str, Any] | None) -> dict[str, Any]:
 
 def annotate_selection_result(selection_result: dict[str, Any]) -> dict[str, Any]:
     annotated = dict(selection_result)
+    annotated["selected_work"] = scrub_selected_work_value(annotated.get("selected_work"))
+    annotated["source_statuses"] = scrub_selected_work_containers(annotated.get("source_statuses"))
     annotated["selected_work_kind"] = "candidate_list"
     return annotated
 
@@ -176,6 +178,29 @@ def selected_work_snapshot(chosen: dict[str, Any] | None) -> dict[str, Any] | No
     if chosen is None:
         return None
     return {key: value for key, value in chosen.items() if not key.startswith("selector_")}
+
+
+def scrub_selected_work_containers(value: Any) -> Any:
+    if isinstance(value, list):
+        return [scrub_selected_work_containers(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+    scrubbed = dict(value)
+    if "selected_work" in scrubbed:
+        scrubbed["selected_work"] = scrub_selected_work_value(scrubbed["selected_work"])
+    return scrubbed
+
+
+def scrub_selected_work_value(value: Any) -> Any:
+    if isinstance(value, list):
+        return [scrub_selected_work_value(item) for item in value]
+    if isinstance(value, dict):
+        return {
+            key: scrub_selected_work_value(item)
+            for key, item in value.items()
+            if not key.startswith("selector_")
+        }
+    return value
 
 
 def normalize_workstream_result(result: Any, *, ledger_dir: Path | None = None) -> dict[str, Any] | None:

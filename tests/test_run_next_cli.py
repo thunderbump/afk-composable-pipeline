@@ -2003,6 +2003,96 @@ raise SystemExit(9)
         self.assertEqual(runner_ledger_dir, ledger_dir)
         self.assertEqual(runner_contract, contract)
 
+    def test_run_next_output_scrubs_selector_fields_from_selection_result_selected_work_snapshots(self):
+        contract = load_project_contract("bump-eqemu", ROOT / "project-contracts", cwd=ROOT)
+        first_candidate = {
+            "source_id": "central-beads",
+            "source_type": "beads",
+            "external_id": "central-lhy.15",
+            "title": "First candidate in list",
+            "status": "open",
+            "labels": ["project:bump-eqemu", "ready-for-agent"],
+            "workstream": "central-lhy",
+            "selector_rationale": "stale list rationale",
+            "candidate_rank": 2,
+        }
+        chosen_candidate = {
+            "source_id": "central-beads",
+            "source_type": "beads",
+            "external_id": "central-lhy.14",
+            "title": "Deterministically selected candidate",
+            "status": "open",
+            "labels": ["project:bump-eqemu", "ready-for-agent"],
+            "workstream": "central-lhy",
+            "selector_model": "gpt-5.4-mini",
+            "candidate_rank": 1,
+        }
+        selection_result = {
+            "schema_version": 1,
+            "source_statuses": [
+                {
+                    "source_id": "central-beads",
+                    "source_type": "beads",
+                    "status": "selected",
+                    "selected_work": [
+                        {
+                            "external_id": "central-lhy.15",
+                            "selector_mode": "model",
+                            "candidate_rank": 2,
+                        },
+                        {
+                            "external_id": "central-lhy.14",
+                            "selector_rationale": "stale source status rationale",
+                            "candidate_rank": 1,
+                        },
+                    ],
+                    "selection_evidence": {
+                        "selector_model": "keep-non-selected-work-evidence",
+                        "candidate_rank": [2, 1],
+                    },
+                }
+            ],
+            "selected_work": [first_candidate, chosen_candidate],
+            "skipped_candidates": [],
+        }
+
+        original_select_work = run_next.__globals__["select_work"]
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                temp_path = Path(temp_dir)
+                beads_workspace = temp_path / "beads"
+                checkout_root = temp_path / "checkouts"
+                checkout_path = checkout_root / "bump-EQEmu"
+                beads_workspace.mkdir()
+                checkout_root.mkdir(parents=True)
+                checkout_path.mkdir(parents=True)
+
+                run_next.__globals__["select_work"] = lambda request, project_contract=None: selection_result
+                payload = run_next(
+                    project_contract=contract,
+                    beads_workspace=beads_workspace,
+                    checkout_root=checkout_root,
+                    checkout_path=checkout_path,
+                    validation_profile="tier1",
+                )
+        finally:
+            run_next.__globals__["select_work"] = original_select_work
+
+        selected_work = payload["selection_result"]["selected_work"]
+        self.assertEqual([item["external_id"] for item in selected_work], ["central-lhy.15", "central-lhy.14"])
+        self.assertNotIn("selector_rationale", selected_work[0])
+        self.assertNotIn("selector_model", selected_work[1])
+        self.assertEqual(selected_work[0]["candidate_rank"], 2)
+        source_selected_work = payload["selection_result"]["source_statuses"][0]["selected_work"]
+        self.assertEqual([item["external_id"] for item in source_selected_work], ["central-lhy.15", "central-lhy.14"])
+        self.assertNotIn("selector_mode", source_selected_work[0])
+        self.assertNotIn("selector_rationale", source_selected_work[1])
+        self.assertEqual(source_selected_work[1]["candidate_rank"], 1)
+        self.assertEqual(
+            payload["selection_result"]["source_statuses"][0]["selection_evidence"]["selector_model"],
+            "keep-non-selected-work-evidence",
+        )
+
     def test_run_next_execute_output_exposes_final_chosen_work_from_deterministic_selection(self):
         contract = load_project_contract("bump-eqemu", ROOT / "project-contracts", cwd=ROOT)
         first_candidate = {
