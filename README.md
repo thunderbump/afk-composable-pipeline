@@ -381,6 +381,10 @@ PYTHONPATH=src python3 -m afk generate-recipe \
   --checkout-path /work/bump-EQEmu \
   --validation-profile tier1 \
   --role-profile fake-local \
+  --publisher-mode create \
+  --publisher-repo thunderbump/afk-composable-pipeline \
+  --publisher-base main \
+  --publisher-gh-config-dir /tmp/afk-gh-config \
   --output recipes/central-afk-pr.1.json
 ```
 

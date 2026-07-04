@@ -315,6 +315,7 @@ raise SystemExit(9)
             self.assertEqual(summary["status"], "published")
             self.assertEqual(result["status"], "published")
             self.assertEqual([step["name"] for step in result["steps"]], ["select-work", "prepare-checkout", "implement", "validate", "review"])
+            validate_step = next(step for step in result["steps"] if step["name"] == "validate")
             self.assertEqual(
                 result["selected_work"],
                 [
@@ -330,6 +331,17 @@ raise SystemExit(9)
             self.assertEqual(result["publication"]["status"], "published")
             self.assertEqual(result["publication"]["mode"], "create")
             self.assertEqual(result["publication"]["url"], "https://github.example/pr/123")
+            self.assertEqual(
+                result["artifacts"],
+                {
+                    "workstream_result": "workstream-result.json",
+                    "command": "command.json",
+                    "publication": "publication-result.json",
+                    "tracker": "tracker-result.json",
+                    "pipeline_retrospective": "pipeline-retrospective.json",
+                    "pr_body": "pr-body.md",
+                },
+            )
             self.assertEqual(
                 result["pipeline_retrospective"],
                 {
@@ -348,6 +360,18 @@ raise SystemExit(9)
                     "judge": {"enabled": False, "status": "disabled"},
                 },
             )
+            workstream_dir = result_path.parent
+            pipeline_retrospective_path = workstream_dir / "pipeline-retrospective.json"
+            pr_body_path = workstream_dir / "pr-body.md"
+            self.assertEqual(
+                json.loads(pipeline_retrospective_path.read_text(encoding="utf-8")),
+                result["pipeline_retrospective"],
+            )
+            self.assertEqual(
+                json.loads((workstream_dir / "publication-result.json").read_text(encoding="utf-8")),
+                result["publication"],
+            )
+            self.assertEqual(pr_body_path.read_text(encoding="utf-8"), calls[-1]["body"])
             self.assertEqual((checkout_path / "afk-generated-workstream.txt").read_text(encoding="utf-8"), "generated recipe executed\n")
             self.assertEqual(
                 [call["tool"] for call in calls],
@@ -356,8 +380,33 @@ raise SystemExit(9)
             self.assertEqual(calls[0]["argv"], ["show", "central-demo.1", "--json"])
             self.assertEqual(calls[0]["password"], "test-password")
             self.assertNotIn("test-password", result_path.read_text(encoding="utf-8"))
-            self.assertIn("Generated recipe published path", calls[-1]["body"])
-            self.assertIn("afk-generated-workstream.txt", calls[-1]["body"])
+            body = calls[-1]["body"]
+            self.assertIn("Generated recipe published path", body)
+            self.assertIn("afk-generated-workstream.txt", body)
+            self.assertIn("## Validation", body)
+            self.assertRegex(
+                body,
+                rf"(?m)^- tier1: validated - result: generated-recipe-smoke=pass - command: [\s\S]+? - summary: validated - evidence: runs/{validate_step['run_id']}/step-result\.json; runs/{validate_step['run_id']}/worker-result\.json$",
+            )
+            self.assertIn("Review: passed", body)
+            self.assertIn("## Artifacts", body)
+            self.assertIn(result["steps"][-1]["result_path"], body)
+            self.assertFalse((workstream_dir / "retrospective.json").exists())
+            self.assertFalse((workstream_dir / "retrospective-judge-evidence.json").exists())
+            self.assertFalse((workstream_dir / "retrospective-judge-request.json").exists())
+            self.assertFalse((workstream_dir / "retrospective-judge-result.json").exists())
+            self.assertFalse((workstream_dir / "retrospective-judge-stdout.log").exists())
+            self.assertFalse((workstream_dir / "retrospective-judge-stderr.log").exists())
+            self.assertNotIn("retrospective", result["artifacts"])
+            self.assertNotIn("retrospective_judge_evidence", result["artifacts"])
+            self.assertNotIn("retrospective_judge_request", result["artifacts"])
+            self.assertNotIn("retrospective_judge_result", result["artifacts"])
+            self.assertNotIn("retrospective_judge_stdout", result["artifacts"])
+            self.assertNotIn("retrospective_judge_stderr", result["artifacts"])
+            self.assertNotIn("retrospective_follow_up_request", result["artifacts"])
+            self.assertNotIn("retrospective_follow_up_result", result["artifacts"])
+            self.assertNotIn("retrospective_follow_up_stdout", result["artifacts"])
+            self.assertNotIn("retrospective_follow_up_stderr", result["artifacts"])
 
     def test_generate_recipe_defaults_to_production_pi_roles_when_mounts_are_present(self):
         with tempfile.TemporaryDirectory() as temp_dir:
