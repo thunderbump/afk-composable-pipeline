@@ -11818,7 +11818,7 @@ Path({str(fake_calls)!r}).write_text("gh should not run\\n", encoding="utf-8")
 
             self.assertEqual(summary["status"], "blocked")
             self.assertEqual(result["publication"]["status"], "blocked")
-            self.assertEqual(result["tracker"]["status"], "validated")
+            self.assertEqual(result["tracker"]["status"], "review-findings-open")
             self.assertFalse(result["tracker"]["close_source_item"])
             self.assertEqual(result["tracker"]["close_reason"], "")
             self.assertEqual(result["tracker"]["pr_url"], "")
@@ -12765,8 +12765,8 @@ sys.exit(0)
             )
             self.assertEqual(result["tracker"]["review_cycles"], result["review_cycles"])
             self.assertEqual(tracker["review_cycles"], result["review_cycles"])
-            self.assertEqual(result["tracker"]["status"], "review-feedback-addressed")
-            self.assertEqual(tracker["status"], "review-feedback-addressed")
+            self.assertEqual(result["tracker"]["status"], "awaiting-review")
+            self.assertEqual(tracker["status"], "awaiting-review")
 
     def test_workstream_surfaces_open_and_addressed_review_cycles_without_overwriting_prior_cycles(self):
         with tempfile.TemporaryDirectory() as temp_dir:

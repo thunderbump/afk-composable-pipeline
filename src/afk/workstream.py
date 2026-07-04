@@ -3136,7 +3136,9 @@ def tracker_review_cycles(normalized: dict[str, Any], state: dict[str, Any] | No
 def tracker_review_cycles_for_status(normalized: dict[str, Any], state: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     configured = normalized.get("review_cycles")
     runtime = state.get("runtime_review_cycles") if isinstance(state, dict) else []
-    cycles = list(configured) if isinstance(configured, list) else []
+    cycles = [
+        cycle for cycle in configured if isinstance(cycle, dict) and runtime_review_cycle_has_feedback(cycle)
+    ] if isinstance(configured, list) else []
     if isinstance(runtime, list) and runtime_review_cycles_have_feedback(runtime):
         cycles.extend(cycle for cycle in runtime if isinstance(cycle, dict) and runtime_review_cycle_has_feedback(cycle))
     return cycles
@@ -3156,13 +3158,17 @@ def runtime_review_cycles_have_feedback(runtime_cycles: list[dict[str, Any]]) ->
 
 
 def runtime_review_cycle_has_feedback(cycle: dict[str, Any]) -> bool:
+    cycle_status = string_field(cycle, "status") or ""
     reviews = cycle.get("reviews")
     if not isinstance(reviews, list):
         return False
     for review in reviews:
         if not isinstance(review, dict):
             continue
-        if (string_field(review, "status") or "") == "request-changes":
+        review_status = string_field(review, "status") or ""
+        if bool(review.get("requires_response")):
+            return True
+        if review_cycle_status_requires_response(cycle_status) or review_cycle_status_requires_response(review_status):
             return True
         if review_cycle_response_is_addressed(review.get("response")):
             return True
