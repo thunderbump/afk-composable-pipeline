@@ -384,8 +384,7 @@ errors instead of silently falling back to fake roles.
 
 For tests, CI fixtures, or local smoke runs that should stay offline, pass
 `--role-profile fake-local`. That preserves fake implementation/review adapters
-and leaves the retrospective judge disabled unless you explicitly opt back into
-Pi roles:
+and keeps retrospective runtime output data-only:
 
 ```sh
 PYTHONPATH=src python3 -m afk generate-recipe \
@@ -408,9 +407,9 @@ the usual `--agent-codex-home`, `--agent-config-home`, and legacy
 emit `PI_CODING_AGENT_DIR` for Pi's agent auth lookup and will not emit
 `--api-key`, `OPENAI_API_KEY`, or token values. Override `--agent-mode`,
 or `--reviewer-mode` only when you need something other than the role profile
-defaults. Legacy `--retrospective-judge-mode` output remains compatibility-only:
-`run-workstream` ignores runtime retrospective judge blocks and keeps
-retrospective handling data-only.
+defaults. Deprecated retrospective judge flags remain parseable as
+compatibility no-ops; generated recipes do not emit runtime retrospective judge
+blocks.
 
 For `--validation-mode project-worker`, the generator embeds the worker host
 contract into both `implement` and `validate` step `input.validation`. By
@@ -560,13 +559,14 @@ cap: `gpt-5.4` or lower. The production role profile defaults to `gpt-5.4` for
 implementation and review. The lightweight selector path stays limited to
 `gpt-5.3-codex-spark` and `gpt-5.4-mini`.
 
-`--agent-ponytail`, `--reviewer-ponytail`, and
-`--retrospective-judge-ponytail` all map to the same bundled extension source
-`git:github.com/DietrichGebert/ponytail`; explicit `--*-ponytail-extension`
-or `--*-ponytail-extension-source` values are accepted when the corresponding
-`--*ponytail` shortcut is not used. The retrospective-judge flags are retained
-for compatibility with older recipe payloads; the minimal runtime ignores those
-blocks and leaves any retrospective follow-up creation to external tooling.
+`--agent-ponytail` and `--reviewer-ponytail` map to the same bundled extension
+source `git:github.com/DietrichGebert/ponytail`; explicit
+`--*-ponytail-extension` or `--*-ponytail-extension-source` values are accepted
+when the corresponding `--*ponytail` shortcut is not used. Retrospective judge
+and follow-up flags are retained only for compatibility with older CLI
+invocations; they are deprecated no-ops. Generated recipes keep retrospective
+output deterministic and data-only, and any judge/follow-up worker remains an
+external concern.
 
 Publisher mode uses absolute mount paths only. Use `--publisher-mode create`,
 `--publisher-repo`, `--publisher-base`, and `--publisher-gh-config-dir` to

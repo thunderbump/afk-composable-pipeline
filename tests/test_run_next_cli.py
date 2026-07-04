@@ -186,6 +186,8 @@ class RunNextCliTest(unittest.TestCase):
         self.assertIn("--publisher-repo", completed.stdout)
         self.assertIn("--publisher-base", completed.stdout)
         self.assertIn("--publisher-gh-config-dir", completed.stdout)
+        self.assertIn("Deprecated no-op compatibility flag", completed.stdout)
+        self.assertNotIn("production uses Pi-backed implementation, review, and retrospective judge", completed.stdout)
 
     def test_run_next_requires_explicit_beads_workspace_flag(self):
         completed = run_afk(
@@ -518,7 +520,7 @@ else:
                 },
             )
 
-    def test_run_next_preview_can_enable_beads_retrospective_follow_up_recipe_block(self):
+    def test_run_next_preview_ignores_deprecated_beads_retrospective_follow_up_flags(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
             contracts_dir = temp_path / "contracts"
@@ -597,15 +599,7 @@ else:
             payload = json.loads(completed.stdout)
             recipe = payload["recipe"]
 
-            self.assertEqual(
-                recipe["retrospective_follow_up"],
-                {
-                    "enabled": True,
-                    "creator": "beads",
-                    "beads_workspace": str(beads_workspace),
-                    "labels": ["project:dogfood", "ready-for-agent", "area:retrospective"],
-                },
-            )
+            self.assertNotIn("retrospective_follow_up", recipe)
             self.assertNotIn("beads-secret", completed.stdout)
 
     def test_run_next_rejects_project_local_beads_workspace_before_github_fallback_recipe_emission(self):
@@ -738,7 +732,7 @@ else:
             payload = json.loads(completed.stdout)
             self.assertNotIn("retrospective_follow_up", payload["recipe"])
 
-    def test_run_next_execute_can_create_beads_retrospective_follow_up_items(self):
+    def test_run_next_execute_does_not_emit_beads_retrospective_follow_up_items(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
             contracts_dir = temp_path / "contracts"
@@ -910,7 +904,7 @@ raise SystemExit(9)
             self.assertTrue((explicit_ledger / payload["workstream_result"]["result_path"]).is_file())
             self.assertFalse(env_ledger.exists())
 
-    def test_run_next_execute_resolves_relative_beads_workspace_for_retrospective_follow_up(self):
+    def test_run_next_execute_ignores_relative_beads_workspace_for_deprecated_retrospective_follow_up(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
             contracts_dir = temp_path / "contracts"
@@ -1029,7 +1023,7 @@ raise SystemExit(9)
             self.assertEqual(completed.returncode, 0, completed.stderr)
             payload = json.loads(completed.stdout)
             recipe = payload["recipe"]
-            self.assertEqual(recipe["retrospective_follow_up"]["beads_workspace"], str(beads_workspace.resolve()))
+            self.assertNotIn("retrospective_follow_up", recipe)
 
             workstream_result = payload["workstream_result"]
             self.assertIsNotNone(workstream_result)
@@ -3427,7 +3421,7 @@ sys.exit(0)
             self.assertNotEqual(completed.returncode, 0, completed.stdout)
             self.assertIn("Pi worker model must be gpt-5.4 or lower", completed.stderr)
 
-    def test_run_next_generates_pi_reviewer_and_pi_retrospective_judge_in_payload(self):
+    def test_run_next_generates_pi_reviewer_and_omits_retrospective_judge_in_payload(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
             fake_bin = temp_path / "bin"
@@ -3475,7 +3469,6 @@ sys.exit(0)
             )
 
             reviewer_model = "gpt-5.4"
-            judge_model = "gpt-5.4-mini"
             completed = run_afk(
                 "run-next",
                 "--project",
@@ -3513,17 +3506,6 @@ sys.exit(0)
                 str(pi_config_home),
                 "--agent-pi-coding-agent-dir",
                 str(pi_coding_agent_dir),
-                "--retrospective-judge-mode",
-                "pi",
-                "--retrospective-judge-pi-bin",
-                "/opt/pi/bin/pi",
-                "--retrospective-judge-pi-provider",
-                "openai-codex",
-                "--retrospective-judge-pi-model",
-                judge_model,
-                "--retrospective-judge-timeout-seconds",
-                "321",
-                "--retrospective-judge-ponytail",
                 env={"GH_TOKEN": None, "GITHUB_TOKEN": None, "PATH": str(fake_bin)},
             )
 
@@ -3552,27 +3534,7 @@ sys.exit(0)
                 },
             )
 
-            retrospective_judge = payload["recipe"]["retrospective_judge"]
-            self.assertEqual(
-                retrospective_judge["command"],
-                build_pi_print_command(
-                    pi_bin="/opt/pi/bin/pi",
-                    provider="openai-codex",
-                    model=judge_model,
-                    ponytail_extension_source=PONYTAIL_EXTENSION_SOURCE,
-                ),
-            )
-            self.assertEqual(retrospective_judge["timeout_seconds"], 321)
-            self.assertEqual(retrospective_judge["type"], "local-command")
-            self.assertEqual(retrospective_judge["codex_home"], str(codex_home))
-            self.assertEqual(retrospective_judge["config_home"], str(config_home))
-            self.assertEqual(
-                retrospective_judge["env"],
-                {
-                    "PI_CONFIG_HOME": str(pi_config_home),
-                    "PI_CODING_AGENT_DIR": str(pi_coding_agent_dir),
-                },
-            )
+            self.assertNotIn("retrospective_judge", payload["recipe"])
 
     def test_run_next_fake_local_pi_reviewer_without_timeout_keeps_non_production_default(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -3717,7 +3679,7 @@ print(json.dumps({{"schema_version":1,"source_statuses":[],"selected_work":[],"s
             self.assertNotEqual(completed.returncode, 0, completed.stdout)
             self.assertIn("Pi worker model must be gpt-5.4 or lower", completed.stderr)
 
-    def test_run_next_rejects_disallowed_pi_retrospective_judge_model(self):
+    def test_run_next_ignores_deprecated_pi_retrospective_judge_model(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
             fake_bin = temp_path / "bin"
@@ -3765,8 +3727,9 @@ print(json.dumps({{"schema_version":1,"source_statuses":[],"selected_work":[],"s
                 env={"GH_TOKEN": None, "GITHUB_TOKEN": None, "PATH": str(fake_bin)},
             )
 
-            self.assertNotEqual(completed.returncode, 0, completed.stdout)
-            self.assertIn("Pi worker model must be gpt-5.4 or lower", completed.stderr)
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            payload = json.loads(completed.stdout)
+            self.assertIsNone(payload["recipe"])
 
     def test_run_next_generates_pi_workers_and_publisher_create_in_recipe(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -3814,7 +3777,6 @@ raise SystemExit(1)
             )
 
             reviewer_model = "gpt-5.4"
-            judge_model = "gpt-5.4"
             completed = run_afk(
                 "run-next",
                 "--project",
@@ -3863,17 +3825,6 @@ raise SystemExit(1)
                 "--reviewer-ponytail",
                 "--reviewer-timeout-seconds",
                 "111",
-                "--retrospective-judge-mode",
-                "pi",
-                "--retrospective-judge-pi-bin",
-                "/opt/pi/bin/pi",
-                "--retrospective-judge-pi-provider",
-                "openai-codex",
-                "--retrospective-judge-pi-model",
-                judge_model,
-                "--retrospective-judge-ponytail",
-                "--retrospective-judge-timeout-seconds",
-                "222",
                 "--publisher-mode",
                 "create",
                 "--publisher-repo",
@@ -3948,27 +3899,7 @@ raise SystemExit(1)
                 },
             )
 
-            retrospective_judge = payload["recipe"]["retrospective_judge"]
-            self.assertEqual(
-                retrospective_judge["command"],
-                build_pi_print_command(
-                    pi_bin="/opt/pi/bin/pi",
-                    provider="openai-codex",
-                    model=judge_model,
-                    ponytail_extension_source=PONYTAIL_EXTENSION_SOURCE,
-                ),
-            )
-            self.assertEqual(retrospective_judge["timeout_seconds"], 222)
-            self.assertEqual(retrospective_judge["type"], "local-command")
-            self.assertEqual(retrospective_judge["codex_home"], str(codex_home))
-            self.assertEqual(retrospective_judge["config_home"], str(config_home))
-            self.assertEqual(
-                retrospective_judge["env"],
-                {
-                    "PI_CONFIG_HOME": str(pi_config_home),
-                    "PI_CODING_AGENT_DIR": str(pi_coding_agent_dir),
-                },
-            )
+            self.assertNotIn("retrospective_judge", payload["recipe"])
 
     def test_run_next_rejects_publisher_create_without_required_arguments(self):
         with tempfile.TemporaryDirectory() as temp_dir:
