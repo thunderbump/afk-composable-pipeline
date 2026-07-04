@@ -5222,14 +5222,18 @@ def _implementation_auth_retrospective_signal(state: dict[str, Any], reason: str
 
 
 def _implementation_auth_failure_excerpt(*texts: str) -> str:
+    explicit_excerpts: list[str] = []
     for text in texts[1:]:
         excerpt = runtime_failure_excerpt(text)
         if _is_explicit_auth_failure_excerpt(excerpt):
-            return excerpt
+            explicit_excerpts.append(excerpt)
     for text in texts:
         if _is_explicit_auth_failure_excerpt(text):
-            return text
-    return ""
+            explicit_excerpts.append(text)
+    for excerpt in explicit_excerpts:
+        if "openai-codex" in excerpt.lower():
+            return excerpt
+    return explicit_excerpts[0] if explicit_excerpts else ""
 
 
 def _implementation_auth_failure_classification(*texts: str) -> str:
