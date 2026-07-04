@@ -187,6 +187,178 @@ class GenerateRecipeCliTest(unittest.TestCase):
             self.assertEqual(reviewer["timeout_seconds"], 30)
             self.assertNotIn("retrospective_judge", recipe)
 
+    def test_generated_fake_local_recipe_runs_full_single_bead_to_published_pr_path(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            contracts_dir = temp_path / "contracts"
+            output = temp_path / "recipe.json"
+            ledger = temp_path / "ledger"
+            beads_workspace = temp_path / "central-beads"
+            checkout_root = temp_path / "checkouts"
+            checkout_path = checkout_root / "demo"
+            repo = temp_path / "repo-src"
+            fake_bin = temp_path / "bin"
+            fake_calls = temp_path / "fake-calls.jsonl"
+            gh_config_dir = temp_path / "gh-config"
+            contracts_dir.mkdir()
+            init_repo(repo)
+            write_contract(contracts_dir / "demo.json", project_slug="demo", repo_url=str(repo))
+            fake_bin.mkdir()
+            gh_config_dir.mkdir()
+            (beads_workspace / "secrets").mkdir(parents=True)
+            (beads_workspace / "secrets" / "dolt_beads_password.txt").write_text("test-password\n", encoding="utf-8")
+            write_executable(
+                fake_bin / "bd",
+                f"""#!{sys.executable}
+import json
+import os
+import sys
+from pathlib import Path
+
+Path({str(fake_calls)!r}).open("a", encoding="utf-8").write(
+    json.dumps({{"tool": "bd", "argv": sys.argv[1:], "password": os.environ.get("BEADS_DOLT_PASSWORD", "")}}) + "\\n"
+)
+if sys.argv[1:3] != ["show", "central-demo.1"]:
+    raise SystemExit(9)
+print(json.dumps({{
+    "id": "central-demo.1",
+    "title": "Generated recipe published path",
+    "status": "open",
+    "labels": ["project:demo"],
+    "metadata": {{"afk.ready": True, "workstream": "central-demo.1"}},
+    "acceptance_criteria": ["Generated recipe publishes after validation and review pass."],
+    "dependencies": [],
+}}))
+""",
+            )
+            write_executable(
+                fake_bin / "gh",
+                f"""#!{sys.executable}
+import json
+import sys
+from pathlib import Path
+
+record = {{"tool": "gh", "argv": sys.argv[1:]}}
+if "--body-file" in sys.argv:
+    body_file = sys.argv[sys.argv.index("--body-file") + 1]
+    record["body"] = Path(body_file).read_text(encoding="utf-8")
+Path({str(fake_calls)!r}).open("a", encoding="utf-8").write(json.dumps(record) + "\\n")
+if sys.argv[1:4] == ["auth", "status", "--hostname"]:
+    raise SystemExit(0)
+if sys.argv[1:3] == ["pr", "create"]:
+    print("https://github.example/pr/123")
+    raise SystemExit(0)
+raise SystemExit(9)
+""",
+            )
+
+            completed = run_afk(
+                "generate-recipe",
+                "--workstream-id",
+                "central-demo.1",
+                "--project",
+                "demo",
+                "--contracts-dir",
+                str(contracts_dir),
+                "--ledger",
+                str(ledger),
+                "--beads-workspace",
+                str(beads_workspace),
+                "--checkout-root",
+                str(checkout_root),
+                "--checkout-path",
+                str(checkout_path),
+                "--validation-profile",
+                "tier1",
+                "--role-profile",
+                "fake-local",
+                "--publisher-mode",
+                "create",
+                "--publisher-repo",
+                "thunderbump/demo",
+                "--publisher-base",
+                "main",
+                "--publisher-gh-config-dir",
+                str(gh_config_dir),
+                "--output",
+                str(output),
+                env={"PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}"},
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            recipe = json.loads(output.read_text(encoding="utf-8"))
+
+            completed = run_afk(
+                "run-workstream",
+                "--workstream-id",
+                "central-demo.1",
+                "--input",
+                json.dumps(recipe),
+                "--ledger",
+                str(ledger),
+                env={
+                    "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+                    "GIT_ALLOW_PROTOCOL": "file",
+                    "GIT_AUTHOR_NAME": "AFK Test",
+                    "GIT_AUTHOR_EMAIL": "afk-test@example.test",
+                    "GIT_COMMITTER_NAME": "AFK Test",
+                    "GIT_COMMITTER_EMAIL": "afk-test@example.test",
+                },
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            result_path = ledger / summary["result_path"]
+            result = json.loads(result_path.read_text(encoding="utf-8"))
+            calls = [json.loads(line) for line in fake_calls.read_text(encoding="utf-8").splitlines()]
+
+            self.assertEqual(summary["status"], "published")
+            self.assertEqual(result["status"], "published")
+            self.assertEqual([step["name"] for step in result["steps"]], ["select-work", "prepare-checkout", "implement", "validate", "review"])
+            self.assertEqual(
+                result["selected_work"],
+                [
+                    {
+                        "external_id": "central-demo.1",
+                        "title": "Generated recipe published path",
+                        "source_id": "central-beads",
+                        "source_type": "beads",
+                        "result": "passed",
+                    }
+                ],
+            )
+            self.assertEqual(result["publication"]["status"], "published")
+            self.assertEqual(result["publication"]["mode"], "create")
+            self.assertEqual(result["publication"]["url"], "https://github.example/pr/123")
+            self.assertEqual(
+                result["pipeline_retrospective"],
+                {
+                    "schema_version": 1,
+                    "status": "published",
+                    "health": "healthy",
+                    "publication_status": "published",
+                    "tracker_status": "awaiting-review",
+                    "signals": [],
+                    "recommended_follow_up": [],
+                    "follow_up": {
+                        "recommended": [],
+                        "created": [],
+                        "creation": {"enabled": False, "status": "recommendation-only"},
+                    },
+                    "judge": {"enabled": False, "status": "disabled"},
+                },
+            )
+            self.assertEqual((checkout_path / "afk-generated-workstream.txt").read_text(encoding="utf-8"), "generated recipe executed\n")
+            self.assertEqual(
+                [call["tool"] for call in calls],
+                ["bd", "gh", "gh"],
+            )
+            self.assertEqual(calls[0]["argv"], ["show", "central-demo.1", "--json"])
+            self.assertEqual(calls[0]["password"], "test-password")
+            self.assertNotIn("test-password", result_path.read_text(encoding="utf-8"))
+            self.assertIn("Generated recipe published path", calls[-1]["body"])
+            self.assertIn("afk-generated-workstream.txt", calls[-1]["body"])
+
     def test_generate_recipe_defaults_to_production_pi_roles_when_mounts_are_present(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
