@@ -194,6 +194,11 @@ class RedactionTest(unittest.TestCase):
                 self.assertEqual(redact_text(f"token={fake_token}"), "token=[REDACTED]")
                 self.assertEqual(redact_text(f"prefix {fake_token} suffix"), "prefix [REDACTED] suffix")
 
+    def test_redacts_bearer_tokens_in_text(self):
+        text = "Authentication failed: Bearer abcdefghijklmnop"
+
+        self.assertEqual(redact_text(text), "Authentication failed: Bearer [REDACTED]")
+
     def test_artifact_redaction_still_removes_safe_url_query_strings(self):
         self.assertEqual(
             redact_text("service=https://example.invalid/api?mode=test#section"),

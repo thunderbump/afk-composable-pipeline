@@ -35,6 +35,7 @@ SECRET_TOKEN_VALUE_PATTERN = re.compile(
     r"AIza[A-Za-z0-9_-]{20,}"
     r")\b"
 )
+BEARER_SECRET_PATTERN = re.compile(r"(?P<prefix>\bBearer\s+)(?P<value>[A-Za-z0-9._~+/=-]{12,})", re.IGNORECASE)
 MIN_EXACT_SECRET_LENGTH = 4
 
 
@@ -134,6 +135,7 @@ def redact_text(value: str, *, exact_secrets: set[str] | None = None) -> str:
     redacted = JSON_SECRET_STRING_PATTERN.sub(redact_json_secret_string, redacted)
     redacted = SECRET_ASSIGNMENT_PATTERN.sub(redact_secret_assignment, redacted)
     redacted = SECRET_TOKEN_VALUE_PATTERN.sub("[REDACTED]", redacted)
+    redacted = BEARER_SECRET_PATTERN.sub(r"\g<prefix>[REDACTED]", redacted)
     return redact_exact_secret_values(redacted, exact_secrets=exact_secrets)
 
 
