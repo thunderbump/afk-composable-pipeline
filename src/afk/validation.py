@@ -15,33 +15,20 @@ from typing import Any
 
 from afk.jsonutil import canonical_json
 from afk.redaction import is_secret_command_flag, redact_artifact_value, redact_text, redact_url
+from afk.role_adapters import (
+    RoleAdapterRuntimeError,
+    execute_role_command,
+    minimal_command_environment,
+    read_json_result_file,
+    render_command,
+    write_adapter_logs,
+)
 
 
 SCHEMA_VERSION = 1
 
 
-class WorkerRuntimeError(RuntimeError):
-    def __init__(
-        self,
-        message: str,
-        *,
-        stdout: str = "",
-        stderr: str = "",
-        returncode: int | None = None,
-        timed_out: bool = False,
-        command: list[str] | None = None,
-        adapter_details: dict[str, Any] | None = None,
-        failure_artifact: dict[str, Any] | None = None,
-    ):
-        super().__init__(message)
-        self.message = message
-        self.stdout = stdout
-        self.stderr = stderr
-        self.returncode = returncode
-        self.timed_out = timed_out
-        self.command = list(command) if isinstance(command, list) else None
-        self.adapter_details = redact_artifact_value(adapter_details or {})
-        self.failure_artifact = redact_artifact_value(failure_artifact or {})
+WorkerRuntimeError = RoleAdapterRuntimeError
 
 
 def validate_step(context: Any) -> dict[str, Any]:
@@ -521,7 +508,7 @@ def run_command_adapter(
     profile: str,
 ) -> dict[str, Any]:
     evidence_dir.mkdir(parents=True, exist_ok=True)
-    env = minimal_worker_environment(evidence_dir)
+    env = minimal_command_environment(evidence_dir)
     env["AFK_WORKER_REQUEST"] = str(request_path)
     env["AFK_WORKER_RESULT"] = str(result_path)
     env["AFK_WORKER_EVIDENCE_DIR"] = str(evidence_dir)
@@ -531,47 +518,32 @@ def run_command_adapter(
         env["AFK_WORKER_REMOTE_HOST"] = worker["host"]
     command = render_command(
         worker["command"],
-        request_path=request_path,
-        result_path=result_path,
-        evidence_dir=evidence_dir,
-        profile=profile,
+        {
+            "{request_path}": str(request_path),
+            "{result_path}": str(result_path),
+            "{evidence_dir}": str(evidence_dir),
+            "{profile}": profile,
+        },
     )
+    runner = None
     if worker["type"] == "local-command":
-        return run_local_command_adapter(
+        runner = lambda command, cwd, env, timeout_seconds: run_local_command_adapter(
             command,
-            cwd=checkout_path,
+            cwd=cwd,
             env=env,
-            timeout_seconds=worker["timeout_seconds"],
+            timeout_seconds=timeout_seconds,
         )
-    try:
-        completed = subprocess.run(
-            command,
-            cwd=checkout_path,
-            env=env,
-            text=False,
-            capture_output=True,
-            check=False,
-            timeout=worker["timeout_seconds"],
-        )
-    except OSError as exc:
-        raise WorkerRuntimeError(str(exc), stderr=str(exc), returncode=None, command=command) from exc
-    except subprocess.TimeoutExpired as exc:
-        stdout = decode_adapter_output(exc.stdout)
-        stderr = decode_adapter_output(exc.stderr)
-        raise WorkerRuntimeError(
-            "worker command timed out",
-            stdout=stdout,
-            stderr=stderr or "worker command timed out",
-            returncode=None,
-            timed_out=True,
-            command=command,
-        ) from exc
-    return {
-        "command": command,
-        "returncode": completed.returncode,
-        "stdout": decode_adapter_output(completed.stdout),
-        "stderr": decode_adapter_output(completed.stderr),
-    }
+    return execute_role_command(
+        command=command,
+        cwd=checkout_path,
+        env=env,
+        timeout_seconds=worker["timeout_seconds"],
+        runtime_failure_message="worker command failed",
+        timeout_message="worker command timed out",
+        allow_nonzero=True,
+        text=False,
+        runner=runner,
+    )
 
 
 STOPPED_PROCESS_REMEDIATION = (
@@ -1077,52 +1049,6 @@ def append_error_message(stderr: str, message: str) -> str:
     return stderr + "\n" + message
 
 
-def render_command(
-    command: list[str],
-    *,
-    request_path: Path,
-    result_path: Path,
-    evidence_dir: Path,
-    profile: str,
-) -> list[str]:
-    replacements = {
-        "{request_path}": str(request_path),
-        "{result_path}": str(result_path),
-        "{evidence_dir}": str(evidence_dir),
-        "{profile}": profile,
-    }
-    rendered = []
-    for part in command:
-        item = part
-        for marker, value in replacements.items():
-            item = item.replace(marker, value)
-        rendered.append(item)
-    return rendered
-
-
-def minimal_worker_environment(temp_path: Path) -> dict[str, str]:
-    env: dict[str, str] = {}
-    for key in (
-        "PATH",
-        "LANG",
-        "LC_ALL",
-        "GIT_AUTHOR_NAME",
-        "GIT_AUTHOR_EMAIL",
-        "GIT_COMMITTER_NAME",
-        "GIT_COMMITTER_EMAIL",
-    ):
-        value = os.environ.get(key)
-        if value is not None:
-            env[key] = value
-    home_path = temp_path / "home"
-    xdg_config_home = temp_path / "xdg-config"
-    home_path.mkdir(exist_ok=True)
-    xdg_config_home.mkdir(exist_ok=True)
-    env["HOME"] = str(home_path)
-    env["XDG_CONFIG_HOME"] = str(xdg_config_home)
-    return env
-
-
 def path_is_equal_to_or_inside(path: Path, parent: Path) -> bool:
     path_resolved = path.resolve(strict=False)
     parent_resolved = parent.resolve(strict=False)
@@ -1130,29 +1056,19 @@ def path_is_equal_to_or_inside(path: Path, parent: Path) -> bool:
 
 
 def read_worker_payload(path: Path, *, fallback_path: Path | None = None) -> dict[str, Any]:
-    try:
-        raw = path.read_text(encoding="utf-8")
-    except FileNotFoundError:
-        if fallback_path is not None and fallback_path != path:
-            return read_worker_payload(fallback_path)
-        return {"status": "missing", "message": "worker result file was not produced"}
-    except OSError:
-        message = "worker result file could not be read"
-        replace_worker_result_evidence(path, protocol_error_evidence(message))
-        return {"status": "invalid", "message": message}
-    try:
-        import json
-
-        payload = json.loads(raw)
-    except json.JSONDecodeError:
-        message = "worker result file is not valid JSON"
-        replace_worker_result_evidence(path, protocol_error_evidence(message))
-        return {"status": "invalid", "message": message}
-    if not isinstance(payload, dict):
-        message = "worker result file must contain an object"
-        replace_worker_result_evidence(path, protocol_error_evidence(message))
-        return {"status": "invalid", "message": message}
-    redacted_payload = redact_artifact_value(payload)
+    result = read_json_result_file(
+        path,
+        missing_message="worker result file was not produced",
+        invalid_json_message="worker result file is not valid JSON",
+        invalid_type_message="worker result file must contain an object",
+        fallback_path=fallback_path,
+    )
+    if result["status"] == "missing":
+        return result
+    if result["status"] != "valid":
+        replace_worker_result_evidence(path, protocol_error_evidence(result["message"]))
+        return {"status": "invalid", "message": result["message"]}
+    redacted_payload = result["payload"]
     if not replace_worker_result_evidence(path, redacted_payload):
         message = "worker result file could not be sanitized"
         replace_worker_result_evidence(path, protocol_error_evidence(message))
@@ -1857,13 +1773,6 @@ def write_worker_result(path: Path, run_id: str, worker_result: dict[str, Any]) 
 
 def write_json(path: Path, payload: dict[str, Any]) -> None:
     path.write_text(canonical_json(payload) + "\n", encoding="utf-8")
-
-
-def write_adapter_logs(stdout: str, stderr: str) -> None:
-    if stdout:
-        print(stdout, end="")
-    if stderr:
-        print(stderr, end="", file=sys.stderr)
 
 
 def command_secret_error_message(command: list[str]) -> str | None:
