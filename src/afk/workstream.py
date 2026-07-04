@@ -5168,6 +5168,9 @@ def _blocked_retrospective_signals(state: dict[str, Any], publication: dict[str,
     reason = string_field(publication, "reason") or ""
     if publication.get("status") != "blocked" or not reason:
         return []
+    implementation_auth_signal = _implementation_auth_retrospective_signal(state, reason)
+    if implementation_auth_signal is not None:
+        return [implementation_auth_signal]
     reviewer_timeout_signal = _reviewer_timeout_retrospective_signal(state, reason)
     if reviewer_timeout_signal is not None:
         return [reviewer_timeout_signal]
@@ -5183,6 +5186,51 @@ def _blocked_retrospective_signals(state: dict[str, Any], publication: dict[str,
             "evidence_paths": [],
         }
     ]
+
+
+def _implementation_auth_retrospective_signal(state: dict[str, Any], reason: str) -> dict[str, Any] | None:
+    if reason != "implement did not reach implemented: failed_runtime":
+        return None
+    implementation = state.get("implementation")
+    if not isinstance(implementation, dict):
+        return None
+    summary = string_field(implementation, "summary") or ""
+    agent_result = implementation.get("agent_result") if isinstance(implementation.get("agent_result"), dict) else {}
+    evidence = agent_result.get("evidence") if isinstance(agent_result.get("evidence"), dict) else {}
+    stderr_excerpt = string_field(evidence, "stderr_excerpt") or ""
+    stdout_excerpt = string_field(evidence, "stdout_excerpt") or ""
+    classification = _implementation_auth_failure_classification(summary, stderr_excerpt, stdout_excerpt)
+    if not classification:
+        return None
+    excerpt = runtime_failure_excerpt(stderr_excerpt) or runtime_failure_excerpt(stdout_excerpt) or summary
+    implementation_result_path = string_field(state, "implementation_result_path") or ""
+    agent_result_path = str(Path(implementation_result_path).with_name("agent-result.json")) if implementation_result_path else ""
+    return {
+        "kind": "implementation-auth",
+        "scope": "pipeline-process",
+        "severity": "error",
+        "summary": redact_text(excerpt),
+        "step": "implement",
+        "classification": classification,
+        "excerpt": redact_text(excerpt),
+        "evidence_paths": _retrospective_evidence_paths(
+            implementation_result_path,
+            agent_result_path,
+        ),
+    }
+
+
+def _implementation_auth_failure_classification(*texts: str) -> str:
+    combined = "\n".join(text for text in texts if text)
+    if not combined:
+        return ""
+    lowered = combined.lower()
+    auth_markers = ("api key", "oauth", "credential", "login", "authentication", "auth")
+    if not any(marker in lowered for marker in auth_markers):
+        return ""
+    if "openai-codex" in lowered:
+        return "openai-codex-auth"
+    return "agent-auth"
 
 
 def _reviewer_timeout_retrospective_signal(state: dict[str, Any], reason: str) -> dict[str, Any] | None:
@@ -5651,6 +5699,12 @@ def _follow_up_for_signal(signal: dict[str, Any]) -> dict[str, Any] | None:
             kind=kind,
             summary="Repair GitHub publisher authentication evidence before rerunning terminal publication.",
             labels=["afk:follow-up", "area:publication"],
+        )
+    if kind == "implementation-auth":
+        return _retrospective_follow_up_item(
+            kind=kind,
+            summary=_follow_up_summary_for_signal(signal, "Fix"),
+            labels=["afk:follow-up", "area:implementation"],
         )
     if kind == "reviewer-timeout":
         excerpt = string_field(signal, "excerpt") or "reviewer command timed out"
