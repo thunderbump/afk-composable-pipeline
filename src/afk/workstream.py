@@ -29,6 +29,7 @@ from afk.redaction import (
     is_secret_command_flag,
     is_secret_key,
     is_secret_value,
+    normalize_bearer_secret_value,
     redact_artifact_value,
     redact_text,
 )
@@ -6638,7 +6639,7 @@ def _command_secret_error_message(command: list[str], *, field_name: str) -> str
         if (
             re.search(r"(?:^|[\s:])Bearer\s*$", stripped_part, re.IGNORECASE)
             and index + 1 < len(command)
-            and is_bearer_secret_value(command[index + 1].strip())
+            and is_bearer_secret_value(normalize_bearer_secret_value(command[index + 1]))
         ):
             return f"{field_name} must not include secret-looking values"
     return None

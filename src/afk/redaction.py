@@ -35,7 +35,10 @@ SECRET_TOKEN_VALUE_PATTERN = re.compile(
     r"AIza[A-Za-z0-9_-]{20,}"
     r")\b"
 )
-BEARER_SECRET_PATTERN = re.compile(r"(?P<prefix>\bBearer\s+)(?P<value>[A-Za-z0-9._~+/=-]{12,})", re.IGNORECASE)
+BEARER_SECRET_PATTERN = re.compile(
+    r"(?P<prefix>\bBearer\s+)(?P<quote>[\"']?)(?P<value>[A-Za-z0-9._~+/=-]{12,})(?P=quote)",
+    re.IGNORECASE,
+)
 SAFE_BEARER_WORDS = {"unauthorized", "authorizationfailed", "missingcredential"}
 MIN_EXACT_SECRET_LENGTH = 4
 
@@ -168,7 +171,8 @@ def bearer_secret_present(value: str) -> bool:
 
 
 def is_bearer_secret_value(value: str) -> bool:
-    unpadded = value.rstrip("=")
+    normalized = normalize_bearer_secret_value(value)
+    unpadded = normalized.rstrip("=")
     if len(unpadded) < 12:
         return False
     if "=" in unpadded:
@@ -178,6 +182,13 @@ def is_bearer_secret_value(value: str) -> bool:
     return any(char.isdigit() for char in unpadded) or any(char.isupper() for char in unpadded) or any(
         char in "./+~_-" for char in unpadded
     ) or unpadded.isalpha()
+
+
+def normalize_bearer_secret_value(value: str) -> str:
+    normalized = value.strip()
+    if len(normalized) >= 2 and normalized[0] == normalized[-1] and normalized[0] in "\"'":
+        return normalized[1:-1].strip()
+    return normalized
 
 
 def redact_bearer_secret(match: re.Match[str]) -> str:

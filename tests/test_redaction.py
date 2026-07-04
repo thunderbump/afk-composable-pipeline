@@ -225,6 +225,22 @@ class RedactionTest(unittest.TestCase):
 
         self.assertEqual(redact_text(text), "Authentication failed: Bearer [REDACTED]")
 
+    def test_redacts_quoted_bearer_tokens_in_text(self):
+        for token in ('"abcdefghijklmnop=="', "'abcdefghijklmnop'"):
+            with self.subTest(token=token):
+                self.assertEqual(
+                    redact_text(f"Authentication failed: Bearer {token}"),
+                    "Authentication failed: Bearer [REDACTED]",
+                )
+
+    def test_preserves_allowlisted_quoted_bearer_auth_failure_text(self):
+        for value in ('"unauthorized"', "'authorizationfailed'", '"missingcredential"'):
+            with self.subTest(value=value):
+                self.assertEqual(
+                    redact_text(f"Authentication failed: Bearer {value}"),
+                    f"Authentication failed: Bearer {value}",
+                )
+
     def test_preserves_www_authenticate_bearer_parameters(self):
         text = "WWW-Authenticate: Bearer authorization_uri=https://login.example/token, error=invalid_token"
 
