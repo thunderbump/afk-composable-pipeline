@@ -523,6 +523,54 @@ class PrepareCheckoutCliTest(unittest.TestCase):
             self.assertEqual(failed["dirty_status"], ["?? agent-result.json", "?? dirty.txt"])
             self.assertTrue((checkout_path / "agent-result.json").exists())
 
+    def test_prepare_checkout_reports_untracked_ledger_artifacts_in_dirty_status(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repo, _start_commit, _submodule_sha = create_repo_with_submodule(temp_path)
+            checkout_path = temp_path / "checkout"
+            ledger = temp_path / "ledger"
+            payload = {
+                "repo_url": str(repo),
+                "base_ref": "main",
+                "checkout_root": str(temp_path),
+                "checkout_path": str(checkout_path),
+                "review_branch": "afk/test-review",
+            }
+
+            first_run = run_afk(
+                "run-step",
+                "prepare-checkout",
+                "--input",
+                json.dumps(payload),
+                "--ledger",
+                str(ledger),
+                env_overrides={"GIT_ALLOW_PROTOCOL": "file"},
+            )
+            self.assertEqual(first_run.returncode, 0, first_run.stderr)
+            (checkout_path / "dogfood-ledgers").mkdir()
+            (checkout_path / "dogfood-ledgers" / "run.json").write_text("{}", encoding="utf-8")
+            (checkout_path / "uv.lock").write_text("lockfile\n", encoding="utf-8")
+
+            second_run = run_afk(
+                "run-step",
+                "prepare-checkout",
+                "--input",
+                json.dumps(payload),
+                "--ledger",
+                str(ledger),
+                env_overrides={"GIT_ALLOW_PROTOCOL": "file"},
+            )
+
+            self.assertEqual(second_run.returncode, 0, second_run.stderr)
+            summary = json.loads(second_run.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+            failed = result["output"]
+
+            self.assertEqual(failed["status"], "failed_dirty_checkout")
+            self.assertEqual(failed["dirty"], True)
+            self.assertEqual(failed["dirty_status"], ["?? dogfood-ledgers/", "?? uv.lock"])
+
     def test_prepare_checkout_can_publish_requested_review_branch(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)

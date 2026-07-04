@@ -5171,6 +5171,9 @@ def _blocked_retrospective_signals(state: dict[str, Any], publication: dict[str,
     reviewer_timeout_signal = _reviewer_timeout_retrospective_signal(state, reason)
     if reviewer_timeout_signal is not None:
         return [reviewer_timeout_signal]
+    dirty_checkout_signal = _dirty_checkout_retrospective_signal(state, reason)
+    if dirty_checkout_signal is not None:
+        return [dirty_checkout_signal]
     return [
         {
             "kind": "retry-or-blocked",
@@ -5211,6 +5214,59 @@ def _reviewer_timeout_retrospective_signal(state: dict[str, Any], reason: str) -
         "excerpt": redact_text(excerpt),
         "evidence_paths": _retrospective_evidence_paths(string_field(state, "review_result_path") or ""),
     }
+
+
+def _dirty_checkout_retrospective_signal(state: dict[str, Any], reason: str) -> dict[str, Any] | None:
+    if reason != "prepare-checkout did not reach prepared: failed_dirty_checkout":
+        return None
+    checkout = state.get("checkout")
+    if not isinstance(checkout, dict) or checkout.get("status") != "failed_dirty_checkout":
+        return None
+    examples = _dirty_checkout_path_examples(checkout.get("dirty_status"))
+    example_text = _dirty_checkout_examples_text(examples, checkout.get("dirty_status"))
+    message = string_field(checkout, "message") or "existing checkout is dirty"
+    summary = f"prepare-checkout blocked by dirty checkout; {message}."
+    if example_text:
+        summary += f" Dirty paths include {example_text}."
+    return {
+        "kind": "dirty-checkout",
+        "scope": "pipeline-process",
+        "severity": "error",
+        "summary": redact_text(summary),
+        "step": "prepare-checkout",
+        "classification": "failed_dirty_checkout",
+        "excerpt": redact_text(summary),
+        "dirty_paths": redact_text(example_text),
+        "evidence_paths": _retrospective_evidence_paths(string_field(checkout, "checkout_path") or ""),
+    }
+
+
+def _dirty_checkout_path_examples(dirty_status: Any, *, limit: int = 2) -> list[str]:
+    if not isinstance(dirty_status, list):
+        return []
+    examples: list[str] = []
+    for line in dirty_status:
+        if not isinstance(line, str):
+            continue
+        text = line.strip()
+        if not text:
+            continue
+        match = re.match(r"^[ MADRCU?!]{1,3}\s+(.*)$", text)
+        path = match.group(1).strip() if match else text
+        if path and path not in examples:
+            examples.append(path)
+        if len(examples) >= limit:
+            break
+    return examples
+
+
+def _dirty_checkout_examples_text(examples: list[str], dirty_status: Any) -> str:
+    if not examples:
+        return ""
+    total = len(dirty_status) if isinstance(dirty_status, list) else len(examples)
+    if total > len(examples):
+        return f"{', '.join(examples)}, and {total - len(examples)} more"
+    return ", ".join(examples)
 
 
 def _blocked_reason_targets_work_item(state: dict[str, Any], reason: str) -> bool:
@@ -5602,6 +5658,17 @@ def _follow_up_for_signal(signal: dict[str, Any]) -> dict[str, Any] | None:
             kind=kind,
             summary=f"Increase or override the reviewer timeout before rerunning the workstream; {excerpt}.",
             labels=["afk:follow-up", "area:review"],
+        )
+    if kind == "dirty-checkout":
+        dirty_paths = string_field(signal, "dirty_paths") or "the reported checkout artifacts"
+        return _retrospective_follow_up_item(
+            kind=kind,
+            summary=(
+                "Clean the target checkout before rerunning prepare-checkout; move pipeline artifacts "
+                "outside the checkout or remove/stash dirty paths such as "
+                f"{dirty_paths}."
+            ),
+            labels=["afk:follow-up", "area:cleanup"],
         )
     if kind == "publisher-failure":
         return _retrospective_follow_up_item(
