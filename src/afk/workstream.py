@@ -5224,12 +5224,9 @@ def _implementation_auth_retrospective_signal(state: dict[str, Any], reason: str
 def _implementation_auth_failure_excerpt(*texts: str) -> str:
     explicit_excerpts: list[str] = []
     for text in texts[1:]:
-        excerpt = runtime_failure_excerpt(text)
-        if _is_explicit_auth_failure_excerpt(excerpt):
-            explicit_excerpts.append(excerpt)
+        explicit_excerpts.extend(_explicit_auth_failure_lines(text))
     for text in texts:
-        if _is_explicit_auth_failure_excerpt(text):
-            explicit_excerpts.append(text)
+        explicit_excerpts.extend(_explicit_auth_failure_lines(text))
     for excerpt in explicit_excerpts:
         if "openai-codex" in excerpt.lower():
             return excerpt
@@ -5262,6 +5259,15 @@ def _is_explicit_auth_failure_excerpt(excerpt: str) -> bool:
         or "login failed" in lowered
         or ("credential" in lowered and ("missing" in lowered or "failed" in lowered or "expired" in lowered))
     )
+
+
+def _explicit_auth_failure_lines(text: str) -> list[str]:
+    lines: list[str] = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if _is_explicit_auth_failure_excerpt(line):
+            lines.append(line)
+    return lines
 
 
 def _reviewer_timeout_retrospective_signal(state: dict[str, Any], reason: str) -> dict[str, Any] | None:
