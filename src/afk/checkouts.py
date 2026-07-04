@@ -305,7 +305,7 @@ def resolve_requested_commit(checkout_path: Path, requested_ref: str) -> str:
 
 
 def dirty_tree(path: Path) -> dict[str, Any]:
-    status = git(["status", "--porcelain=v1", "--untracked-files=all"], cwd=path)
+    status = git(["status", "--porcelain=v1"], cwd=path)
     status_lines = [line for line in status.splitlines() if line]
     return {"dirty": bool(status_lines), "status_lines": status_lines}
 

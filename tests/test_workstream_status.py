@@ -1185,6 +1185,48 @@ class WorkstreamStatusMappingTest(unittest.TestCase):
         self.assertEqual(record["signals"][0]["severity"], "error")
         self.assertIn("required final validation evidence is missing", record["signals"][0]["summary"])
 
+    def test_pipeline_retrospective_record_turns_dirty_checkout_block_into_cleanup_follow_up(self):
+        state = retrospective_state()
+        state["checkout"] = {
+            "status": "failed_dirty_checkout",
+            "message": "existing checkout has uncommitted changes; commit, stash, or remove it before reuse",
+            "dirty": True,
+            "dirty_status": [
+                "?? dogfood-ledgers/",
+                "?? uv.lock",
+                "?? retry.log",
+            ],
+        }
+
+        record = pipeline_retrospective_record(
+            state,
+            {"status": "blocked", "reason": "prepare-checkout did not reach prepared: failed_dirty_checkout"},
+            retrospective_tracker("selected"),
+        )
+
+        self.assertEqual(record["status"], "blocked")
+        self.assertEqual(record["health"], "failing")
+        self.assertEqual(record["signals"][0]["kind"], "dirty-checkout")
+        self.assertEqual(record["signals"][0]["scope"], "pipeline-process")
+        self.assertEqual(record["signals"][0]["step"], "prepare-checkout")
+        self.assertEqual(record["signals"][0]["classification"], "failed_dirty_checkout")
+        self.assertIn("dogfood-ledgers/", record["signals"][0]["summary"])
+        self.assertIn("uv.lock", record["signals"][0]["summary"])
+        self.assertNotIn("retry.log", record["signals"][0]["summary"])
+        self.assertEqual(
+            record["recommended_follow_up"],
+            [
+                {
+                    "summary": (
+                        "Clean the target checkout before rerunning prepare-checkout; move pipeline artifacts "
+                        "outside the checkout or remove/stash dirty paths such as dogfood-ledgers/, uv.lock, "
+                        "and 1 more."
+                    ),
+                    "labels": ["afk:follow-up", "area:cleanup", "project:afk-composable-pipeline"],
+                }
+            ],
+        )
+
     def test_pipeline_retrospective_record_targets_work_for_new_validation_gate_reason(self):
         state = retrospective_state()
         state["validations"] = [
