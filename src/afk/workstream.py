@@ -19,10 +19,7 @@ from afk.implement import runtime_failure_excerpt, safe_git_metadata
 from afk.jsonutil import canonical_json, sha256_json
 from afk.pi_workers import (
     non_openai_pi_mount_error,
-    pi_command_executable,
     openai_codex_pi_mount_error,
-    pi_command_provider,
-    pi_preflight_command,
     validate_absolute_dir,
 )
 from afk.redaction import is_secret_command_flag, is_secret_key, is_secret_value, redact_artifact_value, redact_text
@@ -40,8 +37,6 @@ COMMAND_BEARER_SECRET_PATTERN = re.compile(r"\bBearer\s+[A-Za-z0-9._~+/=-]{12,}"
 PI_JUDGE_PROMPT_PLACEHOLDER = "{prompt}"
 PI_JUDGE_REQUEST_PATH_PLACEHOLDER = "{request_path}"
 PI_JUDGE_RESULT_PATH_PLACEHOLDER = "{result_path}"
-PI_AUTH_PREFLIGHT_PROMPT = "Reply with OK only."
-PI_AUTH_PREFLIGHT_TIMEOUT_SECONDS = 30.0
 
 
 @dataclass(frozen=True)
@@ -171,107 +166,82 @@ def run_workstream(
         "review_selection": [],
         "review_result_path": "",
         "cleanup": {"status": "unknown", "resources": []},
-        "pi_auth_preflight": {"schema_version": SCHEMA_VERSION, "status": "skipped", "results": []},
         "blocked_reason": "",
         "stop_reason": "",
         "next_allowed_command": "",
     }
     steps = []
-    pi_auth_preflight = run_pi_auth_preflight(normalized)
-    pi_auth_preflight_status = {
-        item["target"]: item["status"]
-        for item in pi_auth_preflight.get("results", [])
-        if isinstance(item, dict) and isinstance(item.get("target"), str) and isinstance(item.get("status"), str)
-    }
-
-    if pi_auth_preflight["status"] != "skipped":
-        ledger.write_json("pi-auth-preflight.json", pi_auth_preflight)
-    state["pi_auth_preflight"] = pi_auth_preflight
-    if pi_auth_preflight["status"] == "failed":
-        state["blocked_reason"] = pi_auth_preflight["reason"]
-    else:
-        steps_queue = [deepcopy(step) for step in normalized["steps"]]
-        index = 0
-        while index < len(steps_queue):
-            step_spec = steps_queue[index]
-            step_name = step_spec["name"]
-            remaining_steps = steps_queue[index + 1 :]
-            stop_reason = terminal_stop_reason(step_spec, state)
-            if stop_reason:
-                state["stop_reason"] = stop_reason
-                state["next_allowed_command"] = next_allowed_command_for_terminal_stop(state, normalized)
-                break
-            blocked_reason = workflow_order_blocking_reason(step_name, state, normalized["retry_policy"])
-            if blocked_reason:
-                state["blocked_reason"] = blocked_reason
-                break
-            step_input = composed_step_input(step_spec, normalized, state, ledger_dir, step_index=index)
-            auth_target = pi_auth_target_for_step(step_name, step_input)
-            if auth_target is not None and pi_auth_preflight_status.get(auth_target["target"]) == "deferred":
-                auth_result = run_pi_auth_preflight_target(auth_target, cwd=checkout_path_from_state(state))
-                pi_auth_preflight["results"].append(auth_result)
-                pi_auth_preflight = summarize_pi_auth_preflight(pi_auth_preflight["results"])
-                pi_auth_preflight_status[auth_target["target"]] = auth_result["status"]
-                ledger.write_json("pi-auth-preflight.json", pi_auth_preflight)
-                state["pi_auth_preflight"] = pi_auth_preflight
-                if auth_result["status"] == "failed":
-                    state["blocked_reason"] = pi_auth_preflight_failure_reason(auth_result)
-                    break
-            step_profile = step_spec.get("profile")
-            equivalent_command = equivalent_run_step_command(
-                step_name,
-                step_input,
-                ledger_dir,
-                profile=step_profile,
-                project_contract=project_contract,
+    steps_queue = [deepcopy(step) for step in normalized["steps"]]
+    index = 0
+    while index < len(steps_queue):
+        step_spec = steps_queue[index]
+        step_name = step_spec["name"]
+        remaining_steps = steps_queue[index + 1 :]
+        stop_reason = terminal_stop_reason(step_spec, state)
+        if stop_reason:
+            state["stop_reason"] = stop_reason
+            state["next_allowed_command"] = next_allowed_command_for_terminal_stop(state, normalized)
+            break
+        blocked_reason = workflow_order_blocking_reason(step_name, state, normalized["retry_policy"])
+        if blocked_reason:
+            state["blocked_reason"] = blocked_reason
+            break
+        step_input = composed_step_input(step_spec, normalized, state, ledger_dir, step_index=index)
+        step_profile = step_spec.get("profile")
+        equivalent_command = equivalent_run_step_command(
+            step_name,
+            step_input,
+            ledger_dir,
+            profile=step_profile,
+            project_contract=project_contract,
+        )
+        result = step_runner(step_name, step_input, ledger_dir, project_contract)
+        step_record = step_execution_record(
+            step_name,
+            result,
+            equivalent_command,
+            ledger_dir,
+        )
+        steps.append(step_record)
+        update_state_from_step(state, step_name, result, ledger_dir)
+        if step_name == "validate":
+            repair_steps, repair_blocked_reason = validation_feedback_follow_up(
+                normalized=normalized,
+                state=state,
+                step_spec=step_spec,
+                ledger_dir=ledger_dir,
             )
-            result = step_runner(step_name, step_input, ledger_dir, project_contract)
-            step_record = step_execution_record(
-                step_name,
-                result,
-                equivalent_command,
-                ledger_dir,
-            )
-            steps.append(step_record)
-            update_state_from_step(state, step_name, result, ledger_dir)
-            if step_name == "validate":
-                repair_steps, repair_blocked_reason = validation_feedback_follow_up(
-                    normalized=normalized,
-                    state=state,
-                    step_spec=step_spec,
-                    ledger_dir=ledger_dir,
-                )
-                if repair_blocked_reason:
-                    state["blocked_reason"] = repair_blocked_reason
-                    break
-                if repair_steps:
-                    state["pending_repair_context"] = build_validation_repair_context(state, repair_attempt=retry_attempt_count(state) + 1)
-                    steps_queue[index + 1 : index + 1] = repair_steps
-                    index += 1
-                    continue
-            if step_name == "review":
-                repair_steps, repair_blocked_reason = review_feedback_follow_up(
-                    normalized=normalized,
-                    state=state,
-                    step_spec=step_spec,
-                )
-                if repair_blocked_reason:
-                    state["blocked_reason"] = repair_blocked_reason
-                    break
-                if repair_steps:
-                    state["pending_repair_context"] = build_review_repair_context(
-                        state,
-                        step_spec=step_spec,
-                        repair_attempt=retry_attempt_count(state) + 1,
-                    )
-                    steps_queue[index + 1 : index + 1] = repair_steps
-                    index += 1
-                    continue
-            blocked_reason = blocking_reason_for_step(step_name, result, remaining_steps)
-            if blocked_reason:
-                state["blocked_reason"] = blocked_reason
+            if repair_blocked_reason:
+                state["blocked_reason"] = repair_blocked_reason
                 break
-            index += 1
+            if repair_steps:
+                state["pending_repair_context"] = build_validation_repair_context(state, repair_attempt=retry_attempt_count(state) + 1)
+                steps_queue[index + 1 : index + 1] = repair_steps
+                index += 1
+                continue
+        if step_name == "review":
+            repair_steps, repair_blocked_reason = review_feedback_follow_up(
+                normalized=normalized,
+                state=state,
+                step_spec=step_spec,
+            )
+            if repair_blocked_reason:
+                state["blocked_reason"] = repair_blocked_reason
+                break
+            if repair_steps:
+                state["pending_repair_context"] = build_review_repair_context(
+                    state,
+                    step_spec=step_spec,
+                    repair_attempt=retry_attempt_count(state) + 1,
+                )
+                steps_queue[index + 1 : index + 1] = repair_steps
+                index += 1
+                continue
+        blocked_reason = blocking_reason_for_step(step_name, result, remaining_steps)
+        if blocked_reason:
+            state["blocked_reason"] = blocked_reason
+            break
+        index += 1
 
     state["cleanup"] = final_cleanup_state(state)
 
@@ -651,265 +621,6 @@ def equivalent_run_step_command(
     return command
 
 
-def run_pi_auth_preflight(normalized: dict[str, Any]) -> dict[str, Any]:
-    results = []
-    for target in pi_auth_preflight_targets(normalized):
-        result = run_pi_auth_preflight_target(target, defer_checkout_local=True)
-        results.append(result)
-        if result["status"] == "failed":
-            return summarize_pi_auth_preflight(results)
-    return summarize_pi_auth_preflight(results)
-
-
-def summarize_pi_auth_preflight(results: list[dict[str, Any]]) -> dict[str, Any]:
-    if not results:
-        return {"schema_version": SCHEMA_VERSION, "status": "skipped", "results": []}
-    failed_result = next((item for item in results if item.get("status") == "failed"), None)
-    if failed_result is not None:
-        return {
-            "schema_version": SCHEMA_VERSION,
-            "status": "failed",
-            "reason": pi_auth_preflight_failure_reason(failed_result),
-            "results": results,
-        }
-    if any(item.get("status") == "passed" for item in results):
-        status = "passed"
-    elif any(item.get("status") == "deferred" for item in results):
-        status = "deferred"
-    else:
-        status = "skipped"
-    return {"schema_version": SCHEMA_VERSION, "status": status, "results": results}
-
-
-def pi_auth_preflight_failure_reason(result: dict[str, Any]) -> str:
-    return f"Pi auth preflight failed for {result['target']}: {result['summary']}"
-
-
-def pi_auth_preflight_targets(normalized: dict[str, Any]) -> list[dict[str, Any]]:
-    targets = []
-    for step in normalized["steps"]:
-        step_name = step["name"]
-        input_data = step["input"]
-        if step_name == "implement":
-            target = pi_auth_preflight_target("implement.agent", input_data.get("agent"))
-            if target is not None:
-                targets.append(target)
-        elif step_name == "review":
-            target = pi_auth_preflight_target("review.reviewer", input_data.get("reviewer"))
-            if target is not None:
-                targets.append(target)
-    target = pi_auth_preflight_target("retrospective_judge", normalized.get("retrospective_judge"))
-    if target is not None:
-        targets.append(target)
-    return targets
-
-
-def pi_auth_preflight_target(target_name: str, config: Any) -> dict[str, Any] | None:
-    if not isinstance(config, dict):
-        return None
-    command = config.get("command")
-    if not _is_string_list(command):
-        return None
-    command_list = list(command)
-    if pi_command_provider(command_list) != "openai-codex":
-        return None
-    timeout_seconds = PI_AUTH_PREFLIGHT_TIMEOUT_SECONDS
-    raw_timeout = config.get("timeout_seconds")
-    if isinstance(raw_timeout, (int, float)) and not isinstance(raw_timeout, bool) and raw_timeout > 0:
-        timeout_seconds = min(float(raw_timeout), PI_AUTH_PREFLIGHT_TIMEOUT_SECONDS)
-    env = config.get("env") if isinstance(config.get("env"), dict) else {}
-    target = {
-        "target": target_name,
-        "command": command_list,
-        "codex_home": string_field(config, "codex_home") or "",
-        "config_home": string_field(config, "config_home") or "",
-        "env": {key: str(value) for key, value in env.items() if isinstance(value, str)},
-        "timeout_seconds": timeout_seconds,
-        "defer_until_checkout": pi_auth_preflight_requires_checkout(command_list),
-    }
-    if target_name == "implement.agent":
-        target["job_capsule"] = _implement_preflight_job_capsule(config)
-    return target
-
-
-def pi_auth_preflight_requires_checkout(command: list[str]) -> bool:
-    executable = pi_command_executable(command)
-    if not executable:
-        return False
-    path = Path(executable)
-    return not path.is_absolute() and ("/" in executable or executable.startswith("."))
-
-
-def run_pi_auth_preflight_target(
-    target: dict[str, Any],
-    *,
-    cwd: Path | None = None,
-    defer_checkout_local: bool = False,
-) -> dict[str, Any]:
-    if defer_checkout_local and target.get("defer_until_checkout"):
-        return {
-            "target": target["target"],
-            "provider": "openai-codex",
-            "status": "deferred",
-            "summary": "checkout-local Pi command deferred until prepare-checkout completes",
-            "command": redact_artifact_value(target["command"]),
-            "returncode": None,
-            "stdout_excerpt": "",
-            "stderr_excerpt": "",
-        }
-    with tempfile.TemporaryDirectory(prefix="afk-pi-auth-") as temp_dir:
-        temp_path = Path(temp_dir)
-        env = _minimal_retrospective_judge_environment(temp_path, config_home=target["config_home"])
-        env.update(target["env"])
-        if target["codex_home"]:
-            env["CODEX_HOME"] = target["codex_home"]
-        env["AFK_PI_AUTH_PREFLIGHT"] = "1"
-        _seed_pi_auth_preflight_runtime_env(target, env=env, temp_path=temp_path)
-        rendered_command = _render_pi_auth_preflight_command(target, temp_path=temp_path)
-        command = pi_preflight_command(rendered_command, prompt=PI_AUTH_PREFLIGHT_PROMPT) or [
-            part.replace(PI_JUDGE_PROMPT_PLACEHOLDER, PI_AUTH_PREFLIGHT_PROMPT)
-            for part in rendered_command
-        ]
-        run_cwd = cwd or temp_path
-        try:
-            completed = subprocess.run(
-                command,
-                cwd=run_cwd,
-                env=env,
-                text=True,
-                capture_output=True,
-                check=False,
-                timeout=target["timeout_seconds"],
-            )
-        except OSError as exc:
-            message = redact_text(str(exc))
-            return {
-                "target": target["target"],
-                "provider": "openai-codex",
-                "status": "failed",
-                "summary": message,
-                "command": redact_artifact_value(command),
-                "returncode": None,
-                "stdout_excerpt": "",
-                "stderr_excerpt": message,
-            }
-        except subprocess.TimeoutExpired as exc:
-            stdout = redact_text(exc.stdout if isinstance(exc.stdout, str) else "")
-            stderr = redact_text(exc.stderr if isinstance(exc.stderr, str) else "")
-            return {
-                "target": target["target"],
-                "provider": "openai-codex",
-                "status": "failed",
-                "summary": "pi auth preflight timed out",
-                "command": redact_artifact_value(command),
-                "returncode": None,
-                "stdout_excerpt": stdout[-2000:],
-                "stderr_excerpt": stderr[-2000:],
-            }
-        stdout = redact_text(completed.stdout)
-        stderr = redact_text(completed.stderr)
-        summary = runtime_failure_excerpt(stderr) or runtime_failure_excerpt(stdout) or "pi auth preflight failed"
-        return {
-            "target": target["target"],
-            "provider": "openai-codex",
-            "status": "passed" if completed.returncode == 0 else "failed",
-            "summary": "authenticated" if completed.returncode == 0 else summary,
-            "command": redact_artifact_value(command),
-            "returncode": completed.returncode,
-            "stdout_excerpt": stdout[-2000:],
-            "stderr_excerpt": stderr[-2000:],
-        }
-
-
-def deferred_pi_auth_preflight_result(target: dict[str, Any], *, summary: str) -> dict[str, Any]:
-    return {
-        "target": target["target"],
-        "provider": "openai-codex",
-        "status": "deferred",
-        "summary": summary,
-        "command": redact_artifact_value(target["command"]),
-        "returncode": None,
-        "stdout_excerpt": "",
-        "stderr_excerpt": "",
-    }
-
-
-def _render_pi_auth_preflight_command(target: dict[str, Any], *, temp_path: Path) -> list[str]:
-    command = list(target["command"])
-    if target["target"] == "review.reviewer":
-        return _render_retrospective_command(
-            command,
-            {
-                PI_JUDGE_REQUEST_PATH_PLACEHOLDER: str(temp_path / "reviewer-request.json"),
-                PI_JUDGE_RESULT_PATH_PLACEHOLDER: str(temp_path / "reviewer-result.json"),
-            },
-        )
-    if target["target"] == "retrospective_judge":
-        return _render_retrospective_command(
-            command,
-            {
-                PI_JUDGE_REQUEST_PATH_PLACEHOLDER: str(temp_path / "retrospective-judge-request.json"),
-                PI_JUDGE_RESULT_PATH_PLACEHOLDER: str(temp_path / "retrospective-judge-result.json"),
-            },
-        )
-    return command
-
-
-def _implement_preflight_job_capsule(config: Any) -> dict[str, Any]:
-    agent_mounts = {
-        "codex_home": string_field(config, "codex_home") or "",
-        "config_home": string_field(config, "config_home") or "",
-        "pi_config_home": (
-            string_field(config.get("env"), "PI_CONFIG_HOME") if isinstance(config, dict) else ""
-        )
-        or "",
-    }
-    if isinstance(config, dict):
-        wrapper_secret_files = config.get("wrapper_secret_files")
-        if isinstance(wrapper_secret_files, dict) and wrapper_secret_files:
-            agent_mounts["wrapper_secret_files"] = {
-                key: str(value) for key, value in wrapper_secret_files.items() if isinstance(value, str)
-            }
-        secret_refs = config.get("secret_refs")
-        if isinstance(secret_refs, dict) and secret_refs:
-            agent_mounts["secret_refs"] = json.loads(canonical_json(secret_refs))
-    return {
-        "schema_version": SCHEMA_VERSION,
-        "artifact_type": "job-capsule",
-        "agent_mounts": agent_mounts,
-        "completion_contract": {
-            "result_path": "agent-result.json",
-            "result_path_env": "AFK_AGENT_RESULT_PATH",
-            "write_result_file_before_exit": True,
-        },
-    }
-
-
-def _seed_pi_auth_preflight_runtime_env(target: dict[str, Any], *, env: dict[str, str], temp_path: Path) -> None:
-    target_name = target["target"]
-    if target_name == "implement.agent":
-        capsule_path = temp_path / "job-capsule.json"
-        capsule = target.get("job_capsule")
-        if isinstance(capsule, dict):
-            capsule_path.write_text(canonical_json(capsule) + "\n", encoding="utf-8")
-        else:
-            capsule_path.write_text('{"artifact_type":"job-capsule"}\n', encoding="utf-8")
-        env["AFK_JOB_CAPSULE"] = str(capsule_path)
-        env["AFK_AGENT_RESULT_PATH"] = "agent-result.json"
-        return
-    if target_name == "review.reviewer":
-        request_path = temp_path / "reviewer-request.json"
-        request_path.write_text('{"artifact_type":"reviewer-request"}\n', encoding="utf-8")
-        env["AFK_REVIEWER_REQUEST"] = str(request_path)
-        env["AFK_REVIEWER_RESULT"] = str(temp_path / "reviewer-result.json")
-        return
-    if target_name == "retrospective_judge":
-        request_path = temp_path / "retrospective-judge-request.json"
-        request_path.write_text('{"artifact_type":"retrospective-judge-request"}\n', encoding="utf-8")
-        env["AFK_RETROSPECTIVE_JUDGE_REQUEST"] = str(request_path)
-        env["AFK_RETROSPECTIVE_JUDGE_RESULT"] = str(temp_path / "retrospective-judge-result.json")
-
-
 def step_execution_record(
     step_name: str,
     result: StepResult,
@@ -929,14 +640,6 @@ def step_execution_record(
         "result_abspath": str((ledger_dir / run_result_path).resolve(strict=False)),
         "equivalent_command": redact_artifact_value(equivalent_command),
     }
-
-
-def pi_auth_target_for_step(step_name: str, step_input: Any) -> dict[str, Any] | None:
-    if step_name == "implement" and isinstance(step_input, dict):
-        return pi_auth_preflight_target("implement.agent", step_input.get("agent"))
-    if step_name == "review" and isinstance(step_input, dict):
-        return pi_auth_preflight_target("review.reviewer", step_input.get("reviewer"))
-    return None
 
 
 def update_state_from_step(
@@ -3937,7 +3640,6 @@ def pipeline_retrospective_record(
 ) -> dict[str, Any]:
     signals = (
         _validation_retrospective_signals(state, normalized)
-        + _auth_preflight_retrospective_signals(state)
         + _publication_retrospective_signals(publication)
         + _blocked_retrospective_signals(state, publication)
         + _cleanup_retrospective_signals(state)
@@ -4087,7 +3789,7 @@ def _run_retrospective_judge(
     pipeline_retrospective: dict[str, Any],
     ledger: "WorkstreamLedger",
     skip_reason: str = "",
-    skip_classification: str = "auth_preflight_failed",
+    skip_classification: str = "",
 ) -> dict[str, Any]:
     judge = normalized.get("retrospective_judge") if isinstance(normalized, dict) else {}
     if not isinstance(judge, dict) or not judge.get("enabled"):
@@ -5672,32 +5374,6 @@ def _validation_failure_retrospective_scope(output: dict[str, Any], failure: dic
     return "target-work"
 
 
-def _auth_preflight_retrospective_signals(state: dict[str, Any]) -> list[dict[str, Any]]:
-    preflight = state.get("pi_auth_preflight")
-    if not isinstance(preflight, dict) or preflight.get("status") != "failed":
-        return []
-    results = preflight.get("results")
-    if not isinstance(results, list):
-        return []
-    failed = next((item for item in results if isinstance(item, dict) and item.get("status") == "failed"), None)
-    if failed is None:
-        return []
-    target = string_field(failed, "target") or "pi-auth-preflight"
-    excerpt = string_field(failed, "summary") or string_field(preflight, "reason") or "Pi auth preflight failed"
-    return [
-        {
-            "kind": "auth-preflight",
-            "scope": "pipeline-process",
-            "severity": "error",
-            "summary": redact_text(excerpt),
-            "step": redact_text(target),
-            "classification": "auth-preflight",
-            "excerpt": redact_text(excerpt),
-            "evidence_paths": _retrospective_evidence_paths("pi-auth-preflight.json"),
-        }
-    ]
-
-
 def _publication_retrospective_signals(publication: dict[str, Any]) -> list[dict[str, Any]]:
     if publication.get("status") != "failed-needs-human":
         return []
@@ -5780,8 +5456,6 @@ def _reviewer_timeout_retrospective_signal(state: dict[str, Any], reason: str) -
 
 
 def _blocked_reason_targets_work_item(state: dict[str, Any], reason: str) -> bool:
-    if reason.startswith("Pi auth preflight failed for "):
-        return False
     review = state.get("review") if isinstance(state.get("review"), dict) else {}
     if reason.startswith("review feedback retry budget exhausted:"):
         return string_field(review, "status") == "request_revision"
@@ -6092,7 +5766,7 @@ def _signal_replaces_generic_retry_follow_up(signal: dict[str, Any]) -> bool:
     kind = string_field(signal, "kind") or ""
     if kind in {"validation-failure", "missing-tool-or-config"}:
         return bool(string_field(signal, "excerpt") and signal.get("evidence_paths"))
-    if kind in {"publisher-auth", "auth-preflight"}:
+    if kind == "publisher-auth":
         return bool(signal.get("evidence_paths"))
     return False
 
@@ -6104,7 +5778,6 @@ def _signal_replaces_judge_follow_up(signal: dict[str, Any]) -> bool:
     return kind in {
         "validation-failure",
         "missing-tool-or-config",
-        "auth-preflight",
     } and bool(
         string_field(signal, "excerpt") and signal.get("evidence_paths")
     )
@@ -6167,12 +5840,6 @@ def _follow_up_for_signal(signal: dict[str, Any]) -> dict[str, Any] | None:
             kind=kind,
             summary=f"Increase or override the reviewer timeout before rerunning the workstream; {excerpt}.",
             labels=["afk:follow-up", "area:review"],
-        )
-    if kind == "auth-preflight":
-        return _retrospective_follow_up_item(
-            kind=kind,
-            summary=f"Restore Pi auth preflight for {string_field(signal, 'step') or 'the failing target'} before rerunning the workstream.",
-            labels=["afk:follow-up", "area:workstream"],
         )
     if kind == "publisher-failure":
         return _retrospective_follow_up_item(
@@ -6479,11 +6146,21 @@ def normalize_retrospective_judge(
         key
         for key in retrospective_judge
         if key
-        not in {"enabled", "type", "command", "timeout_seconds", "timeoutSeconds", "codex_home", "config_home", "env"}
+        not in {
+            "enabled",
+            "type",
+            "command",
+            "timeout_seconds",
+            "timeoutSeconds",
+            "provider",
+            "codex_home",
+            "config_home",
+            "env",
+        }
     ]
     if unsupported:
         raise WorkstreamError(
-            "retrospective_judge only supports enabled, type, command, timeout_seconds, codex_home, config_home, env"
+            "retrospective_judge only supports enabled, type, command, timeout_seconds, provider, codex_home, config_home, env"
         )
     enabled = retrospective_judge.get("enabled", False)
     if not isinstance(enabled, bool):
@@ -6513,6 +6190,11 @@ def normalize_retrospective_judge(
         "command": list(command),
         "timeout_seconds": float(timeout_seconds),
     }
+    provider = retrospective_judge.get("provider")
+    if provider is not None:
+        if not isinstance(provider, str) or not provider.strip():
+            raise WorkstreamError("retrospective_judge.provider must be a non-empty string")
+        normalized["provider"] = provider.strip()
     checkout_mount_boundaries = checkout_paths or ([checkout_path] if checkout_path is not None else [])
     for field_name in ("codex_home", "config_home"):
         raw_value = retrospective_judge.get(field_name)
@@ -6552,7 +6234,7 @@ def normalize_retrospective_judge(
                 raise WorkstreamError(str(exc)) from exc
         normalized["env"] = normalized_env
     mount_error = openai_codex_pi_mount_error(
-        command=normalized["command"],
+        provider=normalized.get("provider"),
         codex_home=normalized.get("codex_home"),
         config_home=normalized.get("config_home"),
         env=normalized.get("env"),
@@ -6561,7 +6243,7 @@ def normalize_retrospective_judge(
     if mount_error:
         raise WorkstreamError(mount_error)
     mount_rejection = non_openai_pi_mount_error(
-        command=normalized["command"],
+        provider=normalized.get("provider"),
         codex_home=normalized.get("codex_home"),
         config_home=normalized.get("config_home"),
         env=normalized.get("env"),
@@ -6843,8 +6525,6 @@ def workstream_artifacts(ledger: "WorkstreamLedger") -> dict[str, str]:
         "tracker": "tracker-result.json",
         "pipeline_retrospective": "pipeline-retrospective.json",
     }
-    if (ledger.path / "pi-auth-preflight.json").is_file():
-        artifacts["pi_auth_preflight"] = "pi-auth-preflight.json"
     if (ledger.path / "pr-body.md").is_file():
         artifacts["pr_body"] = "pr-body.md"
     if (ledger.path / "retrospective.json").is_file():

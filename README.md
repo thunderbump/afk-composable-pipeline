@@ -659,14 +659,9 @@ Expected auth evidence:
 
 - If an auth mount is invalid, AFK stops before execution and records
   `agent.env.*`/`agent.*` mount validation messages in the step result message.
-- If Pi `openai-codex` auth cannot answer a minimal prompt with the configured
-  mounts, `run-workstream` stops before any workstream step runs, records
-  `pi-auth-preflight.json`, and returns a blocked result whose reason includes a
-  redacted Pi auth failure summary such as `No API key for provider:
-  openai-codex`.
-- If preflight passes but auth later expires during a real role invocation, the
-  affected implement/review/judge step can still fail as `failed_runtime` with
-  runtime evidence in the step artifacts.
+- If runtime auth is missing or expires during a real Pi/Codex role invocation,
+  the affected implement/review/judge step fails in its own adapter path with
+  redacted runtime evidence in the step artifacts.
 
 Minimal recipe fragment for remote/container portability (for `central-afk-pr.7`):
 

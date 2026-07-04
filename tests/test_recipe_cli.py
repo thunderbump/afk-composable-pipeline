@@ -466,6 +466,7 @@ raise SystemExit(9)
 
             implement_agent = recipe["steps"][2]["input"]["agent"]
             self.assertEqual(implement_agent["type"], "real-agent-command")
+            self.assertEqual(implement_agent["provider"], "openai-codex")
             self.assertEqual(
                 implement_agent["command"],
                 ["pi", "-p", "{prompt}", "--provider", "openai-codex", "--model", "gpt-5.4"],
@@ -484,6 +485,7 @@ raise SystemExit(9)
 
             reviewer = recipe["steps"][4]["input"]["reviewer"]
             self.assertEqual(reviewer["type"], "real-reviewer-command")
+            self.assertEqual(reviewer["provider"], "openai-codex")
             self.assertEqual(
                 reviewer["command"],
                 build_pi_print_command(
@@ -995,7 +997,7 @@ raise SystemExit(9)
             )
 
             self.assertNotEqual(completed.returncode, 0, completed.stdout)
-            self.assertIn("--agent-pi-coding-agent-dir is required when --agent-pi-provider=openai-codex", completed.stderr)
+            self.assertIn("agent.env.PI_CODING_AGENT_DIR is required", completed.stderr)
             self.assertFalse(output.exists())
 
     def test_generate_recipe_requires_core_mount_flags_for_pi_agent(self):
@@ -1275,6 +1277,7 @@ raise SystemExit(9)
             recipe = json.loads(output.read_text(encoding="utf-8"))
             reviewer = recipe["steps"][4]["input"]["reviewer"]
             self.assertEqual(reviewer["type"], "real-reviewer-command")
+            self.assertEqual(reviewer["provider"], "openai-codex")
             self.assertEqual(
                 reviewer["command"],
                 build_pi_print_command(
