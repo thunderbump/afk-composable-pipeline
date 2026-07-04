@@ -1265,6 +1265,34 @@ class GenerateRecipeCliTest(unittest.TestCase):
             recipe = json.loads(output.read_text(encoding="utf-8"))
             self.assertNotIn("retrospective_judge", recipe)
 
+    def test_generate_workstream_recipe_omits_deprecated_retrospective_blocks_from_python_api(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            contracts_dir = temp_path / "contracts"
+            repo = temp_path / "repo-src"
+            beads_workspace = temp_path / "central-beads"
+            checkout_root = temp_path / "checkouts"
+            checkout_path = checkout_root / "demo"
+            contracts_dir.mkdir()
+            init_repo(repo)
+            write_contract(contracts_dir / "demo.json", project_slug="demo", repo_url=str(repo))
+            beads_workspace.mkdir()
+            checkout_root.mkdir()
+
+            recipe = generate_workstream_recipe(
+                workstream_id="central-anh.6",
+                project_contract=load_project_contract("demo", contracts_dir),
+                beads_workspace=beads_workspace,
+                checkout_root=checkout_root,
+                checkout_path=checkout_path,
+                validation_profile="tier1",
+                retrospective_judge={"enabled": True},
+                retrospective_follow_up={"enabled": True, "creator": "beads"},
+            )
+
+            self.assertNotIn("retrospective_judge", recipe)
+            self.assertNotIn("retrospective_follow_up", recipe)
+
     def test_generate_recipe_rejects_openai_codex_pi_reviewer_without_pi_coding_agent_dir(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)

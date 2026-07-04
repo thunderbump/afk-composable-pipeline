@@ -114,10 +114,6 @@ def generate_workstream_recipe(
         "publisher": recipe_publisher,
     }
 
-    if retrospective_judge is not None:
-        recipe["retrospective_judge"] = retrospective_judge
-    if retrospective_follow_up is not None:
-        recipe["retrospective_follow_up"] = retrospective_follow_up
     if expect_generated_smoke_dry_run:
         recipe["validation_expectations"] = {"generated_smoke_dry_run_expected": True}
 

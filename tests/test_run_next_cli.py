@@ -3731,6 +3731,61 @@ print(json.dumps({{"schema_version":1,"source_statuses":[],"selected_work":[],"s
             payload = json.loads(completed.stdout)
             self.assertIsNone(payload["recipe"])
 
+    def test_run_next_python_api_omits_deprecated_retrospective_blocks_from_generated_recipe(self):
+        selection_result = {
+            "schema_version": 1,
+            "source_statuses": [{"source_id": "central-beads", "source_type": "beads", "status": "selected"}],
+            "selected_work": [
+                {
+                    "source_id": "central-beads",
+                    "source_type": "beads",
+                    "external_id": "central-demo.6",
+                    "title": "Keep direct recipes data-only",
+                    "status": "open",
+                    "labels": ["project:demo", "ready-for-agent"],
+                    "workstream": "central-demo",
+                    "acceptance_criteria": ["Deprecated retrospective kwargs do not leak into recipes."],
+                    "dependencies": [],
+                    "blockers": [],
+                    "dependency_status": "clear",
+                    "afk": {"ready": True},
+                    "raw": {"beads": {"id": "central-demo.6"}},
+                }
+            ],
+            "skipped_candidates": [],
+        }
+
+        original_select_work = run_next.__globals__["select_work"]
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                temp_path = Path(temp_dir)
+                contracts_dir = temp_path / "contracts"
+                repo = temp_path / "repo-src"
+                beads_workspace = temp_path / "beads"
+                checkout_root = temp_path / "checkouts"
+                checkout_path = checkout_root / "demo"
+                contracts_dir.mkdir()
+                beads_workspace.mkdir()
+                init_repo(repo)
+                write_contract(contracts_dir / "demo.json", project_slug="demo", repo_url=str(repo))
+                run_next.__globals__["select_work"] = lambda request, project_contract=None: selection_result
+
+                payload = run_next(
+                    project_contract=load_project_contract("demo", contracts_dir),
+                    beads_workspace=beads_workspace,
+                    checkout_root=checkout_root,
+                    checkout_path=checkout_path,
+                    validation_profile="tier1",
+                    retrospective_judge={"enabled": True},
+                    retrospective_follow_up={"enabled": True, "creator": "beads"},
+                )
+        finally:
+            run_next.__globals__["select_work"] = original_select_work
+
+        self.assertIsNotNone(payload["recipe"])
+        self.assertNotIn("retrospective_judge", payload["recipe"])
+        self.assertNotIn("retrospective_follow_up", payload["recipe"])
+
     def test_run_next_generates_pi_workers_and_publisher_create_in_recipe(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
