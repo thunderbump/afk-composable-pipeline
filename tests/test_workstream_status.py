@@ -10,11 +10,13 @@ sys.path.insert(0, str(ROOT / "src"))
 from afk.workstream import (  # noqa: E402
     _apply_retrospective_judge,
     WorkstreamError,
+    effective_review_cycles,
     normalize_retrospective_follow_up_config,
     normalize_retrospective_judge,
     pipeline_retrospective_record,
     tracker_terminal_decision_close_block_reason,
     tracker_record,
+    tracker_review_cycles,
     workstream_status_from_publication,
 )
 
@@ -2326,6 +2328,43 @@ class WorkstreamStatusMappingTest(unittest.TestCase):
         self.assertEqual(record["status"], "review-feedback-addressed")
         self.assertNotIn("response-required review findings", record["comment"])
 
+    def test_tracker_record_keeps_clean_persisted_review_cycles_on_progress_status(self):
+        normalized = {
+            "workstream_id": "central-afk-pr.17",
+            "tracker": {"terminal_decision": {"status": "", "merge_commit": "", "reason": ""}},
+            "review_cycles": [
+                {
+                    "cycle": 1,
+                    "status": "passed",
+                    "reviews": [
+                        {
+                            "role": "correctness",
+                            "status": "passed",
+                            "summary": "Correctness review passed.",
+                            "requires_response": False,
+                        },
+                        {
+                            "role": "bug-risk",
+                            "status": "passed",
+                            "summary": "Bug-risk review passed.",
+                            "requires_response": False,
+                        },
+                    ],
+                }
+            ],
+        }
+
+        cases = (
+            ("validated-unpublished", "validated"),
+            ("published", "awaiting-review"),
+        )
+        for publication_status, expected_status in cases:
+            with self.subTest(publication_status=publication_status):
+                record = tracker_record(normalized, tracker_state(), {"status": publication_status})
+                self.assertEqual(record["status"], expected_status)
+                self.assertEqual(len(record["review_cycles"]), 1)
+                self.assertEqual(record["review_cycles"][0]["status"], "passed")
+
     @unittest.skip("terminal closure moved out of the minimal run-workstream path")
     def test_tracker_record_keeps_terminal_merge_open_until_feedback_resolution_is_recorded(self):
         review_cycles = [
@@ -2504,6 +2543,92 @@ class WorkstreamStatusMappingTest(unittest.TestCase):
         )
 
         self.assertEqual(reason, "")
+
+    def test_tracker_terminal_decision_close_block_reason_accepts_clean_runtime_review_cycles(self):
+        reason = tracker_terminal_decision_close_block_reason(
+            {
+                "workstream_id": "central-afk-pr.17",
+                "tracker": {
+                    "terminal_decision": {
+                        "status": "merged",
+                        "merge_commit": "deadbeef",
+                        "pr_url": "https://github.example/pr/17",
+                        "review_feedback_status": "resolved",
+                    }
+                },
+                "review_cycles": [],
+            },
+            {
+                "runtime_review_cycles": [
+                    {
+                        "cycle": 1,
+                        "status": "passed",
+                        "reviews": [
+                            {
+                                "role": "correctness",
+                                "status": "passed",
+                                "summary": "Correctness review passed.",
+                                "requires_response": False,
+                            },
+                            {
+                                "role": "bug-risk",
+                                "status": "passed",
+                                "summary": "Bug-risk review passed.",
+                                "requires_response": False,
+                            },
+                        ],
+                    }
+                ]
+            },
+        )
+
+        self.assertEqual(reason, "")
+
+    def test_effective_and_tracker_review_cycles_preserve_clean_runtime_cycles(self):
+        configured = [
+            {
+                "cycle": 1,
+                "status": "findings-addressed",
+                "reviews": [
+                    {
+                        "role": "correctness",
+                        "status": "request-changes",
+                        "summary": "Please tighten the close guidance.",
+                        "requires_response": True,
+                        "response": {"status": "addressed", "summary": "Fixed in follow-up."},
+                    }
+                ],
+            }
+        ]
+        runtime = [
+            {
+                "cycle": 2,
+                "status": "passed",
+                "reviews": [
+                    {
+                        "role": "correctness",
+                        "status": "passed",
+                        "summary": "Correctness review passed.",
+                        "requires_response": False,
+                    },
+                    {
+                        "role": "bug-risk",
+                        "status": "passed",
+                        "summary": "Bug-risk review passed.",
+                        "requires_response": False,
+                    },
+                ],
+            }
+        ]
+
+        self.assertEqual(
+            effective_review_cycles({"review_cycles": configured}, {"runtime_review_cycles": runtime}),
+            configured + runtime,
+        )
+        self.assertEqual(
+            tracker_review_cycles({"review_cycles": configured}, {"runtime_review_cycles": runtime}),
+            configured + runtime,
+        )
 
     @unittest.skip("terminal closure moved out of the minimal run-workstream path")
     def test_tracker_record_closes_terminal_merge_when_missing_review_cycles_are_explicitly_waived(self):
