@@ -1853,7 +1853,7 @@ Path(result_env).write_text(
             self.assertEqual(result["status"], "published")
             self.assertEqual([step["name"] for step in result["steps"]], ["select-work", "prepare-checkout", "implement", "validate", "review"])
             self.assertEqual(result["pipeline_retrospective"]["judge"]["status"], "disabled")
-            self.assertEqual([call["target"] for call in calls], ["reviewer"])
+            self.assertEqual([call["target"] for call in calls], ["reviewer", "reviewer"])
             self.assertTrue(all(not call["preflight"] for call in calls))
             self.assertTrue(all(not call["placeholder_seen"] for call in calls))
             self.assertTrue(all(call["request_in_argv"] for call in calls))

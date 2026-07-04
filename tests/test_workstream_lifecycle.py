@@ -67,6 +67,111 @@ def lifecycle_hooks():
 
 
 class WorkstreamLifecycleTest(unittest.TestCase):
+    def test_run_lifecycle_records_clean_two_pass_review_cycle(self):
+        recipe = normalize_recipe(
+            {
+                "workstream_id": "central-wfc9",
+                "parent": "central",
+                "review_branch": "afk/central-wfc9",
+                "steps": [
+                    {"name": "select-work", "input": {"sources": [{"type": "fixture", "id": "fixture", "items": [selected_fixture_item()]}]}},
+                    {"name": "prepare-checkout", "input": {"checkout_path": "/tmp/checkout"}},
+                    {"name": "implement", "input": {}},
+                    {"name": "validate", "profile": "tier1", "input": {"validation": {}}},
+                    {"name": "review", "input": {}},
+                ],
+                "publisher": {"enabled": False},
+            },
+            parent=None,
+            workstream_id=None,
+        )
+        runs = iter(
+            [
+                step_result("select-1", "select-work", {"status": "selected", "selected_work": [selected_fixture_item()]}),
+                step_result(
+                    "checkout-1",
+                    "prepare-checkout",
+                    {"status": "prepared", "checkout_path": "/tmp/checkout", "review_branch": "afk/central-wfc9", "start_commit": "base-1"},
+                ),
+                step_result(
+                    "implement-1",
+                    "implement",
+                    {
+                        "status": "implemented",
+                        "summary": "initial implementation",
+                        "work_item": selected_fixture_item(),
+                        "git": {"after_commit": "head-1", "changed_files": ["implemented.txt"], "dirty": False, "dirty_status": []},
+                    },
+                ),
+                step_result(
+                    "validate-1",
+                    "validate",
+                    {
+                        "status": "validated",
+                        "summary": "tests passed",
+                        "checkout": {"start_commit": "head-1"},
+                        "validation": {"requested_profile": "tier1"},
+                        "worker_result": {
+                            "normalized": {
+                                "status": "validated",
+                                "classification": "success",
+                                "summary": "tests passed",
+                            }
+                        },
+                    },
+                ),
+                step_result(
+                    "review-correctness-1",
+                    "review",
+                    {
+                        "status": "passed",
+                        "summary": "correctness review passed",
+                        "checkout": {"start_commit": "head-1"},
+                        "reviewer_result": {"findings": []},
+                    },
+                ),
+                step_result(
+                    "review-bug-risk-1",
+                    "review",
+                    {
+                        "status": "passed",
+                        "summary": "bug-risk review passed",
+                        "checkout": {"start_commit": "head-1"},
+                        "reviewer_result": {"findings": []},
+                    },
+                ),
+            ]
+        )
+
+        def runner(step_name, step_input, ledger_dir, project_contract):
+            return next(runs)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ledger_root = Path(temp_dir) / "ledger"
+            ledger = WorkstreamLedger(ledger_root, "run-1")
+            ledger.prepare()
+
+            outcome = run_lifecycle(
+                normalized=recipe,
+                run_id="run-1",
+                ledger_dir=ledger_root,
+                ledger=ledger,
+                step_runner=runner,
+                project_contract=None,
+                hooks=lifecycle_hooks(),
+            )
+
+        self.assertEqual(
+            [step["name"] for step in outcome.steps],
+            ["select-work", "prepare-checkout", "implement", "validate", "review"],
+        )
+        self.assertEqual(outcome.publication["status"], "validated-unpublished")
+        self.assertEqual(len(outcome.state["runtime_review_cycles"]), 1)
+        cycle = outcome.state["runtime_review_cycles"][0]
+        self.assertEqual(cycle["status"], "passed")
+        self.assertEqual([review["role"] for review in cycle["reviews"]], ["correctness", "bug-risk"])
+        self.assertEqual([review["status"] for review in cycle["reviews"]], ["passed", "passed"])
+
     def test_run_lifecycle_repairs_validation_feedback_before_review(self):
         recipe = normalize_recipe(
             {
@@ -156,9 +261,24 @@ class WorkstreamLifecycleTest(unittest.TestCase):
                     },
                 ),
                 step_result(
-                    "review-1",
+                    "review-correctness-1",
                     "review",
-                    {"status": "passed", "summary": "ready", "checkout": {"start_commit": "head-2"}, "reviewer_result": {"findings": []}},
+                    {
+                        "status": "passed",
+                        "summary": "correctness review passed",
+                        "checkout": {"start_commit": "head-2"},
+                        "reviewer_result": {"findings": []},
+                    },
+                ),
+                step_result(
+                    "review-bug-risk-1",
+                    "review",
+                    {
+                        "status": "passed",
+                        "summary": "bug-risk review passed",
+                        "checkout": {"start_commit": "head-2"},
+                        "reviewer_result": {"findings": []},
+                    },
                 ),
             ]
         )
@@ -244,22 +364,33 @@ class WorkstreamLifecycleTest(unittest.TestCase):
                     },
                 ),
                 step_result(
-                    "review-1",
+                    "review-correctness-1",
                     "review",
                     {
                         "status": "request_revision",
-                        "summary": "review requested changes",
+                        "summary": "correctness review requested changes",
                         "checkout": {"start_commit": "head-1"},
                         "reviewer_result": {
                             "findings": [
                                 {
                                     "status": "request_revision",
                                     "severity": "high",
+                                    "role": "correctness",
                                     "summary": "Handle the empty review cycle before publishing.",
                                     "required_fix": "Handle the empty review cycle before publishing.",
                                 }
                             ]
                         },
+                    },
+                ),
+                step_result(
+                    "review-bug-risk-1",
+                    "review",
+                    {
+                        "status": "passed",
+                        "summary": "bug-risk review passed",
+                        "checkout": {"start_commit": "head-1"},
+                        "reviewer_result": {"findings": []},
                     },
                 ),
                 step_result(
@@ -295,9 +426,24 @@ class WorkstreamLifecycleTest(unittest.TestCase):
                     },
                 ),
                 step_result(
-                    "review-2",
+                    "review-correctness-2",
                     "review",
-                    {"status": "passed", "summary": "ready", "checkout": {"start_commit": "head-2"}, "reviewer_result": {"findings": []}},
+                    {
+                        "status": "passed",
+                        "summary": "correctness review passed",
+                        "checkout": {"start_commit": "head-2"},
+                        "reviewer_result": {"findings": []},
+                    },
+                ),
+                step_result(
+                    "review-bug-risk-2",
+                    "review",
+                    {
+                        "status": "passed",
+                        "summary": "bug-risk review passed",
+                        "checkout": {"start_commit": "head-2"},
+                        "reviewer_result": {"findings": []},
+                    },
                 ),
             ]
         )
@@ -327,7 +473,142 @@ class WorkstreamLifecycleTest(unittest.TestCase):
         self.assertEqual(outcome.publication["status"], "validated-unpublished")
         self.assertEqual(len(outcome.state["runtime_review_cycles"]), 2)
         self.assertEqual(outcome.state["runtime_review_cycles"][0]["status"], "findings-addressed")
+        self.assertEqual(
+            [review["role"] for review in outcome.state["runtime_review_cycles"][0]["reviews"]],
+            ["correctness", "bug-risk"],
+        )
         self.assertEqual(outcome.state["runtime_review_cycles"][1]["status"], "passed")
+        self.assertEqual(
+            [review["role"] for review in outcome.state["runtime_review_cycles"][1]["reviews"]],
+            ["correctness", "bug-risk"],
+        )
+
+    def test_run_lifecycle_routes_pipeline_only_review_findings_without_target_repair(self):
+        recipe = normalize_recipe(
+            {
+                "workstream_id": "central-wfc9",
+                "parent": "central",
+                "review_branch": "afk/central-wfc9",
+                "steps": [
+                    {"name": "select-work", "input": {"sources": [{"type": "fixture", "id": "fixture", "items": [selected_fixture_item()]}]}},
+                    {"name": "prepare-checkout", "input": {"checkout_path": "/tmp/checkout"}},
+                    {"name": "implement", "input": {}},
+                    {"name": "validate", "profile": "tier1", "input": {"validation": {}}},
+                    {"name": "review", "input": {}},
+                ],
+                "publisher": {"enabled": False},
+                "retry_policy": {"max_retries": 1},
+                "review_feedback": {"enabled": True},
+            },
+            parent=None,
+            workstream_id=None,
+        )
+        runs = iter(
+            [
+                step_result("select-1", "select-work", {"status": "selected", "selected_work": [selected_fixture_item()]}),
+                step_result(
+                    "checkout-1",
+                    "prepare-checkout",
+                    {"status": "prepared", "checkout_path": "/tmp/checkout", "review_branch": "afk/central-wfc9", "start_commit": "base-1"},
+                ),
+                step_result(
+                    "implement-1",
+                    "implement",
+                    {
+                        "status": "implemented",
+                        "summary": "initial implementation",
+                        "work_item": selected_fixture_item(),
+                        "git": {"after_commit": "head-1", "changed_files": ["implemented.txt"], "dirty": False, "dirty_status": []},
+                    },
+                ),
+                step_result(
+                    "validate-1",
+                    "validate",
+                    {
+                        "status": "validated",
+                        "summary": "tests passed",
+                        "checkout": {"start_commit": "head-1"},
+                        "validation": {"requested_profile": "tier1"},
+                        "worker_result": {
+                            "normalized": {
+                                "status": "validated",
+                                "classification": "success",
+                                "summary": "tests passed",
+                            }
+                        },
+                    },
+                ),
+                step_result(
+                    "review-correctness-1",
+                    "review",
+                    {
+                        "status": "request_revision",
+                        "summary": "correctness review found a pipeline issue",
+                        "checkout": {"start_commit": "head-1"},
+                        "reviewer_result": {
+                            "findings": [
+                                {
+                                    "status": "request_revision",
+                                    "classification": "pipeline_failure",
+                                    "severity": "medium",
+                                    "summary": "Capture missing reviewer adapter config as follow-up evidence.",
+                                }
+                            ]
+                        },
+                    },
+                ),
+                step_result(
+                    "review-bug-risk-1",
+                    "review",
+                    {
+                        "status": "passed",
+                        "summary": "bug-risk review passed",
+                        "checkout": {"start_commit": "head-1"},
+                        "reviewer_result": {"findings": []},
+                    },
+                ),
+            ]
+        )
+
+        def runner(step_name, step_input, ledger_dir, project_contract):
+            return next(runs)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ledger_root = Path(temp_dir) / "ledger"
+            ledger = WorkstreamLedger(ledger_root, "run-3")
+            ledger.prepare()
+
+            outcome = run_lifecycle(
+                normalized=recipe,
+                run_id="run-3",
+                ledger_dir=ledger_root,
+                ledger=ledger,
+                step_runner=runner,
+                project_contract=None,
+                hooks=lifecycle_hooks(),
+            )
+
+        self.assertEqual(
+            [step["name"] for step in outcome.steps],
+            ["select-work", "prepare-checkout", "implement", "validate", "review"],
+        )
+        self.assertEqual(outcome.publication["status"], "blocked")
+        self.assertIn("pipeline follow-up", outcome.publication["reason"])
+        self.assertEqual(len(outcome.state["runtime_review_cycles"]), 1)
+        cycle = outcome.state["runtime_review_cycles"][0]
+        self.assertEqual(cycle["status"], "request-changes")
+        self.assertEqual(cycle["reviews"][0]["role"], "correctness")
+        self.assertEqual(
+            cycle["reviews"][0]["pipeline_follow_up"],
+            [
+                {
+                    "role": "correctness",
+                    "classification": "pipeline_failure",
+                    "severity": "medium",
+                    "summary": "Capture missing reviewer adapter config as follow-up evidence.",
+                }
+            ],
+        )
 
     def test_terminal_selected_work_status_returns_validated_after_review_pass(self):
         status = terminal_selected_work_status(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import shlex
+from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -15,6 +16,7 @@ from afk.registry import StepResult
 SCHEMA_VERSION = 1
 REVIEW_CYCLE_RESPONSE_STATUSES = {"addressed", "findings-addressed"}
 TERMINAL_REVIEW_FEEDBACK_STATUSES = {"resolved", "waived"}
+REVIEW_PASS_ROLES = ("correctness", "bug-risk")
 
 StepRunner = Callable[[str, Any, Path, ProjectContract | None], StepResult]
 
@@ -94,6 +96,43 @@ def run_lifecycle(
             profile=step_profile,
             project_contract=project_contract,
         )
+        if step_name == "review":
+            review_step, aggregate_review, review_cycle = execute_review_cycle(
+                step_spec=step_spec,
+                normalized=normalized,
+                state=state,
+                ledger_dir=ledger_dir,
+                project_contract=project_contract,
+                step_runner=step_runner,
+                hooks=hooks,
+            )
+            steps.append(review_step)
+            update_state_from_review_cycle(state, aggregate_review, review_step["result_path"])
+            finalize_latest_runtime_review_cycle(state)
+            append_runtime_review_cycle(state, review_cycle)
+            repair_steps, repair_blocked_reason = review_feedback_follow_up(
+                normalized=normalized,
+                state=state,
+                step_spec=step_spec,
+            )
+            if repair_blocked_reason:
+                state["blocked_reason"] = repair_blocked_reason
+                break
+            if repair_steps:
+                state["pending_repair_context"] = build_review_repair_context(
+                    state,
+                    step_spec=step_spec,
+                    repair_attempt=retry_attempt_count(state) + 1,
+                )
+                steps_queue[index + 1 : index + 1] = repair_steps
+                index += 1
+                continue
+            blocked_reason = blocking_reason_for_review_output(aggregate_review, remaining_steps)
+            if blocked_reason:
+                state["blocked_reason"] = blocked_reason
+                break
+            index += 1
+            continue
         result = step_runner(step_name, step_input, ledger_dir, project_contract)
         steps.append(hooks.step_execution_record(step_name, result, equivalent_command, ledger_dir))
         hooks.update_state_from_step(state, step_name, result, ledger_dir)
@@ -109,24 +148,6 @@ def run_lifecycle(
             if repair_steps:
                 state["pending_repair_context"] = build_validation_repair_context(
                     state,
-                    repair_attempt=retry_attempt_count(state) + 1,
-                )
-                steps_queue[index + 1 : index + 1] = repair_steps
-                index += 1
-                continue
-        if step_name == "review":
-            repair_steps, repair_blocked_reason = review_feedback_follow_up(
-                normalized=normalized,
-                state=state,
-                step_spec=step_spec,
-            )
-            if repair_blocked_reason:
-                state["blocked_reason"] = repair_blocked_reason
-                break
-            if repair_steps:
-                state["pending_repair_context"] = build_review_repair_context(
-                    state,
-                    step_spec=step_spec,
                     repair_attempt=retry_attempt_count(state) + 1,
                 )
                 steps_queue[index + 1 : index + 1] = repair_steps
@@ -322,17 +343,14 @@ def build_validation_repair_context(state: dict[str, Any], *, repair_attempt: in
 def review_feedback_follow_up(
     *, normalized: dict[str, Any], state: dict[str, Any], step_spec: dict[str, Any]
 ) -> tuple[list[dict[str, Any]], str]:
-    if not normalized["review_feedback"]["enabled"]:
-        return [], ""
     review = state.get("review") if isinstance(state.get("review"), dict) else {}
     review_status = string_field(review, "status") or ""
     if review_status == "passed":
-        finalize_latest_runtime_review_cycle(state)
-        append_runtime_review_cycle(state, build_runtime_review_cycle(state, step_spec=step_spec))
+        return [], ""
+    if not normalized["review_feedback"]["enabled"]:
         return [], ""
     if review_status != "request_revision":
         return [], ""
-    append_runtime_review_cycle(state, build_runtime_review_cycle(state, step_spec=step_spec))
     repairable_findings = review_feedback_repairable_findings(review)
     if not repairable_findings:
         return [], review_feedback_blocked_reason(review)
@@ -404,23 +422,6 @@ def build_review_repair_context(
     }
 
 
-def build_runtime_review_cycle(state: dict[str, Any], *, step_spec: dict[str, Any]) -> dict[str, Any]:
-    review = state.get("review") if isinstance(state.get("review"), dict) else {}
-    cycle_status = runtime_review_cycle_status(string_field(review, "status") or "")
-    review_record: dict[str, Any] = {
-        "role": review_feedback_role(step_spec, review),
-        "status": cycle_status,
-        "summary": string_field(review, "summary") or cycle_status,
-        "requires_response": cycle_status == "request-changes",
-    }
-    pipeline_follow_up = review_feedback_pipeline_follow_up(review)
-    if pipeline_follow_up:
-        review_record["pipeline_follow_up"] = pipeline_follow_up
-    runtime_cycles = state.get("runtime_review_cycles")
-    cycle_number = len(runtime_cycles) + 1 if isinstance(runtime_cycles, list) else 1
-    return {"cycle": cycle_number, "status": cycle_status, "reviews": [review_record]}
-
-
 def append_runtime_review_cycle(state: dict[str, Any], cycle: dict[str, Any]) -> None:
     runtime_cycles = state.get("runtime_review_cycles")
     cycles = list(runtime_cycles) if isinstance(runtime_cycles, list) else []
@@ -437,11 +438,6 @@ def finalize_latest_runtime_review_cycle(state: dict[str, Any]) -> None:
         return
     reviews = latest_cycle.get("reviews")
     if not isinstance(reviews, list) or not reviews:
-        return
-    latest_review = reviews[-1]
-    if not isinstance(latest_review, dict) or latest_review.get("response"):
-        return
-    if string_field(latest_review, "status") != "request-changes":
         return
     validation = latest_validation_record(state)
     validation_output = validation.get("output") if isinstance(validation, dict) and isinstance(validation.get("output"), dict) else {}
@@ -460,11 +456,20 @@ def finalize_latest_runtime_review_cycle(state: dict[str, Any]) -> None:
         "follow_up_review_summary": string_field(state.get("review") if isinstance(state.get("review"), dict) else {}, "summary") or "",
         "follow_up_review_result_path": state.get("review_result_path") or "",
     }
-    pipeline_follow_up = latest_review.get("pipeline_follow_up")
-    if isinstance(pipeline_follow_up, list) and pipeline_follow_up:
-        response["pipeline_follow_up"] = pipeline_follow_up
-    latest_review["response"] = response
-    latest_cycle["status"] = "findings-addressed"
+    addressed = False
+    for review in reviews:
+        if not isinstance(review, dict) or review.get("response"):
+            continue
+        if string_field(review, "status") != "request-changes":
+            continue
+        review_response = dict(response)
+        pipeline_follow_up = review.get("pipeline_follow_up")
+        if isinstance(pipeline_follow_up, list) and pipeline_follow_up:
+            review_response["pipeline_follow_up"] = pipeline_follow_up
+        review["response"] = review_response
+        addressed = True
+    if addressed:
+        latest_cycle["status"] = "findings-addressed"
 
 
 def runtime_review_cycle_status(review_status: str) -> str:
@@ -491,6 +496,7 @@ def review_feedback_repairable_findings(review: dict[str, Any]) -> list[dict[str
             continue
         repairable.append(
             {
+                "role": string_field(finding, "role") or string_field(review, "role") or "",
                 "severity": review_finding_severity(finding),
                 "file": review_finding_file(finding),
                 "line": review_finding_line(finding),
@@ -512,6 +518,7 @@ def review_feedback_pipeline_follow_up(review: dict[str, Any]) -> list[dict[str,
             continue
         follow_up.append(
             {
+                "role": string_field(finding, "role") or string_field(review, "role") or "",
                 "classification": string_field(finding, "classification") or string_field(finding, "category") or "pipeline_failure",
                 "severity": review_finding_severity(finding),
                 "summary": string_field(finding, "summary") or string_field(finding, "title") or "",
@@ -529,6 +536,154 @@ def review_feedback_blocked_reason(review: dict[str, Any]) -> str:
     if pipeline_follow_up:
         return f"review requested pipeline follow-up: {string_field(pipeline_follow_up[0], 'summary') or 'pipeline issue'}"
     return string_field(review, "summary") or "review requested changes"
+
+
+def execute_review_cycle(
+    *,
+    step_spec: dict[str, Any],
+    normalized: dict[str, Any],
+    state: dict[str, Any],
+    ledger_dir: Path,
+    project_contract: ProjectContract | None,
+    step_runner: StepRunner,
+    hooks: LifecycleHooks,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    pass_records = []
+    cycle_reviews = []
+    pass_outputs = []
+    last_record: dict[str, Any] | None = None
+    for role in REVIEW_PASS_ROLES:
+        role_step_spec = deepcopy(step_spec)
+        role_input = role_step_spec.setdefault("input", {})
+        role_input["role"] = role
+        step_input = hooks.composed_step_input(role_step_spec, normalized, state, ledger_dir, step_index=None)
+        equivalent_command = hooks.equivalent_run_step_command(
+            "review",
+            step_input,
+            ledger_dir,
+            profile=role_step_spec.get("profile"),
+            project_contract=project_contract,
+        )
+        result = step_runner("review", step_input, ledger_dir, project_contract)
+        last_record = hooks.step_execution_record("review", result, equivalent_command, ledger_dir)
+        pass_records.append(
+            {
+                "role": role,
+                "run_id": result.run_id,
+                "result_path": last_record["result_path"],
+                "result_abspath": last_record["result_abspath"],
+                "equivalent_command": redact_text(render_review_role_command(equivalent_command)),
+            }
+        )
+        output = result.output if isinstance(result.output, dict) else {}
+        pass_outputs.append({"role": role, "output": output, "result_path": last_record["result_path"]})
+        cycle_reviews.append(build_runtime_review_record(role, output, last_record["result_path"]))
+    cycle = {
+        "cycle": next_review_cycle_number(state),
+        "status": aggregate_runtime_review_cycle_status(cycle_reviews),
+        "reviews": cycle_reviews,
+    }
+    aggregate_review = aggregate_review_output(pass_outputs, cycle)
+    assert last_record is not None
+    last_record["output_status"] = string_field(aggregate_review, "status") or last_record.get("output_status", "")
+    last_record["review_passes"] = pass_records
+    return last_record, aggregate_review, cycle
+
+
+def update_state_from_review_cycle(state: dict[str, Any], review: dict[str, Any], result_path: str) -> None:
+    state["review"] = review
+    review_selection = state.get("implementation_selection")
+    if isinstance(review_selection, list):
+        state["review_selection"] = [dict(item) for item in review_selection if isinstance(item, dict)]
+    else:
+        state["review_selection"] = []
+    state["review_result_path"] = result_path
+    cleanup = review.get("cleanup")
+    if isinstance(cleanup, dict):
+        state["cleanup"] = cleanup
+
+
+def build_runtime_review_record(role: str, review: dict[str, Any], result_path: str) -> dict[str, Any]:
+    role_scoped_review = dict(review)
+    role_scoped_review.setdefault("role", role)
+    review_record: dict[str, Any] = {
+        "role": role,
+        "status": runtime_review_cycle_status(string_field(review, "status") or ""),
+        "summary": string_field(review, "summary") or role,
+        "requires_response": string_field(review, "status") == "request_revision",
+        "result_path": result_path,
+    }
+    pipeline_follow_up = review_feedback_pipeline_follow_up(role_scoped_review)
+    if pipeline_follow_up:
+        review_record["pipeline_follow_up"] = pipeline_follow_up
+    return review_record
+
+
+def aggregate_runtime_review_cycle_status(reviews: list[dict[str, Any]]) -> str:
+    statuses = [string_field(review, "status") or "" for review in reviews if isinstance(review, dict)]
+    if any(status == "request-changes" for status in statuses):
+        return "request-changes"
+    if all(status == "passed" for status in statuses) and statuses:
+        return "passed"
+    return "findings-open"
+
+
+def aggregate_review_output(pass_outputs: list[dict[str, Any]], cycle: dict[str, Any]) -> dict[str, Any]:
+    failing_reviews = [review for review in cycle["reviews"] if review.get("status") != "passed"]
+    if failing_reviews:
+        summary = string_field(failing_reviews[0], "summary") or "review requested changes"
+        status = "request_revision" if any(review.get("status") == "request-changes" for review in failing_reviews) else "findings-open"
+        role = string_field(failing_reviews[0], "role") or ""
+    else:
+        summary = "Correctness and bug-risk reviews passed with no open findings."
+        status = "passed"
+        role = "bug-risk"
+    last_output = pass_outputs[-1]["output"] if pass_outputs else {}
+    aggregate = dict(last_output)
+    aggregate["status"] = status
+    aggregate["summary"] = summary
+    aggregate["role"] = role
+    aggregate["reviewer_result"] = {
+        "findings": aggregate_review_findings(pass_outputs),
+    }
+    aggregate["review_passes"] = deepcopy(cycle["reviews"])
+    return aggregate
+
+
+def aggregate_review_findings(pass_outputs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    aggregated = []
+    for item in pass_outputs:
+        role = string_field(item, "role") or ""
+        output = item.get("output") if isinstance(item.get("output"), dict) else {}
+        reviewer_result = output.get("reviewer_result") if isinstance(output.get("reviewer_result"), dict) else output
+        findings = reviewer_result.get("findings")
+        if not isinstance(findings, list):
+            continue
+        for finding in findings:
+            if not isinstance(finding, dict):
+                continue
+            enriched = dict(finding)
+            enriched.setdefault("role", role)
+            aggregated.append(enriched)
+    return aggregated
+
+
+def next_review_cycle_number(state: dict[str, Any]) -> int:
+    runtime_cycles = state.get("runtime_review_cycles")
+    return len(runtime_cycles) + 1 if isinstance(runtime_cycles, list) else 1
+
+
+def blocking_reason_for_review_output(review: dict[str, Any], remaining_steps: list[dict[str, Any]]) -> str:
+    status = string_field(review, "status") or ""
+    if status != "passed" and review_failure_allows_retry_follow_up(remaining_steps):
+        return ""
+    if status != "passed":
+        return f"review did not reach passed: {status or 'missing status'}"
+    return ""
+
+
+def render_review_role_command(command: list[str]) -> str:
+    return " ".join(shlex.quote(str(part)) for part in command)
 
 
 def review_finding_is_pipeline_failure(finding: dict[str, Any]) -> bool:

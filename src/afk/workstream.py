@@ -1541,7 +1541,7 @@ def close_published_pr(
         fields=["url", "state", "isDraft", "mergeStateStatus", "headRefOid"],
     )
     pr_url = publisher_pr_url(view_payload, fallback=config["pr"])
-    review_cycles = effective_review_cycles(normalized, state)
+    review_cycles = tracker_review_cycles(normalized, state)
     if not review_cycles_recorded(review_cycles) and configured_review_feedback_status != "waived":
         return tracker_close_blocked_publication(
             reason=(
@@ -3089,13 +3089,40 @@ def effective_review_cycles(normalized: dict[str, Any], state: dict[str, Any] | 
     configured = normalized.get("review_cycles")
     runtime = state.get("runtime_review_cycles") if isinstance(state, dict) else []
     cycles = list(configured) if isinstance(configured, list) else []
-    if isinstance(runtime, list):
+    if isinstance(runtime, list) and (not cycles or runtime_review_cycles_count_for_tracker(runtime)):
         cycles.extend(cycle for cycle in runtime if isinstance(cycle, dict))
     return cycles
 
 
 def review_cycles_recorded(review_cycles: Any) -> bool:
     return isinstance(review_cycles, list) and bool(review_cycles)
+
+
+def tracker_review_cycles(normalized: dict[str, Any], state: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    configured = normalized.get("review_cycles")
+    runtime = state.get("runtime_review_cycles") if isinstance(state, dict) else []
+    cycles = list(configured) if isinstance(configured, list) else []
+    if isinstance(runtime, list) and runtime_review_cycles_count_for_tracker(runtime):
+        cycles.extend(cycle for cycle in runtime if isinstance(cycle, dict))
+    return cycles
+
+
+def runtime_review_cycles_count_for_tracker(runtime_cycles: list[dict[str, Any]]) -> bool:
+    return any(runtime_review_cycle_has_feedback(cycle) for cycle in runtime_cycles if isinstance(cycle, dict))
+
+
+def runtime_review_cycle_has_feedback(cycle: dict[str, Any]) -> bool:
+    reviews = cycle.get("reviews")
+    if not isinstance(reviews, list):
+        return False
+    for review in reviews:
+        if not isinstance(review, dict):
+            continue
+        if (string_field(review, "status") or "") == "request-changes":
+            return True
+        if review_cycle_response_is_addressed(review.get("response")):
+            return True
+    return False
 
 
 def tracker_terminal_decision_close_block_reason(
@@ -3105,7 +3132,7 @@ def tracker_terminal_decision_close_block_reason(
     if not isinstance(decision, dict) or not decision.get("status"):
         return "terminal tracker decision is not recorded"
     review_feedback_status = terminal_review_feedback_status(decision)
-    review_cycles = effective_review_cycles(normalized, state)
+    review_cycles = tracker_review_cycles(normalized, state)
     if not review_cycles_recorded(review_cycles):
         if review_feedback_status == "waived":
             return ""
@@ -3226,7 +3253,7 @@ def tracker_record(
     recorded_terminal_decision = recorded_tracker_terminal_decision(normalized, publication)
     decision_pr_url = redact_text(decision.get("pr_url") or "")
     decision_review_feedback_status = terminal_review_feedback_status(decision)
-    review_cycles = effective_review_cycles(normalized, state)
+    review_cycles = tracker_review_cycles(normalized, state)
     review_cycle_evidence_recorded = review_cycles_recorded(review_cycles)
     review_feedback_requires_response = review_cycles_require_response(review_cycles)
     review = state.get("review") if isinstance(state.get("review"), dict) else {}
