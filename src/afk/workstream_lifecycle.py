@@ -469,7 +469,7 @@ def finalize_latest_runtime_review_cycle(state: dict[str, Any]) -> None:
         review["response"] = review_response
         addressed = True
     if addressed:
-        latest_cycle["status"] = "findings-addressed"
+        latest_cycle["status"] = finalized_runtime_review_cycle_status(reviews)
 
 
 def runtime_review_cycle_status(review_status: str) -> str:
@@ -478,6 +478,40 @@ def runtime_review_cycle_status(review_status: str) -> str:
     if review_status == "passed":
         return "passed"
     return "findings-open"
+
+
+def finalized_runtime_review_cycle_status(reviews: list[dict[str, Any]]) -> str:
+    saw_addressed_request_changes = False
+    saw_reviews = False
+    saw_only_passed = True
+    for review in reviews:
+        if not isinstance(review, dict):
+            continue
+        saw_reviews = True
+        status = string_field(review, "status") or ""
+        if status == "findings-open":
+            return "findings-open"
+        if status == "request-changes":
+            if review_cycle_response_is_addressed(review.get("response")):
+                saw_addressed_request_changes = True
+                saw_only_passed = False
+                continue
+            return "request-changes"
+        if status != "passed":
+            return "findings-open"
+    if saw_only_passed and saw_reviews:
+        return "passed"
+    if saw_addressed_request_changes:
+        return "findings-addressed"
+    return "findings-open"
+
+
+def review_cycle_response_is_addressed(response: Any) -> bool:
+    if isinstance(response, str):
+        return bool(response.strip())
+    if not isinstance(response, dict):
+        return False
+    return (string_field(response, "status") or "") in REVIEW_CYCLE_RESPONSE_STATUSES
 
 
 def review_feedback_role(step_spec: dict[str, Any], review: dict[str, Any]) -> str:

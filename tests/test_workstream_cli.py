@@ -12753,9 +12753,18 @@ sys.exit(0)
                 }
             ]
 
-            self.assertEqual(result["review_cycles"], expected_cycles)
-            self.assertEqual(result["tracker"]["review_cycles"], expected_cycles)
-            self.assertEqual(tracker["review_cycles"], expected_cycles)
+            self.assertEqual(result["review_cycles"][0], expected_cycles[0])
+            self.assertEqual(result["review_cycles"][1]["status"], "passed")
+            self.assertEqual(
+                [review["role"] for review in result["review_cycles"][1]["reviews"]],
+                ["correctness", "bug-risk"],
+            )
+            self.assertEqual(
+                [review["status"] for review in result["review_cycles"][1]["reviews"]],
+                ["passed", "passed"],
+            )
+            self.assertEqual(result["tracker"]["review_cycles"], result["review_cycles"])
+            self.assertEqual(tracker["review_cycles"], result["review_cycles"])
             self.assertEqual(result["tracker"]["status"], "review-feedback-addressed")
             self.assertEqual(tracker["status"], "review-feedback-addressed")
 
@@ -12848,9 +12857,10 @@ sys.exit(0)
             result = json.loads(result_path.read_text(encoding="utf-8"))
             tracker = json.loads((result_path.parent / "tracker-result.json").read_text(encoding="utf-8"))
 
-            self.assertEqual([cycle["cycle"] for cycle in result["review_cycles"]], [1, 2])
+            self.assertEqual(len(result["review_cycles"]), 3)
             self.assertEqual(result["review_cycles"][0]["status"], "findings-open")
             self.assertEqual(result["review_cycles"][1]["status"], "findings-addressed")
+            self.assertEqual(result["review_cycles"][2]["status"], "passed")
             self.assertEqual(result["review_cycles"][0]["reviews"][0]["requires_response"], True)
             self.assertNotIn("response", result["review_cycles"][0]["reviews"][0])
             self.assertEqual(
@@ -12869,6 +12879,14 @@ sys.exit(0)
                 "https://github.example/pr/123#issuecomment-11",
             )
             self.assertIn("[REDACTED]", result["review_cycles"][0]["reviews"][0]["summary"])
+            self.assertEqual(
+                [review["role"] for review in result["review_cycles"][2]["reviews"]],
+                ["correctness", "bug-risk"],
+            )
+            self.assertEqual(
+                [review["status"] for review in result["review_cycles"][2]["reviews"]],
+                ["passed", "passed"],
+            )
             self.assertEqual(result["tracker"]["review_cycles"], result["review_cycles"])
             self.assertEqual(tracker["review_cycles"], result["review_cycles"])
             self.assertEqual(result["tracker"]["status"], "review-findings-open")

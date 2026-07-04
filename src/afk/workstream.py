@@ -1233,7 +1233,7 @@ def finalize_latest_runtime_review_cycle(state: dict[str, Any]) -> None:
     if isinstance(pipeline_follow_up, list) and pipeline_follow_up:
         response["pipeline_follow_up"] = pipeline_follow_up
     latest_review["response"] = response
-    latest_cycle["status"] = "findings-addressed"
+    latest_cycle["status"] = finalized_runtime_review_cycle_status(reviews)
 
 
 def runtime_review_cycle_status(review_status: str) -> str:
@@ -1241,6 +1241,32 @@ def runtime_review_cycle_status(review_status: str) -> str:
         return "request-changes"
     if review_status == "passed":
         return "passed"
+    return "findings-open"
+
+
+def finalized_runtime_review_cycle_status(reviews: list[dict[str, Any]]) -> str:
+    saw_addressed_request_changes = False
+    saw_reviews = False
+    saw_only_passed = True
+    for review in reviews:
+        if not isinstance(review, dict):
+            continue
+        saw_reviews = True
+        status = string_field(review, "status") or ""
+        if status == "findings-open":
+            return "findings-open"
+        if status == "request-changes":
+            if review_cycle_response_is_addressed(review.get("response")):
+                saw_addressed_request_changes = True
+                saw_only_passed = False
+                continue
+            return "request-changes"
+        if status != "passed":
+            return "findings-open"
+    if saw_only_passed and saw_reviews:
+        return "passed"
+    if saw_addressed_request_changes:
+        return "findings-addressed"
     return "findings-open"
 
 
@@ -3107,7 +3133,25 @@ def tracker_review_cycles(normalized: dict[str, Any], state: dict[str, Any] | No
     return cycles
 
 
+def tracker_review_cycles_for_status(normalized: dict[str, Any], state: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    configured = normalized.get("review_cycles")
+    runtime = state.get("runtime_review_cycles") if isinstance(state, dict) else []
+    cycles = list(configured) if isinstance(configured, list) else []
+    if isinstance(runtime, list) and runtime_review_cycles_have_feedback(runtime):
+        cycles.extend(cycle for cycle in runtime if isinstance(cycle, dict) and runtime_review_cycle_has_feedback(cycle))
+    return cycles
+
+
 def runtime_review_cycles_count_for_tracker(runtime_cycles: list[dict[str, Any]]) -> bool:
+    return any(runtime_review_cycle_is_recorded(cycle) for cycle in runtime_cycles if isinstance(cycle, dict))
+
+
+def runtime_review_cycle_is_recorded(cycle: dict[str, Any]) -> bool:
+    reviews = cycle.get("reviews")
+    return isinstance(reviews, list) and bool(reviews)
+
+
+def runtime_review_cycles_have_feedback(runtime_cycles: list[dict[str, Any]]) -> bool:
     return any(runtime_review_cycle_has_feedback(cycle) for cycle in runtime_cycles if isinstance(cycle, dict))
 
 
@@ -3254,8 +3298,10 @@ def tracker_record(
     decision_pr_url = redact_text(decision.get("pr_url") or "")
     decision_review_feedback_status = terminal_review_feedback_status(decision)
     review_cycles = tracker_review_cycles(normalized, state)
+    status_review_cycles = tracker_review_cycles_for_status(normalized, state)
     review_cycle_evidence_recorded = review_cycles_recorded(review_cycles)
-    review_feedback_requires_response = review_cycles_require_response(review_cycles)
+    review_feedback_requires_response = review_cycles_require_response(status_review_cycles)
+    review_feedback_recorded = review_cycles_recorded(status_review_cycles)
     review = state.get("review") if isinstance(state.get("review"), dict) else {}
     record = {
         "schema_version": SCHEMA_VERSION,
@@ -3315,7 +3361,7 @@ def tracker_record(
         blocked_reason = redact_text(str(decision.get("reason") or publication.get("reason") or ""))
         if review_feedback_requires_response:
             record["status"] = "review-findings-open"
-        elif review_cycles:
+        elif review_feedback_recorded:
             record["status"] = "review-feedback-addressed"
         if blocked_reason:
             record["comment"] = (
@@ -3366,7 +3412,7 @@ def tracker_record(
         if publication.get("status") == "published":
             record["pr_url"] = redact_text(str(publication.get("url") or ""))
         return record
-    if review_cycles:
+    if review_feedback_recorded:
         record["status"] = "review-feedback-addressed"
         record["comment"] = (
             "PR review cycle evidence is present and all response-required findings are addressed; keep the source "
