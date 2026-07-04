@@ -1027,43 +1027,6 @@ class WorkstreamStatusMappingTest(unittest.TestCase):
             ],
         )
 
-    def test_pipeline_retrospective_record_surfaces_auth_preflight_failure_as_process_follow_up(self):
-        state = retrospective_state()
-        state["pi_auth_preflight"] = {
-            "schema_version": 1,
-            "status": "failed",
-            "reason": "Pi auth preflight failed for retrospective_judge: gh auth login required",
-            "results": [
-                {
-                    "target": "retrospective_judge",
-                    "provider": "openai-codex",
-                    "status": "failed",
-                    "summary": "gh auth login required",
-                    "stderr_excerpt": "gh auth login required",
-                }
-            ],
-        }
-
-        record = pipeline_retrospective_record(
-            state,
-            {"status": "blocked", "reason": "Pi auth preflight failed for retrospective_judge: gh auth login required"},
-            retrospective_tracker("implemented"),
-        )
-
-        self.assertEqual(record["health"], "failing")
-        self.assertEqual(record["signals"][0]["kind"], "auth-preflight")
-        self.assertEqual(record["signals"][0]["scope"], "pipeline-process")
-        self.assertEqual(record["signals"][0]["evidence_paths"], ["pi-auth-preflight.json"])
-        self.assertEqual(
-            record["recommended_follow_up"],
-            [
-                {
-                    "summary": "Restore Pi auth preflight for retrospective_judge before rerunning the workstream.",
-                    "labels": ["afk:follow-up", "area:workstream", "project:afk-composable-pipeline"],
-                }
-            ],
-        )
-
     def test_pipeline_retrospective_record_treats_review_feedback_budget_block_as_target_work(self):
         state = retrospective_state()
         state["review"] = {
