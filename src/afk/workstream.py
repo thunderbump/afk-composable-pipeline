@@ -26,6 +26,25 @@ from afk.pi_workers import (
 from afk.redaction import is_secret_command_flag, is_secret_key, is_secret_value, redact_artifact_value, redact_text
 from afk.recipes import review_branch_for_workstream
 from afk.registry import StepResult
+from afk.workstream_lifecycle import (
+    LifecycleHooks,
+    current_review_record,
+    current_validation_records,
+    has_current_validated_evidence,
+    implemented_after_commit,
+    retry_attempt_count,
+    retry_attempt_records,
+    retry_budget_record,
+    review_passed,
+    review_status,
+    run_lifecycle,
+    selected_work_records,
+    terminal_selected_work_status,
+    tracker_selected_work_status,
+    validation_gate_entry,
+    review_gate_entry,
+    workstream_status_from_publication,
+)
 
 
 SCHEMA_VERSION = 1
@@ -151,124 +170,24 @@ def run_workstream(
         },
     )
 
-    state: dict[str, Any] = {
-        "selected_work": [],
-        "checkout": None,
-        "checkout_attempts": [],
-        "implementation": None,
-        "implementation_selection": [],
-        "implementation_result_path": "",
-        "attempted_work_aliases": [],
-        "validations": [],
-        "pending_repair_context": None,
-        "repair_history": [],
-        "runtime_review_cycles": [],
-        "review": None,
-        "review_selection": [],
-        "review_result_path": "",
-        "cleanup": {"status": "unknown", "resources": []},
-        "blocked_reason": "",
-        "stop_reason": "",
-        "next_allowed_command": "",
-    }
-    steps = []
-    steps_queue = [deepcopy(step) for step in normalized["steps"]]
-    index = 0
-    while index < len(steps_queue):
-        step_spec = steps_queue[index]
-        step_name = step_spec["name"]
-        remaining_steps = steps_queue[index + 1 :]
-        stop_reason = terminal_stop_reason(step_spec, state)
-        if stop_reason:
-            state["stop_reason"] = stop_reason
-            state["next_allowed_command"] = next_allowed_command_for_terminal_stop(state, normalized)
-            break
-        blocked_reason = workflow_order_blocking_reason(step_name, state, normalized["retry_policy"])
-        if blocked_reason:
-            state["blocked_reason"] = blocked_reason
-            break
-        step_input = composed_step_input(step_spec, normalized, state, ledger_dir, step_index=index)
-        step_profile = step_spec.get("profile")
-        equivalent_command = equivalent_run_step_command(
-            step_name,
-            step_input,
-            ledger_dir,
-            profile=step_profile,
-            project_contract=project_contract,
-        )
-        result = step_runner(step_name, step_input, ledger_dir, project_contract)
-        step_record = step_execution_record(
-            step_name,
-            result,
-            equivalent_command,
-            ledger_dir,
-        )
-        steps.append(step_record)
-        update_state_from_step(state, step_name, result, ledger_dir)
-        if step_name == "validate":
-            repair_steps, repair_blocked_reason = validation_feedback_follow_up(
-                normalized=normalized,
-                state=state,
-                step_spec=step_spec,
-                ledger_dir=ledger_dir,
-            )
-            if repair_blocked_reason:
-                state["blocked_reason"] = repair_blocked_reason
-                break
-            if repair_steps:
-                state["pending_repair_context"] = build_validation_repair_context(state, repair_attempt=retry_attempt_count(state) + 1)
-                steps_queue[index + 1 : index + 1] = repair_steps
-                index += 1
-                continue
-        if step_name == "review":
-            repair_steps, repair_blocked_reason = review_feedback_follow_up(
-                normalized=normalized,
-                state=state,
-                step_spec=step_spec,
-            )
-            if repair_blocked_reason:
-                state["blocked_reason"] = repair_blocked_reason
-                break
-            if repair_steps:
-                state["pending_repair_context"] = build_review_repair_context(
-                    state,
-                    step_spec=step_spec,
-                    repair_attempt=retry_attempt_count(state) + 1,
-                )
-                steps_queue[index + 1 : index + 1] = repair_steps
-                index += 1
-                continue
-        blocked_reason = blocking_reason_for_step(step_name, result, remaining_steps)
-        if blocked_reason:
-            state["blocked_reason"] = blocked_reason
-            break
-        index += 1
-
-    state["cleanup"] = final_cleanup_state(state)
-
-    publication: dict[str, Any]
-    selected_work = []
-    if state["blocked_reason"]:
-        publication = blocked_publication(state["blocked_reason"], normalized, run_id)
-    else:
-        publication_gate = publication_gate_reason(state)
-        if publication_gate:
-            if state["stop_reason"] and has_current_validated_evidence(state):
-                publication = validated_unpublished_publication(
-                    state["stop_reason"],
-                    next_allowed_command=state["next_allowed_command"] or rerun_workstream_command(normalized),
-                )
-            else:
-                publication = blocked_publication(publication_gate, normalized, run_id)
-        else:
-            publication = publish_terminal_pr(
-                normalized["publisher"],
-                normalized=normalized,
-                state=state,
-                steps=steps,
-                selected_work=selected_work_records(state),
-                ledger=ledger,
-            )
+    lifecycle = run_lifecycle(
+        normalized=normalized,
+        run_id=run_id,
+        ledger_dir=ledger_dir,
+        ledger=ledger,
+        step_runner=step_runner,
+        project_contract=project_contract,
+        hooks=LifecycleHooks(
+            composed_step_input=composed_step_input,
+            equivalent_run_step_command=equivalent_run_step_command,
+            step_execution_record=step_execution_record,
+            update_state_from_step=update_state_from_step,
+            publish_terminal_pr=publish_terminal_pr,
+        ),
+    )
+    state = lifecycle.state
+    steps = lifecycle.steps
+    publication = lifecycle.publication
     tracker = tracker_record(normalized, state, publication)
     status = workstream_status_from_publication(publication, tracker)
     selected_work = selected_work_records(state)
@@ -1013,25 +932,6 @@ def checkout_after_implementation(checkout: Any, implementation: dict[str, Any])
     updated["start_commit"] = after_commit
     updated["requested_ref"] = after_commit
     return updated
-
-
-def implemented_after_commit(state: dict[str, Any]) -> str:
-    implementation = state.get("implementation") if isinstance(state.get("implementation"), dict) else {}
-    if implementation.get("status") != "implemented":
-        return ""
-    git_info = implementation.get("git") if isinstance(implementation.get("git"), dict) else {}
-    return string_field(git_info, "after_commit") or ""
-
-
-def has_current_validated_evidence(state: dict[str, Any]) -> bool:
-    implemented_commit = implemented_after_commit(state)
-    if not implemented_commit:
-        return False
-    return any(
-        validation["output"].get("status") == "validated"
-        and validation_checkout_commit(validation) == implemented_commit
-        for validation in state["validations"]
-    )
 
 
 def blocking_reason_for_step(
@@ -3045,44 +2945,6 @@ def review_failure_allows_retry_follow_up(remaining_steps: list[dict[str, Any]])
     return False
 
 
-def retry_attempt_count(state: dict[str, Any]) -> int:
-    attempts = state.get("checkout_attempts")
-    if not isinstance(attempts, list):
-        return 0
-    return sum(1 for attempt in attempts if isinstance(attempt, dict) and integer_retry_number(attempt) > 0)
-
-
-def retry_budget_record(state: dict[str, Any], retry_policy: dict[str, int]) -> dict[str, int]:
-    attempted_retries = retry_attempt_count(state)
-    max_retries = retry_policy["max_retries"]
-    return {
-        "max_retries": max_retries,
-        "attempted_retries": attempted_retries,
-        "remaining_retries": max(0, max_retries - attempted_retries),
-    }
-
-
-def retry_attempt_records(state: dict[str, Any]) -> list[dict[str, Any]]:
-    attempts = state.get("checkout_attempts")
-    if not isinstance(attempts, list):
-        return []
-    records = []
-    for attempt in attempts:
-        if not isinstance(attempt, dict) or integer_retry_number(attempt) <= 0:
-            continue
-        records.append(
-            {
-                "attempt": int(attempt["attempt"]),
-                "repairing_failure_class": string_field(attempt, "repairing_failure_class") or "",
-                "checkout_path": string_field(attempt, "checkout_path") or "",
-                "review_branch": string_field(attempt, "review_branch") or "",
-                "commit": string_field(attempt, "commit") or "",
-                "status": "dirty" if checkout_attempt_is_dirty(attempt) else string_field(attempt, "status") or "unknown",
-            }
-        )
-    return records
-
-
 def final_cleanup_state(state: dict[str, Any]) -> dict[str, Any]:
     cleanup = state.get("cleanup")
     base = dict(cleanup) if isinstance(cleanup, dict) else {"status": "unknown", "resources": []}
@@ -3128,23 +2990,6 @@ def integer_retry_number(attempt: dict[str, Any]) -> int:
 
 def pr_body_value(value: Any) -> str:
     return redact_text(str(value))
-
-
-def selected_work_records(state: dict[str, Any]) -> list[dict[str, str]]:
-    records = []
-    for item in state["selected_work"]:
-        if not isinstance(item, dict):
-            continue
-        records.append(
-            {
-                "external_id": redact_text(str(item.get("external_id") or "")),
-                "title": redact_text(str(item.get("title") or "")),
-                "source_id": redact_text(str(item.get("source_id") or "")),
-                "source_type": redact_text(str(item.get("source_type") or "")),
-                "result": redact_text(selected_work_result(item, state)),
-            }
-        )
-    return records
 
 
 def selected_work_result(item: dict[str, Any], state: dict[str, Any]) -> str:
@@ -3197,28 +3042,6 @@ def work_item_in_selection(item: dict[str, Any], selection: Any) -> bool:
     return False
 
 
-def current_validation_records(state: dict[str, Any]) -> list[dict[str, Any]]:
-    implemented_commit = implemented_after_commit(state)
-    validations = state.get("validations")
-    if not implemented_commit or not isinstance(validations, list):
-        return []
-    return [
-        validation
-        for validation in validations
-        if isinstance(validation, dict) and validation_checkout_commit(validation) == implemented_commit
-    ]
-
-
-def current_review_record(state: dict[str, Any]) -> dict[str, Any] | None:
-    implemented_commit = implemented_after_commit(state)
-    review = state.get("review")
-    if not implemented_commit or not isinstance(review, dict):
-        return None
-    if review_checkout_commit(review) != implemented_commit:
-        return None
-    return review
-
-
 def selected_work_artifact_lines_for_body(item: dict[str, Any], state: dict[str, Any]) -> list[str]:
     lines = []
     if work_item_in_selection(item, state.get("implementation_selection")):
@@ -3247,56 +3070,6 @@ def selected_work_validation_paths(item: dict[str, Any], state: dict[str, Any]) 
         if worker_path:
             refs.append(worker_path)
     return refs
-
-
-def tracker_selected_work_status(
-    state: dict[str, Any],
-    publication: dict[str, Any],
-    tracker: dict[str, Any],
-) -> str:
-    if tracker.get("close_source_item"):
-        return "closed"
-    if publication.get("status") == "tracker-close-blocked":
-        return "awaiting-review"
-    if publication.get("status") == "published":
-        return "awaiting-review"
-    if publication.get("status") == "validated-unpublished":
-        return terminal_selected_work_status(state)
-    status = review_status(state)
-    if status == "passed":
-        return "validated" if has_current_validated_evidence(state) else "implemented"
-    return status
-
-
-def review_status(state: dict[str, Any]) -> str:
-    review = state.get("review") if isinstance(state.get("review"), dict) else {}
-    status = review.get("status")
-    if status == "passed":
-        return "passed"
-    if isinstance(status, str) and status:
-        return status
-    implementation = state.get("implementation") if isinstance(state.get("implementation"), dict) else {}
-    if implementation.get("status") == "implemented":
-        return "implemented"
-    return "selected"
-
-
-def review_passed(state: dict[str, Any]) -> bool:
-    review = state.get("review") if isinstance(state.get("review"), dict) else {}
-    return review.get("status") == "passed"
-
-
-def gated_selected_work_status(state: dict[str, Any]) -> str:
-    status = review_status(state)
-    if status == "passed":
-        return "implemented" if implemented_after_commit(state) else "selected"
-    return status
-
-
-def terminal_selected_work_status(state: dict[str, Any]) -> str:
-    if review_passed(state) or has_current_validated_evidence(state):
-        return "validated"
-    return gated_selected_work_status(state)
 
 
 def tracker_terminal_decision_present(normalized: dict[str, Any]) -> bool:
@@ -6489,23 +6262,6 @@ def validated_unpublished_publication(reason: str, *, next_allowed_command: str)
     }
 
 
-def workstream_status_from_publication(publication: dict[str, Any], tracker: dict[str, Any] | None = None) -> str:
-    if publication["status"] == "published":
-        return "published"
-    if publication["status"] == "validated-unpublished":
-        return "validated-unpublished"
-    if publication["status"] == "tracker-close-blocked":
-        tracker_status = string_field(tracker, "status") if isinstance(tracker, dict) else ""
-        if tracker_status:
-            return tracker_status
-        return "review-findings-open"
-    if publication["status"] == "tracker-closed":
-        return "closed"
-    if publication["status"] == "blocked":
-        return "blocked"
-    return "failed-needs-human"
-
-
 def workstream_artifacts(ledger: "WorkstreamLedger") -> dict[str, str]:
     artifacts = {
         "workstream_result": "workstream-result.json",
@@ -6631,35 +6387,6 @@ def validation_name(validation: dict[str, Any]) -> str:
     output = validation.get("output") if isinstance(validation.get("output"), dict) else {}
     info = output.get("validation") if isinstance(output.get("validation"), dict) else {}
     return string_field(info, "requested_profile") or string_field(info, "worker_profile") or "validation"
-
-
-def validation_gate_entry(validation: dict[str, Any]) -> dict[str, Any]:
-    output = validation.get("output") if isinstance(validation.get("output"), dict) else {}
-    worker_result = output.get("worker_result") if isinstance(output.get("worker_result"), dict) else {}
-    worker_normalized = worker_result.get("normalized") if isinstance(worker_result.get("normalized"), dict) else {}
-    return {
-        "name": validation_name(validation),
-        "status": string_field(output, "status") or "missing",
-        "classification": string_field(output, "classification") or "",
-        "summary": string_field(output, "summary") or "",
-        "worker_status": string_field(worker_normalized, "status") or "missing",
-        "worker_classification": string_field(worker_normalized, "classification") or "",
-        "worker_summary": string_field(worker_normalized, "summary") or "",
-        "worker_result": worker_result,
-        "evidence_status": "valid",
-        "checkout_commit": validation_checkout_commit(validation),
-        "step_result_path": string_field(validation, "step_result_path") or "",
-        "worker_result_path": string_field(validation, "worker_result_path") or "",
-    }
-
-
-def review_gate_entry(review: Any) -> dict[str, Any] | None:
-    if not isinstance(review, dict):
-        return None
-    return {
-        "status": string_field(review, "status") or "",
-        "checkout_commit": review_checkout_commit(review),
-    }
 
 
 def pr_body_validation_line(validation: dict[str, Any], index: int) -> str:
