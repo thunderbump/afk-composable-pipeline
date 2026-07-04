@@ -5221,12 +5221,29 @@ def _implementation_auth_retrospective_signal(state: dict[str, Any], reason: str
 
 
 def _implementation_auth_failure_classification(*texts: str) -> str:
-    combined = "\n".join(text for text in texts if text)
-    if not combined:
+    excerpt = ""
+    for text in texts[1:]:
+        excerpt = runtime_failure_excerpt(text)
+        if excerpt:
+            break
+    if not excerpt:
+        excerpt = next((text for text in texts if text), "")
+    if not excerpt:
         return ""
-    lowered = combined.lower()
-    auth_markers = ("api key", "oauth", "credential", "login", "authentication", "auth")
-    if not any(marker in lowered for marker in auth_markers):
+    lowered = excerpt.lower()
+    explicit_auth_failure = (
+        "no api key" in lowered
+        or "api key not found" in lowered
+        or "missing api key" in lowered
+        or "oauth refresh failed" in lowered
+        or "expired oauth credential" in lowered
+        or "credential expired" in lowered
+        or "expired credential" in lowered
+        or "authentication failed" in lowered
+        or "login failed" in lowered
+        or ("credential" in lowered and ("missing" in lowered or "failed" in lowered or "expired" in lowered))
+    )
+    if not explicit_auth_failure:
         return ""
     if "openai-codex" in lowered:
         return "openai-codex-auth"
