@@ -2,9 +2,6 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
-import subprocess
-import tempfile
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlsplit
@@ -16,8 +13,6 @@ from afk.work_sources import select_work
 
 
 READY_TAG = "ready-for-agent"
-ALLOWED_SELECTOR_MODELS = {"gpt-5.3-codex-spark", "gpt-5.4-mini"}
-SELECTOR_TIMEOUT_SECONDS = 60
 WORKSTREAM_RESULT_FIELDS = ("run_id", "workstream_id", "parent", "status", "result_path", "publication_status")
 WORKSTREAM_RESULT_SUMMARY_FIELDS = ("publication", "tracker", "artifacts", "pipeline_retrospective")
 
@@ -36,9 +31,6 @@ def run_next(
     retrospective_follow_up: dict[str, Any] | None = None,
     publisher_factory: Callable[[str], dict[str, Any] | None] | None = None,
     ready_tag: str = READY_TAG,
-    selector_mode: str = "deterministic",
-    selector_model: str | None = None,
-    selector_choice_json: str | None = None,
     enable_review_feedback: bool = False,
     expect_generated_smoke_dry_run: bool = False,
     execute: bool = False,
@@ -54,12 +46,7 @@ def run_next(
         tracker_artifact_root=tracker_artifact_root,
     )
     selection_result = select_work(selection_request, project_contract=project_contract)
-    chosen = choose_candidate(
-        selection_result.get("selected_work") or [],
-        selector_mode=selector_mode,
-        selector_model=selector_model,
-        selector_choice_json=selector_choice_json,
-    )
+    chosen = choose_candidate(selection_result.get("selected_work") or [])
     recipe = None
     workstream_result = None
     if chosen is not None:
@@ -95,7 +82,7 @@ def run_next(
         "selection_request": selection_request,
         "selection_result": annotate_selection_result(selection_result),
         "chosen_work": selected_work_snapshot(chosen),
-        "selector": selector_result(chosen, selector_mode=selector_mode, selector_model=selector_model),
+        "selector": selector_result(chosen),
         "recipe": recipe,
         "workstream_result": workstream_result,
     }
@@ -157,57 +144,32 @@ def build_selection_request(
 
 def choose_candidate(
     candidates: list[dict[str, Any]],
-    *,
-    selector_mode: str,
-    selector_model: str | None,
-    selector_choice_json: str | None,
 ) -> dict[str, Any] | None:
-    if selector_mode not in {"deterministic", "model"}:
-        raise ValueError("selector mode must be deterministic or model")
-    if selector_mode == "model":
-        validate_selector_model(selector_model)
     if not candidates:
         return None
-    if selector_mode == "model":
-        model_choice = parse_selector_choice(selector_model, selector_choice_json, candidates)
-        if model_choice is None and selector_choice_json is None:
-            model_choice = invoke_codex_selector(selector_model, candidates)
-        if model_choice is not None:
-            return model_choice
     return deterministic_candidate(candidates)
 
 
-def validate_selector_model(selector_model: str | None) -> None:
-    if selector_model is None:
-        raise ValueError("selector model is required for model mode")
-    if selector_model not in ALLOWED_SELECTOR_MODELS:
-        raise ValueError(
-            "selector model must be one of: gpt-5.3-codex-spark, gpt-5.4-mini"
-        )
-
-
-def selector_result(
-    chosen: dict[str, Any] | None,
-    *,
-    selector_mode: str,
-    selector_model: str | None,
-) -> dict[str, Any]:
+def selector_result(chosen: dict[str, Any] | None) -> dict[str, Any]:
     if chosen is None:
-        return {"mode": selector_mode, "model": selector_model, "selected": None, "rationale": "no candidates"}
+        return {"mode": "deterministic", "model": None, "selected": None, "rationale": "no candidates"}
+    selected = selected_work_snapshot(chosen)
     return {
-        "mode": selector_mode,
-        "model": selector_model,
+        "mode": "deterministic",
+        "model": None,
         "selected": {
-            "source_id": chosen["source_id"],
-            "source_type": chosen["source_type"],
-            "external_id": chosen["external_id"],
-            "rationale": chosen.get("selector_rationale", "deterministic default"),
+            "source_id": selected["source_id"],
+            "source_type": selected["source_type"],
+            "external_id": selected["external_id"],
+            "rationale": "deterministic default",
         },
     }
 
 
 def annotate_selection_result(selection_result: dict[str, Any]) -> dict[str, Any]:
     annotated = dict(selection_result)
+    annotated["selected_work"] = scrub_selected_work_value(annotated.get("selected_work"))
+    annotated["source_statuses"] = scrub_selected_work_containers(annotated.get("source_statuses"))
     annotated["selected_work_kind"] = "candidate_list"
     return annotated
 
@@ -215,94 +177,26 @@ def annotate_selection_result(selection_result: dict[str, Any]) -> dict[str, Any
 def selected_work_snapshot(chosen: dict[str, Any] | None) -> dict[str, Any] | None:
     if chosen is None:
         return None
-    return dict(chosen)
+    return {key: value for key, value in chosen.items() if not key.startswith("selector_")}
 
 
-def parse_selector_choice(
-    selector_model: str | None,
-    selector_choice_json: str | None,
-    candidates: list[dict[str, Any]],
-) -> dict[str, Any] | None:
-    validate_selector_model(selector_model)
-    if not selector_choice_json:
-        return None
-    try:
-        choice = json.loads(selector_choice_json)
-    except json.JSONDecodeError:
-        return None
-    if not isinstance(choice, dict):
-        return None
-    chosen_id = choice.get("external_id")
-    if not isinstance(chosen_id, str) or not chosen_id:
-        return None
-    for candidate in candidates:
-        if candidate.get("external_id") == chosen_id:
-            selected = dict(candidate)
-            rationale = choice.get("rationale")
-            if isinstance(rationale, str) and rationale.strip():
-                selected["selector_rationale"] = rationale.strip()
-            else:
-                selected["selector_rationale"] = f"model {selector_model}"
-            return selected
-    return None
+def scrub_selected_work_containers(value: Any) -> Any:
+    if isinstance(value, list):
+        return [scrub_selected_work_containers(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+    scrubbed = dict(value)
+    if "selected_work" in scrubbed:
+        scrubbed["selected_work"] = scrub_selected_work_value(scrubbed["selected_work"])
+    return scrubbed
 
 
-def invoke_codex_selector(selector_model: str | None, candidates: list[dict[str, Any]]) -> dict[str, Any] | None:
-    validate_selector_model(selector_model)
-    if shutil.which("codex") is None:
-        return None
-    prompt = selector_prompt(candidates)
-    try:
-        with tempfile.TemporaryDirectory(prefix="afk-selector-") as temp_dir:
-            output_path = Path(temp_dir) / "selector-result.json"
-            completed = subprocess.run(
-                [
-                    "codex",
-                    "exec",
-                    "--model",
-                    str(selector_model),
-                    "--sandbox",
-                    "read-only",
-                    "--ephemeral",
-                    "--ignore-rules",
-                    "--output-last-message",
-                    str(output_path),
-                    prompt,
-                ],
-                text=True,
-                capture_output=True,
-                check=False,
-                timeout=SELECTOR_TIMEOUT_SECONDS,
-            )
-            if completed.returncode != 0 or not output_path.is_file():
-                return None
-            return parse_selector_choice(selector_model, output_path.read_text(encoding="utf-8"), candidates)
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-
-
-def selector_prompt(candidates: list[dict[str, Any]]) -> str:
-    selector_candidates = [
-        {
-            "source_id": candidate.get("source_id"),
-            "source_type": candidate.get("source_type"),
-            "external_id": candidate.get("external_id"),
-            "title": candidate.get("title"),
-            "priority": candidate.get("priority"),
-            "issue_type": candidate.get("issue_type"),
-            "labels": candidate.get("labels", []),
-            "workstream": candidate.get("workstream"),
-            "description": candidate.get("description"),
-            "acceptance_criteria": candidate.get("acceptance_criteria", []),
-        }
-        for candidate in candidates
-    ]
-    return (
-        "Choose one ready, unblocked work item from this JSON array. "
-        "Return only JSON with keys external_id and rationale. "
-        "Do not use tools.\n\n"
-        + json.dumps({"candidates": selector_candidates}, sort_keys=True)
-    )
+def scrub_selected_work_value(value: Any) -> Any:
+    if isinstance(value, list):
+        return [scrub_selected_work_value(item) for item in value]
+    if isinstance(value, dict):
+        return {key: item for key, item in value.items() if not key.startswith("selector_")}
+    return value
 
 
 def normalize_workstream_result(result: Any, *, ledger_dir: Path | None = None) -> dict[str, Any] | None:
