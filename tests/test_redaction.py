@@ -200,10 +200,12 @@ class RedactionTest(unittest.TestCase):
         self.assertEqual(redact_text(text), "Authentication failed: Bearer [REDACTED]")
 
     def test_preserves_non_secret_bearer_auth_failure_text(self):
-        self.assertEqual(
-            redact_text("Authentication failed: Bearer unauthorized"),
-            "Authentication failed: Bearer unauthorized",
-        )
+        for value in ("unauthorized", "authorizationfailed", "missingcredential"):
+            with self.subTest(value=value):
+                self.assertEqual(
+                    redact_text(f"Authentication failed: Bearer {value}"),
+                    f"Authentication failed: Bearer {value}",
+                )
 
     def test_redacts_opaque_lowercase_bearer_tokens_in_text(self):
         text = "Authentication failed: Bearer abcdefghijklmnop"

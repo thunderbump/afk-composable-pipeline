@@ -135,6 +135,32 @@ class WorkstreamStatusMappingTest(unittest.TestCase):
                 }
             )
 
+    def test_normalize_retrospective_follow_up_config_allows_bearer_auth_failure_prose_in_command(self):
+        for value in ("authorizationfailed", "missingcredential"):
+            with self.subTest(value=value):
+                config = normalize_retrospective_follow_up_config(
+                    {
+                        "enabled": True,
+                        "type": "fake-follow-up-command",
+                        "command": [
+                            "curl",
+                            "-H",
+                            f"Authorization: Bearer {value}",
+                            "https://example.invalid",
+                        ],
+                    }
+                )
+
+                self.assertEqual(
+                    config["command"],
+                    [
+                        "curl",
+                        "-H",
+                        f"Authorization: Bearer {value}",
+                        "https://example.invalid",
+                    ],
+                )
+
     def test_normalize_retrospective_follow_up_config_rejects_auth_env_keys(self):
         with self.assertRaisesRegex(WorkstreamError, "retrospective_follow_up.env is not supported"):
             normalize_retrospective_follow_up_config(
@@ -1219,6 +1245,28 @@ class WorkstreamStatusMappingTest(unittest.TestCase):
         self.assertEqual(record["signals"][0]["kind"], "implementation-auth")
         self.assertEqual(record["signals"][0]["summary"], "Authentication failed: Bearer [REDACTED]")
         self.assertEqual(record["signals"][0]["excerpt"], "Authentication failed: Bearer [REDACTED]")
+
+    def test_pipeline_retrospective_record_preserves_bearer_auth_failure_prose(self):
+        for value in ("authorizationfailed", "missingcredential"):
+            with self.subTest(value=value):
+                state = retrospective_state()
+                state["implementation"]["summary"] = "implement did not reach implemented: failed_runtime"
+                state["implementation"]["agent_result"] = {
+                    "evidence": {
+                        "stderr_excerpt": f"Authentication failed: Bearer {value}",
+                        "stdout_excerpt": "",
+                    }
+                }
+
+                record = pipeline_retrospective_record(
+                    state,
+                    {"status": "blocked", "reason": "implement did not reach implemented: failed_runtime"},
+                    retrospective_tracker("selected"),
+                )
+
+                self.assertEqual(record["signals"][0]["kind"], "implementation-auth")
+                self.assertEqual(record["signals"][0]["summary"], f"Authentication failed: Bearer {value}")
+                self.assertEqual(record["signals"][0]["excerpt"], f"Authentication failed: Bearer {value}")
 
     def test_pipeline_retrospective_record_turns_dirty_checkout_block_into_cleanup_follow_up(self):
         state = retrospective_state()

@@ -36,7 +36,7 @@ SECRET_TOKEN_VALUE_PATTERN = re.compile(
     r")\b"
 )
 BEARER_SECRET_PATTERN = re.compile(r"(?P<prefix>\bBearer\s+)(?P<value>[A-Za-z0-9._~+/=-]{12,})", re.IGNORECASE)
-SAFE_BEARER_WORDS = {"unauthorized"}
+SAFE_BEARER_WORDS = {"unauthorized", "authorizationfailed", "missingcredential"}
 MIN_EXACT_SECRET_LENGTH = 4
 
 
