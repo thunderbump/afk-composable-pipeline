@@ -7,6 +7,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+from afk import evidence_gate
 from afk.jsonutil import canonical_json
 from afk.pi_workers import non_openai_pi_mount_error, openai_codex_pi_mount_error, validate_absolute_dir
 from afk.redaction import is_secret_command_flag, redact_artifact_value, redact_text
@@ -57,14 +58,13 @@ def review(input_data: Any, *, run_id: str, run_dir: Path | None) -> dict[str, A
     reviewer_request = build_reviewer_request(evidence_pack, run_id=run_id)
     write_json(run_dir / "reviewer-request.json", reviewer_request)
 
-    validation_failures = required_validation_failures(evidence_pack)
-    if validation_failures:
-        summary = validation_gate_summary(validation_failures)
+    validation_gate = evidence_gate.required_validation_gate(request["validation"]["required"])
+    if not validation_gate["passed"]:
         normalized = normalized_reviewer_result(
             status="failed_validation_evidence",
             classification="validation_evidence_incomplete",
-            summary=summary,
-            findings=validation_failures,
+            summary=validation_gate["reason"],
+            findings=validation_gate["failures"],
             adapter=adapter_record(request["reviewer"], None, False),
             stdout="",
             stderr="",

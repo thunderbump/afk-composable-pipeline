@@ -10765,6 +10765,45 @@ raise SystemExit(0)
                 body,
             )
 
+    def test_workstream_pr_body_uses_indexed_fallback_for_unnamed_validation(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            body = pr_body_markdown(
+                {
+                    "workstream_id": "central-lve.9",
+                    "parent": "central-lve",
+                    "review_branch": "afk/workstream-terminal-pr",
+                },
+                {
+                    "implementation": {"git": {"changed_files": [], "commits": []}},
+                    "validations": [
+                        {
+                            "step_result_path": str(temp_path / "ledger" / "runs" / "validate" / "step-result.json"),
+                            "worker_result_path": "",
+                            "output": {
+                                "status": "validated",
+                            },
+                        }
+                    ],
+                    "review": {"status": "passed"},
+                    "cleanup": {"status": "clean", "resources": []},
+                },
+                [{"name": "validate", "result_path": "runs/validate/step-result.json"}],
+                [
+                    {
+                        "external_id": "central-lve.9",
+                        "title": "Compose workstream recipe",
+                        "result": "passed",
+                    }
+                ],
+                WorkstreamLedger(temp_path / "ledger", "run-1"),
+            )
+
+            self.assertIn(
+                "- validation-1: validated - result: missing - command: missing - summary: missing - evidence: runs/validate/step-result.json",
+                body,
+            )
+
     def test_workstream_blocks_publication_when_final_review_fails(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)

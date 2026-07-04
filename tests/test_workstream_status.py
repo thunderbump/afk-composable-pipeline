@@ -1185,6 +1185,41 @@ class WorkstreamStatusMappingTest(unittest.TestCase):
         self.assertEqual(record["signals"][0]["severity"], "error")
         self.assertIn("required final validation evidence is missing", record["signals"][0]["summary"])
 
+    def test_pipeline_retrospective_record_targets_work_for_new_validation_gate_reason(self):
+        state = retrospective_state()
+        state["validations"] = [
+            {
+                "output": {
+                    "status": "failed_validation",
+                    "summary": "failed_validation",
+                    "actionable_failures": [
+                        {
+                            "name": "tier1",
+                            "category": "compiler",
+                            "reason": "command exited with status 1",
+                            "log_path": "/tmp/ledger/runs/validate/validation-evidence/logs/validation.log",
+                            "excerpt": "zone/harness/zone_harness_runtime.cpp:98:9 error: SetBotID is a private member of Bot",
+                        }
+                    ],
+                    "checkout": {"start_commit": "abc123"},
+                    "validation": {"requested_profile": "tier1"},
+                },
+                "step_result_path": "/tmp/ledger/runs/validate/step-result.json",
+                "worker_result_path": "/tmp/ledger/runs/validate/worker-result.json",
+            }
+        ]
+
+        record = pipeline_retrospective_record(
+            state,
+            {"status": "blocked", "reason": "required final validation evidence is not validated: tier1 (failed_validation)"},
+            retrospective_tracker("selected"),
+        )
+
+        self.assertEqual(record["signals"][0]["kind"], "validation-failure")
+        self.assertEqual(record["signals"][0]["scope"], "target-work")
+        self.assertEqual(record["signals"][1]["kind"], "retry-or-blocked")
+        self.assertEqual(record["signals"][1]["scope"], "target-work")
+
     def test_pipeline_retrospective_record_does_not_treat_schema_errors_as_missing_config(self):
         state = retrospective_state()
         state["validations"] = [
