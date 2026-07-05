@@ -6,6 +6,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+from afk import workstream  # noqa: E402
 from afk.retrospective import RetrospectiveContext, build_pipeline_retrospective  # noqa: E402
 
 
@@ -53,6 +54,18 @@ def retrospective_tracker(status="awaiting-review"):
 
 
 class RetrospectiveModuleTest(unittest.TestCase):
+    def test_workstream_does_not_expose_retrospective_internals(self):
+        for symbol in (
+            "_apply_retrospective_judge",
+            "_retrospective_follow_up_bead_description",
+            "_retrospective_follow_up_bead_labels",
+            "_retrospective_follow_up_fingerprint",
+            "effective_retrospective",
+            "pipeline_retrospective_record",
+        ):
+            with self.subTest(symbol=symbol):
+                self.assertFalse(hasattr(workstream, symbol))
+
     def test_build_pipeline_retrospective_reports_clean_published_run(self):
         record = build_pipeline_retrospective(
             RetrospectiveContext(
@@ -71,4 +84,3 @@ class RetrospectiveModuleTest(unittest.TestCase):
         self.assertEqual(record["follow_up"]["recommended"], [])
         self.assertEqual(record["follow_up"]["created"], [])
         self.assertEqual(record["judge"], {"enabled": False, "status": "disabled"})
-

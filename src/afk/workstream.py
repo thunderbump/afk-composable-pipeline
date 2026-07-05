@@ -40,19 +40,7 @@ from afk.redaction import (
 )
 from afk.recipes import review_branch_for_workstream
 from afk.registry import StepResult
-from afk.retrospective import (
-    RetrospectiveContext,
-    _apply_retrospective_judge,
-    _retrospective_follow_up_bead_description,
-    _retrospective_follow_up_bead_labels,
-    _retrospective_follow_up_fingerprint,
-    _retrospective_text_has_missing_tool_or_config,
-    _validation_feedback_text_has_infra_or_setup_failure,
-    build_pipeline_retrospective,
-    effective_retrospective,
-    pipeline_retrospective_record,
-    redacted_terminal_retrospective,
-)
+from afk import retrospective as retrospective_api
 from afk.tracking import (
     TrackerContext,
     build_tracker_record,
@@ -217,14 +205,14 @@ def run_workstream(
             normalized=normalized,
             state=state,
             publication=publication,
-            retrospective=effective_retrospective(normalized, publication),
+            retrospective=retrospective_api.effective_retrospective(normalized, publication),
             schema_version=SCHEMA_VERSION,
         )
     )
     status = workstream_status_from_publication(publication, tracker)
     selected_work = selected_work_records(state)
-    pipeline_retrospective = build_pipeline_retrospective(
-        RetrospectiveContext(
+    pipeline_retrospective = retrospective_api.build_pipeline_retrospective(
+        retrospective_api.RetrospectiveContext(
             state=state,
             publication=publication,
             tracker=tracker,
@@ -234,8 +222,8 @@ def run_workstream(
 
     ledger.write_json("publication-result.json", publication)
     ledger.write_json("tracker-result.json", tracker)
-    terminal_retrospective = effective_retrospective(normalized, publication)
-    redacted_retrospective = redacted_terminal_retrospective(normalized, publication)
+    terminal_retrospective = retrospective_api.effective_retrospective(normalized, publication)
+    redacted_retrospective = retrospective_api.redacted_terminal_retrospective(normalized, publication)
     if terminal_retrospective:
         ledger.write_json("retrospective.json", redacted_retrospective)
     ledger.write_json("pipeline-retrospective.json", pipeline_retrospective)
@@ -1038,9 +1026,9 @@ def validation_feedback_repairable(output: dict[str, Any]) -> bool:
     excerpt = string_field(failure, "excerpt") or string_field(failure, "reason") or ""
     if category in {"runtime", "protocol", "timeout", "missing_result", "prerequisite_skip"}:
         return False
-    if _retrospective_text_has_missing_tool_or_config(excerpt):
+    if retrospective_api._retrospective_text_has_missing_tool_or_config(excerpt):
         return False
-    if _validation_feedback_text_has_infra_or_setup_failure(excerpt):
+    if retrospective_api._validation_feedback_text_has_infra_or_setup_failure(excerpt):
         return False
     return True
 
@@ -2784,32 +2772,6 @@ def validate_retrospective_terminal_decision(
     if (string_field(publisher_config, "mode") or "") == "close":
         return
     raise WorkstreamError("retrospective requires tracker.terminal_decision.status to be merged or no-merge")
-
-
-def effective_retrospective(normalized: dict[str, Any], publication: dict[str, Any]) -> dict[str, Any]:
-    retrospective = normalized.get("retrospective") if isinstance(normalized, dict) else {}
-    if not isinstance(retrospective, dict) or not retrospective:
-        return {}
-    if publisher_mode(normalized) != "close":
-        return retrospective
-    decision_status = effective_tracker_terminal_decision(normalized, publication).get("status")
-    if decision_status not in {"merged", "no-merge"}:
-        return {}
-    return retrospective
-
-
-def retrospective_follow_up_allowed(normalized: dict[str, Any], publication: dict[str, Any]) -> bool:
-    if publisher_mode(normalized) != "close":
-        return True
-    decision_status = effective_tracker_terminal_decision(normalized, publication).get("status")
-    return decision_status in {"merged", "no-merge"}
-
-
-def publisher_mode(normalized: dict[str, Any]) -> str:
-    publisher = normalized.get("publisher") if isinstance(normalized, dict) else {}
-    if not isinstance(publisher, dict):
-        publisher = {}
-    return string_field(publisher, "mode") or "create"
 
 
 def validate_review_cycle_status(status: str, error_message: str) -> None:
