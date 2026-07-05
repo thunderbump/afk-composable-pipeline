@@ -8,7 +8,7 @@ from pathlib import Path
 
 from afk.contracts import load_project_contract
 from afk.pi_workers import PONYTAIL_EXTENSION_SOURCE, build_pi_print_command
-from afk.recipes import generate_workstream_recipe
+from afk.recipes import RecipePlanRequest, generate_workstream_recipe
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -1789,6 +1789,71 @@ raise SystemExit(9)
             )
 
             self.assertEqual(recipe["review_feedback"], {"enabled": True})
+
+    def test_generate_workstream_recipe_delegates_cross_step_policy_to_plan_factory(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repo = temp_path / "repo-src"
+            beads_workspace = temp_path / "central-beads"
+            checkout_root = temp_path / "checkouts"
+            checkout_path = checkout_root / "demo"
+            contract_path = temp_path / "project-contracts" / "bump-eqemu.json"
+            init_repo(repo)
+            beads_workspace.mkdir()
+            contract_path.parent.mkdir()
+            write_contract(contract_path, project_slug="bump-eqemu", repo_url=repo.as_uri())
+
+            validation_input = {"validation": {"profile": "tier1", "commands": [["pytest", "-q"]]}}
+            plan_requests = []
+
+            def fake_plan_factory(plan_request):
+                plan_requests.append(plan_request)
+                return {
+                    "implement_validation": {
+                        "profile": "tier1",
+                        "commands": [["pytest", "-q"]],
+                        "run_commands_during_implementation": True,
+                    },
+                    "validation_feedback": {"enabled": True},
+                    "review_feedback": {"enabled": True},
+                    "retry_policy": {"max_retries": 1},
+                    "validation_expectations": {"generated_smoke_dry_run_expected": True},
+                }
+
+            recipe = generate_workstream_recipe(
+                workstream_id="central-anh.6",
+                project_contract=load_project_contract("bump-eqemu", contract_path.parent, cwd=ROOT),
+                beads_workspace=beads_workspace,
+                checkout_root=checkout_root,
+                checkout_path=checkout_path,
+                validation_profile="tier1",
+                validation_input=validation_input,
+                enable_review_feedback=True,
+                expect_generated_smoke_dry_run=True,
+                plan_factory=fake_plan_factory,
+            )
+
+            self.assertEqual(len(plan_requests), 1)
+            self.assertIsInstance(plan_requests[0], RecipePlanRequest)
+            self.assertEqual(plan_requests[0].validation_profile, "tier1")
+            self.assertEqual(plan_requests[0].validation_input, validation_input)
+            self.assertTrue(plan_requests[0].enable_review_feedback)
+            self.assertTrue(plan_requests[0].expect_generated_smoke_dry_run)
+            self.assertEqual(
+                recipe["steps"][2]["input"]["validation"],
+                {
+                    "profile": "tier1",
+                    "commands": [["pytest", "-q"]],
+                    "run_commands_during_implementation": True,
+                },
+            )
+            self.assertEqual(recipe["validation_feedback"], {"enabled": True})
+            self.assertEqual(recipe["review_feedback"], {"enabled": True})
+            self.assertEqual(recipe["retry_policy"], {"max_retries": 1})
+            self.assertEqual(
+                recipe["validation_expectations"],
+                {"generated_smoke_dry_run_expected": True},
+            )
 
     def test_generate_recipe_derives_project_worker_stack_from_checkout_parent(self):
         with tempfile.TemporaryDirectory() as temp_dir:

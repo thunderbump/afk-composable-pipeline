@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import json
 import re
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from afk.checkouts import url_has_secret_material
 from afk.contracts import ProjectContract
@@ -12,6 +13,14 @@ from afk.implement import agent_command_secret_error
 
 SCHEMA_VERSION = 1
 RUNNABLE_REQUIRED_METADATA = ["afk.ready"]
+
+
+@dataclass(frozen=True)
+class RecipePlanRequest:
+    validation_profile: str
+    validation_input: dict[str, Any]
+    enable_review_feedback: bool = False
+    expect_generated_smoke_dry_run: bool = False
 
 
 def generate_workstream_recipe(
@@ -33,6 +42,7 @@ def generate_workstream_recipe(
     required_metadata: list[str] | None = None,
     enable_review_feedback: bool = False,
     expect_generated_smoke_dry_run: bool = False,
+    plan_factory: Callable[[RecipePlanRequest], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     if url_has_secret_material(project_contract.repo_url):
         raise ValueError("project contract repo_url must not contain embedded credentials or query parameters")
@@ -44,6 +54,14 @@ def generate_workstream_recipe(
     )
     implement_agent = agent if agent is not None else default_recipe_agent()
     validate_step_input = validation_input if validation_input is not None else default_validation_input(validation_profile)
+    recipe_plan = (plan_factory or default_recipe_plan)(
+        RecipePlanRequest(
+            validation_profile=validation_profile,
+            validation_input=validate_step_input,
+            enable_review_feedback=enable_review_feedback,
+            expect_generated_smoke_dry_run=expect_generated_smoke_dry_run,
+        )
+    )
     recipe_publisher = publisher if publisher is not None else {"enabled": False}
     recipe_reviewer = reviewer if reviewer is not None else default_reviewer_config()
 
@@ -52,9 +70,9 @@ def generate_workstream_recipe(
         "workstream_id": workstream_id,
         "parent": parent_from_workstream_id(workstream_id),
         "review_branch": review_branch,
-        "validation_feedback": {"enabled": True},
-        "review_feedback": {"enabled": enable_review_feedback},
-        "retry_policy": {"max_retries": 1},
+        "validation_feedback": recipe_plan["validation_feedback"],
+        "review_feedback": recipe_plan["review_feedback"],
+        "retry_policy": recipe_plan["retry_policy"],
         "steps": [
             {
                 "name": "select-work",
@@ -90,10 +108,7 @@ def generate_workstream_recipe(
                 "name": "implement",
                 "input": {
                     "guardrails": ["stay within the prepared checkout", "do not write secrets"],
-                    "validation": implement_validation_input(
-                        validation_profile=validation_profile,
-                        validation_input=validate_step_input,
-                    ),
+                    "validation": recipe_plan["implement_validation"],
                     "agent": implement_agent,
                 },
             },
@@ -114,8 +129,9 @@ def generate_workstream_recipe(
         "publisher": recipe_publisher,
     }
 
-    if expect_generated_smoke_dry_run:
-        recipe["validation_expectations"] = {"generated_smoke_dry_run_expected": True}
+    validation_expectations = recipe_plan.get("validation_expectations")
+    if validation_expectations is not None:
+        recipe["validation_expectations"] = validation_expectations
 
     return recipe
 
@@ -172,6 +188,21 @@ def default_validation_input(validation_profile: str) -> dict[str, Any]:
             "timeout_seconds": 30,
         },
     }
+
+
+def default_recipe_plan(request: RecipePlanRequest) -> dict[str, Any]:
+    plan: dict[str, Any] = {
+        "implement_validation": implement_validation_input(
+            validation_profile=request.validation_profile,
+            validation_input=request.validation_input,
+        ),
+        "validation_feedback": {"enabled": True},
+        "review_feedback": {"enabled": request.enable_review_feedback},
+        "retry_policy": {"max_retries": 1},
+    }
+    if request.expect_generated_smoke_dry_run:
+        plan["validation_expectations"] = {"generated_smoke_dry_run_expected": True}
+    return plan
 
 
 def validate_recipe_agent_command(value: Any) -> list[str]:
