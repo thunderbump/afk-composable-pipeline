@@ -7,6 +7,7 @@ import shlex
 import subprocess
 import tempfile
 import uuid
+import warnings
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -89,6 +90,10 @@ REVIEW_CYCLE_STATUSES = {"passed", "findings-open", "findings-addressed", "reque
 REVIEW_CYCLE_OPEN_STATUSES = {"findings-open", "request-changes"}
 REVIEW_CYCLE_RESPONSE_STATUSES = {"addressed", "findings-addressed"}
 TERMINAL_REVIEW_FEEDBACK_STATUSES = {"resolved", "waived"}
+_LEGACY_RETROSPECTIVE_EXPORTS = {
+    "effective_retrospective",
+    "pipeline_retrospective_record",
+}
 
 
 @dataclass(frozen=True)
@@ -154,6 +159,17 @@ class PipelineEngine:
 
 
 PIPELINE_ENGINE = PipelineEngine()
+
+
+def __getattr__(name: str) -> Any:
+    if name in _LEGACY_RETROSPECTIVE_EXPORTS:
+        warnings.warn(
+            f"`afk.workstream.{name}` is deprecated; import it from `afk.retrospective` instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return getattr(retrospective_api, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def run_workstream(

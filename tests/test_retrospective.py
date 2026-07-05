@@ -1,5 +1,6 @@
 import sys
 import unittest
+import warnings
 from pathlib import Path
 
 
@@ -7,6 +8,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from afk import workstream  # noqa: E402
+from afk import retrospective as retrospective_api  # noqa: E402
 from afk.retrospective import RetrospectiveContext, build_pipeline_retrospective  # noqa: E402
 
 
@@ -54,17 +56,45 @@ def retrospective_tracker(status="awaiting-review"):
 
 
 class RetrospectiveModuleTest(unittest.TestCase):
-    def test_workstream_does_not_expose_retrospective_internals(self):
+    def test_workstream_does_not_expose_private_retrospective_internals(self):
         for symbol in (
             "_apply_retrospective_judge",
             "_retrospective_follow_up_bead_description",
             "_retrospective_follow_up_bead_labels",
             "_retrospective_follow_up_fingerprint",
-            "effective_retrospective",
-            "pipeline_retrospective_record",
         ):
             with self.subTest(symbol=symbol):
                 self.assertFalse(hasattr(workstream, symbol))
+
+    def test_retrospective_module_exposes_public_retrospective_helpers(self):
+        namespace = {}
+        exec(
+            "from afk.retrospective import effective_retrospective, pipeline_retrospective_record",
+            namespace,
+        )
+
+        self.assertIs(namespace["effective_retrospective"], retrospective_api.effective_retrospective)
+        self.assertIs(
+            namespace["pipeline_retrospective_record"],
+            retrospective_api.pipeline_retrospective_record,
+        )
+
+    def test_workstream_keeps_legacy_retrospective_helper_imports(self):
+        namespace = {}
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            exec(
+                "from afk.workstream import effective_retrospective, pipeline_retrospective_record",
+                namespace,
+            )
+
+        self.assertIs(namespace["effective_retrospective"], retrospective_api.effective_retrospective)
+        self.assertIs(
+            namespace["pipeline_retrospective_record"],
+            retrospective_api.pipeline_retrospective_record,
+        )
+        self.assertEqual(len(caught), 2)
+        self.assertTrue(all(issubclass(item.category, DeprecationWarning) for item in caught))
 
     def test_build_pipeline_retrospective_reports_clean_published_run(self):
         record = build_pipeline_retrospective(
