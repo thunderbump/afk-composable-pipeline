@@ -13,7 +13,16 @@ sys.path.insert(0, str(ROOT / "src"))
 from afk.contracts import load_project_contract  # noqa: E402
 from afk.pi_workers import PONYTAIL_EXTENSION_SOURCE, build_pi_real_worker_agent  # noqa: E402
 from afk.pi_workers import build_pi_print_command
-from afk.run_next import choose_candidate, github_repo_from_repo_url, run_next, selected_work_snapshot, selector_result
+from afk.run_next import (
+    RunNextPlanRequest,
+    RunNextRequest,
+    choose_candidate,
+    github_repo_from_repo_url,
+    run_next,
+    run_next_request,
+    selected_work_snapshot,
+    selector_result,
+)
 from afk.workstream import WorkstreamResult
 
 
@@ -1559,6 +1568,95 @@ raise SystemExit(9)
         self.assertEqual(runner_calls[0][0], recipe)
         self.assertEqual(runner_calls[0][1], ROOT / "project-contracts")
         self.assertEqual(runner_calls[0][2], contract)
+
+    def test_run_next_request_uses_injected_selector_plan_factory_and_runner(self):
+        contract = load_project_contract("bump-eqemu", ROOT / "project-contracts", cwd=ROOT)
+        selection_result = {
+            "schema_version": 1,
+            "source_statuses": [{"source_id": "central-beads", "source_type": "beads", "status": "selected"}],
+            "selected_work": [
+                {
+                    "source_id": "central-beads",
+                    "source_type": "beads",
+                    "external_id": "central-lve.11",
+                    "title": "Rank work from Beads metadata",
+                    "status": "open",
+                    "labels": ["project:bump-eqemu", "ready-for-agent"],
+                    "workstream": "central-lve",
+                    "acceptance_criteria": ["Carry priority into run-next"],
+                    "priority": 2,
+                    "issue_type": "task",
+                    "description": "Implement the selector context.",
+                    "dependencies": [],
+                    "blockers": [],
+                    "dependency_status": "clear",
+                    "afk": {"ready": True},
+                    "raw": {"beads": {"id": "central-lve.11"}},
+                }
+            ],
+            "skipped_candidates": [],
+        }
+        recipe = {"schema_version": 1, "workstream_id": "central-lve.11", "steps": []}
+        selector_calls: list[tuple[object, object]] = []
+        plan_calls: list[object] = []
+        runner_calls: list[tuple[object, object, object]] = []
+
+        def fake_selector(request, project_contract=None):
+            selector_calls.append((request, project_contract))
+            return selection_result
+
+        def fake_plan_factory(plan_request):
+            plan_calls.append(plan_request)
+            return recipe
+
+        def fake_runner(recipe_input, *, ledger_dir, project_contract):
+            runner_calls.append((recipe_input, ledger_dir, project_contract))
+            return {"status": "succeeded", "workstream_id": "central-lve.11"}
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            beads_workspace = temp_path / "beads"
+            checkout_root = temp_path / "checkouts"
+            checkout_path = checkout_root / "bump-EQEmu"
+            ledger_dir = temp_path / "ledger"
+            beads_workspace.mkdir()
+            checkout_root.mkdir(parents=True)
+            checkout_path.mkdir(parents=True)
+            ledger_dir.mkdir()
+
+            payload = run_next_request(
+                RunNextRequest(
+                    project_contract=contract,
+                    beads_workspace=beads_workspace,
+                    ready_tag="ready-for-agent",
+                    tracker_artifact_root=ROOT,
+                    execute=True,
+                    ledger_dir=ledger_dir,
+                    planner=RunNextPlanRequest(
+                        checkout_root=checkout_root,
+                        checkout_path=checkout_path,
+                        validation_profile="tier1",
+                    ),
+                ),
+                work_selector=fake_selector,
+                plan_factory=fake_plan_factory,
+                workstream_runner=fake_runner,
+            )
+
+        self.assertEqual(len(selector_calls), 1)
+        self.assertEqual(selector_calls[0][1], contract)
+        self.assertEqual(selector_calls[0][0]["required_labels"], ["project:bump-eqemu", "ready-for-agent"])
+        self.assertEqual(len(plan_calls), 1)
+        self.assertIsInstance(plan_calls[0], RunNextPlanRequest)
+        self.assertEqual(plan_calls[0].workstream_id, "central-lve.11")
+        self.assertEqual(plan_calls[0].required_labels, ["project:bump-eqemu", "ready-for-agent"])
+        self.assertEqual(plan_calls[0].sources[0]["type"], "beads")
+        self.assertEqual(len(runner_calls), 1)
+        self.assertEqual(runner_calls[0][0], recipe)
+        self.assertEqual(runner_calls[0][1], ledger_dir)
+        self.assertEqual(runner_calls[0][2], contract)
+        self.assertEqual(payload["recipe"], recipe)
+        self.assertEqual(payload["workstream_result"], {"status": "succeeded", "workstream_id": "central-lve.11"})
 
     def test_run_next_execute_mode_preserves_blocked_workstream_summary_from_ledger(self):
         contract = load_project_contract("bump-eqemu", ROOT / "project-contracts", cwd=ROOT)
