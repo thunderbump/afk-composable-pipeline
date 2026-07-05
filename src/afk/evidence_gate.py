@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Any
 
 from afk.redaction import redact_artifact_value
+from afk.schema_helpers import string_field, validation_artifact_ref
 
 
 def required_validation_gate(
@@ -129,11 +130,12 @@ def validation_gate_reason(failures: list[dict[str, Any]]) -> str:
 
 def validation_artifacts(required: list[dict[str, Any]]) -> list[dict[str, str]]:
     return [
-        {
-            "name": string_field(item, "name") or f"validation-{index + 1}",
-            "step_result_path": string_field(item, "step_result_path") or "",
-            "worker_result_path": string_field(item, "worker_result_path") or "",
-        }
+        validation_artifact_ref(
+            index=index,
+            name=string_field(item, "name"),
+            step_result_path=string_field(item, "step_result_path"),
+            worker_result_path=string_field(item, "worker_result_path"),
+        )
         for index, item in enumerate(required)
         if isinstance(item, dict)
     ]
