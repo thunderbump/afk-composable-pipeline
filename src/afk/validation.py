@@ -17,12 +17,9 @@ from afk.jsonutil import canonical_json
 from afk.redaction import is_secret_command_flag, redact_artifact_value, redact_text, redact_url
 from afk.role_adapters import (
     RoleAdapterRuntimeError,
-    execute_role_command,
-    minimal_command_environment,
     read_json_result_file,
-    render_command,
-    write_adapter_logs,
 )
+from afk.roles import execute_role_adapter, log_role_adapter_result, log_role_runtime_error
 
 
 SCHEMA_VERSION = 1
@@ -76,9 +73,7 @@ def validate(
             profile=worker_request["profile"],
         )
     except WorkerRuntimeError as exc:
-        stdout = redact_text(exc.stdout)
-        stderr = redact_text(exc.stderr or exc.message)
-        write_adapter_logs(stdout, stderr)
+        stdout, stderr = log_role_runtime_error(exc)
         read_worker_payload(result_path, fallback_path=evidence_result_path)
         sync_worker_failure_artifacts(
             result_path,
@@ -110,9 +105,7 @@ def validate(
         write_worker_result(worker_result_path, run_id, worker_result)
         return validate_output(request, worker_request, worker_result)
 
-    stdout = redact_text(adapter_result["stdout"])
-    stderr = redact_text(adapter_result["stderr"])
-    write_adapter_logs(stdout, stderr)
+    stdout, stderr = log_role_adapter_result(adapter_result)
 
     raw_payload = read_worker_payload(result_path, fallback_path=evidence_result_path)
     if raw_payload["status"] == "valid":
@@ -508,23 +501,6 @@ def run_command_adapter(
     profile: str,
 ) -> dict[str, Any]:
     evidence_dir.mkdir(parents=True, exist_ok=True)
-    env = minimal_command_environment(evidence_dir)
-    env["AFK_WORKER_REQUEST"] = str(request_path)
-    env["AFK_WORKER_RESULT"] = str(result_path)
-    env["AFK_WORKER_EVIDENCE_DIR"] = str(evidence_dir)
-    env["AFK_VALIDATION_PROFILE"] = profile
-    env.update(worker.get("env", {}))
-    if worker["type"] == "remote-command":
-        env["AFK_WORKER_REMOTE_HOST"] = worker["host"]
-    command = render_command(
-        worker["command"],
-        {
-            "{request_path}": str(request_path),
-            "{result_path}": str(result_path),
-            "{evidence_dir}": str(evidence_dir),
-            "{profile}": profile,
-        },
-    )
     runner = None
     if worker["type"] == "local-command":
         runner = lambda command, cwd, env, timeout_seconds: run_local_command_adapter(
@@ -533,11 +509,25 @@ def run_command_adapter(
             env=env,
             timeout_seconds=timeout_seconds,
         )
-    return execute_role_command(
-        command=command,
+    env_vars = {
+        "AFK_WORKER_REQUEST": str(request_path),
+        "AFK_WORKER_RESULT": str(result_path),
+        "AFK_WORKER_EVIDENCE_DIR": str(evidence_dir),
+        "AFK_VALIDATION_PROFILE": profile,
+    }
+    if worker["type"] == "remote-command":
+        env_vars["AFK_WORKER_REMOTE_HOST"] = worker["host"]
+    return execute_role_adapter(
+        worker,
         cwd=checkout_path,
-        env=env,
-        timeout_seconds=worker["timeout_seconds"],
+        env_root=evidence_dir,
+        env_vars=env_vars,
+        replacements={
+            "{request_path}": str(request_path),
+            "{result_path}": str(result_path),
+            "{evidence_dir}": str(evidence_dir),
+            "{profile}": profile,
+        },
         runtime_failure_message="worker command failed",
         timeout_message="worker command timed out",
         allow_nonzero=True,

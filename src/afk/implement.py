@@ -22,13 +22,9 @@ from afk.redaction import (
 )
 from afk.role_adapters import (
     RoleAdapterRuntimeError,
-    execute_role_command,
-    minimal_command_environment,
     read_json_result_file,
-    redact_adapter_streams,
-    render_command,
-    write_adapter_logs,
 )
+from afk.roles import execute_role_adapter, log_role_adapter_result, log_role_runtime_error
 
 
 SCHEMA_VERSION = 1
@@ -108,12 +104,7 @@ def implement(
     try:
         adapter_result = run_agent_command(request["agent"], checkout_path, capsule)
     except AgentRuntimeError as exc:
-        stdout, stderr = redact_adapter_streams(
-            stdout=exc.stdout,
-            stderr=exc.stderr or exc.message,
-            exact_secrets=exact_secrets,
-        )
-        write_adapter_logs(stdout, stderr)
+        stdout, stderr = log_role_runtime_error(exc, exact_secrets=exact_secrets)
         after_metadata = safe_git_metadata(checkout_path, request["checkout"]["start_commit"])
         summary = runtime_failure_summary(exc.message, stdout=stdout, stderr=stderr)
         normalized = normalized_agent_result(
@@ -134,12 +125,7 @@ def implement(
         )
         return implement_output(capsule, normalized, after_metadata)
 
-    stdout, stderr = redact_adapter_streams(
-        stdout=adapter_result["stdout"],
-        stderr=adapter_result["stderr"],
-        exact_secrets=exact_secrets,
-    )
-    write_adapter_logs(stdout, stderr)
+    stdout, stderr = log_role_adapter_result(adapter_result, exact_secrets=exact_secrets)
 
     agent_payload = read_agent_payload(
         checkout_path,
@@ -931,21 +917,15 @@ def run_agent_command(
         temp_path = Path(temp_dir)
         capsule_path = temp_path / "job-capsule.json"
         capsule_path.write_text(canonical_json(capsule) + "\n", encoding="utf-8")
-        env = minimal_command_environment(temp_path, config_home=agent.get("config_home") or "")
-        add_git_identity_fallback(env, checkout_path)
-        env.update(agent.get("env") or {})
-        if agent.get("codex_home"):
-            env["CODEX_HOME"] = agent["codex_home"]
-        env["AFK_JOB_CAPSULE"] = str(capsule_path)
-        env["AFK_AGENT_RESULT_PATH"] = agent["result_path"]
-        command = render_command(agent["command"], {PI_JOB_PROMPT_PLACEHOLDER: canonical_json(capsule)})
-        return execute_role_command(
-            command=command,
+        return execute_role_adapter(
+            agent,
             cwd=checkout_path,
-            env=env,
-            timeout_seconds=agent["timeout_seconds"],
+            env_root=temp_path,
+            env_vars={"AFK_JOB_CAPSULE": str(capsule_path), "AFK_AGENT_RESULT_PATH": agent["result_path"]},
+            replacements={PI_JOB_PROMPT_PLACEHOLDER: canonical_json(capsule)},
             runtime_failure_message="agent command failed",
             timeout_message="agent command timed out",
+            configure_env=lambda env: add_git_identity_fallback(env, checkout_path),
         )
 
 
