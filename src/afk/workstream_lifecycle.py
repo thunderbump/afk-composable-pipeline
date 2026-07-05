@@ -1233,16 +1233,11 @@ def stuck_same_finding_blocked_reason(state: dict[str, Any], findings: list[dict
     if not isinstance(previous_fingerprints, list) or not previous_fingerprints:
         return ""
     current_fingerprints = review_finding_fingerprints(findings)
-    previous_signatures = {
-        signature
-        for fingerprint in previous_fingerprints
-        for signature in review_finding_repeat_signatures(fingerprint)
-    }
     repeated = next(
         (
             fingerprint
             for fingerprint in current_fingerprints
-            if any(signature in previous_signatures for signature in review_finding_repeat_signatures(fingerprint))
+            if any(review_finding_repeats(previous, fingerprint) for previous in previous_fingerprints)
         ),
         None,
     )
@@ -1305,10 +1300,66 @@ def review_finding_repeat_signatures(fingerprint: dict[str, Any]) -> list[tuple[
     role = str(fingerprint.get("role") or "")
     file_path = str(fingerprint.get("file") or "")
     line = fingerprint.get("line") if isinstance(fingerprint.get("line"), int) else None
-    signatures = [("text", role, file_path, line, str(fingerprint.get("key") or ""))]
-    if file_path and line is not None:
-        signatures.append(("location", role, file_path, line, ""))
-    return signatures
+    return [("text", role, file_path, line, str(fingerprint.get("key") or ""))]
+
+
+def review_finding_repeats(previous: dict[str, Any], current: dict[str, Any]) -> bool:
+    if review_finding_fingerprint_signature(previous) == review_finding_fingerprint_signature(current):
+        return True
+    if not review_finding_roles_match(previous, current):
+        return False
+    if review_finding_locations_match(previous, current):
+        return location_repeat_with_text_overlap(previous, current)
+    return text_repeat_with_overlap(previous, current)
+
+
+def review_finding_roles_match(previous: dict[str, Any], current: dict[str, Any]) -> bool:
+    return str(previous.get("role") or "") == str(current.get("role") or "")
+
+
+def review_finding_locations_match(previous: dict[str, Any], current: dict[str, Any]) -> bool:
+    previous_file = str(previous.get("file") or "")
+    current_file = str(current.get("file") or "")
+    previous_line = previous.get("line") if isinstance(previous.get("line"), int) else None
+    current_line = current.get("line") if isinstance(current.get("line"), int) else None
+    return bool(previous_file and current_file and previous_line is not None and previous_file == current_file and previous_line == current_line)
+
+
+def location_repeat_with_text_overlap(previous: dict[str, Any], current: dict[str, Any]) -> bool:
+    previous_tokens = meaningful_review_finding_tokens(previous)
+    current_tokens = meaningful_review_finding_tokens(current)
+    if not previous_tokens or not current_tokens:
+        return True
+    return token_overlap_ratio(previous_tokens, current_tokens) >= 0.5
+
+
+def text_repeat_with_overlap(previous: dict[str, Any], current: dict[str, Any]) -> bool:
+    previous_tokens = meaningful_review_finding_tokens(previous)
+    current_tokens = meaningful_review_finding_tokens(current)
+    if not previous_tokens or not current_tokens:
+        return False
+    return token_overlap_ratio(previous_tokens, current_tokens) >= 0.5
+
+
+def meaningful_review_finding_tokens(fingerprint: dict[str, Any]) -> set[str]:
+    text = " ".join(
+        part
+        for part in (
+            str(fingerprint.get("required_fix") or ""),
+            str(fingerprint.get("summary") or ""),
+        )
+        if part
+    )
+    return {
+        token
+        for token in re.findall(r"[a-z0-9]+", text)
+        if len(token) > 2
+    }
+
+
+def token_overlap_ratio(previous_tokens: set[str], current_tokens: set[str]) -> float:
+    shared = previous_tokens & current_tokens
+    return len(shared) / min(len(previous_tokens), len(current_tokens))
 
 
 def normalize_review_finding_text(value: str) -> str:

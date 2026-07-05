@@ -8024,6 +8024,158 @@ Path({str(fake_calls)!r}).write_text("gh should not run\\n", encoding="utf-8")
             )
             self.assertIn("stuck_same_finding", result["publication"]["reason"])
 
+    def test_workstream_retry_policy_allows_same_location_different_issue_to_continue(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repo = temp_path / "repo-src"
+            checkout = temp_path / "checkout"
+            ledger = temp_path / "ledger"
+            init_repo(repo)
+            fake_git = temp_path / "publisher-git"
+            fake_gh = temp_path / "publisher-gh"
+            write_executable(fake_git, f"#!{sys.executable}\nraise SystemExit(9)\n")
+            write_executable(fake_gh, f"#!{sys.executable}\nraise SystemExit(9)\n")
+            agent_code = textwrap.dedent(
+                """
+                import json
+                import os
+                import subprocess
+                from pathlib import Path
+
+                capsule = json.loads(Path(os.environ["AFK_JOB_CAPSULE"]).read_text(encoding="utf-8"))
+                repair = capsule.get("repair_context")
+                if repair:
+                    Path(f"repair-{repair['attempt']}.txt").write_text("repair\\n", encoding="utf-8")
+                    subprocess.run(["git", "add", f"repair-{repair['attempt']}.txt"], check=True)
+                    subprocess.run(["git", "commit", "-m", f"repair attempt {repair['attempt']}"], check=True)
+                else:
+                    Path("implemented.txt").write_text("initial\\n", encoding="utf-8")
+                    subprocess.run(["git", "add", "implemented.txt"], check=True)
+                    subprocess.run(["git", "commit", "-m", "initial implementation"], check=True)
+                Path("agent-result.json").write_text(
+                    json.dumps({"status": "completed", "summary": "implementation complete"}),
+                    encoding="utf-8",
+                )
+                """
+            ).strip()
+            worker_code = textwrap.dedent(
+                """
+                import json
+                import os
+                from pathlib import Path
+
+                request = json.loads(Path(os.environ["AFK_WORKER_REQUEST"]).read_text(encoding="utf-8"))
+                Path(os.environ["AFK_WORKER_RESULT"]).write_text(
+                    json.dumps(
+                        {
+                            "profile": request["profile"],
+                            "status": "pass",
+                            "summary": "tests passed",
+                            "steps": [{"name": "unit", "status": "pass"}],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                """
+            ).strip()
+            reviewer_code = textwrap.dedent(
+                f"""
+                import json
+                import os
+                from pathlib import Path
+
+                checkout = Path(os.getcwd())
+                repair_count = len(list(checkout.glob("repair-*.txt")))
+                if repair_count == 0:
+                    payload = {{
+                        "status": "request_revision",
+                        "summary": "review requested changes",
+                        "findings": [
+                            {{
+                                "status": "request_revision",
+                                "severity": "high",
+                                "file": "src/demo.py",
+                                "line": 41,
+                                "required_fix": "Handle the empty review cycle before publishing.",
+                                "summary": "Tracker close path still misses the empty review cycle case.",
+                            }}
+                        ],
+                    }}
+                elif repair_count == 1:
+                    payload = {{
+                        "status": "request_revision",
+                        "summary": "review requested different changes",
+                        "findings": [
+                            {{
+                                "status": "request_revision",
+                                "severity": "high",
+                                "file": "src/demo.py",
+                                "line": 41,
+                                "required_fix": "Stop mutating tracker status after publish.",
+                                "summary": "Tracker publish path regresses status after publish.",
+                            }}
+                        ],
+                    }}
+                else:
+                    payload = {{"status": "pass", "summary": "review passed", "findings": []}}
+                Path(os.environ["AFK_REVIEWER_RESULT"]).write_text(json.dumps(payload), encoding="utf-8")
+                """
+            ).strip()
+            recipe = successful_recipe(temp_path, repo, checkout, fake_git, fake_gh)
+            recipe["publisher"] = {"enabled": False}
+            recipe["retry_policy"] = {"max_retries": 2}
+            recipe["review_feedback"] = {"enabled": True}
+            recipe["steps"][2]["input"]["agent"]["command"] = [sys.executable, "-c", agent_code]
+            recipe["steps"][3]["input"]["worker"]["command"] = [sys.executable, "-c", worker_code]
+            recipe["steps"][4]["input"]["role"] = "correctness"
+            recipe["steps"][4]["input"]["reviewer"]["command"] = [sys.executable, "-c", reviewer_code]
+
+            completed = run_afk(
+                "run-workstream",
+                "--workstream-id",
+                "central-lve.9",
+                "--input",
+                json.dumps(recipe),
+                "--ledger",
+                str(ledger),
+                env_overrides={
+                    "GIT_ALLOW_PROTOCOL": "file",
+                    "GIT_AUTHOR_NAME": "AFK Test",
+                    "GIT_AUTHOR_EMAIL": "afk-test@example.test",
+                    "GIT_COMMITTER_NAME": "AFK Test",
+                    "GIT_COMMITTER_EMAIL": "afk-test@example.test",
+                },
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            result = json.loads((ledger / summary["result_path"]).read_text(encoding="utf-8"))
+
+            self.assertEqual(summary["status"], "validated-unpublished")
+            self.assertEqual(result["status"], "validated-unpublished")
+            self.assertEqual(
+                [step["name"] for step in result["steps"]],
+                [
+                    "select-work",
+                    "prepare-checkout",
+                    "implement",
+                    "validate",
+                    "review",
+                    "prepare-checkout",
+                    "implement",
+                    "validate",
+                    "review",
+                    "prepare-checkout",
+                    "implement",
+                    "validate",
+                    "review",
+                ],
+            )
+            self.assertEqual(
+                result["repair_policy"],
+                {"mode": "legacy_retry", "hard_cap": 2, "source": "retry_policy"},
+            )
+
     def test_workstream_review_feedback_blocks_pipeline_only_request_revision_without_repair(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
