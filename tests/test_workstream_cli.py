@@ -7876,7 +7876,7 @@ Path({str(fake_calls)!r}).write_text("gh should not run\\n", encoding="utf-8")
             self.assertIn("review feedback retry budget exhausted", result["publication"]["reason"])
             self.assertIn("Handle the empty review cycle before publishing.", result["publication"]["reason"])
 
-    def test_workstream_retry_policy_blocks_rephrased_same_location_review_finding_as_stuck(self):
+    def test_workstream_retry_policy_blocks_same_issue_key_with_rephrased_text_as_stuck(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
             repo = temp_path / "repo-src"
@@ -7950,8 +7950,9 @@ Path({str(fake_calls)!r}).write_text("gh should not run\\n", encoding="utf-8")
                                 "severity": "high",
                                 "file": "src/demo.py",
                                 "line": 41,
-                                "required_fix": "Handle the empty review cycle before publishing.",
-                                "summary": "Tracker close path still misses the empty review cycle case.",
+                                "fingerprint": "correctness:empty-review-cycle",
+                                "required_fix": "Guard terminal publish when the cycle list is empty.",
+                                "summary": "Publisher leaves terminal review state dangling after the cycle list is empty.",
                             }}
                         ],
                     }}
@@ -7965,8 +7966,9 @@ Path({str(fake_calls)!r}).write_text("gh should not run\\n", encoding="utf-8")
                                 "severity": "high",
                                 "file": "src/demo.py",
                                 "line": 41,
-                                "required_fix": "Cover the empty review cycle before publishing.",
-                                "summary": "Tracker close path still leaves the empty review cycle path uncovered.",
+                                "fingerprint": "correctness:empty-review-cycle",
+                                "required_fix": "Add the missing empty-cycle publish guard.",
+                                "summary": "Empty-cycle publish still breaks terminal state handling in the tracker path.",
                             }}
                         ],
                     }}
@@ -8024,7 +8026,7 @@ Path({str(fake_calls)!r}).write_text("gh should not run\\n", encoding="utf-8")
             )
             self.assertIn("stuck_same_finding", result["publication"]["reason"])
 
-    def test_workstream_retry_policy_allows_same_location_different_issue_to_continue(self):
+    def test_workstream_retry_policy_allows_same_location_different_issue_keys_to_continue(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
             repo = temp_path / "repo-src"
@@ -8096,8 +8098,9 @@ Path({str(fake_calls)!r}).write_text("gh should not run\\n", encoding="utf-8")
                                 "severity": "high",
                                 "file": "src/demo.py",
                                 "line": 41,
-                                "required_fix": "Handle the empty review cycle before publishing.",
-                                "summary": "Tracker close path still misses the empty review cycle case.",
+                                "fingerprint": "correctness:empty-review-cycle",
+                                "required_fix": "Guard terminal publish when the cycle list is empty.",
+                                "summary": "Publisher leaves terminal review state dangling after the cycle list is empty.",
                             }}
                         ],
                     }}
@@ -8111,8 +8114,9 @@ Path({str(fake_calls)!r}).write_text("gh should not run\\n", encoding="utf-8")
                                 "severity": "high",
                                 "file": "src/demo.py",
                                 "line": 41,
-                                "required_fix": "Stop mutating tracker status after publish.",
-                                "summary": "Tracker publish path regresses status after publish.",
+                                "fingerprint": "correctness:mutated-status-after-publish",
+                                "required_fix": "Preserve tracker status after publish.",
+                                "summary": "Tracker status mutates after publish on the same branch path.",
                             }}
                         ],
                     }}

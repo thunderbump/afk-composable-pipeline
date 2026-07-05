@@ -518,6 +518,7 @@ def review_feedback_repairable_findings(review: dict[str, Any]) -> list[dict[str
                 "severity": review_finding_severity(finding),
                 "file": review_finding_file(finding),
                 "line": review_finding_line(finding),
+                "stable_key": review_finding_stable_key(finding),
                 "required_fix": review_finding_required_fix(finding),
                 "summary": string_field(finding, "summary") or string_field(finding, "title") or "",
             }
@@ -1264,6 +1265,7 @@ def review_finding_fingerprints(findings: list[dict[str, Any]]) -> list[dict[str
                 "role": normalize_review_finding_text(string_field(finding, "role") or ""),
                 "file": normalize_review_finding_text(string_field(finding, "file") or ""),
                 "line": review_finding_line(finding),
+                "stable_key": normalize_review_finding_text(review_finding_stable_key(finding)),
                 "required_fix": normalize_review_finding_text(string_field(finding, "required_fix") or ""),
                 "summary": normalize_review_finding_text(string_field(finding, "summary") or ""),
                 "key": normalize_review_finding_text(
@@ -1278,6 +1280,7 @@ def review_finding_fingerprints(findings: list[dict[str, Any]]) -> list[dict[str
             fingerprint["role"],
             fingerprint["file"],
             fingerprint["line"],
+            fingerprint["stable_key"],
             fingerprint["key"],
         )
         if signature in seen:
@@ -1287,11 +1290,12 @@ def review_finding_fingerprints(findings: list[dict[str, Any]]) -> list[dict[str
     return unique
 
 
-def review_finding_fingerprint_signature(fingerprint: dict[str, Any]) -> tuple[str, str, int | None, str]:
+def review_finding_fingerprint_signature(fingerprint: dict[str, Any]) -> tuple[str, str, int | None, str, str]:
     return (
         str(fingerprint.get("role") or ""),
         str(fingerprint.get("file") or ""),
         fingerprint.get("line") if isinstance(fingerprint.get("line"), int) else None,
+        str(fingerprint.get("stable_key") or ""),
         str(fingerprint.get("key") or ""),
     )
 
@@ -1306,11 +1310,13 @@ def review_finding_repeat_signatures(fingerprint: dict[str, Any]) -> list[tuple[
 def review_finding_repeats(previous: dict[str, Any], current: dict[str, Any]) -> bool:
     if review_finding_fingerprint_signature(previous) == review_finding_fingerprint_signature(current):
         return True
+    previous_stable_key = str(previous.get("stable_key") or "")
+    current_stable_key = str(current.get("stable_key") or "")
+    if previous_stable_key and current_stable_key:
+        return previous_stable_key == current_stable_key
     if not review_finding_roles_match(previous, current):
         return False
-    if review_finding_locations_match(previous, current):
-        return location_repeat_with_text_overlap(previous, current)
-    return text_repeat_with_overlap(previous, current)
+    return review_finding_legacy_repeat(previous, current)
 
 
 def review_finding_roles_match(previous: dict[str, Any], current: dict[str, Any]) -> bool:
@@ -1325,12 +1331,14 @@ def review_finding_locations_match(previous: dict[str, Any], current: dict[str, 
     return bool(previous_file and current_file and previous_line is not None and previous_file == current_file and previous_line == current_line)
 
 
-def location_repeat_with_text_overlap(previous: dict[str, Any], current: dict[str, Any]) -> bool:
-    previous_tokens = meaningful_review_finding_tokens(previous)
-    current_tokens = meaningful_review_finding_tokens(current)
-    if not previous_tokens or not current_tokens:
-        return True
-    return token_overlap_ratio(previous_tokens, current_tokens) >= 0.5
+def review_finding_legacy_repeat(previous: dict[str, Any], current: dict[str, Any]) -> bool:
+    if review_finding_locations_match(previous, current):
+        return review_finding_text_key(previous) == review_finding_text_key(current)
+    return text_repeat_with_overlap(previous, current)
+
+
+def review_finding_text_key(fingerprint: dict[str, Any]) -> str:
+    return str(fingerprint.get("key") or "")
 
 
 def text_repeat_with_overlap(previous: dict[str, Any], current: dict[str, Any]) -> bool:
@@ -1360,6 +1368,15 @@ def meaningful_review_finding_tokens(fingerprint: dict[str, Any]) -> set[str]:
 def token_overlap_ratio(previous_tokens: set[str], current_tokens: set[str]) -> float:
     shared = previous_tokens & current_tokens
     return len(shared) / min(len(previous_tokens), len(current_tokens))
+
+
+def review_finding_stable_key(finding: dict[str, Any]) -> str:
+    return (
+        string_field(finding, "issue_key")
+        or string_field(finding, "fingerprint")
+        or string_field(finding, "stable_key")
+        or ""
+    )
 
 
 def normalize_review_finding_text(value: str) -> str:

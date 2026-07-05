@@ -25,6 +25,7 @@ from afk.workstream import (  # noqa: E402
 from afk.workstream_lifecycle import (  # noqa: E402
     LifecycleHooks,
     run_lifecycle,
+    stuck_same_finding_blocked_reason,
     terminal_selected_work_status,
     workstream_status_from_publication,
 )
@@ -971,7 +972,7 @@ class WorkstreamLifecycleTest(unittest.TestCase):
             ["select-work", "prepare-checkout", "implement", "validate", "review", "prepare-checkout", "implement", "validate", "review"],
         )
 
-    def test_run_lifecycle_blocks_when_rephrased_same_location_review_finding_survives_repair(self):
+    def test_run_lifecycle_blocks_when_same_issue_key_survives_repair_with_rephrased_text(self):
         recipe = normalize_recipe(
             {
                 "workstream_id": "central-wfc9",
@@ -997,8 +998,9 @@ class WorkstreamLifecycleTest(unittest.TestCase):
             "role": "correctness",
             "file": "src/demo.py",
             "line": 41,
-            "summary": "Tracker close path still misses the empty review cycle case.",
-            "required_fix": "Handle the empty review cycle before publishing.",
+            "fingerprint": "correctness:empty-review-cycle",
+            "summary": "Publisher leaves terminal review state dangling after the cycle list is empty.",
+            "required_fix": "Guard terminal publish when the cycle list is empty.",
         }
         rephrased_finding = {
             "status": "request_revision",
@@ -1006,8 +1008,9 @@ class WorkstreamLifecycleTest(unittest.TestCase):
             "role": "correctness",
             "file": "src/demo.py",
             "line": 41,
-            "summary": "Tracker close path still leaves the empty review cycle path uncovered.",
-            "required_fix": "Cover the empty review cycle before publishing.",
+            "fingerprint": "correctness:empty-review-cycle",
+            "summary": "Empty-cycle publish still breaks terminal state handling in the tracker path.",
+            "required_fix": "Add the missing empty-cycle publish guard.",
         }
         runs = iter(
             [
@@ -1143,6 +1146,38 @@ class WorkstreamLifecycleTest(unittest.TestCase):
             [step["name"] for step in outcome.steps],
             ["select-work", "prepare-checkout", "implement", "validate", "review", "prepare-checkout", "implement", "validate", "review"],
         )
+
+    def test_stuck_same_finding_ignores_same_location_different_issue_keys(self):
+        state = {
+            "repair_history": [
+                {
+                    "trigger": "review_feedback",
+                    "review_fingerprints": [
+                        {
+                            "role": "correctness",
+                            "file": "src/demo.py",
+                            "line": 41,
+                            "stable_key": "correctness:empty-review-cycle",
+                            "required_fix": "guard terminal publish when the cycle list is empty",
+                            "summary": "publisher leaves terminal review state dangling after the cycle list is empty",
+                            "key": "guard terminal publish when the cycle list is empty",
+                        }
+                    ],
+                }
+            ]
+        }
+        findings = [
+            {
+                "role": "correctness",
+                "file": "src/demo.py",
+                "line": 41,
+                "stable_key": "correctness:mutated-status-after-publish",
+                "required_fix": "preserve tracker status after publish",
+                "summary": "tracker status mutates after publish on the same branch path",
+            }
+        ]
+
+        self.assertEqual(stuck_same_finding_blocked_reason(state, findings), "")
 
     def test_run_lifecycle_blocks_when_repair_has_no_delta(self):
         recipe = normalize_recipe(
