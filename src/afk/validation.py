@@ -1,5 +1,4 @@
 from __future__ import annotations
-
 import codecs
 import os
 import re
@@ -20,6 +19,7 @@ from afk.role_adapters import (
     read_json_result_file,
 )
 from afk.roles import execute_role_adapter, log_role_adapter_result, log_role_runtime_error
+from afk.schema_helpers import is_string_list, normalize_prepared_checkout, string_field
 
 
 SCHEMA_VERSION = 1
@@ -227,31 +227,7 @@ def invalid_request(message: str) -> dict[str, Any]:
 
 
 def normalize_checkout(checkout: Any) -> dict[str, Any]:
-    if not isinstance(checkout, dict):
-        return {"status": "invalid", "message": "checkout must be an object"}
-    if checkout.get("status") != "prepared":
-        return {"status": "invalid", "message": "checkout.status must be prepared"}
-    path = string_field(checkout, "checkout_path")
-    start_commit = string_field(checkout, "start_commit")
-    if not path:
-        return {"status": "invalid", "message": "checkout.checkout_path is required"}
-    if not start_commit:
-        return {"status": "invalid", "message": "checkout.start_commit is required"}
-    checkout_path = Path(path)
-    if not checkout_path.is_absolute():
-        return {"status": "invalid", "message": "checkout.checkout_path must be absolute"}
-    if not (checkout_path / ".git").is_dir():
-        return {"status": "invalid", "message": "checkout.checkout_path must be a git checkout"}
-    return {
-        "status": "valid",
-        "checkout": {
-            "path": str(checkout_path),
-            "repo_url": redact_url(string_field(checkout, "repo_url") or ""),
-            "review_branch": string_field(checkout, "review_branch") or "",
-            "requested_ref": string_field(checkout, "requested_ref") or "",
-            "start_commit": start_commit,
-        },
-    }
+    return normalize_prepared_checkout(checkout, include_repo_url=True, redact_repo_url=redact_url)
 
 
 def normalize_validation(
@@ -1771,14 +1747,3 @@ def command_secret_error_message(command: list[str]) -> str | None:
             flag = part.strip().split("=", 1)[0].lower()
             return f"worker.command must not include credential flag {flag}"
     return None
-
-
-def string_field(value: dict[str, Any], key: str) -> str | None:
-    item = value.get(key)
-    if isinstance(item, str) and item.strip():
-        return item.strip()
-    return None
-
-
-def is_string_list(value: Any) -> bool:
-    return isinstance(value, list) and all(isinstance(item, str) for item in value)

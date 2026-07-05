@@ -1,22 +1,19 @@
 from __future__ import annotations
-
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
 from afk.publication import PublisherError
+from afk.review_cycles import review_cycle_response_is_addressed, review_cycle_status_requires_response
 from afk.redaction import redact_artifact_value, redact_text
+from afk.schema_helpers import first_selected_work_external_id
 from afk.workstream_lifecycle import (
     TERMINAL_REVIEW_FEEDBACK_STATUSES,
     has_current_validated_evidence,
     implemented_after_commit,
-    review_cycle_response_is_addressed,
     review_passed,
     string_field,
 )
-
-
-REVIEW_CYCLE_OPEN_STATUSES = {"findings-open", "request-changes"}
 
 
 @dataclass(frozen=True)
@@ -436,13 +433,7 @@ def tracker_review_findings(review: dict[str, Any]) -> list[Any]:
 
 
 def current_selected_work_external_id(state: dict[str, Any]) -> str:
-    selected_work = state.get("selected_work")
-    if not isinstance(selected_work, list) or not selected_work:
-        return ""
-    first_item = selected_work[0]
-    if not isinstance(first_item, dict):
-        return ""
-    return string_field(first_item, "external_id") or ""
+    return first_selected_work_external_id(state.get("selected_work"))
 
 
 def redact_review_cycles(review_cycles: Any) -> list[Any]:
@@ -527,7 +518,3 @@ def review_cycles_require_response(review_cycles: Any) -> bool:
                 if not response_is_addressed:
                     return True
     return False
-
-
-def review_cycle_status_requires_response(status: str) -> bool:
-    return status in REVIEW_CYCLE_OPEN_STATUSES

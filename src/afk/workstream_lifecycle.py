@@ -9,12 +9,17 @@ from typing import Any, Callable
 from afk import evidence_gate
 from afk.contracts import ProjectContract
 from afk.implement import safe_git_metadata
+from afk.review_cycles import (
+    aggregate_runtime_review_cycle_status,
+    finalized_runtime_review_cycle_status,
+    review_cycle_response_is_addressed,
+    runtime_review_cycle_status,
+)
 from afk.redaction import redact_text
 from afk.registry import StepResult
 
 
 SCHEMA_VERSION = 1
-REVIEW_CYCLE_RESPONSE_STATUSES = {"addressed", "findings-addressed"}
 TERMINAL_REVIEW_FEEDBACK_STATUSES = {"resolved", "waived"}
 REVIEW_PASS_ROLES = ("correctness", "bug-risk")
 
@@ -472,48 +477,6 @@ def finalize_latest_runtime_review_cycle(state: dict[str, Any]) -> None:
         latest_cycle["status"] = finalized_runtime_review_cycle_status(reviews)
 
 
-def runtime_review_cycle_status(review_status: str) -> str:
-    if review_status == "request_revision":
-        return "request-changes"
-    if review_status == "passed":
-        return "passed"
-    return "findings-open"
-
-
-def finalized_runtime_review_cycle_status(reviews: list[dict[str, Any]]) -> str:
-    saw_addressed_request_changes = False
-    saw_reviews = False
-    saw_only_passed = True
-    for review in reviews:
-        if not isinstance(review, dict):
-            continue
-        saw_reviews = True
-        status = string_field(review, "status") or ""
-        if status == "findings-open":
-            return "findings-open"
-        if status == "request-changes":
-            if review_cycle_response_is_addressed(review.get("response")):
-                saw_addressed_request_changes = True
-                saw_only_passed = False
-                continue
-            return "request-changes"
-        if status != "passed":
-            return "findings-open"
-    if saw_only_passed and saw_reviews:
-        return "passed"
-    if saw_addressed_request_changes:
-        return "findings-addressed"
-    return "findings-open"
-
-
-def review_cycle_response_is_addressed(response: Any) -> bool:
-    if isinstance(response, str):
-        return bool(response.strip())
-    if not isinstance(response, dict):
-        return False
-    return (string_field(response, "status") or "") in REVIEW_CYCLE_RESPONSE_STATUSES
-
-
 def review_feedback_role(step_spec: dict[str, Any], review: dict[str, Any]) -> str:
     input_data = step_spec.get("input") if isinstance(step_spec.get("input"), dict) else {}
     return string_field(input_data, "role") or string_field(review, "role") or "reviewer"
@@ -651,15 +614,6 @@ def build_runtime_review_record(role: str, review: dict[str, Any], result_path: 
     if pipeline_follow_up:
         review_record["pipeline_follow_up"] = pipeline_follow_up
     return review_record
-
-
-def aggregate_runtime_review_cycle_status(reviews: list[dict[str, Any]]) -> str:
-    statuses = [string_field(review, "status") or "" for review in reviews if isinstance(review, dict)]
-    if any(status == "request-changes" for status in statuses):
-        return "request-changes"
-    if all(status == "passed" for status in statuses) and statuses:
-        return "passed"
-    return "findings-open"
 
 
 def aggregate_review_output(pass_outputs: list[dict[str, Any]], cycle: dict[str, Any]) -> dict[str, Any]:

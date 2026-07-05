@@ -1,5 +1,4 @@
 from __future__ import annotations
-
 import json
 import os
 import re
@@ -25,6 +24,14 @@ from afk.role_adapters import (
     read_json_result_file,
 )
 from afk.roles import execute_role_adapter, log_role_adapter_result, log_role_runtime_error
+from afk.schema_helpers import (
+    build_selected_work_record,
+    is_string_list,
+    normalize_prepared_checkout,
+    relation_list,
+    string_field,
+    string_list_field,
+)
 
 
 SCHEMA_VERSION = 1
@@ -301,22 +308,17 @@ def selected_work_item(work_selection: Any, work_index: Any) -> dict[str, Any]:
         return {"status": "invalid", "message": "selected work item dependencies must be a list"}
     if blockers is None:
         return {"status": "invalid", "message": "selected work item blockers must be a list"}
-    normalized = {
-        "source_id": source_id,
-        "source_type": source_type,
-        "external_id": external_id,
-        "url": string_field(work_item, "url") or "",
-        "title": title or "",
-        "status": string_field(work_item, "status") or "",
-        "labels": labels,
-        "parent": work_item.get("parent"),
-        "workstream": work_item.get("workstream"),
-        "acceptance_criteria": acceptance_criteria,
-        "dependencies": dependencies,
-        "blockers": blockers,
-        "dependency_status": string_field(work_item, "dependency_status") or "",
-        "afk": dict(work_item.get("afk") or {}) if isinstance(work_item.get("afk") or {}, dict) else {},
-    }
+    normalized = build_selected_work_record(
+        work_item,
+        external_id=external_id,
+        source_id=source_id,
+        source_type=source_type,
+        labels=labels,
+        acceptance_criteria=acceptance_criteria,
+        dependencies=dependencies,
+        blockers=blockers,
+    )
+    normalized["title"] = title or ""
     redacted = redact_artifact_value(normalized)
     return {"status": "valid", "work_item": redacted, "selected_work": [redacted]}
 
@@ -370,28 +372,7 @@ def combined_selected_work_item(selected_work: list[dict[str, Any]]) -> dict[str
 
 
 def normalize_checkout(checkout: Any) -> dict[str, Any]:
-    if not isinstance(checkout, dict):
-        return {"status": "invalid", "message": "checkout must be an object"}
-    if checkout.get("status") != "prepared":
-        return {"status": "invalid", "message": "checkout.status must be prepared"}
-    path = string_field(checkout, "checkout_path")
-    start_commit = string_field(checkout, "start_commit")
-    if not path:
-        return {"status": "invalid", "message": "checkout.checkout_path is required"}
-    if not start_commit:
-        return {"status": "invalid", "message": "checkout.start_commit is required"}
-    checkout_path = Path(path)
-    if not checkout_path.is_absolute():
-        return {"status": "invalid", "message": "checkout.checkout_path must be absolute"}
-    if not (checkout_path / ".git").is_dir():
-        return {"status": "invalid", "message": "checkout.checkout_path must be a git checkout"}
-    normalized = {
-        "path": str(checkout_path),
-        "review_branch": string_field(checkout, "review_branch") or "",
-        "requested_ref": string_field(checkout, "requested_ref") or "",
-        "start_commit": start_commit,
-    }
-    return {"status": "valid", "checkout": normalized}
+    return normalize_prepared_checkout(checkout)
 
 
 def normalize_validation(validation: Any, project_contract: Any, *, checkout_path: Path) -> dict[str, Any]:
@@ -1321,27 +1302,3 @@ def agent_command_secret_error(command: list[str]) -> str | None:
             flag = part.strip().split("=", 1)[0].lower()
             return f"agent.command must not include credential flag {flag}"
     return None
-
-
-def relation_list(value: Any) -> list[Any] | None:
-    if not isinstance(value, list):
-        return None
-    return [redact_artifact_value(item) for item in value]
-
-
-def string_list_field(value: dict[str, Any], key: str) -> list[str] | None:
-    items = value.get(key, [])
-    if not is_string_list(items):
-        return None
-    return list(items)
-
-
-def string_field(value: dict[str, Any], key: str) -> str | None:
-    item = value.get(key)
-    if isinstance(item, str) and item.strip():
-        return item.strip()
-    return None
-
-
-def is_string_list(value: Any) -> bool:
-    return isinstance(value, list) and all(isinstance(item, str) for item in value)

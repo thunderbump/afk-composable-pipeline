@@ -1,5 +1,4 @@
 from __future__ import annotations
-
 import json
 import os
 import subprocess
@@ -16,6 +15,14 @@ from afk.role_adapters import (
     read_json_result_file,
 )
 from afk.roles import execute_role_adapter, log_role_adapter_result, log_role_runtime_error
+from afk.schema_helpers import (
+    build_selected_work_record,
+    is_string_list,
+    normalize_prepared_checkout,
+    string_field,
+    string_list_field,
+    validation_artifact_ref,
+)
 
 
 SCHEMA_VERSION = 1
@@ -198,26 +205,20 @@ def normalize_work_item(work_item: Any) -> dict[str, Any]:
         return {"status": "invalid", "message": "work_item.labels must be a list of strings"}
     if acceptance_criteria is None:
         return {"status": "invalid", "message": "work_item.acceptance_criteria must be a list of strings"}
-    normalized = {
-        "source_id": source_id,
-        "source_type": source_type,
-        "external_id": external_id,
-        "url": string_field(work_item, "url") or "",
-        "title": string_field(work_item, "title") or "",
-        "status": string_field(work_item, "status") or "",
-        "labels": labels,
-        "parent": work_item.get("parent"),
-        "workstream": work_item.get("workstream"),
-        "acceptance_criteria": acceptance_criteria,
-        "dependencies": (
+    normalized = build_selected_work_record(
+        work_item,
+        external_id=external_id,
+        source_id=source_id,
+        source_type=source_type,
+        labels=labels,
+        acceptance_criteria=acceptance_criteria,
+        dependencies=(
             list(work_item.get("dependencies", []))
             if isinstance(work_item.get("dependencies", []), list)
             else []
         ),
-        "blockers": list(work_item.get("blockers", [])) if isinstance(work_item.get("blockers", []), list) else [],
-        "dependency_status": string_field(work_item, "dependency_status") or "",
-        "afk": dict(work_item.get("afk") or {}) if isinstance(work_item.get("afk") or {}, dict) else {},
-    }
+        blockers=list(work_item.get("blockers", [])) if isinstance(work_item.get("blockers", []), list) else [],
+    )
     return {"status": "valid", "work_item": redact_artifact_value(normalized)}
 
 
@@ -248,30 +249,7 @@ def normalize_work_selection(work_selection: Any, fallback_work_item: dict[str, 
 
 
 def normalize_checkout(checkout: Any) -> dict[str, Any]:
-    if not isinstance(checkout, dict):
-        return {"status": "invalid", "message": "checkout must be an object"}
-    if checkout.get("status") != "prepared":
-        return {"status": "invalid", "message": "checkout.status must be prepared"}
-    path = string_field(checkout, "checkout_path")
-    start_commit = string_field(checkout, "start_commit")
-    if not path:
-        return {"status": "invalid", "message": "checkout.checkout_path is required"}
-    if not start_commit:
-        return {"status": "invalid", "message": "checkout.start_commit is required"}
-    checkout_path = Path(path)
-    if not checkout_path.is_absolute():
-        return {"status": "invalid", "message": "checkout.checkout_path must be absolute"}
-    if not (checkout_path / ".git").is_dir():
-        return {"status": "invalid", "message": "checkout.checkout_path must be a git checkout"}
-    return {
-        "status": "valid",
-        "checkout": {
-            "path": str(checkout_path),
-            "review_branch": string_field(checkout, "review_branch") or "",
-            "requested_ref": string_field(checkout, "requested_ref") or "",
-            "start_commit": start_commit,
-        },
-    }
+    return normalize_prepared_checkout(checkout)
 
 
 def normalize_implementation(implementation: Any, checkout_path: Path) -> dict[str, Any]:
@@ -384,25 +362,27 @@ def normalize_validation(validation: Any) -> dict[str, Any]:
                     worker_result_path=worker_result_path,
                 )
             )
-        normalized.append(
-            redact_artifact_value(
-                {
-                    "name": name,
-                    "step_result_path": step_result_path or "",
-                    "worker_result_path": worker_result_path or "",
-                    "evidence_status": "invalid" if evidence_errors else "valid",
-                    "evidence_errors": evidence_errors,
-                    "status": string_field(output, "status") or "missing",
-                    "classification": string_field(output, "classification") or "",
-                    "summary": string_field(output, "summary") or "",
-                    "worker_status": worker_normalized["status"],
-                    "worker_classification": worker_normalized["classification"],
-                    "worker_summary": worker_normalized["summary"],
-                    "step_result": step_result,
-                    "worker_result": worker_result,
-                }
-            )
+        normalized_artifact = validation_artifact_ref(
+            index=index,
+            name=name,
+            step_result_path=step_result_path,
+            worker_result_path=worker_result_path,
         )
+        normalized_artifact.update(
+            {
+                "evidence_status": "invalid" if evidence_errors else "valid",
+                "evidence_errors": evidence_errors,
+                "status": string_field(output, "status") or "missing",
+                "classification": string_field(output, "classification") or "",
+                "summary": string_field(output, "summary") or "",
+                "worker_status": worker_normalized["status"],
+                "worker_classification": worker_normalized["classification"],
+                "worker_summary": worker_normalized["summary"],
+                "step_result": step_result,
+                "worker_result": worker_result,
+            }
+        )
+        normalized.append(redact_artifact_value(normalized_artifact))
     return {"status": "valid", "validation": {"required": normalized}}
 
 
@@ -1025,21 +1005,3 @@ def command_secret_error_message(command: list[str]) -> str | None:
             flag = part.strip().split("=", 1)[0].lower()
             return f"reviewer.command must not include credential flag {flag}"
     return None
-
-
-def string_list_field(value: dict[str, Any], key: str) -> list[str] | None:
-    items = value.get(key, [])
-    if not is_string_list(items):
-        return None
-    return list(items)
-
-
-def string_field(value: dict[str, Any], key: str) -> str | None:
-    item = value.get(key)
-    if isinstance(item, str) and item.strip():
-        return item.strip()
-    return None
-
-
-def is_string_list(value: Any) -> bool:
-    return isinstance(value, list) and all(isinstance(item, str) for item in value)

@@ -9,6 +9,7 @@ from urllib.parse import urlsplit
 
 from afk.contracts import ProjectContract
 from afk.recipes import RUNNABLE_REQUIRED_METADATA, generate_workstream_recipe
+from afk.schema_helpers import scrub_selected_work_value as scrub_selected_work_fields
 from afk.selection import deterministic_candidate
 from afk.work_sources import select_work
 
@@ -286,7 +287,8 @@ def annotate_selection_result(selection_result: dict[str, Any]) -> dict[str, Any
 def selected_work_snapshot(chosen: dict[str, Any] | None) -> dict[str, Any] | None:
     if chosen is None:
         return None
-    return {key: value for key, value in chosen.items() if not key.startswith("selector_")}
+    scrubbed = scrub_selected_work_fields(chosen)
+    return scrubbed if isinstance(scrubbed, dict) else None
 
 
 def scrub_selected_work_containers(value: Any) -> Any:
@@ -301,11 +303,7 @@ def scrub_selected_work_containers(value: Any) -> Any:
 
 
 def scrub_selected_work_value(value: Any) -> Any:
-    if isinstance(value, list):
-        return [scrub_selected_work_value(item) for item in value]
-    if isinstance(value, dict):
-        return {key: item for key, item in value.items() if not key.startswith("selector_")}
-    return value
+    return scrub_selected_work_fields(value)
 
 
 def normalize_workstream_result(result: Any, *, ledger_dir: Path | None = None) -> dict[str, Any] | None:
