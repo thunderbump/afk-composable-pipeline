@@ -13,13 +13,9 @@ from afk.pi_workers import non_openai_pi_mount_error, openai_codex_pi_mount_erro
 from afk.redaction import is_secret_command_flag, redact_artifact_value, redact_text
 from afk.role_adapters import (
     RoleAdapterRuntimeError,
-    execute_role_command,
-    minimal_command_environment,
     read_json_result_file,
-    redact_adapter_streams,
-    render_command,
-    write_adapter_logs,
 )
+from afk.roles import execute_role_adapter, log_role_adapter_result, log_role_runtime_error
 
 
 SCHEMA_VERSION = 1
@@ -80,9 +76,7 @@ def review(input_data: Any, *, run_id: str, run_dir: Path | None) -> dict[str, A
             request_path=run_dir / "reviewer-request.json",
         )
     except ReviewerRuntimeError as exc:
-        stdout = redact_text(exc.stdout)
-        stderr = redact_text(exc.stderr or exc.message)
-        write_adapter_logs(stdout, stderr)
+        stdout, stderr = log_role_runtime_error(exc)
         normalized = normalized_reviewer_result(
             status="failed_runtime",
             classification="runtime_failure",
@@ -95,11 +89,7 @@ def review(input_data: Any, *, run_id: str, run_dir: Path | None) -> dict[str, A
         write_review_artifacts(run_dir, run_id, normalized)
         return review_output(request, evidence_pack, normalized)
 
-    stdout, stderr = redact_adapter_streams(
-        stdout=adapter_result["stdout"],
-        stderr=adapter_result["stderr"],
-    )
-    write_adapter_logs(stdout, stderr)
+    stdout, stderr = log_role_adapter_result(adapter_result)
 
     if raw_payload["status"] != "valid":
         normalized = normalized_reviewer_result(
@@ -770,25 +760,19 @@ def run_fake_reviewer_command(
     with tempfile.TemporaryDirectory() as temp_dir:
         temp_path = Path(temp_dir)
         result_path = temp_path / "reviewer-result.json"
-        env = minimal_command_environment(temp_path, config_home=reviewer.get("config_home") or "")
-        env.update(reviewer.get("env") or {})
-        if reviewer.get("codex_home"):
-            env["CODEX_HOME"] = reviewer["codex_home"]
-        env["AFK_REVIEWER_REQUEST"] = str(request_path)
-        env["AFK_REVIEWER_RESULT"] = str(result_path)
-        command = render_command(
-            reviewer["command"],
-            {
+        adapter_result = execute_role_adapter(
+            reviewer,
+            cwd=checkout_path,
+            env_root=temp_path,
+            env_vars={
+                "AFK_REVIEWER_REQUEST": str(request_path),
+                "AFK_REVIEWER_RESULT": str(result_path),
+            },
+            replacements={
                 "{prompt}": canonical_json(reviewer_request),
                 "{request_path}": str(request_path),
                 "{result_path}": str(result_path),
             },
-        )
-        adapter_result = execute_role_command(
-            command=command,
-            cwd=checkout_path,
-            env=env,
-            timeout_seconds=reviewer["timeout_seconds"],
             runtime_failure_message="reviewer command failed",
             timeout_message="reviewer command timed out",
         )
