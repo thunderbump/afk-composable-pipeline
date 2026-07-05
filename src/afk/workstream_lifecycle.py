@@ -1233,12 +1233,16 @@ def stuck_same_finding_blocked_reason(state: dict[str, Any], findings: list[dict
     if not isinstance(previous_fingerprints, list) or not previous_fingerprints:
         return ""
     current_fingerprints = review_finding_fingerprints(findings)
-    previous_signatures = {review_finding_fingerprint_signature(fingerprint) for fingerprint in previous_fingerprints}
+    previous_signatures = {
+        signature
+        for fingerprint in previous_fingerprints
+        for signature in review_finding_repeat_signatures(fingerprint)
+    }
     repeated = next(
         (
             fingerprint
             for fingerprint in current_fingerprints
-            if review_finding_fingerprint_signature(fingerprint) in previous_signatures
+            if any(signature in previous_signatures for signature in review_finding_repeat_signatures(fingerprint))
         ),
         None,
     )
@@ -1295,6 +1299,16 @@ def review_finding_fingerprint_signature(fingerprint: dict[str, Any]) -> tuple[s
         fingerprint.get("line") if isinstance(fingerprint.get("line"), int) else None,
         str(fingerprint.get("key") or ""),
     )
+
+
+def review_finding_repeat_signatures(fingerprint: dict[str, Any]) -> list[tuple[str, str, str, int | None, str]]:
+    role = str(fingerprint.get("role") or "")
+    file_path = str(fingerprint.get("file") or "")
+    line = fingerprint.get("line") if isinstance(fingerprint.get("line"), int) else None
+    signatures = [("text", role, file_path, line, str(fingerprint.get("key") or ""))]
+    if file_path and line is not None:
+        signatures.append(("location", role, file_path, line, ""))
+    return signatures
 
 
 def normalize_review_finding_text(value: str) -> str:
