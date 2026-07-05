@@ -80,6 +80,19 @@ class WorkstreamResult:
 StepRunner = Callable[[str, Any, Path, ProjectContract | None], StepResult]
 
 
+@dataclass(frozen=True)
+class PipelinePlan:
+    normalized: dict[str, Any]
+    run_id: str
+
+
+@dataclass(frozen=True)
+class PipelineOutcome:
+    state: dict[str, Any]
+    steps: list[dict[str, Any]]
+    publication: dict[str, Any]
+
+
 class WorkstreamError(ValueError):
     pass
 
@@ -144,6 +157,41 @@ class _RetrospectiveFollowUpError(RuntimeError):
         self.timed_out = timed_out
 
 
+class PipelineEngine:
+    def run(
+        self,
+        plan: PipelinePlan,
+        *,
+        ledger_dir: Path,
+        ledger: Any,
+        step_runner: StepRunner,
+        project_contract: ProjectContract | None = None,
+    ) -> PipelineOutcome:
+        lifecycle = run_lifecycle(
+            normalized=plan.normalized,
+            run_id=plan.run_id,
+            ledger_dir=ledger_dir,
+            ledger=ledger,
+            step_runner=step_runner,
+            project_contract=project_contract,
+            hooks=LifecycleHooks(
+                composed_step_input=composed_step_input,
+                equivalent_run_step_command=equivalent_run_step_command,
+                step_execution_record=step_execution_record,
+                update_state_from_step=update_state_from_step,
+                publish_terminal_pr=publish_terminal_pr,
+            ),
+        )
+        return PipelineOutcome(
+            state=lifecycle.state,
+            steps=lifecycle.steps,
+            publication=lifecycle.publication,
+        )
+
+
+PIPELINE_ENGINE = PipelineEngine()
+
+
 def run_workstream(
     recipe: Any,
     *,
@@ -178,20 +226,12 @@ def run_workstream(
         },
     )
 
-    lifecycle = run_lifecycle(
-        normalized=normalized,
-        run_id=run_id,
+    lifecycle = PIPELINE_ENGINE.run(
+        PipelinePlan(normalized=normalized, run_id=run_id),
         ledger_dir=ledger_dir,
         ledger=ledger,
         step_runner=step_runner,
         project_contract=project_contract,
-        hooks=LifecycleHooks(
-            composed_step_input=composed_step_input,
-            equivalent_run_step_command=equivalent_run_step_command,
-            step_execution_record=step_execution_record,
-            update_state_from_step=update_state_from_step,
-            publish_terminal_pr=publish_terminal_pr,
-        ),
     )
     state = lifecycle.state
     steps = lifecycle.steps
