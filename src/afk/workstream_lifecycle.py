@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import shlex
 from copy import deepcopy
 from dataclasses import dataclass
@@ -141,6 +142,11 @@ def run_lifecycle(
         result = step_runner(step_name, step_input, ledger_dir, project_contract)
         steps.append(hooks.step_execution_record(step_name, result, equivalent_command, ledger_dir))
         hooks.update_state_from_step(state, step_name, result, ledger_dir)
+        if step_name == "implement":
+            repair_blocked_reason = no_repair_delta_blocked_reason(state)
+            if repair_blocked_reason:
+                state["blocked_reason"] = repair_blocked_reason
+                break
         if step_name == "validate":
             repair_steps, repair_blocked_reason = validation_feedback_follow_up(
                 normalized=normalized,
@@ -267,6 +273,9 @@ def validation_feedback_follow_up(
     if validation is None:
         return [], ""
     output = validation.get("output") if isinstance(validation.get("output"), dict) else {}
+    regression_reason = repair_regressed_validation_blocked_reason(state, output)
+    if regression_reason:
+        return [], regression_reason
     if not validation_feedback_repairable(output):
         return [], ""
     attempted_retries = retry_attempt_count(state)
@@ -278,7 +287,8 @@ def validation_feedback_follow_up(
     repair_attempt = attempted_retries + 1
     if repair_attempt_already_recorded(state, repair_attempt):
         return [], ""
-    record_repair_attempt(state, repair_attempt)
+    repair_context = build_validation_repair_context(state, repair_attempt=repair_attempt)
+    record_repair_attempt(state, repair_attempt, repair_context=repair_context)
     return validation_feedback_repair_steps(normalized, step_spec), ""
 
 
@@ -361,6 +371,9 @@ def review_feedback_follow_up(
     repairable_findings = review_feedback_repairable_findings(review)
     if not repairable_findings:
         return [], review_feedback_blocked_reason(review)
+    stuck_reason = stuck_same_finding_blocked_reason(state, repairable_findings)
+    if stuck_reason:
+        return [], stuck_reason
     attempted_retries = retry_attempt_count(state)
     hard_cap = normalized["repair_policy"]["hard_cap"]
     if attempted_retries >= hard_cap:
@@ -376,7 +389,8 @@ def review_feedback_follow_up(
     repair_attempt = attempted_retries + 1
     if repair_attempt_already_recorded(state, repair_attempt):
         return [], ""
-    record_repair_attempt(state, repair_attempt)
+    repair_context = build_review_repair_context(state, step_spec=step_spec, repair_attempt=repair_attempt)
+    record_repair_attempt(state, repair_attempt, repair_context=repair_context)
     return review_feedback_repair_steps(normalized, step_spec), ""
 
 
@@ -1106,15 +1120,191 @@ def recipe_step_template(steps: list[dict[str, Any]], name: str) -> dict[str, An
 
 def repair_attempt_already_recorded(state: dict[str, Any], attempt: int) -> bool:
     history = state.get("repair_history")
-    return isinstance(history, list) and attempt in history
+    if not isinstance(history, list):
+        return False
+    for entry in history:
+        if entry == attempt:
+            return True
+        if isinstance(entry, dict) and entry.get("attempt") == attempt:
+            return True
+    return False
 
 
-def record_repair_attempt(state: dict[str, Any], attempt: int) -> None:
+def record_repair_attempt(state: dict[str, Any], attempt: int, *, repair_context: dict[str, Any] | None = None) -> None:
     history = state.get("repair_history")
     values = list(history) if isinstance(history, list) else []
-    if attempt not in values:
-        values.append(attempt)
+    record = repair_attempt_record_from_context(attempt, repair_context)
+    for index, entry in enumerate(values):
+        if entry == attempt:
+            values[index] = record
+            state["repair_history"] = values
+            return
+        if isinstance(entry, dict) and entry.get("attempt") == attempt:
+            merged = dict(entry)
+            merged.update(record)
+            values[index] = merged
+            state["repair_history"] = values
+            return
+    values.append(record)
     state["repair_history"] = values
+
+
+def repair_attempt_record_from_context(attempt: int, repair_context: dict[str, Any] | None) -> dict[str, Any]:
+    record: dict[str, Any] = {"attempt": attempt}
+    if not isinstance(repair_context, dict):
+        return record
+    trigger = string_field(repair_context, "trigger") or ""
+    if trigger:
+        record["trigger"] = trigger
+    validation = repair_context.get("validation") if isinstance(repair_context.get("validation"), dict) else {}
+    record["previous_validation_status"] = string_field(validation, "status") or ""
+    record["previous_validation_classification"] = string_field(validation, "classification") or ""
+    if trigger == "review_feedback":
+        implementation = (
+            repair_context.get("current_implementation")
+            if isinstance(repair_context.get("current_implementation"), dict)
+            else {}
+        )
+        review = repair_context.get("review") if isinstance(repair_context.get("review"), dict) else {}
+        findings = review.get("findings") if isinstance(review.get("findings"), list) else []
+        record["previous_implementation_commit"] = string_field(implementation, "commit") or ""
+        record["review_fingerprints"] = review_finding_fingerprints(findings)
+    elif trigger == "validation_feedback":
+        implementation = (
+            repair_context.get("previous_implementation")
+            if isinstance(repair_context.get("previous_implementation"), dict)
+            else {}
+        )
+        record["previous_implementation_commit"] = string_field(implementation, "commit") or ""
+    return record
+
+
+def latest_repair_attempt_record(state: dict[str, Any]) -> dict[str, Any] | None:
+    history = state.get("repair_history")
+    if not isinstance(history, list):
+        return None
+    for entry in reversed(history):
+        if isinstance(entry, dict):
+            return entry
+    return None
+
+
+def no_repair_delta_blocked_reason(state: dict[str, Any]) -> str:
+    repair = latest_repair_attempt_record(state)
+    if repair is None:
+        return ""
+    implementation = state.get("implementation") if isinstance(state.get("implementation"), dict) else {}
+    if implementation.get("status") != "implemented":
+        return ""
+    git_info = implementation.get("git") if isinstance(implementation.get("git"), dict) else {}
+    current_commit = string_field(git_info, "after_commit") or ""
+    previous_commit = string_field(repair, "previous_implementation_commit") or ""
+    changed_files = normalized_changed_files(git_info.get("changed_files"))
+    repair["implementation_commit"] = current_commit
+    repair["implementation_changed_files"] = changed_files
+    if not current_commit or current_commit == previous_commit:
+        return "no_repair_delta: repair produced no implementation commit"
+    if not changed_files:
+        return "no_repair_delta: repair produced no meaningful changed files"
+    return ""
+
+
+def repair_regressed_validation_blocked_reason(state: dict[str, Any], output: dict[str, Any]) -> str:
+    repair = latest_repair_attempt_record(state)
+    if repair is None:
+        return ""
+    current_status = string_field(output, "status") or ""
+    current_classification = string_field(output, "classification") or ""
+    repair["validation_status"] = current_status
+    repair["validation_classification"] = current_classification
+    if string_field(repair, "previous_validation_status") != "validated":
+        return ""
+    if current_status == "validated":
+        return ""
+    detail = string_field(output, "summary") or current_classification or current_status or "validation failed after repair"
+    return f"repair_regressed_validation: {detail}"
+
+
+def stuck_same_finding_blocked_reason(state: dict[str, Any], findings: list[dict[str, Any]]) -> str:
+    repair = latest_repair_attempt_record(state)
+    if repair is None or string_field(repair, "trigger") != "review_feedback":
+        return ""
+    previous_fingerprints = repair.get("review_fingerprints")
+    if not isinstance(previous_fingerprints, list) or not previous_fingerprints:
+        return ""
+    current_fingerprints = review_finding_fingerprints(findings)
+    previous_signatures = {review_finding_fingerprint_signature(fingerprint) for fingerprint in previous_fingerprints}
+    repeated = next(
+        (
+            fingerprint
+            for fingerprint in current_fingerprints
+            if review_finding_fingerprint_signature(fingerprint) in previous_signatures
+        ),
+        None,
+    )
+    if repeated is None:
+        return ""
+    role = repeated["role"]
+    location = repeated["file"]
+    if repeated["line"] is not None:
+        location = f"{location}:{repeated['line']}" if location else str(repeated["line"])
+    detail = repeated["required_fix"] or repeated["summary"] or "review finding"
+    context = f"{role} {location}".strip()
+    if context:
+        return f"stuck_same_finding: {context}: {detail}"
+    return f"stuck_same_finding: {detail}"
+
+
+def review_finding_fingerprints(findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    fingerprints = []
+    for finding in findings:
+        if not isinstance(finding, dict):
+            continue
+        fingerprints.append(
+            {
+                "role": normalize_review_finding_text(string_field(finding, "role") or ""),
+                "file": normalize_review_finding_text(string_field(finding, "file") or ""),
+                "line": review_finding_line(finding),
+                "required_fix": normalize_review_finding_text(string_field(finding, "required_fix") or ""),
+                "summary": normalize_review_finding_text(string_field(finding, "summary") or ""),
+                "key": normalize_review_finding_text(
+                    string_field(finding, "required_fix") or string_field(finding, "summary") or ""
+                ),
+            }
+        )
+    unique: list[dict[str, Any]] = []
+    seen = set()
+    for fingerprint in fingerprints:
+        signature = (
+            fingerprint["role"],
+            fingerprint["file"],
+            fingerprint["line"],
+            fingerprint["key"],
+        )
+        if signature in seen:
+            continue
+        seen.add(signature)
+        unique.append(fingerprint)
+    return unique
+
+
+def review_finding_fingerprint_signature(fingerprint: dict[str, Any]) -> tuple[str, str, int | None, str]:
+    return (
+        str(fingerprint.get("role") or ""),
+        str(fingerprint.get("file") or ""),
+        fingerprint.get("line") if isinstance(fingerprint.get("line"), int) else None,
+        str(fingerprint.get("key") or ""),
+    )
+
+
+def normalize_review_finding_text(value: str) -> str:
+    return re.sub(r"\s+", " ", value).strip().lower()
+
+
+def normalized_changed_files(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [path.strip() for path in value if isinstance(path, str) and path.strip()]
 
 
 def integer_retry_number(attempt: dict[str, Any]) -> int:
