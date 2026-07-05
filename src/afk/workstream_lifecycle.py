@@ -88,7 +88,7 @@ def run_lifecycle(
             state["stop_reason"] = stop_reason
             state["next_allowed_command"] = next_allowed_command_for_terminal_stop(state, normalized)
             break
-        blocked_reason = workflow_order_blocking_reason(step_name, state, normalized["retry_policy"])
+        blocked_reason = workflow_order_blocking_reason(step_name, state, normalized["repair_policy"])
         if blocked_reason:
             state["blocked_reason"] = blocked_reason
             break
@@ -189,9 +189,9 @@ def run_lifecycle(
     return LifecycleOutcome(state=state, steps=steps, publication=publication)
 
 
-def workflow_order_blocking_reason(step_name: str, state: dict[str, Any], retry_policy: dict[str, int]) -> str:
+def workflow_order_blocking_reason(step_name: str, state: dict[str, Any], repair_policy: dict[str, Any]) -> str:
     if step_name == "prepare-checkout":
-        retry_block = retry_prepare_checkout_blocking_reason(state, retry_policy)
+        retry_block = retry_prepare_checkout_blocking_reason(state, repair_policy)
         if retry_block:
             return retry_block
     if step_name == "validate" and not implemented_after_commit(state):
@@ -270,9 +270,11 @@ def validation_feedback_follow_up(
     if not validation_feedback_repairable(output):
         return [], ""
     attempted_retries = retry_attempt_count(state)
-    max_retries = normalized["retry_policy"]["max_retries"]
-    if attempted_retries >= max_retries:
-        return [], f"retry budget exhausted: {attempted_retries} retries attempted, max_retries={max_retries}"
+    hard_cap = normalized["repair_policy"]["hard_cap"]
+    if attempted_retries >= hard_cap:
+        if normalized["repair_policy"]["source"] == "retry_policy":
+            return [], f"retry budget exhausted: {attempted_retries} retries attempted, max_retries={hard_cap}"
+        return [], f"repair budget exhausted: {attempted_retries} attempts reached hard_cap={hard_cap}"
     repair_attempt = attempted_retries + 1
     if repair_attempt_already_recorded(state, repair_attempt):
         return [], ""
@@ -360,11 +362,16 @@ def review_feedback_follow_up(
     if not repairable_findings:
         return [], review_feedback_blocked_reason(review)
     attempted_retries = retry_attempt_count(state)
-    max_retries = normalized["retry_policy"]["max_retries"]
-    if attempted_retries >= max_retries:
+    hard_cap = normalized["repair_policy"]["hard_cap"]
+    if attempted_retries >= hard_cap:
+        if normalized["repair_policy"]["source"] == "retry_policy":
+            return [], (
+                f"review feedback retry budget exhausted: {attempted_retries} retries attempted, "
+                f"max_retries={hard_cap}; {review_feedback_blocked_reason(review)}"
+            )
         return [], (
-            f"review feedback retry budget exhausted: {attempted_retries} retries attempted, "
-            f"max_retries={max_retries}; {review_feedback_blocked_reason(review)}"
+            f"review feedback repair budget exhausted: {attempted_retries} attempts reached "
+            f"hard_cap={hard_cap}; {review_feedback_blocked_reason(review)}"
         )
     repair_attempt = attempted_retries + 1
     if repair_attempt_already_recorded(state, repair_attempt):
@@ -936,13 +943,18 @@ def retry_instructions(normalized: dict[str, Any], run_id: str) -> str:
     )
 
 
-def retry_prepare_checkout_blocking_reason(state: dict[str, Any], retry_policy: dict[str, int]) -> str:
+def retry_prepare_checkout_blocking_reason(state: dict[str, Any], repair_policy: dict[str, Any]) -> str:
     attempts = state.get("checkout_attempts")
     if not isinstance(attempts, list) or not attempts:
         return ""
     attempted_retries = retry_attempt_count(state)
-    if attempted_retries >= retry_policy["max_retries"]:
-        return f"retry budget exhausted: {attempted_retries} retries attempted, max_retries={retry_policy['max_retries']}"
+    if attempted_retries >= repair_policy["hard_cap"]:
+        if repair_policy["source"] == "retry_policy":
+            return (
+                f"retry budget exhausted: {attempted_retries} retries attempted, "
+                f"max_retries={repair_policy['hard_cap']}"
+            )
+        return f"repair budget exhausted: {attempted_retries} attempts reached hard_cap={repair_policy['hard_cap']}"
     prior_retry = latest_retry_attempt(state)
     if prior_retry is None:
         return ""
@@ -996,10 +1008,16 @@ def retry_attempt_count(state: dict[str, Any]) -> int:
     return sum(1 for attempt in attempts if isinstance(attempt, dict) and integer_retry_number(attempt) > 0)
 
 
-def retry_budget_record(state: dict[str, Any], retry_policy: dict[str, int]) -> dict[str, int]:
+def retry_budget_record(state: dict[str, Any], repair_policy: dict[str, Any]) -> dict[str, int | bool]:
     attempted_retries = retry_attempt_count(state)
-    max_retries = retry_policy["max_retries"]
-    return {"max_retries": max_retries, "attempted_retries": attempted_retries, "remaining_retries": max(0, max_retries - attempted_retries)}
+    hard_cap = repair_policy["hard_cap"]
+    blocked_reason = string_field(state, "blocked_reason") or ""
+    return {
+        "max_retries": hard_cap,
+        "attempted_retries": attempted_retries,
+        "remaining_retries": max(0, hard_cap - attempted_retries),
+        "hard_cap_exhausted": "budget exhausted" in blocked_reason,
+    }
 
 
 def retry_attempt_records(state: dict[str, Any]) -> list[dict[str, Any]]:

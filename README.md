@@ -163,8 +163,12 @@ The recipe schema is intentionally small:
 - `workstream_id`, `parent`, and `review_branch` identify the workstream and
   shared review branch. CLI `--workstream-id` and `--parent` override the recipe
   values.
-- `retry_policy.max_retries` is optional and defaults to `0`. It bounds how many
-  same-item retry checkout cycles may start after a failed validation.
+- `repair_policy` is optional. `{"mode":"progress_aware","hard_cap":N}` keeps
+  validation failures and repairable review feedback in one shared repair loop,
+  with `hard_cap` as the runaway guard.
+- `retry_policy.max_retries` remains available as the legacy compatibility path.
+  When `repair_policy` is omitted, AFK derives an active low-budget repair
+  policy from `retry_policy`.
 - `validation_feedback.enabled` is optional. When true, repairable validation
   failures inject a bounded `prepare-checkout -> implement -> validate` retry
   loop that passes validation evidence back into `implement` as
@@ -882,9 +886,9 @@ contains the normalized final review status plus pointers to
 `run-workstream` records one workstream directory and one normal `runs/<run-id>/`
 directory for each composed step. `workstream-result.json` lists every step run,
 its ledger result path, the generated equivalent `afk run-step ...` command,
-selected work result summaries, cleanup status, `retry_budget`,
-`retry_attempts`, terminal reason, next allowed command, retry instructions,
-terminal PR publication status, and tracker-close guidance. Dirty retry
+selected work result summaries, cleanup status, active `repair_policy`,
+`retry_budget`, `retry_attempts`, terminal reason, next allowed command, retry
+instructions, terminal PR publication status, and tracker-close guidance. Dirty retry
 checkouts are surfaced through `cleanup.resources` with path, branch, commit,
 and status so failed retry attempts stay visible without spawning more sibling
 checkouts.

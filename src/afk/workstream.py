@@ -258,7 +258,8 @@ def run_workstream(
         "steps": steps,
         "selected_work": selected_work,
         "cleanup": state["cleanup"],
-        "retry_budget": retry_budget_record(state, normalized["retry_policy"]),
+        "repair_policy": normalized["repair_policy"],
+        "retry_budget": retry_budget_record(state, normalized["repair_policy"]),
         "retry_attempts": retry_attempt_records(state),
         "retry": publication.get("retry", ""),
         "terminal_reason": publication.get("reason", ""),
@@ -327,6 +328,7 @@ def normalize_recipe(
     review_branch = string_field(recipe, "review_branch") or review_branch_for_workstream(resolved_workstream_id)
     publisher = recipe.get("publisher", {"enabled": False})
     retry_policy = normalize_retry_policy(recipe.get("retry_policy"))
+    repair_policy = normalize_repair_policy(recipe.get("repair_policy"), retry_policy)
     validation_feedback = normalize_validation_feedback(recipe.get("validation_feedback"))
     validation_expectations = normalize_validation_expectations(recipe.get("validation_expectations"))
     review_feedback = normalize_review_feedback(recipe.get("review_feedback"))
@@ -347,6 +349,7 @@ def normalize_recipe(
         "review_branch": review_branch,
         "steps": normalized_steps,
         "publisher": publisher,
+        "repair_policy": repair_policy,
         "retry_policy": retry_policy,
         "validation_feedback": validation_feedback,
         "validation_expectations": validation_expectations,
@@ -670,10 +673,10 @@ def update_state_from_step(
 def workflow_order_blocking_reason(
     step_name: str,
     state: dict[str, Any],
-    retry_policy: dict[str, int],
+    repair_policy: dict[str, Any],
 ) -> str:
     if step_name == "prepare-checkout":
-        retry_block = retry_prepare_checkout_blocking_reason(state, retry_policy)
+        retry_block = retry_prepare_checkout_blocking_reason(state, repair_policy)
         if retry_block:
             return retry_block
     if step_name == "validate" and not implemented_after_commit(state):
@@ -1020,12 +1023,14 @@ def validation_feedback_follow_up(
     if not validation_feedback_repairable(output):
         return [], ""
     attempted_retries = retry_attempt_count(state)
-    max_retries = normalized["retry_policy"]["max_retries"]
-    if attempted_retries >= max_retries:
-        return [], (
-            "retry budget exhausted: "
-            f"{attempted_retries} retries attempted, max_retries={max_retries}"
-        )
+    hard_cap = normalized["repair_policy"]["hard_cap"]
+    if attempted_retries >= hard_cap:
+        if normalized["repair_policy"]["source"] == "retry_policy":
+            return [], (
+                "retry budget exhausted: "
+                f"{attempted_retries} retries attempted, max_retries={hard_cap}"
+            )
+        return [], f"repair budget exhausted: {attempted_retries} attempts reached hard_cap={hard_cap}"
     repair_attempt = attempted_retries + 1
     if repair_attempt_already_recorded(state, repair_attempt):
         return [], ""
@@ -1123,11 +1128,17 @@ def review_feedback_follow_up(
     if not repairable_findings:
         return [], review_feedback_blocked_reason(review)
     attempted_retries = retry_attempt_count(state)
-    max_retries = normalized["retry_policy"]["max_retries"]
-    if attempted_retries >= max_retries:
+    hard_cap = normalized["repair_policy"]["hard_cap"]
+    if attempted_retries >= hard_cap:
+        if normalized["repair_policy"]["source"] == "retry_policy":
+            return [], (
+                "review feedback retry budget exhausted: "
+                f"{attempted_retries} retries attempted, max_retries={hard_cap}; "
+                f"{review_feedback_blocked_reason(review)}"
+            )
         return [], (
-            "review feedback retry budget exhausted: "
-            f"{attempted_retries} retries attempted, max_retries={max_retries}; "
+            "review feedback repair budget exhausted: "
+            f"{attempted_retries} attempts reached hard_cap={hard_cap}; "
             f"{review_feedback_blocked_reason(review)}"
         )
     repair_attempt = attempted_retries + 1
@@ -2010,6 +2021,28 @@ def normalize_retry_policy(retry_policy: Any) -> dict[str, int]:
     return {"max_retries": max_retries}
 
 
+def normalize_repair_policy(repair_policy: Any, retry_policy: dict[str, int]) -> dict[str, Any]:
+    if repair_policy is None:
+        return {
+            "mode": "legacy_retry",
+            "hard_cap": retry_policy["max_retries"],
+            "source": "retry_policy",
+        }
+    if not isinstance(repair_policy, dict):
+        raise WorkstreamError("repair_policy must be an object")
+    unsupported = [key for key in repair_policy if key not in {"mode", "hard_cap"}]
+    if unsupported:
+        raise WorkstreamError("repair_policy only supports mode and hard_cap")
+    mode = string_field(repair_policy, "mode")
+    if mode != "progress_aware":
+        raise WorkstreamError("repair_policy.mode must be 'progress_aware'")
+    hard_cap = repair_policy.get("hard_cap")
+    if isinstance(hard_cap, bool) or not isinstance(hard_cap, int) or hard_cap < 0:
+        raise WorkstreamError("repair_policy.hard_cap must be a non-negative integer")
+    # ponytail: this first slice only distinguishes shared-loop repair from legacy retry budgets.
+    return {"mode": mode, "hard_cap": hard_cap, "source": "repair_policy"}
+
+
 def normalize_validation_feedback(validation_feedback: Any) -> dict[str, bool]:
     if validation_feedback is None:
         return {"enabled": False}
@@ -2206,16 +2239,18 @@ def checkout_attempt_is_dirty(attempt: dict[str, Any]) -> bool:
     return bool(attempt.get("dirty"))
 
 
-def retry_prepare_checkout_blocking_reason(state: dict[str, Any], retry_policy: dict[str, int]) -> str:
+def retry_prepare_checkout_blocking_reason(state: dict[str, Any], repair_policy: dict[str, Any]) -> str:
     attempts = state.get("checkout_attempts")
     if not isinstance(attempts, list) or not attempts:
         return ""
     attempted_retries = retry_attempt_count(state)
-    if attempted_retries >= retry_policy["max_retries"]:
-        return (
-            "retry budget exhausted: "
-            f"{attempted_retries} retries attempted, max_retries={retry_policy['max_retries']}"
-        )
+    if attempted_retries >= repair_policy["hard_cap"]:
+        if repair_policy["source"] == "retry_policy":
+            return (
+                "retry budget exhausted: "
+                f"{attempted_retries} retries attempted, max_retries={repair_policy['hard_cap']}"
+            )
+        return f"repair budget exhausted: {attempted_retries} attempts reached hard_cap={repair_policy['hard_cap']}"
     prior_retry = latest_retry_attempt(state)
     if prior_retry is None:
         return ""
