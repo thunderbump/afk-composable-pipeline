@@ -926,6 +926,7 @@ def run_agent_command(
             runtime_failure_message="agent command failed",
             timeout_message="agent command timed out",
             configure_env=lambda env: add_git_identity_fallback(env, checkout_path),
+            configure_env_before_adapter_env=True,
         )
 
 

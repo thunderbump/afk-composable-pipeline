@@ -24,16 +24,19 @@ def execute_role_adapter(
     runtime_failure_message: str,
     timeout_message: str,
     configure_env: Callable[[dict[str, str]], None] | None = None,
+    configure_env_before_adapter_env: bool = False,
     allow_nonzero: bool = False,
     text: bool = True,
     runner: CommandRunner | None = None,
 ) -> dict[str, Any]:
     env = minimal_command_environment(env_root, config_home=adapter.get("config_home") or "")
+    if configure_env is not None and configure_env_before_adapter_env:
+        configure_env(env)
     env.update(adapter.get("env") or {})
     if adapter.get("codex_home"):
         env["CODEX_HOME"] = adapter["codex_home"]
     env.update(env_vars)
-    if configure_env is not None:
+    if configure_env is not None and not configure_env_before_adapter_env:
         configure_env(env)
     command = render_command(adapter["command"], replacements or {})
     return execute_role_command(
