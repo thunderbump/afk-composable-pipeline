@@ -17,11 +17,13 @@ from afk.contracts import ProjectContract, ProjectContractIdentity  # noqa: E402
 from afk.recipes import generate_workstream_recipe  # noqa: E402
 from afk.registry import StepResult  # noqa: E402
 from afk.implement import normalize_validation as normalize_implement_validation  # noqa: E402
-from afk.workstream import (  # noqa: E402
-    WorkstreamLedger,
+from afk.retrospective import (  # noqa: E402
     _retrospective_follow_up_bead_description,
     _retrospective_follow_up_bead_labels,
     _retrospective_follow_up_fingerprint,
+)
+from afk.workstream import (  # noqa: E402
+    WorkstreamLedger,
     composed_step_input,
     current_selected_work_selection_identity,
     merged_implement_validation_input,

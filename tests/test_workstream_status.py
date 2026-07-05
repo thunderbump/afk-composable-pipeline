@@ -7,13 +7,15 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from afk.workstream import (  # noqa: E402
+from afk.retrospective import (  # noqa: E402
     _apply_retrospective_judge,
+    pipeline_retrospective_record,
+)
+from afk.workstream import (  # noqa: E402
     WorkstreamError,
     effective_review_cycles,
     normalize_retrospective_follow_up_config,
     normalize_retrospective_judge,
-    pipeline_retrospective_record,
     tracker_terminal_decision_close_block_reason,
     tracker_record,
     tracker_review_cycles,
