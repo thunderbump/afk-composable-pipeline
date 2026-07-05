@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlsplit
@@ -15,6 +16,38 @@ from afk.work_sources import select_work
 READY_TAG = "ready-for-agent"
 WORKSTREAM_RESULT_FIELDS = ("run_id", "workstream_id", "parent", "status", "result_path", "publication_status")
 WORKSTREAM_RESULT_SUMMARY_FIELDS = ("publication", "tracker", "artifacts", "pipeline_retrospective")
+
+
+@dataclass(frozen=True)
+class RunNextPlanRequest:
+    checkout_root: Path
+    checkout_path: Path
+    validation_profile: str
+    project_contract: ProjectContract | None = None
+    beads_workspace: Path | None = None
+    validation_input: dict[str, Any] | None = None
+    agent: dict[str, Any] | None = None
+    reviewer: dict[str, Any] | None = None
+    retrospective_judge: dict[str, Any] | None = None
+    retrospective_follow_up: dict[str, Any] | None = None
+    publisher_factory: Callable[[str], dict[str, Any] | None] | None = None
+    enable_review_feedback: bool = False
+    expect_generated_smoke_dry_run: bool = False
+    workstream_id: str | None = None
+    sources: list[dict[str, Any]] | None = None
+    required_labels: list[str] | None = None
+    required_metadata: list[str] | None = None
+
+
+@dataclass(frozen=True)
+class RunNextRequest:
+    project_contract: ProjectContract
+    beads_workspace: Path
+    planner: RunNextPlanRequest
+    ready_tag: str = READY_TAG
+    tracker_artifact_root: Path | None = None
+    execute: bool = False
+    ledger_dir: Path | None = None
 
 
 def run_next(
@@ -38,47 +71,72 @@ def run_next(
     workstream_runner: Callable[..., Any] | None = None,
     tracker_artifact_root: Path | None = None,
 ) -> dict[str, Any]:
-    workspace = validate_beads_workspace(beads_workspace)
-    selection_request = build_selection_request(
-        project_contract,
-        beads_workspace=workspace,
-        ready_tag=ready_tag,
-        tracker_artifact_root=tracker_artifact_root,
+    return run_next_request(
+        RunNextRequest(
+            project_contract=project_contract,
+            beads_workspace=beads_workspace,
+            planner=RunNextPlanRequest(
+                checkout_root=checkout_root,
+                checkout_path=checkout_path,
+                validation_profile=validation_profile,
+                validation_input=validation_input,
+                agent=agent,
+                reviewer=reviewer,
+                retrospective_judge=retrospective_judge,
+                retrospective_follow_up=retrospective_follow_up,
+                publisher_factory=publisher_factory,
+                enable_review_feedback=enable_review_feedback,
+                expect_generated_smoke_dry_run=expect_generated_smoke_dry_run,
+            ),
+            ready_tag=ready_tag,
+            tracker_artifact_root=tracker_artifact_root,
+            execute=execute,
+            ledger_dir=ledger_dir,
+        ),
+        workstream_runner=workstream_runner,
     )
-    selection_result = select_work(selection_request, project_contract=project_contract)
+
+
+def run_next_request(
+    request: RunNextRequest,
+    *,
+    work_selector: Callable[..., dict[str, Any]] | None = None,
+    plan_factory: Callable[[RunNextPlanRequest], dict[str, Any]] | None = None,
+    workstream_runner: Callable[..., Any] | None = None,
+) -> dict[str, Any]:
+    selector = work_selector or select_work
+    planner = plan_factory or generate_run_next_plan
+    workspace = validate_beads_workspace(request.beads_workspace)
+    selection_request = build_selection_request(
+        request.project_contract,
+        beads_workspace=workspace,
+        ready_tag=request.ready_tag,
+        tracker_artifact_root=request.tracker_artifact_root,
+    )
+    selection_result = selector(selection_request, project_contract=request.project_contract)
     chosen = choose_candidate(selection_result.get("selected_work") or [])
     recipe = None
     workstream_result = None
     if chosen is not None:
-        recipe = generate_workstream_recipe(
-            workstream_id=chosen["external_id"],
-            project_contract=project_contract,
-            beads_workspace=workspace,
-            checkout_root=checkout_root,
-            checkout_path=checkout_path,
-            validation_profile=validation_profile,
-            validation_input=validation_input,
-            agent=agent,
-            reviewer=reviewer,
-            retrospective_judge=retrospective_judge,
-            retrospective_follow_up=retrospective_follow_up,
-            publisher=publisher_factory(chosen["external_id"]) if publisher_factory is not None else None,
-            sources=selection_request["sources"],
-            required_labels=selection_request["required_labels"],
-            required_metadata=selection_request["required_metadata"],
-            enable_review_feedback=enable_review_feedback,
-            expect_generated_smoke_dry_run=expect_generated_smoke_dry_run,
+        recipe = planner(
+            prepare_run_next_plan_request(
+                request.planner,
+                chosen=chosen,
+                selection_request=selection_request,
+                project_contract=request.project_contract,
+                beads_workspace=workspace,
+            )
         )
-        if execute:
+        if request.execute:
             if workstream_runner is None:
                 raise ValueError("workstream_runner is required when --execute is set")
             workstream_result = normalize_workstream_result(
-                workstream_runner(recipe, ledger_dir=ledger_dir, project_contract=project_contract),
-                ledger_dir=ledger_dir,
+                workstream_runner(recipe, ledger_dir=request.ledger_dir, project_contract=request.project_contract),
+                ledger_dir=request.ledger_dir,
             )
     return {
         "command": "run-next",
-        "project": project_contract.project_slug,
+        "project": request.project_contract.project_slug,
         "selection_request": selection_request,
         "selection_result": annotate_selection_result(selection_result),
         "chosen_work": selected_work_snapshot(chosen),
@@ -86,6 +144,57 @@ def run_next(
         "recipe": recipe,
         "workstream_result": workstream_result,
     }
+
+
+def prepare_run_next_plan_request(
+    request: RunNextPlanRequest,
+    *,
+    chosen: dict[str, Any],
+    selection_request: dict[str, Any],
+    project_contract: ProjectContract,
+    beads_workspace: Path,
+) -> RunNextPlanRequest:
+    return replace(
+        request,
+        project_contract=project_contract,
+        beads_workspace=beads_workspace,
+        workstream_id=chosen["external_id"],
+        sources=selection_request["sources"],
+        required_labels=selection_request["required_labels"],
+        required_metadata=selection_request["required_metadata"],
+    )
+
+
+def generate_run_next_plan(request: RunNextPlanRequest) -> dict[str, Any]:
+    if request.project_contract is None or request.beads_workspace is None:
+        raise ValueError("project contract and beads workspace are required")
+    if request.workstream_id is None:
+        raise ValueError("workstream_id is required")
+    if request.sources is None or request.required_labels is None or request.required_metadata is None:
+        raise ValueError("selection context is required")
+    return generate_workstream_recipe(
+        workstream_id=request.workstream_id,
+        project_contract=request.project_contract,
+        beads_workspace=request.beads_workspace,
+        checkout_root=request.checkout_root,
+        checkout_path=request.checkout_path,
+        validation_profile=request.validation_profile,
+        validation_input=request.validation_input,
+        agent=request.agent,
+        reviewer=request.reviewer,
+        retrospective_judge=request.retrospective_judge,
+        retrospective_follow_up=request.retrospective_follow_up,
+        publisher=(
+            request.publisher_factory(request.workstream_id)
+            if request.publisher_factory is not None
+            else None
+        ),
+        sources=request.sources,
+        required_labels=request.required_labels,
+        required_metadata=request.required_metadata,
+        enable_review_feedback=request.enable_review_feedback,
+        expect_generated_smoke_dry_run=request.expect_generated_smoke_dry_run,
+    )
 
 
 def validate_beads_workspace(beads_workspace: Path) -> Path:

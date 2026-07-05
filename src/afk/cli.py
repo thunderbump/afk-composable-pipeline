@@ -20,7 +20,7 @@ from afk.recipes import (
     real_local_recipe_agent,
     write_recipe,
 )
-from afk.run_next import run_next, validate_beads_workspace
+from afk.run_next import RunNextPlanRequest, RunNextRequest, run_next_request, validate_beads_workspace
 from afk.pi_workers import (
     PONYTAIL_EXTENSION_SOURCE,
     build_pi_mount_config,
@@ -251,25 +251,29 @@ def main(argv: list[str] | None = None) -> int:
                     step_runner=run_step,
                     project_contract=project_contract,
                 )
-            payload = run_next(
-                project_contract=project_contract,
-                beads_workspace=Path(args.beads_workspace),
-                checkout_root=Path(args.checkout_root),
-                checkout_path=Path(args.checkout_path),
-                validation_profile=args.validation_profile,
-                validation_input=validation_input,
-                agent=recipe_agent,
-                reviewer=reviewer,
-                publisher_factory=recipe_publisher_factory,
-                ready_tag=args.ready_tag,
-                enable_review_feedback=args.role_profile == PRODUCTION_ROLE_PROFILE,
-                expect_generated_smoke_dry_run=(
-                    args.role_profile == FAKE_LOCAL_ROLE_PROFILE and args.effective_validation_mode == "fake"
+            payload = run_next_request(
+                RunNextRequest(
+                    project_contract=project_contract,
+                    beads_workspace=Path(args.beads_workspace),
+                    planner=RunNextPlanRequest(
+                        checkout_root=Path(args.checkout_root),
+                        checkout_path=Path(args.checkout_path),
+                        validation_profile=args.validation_profile,
+                        validation_input=validation_input,
+                        agent=recipe_agent,
+                        reviewer=reviewer,
+                        publisher_factory=recipe_publisher_factory,
+                        enable_review_feedback=args.role_profile == PRODUCTION_ROLE_PROFILE,
+                        expect_generated_smoke_dry_run=(
+                            args.role_profile == FAKE_LOCAL_ROLE_PROFILE and args.effective_validation_mode == "fake"
+                        ),
+                    ),
+                    ready_tag=args.ready_tag,
+                    execute=args.execute,
+                    ledger_dir=resolve_ledger_dir(args.ledger),
+                    tracker_artifact_root=Path(args.contracts_dir).resolve().parent,
                 ),
-                execute=args.execute,
-                ledger_dir=resolve_ledger_dir(args.ledger),
                 workstream_runner=workstream_runner,
-                tracker_artifact_root=Path(args.contracts_dir).resolve().parent,
             )
         except ValueError as exc:
             parser.error(str(exc))
