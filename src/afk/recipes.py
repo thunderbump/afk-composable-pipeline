@@ -13,6 +13,7 @@ from afk.implement import agent_command_secret_error
 
 SCHEMA_VERSION = 1
 RUNNABLE_REQUIRED_METADATA = ["afk.ready"]
+DEFAULT_PROGRESS_AWARE_REPAIR_HARD_CAP = 5
 
 
 @dataclass(frozen=True)
@@ -72,7 +73,6 @@ def generate_workstream_recipe(
         "review_branch": review_branch,
         "validation_feedback": recipe_plan["validation_feedback"],
         "review_feedback": recipe_plan["review_feedback"],
-        "retry_policy": recipe_plan["retry_policy"],
         "steps": [
             {
                 "name": "select-work",
@@ -128,6 +128,10 @@ def generate_workstream_recipe(
         ],
         "publisher": recipe_publisher,
     }
+    if "repair_policy" in recipe_plan:
+        recipe["repair_policy"] = recipe_plan["repair_policy"]
+    elif "retry_policy" in recipe_plan:
+        recipe["retry_policy"] = recipe_plan["retry_policy"]
 
     validation_expectations = recipe_plan.get("validation_expectations")
     if validation_expectations is not None:
@@ -198,7 +202,7 @@ def default_recipe_plan(request: RecipePlanRequest) -> dict[str, Any]:
         ),
         "validation_feedback": {"enabled": True},
         "review_feedback": {"enabled": request.enable_review_feedback},
-        "retry_policy": {"max_retries": 1},
+        "repair_policy": {"mode": "progress_aware", "hard_cap": DEFAULT_PROGRESS_AWARE_REPAIR_HARD_CAP},
     }
     if request.expect_generated_smoke_dry_run:
         plan["validation_expectations"] = {"generated_smoke_dry_run_expected": True}

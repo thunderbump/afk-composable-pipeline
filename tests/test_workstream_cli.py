@@ -6563,6 +6563,7 @@ Path({str(fake_calls)!r}).write_text("gh should not run\\n", encoding="utf-8")
                     "max_retries": 0,
                     "attempted_retries": 0,
                     "remaining_retries": 0,
+                    "hard_cap_exhausted": True,
                 },
             )
             self.assertEqual(result["retry_attempts"], [])
@@ -7282,6 +7283,356 @@ Path({str(fake_calls)!r}).write_text("gh should not run\\n", encoding="utf-8")
             self.assertEqual(result["review_cycles"][1]["reviews"][0]["role"], "correctness")
             self.assertEqual(result["tracker"]["review_cycles"], result["review_cycles"])
             self.assertEqual(result["tracker"]["status"], "review-feedback-addressed")
+
+    def test_workstream_progress_aware_repair_policy_handles_validation_and_review_in_one_loop(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repo = temp_path / "repo-src"
+            checkout = temp_path / "checkout"
+            ledger = temp_path / "ledger"
+            init_repo(repo)
+            fake_git = temp_path / "publisher-git"
+            fake_gh = temp_path / "publisher-gh"
+            write_executable(fake_git, f"#!{sys.executable}\nraise SystemExit(9)\n")
+            write_executable(fake_gh, f"#!{sys.executable}\nraise SystemExit(9)\n")
+            validate_count = temp_path / "validate-count.txt"
+            review_count = temp_path / "review-count.txt"
+            agent_code = textwrap.dedent(
+                """
+                import json
+                import os
+                import subprocess
+                from pathlib import Path
+
+                capsule = json.loads(Path(os.environ["AFK_JOB_CAPSULE"]).read_text(encoding="utf-8"))
+                repair = capsule.get("repair_context")
+                if repair is None:
+                    Path("implemented.txt").write_text("initial\\n", encoding="utf-8")
+                    subprocess.run(["git", "add", "implemented.txt"], check=True)
+                    subprocess.run(["git", "commit", "-m", "initial implementation"], check=True)
+                elif repair["attempt"] == 1:
+                    assert repair["trigger"] == "validation_feedback"
+                    Path("repair-validation.txt").write_text("repair validation\\n", encoding="utf-8")
+                    subprocess.run(["git", "add", "repair-validation.txt"], check=True)
+                    subprocess.run(["git", "commit", "-m", "repair validation failure"], check=True)
+                else:
+                    assert repair["attempt"] == 2
+                    assert repair["trigger"] == "review_feedback"
+                    Path("repair-review.txt").write_text("repair review\\n", encoding="utf-8")
+                    subprocess.run(["git", "add", "repair-review.txt"], check=True)
+                    subprocess.run(["git", "commit", "-m", "repair review feedback"], check=True)
+                Path("agent-result.json").write_text(
+                    json.dumps({"status": "completed", "summary": "implementation complete"}),
+                    encoding="utf-8",
+                )
+                """
+            ).strip()
+            worker_code = textwrap.dedent(
+                f"""
+                import json
+                import os
+                from pathlib import Path
+
+                count_path = Path({str(validate_count)!r})
+                prior = int(count_path.read_text(encoding="utf-8")) if count_path.exists() else 0
+                count_path.write_text(str(prior + 1), encoding="utf-8")
+                request = json.loads(Path(os.environ["AFK_WORKER_REQUEST"]).read_text(encoding="utf-8"))
+                if prior == 0:
+                    payload = {{
+                        "profile": request["profile"],
+                        "status": "fail",
+                        "summary": "compile failed",
+                        "failures": [
+                            {{
+                                "name": "build",
+                                "status": "fail",
+                                "category": "compiler",
+                                "reason": "demo.cpp:1: error: missing semicolon",
+                                "command": "ninja test",
+                                "exitCode": 1,
+                            }}
+                        ],
+                    }}
+                else:
+                    payload = {{
+                        "profile": request["profile"],
+                        "status": "pass",
+                        "summary": "tests passed",
+                        "steps": [{{"name": "unit", "status": "pass"}}],
+                    }}
+                Path(os.environ["AFK_WORKER_RESULT"]).write_text(json.dumps(payload), encoding="utf-8")
+                """
+            ).strip()
+            reviewer_code = textwrap.dedent(
+                f"""
+                import json
+                import os
+                from pathlib import Path
+
+                count_path = Path({str(review_count)!r})
+                prior = int(count_path.read_text(encoding="utf-8")) if count_path.exists() else 0
+                count_path.write_text(str(prior + 1), encoding="utf-8")
+                if prior == 0:
+                    payload = {{
+                        "status": "request_revision",
+                        "summary": "review requested changes",
+                        "findings": [
+                            {{
+                                "status": "request_revision",
+                                "severity": "high",
+                                "file": "src/demo.py",
+                                "line": 41,
+                                "required_fix": "Address the missing follow-up behavior.",
+                                "summary": "One review fix is still required.",
+                            }}
+                        ],
+                    }}
+                else:
+                    payload = {{
+                        "status": "pass",
+                        "summary": "review passed after repair",
+                        "findings": [],
+                    }}
+                Path(os.environ["AFK_REVIEWER_RESULT"]).write_text(json.dumps(payload), encoding="utf-8")
+                """
+            ).strip()
+            recipe = successful_recipe(temp_path, repo, checkout, fake_git, fake_gh)
+            recipe["publisher"] = {"enabled": False}
+            recipe["repair_policy"] = {"mode": "progress_aware", "hard_cap": 2}
+            recipe["validation_feedback"] = {"enabled": True}
+            recipe["review_feedback"] = {"enabled": True}
+            recipe["steps"][2]["input"]["agent"]["command"] = [sys.executable, "-c", agent_code]
+            recipe["steps"][3]["input"]["worker"]["command"] = [sys.executable, "-c", worker_code]
+            recipe["steps"][4]["input"]["role"] = "correctness"
+            recipe["steps"][4]["input"]["reviewer"]["command"] = [sys.executable, "-c", reviewer_code]
+
+            completed = run_afk(
+                "run-workstream",
+                "--workstream-id",
+                "central-lve.9",
+                "--input",
+                json.dumps(recipe),
+                "--ledger",
+                str(ledger),
+                env_overrides={
+                    "GIT_ALLOW_PROTOCOL": "file",
+                    "GIT_AUTHOR_NAME": "AFK Test",
+                    "GIT_AUTHOR_EMAIL": "afk-test@example.test",
+                    "GIT_COMMITTER_NAME": "AFK Test",
+                    "GIT_COMMITTER_EMAIL": "afk-test@example.test",
+                },
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            result = json.loads((ledger / summary["result_path"]).read_text(encoding="utf-8"))
+
+            self.assertEqual(summary["status"], "validated-unpublished")
+            self.assertEqual(
+                [step["name"] for step in result["steps"]],
+                [
+                    "select-work",
+                    "prepare-checkout",
+                    "implement",
+                    "validate",
+                    "prepare-checkout",
+                    "implement",
+                    "validate",
+                    "review",
+                    "prepare-checkout",
+                    "implement",
+                    "validate",
+                    "review",
+                ],
+            )
+            self.assertEqual(
+                result["repair_policy"],
+                {"mode": "progress_aware", "hard_cap": 2, "source": "repair_policy"},
+            )
+            self.assertEqual(
+                result["retry_budget"],
+                {
+                    "max_retries": 2,
+                    "attempted_retries": 2,
+                    "remaining_retries": 0,
+                    "hard_cap_exhausted": False,
+                },
+            )
+            self.assertEqual(
+                [attempt["repairing_failure_class"] for attempt in result["retry_attempts"]],
+                ["failed_validation", "request_revision"],
+            )
+
+    def test_workstream_retry_policy_remains_legacy_low_budget_compatibility_path(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repo = temp_path / "repo-src"
+            checkout = temp_path / "checkout"
+            ledger = temp_path / "ledger"
+            init_repo(repo)
+            fake_git = temp_path / "publisher-git"
+            fake_gh = temp_path / "publisher-gh"
+            write_executable(fake_git, f"#!{sys.executable}\nraise SystemExit(9)\n")
+            write_executable(fake_gh, f"#!{sys.executable}\nraise SystemExit(9)\n")
+            validate_count = temp_path / "validate-count.txt"
+            review_count = temp_path / "review-count.txt"
+            agent_code = textwrap.dedent(
+                """
+                import json
+                import os
+                import subprocess
+                from pathlib import Path
+
+                capsule = json.loads(Path(os.environ["AFK_JOB_CAPSULE"]).read_text(encoding="utf-8"))
+                repair = capsule.get("repair_context")
+                if repair is None:
+                    Path("implemented.txt").write_text("initial\\n", encoding="utf-8")
+                    subprocess.run(["git", "add", "implemented.txt"], check=True)
+                    subprocess.run(["git", "commit", "-m", "initial implementation"], check=True)
+                else:
+                    assert repair["attempt"] == 1
+                    assert repair["trigger"] == "validation_feedback"
+                    Path("repair-validation.txt").write_text("repair validation\\n", encoding="utf-8")
+                    subprocess.run(["git", "add", "repair-validation.txt"], check=True)
+                    subprocess.run(["git", "commit", "-m", "repair validation failure"], check=True)
+                Path("agent-result.json").write_text(
+                    json.dumps({"status": "completed", "summary": "implementation complete"}),
+                    encoding="utf-8",
+                )
+                """
+            ).strip()
+            worker_code = textwrap.dedent(
+                f"""
+                import json
+                import os
+                from pathlib import Path
+
+                count_path = Path({str(validate_count)!r})
+                prior = int(count_path.read_text(encoding="utf-8")) if count_path.exists() else 0
+                count_path.write_text(str(prior + 1), encoding="utf-8")
+                request = json.loads(Path(os.environ["AFK_WORKER_REQUEST"]).read_text(encoding="utf-8"))
+                if prior == 0:
+                    payload = {{
+                        "profile": request["profile"],
+                        "status": "fail",
+                        "summary": "compile failed",
+                        "failures": [
+                            {{
+                                "name": "build",
+                                "status": "fail",
+                                "category": "compiler",
+                                "reason": "demo.cpp:1: error: missing semicolon",
+                                "command": "ninja test",
+                                "exitCode": 1,
+                            }}
+                        ],
+                    }}
+                else:
+                    payload = {{
+                        "profile": request["profile"],
+                        "status": "pass",
+                        "summary": "tests passed",
+                        "steps": [{{"name": "unit", "status": "pass"}}],
+                    }}
+                Path(os.environ["AFK_WORKER_RESULT"]).write_text(json.dumps(payload), encoding="utf-8")
+                """
+            ).strip()
+            reviewer_code = textwrap.dedent(
+                f"""
+                import json
+                import os
+                from pathlib import Path
+
+                count_path = Path({str(review_count)!r})
+                prior = int(count_path.read_text(encoding="utf-8")) if count_path.exists() else 0
+                count_path.write_text(str(prior + 1), encoding="utf-8")
+                if prior == 0:
+                    payload = {{
+                        "status": "request_revision",
+                        "summary": "review requested changes",
+                        "findings": [
+                            {{
+                                "status": "request_revision",
+                                "severity": "high",
+                                "file": "src/demo.py",
+                                "line": 41,
+                                "required_fix": "Address the missing follow-up behavior.",
+                                "summary": "One review fix is still required.",
+                            }}
+                        ],
+                    }}
+                else:
+                    payload = {{
+                        "status": "pass",
+                        "summary": "review passed after repair",
+                        "findings": [],
+                    }}
+                Path(os.environ["AFK_REVIEWER_RESULT"]).write_text(json.dumps(payload), encoding="utf-8")
+                """
+            ).strip()
+            recipe = successful_recipe(temp_path, repo, checkout, fake_git, fake_gh)
+            recipe["publisher"] = {"enabled": False}
+            recipe["retry_policy"] = {"max_retries": 1}
+            recipe["validation_feedback"] = {"enabled": True}
+            recipe["review_feedback"] = {"enabled": True}
+            recipe["steps"][2]["input"]["agent"]["command"] = [sys.executable, "-c", agent_code]
+            recipe["steps"][3]["input"]["worker"]["command"] = [sys.executable, "-c", worker_code]
+            recipe["steps"][4]["input"]["role"] = "correctness"
+            recipe["steps"][4]["input"]["reviewer"]["command"] = [sys.executable, "-c", reviewer_code]
+
+            completed = run_afk(
+                "run-workstream",
+                "--workstream-id",
+                "central-lve.9",
+                "--input",
+                json.dumps(recipe),
+                "--ledger",
+                str(ledger),
+                env_overrides={
+                    "GIT_ALLOW_PROTOCOL": "file",
+                    "GIT_AUTHOR_NAME": "AFK Test",
+                    "GIT_AUTHOR_EMAIL": "afk-test@example.test",
+                    "GIT_COMMITTER_NAME": "AFK Test",
+                    "GIT_COMMITTER_EMAIL": "afk-test@example.test",
+                },
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            result = json.loads((ledger / summary["result_path"]).read_text(encoding="utf-8"))
+
+            self.assertEqual(summary["status"], "blocked")
+            self.assertEqual(
+                [step["name"] for step in result["steps"]],
+                [
+                    "select-work",
+                    "prepare-checkout",
+                    "implement",
+                    "validate",
+                    "prepare-checkout",
+                    "implement",
+                    "validate",
+                    "review",
+                ],
+            )
+            self.assertEqual(
+                result["repair_policy"],
+                {"mode": "legacy_retry", "hard_cap": 1, "source": "retry_policy"},
+            )
+            self.assertEqual(
+                result["retry_budget"],
+                {
+                    "max_retries": 1,
+                    "attempted_retries": 1,
+                    "remaining_retries": 0,
+                    "hard_cap_exhausted": True,
+                },
+            )
+            self.assertEqual(
+                [attempt["repairing_failure_class"] for attempt in result["retry_attempts"]],
+                ["failed_validation"],
+            )
+            self.assertIn("review feedback retry budget exhausted", result["publication"]["reason"])
 
     def test_workstream_review_feedback_retry_review_uses_cumulative_branch_diff_and_latest_repair_context(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -8173,6 +8524,7 @@ Path({str(fake_calls)!r}).write_text("gh should not run\\n", encoding="utf-8")
                     "max_retries": 2,
                     "attempted_retries": 1,
                     "remaining_retries": 1,
+                    "hard_cap_exhausted": False,
                 },
             )
             self.assertEqual(len(result["retry_attempts"]), 1)
@@ -8331,6 +8683,7 @@ Path({str(fake_calls)!r}).write_text("gh should not run\\n", encoding="utf-8")
                     "max_retries": 2,
                     "attempted_retries": 1,
                     "remaining_retries": 1,
+                    "hard_cap_exhausted": False,
                 },
             )
             self.assertEqual(len(result["retry_attempts"]), 1)
@@ -8487,6 +8840,7 @@ Path({str(fake_calls)!r}).write_text("gh should not run\\n", encoding="utf-8")
                     "max_retries": 2,
                     "attempted_retries": 1,
                     "remaining_retries": 1,
+                    "hard_cap_exhausted": False,
                 },
             )
             self.assertEqual(len(result["retry_attempts"]), 1)
