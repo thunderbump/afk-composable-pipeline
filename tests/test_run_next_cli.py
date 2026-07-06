@@ -1238,6 +1238,22 @@ raise SystemExit(9)
             self.assertNotIn("config_home", reviewer)
             self.assertNotIn("env", reviewer)
 
+            validate = next(step for step in payload["recipe"]["steps"] if step["name"] == "validate")
+            self.assertEqual(
+                validate["input"]["validation"],
+                {
+                    "profile": "tier1",
+                    "dry_run": False,
+                    "timeout_seconds": 3600,
+                    "worker_home": str(checkout_root / ".validation-worker" / "bump-EQEmu"),
+                    "stack": {
+                        "role": "validation",
+                        "path": str(checkout_root / "bump-akk-stack-validation"),
+                    },
+                },
+            )
+            self.assertNotIn("worker", validate["input"])
+            self.assertNotIn("validation_expectations", payload["recipe"])
             self.assertNotIn("retrospective_judge", payload["recipe"])
 
     def test_run_next_execute_production_defaults_fail_without_pi_auth_mounts(self):
