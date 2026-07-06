@@ -579,16 +579,16 @@ The pipeline has a docs-safe dogfood path:
    ```
 
 2. For docs-only runs, include or update the doc-card marker in the PR body
-   (`AFK_SUCCESS_DOGFOOD`) and keep `run-next`/`run-workstream` paths in
-   inspect mode (preview only), or execute only when intentionally running the
-   real dogfood command path.
+   (`AFK_SUCCESS_DOGFOOD`) and keep `run-next`/`run-workstream` in preview mode
+   unless you are intentionally exercising the full Pi-backed implementation,
+   review, publisher, and retrospective path for the selected doc card.
 
    ```md
-   <!-- AFK_SUCCESS_DOGFOOD: central-afk-pr.16 -->
+   <!-- AFK_SUCCESS_DOGFOOD: central-ac1 -->
    ```
 
-This keeps docs-only work from accidentally publishing while still exercising the
-`run-next` recipe and schema shape.
+This keeps docs-only work safe to review while still exercising `run-next`
+recipe generation and the downstream workstream/review/publication schema shape.
 
 For `bump-eqemu`, keep these caveats in mind:
 
@@ -969,4 +969,4 @@ Validation Worker, `afk run-step implement` with a fake/local Pi command, and
 is available. If neither runtime exists, it exits
 successfully with a clear skip message.
 
-<!-- AFK_SUCCESS_DOGFOOD: central-afk-pr.16 --> Dogfood success marker for central-afk-pr.16 (docs-only, pipeline path).
+<!-- AFK_SUCCESS_DOGFOOD: central-ac1 --> Dogfood success marker for central-ac1 (docs-only, run-next pipeline path).
