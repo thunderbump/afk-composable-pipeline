@@ -1179,6 +1179,38 @@ class WorkstreamLifecycleTest(unittest.TestCase):
 
         self.assertEqual(stuck_same_finding_blocked_reason(state, findings), "")
 
+    def test_stuck_same_finding_ignores_same_stable_key_across_different_roles(self):
+        state = {
+            "repair_history": [
+                {
+                    "trigger": "review_feedback",
+                    "review_fingerprints": [
+                        {
+                            "role": "correctness",
+                            "file": "src/demo.py",
+                            "line": 41,
+                            "stable_key": "empty-review-cycle",
+                            "required_fix": "guard terminal publish when the cycle list is empty",
+                            "summary": "publisher leaves terminal review state dangling after the cycle list is empty",
+                            "key": "guard terminal publish when the cycle list is empty",
+                        }
+                    ],
+                }
+            ]
+        }
+        findings = [
+            {
+                "role": "bug-risk",
+                "file": "src/demo.py",
+                "line": 41,
+                "stable_key": "empty-review-cycle",
+                "required_fix": "guard terminal publish when the cycle list is empty",
+                "summary": "publisher leaves terminal review state dangling after the cycle list is empty",
+            }
+        ]
+
+        self.assertEqual(stuck_same_finding_blocked_reason(state, findings), "")
+
     def test_run_lifecycle_blocks_when_repair_has_no_delta(self):
         recipe = normalize_recipe(
             {

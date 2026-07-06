@@ -1310,12 +1310,12 @@ def review_finding_repeat_signatures(fingerprint: dict[str, Any]) -> list[tuple[
 def review_finding_repeats(previous: dict[str, Any], current: dict[str, Any]) -> bool:
     if review_finding_fingerprint_signature(previous) == review_finding_fingerprint_signature(current):
         return True
+    if not review_finding_roles_match(previous, current):
+        return False
     previous_stable_key = str(previous.get("stable_key") or "")
     current_stable_key = str(current.get("stable_key") or "")
     if previous_stable_key and current_stable_key:
         return previous_stable_key == current_stable_key
-    if not review_finding_roles_match(previous, current):
-        return False
     return review_finding_legacy_repeat(previous, current)
 
 
