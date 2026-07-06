@@ -87,7 +87,7 @@ def integrate_published_pr(
         else:
             checks_snapshots = normalize_check_snapshots(checks_payload)
             if checks_snapshots:
-                check_snapshots = checks_snapshots
+                check_snapshots = merge_check_snapshots(check_snapshots, checks_snapshots)
     decision, next_poll_seconds, remediation = classify_integration(
         expected_head=request["expected_head_sha"],
         observed_head=observed_head,
@@ -372,6 +372,18 @@ def normalize_status_check_rollup(payload: Any) -> list[dict[str, Any]]:
             }
         )
     return snapshots
+
+
+def merge_check_snapshots(existing: list[dict[str, Any]], fresh: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    merged = [item.copy() for item in existing]
+    names = {item["name"]: index for index, item in enumerate(merged) if item.get("name")}
+    for item in fresh:
+        name = item.get("name") or ""
+        if name and name in names:
+            merged[names[name]] = item
+            continue
+        merged.append(item)
+    return merged
 
 
 def check_status(item: dict[str, Any]) -> str:

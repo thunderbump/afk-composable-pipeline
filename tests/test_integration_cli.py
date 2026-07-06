@@ -530,6 +530,75 @@ raise SystemExit(9)
             self.assertEqual(result["check_snapshots"], [{"name": "build", "workflow": "", "state": "COMPLETED", "bucket": "", "status": "passed", "link": ""}])
             self.assertEqual([call["argv"][0:2] for call in calls], [["auth", "status"], ["pr", "view"]])
 
+    def test_integrate_pr_merges_rollup_and_pr_checks_by_required_check_name(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            workstream_path = temp_path / "ledger" / "workstreams" / "run-mixed-check-sources" / "workstream-result.json"
+            write_workstream_result(workstream_path, expected_head="abc123")
+            fake_gh = temp_path / "fake-gh"
+            fake_calls = temp_path / "fake-calls.jsonl"
+            auth_dir = temp_path / "gh-config"
+            auth_dir.mkdir()
+            (auth_dir / "view.json").write_text(
+                json.dumps(
+                    {
+                        "number": 17,
+                        "url": "https://github.com/acme/widgets/pull/17",
+                        "state": "OPEN",
+                        "isDraft": False,
+                        "mergeStateStatus": "CLEAN",
+                        "headRefOid": "abc123",
+                        "statusCheckRollup": [
+                            {"name": "build", "status": "COMPLETED", "conclusion": "SUCCESS"},
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (auth_dir / "checks.json").write_text(
+                json.dumps(
+                    [
+                        {
+                            "name": "lint",
+                            "state": "SUCCESS",
+                            "bucket": "pass",
+                            "workflow": "CI",
+                            "link": "https://github.com/acme/widgets/actions/runs/7",
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            write_executable(fake_gh, fake_gh_script(fake_calls))
+
+            completed = run_afk(
+                "integrate-pr",
+                "--published-result",
+                str(workstream_path),
+                "--policy",
+                json.dumps({"gh": {"path": str(fake_gh)}, "required_checks": ["build", "lint"], "poll_seconds": 60}),
+                "--gh-auth-config-dir",
+                str(auth_dir),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            result = json.loads((output_dir_for(workstream_path) / "integration-result.json").read_text(encoding="utf-8"))
+            self.assertEqual(result["decision"], "merge_ready")
+            self.assertEqual(
+                result["check_snapshots"],
+                [
+                    {"name": "build", "workflow": "", "state": "COMPLETED", "bucket": "", "status": "passed", "link": ""},
+                    {
+                        "name": "lint",
+                        "workflow": "CI",
+                        "state": "SUCCESS",
+                        "bucket": "pass",
+                        "status": "passed",
+                        "link": "https://github.com/acme/widgets/actions/runs/7",
+                    },
+                ],
+            )
+
     def test_integrate_pr_writes_run_scoped_output_paths(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
