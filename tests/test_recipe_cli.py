@@ -354,6 +354,7 @@ raise SystemExit(9)
                     "health": "healthy",
                     "publication_status": "published",
                     "tracker_status": "awaiting-review",
+                    "repair_stop": {},
                     "signals": [],
                     "recommended_follow_up": [],
                     "follow_up": {

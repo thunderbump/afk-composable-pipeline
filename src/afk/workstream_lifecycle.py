@@ -1057,6 +1057,49 @@ def retry_attempt_records(state: dict[str, Any]) -> list[dict[str, Any]]:
     return records
 
 
+def repair_stop_record(state: dict[str, Any], publication: dict[str, Any]) -> dict[str, Any]:
+    reason = string_field(publication, "reason") or ""
+    if publication.get("status") != "blocked" or not reason:
+        return {}
+    classification = repair_stop_classification(reason)
+    if not classification:
+        return {}
+    return {
+        "classification": classification,
+        "scope": "target-work",
+        "reason": redact_text(reason),
+        "evidence_paths": repair_stop_evidence_paths(state, classification),
+    }
+
+
+def repair_stop_classification(reason: str) -> str:
+    prefix, _, _ = reason.partition(":")
+    if prefix in {"stuck_same_finding", "no_repair_delta", "repair_regressed_validation"}:
+        return prefix
+    return ""
+
+
+def repair_stop_evidence_paths(state: dict[str, Any], classification: str) -> list[str]:
+    validation = latest_validation_record(state) or {}
+    candidates = []
+    if classification in {"stuck_same_finding", "no_repair_delta"}:
+        candidates.append(string_field(state, "implementation_result_path") or "")
+    if classification in {"stuck_same_finding", "repair_regressed_validation"}:
+        candidates.extend(
+            [
+                string_field(validation, "step_result_path") or "",
+                string_field(validation, "worker_result_path") or "",
+            ]
+        )
+    if classification == "stuck_same_finding":
+        candidates.append(string_field(state, "review_result_path") or "")
+    evidence_paths: list[str] = []
+    for path in candidates:
+        if path and path not in evidence_paths:
+            evidence_paths.append(path)
+    return evidence_paths
+
+
 def final_cleanup_state(state: dict[str, Any]) -> dict[str, Any]:
     cleanup = state.get("cleanup")
     base = dict(cleanup) if isinstance(cleanup, dict) else {"status": "unknown", "resources": []}

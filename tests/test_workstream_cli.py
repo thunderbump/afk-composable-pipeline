@@ -827,6 +827,7 @@ sys.exit(0)
                     "health": "healthy",
                     "publication_status": "published",
                     "tracker_status": "awaiting-review",
+                    "repair_stop": {},
                     "signals": [],
                     "recommended_follow_up": [],
                     "follow_up": {
@@ -8025,6 +8026,16 @@ Path({str(fake_calls)!r}).write_text("gh should not run\\n", encoding="utf-8")
                 {"mode": "legacy_retry", "hard_cap": 2, "source": "retry_policy"},
             )
             self.assertIn("stuck_same_finding", result["publication"]["reason"])
+            self.assertEqual(result["tracker"]["repair_stop"]["classification"], "stuck_same_finding")
+            self.assertEqual(result["tracker"]["repair_stop"]["scope"], "target-work")
+            self.assertEqual(
+                result["pipeline_retrospective"]["repair_stop"]["classification"],
+                "stuck_same_finding",
+            )
+            self.assertEqual(
+                result["pipeline_retrospective"]["repair_stop"]["evidence_paths"],
+                result["tracker"]["repair_stop"]["evidence_paths"],
+            )
 
     def test_workstream_retry_policy_allows_same_location_different_issue_keys_to_continue(self):
         with tempfile.TemporaryDirectory() as temp_dir:

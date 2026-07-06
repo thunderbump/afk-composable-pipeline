@@ -13,7 +13,7 @@ from afk.implement import runtime_failure_excerpt
 from afk.jsonutil import canonical_json, sha256_json
 from afk.redaction import redact_artifact_value, redact_text
 from afk.tracking import effective_tracker_terminal_decision, redact_retrospective
-from afk.workstream_lifecycle import workstream_status_from_publication
+from afk.workstream_lifecycle import repair_stop_record, workstream_status_from_publication
 
 
 SCHEMA_VERSION = 1
@@ -207,6 +207,7 @@ def pipeline_retrospective_record(
         "health": _retrospective_health(_process_retrospective_signals(signals)),
         "publication_status": redact_text(str(publication.get("status") or "")),
         "tracker_status": redact_text(str(tracker.get("status") or "")),
+        "repair_stop": redact_artifact_value(repair_stop_record(state, publication)),
         "signals": signals,
         "recommended_follow_up": _legacy_recommended_follow_up(follow_up["recommended"]),
         "follow_up": follow_up,
@@ -308,10 +309,12 @@ def _retrospective_judge_signal_scope(
     if publication.get("status") != "blocked":
         return "pipeline-process"
     reason = string_field(publication, "reason") or ""
+    repair_stop = repair_stop_record(state or {}, publication)
     if not (
         reason.startswith("review did not reach passed: request_revision")
         or reason.startswith("review feedback retry budget exhausted:")
         or reason.startswith("review requested changes:")
+        or string_field(repair_stop, "scope") == "target-work"
     ):
         return "pipeline-process"
     review = state.get("review") if isinstance(state, dict) and isinstance(state.get("review"), dict) else {}
@@ -325,7 +328,7 @@ def _retrospective_judge_signal_scope(
         return "pipeline-process"
     if not any(
         isinstance(signal, dict)
-        and string_field(signal, "kind") == "retry-or-blocked"
+        and string_field(signal, "kind") in {"retry-or-blocked", "repair-stop"}
         and string_field(signal, "scope") == "target-work"
         for signal in existing_signals
     ):
@@ -1966,6 +1969,18 @@ def _blocked_retrospective_signals(state: dict[str, Any], publication: dict[str,
     reason = string_field(publication, "reason") or ""
     if publication.get("status") != "blocked" or not reason:
         return []
+    repair_stop = repair_stop_record(state, publication)
+    if repair_stop:
+        return [
+            {
+                "kind": "repair-stop",
+                "scope": repair_stop["scope"],
+                "severity": "error",
+                "summary": repair_stop["reason"],
+                "classification": repair_stop["classification"],
+                "evidence_paths": repair_stop["evidence_paths"],
+            }
+        ]
     implementation_auth_signal = _implementation_auth_retrospective_signal(state, reason)
     if implementation_auth_signal is not None:
         return [implementation_auth_signal]
