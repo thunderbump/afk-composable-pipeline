@@ -320,6 +320,10 @@ raise SystemExit(9)
                 ["project:bump-eqemu", "ready-for-agent"],
             )
             self.assertEqual(
+                payload["selection_request"]["sources"][0]["target_repo"],
+                "thunderbump/bump-EQEmu",
+            )
+            self.assertEqual(
                 payload["selection_request"]["sources"][1]["labels"],
                 ["project:bump-eqemu", "ready-for-agent"],
             )
@@ -2582,6 +2586,106 @@ else:
                     (
                         "central-zwk",
                         "open_afk_pr_exists:workstream=central-zwk,pr_url=https://github.example/pr/31",
+                    )
+                ],
+            )
+
+    def test_run_next_skips_beads_item_when_target_repo_has_open_afk_pr_for_workstream_branch(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            fake_bin = temp_path / "bin"
+            beads_workspace = temp_path / "beads"
+            checkout_root = temp_path / "checkouts"
+            checkout_path = checkout_root / "bump-EQEmu"
+            secret_dir = beads_workspace / "secrets"
+            secret_dir.mkdir(parents=True)
+            secret_dir.joinpath("dolt_beads_password.txt").write_text("beads-secret", encoding="utf-8")
+            fake_bin.mkdir()
+            write_executable(
+                fake_bin / "gh",
+                f"""#!{sys.executable}
+import json
+import sys
+
+if sys.argv[1:3] == ["auth", "status"]:
+    sys.exit(0)
+if sys.argv[1:3] == ["pr", "list"]:
+    print(json.dumps([
+        {{
+            "url": "https://github.com/thunderbump/bump-EQEmu/pull/32",
+            "headRefName": "afk/central-lhy-15"
+        }}
+    ]))
+    sys.exit(0)
+raise SystemExit(9)
+""",
+            )
+            write_executable(
+                fake_bin / "bd",
+                f"""#!{sys.executable}
+import json
+import sys
+
+if sys.argv[1:2] == ["list"]:
+    print(json.dumps([{{"id": "central-lhy.15"}}, {{"id": "central-next.1"}}]))
+elif sys.argv[1:3] == ["show", "central-lhy.15"]:
+    print(json.dumps({{
+        "id": "central-lhy.15",
+        "title": "Already published source Bead",
+        "status": "open",
+        "labels": ["project:bump-eqemu", "ready-for-agent"],
+        "metadata": {{"afk.ready": True, "workstream": "central-lhy.15"}},
+        "acceptance_criteria": ["Should be skipped while target PR stays open"],
+        "notes": "Open PR https://github.com/thunderbump/bump-EQEmu/pull/32",
+        "dependencies": [],
+    }}))
+elif sys.argv[1:3] == ["show", "central-next.1"]:
+    print(json.dumps({{
+        "id": "central-next.1",
+        "title": "Fresh source Bead",
+        "status": "open",
+        "labels": ["project:bump-eqemu", "ready-for-agent"],
+        "metadata": {{"afk.ready": True, "workstream": "central-next"}},
+        "acceptance_criteria": ["Should still be selected"],
+        "dependencies": [],
+    }}))
+else:
+    raise SystemExit(9)
+""",
+            )
+
+            completed = run_afk(
+                "run-next",
+                "--project",
+                "bump-eqemu",
+                "--contracts-dir",
+                "project-contracts",
+                "--beads-workspace",
+                str(beads_workspace),
+                "--checkout-root",
+                str(checkout_root),
+                "--checkout-path",
+                str(checkout_path),
+                "--validation-profile",
+                "tier1",
+                "--role-profile",
+                "fake-local",
+                env={"GH_TOKEN": "fake-token", "GITHUB_TOKEN": None, "PATH": str(fake_bin)},
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            payload = json.loads(completed.stdout)
+
+            self.assertEqual(payload["selector"]["selected"]["external_id"], "central-next.1")
+            self.assertEqual(
+                [
+                    (item["candidate"]["external_id"], item["reason"])
+                    for item in payload["selection_result"]["skipped_candidates"]
+                ],
+                [
+                    (
+                        "central-lhy.15",
+                        "open_afk_pr_exists:workstream=central-lhy.15,pr_url=https://github.com/thunderbump/bump-EQEmu/pull/32",
                     )
                 ],
             )

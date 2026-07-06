@@ -221,6 +221,7 @@ def build_selection_request(
 ) -> dict[str, Any]:
     required_labels = list(project_contract.beads_labels) + [ready_tag]
     tracker_root = (tracker_artifact_root or Path.cwd()).resolve(strict=False)
+    github_repo = github_repo_from_repo_url(project_contract.repo_url)
     sources = [
         {
             "type": "beads",
@@ -231,9 +232,9 @@ def build_selection_request(
             "labels": required_labels,
             "status": "open",
             "tracker_artifact_roots": [str(tracker_root)],
+            "target_repo": github_repo,
         }
     ]
-    github_repo = github_repo_from_repo_url(project_contract.repo_url)
     if github_repo:
         sources.append(
             {

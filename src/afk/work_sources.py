@@ -8,6 +8,7 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+from afk.recipes import review_branch_for_workstream
 from afk.selection import deterministic_candidates
 
 SCHEMA_VERSION = 1
@@ -548,6 +549,7 @@ def load_beads_issues(source: dict[str, Any]) -> list[dict[str, Any]]:
         return normalized
 
     tracker_records_by_external_id = latest_tracker_records_by_source_item(source)
+    target_pr_records_by_branch = open_target_pr_records_by_branch(source)
     command = [
         "bd",
         "list",
@@ -583,6 +585,7 @@ def load_beads_issues(source: dict[str, Any]) -> list[dict[str, Any]]:
                 source,
                 issue,
                 tracker_records_by_external_id=tracker_records_by_external_id,
+                target_pr_records_by_branch=target_pr_records_by_branch,
             )
         )
     return normalized
@@ -670,6 +673,7 @@ def normalize_beads_issue(
     issue: dict[str, Any],
     *,
     tracker_records_by_external_id: dict[str, dict[str, str]] | None = None,
+    target_pr_records_by_branch: dict[str, dict[str, str]] | None = None,
 ) -> dict[str, Any]:
     issue_id = issue.get("id")
     if not is_non_blank_string(issue_id):
@@ -704,7 +708,9 @@ def normalize_beads_issue(
     if not source.get("target_ids"):
         selection_skip_reason = open_afk_pr_skip_reason(
             normalized["external_id"],
+            normalized.get("workstream"),
             tracker_records_by_external_id=tracker_records_by_external_id or {},
+            target_pr_records_by_branch=target_pr_records_by_branch or {},
         )
         if selection_skip_reason:
             normalized["selection_skip_reason"] = selection_skip_reason
@@ -782,13 +788,21 @@ def configured_ready_labels(source: dict[str, Any]) -> set[str]:
 
 def open_afk_pr_skip_reason(
     external_id: str,
+    workstream_id: Any,
     *,
     tracker_records_by_external_id: dict[str, dict[str, str]],
+    target_pr_records_by_branch: dict[str, dict[str, str]],
 ) -> str | None:
     tracker_record = latest_open_tracker_record(
         external_id,
         tracker_records_by_external_id=tracker_records_by_external_id,
     )
+    if tracker_record is None:
+        tracker_record = latest_open_target_pr_record(
+            external_id,
+            workstream_id=workstream_id,
+            target_pr_records_by_branch=target_pr_records_by_branch,
+        )
     if tracker_record is None:
         return None
     details = []
@@ -814,6 +828,65 @@ def latest_open_tracker_record(
     if record.get("status") not in OPEN_TRACKER_STATUSES:
         return None
     return record
+
+
+def latest_open_target_pr_record(
+    external_id: str,
+    *,
+    workstream_id: Any,
+    target_pr_records_by_branch: dict[str, dict[str, str]],
+) -> dict[str, str] | None:
+    workstream = str(workstream_id or external_id).strip()
+    if not workstream:
+        return None
+    record = target_pr_records_by_branch.get(review_branch_for_workstream(workstream))
+    if record is None:
+        return None
+    normalized = dict(record)
+    normalized["workstream_id"] = workstream
+    return normalized
+
+
+def open_target_pr_records_by_branch(source: dict[str, Any]) -> dict[str, dict[str, str]]:
+    repo = str(source.get("target_repo") or "").strip()
+    if not repo or shutil.which("gh") is None or not github_auth_available():
+        return {}
+    try:
+        payload = run_json_command(
+            [
+                "gh",
+                "pr",
+                "list",
+                "--repo",
+                repo,
+                "--state",
+                "open",
+                "--limit",
+                "100",
+                "--json",
+                "url,headRefName",
+            ],
+            status_on_failure="skipped_unreachable",
+            message_on_failure="gh pr list failed",
+        )
+    except SourceLoadError as exc:
+        if exc.status == "failed_invalid_payload":
+            raise
+        return {}
+    if not isinstance(payload, list):
+        raise SourceLoadError("failed_invalid_payload", "gh pr list returned invalid JSON payload")
+    records: dict[str, dict[str, str]] = {}
+    for item in payload:
+        if not isinstance(item, dict):
+            raise SourceLoadError("failed_invalid_payload", "gh pr list returned invalid PR")
+        head_ref_name = str(item.get("headRefName") or "").strip()
+        if not head_ref_name.startswith("afk/"):
+            continue
+        records[head_ref_name] = {
+            "status": "awaiting-review",
+            "pr_url": str(item.get("url") or "").strip(),
+        }
+    return records
 
 
 def latest_tracker_records_by_source_item(source: dict[str, Any]) -> dict[str, dict[str, str]]:
