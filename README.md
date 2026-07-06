@@ -3,6 +3,13 @@
 Small Python scaffold for composable AFK pipeline steps. The first public
 interface runs a no-op step and records evidence under a ledger directory.
 
+## Pipeline Guide
+
+For a narrative walkthrough of the current composed pipeline, including
+Mermaid flowcharts, repair-loop behavior, evidence artifacts, tracker state,
+project-contract boundaries, and the current post-publication gap, see
+[docs/pipeline-overview.md](docs/pipeline-overview.md).
+
 ## Usage
 
 Run through the installed console script:
