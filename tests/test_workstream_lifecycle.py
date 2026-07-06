@@ -25,6 +25,7 @@ from afk.workstream import (  # noqa: E402
 from afk.workstream_lifecycle import (  # noqa: E402
     LifecycleHooks,
     run_lifecycle,
+    stuck_same_finding_blocked_reason,
     terminal_selected_work_status,
     workstream_status_from_publication,
 )
@@ -804,6 +805,1178 @@ class WorkstreamLifecycleTest(unittest.TestCase):
                     "severity": "medium",
                     "summary": "Capture missing reviewer adapter config as follow-up evidence.",
                 }
+            ],
+        )
+
+    def test_run_lifecycle_blocks_when_same_review_finding_survives_repair(self):
+        recipe = normalize_recipe(
+            {
+                "workstream_id": "central-wfc9",
+                "parent": "central",
+                "review_branch": "afk/central-wfc9",
+                "steps": [
+                    {"name": "select-work", "input": {"sources": [{"type": "fixture", "id": "fixture", "items": [selected_fixture_item()]}]}},
+                    {"name": "prepare-checkout", "input": {"checkout_path": "/tmp/checkout"}},
+                    {"name": "implement", "input": {}},
+                    {"name": "validate", "profile": "tier1", "input": {"validation": {}}},
+                    {"name": "review", "input": {"role": "correctness"}},
+                ],
+                "publisher": {"enabled": False},
+                "repair_policy": {"mode": "progress_aware", "hard_cap": 2},
+                "review_feedback": {"enabled": True},
+            },
+            parent=None,
+            workstream_id=None,
+        )
+        repeated_finding = {
+            "status": "request_revision",
+            "severity": "high",
+            "role": "correctness",
+            "file": "src/demo.py",
+            "line": 41,
+            "summary": "Tracker close path still misses the empty review cycle case.",
+            "required_fix": "Handle the empty review cycle before publishing.",
+        }
+        runs = iter(
+            [
+                step_result("select-1", "select-work", {"status": "selected", "selected_work": [selected_fixture_item()]}),
+                step_result(
+                    "checkout-1",
+                    "prepare-checkout",
+                    {"status": "prepared", "checkout_path": "/tmp/checkout", "review_branch": "afk/central-wfc9", "start_commit": "base-1"},
+                ),
+                step_result(
+                    "implement-1",
+                    "implement",
+                    {
+                        "status": "implemented",
+                        "summary": "initial implementation",
+                        "work_item": selected_fixture_item(),
+                        "git": {"after_commit": "head-1", "changed_files": ["implemented.txt"], "dirty": False, "dirty_status": []},
+                    },
+                ),
+                step_result(
+                    "validate-1",
+                    "validate",
+                    {
+                        "status": "validated",
+                        "summary": "tests passed",
+                        "checkout": {"start_commit": "head-1"},
+                        "validation": {"requested_profile": "tier1"},
+                        "worker_result": {
+                            "normalized": {
+                                "status": "validated",
+                                "classification": "success",
+                                "summary": "tests passed",
+                            }
+                        },
+                    },
+                ),
+                step_result(
+                    "review-correctness-1",
+                    "review",
+                    {
+                        "status": "request_revision",
+                        "summary": "correctness review requested changes",
+                        "checkout": {"start_commit": "head-1"},
+                        "reviewer_result": {"findings": [dict(repeated_finding)]},
+                    },
+                ),
+                step_result(
+                    "review-bug-risk-1",
+                    "review",
+                    {
+                        "status": "passed",
+                        "summary": "bug-risk review passed",
+                        "checkout": {"start_commit": "head-1"},
+                        "reviewer_result": {"findings": []},
+                    },
+                ),
+                step_result(
+                    "checkout-2",
+                    "prepare-checkout",
+                    {"status": "prepared", "checkout_path": "/tmp/checkout", "review_branch": "afk/central-wfc9", "start_commit": "head-1"},
+                ),
+                step_result(
+                    "implement-2",
+                    "implement",
+                    {
+                        "status": "implemented",
+                        "summary": "repair implementation",
+                        "work_item": selected_fixture_item(),
+                        "git": {"after_commit": "head-2", "changed_files": ["repair.txt"], "dirty": False, "dirty_status": []},
+                    },
+                ),
+                step_result(
+                    "validate-2",
+                    "validate",
+                    {
+                        "status": "validated",
+                        "summary": "tests passed",
+                        "checkout": {"start_commit": "head-2"},
+                        "validation": {"requested_profile": "tier1"},
+                        "worker_result": {
+                            "normalized": {
+                                "status": "validated",
+                                "classification": "success",
+                                "summary": "tests passed",
+                            }
+                        },
+                    },
+                ),
+                step_result(
+                    "review-correctness-2",
+                    "review",
+                    {
+                        "status": "request_revision",
+                        "summary": "correctness review requested changes again",
+                        "checkout": {"start_commit": "head-2"},
+                        "reviewer_result": {"findings": [dict(repeated_finding)]},
+                    },
+                ),
+                step_result(
+                    "review-bug-risk-2",
+                    "review",
+                    {
+                        "status": "passed",
+                        "summary": "bug-risk review passed",
+                        "checkout": {"start_commit": "head-2"},
+                        "reviewer_result": {"findings": []},
+                    },
+                ),
+            ]
+        )
+
+        def runner(step_name, step_input, ledger_dir, project_contract):
+            return next(runs)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ledger_root = Path(temp_dir) / "ledger"
+            ledger = WorkstreamLedger(ledger_root, "run-stuck-review")
+            ledger.prepare()
+
+            outcome = run_lifecycle(
+                normalized=recipe,
+                run_id="run-stuck-review",
+                ledger_dir=ledger_root,
+                ledger=ledger,
+                step_runner=runner,
+                project_contract=None,
+                hooks=lifecycle_hooks(),
+            )
+
+        self.assertEqual(outcome.publication["status"], "blocked")
+        self.assertIn("stuck_same_finding", outcome.publication["reason"])
+        self.assertEqual(
+            [step["name"] for step in outcome.steps],
+            ["select-work", "prepare-checkout", "implement", "validate", "review", "prepare-checkout", "implement", "validate", "review"],
+        )
+
+    def test_run_lifecycle_blocks_when_same_issue_key_survives_repair_with_rephrased_text(self):
+        recipe = normalize_recipe(
+            {
+                "workstream_id": "central-wfc9",
+                "parent": "central",
+                "review_branch": "afk/central-wfc9",
+                "steps": [
+                    {"name": "select-work", "input": {"sources": [{"type": "fixture", "id": "fixture", "items": [selected_fixture_item()]}]}},
+                    {"name": "prepare-checkout", "input": {"checkout_path": "/tmp/checkout"}},
+                    {"name": "implement", "input": {}},
+                    {"name": "validate", "profile": "tier1", "input": {"validation": {}}},
+                    {"name": "review", "input": {"role": "correctness"}},
+                ],
+                "publisher": {"enabled": False},
+                "repair_policy": {"mode": "progress_aware", "hard_cap": 2},
+                "review_feedback": {"enabled": True},
+            },
+            parent=None,
+            workstream_id=None,
+        )
+        first_finding = {
+            "status": "request_revision",
+            "severity": "high",
+            "role": "correctness",
+            "file": "src/demo.py",
+            "line": 41,
+            "fingerprint": "correctness:empty-review-cycle",
+            "summary": "Publisher leaves terminal review state dangling after the cycle list is empty.",
+            "required_fix": "Guard terminal publish when the cycle list is empty.",
+        }
+        rephrased_finding = {
+            "status": "request_revision",
+            "severity": "high",
+            "role": "correctness",
+            "file": "src/demo.py",
+            "line": 41,
+            "fingerprint": "correctness:empty-review-cycle",
+            "summary": "Empty-cycle publish still breaks terminal state handling in the tracker path.",
+            "required_fix": "Add the missing empty-cycle publish guard.",
+        }
+        runs = iter(
+            [
+                step_result("select-1", "select-work", {"status": "selected", "selected_work": [selected_fixture_item()]}),
+                step_result(
+                    "checkout-1",
+                    "prepare-checkout",
+                    {"status": "prepared", "checkout_path": "/tmp/checkout", "review_branch": "afk/central-wfc9", "start_commit": "base-1"},
+                ),
+                step_result(
+                    "implement-1",
+                    "implement",
+                    {
+                        "status": "implemented",
+                        "summary": "initial implementation",
+                        "work_item": selected_fixture_item(),
+                        "git": {"after_commit": "head-1", "changed_files": ["implemented.txt"], "dirty": False, "dirty_status": []},
+                    },
+                ),
+                step_result(
+                    "validate-1",
+                    "validate",
+                    {
+                        "status": "validated",
+                        "summary": "tests passed",
+                        "checkout": {"start_commit": "head-1"},
+                        "validation": {"requested_profile": "tier1"},
+                        "worker_result": {
+                            "normalized": {
+                                "status": "validated",
+                                "classification": "success",
+                                "summary": "tests passed",
+                            }
+                        },
+                    },
+                ),
+                step_result(
+                    "review-correctness-1",
+                    "review",
+                    {
+                        "status": "request_revision",
+                        "summary": "correctness review requested changes",
+                        "checkout": {"start_commit": "head-1"},
+                        "reviewer_result": {"findings": [dict(first_finding)]},
+                    },
+                ),
+                step_result(
+                    "review-bug-risk-1",
+                    "review",
+                    {
+                        "status": "passed",
+                        "summary": "bug-risk review passed",
+                        "checkout": {"start_commit": "head-1"},
+                        "reviewer_result": {"findings": []},
+                    },
+                ),
+                step_result(
+                    "checkout-2",
+                    "prepare-checkout",
+                    {"status": "prepared", "checkout_path": "/tmp/checkout", "review_branch": "afk/central-wfc9", "start_commit": "head-1"},
+                ),
+                step_result(
+                    "implement-2",
+                    "implement",
+                    {
+                        "status": "implemented",
+                        "summary": "repair implementation",
+                        "work_item": selected_fixture_item(),
+                        "git": {"after_commit": "head-2", "changed_files": ["repair.txt"], "dirty": False, "dirty_status": []},
+                    },
+                ),
+                step_result(
+                    "validate-2",
+                    "validate",
+                    {
+                        "status": "validated",
+                        "summary": "tests passed",
+                        "checkout": {"start_commit": "head-2"},
+                        "validation": {"requested_profile": "tier1"},
+                        "worker_result": {
+                            "normalized": {
+                                "status": "validated",
+                                "classification": "success",
+                                "summary": "tests passed",
+                            }
+                        },
+                    },
+                ),
+                step_result(
+                    "review-correctness-2",
+                    "review",
+                    {
+                        "status": "request_revision",
+                        "summary": "correctness review requested changes again",
+                        "checkout": {"start_commit": "head-2"},
+                        "reviewer_result": {"findings": [dict(rephrased_finding)]},
+                    },
+                ),
+                step_result(
+                    "review-bug-risk-2",
+                    "review",
+                    {
+                        "status": "passed",
+                        "summary": "bug-risk review passed",
+                        "checkout": {"start_commit": "head-2"},
+                        "reviewer_result": {"findings": []},
+                    },
+                ),
+            ]
+        )
+
+        def runner(step_name, step_input, ledger_dir, project_contract):
+            return next(runs)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ledger_root = Path(temp_dir) / "ledger"
+            ledger = WorkstreamLedger(ledger_root, "run-stuck-review-rephrased")
+            ledger.prepare()
+
+            outcome = run_lifecycle(
+                normalized=recipe,
+                run_id="run-stuck-review-rephrased",
+                ledger_dir=ledger_root,
+                ledger=ledger,
+                step_runner=runner,
+                project_contract=None,
+                hooks=lifecycle_hooks(),
+            )
+
+        self.assertEqual(outcome.publication["status"], "blocked")
+        self.assertIn("stuck_same_finding", outcome.publication["reason"])
+        self.assertEqual(
+            [step["name"] for step in outcome.steps],
+            ["select-work", "prepare-checkout", "implement", "validate", "review", "prepare-checkout", "implement", "validate", "review"],
+        )
+
+    def test_stuck_same_finding_ignores_same_location_different_issue_keys(self):
+        state = {
+            "repair_history": [
+                {
+                    "trigger": "review_feedback",
+                    "review_fingerprints": [
+                        {
+                            "role": "correctness",
+                            "file": "src/demo.py",
+                            "line": 41,
+                            "stable_key": "correctness:empty-review-cycle",
+                            "required_fix": "guard terminal publish when the cycle list is empty",
+                            "summary": "publisher leaves terminal review state dangling after the cycle list is empty",
+                            "key": "guard terminal publish when the cycle list is empty",
+                        }
+                    ],
+                }
+            ]
+        }
+        findings = [
+            {
+                "role": "correctness",
+                "file": "src/demo.py",
+                "line": 41,
+                "stable_key": "correctness:mutated-status-after-publish",
+                "required_fix": "preserve tracker status after publish",
+                "summary": "tracker status mutates after publish on the same branch path",
+            }
+        ]
+
+        self.assertEqual(stuck_same_finding_blocked_reason(state, findings), "")
+
+    def test_stuck_same_finding_ignores_same_stable_key_across_different_roles(self):
+        state = {
+            "repair_history": [
+                {
+                    "trigger": "review_feedback",
+                    "review_fingerprints": [
+                        {
+                            "role": "correctness",
+                            "file": "src/demo.py",
+                            "line": 41,
+                            "stable_key": "empty-review-cycle",
+                            "required_fix": "guard terminal publish when the cycle list is empty",
+                            "summary": "publisher leaves terminal review state dangling after the cycle list is empty",
+                            "key": "guard terminal publish when the cycle list is empty",
+                        }
+                    ],
+                }
+            ]
+        }
+        findings = [
+            {
+                "role": "bug-risk",
+                "file": "src/demo.py",
+                "line": 41,
+                "stable_key": "empty-review-cycle",
+                "required_fix": "guard terminal publish when the cycle list is empty",
+                "summary": "publisher leaves terminal review state dangling after the cycle list is empty",
+            }
+        ]
+
+        self.assertEqual(stuck_same_finding_blocked_reason(state, findings), "")
+
+    def test_run_lifecycle_blocks_when_repair_has_no_delta(self):
+        recipe = normalize_recipe(
+            {
+                "workstream_id": "central-wfc9",
+                "parent": "central",
+                "review_branch": "afk/central-wfc9",
+                "steps": [
+                    {"name": "select-work", "input": {"sources": [{"type": "fixture", "id": "fixture", "items": [selected_fixture_item()]}]}},
+                    {"name": "prepare-checkout", "input": {"checkout_path": "/tmp/checkout"}},
+                    {"name": "implement", "input": {}},
+                    {"name": "validate", "profile": "tier1", "input": {"validation": {}}},
+                    {"name": "review", "input": {"role": "correctness"}},
+                ],
+                "publisher": {"enabled": False},
+                "repair_policy": {"mode": "progress_aware", "hard_cap": 2},
+                "review_feedback": {"enabled": True},
+            },
+            parent=None,
+            workstream_id=None,
+        )
+        runs = iter(
+            [
+                step_result("select-1", "select-work", {"status": "selected", "selected_work": [selected_fixture_item()]}),
+                step_result(
+                    "checkout-1",
+                    "prepare-checkout",
+                    {"status": "prepared", "checkout_path": "/tmp/checkout", "review_branch": "afk/central-wfc9", "start_commit": "base-1"},
+                ),
+                step_result(
+                    "implement-1",
+                    "implement",
+                    {
+                        "status": "implemented",
+                        "summary": "initial implementation",
+                        "work_item": selected_fixture_item(),
+                        "git": {"after_commit": "head-1", "changed_files": ["implemented.txt"], "dirty": False, "dirty_status": []},
+                    },
+                ),
+                step_result(
+                    "validate-1",
+                    "validate",
+                    {
+                        "status": "validated",
+                        "summary": "tests passed",
+                        "checkout": {"start_commit": "head-1"},
+                        "validation": {"requested_profile": "tier1"},
+                        "worker_result": {
+                            "normalized": {
+                                "status": "validated",
+                                "classification": "success",
+                                "summary": "tests passed",
+                            }
+                        },
+                    },
+                ),
+                step_result(
+                    "review-correctness-1",
+                    "review",
+                    {
+                        "status": "request_revision",
+                        "summary": "correctness review requested changes",
+                        "checkout": {"start_commit": "head-1"},
+                        "reviewer_result": {
+                            "findings": [
+                                {
+                                    "status": "request_revision",
+                                    "severity": "high",
+                                    "role": "correctness",
+                                    "summary": "Add the missing follow-up behavior.",
+                                    "required_fix": "Add the missing follow-up behavior.",
+                                }
+                            ]
+                        },
+                    },
+                ),
+                step_result(
+                    "review-bug-risk-1",
+                    "review",
+                    {
+                        "status": "passed",
+                        "summary": "bug-risk review passed",
+                        "checkout": {"start_commit": "head-1"},
+                        "reviewer_result": {"findings": []},
+                    },
+                ),
+                step_result(
+                    "checkout-2",
+                    "prepare-checkout",
+                    {"status": "prepared", "checkout_path": "/tmp/checkout", "review_branch": "afk/central-wfc9", "start_commit": "head-1"},
+                ),
+                step_result(
+                    "implement-2",
+                    "implement",
+                    {
+                        "status": "implemented",
+                        "summary": "repair implementation",
+                        "work_item": selected_fixture_item(),
+                        "git": {"after_commit": "head-1", "changed_files": [], "dirty": False, "dirty_status": []},
+                    },
+                ),
+            ]
+        )
+
+        def runner(step_name, step_input, ledger_dir, project_contract):
+            return next(runs)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ledger_root = Path(temp_dir) / "ledger"
+            ledger = WorkstreamLedger(ledger_root, "run-no-delta")
+            ledger.prepare()
+
+            outcome = run_lifecycle(
+                normalized=recipe,
+                run_id="run-no-delta",
+                ledger_dir=ledger_root,
+                ledger=ledger,
+                step_runner=runner,
+                project_contract=None,
+                hooks=lifecycle_hooks(),
+            )
+
+        self.assertEqual(outcome.publication["status"], "blocked")
+        self.assertIn("no_repair_delta", outcome.publication["reason"])
+        self.assertEqual(
+            [step["name"] for step in outcome.steps],
+            ["select-work", "prepare-checkout", "implement", "validate", "review", "prepare-checkout", "implement"],
+        )
+
+    def test_run_lifecycle_blocks_when_repair_regresses_validation(self):
+        recipe = normalize_recipe(
+            {
+                "workstream_id": "central-wfc9",
+                "parent": "central",
+                "review_branch": "afk/central-wfc9",
+                "steps": [
+                    {"name": "select-work", "input": {"sources": [{"type": "fixture", "id": "fixture", "items": [selected_fixture_item()]}]}},
+                    {"name": "prepare-checkout", "input": {"checkout_path": "/tmp/checkout"}},
+                    {"name": "implement", "input": {}},
+                    {"name": "validate", "profile": "tier1", "input": {"validation": {}}},
+                    {"name": "review", "input": {"role": "correctness"}},
+                ],
+                "publisher": {"enabled": False},
+                "repair_policy": {"mode": "progress_aware", "hard_cap": 2},
+                "validation_feedback": {"enabled": True},
+                "review_feedback": {"enabled": True},
+            },
+            parent=None,
+            workstream_id=None,
+        )
+        runs = iter(
+            [
+                step_result("select-1", "select-work", {"status": "selected", "selected_work": [selected_fixture_item()]}),
+                step_result(
+                    "checkout-1",
+                    "prepare-checkout",
+                    {"status": "prepared", "checkout_path": "/tmp/checkout", "review_branch": "afk/central-wfc9", "start_commit": "base-1"},
+                ),
+                step_result(
+                    "implement-1",
+                    "implement",
+                    {
+                        "status": "implemented",
+                        "summary": "initial implementation",
+                        "work_item": selected_fixture_item(),
+                        "git": {"after_commit": "head-1", "changed_files": ["implemented.txt"], "dirty": False, "dirty_status": []},
+                    },
+                ),
+                step_result(
+                    "validate-1",
+                    "validate",
+                    {
+                        "status": "validated",
+                        "summary": "tests passed",
+                        "checkout": {"start_commit": "head-1"},
+                        "validation": {"requested_profile": "tier1"},
+                        "worker_result": {
+                            "normalized": {
+                                "status": "validated",
+                                "classification": "success",
+                                "summary": "tests passed",
+                            }
+                        },
+                    },
+                ),
+                step_result(
+                    "review-correctness-1",
+                    "review",
+                    {
+                        "status": "request_revision",
+                        "summary": "correctness review requested changes",
+                        "checkout": {"start_commit": "head-1"},
+                        "reviewer_result": {
+                            "findings": [
+                                {
+                                    "status": "request_revision",
+                                    "severity": "high",
+                                    "role": "correctness",
+                                    "summary": "Add the missing follow-up behavior.",
+                                    "required_fix": "Add the missing follow-up behavior.",
+                                }
+                            ]
+                        },
+                    },
+                ),
+                step_result(
+                    "review-bug-risk-1",
+                    "review",
+                    {
+                        "status": "passed",
+                        "summary": "bug-risk review passed",
+                        "checkout": {"start_commit": "head-1"},
+                        "reviewer_result": {"findings": []},
+                    },
+                ),
+                step_result(
+                    "checkout-2",
+                    "prepare-checkout",
+                    {"status": "prepared", "checkout_path": "/tmp/checkout", "review_branch": "afk/central-wfc9", "start_commit": "head-1"},
+                ),
+                step_result(
+                    "implement-2",
+                    "implement",
+                    {
+                        "status": "implemented",
+                        "summary": "repair implementation",
+                        "work_item": selected_fixture_item(),
+                        "git": {"after_commit": "head-2", "changed_files": ["repair.txt"], "dirty": False, "dirty_status": []},
+                    },
+                ),
+                step_result(
+                    "validate-2",
+                    "validate",
+                    {
+                        "status": "failed_validation",
+                        "summary": "tests failed after repair",
+                        "classification": "worker_failure",
+                        "checkout": {"start_commit": "head-2"},
+                        "validation": {"requested_profile": "tier1"},
+                        "actionable_failures": [
+                            {
+                                "category": "compiler",
+                                "reason": "demo.cpp:1: error: missing semicolon",
+                            }
+                        ],
+                        "worker_result": {
+                            "normalized": {
+                                "status": "failed_validation",
+                                "classification": "worker_failure",
+                                "summary": "tests failed after repair",
+                            }
+                        },
+                    },
+                ),
+            ]
+        )
+
+        def runner(step_name, step_input, ledger_dir, project_contract):
+            return next(runs)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ledger_root = Path(temp_dir) / "ledger"
+            ledger = WorkstreamLedger(ledger_root, "run-regressed-validation")
+            ledger.prepare()
+
+            outcome = run_lifecycle(
+                normalized=recipe,
+                run_id="run-regressed-validation",
+                ledger_dir=ledger_root,
+                ledger=ledger,
+                step_runner=runner,
+                project_contract=None,
+                hooks=lifecycle_hooks(),
+            )
+
+        self.assertEqual(outcome.publication["status"], "blocked")
+        self.assertIn("repair_regressed_validation", outcome.publication["reason"])
+        self.assertEqual(
+            [step["name"] for step in outcome.steps],
+            ["select-work", "prepare-checkout", "implement", "validate", "review", "prepare-checkout", "implement", "validate"],
+        )
+
+    def test_run_lifecycle_allows_changed_review_feedback_to_continue_repair_loop(self):
+        recipe = normalize_recipe(
+            {
+                "workstream_id": "central-wfc9",
+                "parent": "central",
+                "review_branch": "afk/central-wfc9",
+                "steps": [
+                    {"name": "select-work", "input": {"sources": [{"type": "fixture", "id": "fixture", "items": [selected_fixture_item()]}]}},
+                    {"name": "prepare-checkout", "input": {"checkout_path": "/tmp/checkout"}},
+                    {"name": "implement", "input": {}},
+                    {"name": "validate", "profile": "tier1", "input": {"validation": {}}},
+                    {"name": "review", "input": {"role": "correctness"}},
+                ],
+                "publisher": {"enabled": False},
+                "repair_policy": {"mode": "progress_aware", "hard_cap": 2},
+                "review_feedback": {"enabled": True},
+            },
+            parent=None,
+            workstream_id=None,
+        )
+        runs = iter(
+            [
+                step_result("select-1", "select-work", {"status": "selected", "selected_work": [selected_fixture_item()]}),
+                step_result(
+                    "checkout-1",
+                    "prepare-checkout",
+                    {"status": "prepared", "checkout_path": "/tmp/checkout", "review_branch": "afk/central-wfc9", "start_commit": "base-1"},
+                ),
+                step_result(
+                    "implement-1",
+                    "implement",
+                    {
+                        "status": "implemented",
+                        "summary": "initial implementation",
+                        "work_item": selected_fixture_item(),
+                        "git": {"after_commit": "head-1", "changed_files": ["implemented.txt"], "dirty": False, "dirty_status": []},
+                    },
+                ),
+                step_result(
+                    "validate-1",
+                    "validate",
+                    {
+                        "status": "validated",
+                        "summary": "tests passed",
+                        "checkout": {"start_commit": "head-1"},
+                        "validation": {"requested_profile": "tier1"},
+                        "worker_result": {
+                            "normalized": {
+                                "status": "validated",
+                                "classification": "success",
+                                "summary": "tests passed",
+                            }
+                        },
+                    },
+                ),
+                step_result(
+                    "review-correctness-1",
+                    "review",
+                    {
+                        "status": "request_revision",
+                        "summary": "correctness review requested changes",
+                        "checkout": {"start_commit": "head-1"},
+                        "reviewer_result": {
+                            "findings": [
+                                {
+                                    "status": "request_revision",
+                                    "severity": "high",
+                                    "role": "correctness",
+                                    "file": "src/demo.py",
+                                    "line": 41,
+                                    "summary": "Fix the empty review cycle path.",
+                                    "required_fix": "Handle the empty review cycle before publishing.",
+                                }
+                            ]
+                        },
+                    },
+                ),
+                step_result(
+                    "review-bug-risk-1",
+                    "review",
+                    {
+                        "status": "passed",
+                        "summary": "bug-risk review passed",
+                        "checkout": {"start_commit": "head-1"},
+                        "reviewer_result": {"findings": []},
+                    },
+                ),
+                step_result(
+                    "checkout-2",
+                    "prepare-checkout",
+                    {"status": "prepared", "checkout_path": "/tmp/checkout", "review_branch": "afk/central-wfc9", "start_commit": "head-1"},
+                ),
+                step_result(
+                    "implement-2",
+                    "implement",
+                    {
+                        "status": "implemented",
+                        "summary": "first repair implementation",
+                        "work_item": selected_fixture_item(),
+                        "git": {"after_commit": "head-2", "changed_files": ["repair-1.txt"], "dirty": False, "dirty_status": []},
+                    },
+                ),
+                step_result(
+                    "validate-2",
+                    "validate",
+                    {
+                        "status": "validated",
+                        "summary": "tests passed",
+                        "checkout": {"start_commit": "head-2"},
+                        "validation": {"requested_profile": "tier1"},
+                        "worker_result": {
+                            "normalized": {
+                                "status": "validated",
+                                "classification": "success",
+                                "summary": "tests passed",
+                            }
+                        },
+                    },
+                ),
+                step_result(
+                    "review-correctness-2",
+                    "review",
+                    {
+                        "status": "request_revision",
+                        "summary": "correctness review requested different changes",
+                        "checkout": {"start_commit": "head-2"},
+                        "reviewer_result": {
+                            "findings": [
+                                {
+                                    "status": "request_revision",
+                                    "severity": "high",
+                                    "role": "correctness",
+                                    "file": "src/other.py",
+                                    "line": 12,
+                                    "summary": "Fix the new post-repair issue.",
+                                    "required_fix": "Handle the follow-up edge case in the repair path.",
+                                }
+                            ]
+                        },
+                    },
+                ),
+                step_result(
+                    "review-bug-risk-2",
+                    "review",
+                    {
+                        "status": "passed",
+                        "summary": "bug-risk review passed",
+                        "checkout": {"start_commit": "head-2"},
+                        "reviewer_result": {"findings": []},
+                    },
+                ),
+                step_result(
+                    "checkout-3",
+                    "prepare-checkout",
+                    {"status": "prepared", "checkout_path": "/tmp/checkout", "review_branch": "afk/central-wfc9", "start_commit": "head-2"},
+                ),
+                step_result(
+                    "implement-3",
+                    "implement",
+                    {
+                        "status": "implemented",
+                        "summary": "second repair implementation",
+                        "work_item": selected_fixture_item(),
+                        "git": {"after_commit": "head-3", "changed_files": ["repair-2.txt"], "dirty": False, "dirty_status": []},
+                    },
+                ),
+                step_result(
+                    "validate-3",
+                    "validate",
+                    {
+                        "status": "validated",
+                        "summary": "tests passed",
+                        "checkout": {"start_commit": "head-3"},
+                        "validation": {"requested_profile": "tier1"},
+                        "worker_result": {
+                            "normalized": {
+                                "status": "validated",
+                                "classification": "success",
+                                "summary": "tests passed",
+                            }
+                        },
+                    },
+                ),
+                step_result(
+                    "review-correctness-3",
+                    "review",
+                    {
+                        "status": "passed",
+                        "summary": "correctness review passed",
+                        "checkout": {"start_commit": "head-3"},
+                        "reviewer_result": {"findings": []},
+                    },
+                ),
+                step_result(
+                    "review-bug-risk-3",
+                    "review",
+                    {
+                        "status": "passed",
+                        "summary": "bug-risk review passed",
+                        "checkout": {"start_commit": "head-3"},
+                        "reviewer_result": {"findings": []},
+                    },
+                ),
+            ]
+        )
+
+        def runner(step_name, step_input, ledger_dir, project_contract):
+            return next(runs)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ledger_root = Path(temp_dir) / "ledger"
+            ledger = WorkstreamLedger(ledger_root, "run-changed-feedback")
+            ledger.prepare()
+
+            outcome = run_lifecycle(
+                normalized=recipe,
+                run_id="run-changed-feedback",
+                ledger_dir=ledger_root,
+                ledger=ledger,
+                step_runner=runner,
+                project_contract=None,
+                hooks=lifecycle_hooks(),
+            )
+
+        self.assertEqual(outcome.publication["status"], "validated-unpublished")
+        self.assertEqual(
+            [step["name"] for step in outcome.steps],
+            [
+                "select-work",
+                "prepare-checkout",
+                "implement",
+                "validate",
+                "review",
+                "prepare-checkout",
+                "implement",
+                "validate",
+                "review",
+                "prepare-checkout",
+                "implement",
+                "validate",
+                "review",
+            ],
+        )
+
+    def test_run_lifecycle_allows_same_location_different_issue_to_continue_repair_loop(self):
+        recipe = normalize_recipe(
+            {
+                "workstream_id": "central-wfc9",
+                "parent": "central",
+                "review_branch": "afk/central-wfc9",
+                "steps": [
+                    {"name": "select-work", "input": {"sources": [{"type": "fixture", "id": "fixture", "items": [selected_fixture_item()]}]}},
+                    {"name": "prepare-checkout", "input": {"checkout_path": "/tmp/checkout"}},
+                    {"name": "implement", "input": {}},
+                    {"name": "validate", "profile": "tier1", "input": {"validation": {}}},
+                    {"name": "review", "input": {"role": "correctness"}},
+                ],
+                "publisher": {"enabled": False},
+                "repair_policy": {"mode": "progress_aware", "hard_cap": 2},
+                "review_feedback": {"enabled": True},
+            },
+            parent=None,
+            workstream_id=None,
+        )
+        runs = iter(
+            [
+                step_result("select-1", "select-work", {"status": "selected", "selected_work": [selected_fixture_item()]}),
+                step_result(
+                    "checkout-1",
+                    "prepare-checkout",
+                    {"status": "prepared", "checkout_path": "/tmp/checkout", "review_branch": "afk/central-wfc9", "start_commit": "base-1"},
+                ),
+                step_result(
+                    "implement-1",
+                    "implement",
+                    {
+                        "status": "implemented",
+                        "summary": "initial implementation",
+                        "work_item": selected_fixture_item(),
+                        "git": {"after_commit": "head-1", "changed_files": ["implemented.txt"], "dirty": False, "dirty_status": []},
+                    },
+                ),
+                step_result(
+                    "validate-1",
+                    "validate",
+                    {
+                        "status": "validated",
+                        "summary": "tests passed",
+                        "checkout": {"start_commit": "head-1"},
+                        "validation": {"requested_profile": "tier1"},
+                        "worker_result": {
+                            "normalized": {
+                                "status": "validated",
+                                "classification": "success",
+                                "summary": "tests passed",
+                            }
+                        },
+                    },
+                ),
+                step_result(
+                    "review-correctness-1",
+                    "review",
+                    {
+                        "status": "request_revision",
+                        "summary": "correctness review requested changes",
+                        "checkout": {"start_commit": "head-1"},
+                        "reviewer_result": {
+                            "findings": [
+                                {
+                                    "status": "request_revision",
+                                    "severity": "high",
+                                    "role": "correctness",
+                                    "file": "src/demo.py",
+                                    "line": 41,
+                                    "summary": "Fix the empty review cycle path.",
+                                    "required_fix": "Handle the empty review cycle before publishing.",
+                                }
+                            ]
+                        },
+                    },
+                ),
+                step_result(
+                    "review-bug-risk-1",
+                    "review",
+                    {
+                        "status": "passed",
+                        "summary": "bug-risk review passed",
+                        "checkout": {"start_commit": "head-1"},
+                        "reviewer_result": {"findings": []},
+                    },
+                ),
+                step_result(
+                    "checkout-2",
+                    "prepare-checkout",
+                    {"status": "prepared", "checkout_path": "/tmp/checkout", "review_branch": "afk/central-wfc9", "start_commit": "head-1"},
+                ),
+                step_result(
+                    "implement-2",
+                    "implement",
+                    {
+                        "status": "implemented",
+                        "summary": "first repair implementation",
+                        "work_item": selected_fixture_item(),
+                        "git": {"after_commit": "head-2", "changed_files": ["repair-1.txt"], "dirty": False, "dirty_status": []},
+                    },
+                ),
+                step_result(
+                    "validate-2",
+                    "validate",
+                    {
+                        "status": "validated",
+                        "summary": "tests passed",
+                        "checkout": {"start_commit": "head-2"},
+                        "validation": {"requested_profile": "tier1"},
+                        "worker_result": {
+                            "normalized": {
+                                "status": "validated",
+                                "classification": "success",
+                                "summary": "tests passed",
+                            }
+                        },
+                    },
+                ),
+                step_result(
+                    "review-correctness-2",
+                    "review",
+                    {
+                        "status": "request_revision",
+                        "summary": "correctness review requested different changes",
+                        "checkout": {"start_commit": "head-2"},
+                        "reviewer_result": {
+                            "findings": [
+                                {
+                                    "status": "request_revision",
+                                    "severity": "high",
+                                    "role": "correctness",
+                                    "file": "src/demo.py",
+                                    "line": 41,
+                                    "summary": "Fix the publish-state regression.",
+                                    "required_fix": "Stop mutating tracker status after publish.",
+                                }
+                            ]
+                        },
+                    },
+                ),
+                step_result(
+                    "review-bug-risk-2",
+                    "review",
+                    {
+                        "status": "passed",
+                        "summary": "bug-risk review passed",
+                        "checkout": {"start_commit": "head-2"},
+                        "reviewer_result": {"findings": []},
+                    },
+                ),
+                step_result(
+                    "checkout-3",
+                    "prepare-checkout",
+                    {"status": "prepared", "checkout_path": "/tmp/checkout", "review_branch": "afk/central-wfc9", "start_commit": "head-2"},
+                ),
+                step_result(
+                    "implement-3",
+                    "implement",
+                    {
+                        "status": "implemented",
+                        "summary": "second repair implementation",
+                        "work_item": selected_fixture_item(),
+                        "git": {"after_commit": "head-3", "changed_files": ["repair-2.txt"], "dirty": False, "dirty_status": []},
+                    },
+                ),
+                step_result(
+                    "validate-3",
+                    "validate",
+                    {
+                        "status": "validated",
+                        "summary": "tests passed",
+                        "checkout": {"start_commit": "head-3"},
+                        "validation": {"requested_profile": "tier1"},
+                        "worker_result": {
+                            "normalized": {
+                                "status": "validated",
+                                "classification": "success",
+                                "summary": "tests passed",
+                            }
+                        },
+                    },
+                ),
+                step_result(
+                    "review-correctness-3",
+                    "review",
+                    {
+                        "status": "passed",
+                        "summary": "correctness review passed",
+                        "checkout": {"start_commit": "head-3"},
+                        "reviewer_result": {"findings": []},
+                    },
+                ),
+                step_result(
+                    "review-bug-risk-3",
+                    "review",
+                    {
+                        "status": "passed",
+                        "summary": "bug-risk review passed",
+                        "checkout": {"start_commit": "head-3"},
+                        "reviewer_result": {"findings": []},
+                    },
+                ),
+            ]
+        )
+
+        def runner(step_name, step_input, ledger_dir, project_contract):
+            return next(runs)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ledger_root = Path(temp_dir) / "ledger"
+            ledger = WorkstreamLedger(ledger_root, "run-changed-same-location-feedback")
+            ledger.prepare()
+
+            outcome = run_lifecycle(
+                normalized=recipe,
+                run_id="run-changed-same-location-feedback",
+                ledger_dir=ledger_root,
+                ledger=ledger,
+                step_runner=runner,
+                project_contract=None,
+                hooks=lifecycle_hooks(),
+            )
+
+        self.assertEqual(outcome.publication["status"], "validated-unpublished")
+        self.assertEqual(
+            [step["name"] for step in outcome.steps],
+            [
+                "select-work",
+                "prepare-checkout",
+                "implement",
+                "validate",
+                "review",
+                "prepare-checkout",
+                "implement",
+                "validate",
+                "review",
+                "prepare-checkout",
+                "implement",
+                "validate",
+                "review",
             ],
         )
 
