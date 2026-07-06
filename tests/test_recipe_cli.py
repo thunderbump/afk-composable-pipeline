@@ -553,6 +553,62 @@ raise SystemExit(9)
             )
             self.assertNotIn("retrospective_judge", recipe)
 
+    def test_generate_recipe_production_defaults_to_project_worker_validation_when_available(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            output = temp_path / "recipe.json"
+            ledger = temp_path / "ledger"
+            beads_workspace = temp_path / "central-beads"
+            checkout_root = temp_path / "checkouts"
+            checkout_path = checkout_root / "bump-EQEmu"
+            beads_workspace.mkdir()
+
+            completed = run_afk(
+                "generate-recipe",
+                "--workstream-id",
+                "central-anh.6",
+                "--project",
+                "bump-eqemu",
+                "--contracts-dir",
+                "project-contracts",
+                "--ledger",
+                str(ledger),
+                "--beads-workspace",
+                str(beads_workspace),
+                "--checkout-root",
+                str(checkout_root),
+                "--checkout-path",
+                str(checkout_path),
+                "--validation-profile",
+                "tier1",
+                "--agent-mode",
+                "fake",
+                "--reviewer-mode",
+                "fake",
+                "--output",
+                str(output),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            recipe = json.loads(output.read_text(encoding="utf-8"))
+            validate = next(step for step in recipe["steps"] if step["name"] == "validate")
+
+            self.assertEqual(
+                validate["input"]["validation"],
+                {
+                    "profile": "tier1",
+                    "dry_run": False,
+                    "timeout_seconds": 3600,
+                    "worker_home": str(checkout_root / ".validation-worker" / "bump-EQEmu"),
+                    "stack": {
+                        "role": "validation",
+                        "path": str(checkout_root / "bump-akk-stack-validation"),
+                    },
+                },
+            )
+            self.assertNotIn("worker", validate["input"])
+            self.assertNotIn("validation_expectations", recipe)
+
     def test_generate_recipe_production_default_fails_fast_without_pi_auth_mounts(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)

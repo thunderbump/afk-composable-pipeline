@@ -161,6 +161,10 @@ def main(argv: list[str] | None = None) -> int:
         if path_error is not None:
             parser.error(path_error)
         try:
+            args.effective_validation_mode = effective_validation_mode(
+                args,
+                project_contract=project_contract,
+            )
             validation_input = recipe_validation_input_from_args(args, project_contract=project_contract)
             recipe_agent = recipe_agent_from_args(args, checkout_path=Path(args.checkout_path))
             reviewer = recipe_reviewer_from_args(args, checkout_path=Path(args.checkout_path))
@@ -185,7 +189,7 @@ def main(argv: list[str] | None = None) -> int:
                 publisher=recipe_publisher,
                 enable_review_feedback=args.role_profile == PRODUCTION_ROLE_PROFILE,
                 expect_generated_smoke_dry_run=(
-                    args.role_profile == FAKE_LOCAL_ROLE_PROFILE and args.validation_mode == "fake"
+                    args.role_profile == FAKE_LOCAL_ROLE_PROFILE and args.effective_validation_mode == "fake"
                 ),
             )
         except ValueError as exc:
@@ -221,7 +225,7 @@ def main(argv: list[str] | None = None) -> int:
         if path_error is not None:
             parser.error(path_error)
         try:
-            args.effective_validation_mode = effective_run_next_validation_mode(
+            args.effective_validation_mode = effective_validation_mode(
                 args,
                 project_contract=project_contract,
             )
@@ -334,7 +338,7 @@ def build_parser() -> argparse.ArgumentParser:
     generate_recipe_parser.add_argument(
         "--validation-mode",
         choices=("fake", "project-worker"),
-        default="fake",
+        default=None,
         help="Validation adapter mode to embed in the generated recipe",
     )
     generate_recipe_parser.add_argument(
@@ -611,13 +615,11 @@ def add_publisher_flags(parser: argparse.ArgumentParser) -> None:
     )
 
 
-def effective_run_next_validation_mode(args: argparse.Namespace, *, project_contract: ProjectContract) -> str:
+def effective_validation_mode(args: argparse.Namespace, *, project_contract: ProjectContract) -> str:
     requested_mode = args.validation_mode or "fake"
     if args.role_profile == FAKE_LOCAL_ROLE_PROFILE:
         return requested_mode
     if args.validation_mode is not None:
-        return requested_mode
-    if not args.execute:
         return requested_mode
     if not project_contract_has_default_worker(project_contract):
         return requested_mode
