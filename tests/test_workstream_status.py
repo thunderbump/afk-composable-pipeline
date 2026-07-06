@@ -1353,6 +1353,60 @@ class WorkstreamStatusMappingTest(unittest.TestCase):
         self.assertEqual(record["signals"][1]["scope"], "target-work")
         self.assertEqual(record["follow_up"]["recommended"], [])
 
+    def test_pipeline_retrospective_record_classifies_repair_stop_judge_failure_as_target_work(self):
+        state = retrospective_state()
+        state["review"] = {
+            "status": "request_revision",
+            "summary": "review requested changes",
+            "reviewer_result": {
+                "findings": [
+                    {
+                        "classification": "correctness",
+                        "summary": "Handle the empty review cycle before publishing.",
+                    }
+                ]
+            },
+        }
+        publication = {
+            "status": "blocked",
+            "reason": (
+                "stuck_same_finding: correctness src/demo.py:41: "
+                "Handle the empty review cycle before publishing."
+            ),
+        }
+
+        record = pipeline_retrospective_record(
+            state,
+            publication,
+            retrospective_tracker("validated"),
+        )
+
+        record = _apply_retrospective_judge(
+            record,
+            {
+                "enabled": True,
+                "status": "failed",
+                "classification": "judge_failure",
+                "summary": "Needs attention.",
+                "findings": [{"severity": "medium", "summary": "Outstanding issue remains."}],
+                "evidence": {
+                    "request_path": "retrospective-judge-request.json",
+                    "result_path": "retrospective-judge-result.json",
+                    "stdout_path": "retrospective-judge-stdout.log",
+                    "stderr_path": "retrospective-judge-stderr.log",
+                },
+            },
+            normalized=None,
+            publication=publication,
+            state=state,
+        )
+
+        self.assertEqual(record["signals"][0]["kind"], "repair-stop")
+        self.assertEqual(record["signals"][0]["scope"], "target-work")
+        self.assertEqual(record["signals"][1]["kind"], "retrospective-judge")
+        self.assertEqual(record["signals"][1]["scope"], "target-work")
+        self.assertEqual(record["follow_up"]["recommended"], [])
+
     def test_pipeline_retrospective_record_keeps_judge_follow_up_for_mixed_review_feedback_budget_block(self):
         state = retrospective_state()
         state["review"] = {

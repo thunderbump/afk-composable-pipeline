@@ -309,10 +309,12 @@ def _retrospective_judge_signal_scope(
     if publication.get("status") != "blocked":
         return "pipeline-process"
     reason = string_field(publication, "reason") or ""
+    repair_stop = repair_stop_record(state or {}, publication)
     if not (
         reason.startswith("review did not reach passed: request_revision")
         or reason.startswith("review feedback retry budget exhausted:")
         or reason.startswith("review requested changes:")
+        or string_field(repair_stop, "scope") == "target-work"
     ):
         return "pipeline-process"
     review = state.get("review") if isinstance(state, dict) and isinstance(state.get("review"), dict) else {}
@@ -326,7 +328,7 @@ def _retrospective_judge_signal_scope(
         return "pipeline-process"
     if not any(
         isinstance(signal, dict)
-        and string_field(signal, "kind") == "retry-or-blocked"
+        and string_field(signal, "kind") in {"retry-or-blocked", "repair-stop"}
         and string_field(signal, "scope") == "target-work"
         for signal in existing_signals
     ):
