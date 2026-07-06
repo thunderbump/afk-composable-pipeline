@@ -37,13 +37,7 @@ def _resolve_step_result_path(step: dict[str, Any], workstream_dir: Path) -> Pat
         candidate = (ledger_root / relative_path).resolve(strict=False)
         if _path_is_within_root(candidate, ledger_root) and candidate.is_file():
             return candidate
-    absolute_path = string_field(step, "result_abspath")
-    if not absolute_path:
-        return None
-    candidate = Path(absolute_path).resolve(strict=False)
-    if not _path_is_within_root(candidate, ledger_root) or not candidate.is_file():
-        return None
-    return candidate
+    return None
 
 
 def integrate_published_pr(

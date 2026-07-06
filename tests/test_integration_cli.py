@@ -1372,6 +1372,72 @@ raise SystemExit(0)
             self.assertNotEqual(completed.returncode, 0)
             self.assertIn("could not determine expected head SHA from published artifact", completed.stderr)
 
+    def test_integrate_pr_rejects_in_ledger_absolute_implement_result_without_current_relative_evidence(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            ledger = temp_path / "ledger"
+            workstream_dir = ledger / "workstreams" / "run-stale-in-ledger-head"
+            workstream_path = workstream_dir / "workstream-result.json"
+            publication_path = workstream_dir / "publication-result.json"
+            stale_result_path = ledger / "runs" / "old-implement" / "step-result.json"
+            stale_result_path.parent.mkdir(parents=True, exist_ok=True)
+            stale_result_path.write_text(
+                json.dumps({"output": {"git": {"after_commit": "stale-sha"}}}),
+                encoding="utf-8",
+            )
+            workstream_path.parent.mkdir(parents=True, exist_ok=True)
+            workstream_path.write_text(
+                json.dumps(
+                    {
+                        "workstream_id": "central-umi2.3",
+                        "publication": {
+                            "status": "published",
+                            "url": "https://github.com/acme/widgets/pull/17",
+                        },
+                        "steps": [
+                            {
+                                "name": "implement",
+                                "result_abspath": str(stale_result_path),
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            write_publication_result(publication_path)
+            fake_gh = temp_path / "fake-gh"
+            fake_calls = temp_path / "fake-calls.jsonl"
+            auth_dir = temp_path / "gh-config"
+            auth_dir.mkdir()
+            (auth_dir / "view.json").write_text(
+                json.dumps(
+                    {
+                        "number": 17,
+                        "url": "https://github.com/acme/widgets/pull/17",
+                        "state": "OPEN",
+                        "isDraft": False,
+                        "mergeStateStatus": "CLEAN",
+                        "headRefOid": "stale-sha",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (auth_dir / "checks.json").write_text(json.dumps([]), encoding="utf-8")
+            write_executable(fake_gh, fake_gh_script(fake_calls))
+
+            completed = run_afk(
+                "integrate-pr",
+                "--published-result",
+                str(publication_path),
+                "--policy",
+                json.dumps({"gh": {"path": str(fake_gh)}, "required_checks": []}),
+                "--gh-auth-config-dir",
+                str(auth_dir),
+            )
+
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("could not determine expected head SHA from published artifact", completed.stderr)
+
     def test_integrate_pr_uses_status_check_rollup_when_pr_checks_is_empty(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
