@@ -68,6 +68,7 @@ def integrate_published_pr(
         auth=request["auth"],
         failure_message="gh pr view returned invalid JSON payload",
     )
+    retry_context = prior_tracker_close_failure(request["output_dir"])
     observed_head = string_field(view_payload, "headRefOid") or ""
     merge_state_status = (string_field(view_payload, "mergeStateStatus") or "").upper()
     pr_state = (string_field(view_payload, "state") or "").upper()
@@ -90,16 +91,23 @@ def integrate_published_pr(
             checks_snapshots = normalize_check_snapshots(checks_payload)
             if checks_snapshots:
                 check_snapshots = merge_check_snapshots(check_snapshots, checks_snapshots)
-    decision, next_poll_seconds, remediation = classify_integration(
-        expected_head=request["expected_head_sha"],
-        observed_head=observed_head,
-        pr_state=pr_state,
-        is_draft=is_draft,
-        merge_state_status=merge_state_status,
-        check_snapshots=check_snapshots,
-        required_checks=request["required_checks"],
-        poll_seconds=request["poll_seconds"],
-    )
+    if retry_context:
+        decision, next_poll_seconds, remediation = (
+            "merge_ready",
+            0,
+            "Retry the recorded tracker close for the already-merged PR without attempting another merge.",
+        )
+    else:
+        decision, next_poll_seconds, remediation = classify_integration(
+            expected_head=request["expected_head_sha"],
+            observed_head=observed_head,
+            pr_state=pr_state,
+            is_draft=is_draft,
+            merge_state_status=merge_state_status,
+            check_snapshots=check_snapshots,
+            required_checks=request["required_checks"],
+            poll_seconds=request["poll_seconds"],
+        )
 
     result = {
         "schema_version": SCHEMA_VERSION,
@@ -131,6 +139,7 @@ def integrate_published_pr(
             result=result,
             view_payload=view_payload,
             view_command=view_command,
+            retry_context=retry_context,
         )
     write_json(request["output_dir"] / "integration-result.json", result)
     write_events(
@@ -219,8 +228,10 @@ def integrate_terminal_merge(
     result: dict[str, Any],
     view_payload: dict[str, Any],
     view_command: list[str],
+    retry_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    retry_context = prior_tracker_close_failure(request["output_dir"])
+    if retry_context is None:
+        retry_context = prior_tracker_close_failure(request["output_dir"])
     if retry_context:
         return retry_tracker_close(request=request, result=result, retry_context=retry_context, view_command=view_command)
 

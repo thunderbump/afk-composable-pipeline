@@ -533,6 +533,22 @@ raise SystemExit(0)
             self.assertEqual(first_result["merge"]["status"], "merged")
             self.assertEqual(first_result["tracker_close"]["status"], "failed")
 
+            (auth_dir / "view.json").write_text(
+                json.dumps(
+                    {
+                        "number": 17,
+                        "url": "https://github.com/acme/widgets/pull/17",
+                        "state": "MERGED",
+                        "isDraft": False,
+                        "mergeStateStatus": "UNKNOWN",
+                        "headRefOid": "abc123",
+                        "statusCheckRollup": [
+                            {"name": "build", "status": "COMPLETED", "conclusion": "SUCCESS"},
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
             (temp_path / "bd-ok").write_text("ok\n", encoding="utf-8")
             second = run_afk(
                 "integrate-pr",
