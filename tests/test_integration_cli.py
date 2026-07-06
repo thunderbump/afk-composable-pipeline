@@ -3,6 +3,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import textwrap
 import unittest
 from pathlib import Path
 
@@ -28,6 +29,42 @@ def run_afk(*args, env_extra=None):
 def write_executable(path: Path, content: str) -> None:
     path.write_text(content, encoding="utf-8")
     path.chmod(0o755)
+
+
+def git(cwd: Path, *args: str) -> str:
+    env = os.environ.copy()
+    env.update(
+        {
+            "GIT_AUTHOR_NAME": "AFK Test",
+            "GIT_AUTHOR_EMAIL": "afk-test@example.test",
+            "GIT_COMMITTER_NAME": "AFK Test",
+            "GIT_COMMITTER_EMAIL": "afk-test@example.test",
+            "GIT_ALLOW_PROTOCOL": "file",
+        }
+    )
+    completed = subprocess.run(
+        ["git", *args],
+        cwd=cwd,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise AssertionError(
+            f"git {' '.join(args)} failed\nstdout:\n{completed.stdout}\nstderr:\n{completed.stderr}"
+        )
+    return completed.stdout.strip()
+
+
+def init_repo(path: Path) -> None:
+    path.mkdir(parents=True)
+    git(path, "init", "--initial-branch", "main")
+    git(path, "config", "user.name", "AFK Test")
+    git(path, "config", "user.email", "afk-test@example.test")
+    (path / "README.md").write_text("seed\n", encoding="utf-8")
+    git(path, "add", "README.md")
+    git(path, "commit", "-m", "seed")
 
 
 def write_workstream_result(
@@ -92,12 +129,19 @@ import sys
 from pathlib import Path
 
 record = {{
+    "tool": "gh",
     "argv": sys.argv[1:],
     "cwd": os.getcwd(),
     "gh_config_dir": os.environ.get("GH_CONFIG_DIR", ""),
 }}
+if "--body-file" in sys.argv:
+    body_file = sys.argv[sys.argv.index("--body-file") + 1]
+    record["body"] = Path(body_file).read_text(encoding="utf-8")
 Path({str(fake_calls)!r}).open("a", encoding="utf-8").write(json.dumps(record) + "\\n")
 if sys.argv[1:4] == ["auth", "status", "--hostname"]:
+    raise SystemExit(0)
+if sys.argv[1:3] == ["pr", "create"]:
+    print("https://github.com/acme/widgets/pull/17")
     raise SystemExit(0)
 if sys.argv[1:3] == ["pr", "view"]:
     config_dir = Path(os.environ["GH_CONFIG_DIR"])
@@ -128,7 +172,311 @@ def output_dir_for(workstream_path: Path) -> Path:
     return workstream_path.parent / "output"
 
 
+def lifecycle_recipe(temp_path: Path, repo: Path, checkout: Path, fake_git: Path, fake_gh: Path, beads_workspace: Path) -> dict[str, object]:
+    agent_code = textwrap.dedent(
+        """
+        import json
+        import subprocess
+        from pathlib import Path
+
+        Path("implemented.txt").write_text("central-umi2.3\\n", encoding="utf-8")
+        subprocess.run(["git", "add", "implemented.txt"], check=True)
+        subprocess.run(["git", "commit", "-m", "implement central-umi2.3"], check=True)
+        Path("agent-result.json").write_text(
+            json.dumps({"status": "completed", "summary": "implemented lifecycle smoke"}),
+            encoding="utf-8",
+        )
+        """
+    ).strip()
+    worker_code = textwrap.dedent(
+        """
+        import json
+        import os
+        from pathlib import Path
+
+        request = json.loads(Path(os.environ["AFK_WORKER_REQUEST"]).read_text(encoding="utf-8"))
+        Path(os.environ["AFK_WORKER_RESULT"]).write_text(
+            json.dumps(
+                {
+                    "profile": request["profile"],
+                    "status": "pass",
+                    "failureCount": 0,
+                    "steps": [{"name": "unit", "status": "pass"}],
+                }
+            ),
+            encoding="utf-8",
+        )
+        """
+    ).strip()
+    reviewer_code = textwrap.dedent(
+        """
+        import json
+        import os
+        from pathlib import Path
+
+        request = json.loads(Path(os.environ["AFK_REVIEWER_REQUEST"]).read_text(encoding="utf-8"))
+        assert request["evidence_pack"]["validation"]["required"][0]["status"] == "validated"
+        Path(os.environ["AFK_REVIEWER_RESULT"]).write_text(
+            json.dumps({"status": "pass", "summary": "ready for PR", "findings": []}),
+            encoding="utf-8",
+        )
+        """
+    ).strip()
+    return {
+        "schema_version": 1,
+        "workstream_id": "central-umi2.3",
+        "parent": "central-umi2",
+        "review_branch": "afk/central-umi2-3",
+        "steps": [
+            {
+                "name": "select-work",
+                "input": {
+                    "required_labels": ["ready-for-agent"],
+                    "sources": [
+                        {
+                            "type": "beads",
+                            "id": "central",
+                            "workspace": str(beads_workspace),
+                            "workspace_kind": "central",
+                            "status": "open",
+                            "labels": ["project:afk-composable-pipeline", "ready-for-agent"],
+                        }
+                    ],
+                },
+            },
+            {
+                "name": "prepare-checkout",
+                "input": {
+                    "repo_url": str(repo),
+                    "base_ref": "main",
+                    "checkout_root": str(temp_path),
+                    "checkout_path": str(checkout),
+                },
+            },
+            {
+                "name": "implement",
+                "input": {
+                    "guardrails": ["stay within checkout"],
+                    "validation": {"profile": "tier1", "commands": []},
+                    "agent": {
+                        "type": "fake-pi-command",
+                        "command": [sys.executable, "-c", agent_code],
+                        "result_path": "agent-result.json",
+                    },
+                },
+            },
+            {
+                "name": "validate",
+                "profile": "tier1",
+                "input": {
+                    "validation": {"dry_run": True, "timeout_seconds": 30},
+                    "worker": {
+                        "type": "local-command",
+                        "command": [sys.executable, "-c", worker_code],
+                        "timeout_seconds": 10,
+                    },
+                },
+            },
+            {
+                "name": "review",
+                "input": {
+                    "guardrails": [{"name": "no secrets", "status": "pass"}],
+                    "cleanup": {"status": "clean", "resources": []},
+                    "reviewer": {
+                        "type": "fake-reviewer-command",
+                        "command": [sys.executable, "-c", reviewer_code],
+                        "timeout_seconds": 10,
+                    },
+                },
+            },
+        ],
+        "publisher": {
+            "enabled": True,
+            "mode": "create",
+            "git": {"path": str(fake_git), "push": True, "remote": "origin"},
+            "gh": {"path": str(fake_gh)},
+            "repo": "acme/widgets",
+            "base": "main",
+            "head": "afk/central-umi2-3",
+            "title": "central-umi2.3: lifecycle smoke",
+        },
+        "tracker": {"terminal_decision": {"review_feedback_status": "waived"}},
+    }
+
+
 class IntegrationCliTest(unittest.TestCase):
+    def test_integrate_pr_smoke_runs_full_fake_backed_lifecycle(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repo = temp_path / "repo-src"
+            checkout = temp_path / "checkout"
+            ledger = temp_path / "ledger"
+            beads_workspace = temp_path / "beads"
+            fake_bin = temp_path / "bin"
+            fake_bin.mkdir()
+            init_repo(repo)
+            (beads_workspace / "secrets").mkdir(parents=True)
+            (beads_workspace / "secrets" / "dolt_beads_password.txt").write_text("secret-password\n", encoding="utf-8")
+            fake_calls = temp_path / "fake-calls.jsonl"
+            fake_git = temp_path / "publisher-git"
+            fake_gh = fake_bin / "gh"
+            fake_bd = fake_bin / "bd"
+            auth_dir = temp_path / "gh-config"
+            auth_dir.mkdir()
+            (auth_dir / "view.json").write_text(
+                json.dumps(
+                    {
+                        "number": 17,
+                        "url": "https://github.com/acme/widgets/pull/17",
+                        "state": "OPEN",
+                        "isDraft": False,
+                        "mergeStateStatus": "CLEAN",
+                        "headRefOid": "placeholder",
+                        "statusCheckRollup": [{"name": "build", "status": "COMPLETED", "conclusion": "SUCCESS"}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (auth_dir / "view-merged.json").write_text(
+                json.dumps(
+                    {
+                        "url": "https://github.com/acme/widgets/pull/17",
+                        "mergeCommit": {"oid": "deadbeef"},
+                        "mergedAt": "2026-07-06T12:00:00Z",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (auth_dir / "checks.json").write_text(json.dumps([]), encoding="utf-8")
+            write_executable(
+                fake_git,
+                f"""#!{sys.executable}
+import json
+import os
+import sys
+from pathlib import Path
+
+Path({str(fake_calls)!r}).open("a", encoding="utf-8").write(
+    json.dumps({{"tool": "git", "argv": sys.argv[1:], "cwd": os.getcwd()}}) + "\\n"
+)
+raise SystemExit(0)
+""",
+            )
+            write_executable(fake_gh, fake_gh_script(fake_calls))
+            write_executable(
+                fake_bd,
+                f"""#!{sys.executable}
+import json
+import os
+import sys
+from pathlib import Path
+
+Path({str(fake_calls)!r}).open("a", encoding="utf-8").write(
+    json.dumps(
+        {{
+            "tool": "bd",
+            "argv": sys.argv[1:],
+            "cwd": os.getcwd(),
+            "password": os.environ.get("BEADS_DOLT_PASSWORD", ""),
+        }}
+    ) + "\\n"
+)
+if sys.argv[1:3] == ["list", "--json"]:
+    print(json.dumps([{{"id": "central-umi2.3"}}]))
+    raise SystemExit(0)
+if sys.argv[1:4] == ["show", "central-umi2.3", "--json"]:
+    print(
+        json.dumps(
+            {{
+                "id": "central-umi2.3",
+                "title": "Add fake-backed full lifecycle terminal integration smoke",
+                "status": "open",
+                "labels": ["project:afk-composable-pipeline", "ready-for-agent"],
+                "metadata": {{"workstream": "central-umi2", "afk.ready": True}},
+                "description": "Acceptance Criteria\\n- Add fake-backed smoke\\n",
+                "dependencies": [],
+            }}
+        )
+    )
+    raise SystemExit(0)
+if sys.argv[1:3] == ["close", "central-umi2.3"]:
+    raise SystemExit(0)
+raise SystemExit(9)
+""",
+            )
+
+            workstream_recipe = lifecycle_recipe(temp_path, repo, checkout, fake_git, fake_gh, beads_workspace)
+            published = run_afk(
+                "run-workstream",
+                "--workstream-id",
+                "central-umi2.3",
+                "--input",
+                json.dumps(workstream_recipe),
+                "--ledger",
+                str(ledger),
+                env_extra={
+                    "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+                    "GIT_ALLOW_PROTOCOL": "file",
+                    "GIT_AUTHOR_NAME": "AFK Test",
+                    "GIT_AUTHOR_EMAIL": "afk-test@example.test",
+                    "GIT_COMMITTER_NAME": "AFK Test",
+                    "GIT_COMMITTER_EMAIL": "afk-test@example.test",
+                },
+            )
+
+            self.assertEqual(published.returncode, 0, published.stderr)
+            published_summary = json.loads(published.stdout)
+            workstream_path = ledger / published_summary["result_path"]
+            workstream_result = json.loads(workstream_path.read_text(encoding="utf-8"))
+            implement_step = next(step for step in workstream_result["steps"] if step["name"] == "implement")
+            implement_result = json.loads((ledger / implement_step["result_path"]).read_text(encoding="utf-8"))
+            implemented_head = implement_result["output"]["git"]["after_commit"]
+            open_view = json.loads((auth_dir / "view.json").read_text(encoding="utf-8"))
+            open_view["headRefOid"] = implemented_head
+            (auth_dir / "view.json").write_text(json.dumps(open_view), encoding="utf-8")
+
+            integrated = run_afk(
+                "integrate-pr",
+                "--published-result",
+                str(workstream_path),
+                "--policy",
+                json.dumps({"gh": {"path": str(fake_gh)}, "required_checks": ["build"]}),
+                "--gh-auth-config-dir",
+                str(auth_dir),
+                env_extra={"PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}"},
+            )
+
+            self.assertEqual(integrated.returncode, 0, integrated.stderr)
+            integrated_summary = json.loads(integrated.stdout)
+            result = json.loads((output_dir_for(workstream_path) / "integration-result.json").read_text(encoding="utf-8"))
+            calls = [json.loads(line) for line in fake_calls.read_text(encoding="utf-8").splitlines()]
+
+            self.assertEqual(published_summary["status"], "published")
+            self.assertEqual(workstream_result["publication"]["status"], "published")
+            self.assertEqual(workstream_result["tracker"]["status"], "awaiting-review")
+            self.assertEqual(integrated_summary["command"], "integrate-pr")
+            self.assertEqual(integrated_summary["decision"], "merge_ready")
+            self.assertEqual(result["status"], "tracker-closed")
+            self.assertEqual(result["decision"], "merge_ready")
+            self.assertEqual(result["expected_head_sha"], implemented_head)
+            self.assertEqual(result["observed_head_sha"], implemented_head)
+            self.assertEqual(result["merge"]["status"], "merged")
+            self.assertEqual(result["merge"]["matched_head_sha"], implemented_head)
+            self.assertEqual(result["terminal_decision"]["status"], "merged")
+            self.assertEqual(result["terminal_decision"]["merge_commit"], "deadbeef")
+            self.assertEqual(result["tracker_close"]["status"], "closed")
+            self.assertEqual(result["tracker_close"]["command"], ["bd", "close", "central-umi2.3", "--reason", "merged via deadbeef"])
+            self.assertEqual(calls[0]["tool"], "bd")
+            self.assertEqual(calls[0]["argv"][:2], ["list", "--json"])
+            self.assertEqual(calls[1]["tool"], "bd")
+            self.assertEqual(calls[1]["argv"][:2], ["show", "central-umi2.3"])
+            self.assertIn(["push", "origin"], [call["argv"][:2] for call in calls if call["tool"] == "git"])
+            gh_commands = [call["argv"][:2] for call in calls if call["tool"] == "gh"]
+            self.assertIn(["pr", "create"], gh_commands)
+            self.assertEqual(gh_commands[-4:], [["auth", "status"], ["pr", "view"], ["pr", "merge"], ["pr", "view"]])
+            self.assertEqual(calls[-1]["tool"], "bd")
+            self.assertEqual(calls[-1]["argv"][:2], ["close", "central-umi2.3"])
+
     def test_integrate_pr_merges_exact_head_and_closes_bead(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)

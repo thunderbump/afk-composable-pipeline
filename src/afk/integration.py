@@ -181,7 +181,7 @@ def normalize_request(
     repo = publication_repo(publication, workstream)
     pr_number = publication_pr_number(publication, workstream)
     pr_url = publication_pr_url(publication, workstream)
-    expected_head_sha = publication_expected_head(publication, workstream)
+    expected_head_sha = publication_expected_head(publication, workstream, workstream_dir=workstream_dir)
     required_checks = normalize_required_checks(policy)
     if not repo:
         raise ValueError("could not determine repo from published artifact")
@@ -532,7 +532,12 @@ def publication_pr_url(publication: dict[str, Any], workstream: dict[str, Any]) 
     return ""
 
 
-def publication_expected_head(publication: dict[str, Any], workstream: dict[str, Any]) -> str:
+def publication_expected_head(
+    publication: dict[str, Any],
+    workstream: dict[str, Any],
+    *,
+    workstream_dir: Path | None = None,
+) -> str:
     for source in (
         publication,
         workstream.get("publication", {}) if isinstance(workstream.get("publication"), dict) else {},
@@ -550,13 +555,30 @@ def publication_expected_head(publication: dict[str, Any], workstream: dict[str,
         if step_name != "implement":
             continue
         output = step.get("output")
-        if not isinstance(output, dict):
-            continue
-        git_info = output.get("git")
-        if isinstance(git_info, dict):
-            head = string_field(git_info, "after_commit")
-            if head:
-                return head
+        if isinstance(output, dict):
+            git_info = output.get("git")
+            if isinstance(git_info, dict):
+                head = string_field(git_info, "after_commit")
+                if head:
+                    return head
+        if workstream_dir is not None:
+            result_path = string_field(step, "result_abspath")
+            if not result_path:
+                relative_path = string_field(step, "result_path")
+                if relative_path:
+                    result_path = str(workstream_dir.parent.parent / relative_path)
+            if result_path:
+                path = Path(result_path)
+                if path.is_file():
+                    payload = read_json_file(path)
+                    if isinstance(payload, dict):
+                        output = payload.get("output")
+                        if isinstance(output, dict):
+                            git_info = output.get("git")
+                            if isinstance(git_info, dict):
+                                head = string_field(git_info, "after_commit")
+                                if head:
+                                    return head
     return ""
 
 
@@ -747,7 +769,7 @@ def classify_terminal_integration(
         "repo": publication_repo(publication, workstream),
         "pr_number": publication_pr_number(publication, workstream),
         "pr_url": publication_pr_url(publication, workstream),
-        "expected_head_sha": publication_expected_head(publication, workstream),
+        "expected_head_sha": publication_expected_head(publication, workstream, workstream_dir=published_path.parent),
         "required_checks": normalize_required_checks(policy if isinstance(policy, dict) else {}),
         "auth": {
             "configured": True,
