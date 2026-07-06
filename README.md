@@ -267,6 +267,23 @@ validated HEAD. Those blocked cases include:
 - a failed validation followed by an attempt to start a fresh retry checkout
   while the previous retry checkout is still awaiting validation evidence
 
+Classify a published PR's current head/check state without merging:
+
+```sh
+PYTHONPATH=src python3 -m afk integrate-pr \
+  --published-result ledger/workstreams/<run-id>/workstream-result.json \
+  --policy '{"gh":{"path":"gh"},"poll_seconds":300}' \
+  --gh-auth-config-dir /work/mounts/gh-config
+```
+
+`integrate-pr` consumes a published `workstream-result.json` or
+`publication-result.json`, queries `gh pr view` and `gh pr checks`, then writes
+`integration-result.json` and `integration-events.jsonl` beside the published
+artifact. The first slice is classification-only: it records repo, PR number,
+expected/observed head SHAs, check snapshots, and a deterministic decision such
+as `checks_pending`, `checks_failed`, `checks_inconclusive`, `merge_ready`, or
+`merge_blocked`. It does not merge or close tracker items.
+
 Generated PR bodies include a `## Validation` section. Each validation bullet is
 nonblank and has this contract:
 

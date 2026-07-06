@@ -10,7 +10,9 @@ from typing import Any, Callable
 
 from afk.checkouts import checkout_path_error
 from afk.contracts import ContractError, ProjectContract, load_project_contract
+from afk.integration import integrate_published_pr
 from afk.jsonutil import canonical_json, sha256_json
+from afk.publication import PublicationConfigError, PublisherError
 from afk.redaction import redact_artifact_value
 from afk.recipes import (
     branch_slug,
@@ -300,6 +302,30 @@ def main(argv: list[str] | None = None) -> int:
         print(canonical_json(payload))
         return 0
 
+    if args.command == "integrate-pr":
+        try:
+            policy = json.loads(args.policy)
+        except json.JSONDecodeError as exc:
+            parser.error(f"--policy must be valid JSON: {exc.msg}")
+        try:
+            result = integrate_published_pr(
+                args.published_result,
+                policy=policy,
+                gh_auth_config_dir=args.gh_auth_config_dir,
+            )
+        except (OSError, PublicationConfigError, PublisherError, ValueError) as exc:
+            parser.error(str(exc))
+        print(
+            canonical_json(
+                {
+                    "command": "integrate-pr",
+                    "decision": result["decision"],
+                    "result_path": str(Path(args.published_result).resolve(strict=True).parent / "integration-result.json"),
+                }
+            )
+        )
+        return 0
+
     parser.print_help()
     return 1
 
@@ -429,6 +455,22 @@ def build_parser() -> argparse.ArgumentParser:
     add_retrospective_judge_flags(run_next_parser)
     add_retrospective_follow_up_flags(run_next_parser)
     add_publisher_flags(run_next_parser)
+
+    integrate_parser = subcommands.add_parser(
+        "integrate-pr",
+        help="Classify a published PR head/check state without merging",
+    )
+    integrate_parser.add_argument(
+        "--published-result",
+        required=True,
+        help="Path to publication-result.json or workstream-result.json",
+    )
+    integrate_parser.add_argument("--policy", required=True, help="JSON terminal integration policy")
+    integrate_parser.add_argument(
+        "--gh-auth-config-dir",
+        required=True,
+        help="Absolute GitHub CLI auth config directory",
+    )
 
     return parser
 
