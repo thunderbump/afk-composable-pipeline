@@ -462,6 +462,74 @@ class IntegrationCliTest(unittest.TestCase):
             self.assertEqual(result["decision"], "merge_ready")
             self.assertEqual(result["check_snapshots"], [{"name": "build", "workflow": "", "state": "COMPLETED", "bucket": "", "status": "passed", "link": ""}])
 
+    def test_integrate_pr_uses_status_check_rollup_when_pr_checks_json_is_unsupported(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            workstream_path = temp_path / "ledger" / "workstreams" / "run-rollup-unsupported" / "workstream-result.json"
+            write_workstream_result(workstream_path, expected_head="abc123")
+            fake_gh = temp_path / "fake-gh"
+            fake_calls = temp_path / "fake-calls.jsonl"
+            auth_dir = temp_path / "gh-config"
+            auth_dir.mkdir()
+            (auth_dir / "view.json").write_text(
+                json.dumps(
+                    {
+                        "number": 17,
+                        "url": "https://github.com/acme/widgets/pull/17",
+                        "state": "OPEN",
+                        "isDraft": False,
+                        "mergeStateStatus": "CLEAN",
+                        "headRefOid": "abc123",
+                        "statusCheckRollup": [
+                            {"name": "build", "status": "COMPLETED", "conclusion": "SUCCESS"},
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            write_executable(
+                fake_gh,
+                f"""#!{sys.executable}
+import json
+import os
+import sys
+from pathlib import Path
+
+record = {{
+    "argv": sys.argv[1:],
+    "cwd": os.getcwd(),
+    "gh_config_dir": os.environ.get("GH_CONFIG_DIR", ""),
+}}
+Path({str(fake_calls)!r}).open("a", encoding="utf-8").write(json.dumps(record) + "\\n")
+if sys.argv[1:4] == ["auth", "status", "--hostname"]:
+    raise SystemExit(0)
+if sys.argv[1:3] == ["pr", "view"]:
+    print(Path(os.environ["GH_CONFIG_DIR"]).joinpath("view.json").read_text(encoding="utf-8"))
+    raise SystemExit(0)
+if sys.argv[1:3] == ["pr", "checks"]:
+    sys.stderr.write("unknown flag: --json\\n")
+    raise SystemExit(1)
+raise SystemExit(9)
+""",
+            )
+
+            completed = run_afk(
+                "integrate-pr",
+                "--published-result",
+                str(workstream_path),
+                "--policy",
+                json.dumps({"gh": {"path": str(fake_gh)}, "required_checks": ["build"], "poll_seconds": 60}),
+                "--gh-auth-config-dir",
+                str(auth_dir),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            result = json.loads((output_dir_for(workstream_path) / "integration-result.json").read_text(encoding="utf-8"))
+            calls = [json.loads(line) for line in fake_calls.read_text(encoding="utf-8").splitlines()]
+            self.assertEqual(result["decision"], "merge_ready")
+            self.assertEqual(result["check_snapshots"], [{"name": "build", "workflow": "", "state": "COMPLETED", "bucket": "", "status": "passed", "link": ""}])
+            self.assertEqual([call["argv"][0:2] for call in calls], [["auth", "status"], ["pr", "view"]])
+
     def test_integrate_pr_writes_run_scoped_output_paths(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)

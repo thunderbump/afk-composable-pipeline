@@ -6,7 +6,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from afk.jsonutil import canonical_json
-from afk.publication import publisher_auth_artifact, run_publisher_command, validate_publisher_auth_config
+from afk.publication import PublisherError, publisher_auth_artifact, run_publisher_command, validate_publisher_auth_config
 from afk.redaction import redact_artifact_value, redact_text
 from afk.schema_helpers import string_field
 
@@ -66,20 +66,28 @@ def integrate_published_pr(
         auth=request["auth"],
         failure_message="gh pr view returned invalid JSON payload",
     )
-    checks_payload = load_json_command(
-        checks_command,
-        cwd=request["command_cwd"],
-        auth=request["auth"],
-        failure_message="gh pr checks returned invalid JSON payload",
-    )
-
     observed_head = string_field(view_payload, "headRefOid") or ""
     merge_state_status = (string_field(view_payload, "mergeStateStatus") or "").upper()
     pr_state = (string_field(view_payload, "state") or "").upper()
     is_draft = bool(view_payload.get("isDraft"))
-    check_snapshots = normalize_check_snapshots(checks_payload)
-    if not check_snapshots:
-        check_snapshots = normalize_status_check_rollup(view_payload.get("statusCheckRollup"))
+    check_snapshots = normalize_status_check_rollup(view_payload.get("statusCheckRollup"))
+    checks_by_name = {item["name"] for item in check_snapshots if item["name"]}
+    needs_pr_checks = not check_snapshots or any(name not in checks_by_name for name in request["required_checks"])
+    if needs_pr_checks:
+        try:
+            checks_payload = load_json_command(
+                checks_command,
+                cwd=request["command_cwd"],
+                auth=request["auth"],
+                failure_message="gh pr checks returned invalid JSON payload",
+            )
+        except (PublisherError, ValueError):
+            if not check_snapshots:
+                raise
+        else:
+            checks_snapshots = normalize_check_snapshots(checks_payload)
+            if checks_snapshots:
+                check_snapshots = checks_snapshots
     decision, next_poll_seconds, remediation = classify_integration(
         expected_head=request["expected_head_sha"],
         observed_head=observed_head,
