@@ -42,6 +42,48 @@ def tracker_state():
 
 
 class TrackingModuleTest(unittest.TestCase):
+    def test_build_tracker_record_includes_repair_stop_evidence(self):
+        state = tracker_state()
+        state["implementation_result_path"] = "runs/implement/step-result.json"
+        state["review_result_path"] = "runs/review/step-result.json"
+        state["review"] = {
+            "status": "request_revision",
+            "summary": "review requested changes",
+            "reviewer_result": {
+                "findings": [
+                    {
+                        "classification": "correctness",
+                        "summary": "Guard terminal publish when the cycle list is empty.",
+                    }
+                ]
+            },
+        }
+        record = build_tracker_record(
+            TrackerContext(
+                schema_version=1,
+                normalized={"workstream_id": "central-afk-pr.17", "tracker": {"terminal_decision": {}}},
+                state=state,
+                publication={
+                    "status": "blocked",
+                    "reason": (
+                        "stuck_same_finding: correctness src/demo.py:41: "
+                        "Guard terminal publish when the cycle list is empty."
+                    ),
+                },
+                retrospective={},
+            )
+        )
+
+        self.assertEqual(record["repair_stop"]["classification"], "stuck_same_finding")
+        self.assertEqual(record["repair_stop"]["scope"], "target-work")
+        self.assertEqual(
+            record["repair_stop"]["evidence_paths"],
+            [
+                "runs/implement/step-result.json",
+                "runs/review/step-result.json",
+            ],
+        )
+
     def test_build_tracker_record_preserves_addressed_review_cycle_status(self):
         record = build_tracker_record(
             TrackerContext(

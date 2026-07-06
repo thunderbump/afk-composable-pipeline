@@ -11,6 +11,7 @@ from afk.workstream_lifecycle import (
     TERMINAL_REVIEW_FEEDBACK_STATUSES,
     has_current_validated_evidence,
     implemented_after_commit,
+    repair_stop_record,
     review_passed,
     string_field,
 )
@@ -248,6 +249,7 @@ def build_tracker_record(context: TrackerContext) -> dict[str, Any]:
     record = {
         "schema_version": context.schema_version,
         "status": tracker_progress_status(context.state),
+        "repair_stop": redact_artifact_value(repair_stop_record(context.state, context.publication)),
         "close_source_item": False,
         "close_reason": "",
         "comment": "",

@@ -114,3 +114,105 @@ class RetrospectiveModuleTest(unittest.TestCase):
         self.assertEqual(record["follow_up"]["recommended"], [])
         self.assertEqual(record["follow_up"]["created"], [])
         self.assertEqual(record["judge"], {"enabled": False, "status": "disabled"})
+
+    def test_build_pipeline_retrospective_includes_target_work_repair_stop_evidence(self):
+        state = retrospective_state()
+        state["review"] = {
+            "status": "request_revision",
+            "summary": "review requested changes",
+            "reviewer_result": {
+                "findings": [
+                    {
+                        "classification": "correctness",
+                        "summary": "Guard terminal publish when the cycle list is empty.",
+                    }
+                ]
+            },
+        }
+
+        record = build_pipeline_retrospective(
+            RetrospectiveContext(
+                state=state,
+                publication={
+                    "status": "blocked",
+                    "reason": (
+                        "stuck_same_finding: correctness src/demo.py:41: "
+                        "Guard terminal publish when the cycle list is empty."
+                    ),
+                },
+                tracker=retrospective_tracker("validated"),
+            )
+        )
+
+        self.assertEqual(record["repair_stop"]["classification"], "stuck_same_finding")
+        self.assertEqual(record["repair_stop"]["scope"], "target-work")
+        self.assertEqual(
+            record["repair_stop"]["evidence_paths"],
+            [
+                "/tmp/ledger/runs/impl/step-result.json",
+                "/tmp/ledger/runs/validate/step-result.json",
+                "/tmp/ledger/runs/validate/worker-result.json",
+                "runs/review/step-result.json",
+            ],
+        )
+        self.assertEqual(record["recommended_follow_up"], [])
+
+    def test_build_pipeline_retrospective_includes_regressed_validation_repair_stop_evidence(self):
+        record = build_pipeline_retrospective(
+            RetrospectiveContext(
+                state=retrospective_state(),
+                publication={
+                    "status": "blocked",
+                    "reason": "repair_regressed_validation: tests failed after repair",
+                },
+                tracker=retrospective_tracker("validated"),
+            )
+        )
+
+        self.assertEqual(record["repair_stop"]["classification"], "repair_regressed_validation")
+        self.assertEqual(record["repair_stop"]["scope"], "target-work")
+        self.assertEqual(
+            record["repair_stop"]["evidence_paths"],
+            [
+                "/tmp/ledger/runs/validate/step-result.json",
+                "/tmp/ledger/runs/validate/worker-result.json",
+            ],
+        )
+        self.assertEqual(record["recommended_follow_up"], [])
+
+    def test_build_pipeline_retrospective_includes_no_repair_delta_evidence(self):
+        record = build_pipeline_retrospective(
+            RetrospectiveContext(
+                state=retrospective_state(),
+                publication={
+                    "status": "blocked",
+                    "reason": "no_repair_delta: repair produced no implementation commit",
+                },
+                tracker=retrospective_tracker("validated"),
+            )
+        )
+
+        self.assertEqual(record["repair_stop"]["classification"], "no_repair_delta")
+        self.assertEqual(record["repair_stop"]["scope"], "target-work")
+        self.assertEqual(
+            record["repair_stop"]["evidence_paths"],
+            ["/tmp/ledger/runs/impl/step-result.json"],
+        )
+        self.assertEqual(record["recommended_follow_up"], [])
+
+    def test_build_pipeline_retrospective_keeps_process_failure_out_of_repair_stop(self):
+        record = build_pipeline_retrospective(
+            RetrospectiveContext(
+                state=retrospective_state(),
+                publication={
+                    "status": "failed-needs-human",
+                    "reason": "gh command failed",
+                    "command": ["gh", "auth", "status", "--hostname", "github.com"],
+                    "stderr_excerpt": "gh auth status failed",
+                },
+                tracker=retrospective_tracker("validated"),
+            )
+        )
+
+        self.assertEqual(record["repair_stop"], {})
+        self.assertEqual(record["signals"][0]["scope"], "pipeline-process")
