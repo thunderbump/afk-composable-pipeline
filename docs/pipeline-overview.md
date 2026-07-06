@@ -7,8 +7,9 @@ It is written against the runtime surfaces in `README.md`, `src/afk/*.py`,
 It intentionally separates:
 
 - the current minimal runtime path, which stops after PR publication; from
-- terminal integration and closure work, which is the next seam under active
-  design and implementation.
+- the shipped post-publication integration classifier, which inspects published
+  PR state without merging or closing; from
+- later merge/close and terminal retrospective work.
 
 If a behavior appears in tests or legacy code paths but is not part of the
 current documented minimal contract, this guide calls that out as a note or
@@ -30,12 +31,16 @@ Today the composed AFK workstream owns:
 Today the minimal runtime does not own:
 
 - waiting for external checks after PR publication;
-- interpreting GitHub review/check state over time;
 - merging the exact validated head as a first-class current contract;
 - closing the source tracker item after merge;
 - running a terminal retrospective worker after merge/no-merge.
 
-Those post-publication responsibilities are the seam described by the
+Today the repo also includes a separate post-publication classifier via
+`afk integrate-pr` / `src/afk/integration.py`. It consumes a published
+workstream/publication artifact, classifies PR/head/check state, and writes
+integration artifacts without merge/close behavior.
+
+Those later merge/close responsibilities are the seam described by the
 2026-07-06 spike in
 `~/Documents/rmd/Ceremonies/Personal Work/spikes/2026-07-06-afk-integration-merge-phase.md`
 and by Bead `central-umi2.1`.
@@ -57,15 +62,16 @@ flowchart LR
   Validate -. repair context .-> Implement
   Review -. repair context .-> Implement
 
-  Publish --> Stop[published / tracker still open]
-  Stop -. planned seam .-> Integrate[terminal integration worker]
-  Integrate --> Close[merge exact head + close tracker]
+  Publish --> Published[published / tracker still open]
+  Published --> Integrate[afk integrate-pr classifier]
+  Integrate --> Artifacts[integration-result.json<br/>integration-events.jsonl]
+  Artifacts -. later seam .-> Close[merge exact head + close tracker]
   Close --> Retro[terminal retrospective]
 ```
 
 The important boundary is after `publish PR`: the current runtime emits evidence
-for that state, but it does not yet treat merge/close as the default finished
-path.
+for that state, and the repo can now classify the published PR afterward, but
+it does not yet treat merge/close as the default finished path.
 
 ## Phase Walkthrough
 
@@ -228,7 +234,33 @@ The documented terminal publication states for the minimal path are:
 - `failed-needs-human`
 
 When the status is `published`, the source tracker item still remains open. That
-is the handoff point to a future terminal integration worker.
+is where the composed workstream stops today.
+
+### 8. Post-Publication Integration Classification
+
+After publication, the repo now includes a standalone terminal integration
+classifier:
+
+- CLI entrypoint: `afk integrate-pr`
+- implementation: `src/afk/integration.py`
+- input: `publication-result.json` or `workstream-result.json`
+- output: `output/integration-result.json` plus
+  `output/integration-events.jsonl`
+
+Its job is narrow on purpose:
+
+- read the published artifact and recover repo, PR number, and expected HEAD;
+- query GitHub for the live PR head and status checks;
+- classify the state as pending, failed, inconclusive, blocked, or
+  merge-ready;
+- write deterministic integration artifacts for a later operator or worker.
+
+It does not currently:
+
+- merge the PR;
+- close the source tracker item;
+- write the terminal retrospective;
+- extend the composed `run-workstream` contract past `published`.
 
 ## Evidence And Ledgers
 
@@ -248,6 +280,7 @@ flowchart TD
   Workstream --> Tracker[tracker-result.json]
   Workstream --> Retro[pipeline-retrospective.json]
   Workstream --> Body[pr-body.md]
+  Workstream --> Output[output/integration-result.json<br/>output/integration-events.jsonl]
 ```
 
 The workstream ledger is the operational summary:
@@ -256,6 +289,8 @@ The workstream ledger is the operational summary:
 - `publication-result.json` tells you whether AFK could publish;
 - `tracker-result.json` tells you whether the source item is still open and why;
 - `pipeline-retrospective.json` records deterministic process feedback;
+- `output/integration-result.json`, when present, records post-publication
+  PR/head/check classification;
 - `retrospective.json`, when present, stores user-supplied terminal evidence.
 
 In practice, the workstream ledger is the handoff package for any later
@@ -315,25 +350,31 @@ artifact family that should run after a real terminal decision exists.
 1. Current default runtime stop
 
    The documented minimal path stops at `published`. AFK emits enough evidence
-   for a later closer/integration worker, but it does not yet own the
-   asynchronous post-PR loop.
+   for later post-publication steps, but the composed workstream does not yet
+   own merge/close behavior.
 
-2. Terminal integration seam
+2. Current integration classifier
 
-   The next intended seam is a resumable worker that consumes published
-   workstream/publication artifacts, checks PR/head/check state, and only later
-   grows merge/close behavior. That is the focus of `central-umi2.1`.
+   `afk integrate-pr` already ships as a standalone classifier for published
+   workstream/publication artifacts. It observes PR/head/check state and writes
+   integration artifacts, but intentionally stops short of merge/close.
 
-3. Historical close-mode code and tests
+3. Merge/close seam
+
+   The next intended seam is to build on that classifier with exact-head merge,
+   source-item closure, and terminal retrospective behavior. That is the focus
+   of the `central-umi2` line of work.
+
+4. Historical close-mode code and tests
 
    This repo still contains `publisher.mode == "close"` paths and tests for
    merge plus source-item closure. The current README and active spike position
-   treat terminal integration as a separate seam, so those older close-mode
-   surfaces should be read as historical or transitional implementation detail
-   until the terminal integration worker contract is fully documented and
-   shipped.
+   treat post-publication integration as a separate seam, so those older
+   close-mode surfaces should be read as historical or transitional
+   implementation detail until the current integration contract is fully
+   documented and extended.
 
-4. Contract gap
+5. Contract gap
 
    Project contracts currently encode validation and PR-target facts, but not a
    dedicated terminal integration/check policy surface. Document that policy in
@@ -355,6 +396,7 @@ That sequence tells you:
 - what AFK attempted;
 - whether the implemented HEAD reached final gates;
 - whether publication succeeded;
+- whether post-publication classification has already been recorded;
 - why the tracker item is still open;
-- whether the next action belongs in implementation, publication resume, or a
-  future terminal integration phase.
+- whether the next action belongs in implementation, publication resume,
+  integration classification, or a later merge/close phase.
