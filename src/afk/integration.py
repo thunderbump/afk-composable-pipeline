@@ -22,6 +22,30 @@ PASSED_CHECK_STATES = {"SUCCESS", "PASS", "PASSED"}
 BLOCKED_MERGE_STATES = {"BLOCKED", "DIRTY", "UNKNOWN", "UNSTABLE", "BEHIND", "DRAFT"}
 
 
+def _path_is_within_root(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
+def _resolve_step_result_path(step: dict[str, Any], workstream_dir: Path) -> Path | None:
+    ledger_root = workstream_dir.parent.parent.resolve(strict=False)
+    relative_path = string_field(step, "result_path")
+    if relative_path:
+        candidate = (ledger_root / relative_path).resolve(strict=False)
+        if _path_is_within_root(candidate, ledger_root) and candidate.is_file():
+            return candidate
+    absolute_path = string_field(step, "result_abspath")
+    if not absolute_path:
+        return None
+    candidate = Path(absolute_path).resolve(strict=False)
+    if not _path_is_within_root(candidate, ledger_root) or not candidate.is_file():
+        return None
+    return candidate
+
+
 def integrate_published_pr(
     published_result_path: str | Path,
     *,
@@ -562,23 +586,17 @@ def publication_expected_head(
                 if head:
                     return head
         if workstream_dir is not None:
-            result_path = string_field(step, "result_abspath")
-            if not result_path:
-                relative_path = string_field(step, "result_path")
-                if relative_path:
-                    result_path = str(workstream_dir.parent.parent / relative_path)
-            if result_path:
-                path = Path(result_path)
-                if path.is_file():
-                    payload = read_json_file(path)
-                    if isinstance(payload, dict):
-                        output = payload.get("output")
-                        if isinstance(output, dict):
-                            git_info = output.get("git")
-                            if isinstance(git_info, dict):
-                                head = string_field(git_info, "after_commit")
-                                if head:
-                                    return head
+            path = _resolve_step_result_path(step, workstream_dir)
+            if path is not None:
+                payload = read_json_file(path)
+                if isinstance(payload, dict):
+                    output = payload.get("output")
+                    if isinstance(output, dict):
+                        git_info = output.get("git")
+                        if isinstance(git_info, dict):
+                            head = string_field(git_info, "after_commit")
+                            if head:
+                                return head
     return ""
 
 
