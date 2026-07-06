@@ -320,6 +320,10 @@ raise SystemExit(9)
                 ["project:bump-eqemu", "ready-for-agent"],
             )
             self.assertEqual(
+                payload["selection_request"]["sources"][0]["target_repo"],
+                "thunderbump/bump-EQEmu",
+            )
+            self.assertEqual(
                 payload["selection_request"]["sources"][1]["labels"],
                 ["project:bump-eqemu", "ready-for-agent"],
             )
@@ -448,10 +452,14 @@ raise SystemExit(9)
             write_executable(
                 fake_bin / "gh",
                 f"""#!{sys.executable}
+import json
 import sys
 
 if sys.argv[1:3] == ["auth", "status"]:
-    sys.exit(1)
+    sys.exit(0)
+if sys.argv[1:3] == ["pr", "list"]:
+    print(json.dumps([]))
+    sys.exit(0)
 raise SystemExit(9)
 """,
             )
@@ -554,10 +562,14 @@ else:
             write_executable(
                 fake_bin / "gh",
                 f"""#!{sys.executable}
+import json
 import sys
 
 if sys.argv[1:3] == ["auth", "status"]:
-    sys.exit(1)
+    sys.exit(0)
+if sys.argv[1:3] == ["pr", "list"]:
+    print(json.dumps([]))
+    sys.exit(0)
 raise SystemExit(9)
 """,
             )
@@ -691,10 +703,14 @@ raise SystemExit("bd should not be called when project-local .beads is rejected 
             write_executable(
                 fake_bin / "gh",
                 f"""#!{sys.executable}
+import json
 import sys
 
 if sys.argv[1:3] == ["auth", "status"]:
-    sys.exit(1)
+    sys.exit(0)
+if sys.argv[1:3] == ["pr", "list"]:
+    print(json.dumps([]))
+    sys.exit(0)
 raise SystemExit(9)
 """,
             )
@@ -772,10 +788,14 @@ else:
             write_executable(
                 fake_bin / "gh",
                 f"""#!{sys.executable}
+import json
 import sys
 
 if sys.argv[1:3] == ["auth", "status"]:
-    sys.exit(1)
+    sys.exit(0)
+if sys.argv[1:3] == ["pr", "list"]:
+    print(json.dumps([]))
+    sys.exit(0)
 raise SystemExit(9)
 """,
             )
@@ -945,10 +965,14 @@ raise SystemExit(9)
             write_executable(
                 fake_bin / "gh",
                 f"""#!{sys.executable}
+import json
 import sys
 
 if sys.argv[1:3] == ["auth", "status"]:
-    sys.exit(1)
+    sys.exit(0)
+if sys.argv[1:3] == ["pr", "list"]:
+    print(json.dumps([]))
+    sys.exit(0)
 raise SystemExit(9)
 """,
             )
@@ -1073,7 +1097,15 @@ raise SystemExit(9)
 
             write_executable(
                 fake_bin / "gh",
-                "#!%s\nraise SystemExit(1)\n" % sys.executable,
+                "#!%s\n"
+                "import json\n"
+                "import sys\n"
+                "if sys.argv[1:3] == ['auth', 'status']:\n"
+                "    raise SystemExit(0)\n"
+                "if sys.argv[1:3] == ['pr', 'list']:\n"
+                "    print(json.dumps([]))\n"
+                "    raise SystemExit(0)\n"
+                "raise SystemExit(1)\n" % sys.executable,
             )
             write_executable(
                 fake_bin / "bd",
@@ -1169,7 +1201,15 @@ raise SystemExit(9)
 
             write_executable(
                 fake_bin / "gh",
-                "#!%s\nraise SystemExit(1)\n" % sys.executable,
+                "#!%s\n"
+                "import json\n"
+                "import sys\n"
+                "if sys.argv[1:3] == ['auth', 'status']:\n"
+                "    raise SystemExit(0)\n"
+                "if sys.argv[1:3] == ['pr', 'list']:\n"
+                "    print(json.dumps([]))\n"
+                "    raise SystemExit(0)\n"
+                "raise SystemExit(1)\n" % sys.executable,
             )
             write_executable(
                 fake_bin / "bd",
@@ -1276,7 +1316,15 @@ raise SystemExit(9)
 
             write_executable(
                 fake_bin / "gh",
-                "#!%s\nraise SystemExit(1)\n" % sys.executable,
+                "#!%s\n"
+                "import json\n"
+                "import sys\n"
+                "if sys.argv[1:3] == ['auth', 'status']:\n"
+                "    raise SystemExit(0)\n"
+                "if sys.argv[1:3] == ['pr', 'list']:\n"
+                "    print(json.dumps([]))\n"
+                "    raise SystemExit(0)\n"
+                "raise SystemExit(1)\n" % sys.executable,
             )
             write_executable(
                 fake_bin / "bd",
@@ -1335,7 +1383,15 @@ raise SystemExit(9)
             secret_dir.joinpath("dolt_beads_password.txt").write_text("beads-secret", encoding="utf-8")
             write_executable(
                 fake_bin / "gh",
-                "#!%s\nraise SystemExit(1)\n" % sys.executable,
+                "#!%s\n"
+                "import json\n"
+                "import sys\n"
+                "if sys.argv[1:3] == ['auth', 'status']:\n"
+                "    raise SystemExit(0)\n"
+                "if sys.argv[1:3] == ['pr', 'list']:\n"
+                "    print(json.dumps([]))\n"
+                "    raise SystemExit(0)\n"
+                "raise SystemExit(1)\n" % sys.executable,
             )
             write_executable(
                 fake_bin / "bd",
@@ -2386,10 +2442,14 @@ raise SystemExit(9)
             write_executable(
                 fake_bin / "gh",
                 f"""#!{sys.executable}
+import json
 import sys
 
 if sys.argv[1:3] == ["auth", "status"]:
-    sys.exit(1)
+    sys.exit(0)
+if sys.argv[1:3] == ["pr", "list"]:
+    print(json.dumps([]))
+    sys.exit(0)
 raise SystemExit(9)
 """,
             )
@@ -2506,10 +2566,14 @@ else:
             write_executable(
                 fake_bin / "gh",
                 f"""#!{sys.executable}
+import json
 import sys
 
 if sys.argv[1:3] == ["auth", "status"]:
-    sys.exit(1)
+    sys.exit(0)
+if sys.argv[1:3] == ["pr", "list"]:
+    print(json.dumps([]))
+    sys.exit(0)
 raise SystemExit(9)
 """,
             )
@@ -2583,6 +2647,181 @@ else:
                         "central-zwk",
                         "open_afk_pr_exists:workstream=central-zwk,pr_url=https://github.example/pr/31",
                     )
+                ],
+            )
+
+    def test_run_next_skips_beads_item_when_target_repo_has_open_afk_pr_for_workstream_branch(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            fake_bin = temp_path / "bin"
+            beads_workspace = temp_path / "beads"
+            checkout_root = temp_path / "checkouts"
+            checkout_path = checkout_root / "bump-EQEmu"
+            secret_dir = beads_workspace / "secrets"
+            secret_dir.mkdir(parents=True)
+            secret_dir.joinpath("dolt_beads_password.txt").write_text("beads-secret", encoding="utf-8")
+            fake_bin.mkdir()
+            write_executable(
+                fake_bin / "gh",
+                f"""#!{sys.executable}
+import json
+import sys
+
+if sys.argv[1:3] == ["auth", "status"]:
+    sys.exit(0)
+if sys.argv[1:3] == ["pr", "list"]:
+    print(json.dumps([
+        {{
+            "url": "https://github.com/thunderbump/bump-EQEmu/pull/32",
+            "headRefName": "afk/central-lhy-15"
+        }}
+    ]))
+    sys.exit(0)
+raise SystemExit(9)
+""",
+            )
+            write_executable(
+                fake_bin / "bd",
+                f"""#!{sys.executable}
+import json
+import sys
+
+if sys.argv[1:2] == ["list"]:
+    print(json.dumps([{{"id": "central-lhy.15"}}, {{"id": "central-next.1"}}]))
+elif sys.argv[1:3] == ["show", "central-lhy.15"]:
+    print(json.dumps({{
+        "id": "central-lhy.15",
+        "title": "Already published source Bead",
+        "status": "open",
+        "labels": ["project:bump-eqemu", "ready-for-agent"],
+        "metadata": {{"afk.ready": True, "workstream": "central-lhy.15"}},
+        "acceptance_criteria": ["Should be skipped while target PR stays open"],
+        "notes": "Open PR https://github.com/thunderbump/bump-EQEmu/pull/32",
+        "dependencies": [],
+    }}))
+elif sys.argv[1:3] == ["show", "central-next.1"]:
+    print(json.dumps({{
+        "id": "central-next.1",
+        "title": "Fresh source Bead",
+        "status": "open",
+        "labels": ["project:bump-eqemu", "ready-for-agent"],
+        "metadata": {{"afk.ready": True, "workstream": "central-next"}},
+        "acceptance_criteria": ["Should still be selected"],
+        "dependencies": [],
+    }}))
+else:
+    raise SystemExit(9)
+""",
+            )
+
+            completed = run_afk(
+                "run-next",
+                "--project",
+                "bump-eqemu",
+                "--contracts-dir",
+                "project-contracts",
+                "--beads-workspace",
+                str(beads_workspace),
+                "--checkout-root",
+                str(checkout_root),
+                "--checkout-path",
+                str(checkout_path),
+                "--validation-profile",
+                "tier1",
+                "--role-profile",
+                "fake-local",
+                env={"GH_TOKEN": "fake-token", "GITHUB_TOKEN": None, "PATH": str(fake_bin)},
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            payload = json.loads(completed.stdout)
+
+            self.assertEqual(payload["selector"]["selected"]["external_id"], "central-next.1")
+            self.assertEqual(
+                [
+                    (item["candidate"]["external_id"], item["reason"])
+                    for item in payload["selection_result"]["skipped_candidates"]
+                ],
+                [
+                    (
+                        "central-lhy.15",
+                        "open_afk_pr_exists:workstream=central-lhy.15,pr_url=https://github.com/thunderbump/bump-EQEmu/pull/32",
+                    )
+                ],
+            )
+
+    def test_run_next_does_not_select_beads_item_when_target_repo_pr_lookup_has_no_auth(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            fake_bin = temp_path / "bin"
+            beads_workspace = temp_path / "beads"
+            checkout_root = temp_path / "checkouts"
+            checkout_path = checkout_root / "bump-EQEmu"
+            secret_dir = beads_workspace / "secrets"
+            secret_dir.mkdir(parents=True)
+            secret_dir.joinpath("dolt_beads_password.txt").write_text("beads-secret", encoding="utf-8")
+            fake_bin.mkdir()
+            write_executable(
+                fake_bin / "gh",
+                f"""#!{sys.executable}
+import sys
+
+if sys.argv[1:3] == ["auth", "status"]:
+    sys.exit(1)
+raise SystemExit(9)
+""",
+            )
+            write_executable(
+                fake_bin / "bd",
+                f"""#!{sys.executable}
+raise SystemExit("bd should not be called when target_repo PR lookup has no auth")
+""",
+            )
+
+            completed = run_afk(
+                "run-next",
+                "--project",
+                "bump-eqemu",
+                "--contracts-dir",
+                "project-contracts",
+                "--beads-workspace",
+                str(beads_workspace),
+                "--checkout-root",
+                str(checkout_root),
+                "--checkout-path",
+                str(checkout_path),
+                "--validation-profile",
+                "tier1",
+                "--role-profile",
+                "fake-local",
+                env={"GH_TOKEN": None, "GITHUB_TOKEN": None, "PATH": str(fake_bin)},
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            payload = json.loads(completed.stdout)
+
+            self.assertEqual(payload["selector"]["selected"], None)
+            self.assertEqual(payload["selector"]["rationale"], "no candidates")
+            self.assertEqual(payload["selection_result"]["selected_work"], [])
+            self.assertEqual(
+                payload["selection_result"]["source_statuses"],
+                [
+                    {
+                        "source_id": "central-beads",
+                        "source_type": "beads",
+                        "status": "skipped_no_auth",
+                        "candidate_count": 0,
+                        "selected_count": 0,
+                        "message": "GH_TOKEN or GITHUB_TOKEN is required for target_repo PR lookup",
+                    },
+                    {
+                        "source_id": "github",
+                        "source_type": "github_issues",
+                        "status": "skipped_no_auth",
+                        "candidate_count": 0,
+                        "selected_count": 0,
+                        "message": "GH_TOKEN or GITHUB_TOKEN is required",
+                    },
                 ],
             )
 
@@ -2680,10 +2919,14 @@ raise SystemExit(9)
             write_executable(
                 fake_bin / "gh",
                 f"""#!{sys.executable}
+import json
 import sys
 
 if sys.argv[1:3] == ["auth", "status"]:
-    sys.exit(1)
+    sys.exit(0)
+if sys.argv[1:3] == ["pr", "list"]:
+    print(json.dumps([]))
+    sys.exit(0)
 raise SystemExit(9)
 """,
             )
@@ -2791,10 +3034,14 @@ else:
             write_executable(
                 fake_bin / "gh",
                 f"""#!{sys.executable}
+import json
 import sys
 
 if sys.argv[1:3] == ["auth", "status"]:
-    sys.exit(1)
+    sys.exit(0)
+if sys.argv[1:3] == ["pr", "list"]:
+    print(json.dumps([]))
+    sys.exit(0)
 raise SystemExit(9)
 """,
             )
@@ -3310,6 +3557,9 @@ record = {{"argv": sys.argv[1:], "gh_config_dir": os.environ.get("GH_CONFIG_DIR"
 Path({str(fake_calls)!r}).open("a", encoding="utf-8").write(json.dumps(record) + "\\n")
 if sys.argv[1:4] == ["auth", "status", "--hostname"]:
     raise SystemExit(0)
+if sys.argv[1:3] == ["pr", "list"]:
+    print(json.dumps([]))
+    raise SystemExit(0)
 if sys.argv[1:3] == ["pr", "create"]:
     print("https://github.example/pr/123")
     raise SystemExit(0)
@@ -3500,6 +3750,9 @@ record = {{"argv": sys.argv[1:], "gh_config_dir": os.environ.get("GH_CONFIG_DIR"
 Path({str(fake_calls)!r}).open("a", encoding="utf-8").write(json.dumps(record) + "\\n")
 if sys.argv[1:4] == ["auth", "status", "--hostname"]:
     raise SystemExit(0)
+if sys.argv[1:3] == ["pr", "list"]:
+    print(json.dumps([]))
+    raise SystemExit(0)
 if sys.argv[1:3] == ["pr", "create"]:
     print("https://github.example/pr/123")
     raise SystemExit(0)
@@ -3584,6 +3837,18 @@ else:
             gh_config_dir.mkdir()
             (beads_workspace / "secrets").mkdir(parents=True)
             (beads_workspace / "secrets" / "dolt_beads_password.txt").write_text("beads-secret\n", encoding="utf-8")
+            write_executable(
+                fake_bin / "gh",
+                "#!%s\n"
+                "import json\n"
+                "import sys\n"
+                "if sys.argv[1:3] == ['auth', 'status']:\n"
+                "    raise SystemExit(0)\n"
+                "if sys.argv[1:3] == ['pr', 'list']:\n"
+                "    print(json.dumps([]))\n"
+                "    raise SystemExit(0)\n"
+                "raise SystemExit(1)\n" % sys.executable,
+            )
             write_executable(
                 fake_bin / "bd",
                 "#!%s\n"
@@ -4193,7 +4458,15 @@ sys.exit(0)
 
             write_executable(
                 fake_bin / "gh",
-                "#!%s\nraise SystemExit(1)\n" % sys.executable,
+                "#!%s\n"
+                "import json\n"
+                "import sys\n"
+                "if sys.argv[1:3] == ['auth', 'status']:\n"
+                "    raise SystemExit(0)\n"
+                "if sys.argv[1:3] == ['pr', 'list']:\n"
+                "    print(json.dumps([]))\n"
+                "    raise SystemExit(0)\n"
+                "raise SystemExit(1)\n" % sys.executable,
             )
             write_executable(
                 fake_bin / "bd",
@@ -4309,7 +4582,15 @@ sys.exit(0)
 
             write_executable(
                 fake_bin / "gh",
-                "#!%s\nraise SystemExit(1)\n" % sys.executable,
+                "#!%s\n"
+                "import json\n"
+                "import sys\n"
+                "if sys.argv[1:3] == ['auth', 'status']:\n"
+                "    raise SystemExit(0)\n"
+                "if sys.argv[1:3] == ['pr', 'list']:\n"
+                "    print(json.dumps([]))\n"
+                "    raise SystemExit(0)\n"
+                "raise SystemExit(1)\n" % sys.executable,
             )
             write_executable(
                 fake_bin / "bd",
@@ -4386,6 +4667,14 @@ sys.exit(0)
             write_executable(
                 fake_bin / "gh",
                 f"""#!{sys.executable}
+import json
+import sys
+
+if sys.argv[1:3] == ["auth", "status"]:
+    raise SystemExit(0)
+if sys.argv[1:3] == ["pr", "list"]:
+    print(json.dumps([]))
+    raise SystemExit(0)
 raise SystemExit(1)
 """,
             )
@@ -4439,6 +4728,14 @@ print(json.dumps({{"schema_version":1,"source_statuses":[],"selected_work":[],"s
             write_executable(
                 fake_bin / "gh",
                 f"""#!{sys.executable}
+import json
+import sys
+
+if sys.argv[1:3] == ["auth", "status"]:
+    raise SystemExit(0)
+if sys.argv[1:3] == ["pr", "list"]:
+    print(json.dumps([]))
+    raise SystemExit(0)
 raise SystemExit(1)
 """,
             )
@@ -4563,6 +4860,14 @@ print(json.dumps({{"schema_version":1,"source_statuses":[],"selected_work":[],"s
             write_executable(
                 fake_bin / "gh",
                 f"""#!{sys.executable}
+import json
+import sys
+
+if sys.argv[1:3] == ["auth", "status"]:
+    raise SystemExit(0)
+if sys.argv[1:3] == ["pr", "list"]:
+    print(json.dumps([]))
+    raise SystemExit(0)
 raise SystemExit(1)
 """,
             )
