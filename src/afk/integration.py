@@ -9,6 +9,8 @@ from afk.jsonutil import canonical_json
 from afk.publication import PublisherError, publisher_auth_artifact, run_publisher_command, validate_publisher_auth_config
 from afk.redaction import redact_artifact_value, redact_text
 from afk.schema_helpers import string_field
+from afk.tracking import terminal_review_feedback_status, tracker_close_failure_artifact
+from afk.workstream import close_selected_source_item, publisher_pr_merge_commit, publisher_pr_url
 
 
 SCHEMA_VERSION = 1
@@ -116,12 +118,20 @@ def integrate_published_pr(
         "decision": decision,
         "next_poll_seconds": next_poll_seconds,
         "remediation": remediation,
+        "retry": "",
         "auth": auth_artifact,
         "commands": {
             "gh_view": redact_artifact_value(view_command),
             "gh_checks": redact_artifact_value(checks_command),
         },
     }
+    if decision == "merge_ready":
+        result = integrate_terminal_merge(
+            request=request,
+            result=result,
+            view_payload=view_payload,
+            view_command=view_command,
+        )
     write_json(request["output_dir"] / "integration-result.json", result)
     write_events(
         request["output_dir"] / "integration-events.jsonl",
@@ -191,6 +201,7 @@ def normalize_request(
         "workstream_dir": workstream_dir,
         "command_cwd": workstream_dir,
         "output_dir": output_dir,
+        "workstream": workstream,
         "repo": repo,
         "pr_number": pr_number,
         "pr_url": pr_url,
@@ -200,6 +211,238 @@ def normalize_request(
         "gh_path": string_field(gh, "path") or "gh",
         "poll_seconds": poll_seconds,
     }
+
+
+def integrate_terminal_merge(
+    *,
+    request: dict[str, Any],
+    result: dict[str, Any],
+    view_payload: dict[str, Any],
+    view_command: list[str],
+) -> dict[str, Any]:
+    retry_context = prior_tracker_close_failure(request["output_dir"])
+    if retry_context:
+        return retry_tracker_close(request=request, result=result, retry_context=retry_context, view_command=view_command)
+
+    merge_command = [
+        request["gh_path"],
+        "pr",
+        "merge",
+        str(request["pr_number"]),
+        "--repo",
+        request["repo"],
+        "--merge",
+        "--match-head-commit",
+        request["expected_head_sha"],
+    ]
+    try:
+        run_publisher_command(
+            merge_command,
+            cwd=request["command_cwd"],
+            tool="gh",
+            auth=request["auth"],
+            message_on_failure="gh pr merge failed",
+        )
+    except PublisherError as exc:
+        return {
+            **result,
+            "status": "merge_blocked",
+            "remediation": f"Terminal merge failed: {exc.message}",
+            "merge": {
+                "status": "blocked",
+                "method": "merge",
+                "matched_head_sha": request["expected_head_sha"],
+                "reason": exc.message,
+                "returncode": exc.returncode,
+                "stdout_excerpt": redact_text(exc.stdout[-2000:]),
+                "stderr_excerpt": redact_text(exc.stderr[-2000:]),
+            },
+            "commands": {
+                **result["commands"],
+                "gh_merge": redact_artifact_value(merge_command),
+            },
+        }
+
+    merged_view_command = [
+        request["gh_path"],
+        "pr",
+        "view",
+        str(request["pr_number"]),
+        "--repo",
+        request["repo"],
+        "--json",
+        "url,mergeCommit,mergedAt",
+    ]
+    merged_payload = load_json_command(
+        merged_view_command,
+        cwd=request["command_cwd"],
+        auth=request["auth"],
+        failure_message="gh pr view returned invalid merged JSON payload",
+    )
+    merge_commit = publisher_pr_merge_commit(merged_payload)
+    if not merge_commit:
+        raise PublisherError(
+            "merged PR did not report a merge commit",
+            command=merged_view_command,
+            returncode=0,
+            stdout=json.dumps(merged_payload),
+            stderr="",
+        )
+    terminal_decision = {
+        "status": "merged",
+        "merge_commit": merge_commit,
+        "reason": "",
+        "pr_url": publisher_pr_url(merged_payload, fallback=string_field(view_payload, "url") or request["pr_url"]),
+        "review_feedback_status": integration_review_feedback_status(request["workstream"]),
+    }
+    return close_tracker_after_merge(
+        request=request,
+        result=result,
+        terminal_decision=terminal_decision,
+        merge_status="merged",
+        merge_command=merge_command,
+        merged_view_command=merged_view_command,
+    )
+
+
+def retry_tracker_close(
+    *,
+    request: dict[str, Any],
+    result: dict[str, Any],
+    retry_context: dict[str, Any],
+    view_command: list[str],
+) -> dict[str, Any]:
+    terminal_decision = retry_context.get("terminal_decision")
+    if not isinstance(terminal_decision, dict):
+        terminal_decision = {}
+    commands = retry_context.get("commands")
+    merge_command = commands.get("gh_merge") if isinstance(commands, dict) else []
+    merged_view_command = commands.get("gh_view_merged") if isinstance(commands, dict) else []
+    return close_tracker_after_merge(
+        request=request,
+        result={
+            **result,
+            "commands": {
+                **result["commands"],
+                "gh_view": redact_artifact_value(view_command),
+            },
+        },
+        terminal_decision={
+            "status": "merged",
+            "merge_commit": string_field(terminal_decision, "merge_commit") or string_field(retry_context.get("merge"), "merge_commit"),
+            "reason": "",
+            "pr_url": string_field(terminal_decision, "pr_url") or request["pr_url"],
+            "review_feedback_status": string_field(terminal_decision, "review_feedback_status")
+            or integration_review_feedback_status(request["workstream"]),
+        },
+        merge_status="already_merged",
+        merge_command=merge_command if isinstance(merge_command, list) else [],
+        merged_view_command=merged_view_command if isinstance(merged_view_command, list) else [],
+    )
+
+
+def close_tracker_after_merge(
+    *,
+    request: dict[str, Any],
+    result: dict[str, Any],
+    terminal_decision: dict[str, Any],
+    merge_status: str,
+    merge_command: list[str],
+    merged_view_command: list[str],
+) -> dict[str, Any]:
+    merge_commit = string_field(terminal_decision, "merge_commit")
+    selected_work = request["workstream"].get("selected_work")
+    if not isinstance(selected_work, list) or not selected_work:
+        return {
+            **result,
+            "status": "merged",
+            "merge": {
+                "status": merge_status,
+                "method": "merge",
+                "matched_head_sha": request["expected_head_sha"],
+                "merge_commit": merge_commit,
+            },
+            "terminal_decision": terminal_decision,
+            "tracker_close": {"status": "not_attempted", "reason": "no selected work item recorded for tracker closure"},
+            "commands": terminal_commands(result["commands"], merge_command, merged_view_command),
+        }
+    try:
+        tracker_close = close_selected_source_item(
+            normalized=request["workstream"],
+            state=request["workstream"],
+            config={"gh_path": request["gh_path"], "repo": request["repo"], "pr": str(request["pr_number"])},
+            checkout_path=request["command_cwd"],
+            auth=request["auth"],
+            close_reason=f"merged via {merge_commit}",
+        )
+    except PublisherError as exc:
+        return {
+            **result,
+            "status": "tracker_close_failed",
+            "retry": (
+                "PR is already merged. Remediate the recorded source-item closure failure, then retry only the "
+                "tracker close without attempting another merge."
+            ),
+            "merge": {
+                "status": merge_status,
+                "method": "merge",
+                "matched_head_sha": request["expected_head_sha"],
+                "merge_commit": merge_commit,
+            },
+            "terminal_decision": terminal_decision,
+            "tracker_close": tracker_close_failure_artifact(exc),
+            "commands": terminal_commands(result["commands"], merge_command, merged_view_command),
+        }
+
+    return {
+        **result,
+        "status": "tracker-closed",
+        "merge": {
+            "status": merge_status,
+            "method": "merge",
+            "matched_head_sha": request["expected_head_sha"],
+            "merge_commit": merge_commit,
+        },
+        "terminal_decision": terminal_decision,
+        "tracker_close": tracker_close,
+        "commands": terminal_commands(result["commands"], merge_command, merged_view_command),
+    }
+
+
+def terminal_commands(
+    commands: dict[str, Any],
+    merge_command: list[str],
+    merged_view_command: list[str],
+) -> dict[str, Any]:
+    merged = dict(commands)
+    if merge_command:
+        merged["gh_merge"] = redact_artifact_value(merge_command)
+    if merged_view_command:
+        merged["gh_view_merged"] = redact_artifact_value(merged_view_command)
+    return merged
+
+
+def prior_tracker_close_failure(output_dir: Path) -> dict[str, Any] | None:
+    path = output_dir / "integration-result.json"
+    if not path.is_file():
+        return None
+    payload = read_json_file(path)
+    if not isinstance(payload, dict) or string_field(payload, "status") != "tracker_close_failed":
+        return None
+    merge = payload.get("merge")
+    if not isinstance(merge, dict) or not string_field(merge, "merge_commit"):
+        return None
+    return payload
+
+
+def integration_review_feedback_status(workstream: dict[str, Any]) -> str:
+    tracker = workstream.get("tracker")
+    if not isinstance(tracker, dict):
+        return ""
+    decision = tracker.get("terminal_decision")
+    if not isinstance(decision, dict):
+        return ""
+    return terminal_review_feedback_status(decision)
 
 
 def integration_output_dir(published_path: str | Path) -> Path:
@@ -290,7 +533,10 @@ def publication_expected_head(publication: dict[str, Any], workstream: dict[str,
     if not isinstance(steps, list):
         return ""
     for step in steps:
-        if not isinstance(step, dict) or string_field(step, "name") != "implement":
+        if not isinstance(step, dict):
+            continue
+        step_name = string_field(step, "name") or string_field(step, "step")
+        if step_name != "implement":
             continue
         output = step.get("output")
         if not isinstance(output, dict):
@@ -469,3 +715,122 @@ def write_json(path: Path, payload: dict[str, Any]) -> None:
 
 def write_events(path: Path, events: list[dict[str, Any]]) -> None:
     path.write_text("".join(canonical_json(event) + "\n" for event in events), encoding="utf-8")
+
+
+def classify_terminal_integration(
+    published_result_path: str | Path,
+    *,
+    policy: Any,
+    github: dict[str, Any],
+    ledger_dir: str | Path,
+) -> dict[str, Any]:
+    published_path = Path(published_result_path).resolve(strict=True)
+    workstream = load_workstream_payload(published_path)
+    publication = load_publication_payload(published_path)
+    request = {
+        "published_result_path": published_path,
+        "workstream_dir": published_path.parent,
+        "command_cwd": published_path.parent,
+        "output_dir": Path(ledger_dir) / "output",
+        "workstream": workstream,
+        "repo": publication_repo(publication, workstream),
+        "pr_number": publication_pr_number(publication, workstream),
+        "pr_url": publication_pr_url(publication, workstream),
+        "expected_head_sha": publication_expected_head(publication, workstream),
+        "required_checks": normalize_required_checks(policy if isinstance(policy, dict) else {}),
+        "auth": {
+            "configured": True,
+            "source": "gh_config_dir",
+            "config_dir": string_field(github.get("auth") if isinstance(github, dict) else {}, "config_dir"),
+        },
+        "gh_path": string_field(github if isinstance(github, dict) else {}, "path") or "gh",
+        "poll_seconds": (
+            policy.get("poll_seconds", policy.get("poll_interval_seconds", DEFAULT_POLL_SECONDS))
+            if isinstance(policy, dict)
+            else DEFAULT_POLL_SECONDS
+        ),
+    }
+    output_dir = Path(ledger_dir) / "output"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    request["output_dir"] = output_dir
+
+    auth_artifact = publisher_auth_artifact(request["auth"])
+    view_command = [
+        request["gh_path"],
+        "pr",
+        "view",
+        str(request["pr_number"]),
+        "--repo",
+        request["repo"],
+        "--json",
+        "number,url,state,isDraft,mergeStateStatus,headRefOid,statusCheckRollup",
+    ]
+    run_publisher_command(
+        [request["gh_path"], "auth", "status", "--hostname", "github.com"],
+        cwd=request["command_cwd"],
+        tool="gh",
+        auth=request["auth"],
+        message_on_failure="gh auth status failed",
+    )
+    view_payload = load_json_command(
+        view_command,
+        cwd=request["command_cwd"],
+        auth=request["auth"],
+        failure_message="gh pr view returned invalid JSON payload",
+    )
+    observed_head = string_field(view_payload, "headRefOid") or ""
+    decision, next_poll_seconds, remediation = classify_integration(
+        expected_head=request["expected_head_sha"],
+        observed_head=observed_head,
+        pr_state=(string_field(view_payload, "state") or "").upper(),
+        is_draft=bool(view_payload.get("isDraft")),
+        merge_state_status=(string_field(view_payload, "mergeStateStatus") or "").upper(),
+        check_snapshots=normalize_status_check_rollup(view_payload.get("statusCheckRollup")),
+        required_checks=request["required_checks"],
+        poll_seconds=request["poll_seconds"],
+    )
+    result = {
+        "schema_version": SCHEMA_VERSION,
+        "artifact_type": "integration-result",
+        "status": "classified",
+        "published_result_path": str(request["published_result_path"]),
+        "repo": request["repo"],
+        "pr_number": request["pr_number"],
+        "pr_url": redact_text(string_field(view_payload, "url") or request["pr_url"]),
+        "expected_head_sha": request["expected_head_sha"],
+        "observed_head_sha": observed_head,
+        "pr_state": (string_field(view_payload, "state") or "").upper(),
+        "is_draft": bool(view_payload.get("isDraft")),
+        "merge_state_status": (string_field(view_payload, "mergeStateStatus") or "").upper(),
+        "check_snapshots": normalize_status_check_rollup(view_payload.get("statusCheckRollup")),
+        "decision": decision,
+        "next_poll_seconds": next_poll_seconds,
+        "remediation": "" if decision == "merge_ready" else remediation,
+        "auth": auth_artifact,
+        "commands": {"gh_view": redact_artifact_value(view_command)},
+    }
+    write_json(output_dir / "integration-result.json", result)
+    write_events(
+        output_dir / "integration-events.jsonl",
+        [
+            {
+                "schema_version": SCHEMA_VERSION,
+                "event": "integration.classified",
+                "repo": request["repo"],
+                "pr_number": request["pr_number"],
+                "expected_head_sha": request["expected_head_sha"],
+                "observed_head_sha": observed_head,
+                "decision": decision,
+                "next_poll_seconds": next_poll_seconds,
+                "remediation": result["remediation"],
+            },
+            {
+                "schema_version": SCHEMA_VERSION,
+                "event": "integration.compatibility-classified",
+                "repo": request["repo"],
+                "pr_number": request["pr_number"],
+                "decision": decision,
+            },
+        ],
+    )
+    return result
