@@ -896,6 +896,7 @@ def resolve_effective_publisher_settings(
     repo = args.publisher_repo
     base = args.publisher_base
     gh_config_dir = args.publisher_gh_config_dir
+    remote = project_contract.pr_target.get("remote", "origin")
     if mode is None:
         mode = "disabled"
         if (
@@ -903,24 +904,25 @@ def resolve_effective_publisher_settings(
             and args.role_profile == PRODUCTION_ROLE_PROFILE
             and getattr(args, "effective_validation_mode", args.validation_mode or "fake") != "fake"
         ):
-            repo = github_repo_from_repo_url(project_contract.repo_url)
+            repo = repo or github_repo_from_repo_url(project_contract.repo_url)
             if not repo:
                 raise ValueError(
                     "production default publisher requires a GitHub repo_url in the project contract; "
                     "pass --publisher-mode disabled to stay non-publishing"
                 )
-            gh_config_dir = discover_gh_config_dir()
+            gh_config_dir = gh_config_dir or discover_gh_config_dir()
             if gh_config_dir is None:
                 raise ValueError(
                     "production default publisher requires GitHub auth config; pass --publisher-gh-config-dir "
                     "or configure GH_CONFIG_DIR / ~/.config/gh, or set --publisher-mode disabled"
                 )
             mode = "create"
-            base = project_contract.pr_target["branch"]
+            base = base or project_contract.pr_target["branch"]
     args.effective_publisher_mode = mode
     args.effective_publisher_repo = repo
     args.effective_publisher_base = base
     args.effective_publisher_gh_config_dir = gh_config_dir
+    args.effective_publisher_remote = remote
 
 
 def discover_gh_config_dir() -> str | None:
@@ -952,13 +954,15 @@ def recipe_publisher_from_args(
     mode = getattr(args, "effective_publisher_mode", args.publisher_mode)
     if mode == "disabled":
         return None
-    return create_recipe_publisher(
+    publisher = create_recipe_publisher(
         review_branch=review_branch,
         repo=getattr(args, "effective_publisher_repo", args.publisher_repo),
         base=getattr(args, "effective_publisher_base", args.publisher_base),
         gh_config_dir=getattr(args, "effective_publisher_gh_config_dir", args.publisher_gh_config_dir),
         checkout_path=checkout_path,
     )
+    publisher["git"]["remote"] = getattr(args, "effective_publisher_remote", "origin")
+    return publisher
 
 
 def recipe_publisher_factory_from_args(

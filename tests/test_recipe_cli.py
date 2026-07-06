@@ -801,6 +801,63 @@ raise SystemExit(9)
                 },
             )
 
+    def test_generate_recipe_production_default_publisher_honors_explicit_gh_config_dir(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            contracts_dir = temp_path / "contracts"
+            output = temp_path / "recipe.json"
+            ledger = temp_path / "ledger"
+            beads_workspace = temp_path / "central-beads"
+            checkout_root = temp_path / "checkouts"
+            checkout_path = checkout_root / "bump-EQEmu"
+            explicit_gh_config_dir = temp_path / "explicit-gh-config"
+
+            contracts_dir.mkdir()
+            beads_workspace.mkdir()
+            checkout_root.mkdir()
+            explicit_gh_config_dir.mkdir()
+            write_contract(contracts_dir / "bump-eqemu.json", project_slug="bump-eqemu", repo_url="git@github.com:thunderbump/bump-EQEmu.git")
+
+            completed = run_afk(
+                "generate-recipe",
+                "--workstream-id",
+                "central-rsah.1",
+                "--project",
+                "bump-eqemu",
+                "--contracts-dir",
+                str(contracts_dir),
+                "--ledger",
+                str(ledger),
+                "--beads-workspace",
+                str(beads_workspace),
+                "--checkout-root",
+                str(checkout_root),
+                "--checkout-path",
+                str(checkout_path),
+                "--validation-profile",
+                "tier1",
+                "--agent-mode",
+                "fake",
+                "--reviewer-mode",
+                "fake",
+                "--retrospective-judge-mode",
+                "disabled",
+                "--publisher-gh-config-dir",
+                str(explicit_gh_config_dir),
+                "--output",
+                str(output),
+                env={
+                    "GH_CONFIG_DIR": "",
+                    "XDG_CONFIG_HOME": "",
+                    "HOME": str(temp_path / "home"),
+                },
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            recipe = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(recipe["publisher"]["mode"], "create")
+            self.assertEqual(recipe["publisher"]["gh"]["auth"]["config_dir"], str(explicit_gh_config_dir))
+
     def test_generate_recipe_writes_pi_agent_and_ponytail_extension_when_requested(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
