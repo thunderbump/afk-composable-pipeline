@@ -742,6 +742,65 @@ raise SystemExit(9)
                 },
             )
 
+    def test_generate_recipe_production_defaults_to_enabled_publisher_when_gh_auth_is_configured(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            output = temp_path / "recipe.json"
+            ledger = temp_path / "ledger"
+            beads_workspace = temp_path / "central-beads"
+            checkout_root = temp_path / "checkouts"
+            checkout_path = checkout_root / "bump-EQEmu"
+            gh_config_dir = temp_path / "gh-config"
+            beads_workspace.mkdir()
+            checkout_root.mkdir()
+            gh_config_dir.mkdir()
+
+            completed = run_afk(
+                "generate-recipe",
+                "--workstream-id",
+                "central-rsah.1",
+                "--project",
+                "bump-eqemu",
+                "--contracts-dir",
+                "project-contracts",
+                "--ledger",
+                str(ledger),
+                "--beads-workspace",
+                str(beads_workspace),
+                "--checkout-root",
+                str(checkout_root),
+                "--checkout-path",
+                str(checkout_path),
+                "--validation-profile",
+                "tier1",
+                "--agent-mode",
+                "fake",
+                "--reviewer-mode",
+                "fake",
+                "--retrospective-judge-mode",
+                "disabled",
+                "--output",
+                str(output),
+                env={
+                    "GH_CONFIG_DIR": str(gh_config_dir),
+                },
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            recipe = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(
+                recipe["publisher"],
+                {
+                    "enabled": True,
+                    "mode": "create",
+                    "repo": "thunderbump/bump-EQEmu",
+                    "base": "master",
+                    "head": "afk/central-rsah-1",
+                    "git": {"push": True, "remote": "origin"},
+                    "gh": {"auth": {"config_dir": str(gh_config_dir)}},
+                },
+            )
+
     def test_generate_recipe_writes_pi_agent_and_ponytail_extension_when_requested(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)

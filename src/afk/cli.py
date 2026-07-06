@@ -20,7 +20,13 @@ from afk.recipes import (
     real_local_recipe_agent,
     write_recipe,
 )
-from afk.run_next import RunNextPlanRequest, RunNextRequest, run_next_request, validate_beads_workspace
+from afk.run_next import (
+    RunNextPlanRequest,
+    RunNextRequest,
+    github_repo_from_repo_url,
+    run_next_request,
+    validate_beads_workspace,
+)
 from afk.pi_workers import (
     PONYTAIL_EXTENSION_SOURCE,
     build_pi_mount_config,
@@ -165,6 +171,11 @@ def main(argv: list[str] | None = None) -> int:
                 args,
                 project_contract=project_contract,
             )
+            resolve_effective_publisher_settings(
+                args,
+                project_contract=project_contract,
+                default_create_allowed=True,
+            )
             validation_input = recipe_validation_input_from_args(args, project_contract=project_contract)
             recipe_agent = recipe_agent_from_args(args, checkout_path=Path(args.checkout_path))
             reviewer = recipe_reviewer_from_args(args, checkout_path=Path(args.checkout_path))
@@ -228,6 +239,11 @@ def main(argv: list[str] | None = None) -> int:
             args.effective_validation_mode = effective_validation_mode(
                 args,
                 project_contract=project_contract,
+            )
+            resolve_effective_publisher_settings(
+                args,
+                project_contract=project_contract,
+                default_create_allowed=args.execute,
             )
             validation_input = recipe_validation_input_from_args(args, project_contract=project_contract)
             recipe_agent = recipe_agent_from_args(
@@ -604,7 +620,6 @@ def add_publisher_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--publisher-mode",
         choices=("disabled", "create"),
-        default="disabled",
         help="Terminal publisher mode to embed in the generated recipe",
     )
     parser.add_argument("--publisher-repo", help="owner/repo for publisher create mode")
@@ -871,19 +886,77 @@ def project_contract_has_default_worker(project_contract: ProjectContract) -> bo
     return project_contract.project_slug == "bump-eqemu"
 
 
+def resolve_effective_publisher_settings(
+    args: argparse.Namespace,
+    *,
+    project_contract: ProjectContract,
+    default_create_allowed: bool,
+) -> None:
+    mode = args.publisher_mode
+    repo = args.publisher_repo
+    base = args.publisher_base
+    gh_config_dir = args.publisher_gh_config_dir
+    if mode is None:
+        mode = "disabled"
+        if (
+            default_create_allowed
+            and args.role_profile == PRODUCTION_ROLE_PROFILE
+            and getattr(args, "effective_validation_mode", args.validation_mode or "fake") != "fake"
+        ):
+            repo = github_repo_from_repo_url(project_contract.repo_url)
+            if not repo:
+                raise ValueError(
+                    "production default publisher requires a GitHub repo_url in the project contract; "
+                    "pass --publisher-mode disabled to stay non-publishing"
+                )
+            gh_config_dir = discover_gh_config_dir()
+            if gh_config_dir is None:
+                raise ValueError(
+                    "production default publisher requires GitHub auth config; pass --publisher-gh-config-dir "
+                    "or configure GH_CONFIG_DIR / ~/.config/gh, or set --publisher-mode disabled"
+                )
+            mode = "create"
+            base = project_contract.pr_target["branch"]
+    args.effective_publisher_mode = mode
+    args.effective_publisher_repo = repo
+    args.effective_publisher_base = base
+    args.effective_publisher_gh_config_dir = gh_config_dir
+
+
+def discover_gh_config_dir() -> str | None:
+    configured = os.environ.get("GH_CONFIG_DIR")
+    if configured:
+        path = Path(configured)
+        if path.is_absolute() and path.is_dir():
+            return str(path)
+        return None
+    xdg_config_home = os.environ.get("XDG_CONFIG_HOME")
+    if xdg_config_home:
+        xdg_path = Path(xdg_config_home) / "gh"
+        if xdg_path.is_absolute() and xdg_path.is_dir():
+            return str(xdg_path)
+    home = os.environ.get("HOME")
+    if home:
+        home_path = Path(home) / ".config" / "gh"
+        if home_path.is_absolute() and home_path.is_dir():
+            return str(home_path)
+    return None
+
+
 def recipe_publisher_from_args(
     args: argparse.Namespace,
     *,
     review_branch: str,
     checkout_path: Path,
 ) -> dict[str, Any] | None:
-    if args.publisher_mode == "disabled":
+    mode = getattr(args, "effective_publisher_mode", args.publisher_mode)
+    if mode == "disabled":
         return None
     return create_recipe_publisher(
         review_branch=review_branch,
-        repo=args.publisher_repo,
-        base=args.publisher_base,
-        gh_config_dir=args.publisher_gh_config_dir,
+        repo=getattr(args, "effective_publisher_repo", args.publisher_repo),
+        base=getattr(args, "effective_publisher_base", args.publisher_base),
+        gh_config_dir=getattr(args, "effective_publisher_gh_config_dir", args.publisher_gh_config_dir),
         checkout_path=checkout_path,
     )
 
@@ -893,10 +966,11 @@ def recipe_publisher_factory_from_args(
     *,
     checkout_path: Path,
 ) -> Callable[[str], dict[str, Any] | None] | None:
-    if args.publisher_mode == "disabled":
+    mode = getattr(args, "effective_publisher_mode", args.publisher_mode)
+    if mode == "disabled":
         return None
-    if args.publisher_mode != "create":
-        raise ValueError(f"Unsupported --publisher-mode: {args.publisher_mode}")
+    if mode != "create":
+        raise ValueError(f"Unsupported --publisher-mode: {mode}")
     # Fail fast so run-next validates misconfiguration before selection work runs.
     recipe_publisher_from_args(
         args,
