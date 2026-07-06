@@ -2144,6 +2144,155 @@ sys.exit(9)
             self.assertEqual(result["output"]["skipped_candidates"], [])
             self.assertEqual(result["output"]["source_statuses"][0]["status"], "selected")
 
+    def test_beads_source_with_target_repo_does_not_silently_select_when_gh_auth_is_missing(self):
+        secret = "beads-secret-value"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            fake_bin = temp_path / "bin"
+            workspace = temp_path / "beads"
+            (workspace / "secrets").mkdir(parents=True)
+            (workspace / "secrets" / "dolt_beads_password.txt").write_text(secret, encoding="utf-8")
+            fake_bin.mkdir()
+            write_executable(
+                fake_bin / "gh",
+                f"""#!{sys.executable}
+import sys
+
+if sys.argv[1:3] == ["auth", "status"]:
+    sys.exit(1)
+raise SystemExit(9)
+""",
+            )
+            write_executable(
+                fake_bin / "bd",
+                f"""#!{sys.executable}
+raise SystemExit("bd should not be called when target PR lookup auth is missing")
+""",
+            )
+
+            request = {
+                "required_labels": ["project:afk-composable-pipeline", "ready-for-agent"],
+                "required_metadata": ["workstream", "acceptance_criteria", "afk.ready"],
+                "sources": [
+                    {
+                        "type": "beads",
+                        "id": "central-beads",
+                        "workspace": str(workspace),
+                        "workspace_kind": "mounted",
+                        "labels": ["project:afk-composable-pipeline", "ready-for-agent"],
+                        "status": "open",
+                        "target_repo": "thunderbump/bump-EQEmu",
+                    }
+                ],
+            }
+            ledger = temp_path / "ledger"
+            completed = run_afk(
+                "run-step",
+                "select-work",
+                "--input",
+                json.dumps(request),
+                "--ledger",
+                str(ledger),
+                env={"GH_TOKEN": None, "GITHUB_TOKEN": None, "PATH": str(fake_bin)},
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(result["output"]["selected_work"], [])
+            self.assertEqual(result["output"]["skipped_candidates"], [])
+            self.assertEqual(
+                result["output"]["source_statuses"],
+                [
+                    {
+                        "source_id": "central-beads",
+                        "source_type": "beads",
+                        "status": "skipped_no_auth",
+                        "candidate_count": 0,
+                        "selected_count": 0,
+                        "message": "GH_TOKEN or GITHUB_TOKEN is required for target_repo PR lookup",
+                    }
+                ],
+            )
+
+    def test_beads_source_with_target_repo_reports_pr_list_failure_instead_of_selecting(self):
+        secret = "beads-secret-value"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            fake_bin = temp_path / "bin"
+            workspace = temp_path / "beads"
+            (workspace / "secrets").mkdir(parents=True)
+            (workspace / "secrets" / "dolt_beads_password.txt").write_text(secret, encoding="utf-8")
+            fake_bin.mkdir()
+            write_executable(
+                fake_bin / "gh",
+                f"""#!{sys.executable}
+import sys
+
+if sys.argv[1:3] == ["auth", "status"]:
+    sys.exit(0)
+if sys.argv[1:3] == ["pr", "list"]:
+    print("gh pr list exploded", file=sys.stderr)
+    sys.exit(1)
+raise SystemExit(9)
+""",
+            )
+            write_executable(
+                fake_bin / "bd",
+                f"""#!{sys.executable}
+raise SystemExit("bd list should not continue when target PR lookup fails")
+""",
+            )
+
+            request = {
+                "required_labels": ["project:afk-composable-pipeline", "ready-for-agent"],
+                "required_metadata": ["workstream", "acceptance_criteria", "afk.ready"],
+                "sources": [
+                    {
+                        "type": "beads",
+                        "id": "central-beads",
+                        "workspace": str(workspace),
+                        "workspace_kind": "mounted",
+                        "labels": ["project:afk-composable-pipeline", "ready-for-agent"],
+                        "status": "open",
+                        "target_repo": "thunderbump/bump-EQEmu",
+                    }
+                ],
+            }
+            ledger = temp_path / "ledger"
+            completed = run_afk(
+                "run-step",
+                "select-work",
+                "--input",
+                json.dumps(request),
+                "--ledger",
+                str(ledger),
+                env={"GH_TOKEN": "fake-token", "PATH": str(fake_bin)},
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(result["output"]["selected_work"], [])
+            self.assertEqual(result["output"]["skipped_candidates"], [])
+            self.assertEqual(
+                result["output"]["source_statuses"],
+                [
+                    {
+                        "source_id": "central-beads",
+                        "source_type": "beads",
+                        "status": "skipped_unreachable",
+                        "candidate_count": 0,
+                        "selected_count": 0,
+                        "message": "gh pr list failed",
+                    }
+                ],
+            )
+
     def test_malformed_beads_show_payload_records_source_failure_without_crashing(self):
         secret = "beads-secret-value"
         with tempfile.TemporaryDirectory() as temp_dir:

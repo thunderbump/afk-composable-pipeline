@@ -337,6 +337,26 @@ def source_prerequisite_status(source: dict[str, Any]) -> dict[str, Any] | None:
                 0,
                 "beads credentials are not available",
             )
+        target_repo = str(source.get("target_repo") or "").strip()
+        if target_repo and not source.get("target_ids"):
+            if shutil.which("gh") is None:
+                return source_status(
+                    source_id,
+                    source_type,
+                    "skipped_unreachable",
+                    0,
+                    0,
+                    "gh command is not available for target_repo PR lookup",
+                )
+            if not github_auth_available():
+                return source_status(
+                    source_id,
+                    source_type,
+                    "skipped_no_auth",
+                    0,
+                    0,
+                    "GH_TOKEN or GITHUB_TOKEN is required for target_repo PR lookup",
+                )
         return None
     return source_status(
         source_id,
@@ -849,30 +869,25 @@ def latest_open_target_pr_record(
 
 def open_target_pr_records_by_branch(source: dict[str, Any]) -> dict[str, dict[str, str]]:
     repo = str(source.get("target_repo") or "").strip()
-    if not repo or shutil.which("gh") is None or not github_auth_available():
+    if not repo:
         return {}
-    try:
-        payload = run_json_command(
-            [
-                "gh",
-                "pr",
-                "list",
-                "--repo",
-                repo,
-                "--state",
-                "open",
-                "--limit",
-                "100",
-                "--json",
-                "url,headRefName",
-            ],
-            status_on_failure="skipped_unreachable",
-            message_on_failure="gh pr list failed",
-        )
-    except SourceLoadError as exc:
-        if exc.status == "failed_invalid_payload":
-            raise
-        return {}
+    payload = run_json_command(
+        [
+            "gh",
+            "pr",
+            "list",
+            "--repo",
+            repo,
+            "--state",
+            "open",
+            "--limit",
+            "100",
+            "--json",
+            "url,headRefName",
+        ],
+        status_on_failure="skipped_unreachable",
+        message_on_failure="gh pr list failed",
+    )
     if not isinstance(payload, list):
         raise SourceLoadError("failed_invalid_payload", "gh pr list returned invalid JSON payload")
     records: dict[str, dict[str, str]] = {}
