@@ -94,7 +94,7 @@ raise SystemExit(9)
 
 
 def output_dir_for(workstream_path: Path) -> Path:
-    return workstream_path.parents[2] / "output"
+    return workstream_path.parent / "output"
 
 
 class IntegrationCliTest(unittest.TestCase):
@@ -328,6 +328,52 @@ class IntegrationCliTest(unittest.TestCase):
             self.assertEqual(result["next_poll_seconds"], 0)
             self.assertEqual([call["argv"][0:2] for call in calls], [["auth", "status"], ["pr", "view"], ["pr", "checks"]])
 
+    def test_integrate_pr_records_merge_blocked_when_pr_state_blocks_merge(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            workstream_path = temp_path / "ledger" / "workstreams" / "run-blocked" / "workstream-result.json"
+            write_workstream_result(workstream_path, expected_head="abc123")
+            fake_gh = temp_path / "fake-gh"
+            fake_calls = temp_path / "fake-calls.jsonl"
+            auth_dir = temp_path / "gh-config"
+            auth_dir.mkdir()
+            (auth_dir / "view.json").write_text(
+                json.dumps(
+                    {
+                        "number": 17,
+                        "url": "https://github.com/acme/widgets/pull/17",
+                        "state": "OPEN",
+                        "isDraft": False,
+                        "mergeStateStatus": "BLOCKED",
+                        "headRefOid": "abc123",
+                        "statusCheckRollup": [
+                            {"name": "build", "status": "COMPLETED", "conclusion": "SUCCESS"},
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (auth_dir / "checks.json").write_text(json.dumps([]), encoding="utf-8")
+            write_executable(fake_gh, fake_gh_script(fake_calls))
+
+            completed = run_afk(
+                "integrate-pr",
+                "--published-result",
+                str(workstream_path),
+                "--policy",
+                json.dumps({"gh": {"path": str(fake_gh)}, "required_checks": ["build"]}),
+                "--gh-auth-config-dir",
+                str(auth_dir),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            result = json.loads((output_dir_for(workstream_path) / "integration-result.json").read_text(encoding="utf-8"))
+            self.assertEqual(result["decision"], "merge_blocked")
+            self.assertEqual(result["expected_head_sha"], "abc123")
+            self.assertEqual(result["observed_head_sha"], "abc123")
+            self.assertEqual(result["merge_state_status"], "BLOCKED")
+            self.assertIn("current PR state", result["remediation"])
+
     def test_integrate_pr_records_exact_head_mismatch_from_publication_result_path(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
@@ -372,6 +418,113 @@ class IntegrationCliTest(unittest.TestCase):
             self.assertEqual(result["expected_head_sha"], "abc123")
             self.assertEqual(result["observed_head_sha"], "def456")
             self.assertIn("Exact head mismatch", result["remediation"])
+
+    def test_integrate_pr_uses_status_check_rollup_when_pr_checks_is_empty(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            workstream_path = temp_path / "ledger" / "workstreams" / "run-rollup" / "workstream-result.json"
+            write_workstream_result(workstream_path, expected_head="abc123")
+            fake_gh = temp_path / "fake-gh"
+            fake_calls = temp_path / "fake-calls.jsonl"
+            auth_dir = temp_path / "gh-config"
+            auth_dir.mkdir()
+            (auth_dir / "view.json").write_text(
+                json.dumps(
+                    {
+                        "number": 17,
+                        "url": "https://github.com/acme/widgets/pull/17",
+                        "state": "OPEN",
+                        "isDraft": False,
+                        "mergeStateStatus": "CLEAN",
+                        "headRefOid": "abc123",
+                        "statusCheckRollup": [
+                            {"name": "build", "status": "COMPLETED", "conclusion": "SUCCESS"},
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (auth_dir / "checks.json").write_text(json.dumps([]), encoding="utf-8")
+            write_executable(fake_gh, fake_gh_script(fake_calls))
+
+            completed = run_afk(
+                "integrate-pr",
+                "--published-result",
+                str(workstream_path),
+                "--policy",
+                json.dumps({"gh": {"path": str(fake_gh)}, "required_checks": ["build"], "poll_seconds": 60}),
+                "--gh-auth-config-dir",
+                str(auth_dir),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            result = json.loads((output_dir_for(workstream_path) / "integration-result.json").read_text(encoding="utf-8"))
+            self.assertEqual(result["decision"], "merge_ready")
+            self.assertEqual(result["check_snapshots"], [{"name": "build", "workflow": "", "state": "COMPLETED", "bucket": "", "status": "passed", "link": ""}])
+
+    def test_integrate_pr_writes_run_scoped_output_paths(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            fake_gh = temp_path / "fake-gh"
+            fake_calls = temp_path / "fake-calls.jsonl"
+            auth_dir = temp_path / "gh-config"
+            auth_dir.mkdir()
+            write_executable(fake_gh, fake_gh_script(fake_calls))
+
+            run_one = temp_path / "ledger" / "workstreams" / "run-1" / "workstream-result.json"
+            run_two = temp_path / "ledger" / "workstreams" / "run-2" / "workstream-result.json"
+            write_workstream_result(run_one, expected_head="abc123")
+            write_workstream_result(run_two, expected_head="abc123")
+
+            (auth_dir / "view.json").write_text(
+                json.dumps(
+                    {
+                        "number": 17,
+                        "url": "https://github.com/acme/widgets/pull/17",
+                        "state": "OPEN",
+                        "isDraft": False,
+                        "mergeStateStatus": "CLEAN",
+                        "headRefOid": "abc123",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (auth_dir / "checks.json").write_text(
+                json.dumps([{"name": "build", "state": "PENDING", "bucket": "pending", "workflow": "CI", "link": ""}]),
+                encoding="utf-8",
+            )
+            first = run_afk(
+                "integrate-pr",
+                "--published-result",
+                str(run_one),
+                "--policy",
+                json.dumps({"gh": {"path": str(fake_gh)}, "required_checks": ["build"], "poll_seconds": 120}),
+                "--gh-auth-config-dir",
+                str(auth_dir),
+            )
+            self.assertEqual(first.returncode, 0, first.stderr)
+
+            (auth_dir / "checks.json").write_text(
+                json.dumps([{"name": "build", "state": "SUCCESS", "bucket": "pass", "workflow": "CI", "link": ""}]),
+                encoding="utf-8",
+            )
+            second = run_afk(
+                "integrate-pr",
+                "--published-result",
+                str(run_two),
+                "--policy",
+                json.dumps({"gh": {"path": str(fake_gh)}, "required_checks": ["build"]}),
+                "--gh-auth-config-dir",
+                str(auth_dir),
+            )
+            self.assertEqual(second.returncode, 0, second.stderr)
+
+            first_result = json.loads((output_dir_for(run_one) / "integration-result.json").read_text(encoding="utf-8"))
+            second_result = json.loads((output_dir_for(run_two) / "integration-result.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(first_result["decision"], "checks_pending")
+            self.assertEqual(second_result["decision"], "merge_ready")
+            self.assertFalse((temp_path / "ledger" / "output" / "integration-result.json").exists())
 
 
 if __name__ == "__main__":

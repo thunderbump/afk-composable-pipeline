@@ -40,7 +40,7 @@ def integrate_published_pr(
         "--repo",
         request["repo"],
         "--json",
-        "number,url,state,isDraft,mergeStateStatus,headRefOid",
+        "number,url,state,isDraft,mergeStateStatus,headRefOid,statusCheckRollup",
     ]
     checks_command = [
         request["gh_path"],
@@ -78,6 +78,8 @@ def integrate_published_pr(
     pr_state = (string_field(view_payload, "state") or "").upper()
     is_draft = bool(view_payload.get("isDraft"))
     check_snapshots = normalize_check_snapshots(checks_payload)
+    if not check_snapshots:
+        check_snapshots = normalize_status_check_rollup(view_payload.get("statusCheckRollup"))
     decision, next_poll_seconds, remediation = classify_integration(
         expected_head=request["expected_head_sha"],
         observed_head=observed_head,
@@ -194,11 +196,7 @@ def normalize_request(
 
 def integration_output_dir(published_path: str | Path) -> Path:
     published_path = Path(published_path)
-    parent = published_path.parent
-    if parent.parent.name == "workstreams":
-        output_dir = parent.parent.parent / "output"
-    else:
-        output_dir = parent / "output"
+    output_dir = published_path.parent / "output"
     output_dir.mkdir(parents=True, exist_ok=True)
     return output_dir
 
@@ -346,6 +344,28 @@ def normalize_check_snapshots(payload: Any) -> list[dict[str, Any]]:
     return snapshots
 
 
+def normalize_status_check_rollup(payload: Any) -> list[dict[str, Any]]:
+    if not isinstance(payload, list):
+        return []
+    snapshots = []
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        raw_status = (string_field(item, "status") or "").upper()
+        conclusion = (string_field(item, "conclusion") or "").upper()
+        snapshots.append(
+            {
+                "name": string_field(item, "name") or "",
+                "workflow": "",
+                "state": raw_status,
+                "bucket": "",
+                "status": rollup_status(raw_status, conclusion),
+                "link": "",
+            }
+        )
+    return snapshots
+
+
 def check_status(item: dict[str, Any]) -> str:
     bucket = (string_field(item, "bucket") or "").lower()
     state = (string_field(item, "state") or "").upper()
@@ -357,6 +377,16 @@ def check_status(item: dict[str, Any]) -> str:
         return "passed"
     if state in INCONCLUSIVE_CHECK_STATES or bucket == "skipping":
         return "inconclusive"
+    return "inconclusive"
+
+
+def rollup_status(status: str, conclusion: str) -> str:
+    if status != "COMPLETED":
+        return "pending"
+    if conclusion in PASSED_CHECK_STATES:
+        return "passed"
+    if conclusion in FAILED_CHECK_STATES:
+        return "failed"
     return "inconclusive"
 
 
