@@ -2003,9 +2003,24 @@ def _validation_failure_retrospective_scope(
     if category == "worker_failure":
         if not selected_work_target_project_labels(selected_work or []):
             return "pipeline-process"
+        if _validation_worker_failure_is_pipeline_infrastructure(failure, evidence_paths or []):
+            return "pipeline-process"
         if not _validation_failure_has_target_repo_evidence(evidence_paths or []):
             return "pipeline-process"
     return "target-work"
+
+
+def _validation_worker_failure_is_pipeline_infrastructure(
+    failure: dict[str, Any],
+    evidence_paths: list[str],
+) -> bool:
+    log_path = string_field(failure, "log_path") or ""
+    excerpt = string_field(failure, "excerpt") or ""
+    if any(path.endswith("/validation-evidence/logs/stack.log") for path in evidence_paths if isinstance(path, str)):
+        return True
+    if log_path.endswith("/validation-evidence/logs/stack.log"):
+        return True
+    return "binding validation stack " in excerpt.lower()
 
 
 def _validation_failure_has_target_repo_evidence(evidence_paths: list[str]) -> bool:
@@ -2283,7 +2298,7 @@ def _blocked_reason_targets_work_item(state: dict[str, Any], reason: str) -> boo
         ) == "target-work"
     if reason.startswith("review did not reach passed: request_revision"):
         return True
-    if reason.startswith("retry budget exhausted:"):
+    if _reason_is_repair_budget_exhausted(reason):
         if string_field(review, "status") == "request_revision":
             return True
         validation = latest_validation_record(state)
@@ -2303,6 +2318,10 @@ def _blocked_reason_targets_work_item(state: dict[str, Any], reason: str) -> boo
             ),
         ) == "target-work"
     return False
+
+
+def _reason_is_repair_budget_exhausted(reason: str) -> bool:
+    return reason.startswith("retry budget exhausted:") or reason.startswith("repair budget exhausted:")
 
 
 def _cleanup_retrospective_signals(state: dict[str, Any]) -> list[dict[str, Any]]:
@@ -2724,7 +2743,7 @@ def _repeated_target_validation_follow_up(signals: list[dict[str, Any]]) -> dict
         isinstance(signal, dict)
         and string_field(signal, "kind") == "retry-or-blocked"
         and string_field(signal, "scope") == "target-work"
-        and (string_field(signal, "summary") or "").startswith("retry budget exhausted:")
+        and _reason_is_repair_budget_exhausted(string_field(signal, "summary") or "")
         for signal in signals
     ):
         return None

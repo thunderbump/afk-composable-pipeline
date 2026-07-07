@@ -252,7 +252,7 @@ class RetrospectiveModuleTest(unittest.TestCase):
         record = build_pipeline_retrospective(
             RetrospectiveContext(
                 state=state,
-                publication={"status": "blocked", "reason": "retry budget exhausted: 5 attempts reached hard_cap=5"},
+                publication={"status": "blocked", "reason": "repair budget exhausted: 5 attempts reached hard_cap=5"},
                 tracker=retrospective_tracker("implemented"),
             )
         )
@@ -265,6 +265,58 @@ class RetrospectiveModuleTest(unittest.TestCase):
                 {
                     "summary": "central-umi2.5: Fix worker [worker_failure]: Zone |   Error    | Connect Connection [default] Failed to connect to database",
                     "labels": ["afk:follow-up", "area:validation", "project:bump-eqemu"],
+                }
+            ],
+        )
+
+    def test_build_pipeline_retrospective_keeps_stack_binding_worker_failure_pipeline_owned(self):
+        state = retrospective_state()
+        state["selected_work"] = [
+            {
+                "external_id": "central-umi2.5",
+                "title": "Align bump-EQEmu validation worker with portable AFK contract",
+                "labels": ["project:bump-eqemu", "ready-for-agent", "validation-worker"],
+            }
+        ]
+        state["validations"] = [
+            {
+                "output": {
+                    "status": "failed_validation",
+                    "classification": "worker_failure",
+                    "summary": "failed_validation",
+                    "actionable_failures": [
+                        {
+                            "name": "worker",
+                            "category": "worker_failure",
+                            "reason": "failed_validation",
+                            "log_path": "/tmp/ledger/runs/validate/validation-evidence/logs/stack.log",
+                            "excerpt": "2026-07-01T02:30:42Z binding validation stack /tmp/stack code to /tmp/checkout",
+                        }
+                    ],
+                    "checkout": {"start_commit": "abc123"},
+                    "validation": {"requested_profile": "tier1"},
+                },
+                "step_result_path": "/tmp/ledger/runs/validate/step-result.json",
+                "worker_result_path": "/tmp/ledger/runs/validate/worker-result.json",
+            }
+        ]
+
+        record = build_pipeline_retrospective(
+            RetrospectiveContext(
+                state=state,
+                publication={"status": "blocked", "reason": "repair budget exhausted: 5 attempts reached hard_cap=5"},
+                tracker=retrospective_tracker("implemented"),
+            )
+        )
+
+        self.assertEqual(record["signals"][0]["scope"], "pipeline-process")
+        self.assertEqual(record["signals"][1]["scope"], "pipeline-process")
+        self.assertEqual(
+            record["recommended_follow_up"],
+            [
+                {
+                    "summary": "Fix worker [worker_failure]: 2026-07-01T02:30:42Z binding validation stack /tmp/stack code to /tmp/checkout",
+                    "labels": ["afk:follow-up", "area:validation", "project:afk-composable-pipeline"],
                 }
             ],
         )
