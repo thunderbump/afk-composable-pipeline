@@ -1826,6 +1826,17 @@ def selected_work_source_config(normalized: dict[str, Any], selected_item: dict[
         if not isinstance(step, dict) or step.get("name") != "select-work":
             continue
         input_data = step.get("input") if isinstance(step.get("input"), dict) else {}
+        if not input_data:
+            equivalent_command = step.get("equivalent_command")
+            if isinstance(equivalent_command, list) and "--input" in equivalent_command:
+                input_index = equivalent_command.index("--input") + 1
+                if input_index < len(equivalent_command):
+                    try:
+                        parsed_input = json.loads(equivalent_command[input_index])
+                    except json.JSONDecodeError:
+                        parsed_input = {}
+                    if isinstance(parsed_input, dict):
+                        input_data = parsed_input
         sources = input_data.get("sources")
         if not isinstance(sources, list):
             continue

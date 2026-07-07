@@ -22,6 +22,24 @@ PASSED_CHECK_STATES = {"SUCCESS", "PASS", "PASSED"}
 BLOCKED_MERGE_STATES = {"BLOCKED", "DIRTY", "UNKNOWN", "UNSTABLE", "BEHIND", "DRAFT"}
 
 
+def _path_is_within_root(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
+def _resolve_step_result_path(step: dict[str, Any], workstream_dir: Path) -> Path | None:
+    ledger_root = workstream_dir.parent.parent.resolve(strict=False)
+    relative_path = string_field(step, "result_path")
+    if relative_path:
+        candidate = (ledger_root / relative_path).resolve(strict=False)
+        if _path_is_within_root(candidate, ledger_root) and candidate.is_file():
+            return candidate
+    return None
+
+
 def integrate_published_pr(
     published_result_path: str | Path,
     *,
@@ -181,7 +199,7 @@ def normalize_request(
     repo = publication_repo(publication, workstream)
     pr_number = publication_pr_number(publication, workstream)
     pr_url = publication_pr_url(publication, workstream)
-    expected_head_sha = publication_expected_head(publication, workstream)
+    expected_head_sha = publication_expected_head(publication, workstream, workstream_dir=workstream_dir)
     required_checks = normalize_required_checks(policy)
     if not repo:
         raise ValueError("could not determine repo from published artifact")
@@ -532,7 +550,12 @@ def publication_pr_url(publication: dict[str, Any], workstream: dict[str, Any]) 
     return ""
 
 
-def publication_expected_head(publication: dict[str, Any], workstream: dict[str, Any]) -> str:
+def publication_expected_head(
+    publication: dict[str, Any],
+    workstream: dict[str, Any],
+    *,
+    workstream_dir: Path | None = None,
+) -> str:
     for source in (
         publication,
         workstream.get("publication", {}) if isinstance(workstream.get("publication"), dict) else {},
@@ -550,13 +573,24 @@ def publication_expected_head(publication: dict[str, Any], workstream: dict[str,
         if step_name != "implement":
             continue
         output = step.get("output")
-        if not isinstance(output, dict):
-            continue
-        git_info = output.get("git")
-        if isinstance(git_info, dict):
-            head = string_field(git_info, "after_commit")
-            if head:
-                return head
+        if isinstance(output, dict):
+            git_info = output.get("git")
+            if isinstance(git_info, dict):
+                head = string_field(git_info, "after_commit")
+                if head:
+                    return head
+        if workstream_dir is not None:
+            path = _resolve_step_result_path(step, workstream_dir)
+            if path is not None:
+                payload = read_json_file(path)
+                if isinstance(payload, dict):
+                    output = payload.get("output")
+                    if isinstance(output, dict):
+                        git_info = output.get("git")
+                        if isinstance(git_info, dict):
+                            head = string_field(git_info, "after_commit")
+                            if head:
+                                return head
     return ""
 
 
@@ -747,7 +781,7 @@ def classify_terminal_integration(
         "repo": publication_repo(publication, workstream),
         "pr_number": publication_pr_number(publication, workstream),
         "pr_url": publication_pr_url(publication, workstream),
-        "expected_head_sha": publication_expected_head(publication, workstream),
+        "expected_head_sha": publication_expected_head(publication, workstream, workstream_dir=published_path.parent),
         "required_checks": normalize_required_checks(policy if isinstance(policy, dict) else {}),
         "auth": {
             "configured": True,

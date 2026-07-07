@@ -2750,6 +2750,117 @@ else:
                 ],
             )
 
+    def test_run_next_skips_open_target_pr_with_generic_contract_fixture(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            contracts_dir = temp_path / "contracts"
+            repo = temp_path / "repo-src"
+            fake_bin = temp_path / "bin"
+            beads_workspace = temp_path / "beads"
+            checkout_root = temp_path / "checkouts"
+            checkout_path = checkout_root / "widgets"
+
+            contracts_dir.mkdir()
+            init_repo(repo)
+            write_contract(
+                contracts_dir / "widgets.json",
+                project_slug="widgets",
+                repo_url="https://github.com/acme/widgets",
+            )
+            (beads_workspace / "secrets").mkdir(parents=True)
+            (beads_workspace / "secrets" / "dolt_beads_password.txt").write_text("beads-secret", encoding="utf-8")
+            fake_bin.mkdir()
+            write_executable(
+                fake_bin / "gh",
+                f"""#!{sys.executable}
+import json
+import sys
+
+if sys.argv[1:3] == ["auth", "status"]:
+    sys.exit(0)
+if sys.argv[1:3] == ["pr", "list"]:
+    print(json.dumps([
+        {{
+            "url": "https://github.com/acme/widgets/pull/17",
+            "headRefName": "afk/central-generic-1"
+        }}
+    ]))
+    sys.exit(0)
+raise SystemExit(9)
+""",
+            )
+            write_executable(
+                fake_bin / "bd",
+                f"""#!{sys.executable}
+import json
+import sys
+
+if sys.argv[1:2] == ["list"]:
+    print(json.dumps([{{"id": "central-generic.1"}}, {{"id": "central-next.1"}}]))
+elif sys.argv[1:3] == ["show", "central-generic.1"]:
+    print(json.dumps({{
+        "id": "central-generic.1",
+        "title": "Already published generic item",
+        "status": "open",
+        "labels": ["project:widgets", "ready-for-agent"],
+        "metadata": {{"afk.ready": True, "workstream": "central-generic.1"}},
+        "acceptance_criteria": ["Should be skipped while target PR stays open"],
+        "dependencies": [],
+    }}))
+elif sys.argv[1:3] == ["show", "central-next.1"]:
+    print(json.dumps({{
+        "id": "central-next.1",
+        "title": "Fresh generic item",
+        "status": "open",
+        "labels": ["project:widgets", "ready-for-agent"],
+        "metadata": {{"afk.ready": True, "workstream": "central-next"}},
+        "acceptance_criteria": ["Should still be selected"],
+        "dependencies": [],
+    }}))
+else:
+    raise SystemExit(9)
+""",
+            )
+
+            completed = run_afk(
+                "run-next",
+                "--project",
+                "widgets",
+                "--contracts-dir",
+                str(contracts_dir),
+                "--beads-workspace",
+                str(beads_workspace),
+                "--checkout-root",
+                str(checkout_root),
+                "--checkout-path",
+                str(checkout_path),
+                "--validation-profile",
+                "tier1",
+                "--role-profile",
+                "fake-local",
+                env={"GH_TOKEN": "fake-token", "GITHUB_TOKEN": None, "PATH": str(fake_bin)},
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            payload = json.loads(completed.stdout)
+            self.assertEqual(payload["selector"]["selected"]["external_id"], "central-next.1")
+            self.assertEqual(
+                [
+                    (item["candidate"]["external_id"], item["reason"])
+                    for item in payload["selection_result"]["skipped_candidates"]
+                ],
+                [
+                    (
+                        "central-generic.1",
+                        "open_afk_pr_exists:workstream=central-generic.1,pr_url=https://github.com/acme/widgets/pull/17",
+                    )
+                ],
+            )
+            self.assertEqual(
+                payload["selection_request"]["sources"][1]["repo"],
+                "acme/widgets",
+            )
+
     def test_run_next_does_not_select_beads_item_when_target_repo_pr_lookup_has_no_auth(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
