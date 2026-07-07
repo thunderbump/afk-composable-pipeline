@@ -1721,6 +1721,7 @@ raise SystemExit(9)
             self.assertEqual(result["pipeline_retrospective"]["follow_up"]["created"][0]["id"], "central-new.1")
             self.assertEqual(sum(1 for call in calls if call["argv"][0] == "create"), 1)
             self.assertIn("project:dogfood", created[0]["labels"])
+            self.assertNotIn("project:afk-composable-pipeline", created[0]["labels"])
             self.assertIn("area:retrospective", created[0]["labels"])
             self.assertIn("retrospective-follow-up-request.json", created[0]["description"])
             self.assertIn("retrospective-follow-up-result.json", created[0]["description"])
@@ -2001,6 +2002,39 @@ Path(result_env).write_text(
             labels,
             ["area:retro", "project:afk-composable-pipeline", "ready-for-agent"],
         )
+
+    def test_retrospective_follow_up_bead_labels_prefer_explicit_project_label(self):
+        labels = _retrospective_follow_up_bead_labels(
+            {"summary": "Configured follow-up", "labels": ["area:retro", "project:afk-composable-pipeline"]},
+            {"labels": ["project:dogfood", "ready-for-agent"]},
+        )
+
+        self.assertEqual(
+            labels,
+            ["area:retro", "project:dogfood", "ready-for-agent"],
+        )
+
+    def test_run_workstream_beads_mode_requires_beads_workspace_flag(self):
+        completed = run_afk(
+            "run-workstream",
+            "--project",
+            "afk-composable-pipeline",
+            "--contracts-dir",
+            "project-contracts",
+            "--retrospective-follow-up-mode",
+            "beads",
+            "--workstream-id",
+            "central-lve.9",
+            "--input",
+            "{}",
+        )
+
+        self.assertEqual(completed.returncode, 2)
+        self.assertIn(
+            "--beads-workspace is required when retrospective follow-up mode is beads",
+            completed.stderr,
+        )
+        self.assertNotIn("TypeError", completed.stderr)
 
     def test_retrospective_follow_up_fingerprint_includes_kind(self):
         summary = "Same follow-up summary"

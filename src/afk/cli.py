@@ -138,7 +138,7 @@ def main(argv: list[str] | None = None) -> int:
                     recipe_retrospective_follow_up_from_args(
                         args,
                         project_contract=project_contract,
-                        beads_workspace=Path(args.beads_workspace),
+                        beads_workspace=Path(args.beads_workspace) if args.beads_workspace is not None else None,
                     )
                     if args.retrospective_follow_up_mode != "disabled" and project_contract is not None
                     else None
@@ -877,7 +877,7 @@ def recipe_retrospective_follow_up_from_args(
     args: argparse.Namespace,
     *,
     project_contract: ProjectContract,
-    beads_workspace: Path,
+    beads_workspace: Path | None,
 ) -> dict[str, Any] | None:
     if args.retrospective_follow_up_mode == "disabled":
         return None
@@ -885,7 +885,7 @@ def recipe_retrospective_follow_up_from_args(
         raise ValueError(
             f"Unsupported --retrospective-follow-up-mode: {args.retrospective_follow_up_mode}"
         )
-    if not str(beads_workspace).strip():
+    if beads_workspace is None or not str(beads_workspace).strip():
         raise ValueError("--beads-workspace is required when retrospective follow-up mode is beads")
     workspace = validate_beads_workspace(beads_workspace)
     return {
