@@ -337,11 +337,14 @@ def optional_bool_or_alias(
     candidates = [name for name in (key, alias) if name in data]
     if not candidates:
         return default
-    if len(candidates) == 2 and bool(data[key]) != bool(data[alias]):
+    for name in candidates:
+        if not isinstance(data[name], bool):
+            raise ContractError(
+                f"invalid project contract {path}: {prefix}{name} must be a boolean"
+            )
+    if len(candidates) == 2 and data[key] != data[alias]:
         raise ContractError(f"invalid project contract {path}: {prefix}{key} and {alias} must agree when both are set")
     value = data[candidates[0]]
-    if not isinstance(value, bool):
-        raise ContractError(f"invalid project contract {path}: {prefix}{key} must be a boolean")
     return value
 
 

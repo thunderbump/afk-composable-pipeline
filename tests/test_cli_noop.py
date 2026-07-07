@@ -11,7 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = ROOT / "tests" / "fixtures"
 sys.path.insert(0, str(ROOT / "src"))
 
-from afk.contracts import load_project_contract, materialize_terminal_integration_policy  # noqa: E402
+from afk.contracts import ContractError, load_project_contract, materialize_terminal_integration_policy  # noqa: E402
 
 
 def run_afk(*args, cwd=None, env_overrides=None):
@@ -30,6 +30,118 @@ def run_afk(*args, cwd=None, env_overrides=None):
 
 
 class NoopCliTest(unittest.TestCase):
+    def test_project_contract_rejects_non_boolean_close_tracker_alias(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            contracts_dir = Path(temp_dir)
+            (contracts_dir / "defaulted.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "project_slug": "defaulted",
+                        "repo_url": "https://github.com/acme/defaulted.git",
+                        "base_branch": "main",
+                        "beads_labels": ["project:defaulted"],
+                        "validation_profiles": ["tier1"],
+                        "artifact_retention": {"ledger_days": 30, "log_days": 30},
+                        "pr_target": {"remote": "origin", "branch": "main"},
+                        "terminal_integration": {
+                            "close_tracker_on_merge": True,
+                            "closeTrackerOnMerge": "yes",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(
+                ContractError,
+                r"terminal_integration\.closeTrackerOnMerge must be a boolean",
+            ):
+                load_project_contract("defaulted", contracts_dir, cwd=contracts_dir)
+
+    def test_project_contract_rejects_non_boolean_close_tracker_snake_case(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            contracts_dir = Path(temp_dir)
+            (contracts_dir / "defaulted.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "project_slug": "defaulted",
+                        "repo_url": "https://github.com/acme/defaulted.git",
+                        "base_branch": "main",
+                        "beads_labels": ["project:defaulted"],
+                        "validation_profiles": ["tier1"],
+                        "artifact_retention": {"ledger_days": 30, "log_days": 30},
+                        "pr_target": {"remote": "origin", "branch": "main"},
+                        "terminal_integration": {
+                            "close_tracker_on_merge": "yes",
+                            "closeTrackerOnMerge": True,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(
+                ContractError,
+                r"terminal_integration\.close_tracker_on_merge must be a boolean",
+            ):
+                load_project_contract("defaulted", contracts_dir, cwd=contracts_dir)
+
+    def test_project_contract_rejects_conflicting_close_tracker_aliases(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            contracts_dir = Path(temp_dir)
+            (contracts_dir / "defaulted.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "project_slug": "defaulted",
+                        "repo_url": "https://github.com/acme/defaulted.git",
+                        "base_branch": "main",
+                        "beads_labels": ["project:defaulted"],
+                        "validation_profiles": ["tier1"],
+                        "artifact_retention": {"ledger_days": 30, "log_days": 30},
+                        "pr_target": {"remote": "origin", "branch": "main"},
+                        "terminal_integration": {
+                            "close_tracker_on_merge": True,
+                            "closeTrackerOnMerge": False,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(
+                ContractError,
+                r"terminal_integration\.close_tracker_on_merge and closeTrackerOnMerge must agree when both are set",
+            ):
+                load_project_contract("defaulted", contracts_dir, cwd=contracts_dir)
+
+    def test_project_contract_materializes_terminal_integration_from_close_tracker_alias(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            contracts_dir = Path(temp_dir)
+            (contracts_dir / "defaulted.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "project_slug": "defaulted",
+                        "repo_url": "https://github.com/acme/defaulted.git",
+                        "base_branch": "main",
+                        "beads_labels": ["project:defaulted"],
+                        "validation_profiles": ["tier1"],
+                        "artifact_retention": {"ledger_days": 30, "log_days": 30},
+                        "pr_target": {"remote": "origin", "branch": "main"},
+                        "terminal_integration": {"closeTrackerOnMerge": False},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            contract = load_project_contract("defaulted", contracts_dir, cwd=contracts_dir)
+
+        self.assertFalse(materialize_terminal_integration_policy(contract)["close_tracker_on_merge"])
+        self.assertFalse(materialize_terminal_integration_policy(contract)["closeTrackerOnMerge"])
+
     def test_run_step_defaults_ledger_to_ledgers_directory(self):
         input_json = (FIXTURES / "noop-input.json").read_text(encoding="utf-8")
 
