@@ -164,6 +164,38 @@ def selected_work_target_project_labels(selected_work: list[dict[str, Any]]) -> 
                 and label not in labels
             ):
                 labels.append(label)
+    if labels:
+        return labels
+    for item in selected_work:
+        labels.extend(_inferred_project_labels_from_text(string_field(item, "title") or "", existing=labels))
+    return labels
+
+
+def inferred_target_project_labels(state: dict[str, Any]) -> list[str]:
+    labels = selected_work_target_project_labels(selected_work_items(state))
+    if labels:
+        return labels
+    attempts = state.get("retry_attempts")
+    if not isinstance(attempts, list):
+        return labels
+    for attempt in attempts:
+        if not isinstance(attempt, dict):
+            continue
+        checkout_path = string_field(attempt, "checkout_path") or ""
+        checkout_name = Path(checkout_path).name if checkout_path else ""
+        labels.extend(_inferred_project_labels_from_text(checkout_name, existing=labels))
+    return labels
+
+
+def _inferred_project_labels_from_text(text: str, *, existing: list[str]) -> list[str]:
+    labels: list[str] = []
+    for candidate in re.findall(r"\b[A-Za-z0-9]+(?:[-_][A-Za-z0-9]+)+\b", text):
+        slug = candidate.lower().replace("_", "-")
+        if slug in {"afk-composable-pipeline"} or slug.startswith("central-"):
+            continue
+        label = f"project:{slug}"
+        if label not in existing and label not in labels:
+            labels.append(label)
     return labels
 
 
@@ -1846,8 +1878,8 @@ def _validation_retrospective_signals(
     normalized: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     validations = state.get("validations")
-    if not isinstance(validations, list):
-        return []
+    if not isinstance(validations, list) or not validations:
+        return _persisted_validation_retrospective_signals(state)
     selected_work = selected_work_items(state)
     signals = []
     for index, validation in enumerate(validations):
@@ -1877,6 +1909,49 @@ def _validation_retrospective_signals(
                     signal["consumed_by_repair"] = True
                 signals.append(signal)
                 break
+    return signals
+
+
+def _persisted_validation_retrospective_signals(state: dict[str, Any]) -> list[dict[str, Any]]:
+    pipeline_retrospective = (
+        state.get("pipeline_retrospective") if isinstance(state.get("pipeline_retrospective"), dict) else {}
+    )
+    persisted_signals = pipeline_retrospective.get("signals")
+    if not isinstance(persisted_signals, list):
+        return []
+    selected_work = selected_work_items(state)
+    signals: list[dict[str, Any]] = []
+    for signal in persisted_signals:
+        if not isinstance(signal, dict):
+            continue
+        kind = string_field(signal, "kind") or ""
+        if kind not in {"validation-failure", "missing-tool-or-config"}:
+            continue
+        evidence_paths = [
+            path for path in signal.get("evidence_paths", []) if isinstance(path, str) and path
+        ]
+        scope = _validation_failure_retrospective_scope(
+            {"classification": string_field(signal, "classification") or ""},
+            {
+                "category": string_field(signal, "classification") or "",
+                "excerpt": string_field(signal, "excerpt") or string_field(signal, "summary") or "",
+                "log_path": evidence_paths[0] if evidence_paths else "",
+            },
+            kind=kind,
+            selected_work=selected_work,
+            evidence_paths=evidence_paths,
+            target_project_labels=inferred_target_project_labels(state),
+        )
+        rebuilt = dict(signal)
+        rebuilt["scope"] = scope
+        if scope == "target-work":
+            external_id = selected_work_external_id(selected_work)
+            labels = inferred_target_project_labels(state)
+            if external_id:
+                rebuilt["external_id"] = redact_text(external_id)
+            if labels:
+                rebuilt["labels"] = labels
+        signals.append(rebuilt)
     return signals
 
 
@@ -1994,6 +2069,7 @@ def _validation_failure_retrospective_scope(
     kind: str,
     selected_work: list[dict[str, Any]] | None = None,
     evidence_paths: list[str] | None = None,
+    target_project_labels: list[str] | None = None,
 ) -> str:
     if kind == "missing-tool-or-config":
         return "pipeline-process"
@@ -2001,7 +2077,10 @@ def _validation_failure_retrospective_scope(
     if category in {"runtime", "protocol", "timeout", "missing_result", "prerequisite_skip"}:
         return "pipeline-process"
     if category == "worker_failure":
-        if not selected_work_target_project_labels(selected_work or []):
+        effective_target_project_labels = target_project_labels
+        if effective_target_project_labels is None:
+            effective_target_project_labels = selected_work_target_project_labels(selected_work or [])
+        if not effective_target_project_labels:
             return "pipeline-process"
         if _validation_worker_failure_is_pipeline_infrastructure(failure, evidence_paths or []):
             return "pipeline-process"
@@ -2282,7 +2361,7 @@ def _blocked_reason_targets_work_item(state: dict[str, Any], reason: str) -> boo
     ):
         validation = latest_validation_record(state)
         if validation is None:
-            return False
+            return _persisted_validation_targets_work_item(state)
         output = validation.get("output") if isinstance(validation.get("output"), dict) else {}
         failure = first_validation_failure(output) or {}
         return _validation_failure_retrospective_scope(
@@ -2303,7 +2382,7 @@ def _blocked_reason_targets_work_item(state: dict[str, Any], reason: str) -> boo
             return True
         validation = latest_validation_record(state)
         if validation is None:
-            return False
+            return _persisted_validation_targets_work_item(state)
         output = validation.get("output") if isinstance(validation.get("output"), dict) else {}
         failure = first_validation_failure(output) or {}
         return _validation_failure_retrospective_scope(
@@ -2318,6 +2397,13 @@ def _blocked_reason_targets_work_item(state: dict[str, Any], reason: str) -> boo
             ),
         ) == "target-work"
     return False
+
+
+def _persisted_validation_targets_work_item(state: dict[str, Any]) -> bool:
+    return any(
+        isinstance(signal, dict) and string_field(signal, "scope") == "target-work"
+        for signal in _persisted_validation_retrospective_signals(state)
+    )
 
 
 def _reason_is_repair_budget_exhausted(reason: str) -> bool:
