@@ -249,6 +249,7 @@ def build_tracker_record(context: TrackerContext) -> dict[str, Any]:
     record = {
         "schema_version": context.schema_version,
         "status": tracker_progress_status(context.state),
+        "implementation_commit": implemented_after_commit(context.state),
         "repair_stop": redact_artifact_value(repair_stop_record(context.state, context.publication)),
         "close_source_item": False,
         "close_reason": "",
@@ -373,6 +374,16 @@ def build_tracker_record(context: TrackerContext) -> dict[str, Any]:
     if context.publication.get("status") == "validated-unpublished":
         record["status"] = "validated"
         record["comment"] = "Validated head is ready, but the source Beads item stays open until merge or no-merge."
+        return record
+    if context.publication.get("status") == "blocked":
+        record["status"] = "blocked"
+        blocked_reason = redact_text(str(context.publication.get("reason") or ""))
+        if blocked_reason:
+            record["comment"] = (
+                f"{blocked_reason}; keep the source Beads item open until the recorded blocker is cleared."
+            )
+        else:
+            record["comment"] = "Workstream is blocked; keep the source Beads item open until the blocker is cleared."
         return record
     if record["review_findings"]:
         record["comment"] = "Review findings are available; update the source Beads item and keep it open."
