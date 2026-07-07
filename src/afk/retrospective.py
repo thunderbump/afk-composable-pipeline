@@ -1352,11 +1352,19 @@ def _retrospective_follow_up_bead_labels(
     follow_up_config: dict[str, Any],
 ) -> list[str]:
     labels = _retrospective_follow_up_labels(recommendation.get("labels"))
-    for label in follow_up_config.get("labels", []):
+    configured_labels: list[str] = []
+    if isinstance(follow_up_config.get("labels"), list):
+        for label in follow_up_config["labels"]:
+            if isinstance(label, str) and label and label not in configured_labels:
+                configured_labels.append(label)
+    configured_project_labels = [label for label in configured_labels if label.startswith("project:")]
+    if configured_project_labels:
+        labels = [label for label in labels if not label.startswith("project:")]
+    elif not any(label.startswith("project:") for label in labels):
+        labels.append(_retrospective_follow_up_project_label([recommendation]))
+    for label in configured_labels:
         if label not in labels:
             labels.append(label)
-    if not any(label.startswith("project:") for label in labels):
-        labels.append(_retrospective_follow_up_project_label([recommendation]))
     return labels
 
 

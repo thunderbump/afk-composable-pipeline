@@ -1593,11 +1593,139 @@ raise SystemExit(9)
             summary = json.loads(completed.stdout)
             result = json.loads((ledger / summary["result_path"]).read_text(encoding="utf-8"))
             self.assertEqual(result["status"], "published")
-            self.assertEqual(result["pipeline_retrospective"]["judge"], {"enabled": False, "status": "disabled"})
             self.assertEqual(
                 result["pipeline_retrospective"]["follow_up"]["creation"],
                 {"enabled": False, "status": "recommendation-only"},
             )
+
+    def test_workstream_beads_mode_creates_retrospective_follow_up_from_explicit_runtime_config(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repo = temp_path / "repo-src"
+            checkout = temp_path / "checkout"
+            ledger = temp_path / "ledger"
+            contracts_dir = temp_path / "contracts"
+            beads_workspace = temp_path / "beads"
+            fake_calls = temp_path / "fake-bd-calls.jsonl"
+            created_beads = temp_path / "created-beads.json"
+            init_repo(repo)
+            contracts_dir.mkdir()
+            beads_workspace.mkdir()
+            (beads_workspace / "secrets").mkdir()
+            (beads_workspace / "secrets" / "dolt_beads_password.txt").write_text("test-password\n", encoding="utf-8")
+            (contracts_dir / "dogfood.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "project_slug": "dogfood",
+                        "repo_url": repo.as_uri(),
+                        "base_branch": "main",
+                        "beads_labels": ["project:dogfood"],
+                        "validation_profiles": ["tier1"],
+                        "validation_profile_requests": {"tier1": {"profile": "tier1"}},
+                        "artifact_retention": {"ledger_days": 30, "log_days": 30},
+                        "pr_target": {"remote": "origin", "branch": "main"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            fake_git = temp_path / "publisher-git"
+            fake_gh = temp_path / "publisher-gh"
+            fake_bd = temp_path / "bd"
+            write_executable(
+                fake_git,
+                f"""#!{sys.executable}
+raise SystemExit(0)
+""",
+            )
+            write_executable(
+                fake_gh,
+                f"""#!{sys.executable}
+import sys
+if sys.argv[1:4] == ["auth", "status", "--hostname"]:
+    raise SystemExit(1)
+raise SystemExit(9)
+""",
+            )
+            write_executable(
+                fake_bd,
+                f"""#!{sys.executable}
+import json
+import os
+import sys
+from pathlib import Path
+
+calls_path = Path({str(fake_calls)!r})
+created_path = Path({str(created_beads)!r})
+items = json.loads(created_path.read_text(encoding="utf-8")) if created_path.exists() else []
+calls_path.open("a", encoding="utf-8").write(
+    json.dumps({{"argv": sys.argv[1:], "password": os.environ.get("BEADS_DOLT_PASSWORD", "")}}) + "\\n"
+)
+if sys.argv[1:2] == ["list"]:
+    print(json.dumps(items))
+    raise SystemExit(0)
+if sys.argv[1:2] == ["create"]:
+    bead_id = f"central-new.{{len(items) + 1}}"
+    item = {{
+        "id": bead_id,
+        "title": sys.argv[sys.argv.index("--title") + 1],
+        "labels": sys.argv[sys.argv.index("--labels") + 1].split(","),
+        "description": sys.argv[sys.argv.index("--description") + 1],
+        "metadata": json.loads(sys.argv[sys.argv.index("--metadata") + 1]),
+    }}
+    items.append(item)
+    created_path.write_text(json.dumps(items), encoding="utf-8")
+    print(bead_id)
+    raise SystemExit(0)
+raise SystemExit(9)
+""",
+            )
+            recipe = successful_recipe(temp_path, repo, checkout, fake_git, fake_gh)
+
+            completed = run_afk(
+                "run-workstream",
+                "--project",
+                "dogfood",
+                "--contracts-dir",
+                str(contracts_dir),
+                "--beads-workspace",
+                str(beads_workspace),
+                "--retrospective-follow-up-mode",
+                "beads",
+                "--retrospective-follow-up-label",
+                "area:retrospective",
+                "--workstream-id",
+                "central-lve.9",
+                "--input",
+                json.dumps(recipe),
+                "--ledger",
+                str(ledger),
+                env_overrides={
+                    "PATH": f"{temp_path}{os.pathsep}{os.environ['PATH']}",
+                    "GIT_ALLOW_PROTOCOL": "file",
+                    "GIT_AUTHOR_NAME": "AFK Test",
+                    "GIT_AUTHOR_EMAIL": "afk-test@example.test",
+                    "GIT_COMMITTER_NAME": "AFK Test",
+                    "GIT_COMMITTER_EMAIL": "afk-test@example.test",
+                },
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            result = json.loads((ledger / summary["result_path"]).read_text(encoding="utf-8"))
+            calls = [json.loads(line) for line in fake_calls.read_text(encoding="utf-8").splitlines()]
+            created = json.loads(created_beads.read_text(encoding="utf-8"))
+
+            self.assertEqual(result["pipeline_retrospective"]["follow_up"]["creation"]["status"], "created")
+            self.assertEqual(len(result["pipeline_retrospective"]["follow_up"]["created"]), 1)
+            self.assertEqual(result["pipeline_retrospective"]["follow_up"]["created"][0]["id"], "central-new.1")
+            self.assertEqual(sum(1 for call in calls if call["argv"][0] == "create"), 1)
+            self.assertIn("project:dogfood", created[0]["labels"])
+            self.assertNotIn("project:afk-composable-pipeline", created[0]["labels"])
+            self.assertIn("area:retrospective", created[0]["labels"])
+            self.assertIn("retrospective-follow-up-request.json", created[0]["description"])
+            self.assertIn("retrospective-follow-up-result.json", created[0]["description"])
+            self.assertEqual(result["pipeline_retrospective"]["judge"], {"enabled": False, "status": "disabled"})
 
     def test_workstream_runs_checkout_local_shell_wrapped_pi_command_once_without_preflight(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1874,6 +2002,39 @@ Path(result_env).write_text(
             labels,
             ["area:retro", "project:afk-composable-pipeline", "ready-for-agent"],
         )
+
+    def test_retrospective_follow_up_bead_labels_prefer_explicit_project_label(self):
+        labels = _retrospective_follow_up_bead_labels(
+            {"summary": "Configured follow-up", "labels": ["area:retro", "project:afk-composable-pipeline"]},
+            {"labels": ["project:dogfood", "ready-for-agent"]},
+        )
+
+        self.assertEqual(
+            labels,
+            ["area:retro", "project:dogfood", "ready-for-agent"],
+        )
+
+    def test_run_workstream_beads_mode_requires_beads_workspace_flag(self):
+        completed = run_afk(
+            "run-workstream",
+            "--project",
+            "afk-composable-pipeline",
+            "--contracts-dir",
+            "project-contracts",
+            "--retrospective-follow-up-mode",
+            "beads",
+            "--workstream-id",
+            "central-lve.9",
+            "--input",
+            "{}",
+        )
+
+        self.assertEqual(completed.returncode, 2)
+        self.assertIn(
+            "--beads-workspace is required when retrospective follow-up mode is beads",
+            completed.stderr,
+        )
+        self.assertNotIn("TypeError", completed.stderr)
 
     def test_retrospective_follow_up_fingerprint_includes_kind(self):
         summary = "Same follow-up summary"

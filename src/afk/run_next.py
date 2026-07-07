@@ -136,8 +136,18 @@ def run_next_request(
         if request.execute:
             if workstream_runner is None:
                 raise ValueError("workstream_runner is required when --execute is set")
+            runtime_recipe = recipe
+            if isinstance(recipe, dict) and request.planner.retrospective_follow_up is not None:
+                runtime_recipe = {
+                    **recipe,
+                    "retrospective_follow_up": dict(request.planner.retrospective_follow_up),
+                }
             workstream_result = normalize_workstream_result(
-                workstream_runner(recipe, ledger_dir=request.ledger_dir, project_contract=request.project_contract),
+                workstream_runner(
+                    runtime_recipe,
+                    ledger_dir=request.ledger_dir,
+                    project_contract=request.project_contract,
+                ),
                 ledger_dir=request.ledger_dir,
             )
     return {

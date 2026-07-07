@@ -204,12 +204,12 @@ The recipe schema is intentionally small:
   optional note-path lists under `notes.personal_work` and `notes.spikes`.
   Keep retrospective note paths free of secrets; AFK redacts sensitive-looking
   values before writing ledger outputs.
-- Runtime workstreams stay data-only after the deterministic retrospective is
-  built. `pipeline_retrospective.follow_up.creation` remains a
-  recommendation-only record in the minimal pipeline; any future
-  self-improvement worker or Beads creation should run as an external concern
-  against the emitted retrospective evidence instead of inside
-  `run-workstream`.
+- Runtime workstreams stay recommendation-only by default after the
+  deterministic retrospective is built. When `run-next --execute` or
+  `run-workstream` is launched with `--retrospective-follow-up-mode beads`,
+  AFK can materialize deterministic retrospective recommendations into central
+  Beads; otherwise `pipeline_retrospective.follow_up.creation` remains a
+  recommendation-only record.
 - `tracker.terminal_decision` is optional metadata for a future external closer
   or retrospective worker. `run-workstream` does not merge/close PRs or close
   source tracker items on the minimal path.
@@ -912,10 +912,10 @@ contains Beads-shaped `recommended` entries with `kind`, `summary`, `labels`,
 and stable redacted `fingerprint` values plus a `creation` record describing
 recommendation-only mode. The legacy `recommended_follow_up` list is preserved
 for compatibility.
-The minimal runtime does not execute a retrospective judge or create follow-up
-Beads. Future self-improvement workers should consume
-`pipeline-retrospective.json` outside the workstream lifecycle if that behavior
-is needed.
+By default the runtime stays recommendation-only. When `run-next --execute` or
+`run-workstream` is launched with `--retrospective-follow-up-mode beads`, the
+runtime can materialize deterministic retrospective recommendations into
+central Beads with fingerprint-based dedupe.
 `retrospective.json`, when present, stores the user-supplied terminal
 retrospective evidence separately from the derived pipeline retrospective.
 `review_cycles` evidence, when supplied, is included in both
