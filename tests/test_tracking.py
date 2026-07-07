@@ -42,6 +42,62 @@ def tracker_state():
 
 
 class TrackingModuleTest(unittest.TestCase):
+    def test_build_tracker_record_marks_blocked_publication_and_preserves_implementation_commit(self):
+        record = build_tracker_record(
+            TrackerContext(
+                schema_version=1,
+                normalized={"workstream_id": "central-afk-pr.17", "tracker": {"terminal_decision": {}}},
+                state=tracker_state(),
+                publication={
+                    "status": "blocked",
+                    "reason": "stuck_same_finding: validation repairs exhausted for the selected work item",
+                },
+                retrospective={},
+            )
+        )
+
+        self.assertEqual(record["status"], "blocked")
+        self.assertEqual(record["implementation_commit"], "abc123")
+        self.assertFalse(record["close_source_item"])
+        self.assertIn("keep the source Beads item open", record["comment"])
+
+    def test_build_tracker_record_clears_stale_terminal_decision_for_blocked_publication(self):
+        record = build_tracker_record(
+            TrackerContext(
+                schema_version=1,
+                normalized={
+                    "workstream_id": "central-afk-pr.17",
+                    "tracker": {
+                        "terminal_decision": {
+                            "status": "merged",
+                            "merge_commit": "deadbeef",
+                            "pr_url": "https://github.example/pr/123",
+                        }
+                    },
+                },
+                state=tracker_state(),
+                publication={
+                    "status": "blocked",
+                    "reason": "repair budget exhausted: 5 attempts reached hard_cap=5",
+                },
+                retrospective={},
+            )
+        )
+
+        self.assertEqual(record["status"], "blocked")
+        self.assertEqual(
+            record["terminal_decision"],
+            {
+                "status": "",
+                "merge_commit": "",
+                "reason": "",
+                "pr_url": "",
+                "review_feedback_status": "",
+            },
+        )
+        self.assertEqual(record["pr_url"], "")
+        self.assertEqual(record["merge_commit"], "")
+
     def test_build_tracker_record_includes_repair_stop_evidence(self):
         state = tracker_state()
         state["implementation_result_path"] = "runs/implement/step-result.json"

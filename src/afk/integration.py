@@ -195,6 +195,9 @@ def normalize_request(
     publication = load_publication_payload(published_path)
     workstream = load_workstream_payload(published_path)
     output_dir = integration_output_dir(published_path)
+    blocked_reason = blocked_workstream_artifact_reason(publication, workstream)
+    if blocked_reason:
+        raise ValueError(f"cannot integrate blocked workstream artifact: {blocked_reason}")
 
     repo = publication_repo(publication, workstream)
     pr_number = publication_pr_number(publication, workstream)
@@ -238,6 +241,26 @@ def normalize_request(
         "gh_path": string_field(gh, "path") or "gh",
         "poll_seconds": poll_seconds,
     }
+
+
+def blocked_workstream_artifact_reason(publication: dict[str, Any], workstream: dict[str, Any]) -> str:
+    publication_status = string_field(publication, "status")
+    workstream_status = string_field(workstream, "status")
+    if publication_status != "blocked" and workstream_status != "blocked":
+        return ""
+    for candidate in (
+        string_field(publication, "reason"),
+        string_field(workstream, "terminal_reason"),
+        string_field(workstream, "retry"),
+    ):
+        if candidate:
+            return candidate
+    nested_publication = workstream.get("publication")
+    if isinstance(nested_publication, dict):
+        reason = string_field(nested_publication, "reason")
+        if reason:
+            return reason
+    return "workstream publication is blocked"
 
 
 def integrate_terminal_merge(

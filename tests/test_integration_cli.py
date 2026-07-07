@@ -1203,6 +1203,50 @@ raise SystemExit(0)
             self.assertEqual(result["merge_state_status"], "BLOCKED")
             self.assertIn("current PR state", result["remediation"])
 
+    def test_integrate_pr_refuses_blocked_workstream_artifact_before_repo_resolution(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            workstream_path = temp_path / "ledger" / "workstreams" / "run-blocked-artifact" / "workstream-result.json"
+            workstream_path.parent.mkdir(parents=True, exist_ok=True)
+            workstream_path.write_text(
+                json.dumps(
+                    {
+                        "workstream_id": "central-umi2.9",
+                        "publication": {
+                            "status": "blocked",
+                            "reason": "repair budget exhausted: 5 attempts reached hard_cap=5",
+                        },
+                        "tracker": {
+                            "status": "blocked",
+                            "terminal_decision": {
+                                "status": "",
+                                "merge_commit": "",
+                                "reason": "",
+                                "pr_url": "",
+                                "review_feedback_status": "",
+                            },
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            auth_dir = temp_path / "gh-config"
+            auth_dir.mkdir()
+
+            completed = run_afk(
+                "integrate-pr",
+                "--published-result",
+                str(workstream_path),
+                "--policy",
+                json.dumps({"required_checks": []}),
+                "--gh-auth-config-dir",
+                str(auth_dir),
+            )
+
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("cannot integrate blocked workstream artifact", completed.stderr)
+            self.assertIn("repair budget exhausted: 5 attempts reached hard_cap=5", completed.stderr)
+
     def test_integrate_pr_records_exact_head_mismatch_from_publication_result_path(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
