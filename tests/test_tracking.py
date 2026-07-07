@@ -61,6 +61,43 @@ class TrackingModuleTest(unittest.TestCase):
         self.assertFalse(record["close_source_item"])
         self.assertIn("keep the source Beads item open", record["comment"])
 
+    def test_build_tracker_record_clears_stale_terminal_decision_for_blocked_publication(self):
+        record = build_tracker_record(
+            TrackerContext(
+                schema_version=1,
+                normalized={
+                    "workstream_id": "central-afk-pr.17",
+                    "tracker": {
+                        "terminal_decision": {
+                            "status": "merged",
+                            "merge_commit": "deadbeef",
+                            "pr_url": "https://github.example/pr/123",
+                        }
+                    },
+                },
+                state=tracker_state(),
+                publication={
+                    "status": "blocked",
+                    "reason": "repair budget exhausted: 5 attempts reached hard_cap=5",
+                },
+                retrospective={},
+            )
+        )
+
+        self.assertEqual(record["status"], "blocked")
+        self.assertEqual(
+            record["terminal_decision"],
+            {
+                "status": "",
+                "merge_commit": "",
+                "reason": "",
+                "pr_url": "",
+                "review_feedback_status": "",
+            },
+        )
+        self.assertEqual(record["pr_url"], "")
+        self.assertEqual(record["merge_commit"], "")
+
     def test_build_tracker_record_includes_repair_stop_evidence(self):
         state = tracker_state()
         state["implementation_result_path"] = "runs/implement/step-result.json"

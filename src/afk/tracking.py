@@ -419,6 +419,8 @@ def recorded_tracker_terminal_decision(normalized: dict[str, Any], publication: 
     publication_decision = runtime_terminal_decision(publication.get("terminal_decision"))
     if publication_decision.get("status"):
         return publication_decision
+    if string_field(publication, "status") == "blocked":
+        return empty_terminal_decision()
     return runtime_terminal_decision(normalized.get("tracker", {}).get("terminal_decision"))
 
 

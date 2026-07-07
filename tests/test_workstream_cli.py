@@ -6574,6 +6574,16 @@ Path({str(fake_calls)!r}).write_text("gh should not run\\n", encoding="utf-8")
             self.assertFalse(result["tracker"]["close_source_item"])
             self.assertEqual(result["tracker"]["close_reason"], "")
             self.assertEqual(result["tracker"]["pr_url"], "")
+            self.assertEqual(
+                result["tracker"]["terminal_decision"],
+                {
+                    "status": "",
+                    "merge_commit": "",
+                    "reason": "",
+                    "pr_url": "",
+                    "review_feedback_status": "",
+                },
+            )
             self.assertFalse(fake_calls.exists())
 
     def test_workstream_blocks_validation_before_implementation(self):
@@ -7638,6 +7648,144 @@ Path({str(fake_calls)!r}).write_text("gh should not run\\n", encoding="utf-8")
             self.assertEqual(
                 [attempt["repairing_failure_class"] for attempt in result["retry_attempts"]],
                 ["failed_validation", "request_revision"],
+            )
+
+    def test_workstream_blocks_when_validation_repairs_hit_progress_aware_hard_cap(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repo = temp_path / "repo-src"
+            checkout = temp_path / "checkout"
+            ledger = temp_path / "ledger"
+            init_repo(repo)
+            fake_git = temp_path / "publisher-git"
+            fake_gh = temp_path / "publisher-gh"
+            write_executable(fake_git, f"#!{sys.executable}\nraise SystemExit(9)\n")
+            write_executable(fake_gh, f"#!{sys.executable}\nraise SystemExit(9)\n")
+            validate_count = temp_path / "validate-count.txt"
+            agent_code = textwrap.dedent(
+                """
+                import json
+                import os
+                import subprocess
+                from pathlib import Path
+
+                capsule = json.loads(Path(os.environ["AFK_JOB_CAPSULE"]).read_text(encoding="utf-8"))
+                repair = capsule.get("repair_context")
+                if repair is None:
+                    filename = "implemented-0.txt"
+                    message = "initial implementation"
+                else:
+                    filename = f"implemented-{repair['attempt']}.txt"
+                    message = f"repair attempt {repair['attempt']}"
+                Path(filename).write_text(message + "\\n", encoding="utf-8")
+                subprocess.run(["git", "add", filename], check=True)
+                subprocess.run(["git", "commit", "-m", message], check=True)
+                Path("agent-result.json").write_text(
+                    json.dumps({"status": "completed", "summary": message}),
+                    encoding="utf-8",
+                )
+                """
+            ).strip()
+            worker_code = textwrap.dedent(
+                f"""
+                import json
+                import os
+                from pathlib import Path
+
+                result_path = Path(os.environ["AFK_WORKER_RESULT"])
+                evidence_dir = result_path.parent
+                count_path = Path({str(validate_count)!r})
+                prior = int(count_path.read_text(encoding="utf-8")) if count_path.exists() else 0
+                count_path.write_text(str(prior + 1), encoding="utf-8")
+                request = json.loads(Path(os.environ["AFK_WORKER_REQUEST"]).read_text(encoding="utf-8"))
+                (evidence_dir / "compiler.log").write_text(
+                    f"attempt {{prior + 1}}: src/demo.py:41: error: failing validation\\n",
+                    encoding="utf-8",
+                )
+                payload = {{
+                    "profile": request["profile"],
+                    "status": "fail",
+                    "summary": "unit tests failed",
+                    "steps": [{{"name": "unit", "status": "fail"}}],
+                    "failures": [
+                        {{
+                            "category": "compiler",
+                            "path": "src/demo.py",
+                            "line": 41,
+                            "excerpt": "src/demo.py:41: error: failing validation",
+                            "evidence_path": "compiler.log",
+                        }}
+                    ],
+                }}
+                result_path.write_text(json.dumps(payload), encoding="utf-8")
+                """
+            ).strip()
+            recipe = successful_recipe(temp_path, repo, checkout, fake_git, fake_gh)
+            recipe["publisher"] = {"enabled": False}
+            recipe["repair_policy"] = {"mode": "progress_aware", "hard_cap": 5}
+            recipe["validation_feedback"] = {"enabled": True}
+            recipe["review_feedback"] = {"enabled": False}
+            recipe["steps"][2]["input"]["agent"]["command"] = [sys.executable, "-c", agent_code]
+            recipe["steps"][3]["input"]["worker"]["command"] = [sys.executable, "-c", worker_code]
+
+            completed = run_afk(
+                "run-workstream",
+                "--workstream-id",
+                "central-lve.9",
+                "--input",
+                json.dumps(recipe),
+                "--ledger",
+                str(ledger),
+                env_overrides={
+                    "GIT_ALLOW_PROTOCOL": "file",
+                    "GIT_AUTHOR_NAME": "AFK Test",
+                    "GIT_AUTHOR_EMAIL": "afk-test@example.test",
+                    "GIT_COMMITTER_NAME": "AFK Test",
+                    "GIT_COMMITTER_EMAIL": "afk-test@example.test",
+                },
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            result = json.loads((ledger / summary["result_path"]).read_text(encoding="utf-8"))
+            latest_commit = git(checkout, "rev-parse", "HEAD")
+
+            self.assertEqual(summary["status"], "blocked")
+            self.assertEqual(result["status"], "blocked")
+            self.assertEqual(result["publication"]["status"], "blocked")
+            self.assertEqual(
+                result["publication"]["reason"],
+                "repair budget exhausted: 5 attempts reached hard_cap=5",
+            )
+            self.assertEqual(result["tracker"]["status"], "blocked")
+            self.assertEqual(result["tracker"]["implementation_commit"], latest_commit)
+            self.assertEqual(
+                result["tracker"]["terminal_decision"],
+                {
+                    "status": "",
+                    "merge_commit": "",
+                    "reason": "",
+                    "pr_url": "",
+                    "review_feedback_status": "",
+                },
+            )
+            self.assertEqual(
+                result["retry_budget"],
+                {
+                    "max_retries": 5,
+                    "attempted_retries": 5,
+                    "remaining_retries": 0,
+                    "hard_cap_exhausted": True,
+                },
+            )
+            self.assertEqual(len(result["retry_attempts"]), 5)
+            self.assertEqual(
+                [step["name"] for step in result["steps"]].count("implement"),
+                6,
+            )
+            self.assertEqual(
+                [step["name"] for step in result["steps"]].count("validate"),
+                6,
             )
 
     def test_workstream_retry_policy_remains_legacy_low_budget_compatibility_path(self):
