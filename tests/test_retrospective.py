@@ -1,6 +1,7 @@
 import sys
 import unittest
 import warnings
+import json
 from pathlib import Path
 
 
@@ -64,7 +65,41 @@ def persisted_workstream_result_state(*, excerpt: str, log_path: str):
                 "source_id": "central-beads",
                 "source_type": "beads",
                 "title": "Align bump-EQEmu validation worker with portable AFK contract",
-                "labels": ["project:bump-eqemu", "ready-for-agent", "validation-worker"],
+            }
+        ],
+        "steps": [
+            {
+                "name": "implement",
+                "equivalent_command": [
+                    "afk",
+                    "run-step",
+                    "implement",
+                    "--input",
+                    json.dumps(
+                        {
+                            "work_selection": {
+                                "schema_version": 1,
+                                "selected_work": [
+                                    {
+                                        "external_id": "central-umi2.5",
+                                        "labels": [
+                                            "project:bump-eqemu",
+                                            "ready-for-agent",
+                                            "validation-worker",
+                                        ],
+                                        "source_id": "central-beads",
+                                        "source_type": "beads",
+                                        "title": "Align bump-EQEmu validation worker with portable AFK contract",
+                                    }
+                                ],
+                            }
+                        }
+                    ),
+                    "--ledger",
+                    "dogfood-ledgers/bump-eqemu-2026-07-07-1",
+                    "--project",
+                    "bump-eqemu",
+                ],
             }
         ],
         "retry_attempts": [
@@ -459,6 +494,41 @@ class RetrospectiveModuleTest(unittest.TestCase):
             ],
         )
 
+    def test_build_pipeline_retrospective_replays_checked_in_dogfood_artifact(self):
+        artifact_path = (
+            ROOT
+            / "dogfood-ledgers"
+            / "bump-eqemu-2026-07-07-1"
+            / "workstreams"
+            / "20260707T051607132664Z-5f118c15"
+            / "workstream-result.json"
+        )
+        state = json.loads(artifact_path.read_text(encoding="utf-8"))
+
+        record = build_pipeline_retrospective(
+            RetrospectiveContext(
+                state=state,
+                publication=state["publication"],
+                tracker=state["tracker"],
+            )
+        )
+
+        self.assertEqual(record["signals"][0]["scope"], "target-work")
+        self.assertEqual(record["signals"][1]["scope"], "target-work")
+        self.assertEqual(
+            record["recommended_follow_up"],
+            [
+                {
+                    "summary": (
+                        "central-umi2.5: Fix worker [worker_failure]: Zone |   Error    | Connect Connection "
+                        "[default] Failed to connect to database Error [#2002: Can't connect to server on "
+                        "'mariadb' (115)]"
+                    ),
+                    "labels": ["afk:follow-up", "area:validation", "project:bump-eqemu"],
+                }
+            ],
+        )
+
     def test_build_pipeline_retrospective_ignores_dry_run_title_when_replaying_persisted_target_failure(self):
         excerpt = "Zone |   Error    | Connect Connection [default] Failed to connect to database"
         state = persisted_workstream_result_state(
@@ -493,7 +563,8 @@ class RetrospectiveModuleTest(unittest.TestCase):
             excerpt=excerpt,
             log_path="/tmp/ledger/runs/validate/validation-evidence/logs/validation.log",
         )
-        state["selected_work"][0].pop("labels")
+        state["steps"] = []
+        state["selected_work"][0]["title"] = "Document dry-run validation smoke coverage"
         state["retry_attempts"][0]["checkout_path"] = "/tmp/afk-dogfood-checkouts/dry-run"
 
         record = build_pipeline_retrospective(

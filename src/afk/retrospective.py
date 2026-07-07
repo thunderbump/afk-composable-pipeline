@@ -168,7 +168,59 @@ def selected_work_target_project_labels(selected_work: list[dict[str, Any]]) -> 
 
 
 def inferred_target_project_labels(state: dict[str, Any]) -> list[str]:
-    return selected_work_target_project_labels(selected_work_items(state))
+    labels = selected_work_target_project_labels(selected_work_items(state))
+    if labels:
+        return labels
+    labels = selected_work_target_project_labels(_persisted_selected_work_items(state))
+    if labels:
+        return labels
+    project_slug = _persisted_run_project_slug(state)
+    if project_slug and project_slug != "afk-composable-pipeline":
+        return [f"project:{project_slug}"]
+    return []
+
+
+def _persisted_selected_work_items(state: dict[str, Any]) -> list[dict[str, Any]]:
+    for step in state.get("steps", []):
+        if not isinstance(step, dict) or string_field(step, "name") != "implement":
+            continue
+        input_data = _persisted_step_input(step)
+        work_selection = input_data.get("work_selection") if isinstance(input_data.get("work_selection"), dict) else {}
+        selected_work = work_selection.get("selected_work")
+        if isinstance(selected_work, list):
+            return [item for item in selected_work if isinstance(item, dict)]
+    return []
+
+
+def _persisted_run_project_slug(state: dict[str, Any]) -> str:
+    for step in state.get("steps", []):
+        if not isinstance(step, dict):
+            continue
+        project_slug = _persisted_step_option(step, "--project")
+        if project_slug:
+            return project_slug
+    return ""
+
+
+def _persisted_step_input(step: dict[str, Any]) -> dict[str, Any]:
+    raw_input = _persisted_step_option(step, "--input")
+    if not raw_input:
+        return {}
+    try:
+        parsed = json.loads(raw_input)
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _persisted_step_option(step: dict[str, Any], option: str) -> str:
+    command = step.get("equivalent_command")
+    if not isinstance(command, list):
+        return ""
+    for index, part in enumerate(command[:-1]):
+        if part == option and isinstance(command[index + 1], str):
+            return command[index + 1]
+    return ""
 
 
 def review_feedback_pipeline_follow_up(review: dict[str, Any]) -> list[dict[str, Any]]:
