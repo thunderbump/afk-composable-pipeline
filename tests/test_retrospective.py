@@ -64,6 +64,7 @@ def persisted_workstream_result_state(*, excerpt: str, log_path: str):
                 "source_id": "central-beads",
                 "source_type": "beads",
                 "title": "Align bump-EQEmu validation worker with portable AFK contract",
+                "labels": ["project:bump-eqemu", "ready-for-agent", "validation-worker"],
             }
         ],
         "retry_attempts": [
@@ -482,6 +483,35 @@ class RetrospectiveModuleTest(unittest.TestCase):
                 {
                     "summary": f"central-umi2.5: Fix worker [worker_failure]: {excerpt}",
                     "labels": ["afk:follow-up", "area:validation", "project:bump-eqemu"],
+                }
+            ],
+        )
+
+    def test_build_pipeline_retrospective_does_not_infer_project_label_from_retry_checkout_basename(self):
+        excerpt = "Zone |   Error    | Connect Connection [default] Failed to connect to database"
+        state = persisted_workstream_result_state(
+            excerpt=excerpt,
+            log_path="/tmp/ledger/runs/validate/validation-evidence/logs/validation.log",
+        )
+        state["selected_work"][0].pop("labels")
+        state["retry_attempts"][0]["checkout_path"] = "/tmp/afk-dogfood-checkouts/dry-run"
+
+        record = build_pipeline_retrospective(
+            RetrospectiveContext(
+                state=state,
+                publication={"status": "blocked", "reason": "repair budget exhausted: 5 attempts reached hard_cap=5"},
+                tracker=retrospective_tracker("implemented"),
+            )
+        )
+
+        self.assertEqual(record["signals"][0]["scope"], "pipeline-process")
+        self.assertEqual(record["signals"][1]["scope"], "pipeline-process")
+        self.assertEqual(
+            record["recommended_follow_up"],
+            [
+                {
+                    "summary": f"Fix worker [worker_failure]: {excerpt}",
+                    "labels": ["afk:follow-up", "area:validation", "project:afk-composable-pipeline"],
                 }
             ],
         )

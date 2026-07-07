@@ -168,31 +168,7 @@ def selected_work_target_project_labels(selected_work: list[dict[str, Any]]) -> 
 
 
 def inferred_target_project_labels(state: dict[str, Any]) -> list[str]:
-    labels = selected_work_target_project_labels(selected_work_items(state))
-    if labels:
-        return labels
-    attempts = state.get("retry_attempts")
-    if not isinstance(attempts, list):
-        return labels
-    for attempt in attempts:
-        if not isinstance(attempt, dict):
-            continue
-        checkout_path = string_field(attempt, "checkout_path") or ""
-        checkout_name = Path(checkout_path).name if checkout_path else ""
-        labels.extend(_inferred_project_labels_from_text(checkout_name, existing=labels))
-    return labels
-
-
-def _inferred_project_labels_from_text(text: str, *, existing: list[str]) -> list[str]:
-    labels: list[str] = []
-    for candidate in re.findall(r"\b[A-Za-z0-9]+(?:[-_][A-Za-z0-9]+)+\b", text):
-        slug = candidate.lower().replace("_", "-")
-        if slug in {"afk-composable-pipeline"} or slug.startswith("central-"):
-            continue
-        label = f"project:{slug}"
-        if label not in existing and label not in labels:
-            labels.append(label)
-    return labels
+    return selected_work_target_project_labels(selected_work_items(state))
 
 
 def review_feedback_pipeline_follow_up(review: dict[str, Any]) -> list[dict[str, Any]]:
