@@ -216,3 +216,107 @@ class RetrospectiveModuleTest(unittest.TestCase):
 
         self.assertEqual(record["repair_stop"], {})
         self.assertEqual(record["signals"][0]["scope"], "pipeline-process")
+
+    def test_build_pipeline_retrospective_recommends_target_follow_up_for_target_owned_worker_failure(self):
+        state = retrospective_state()
+        state["selected_work"] = [
+            {
+                "external_id": "central-umi2.5",
+                "title": "Align bump-EQEmu validation worker with portable AFK contract",
+                "labels": ["project:bump-eqemu", "ready-for-agent", "validation-worker"],
+            }
+        ]
+        state["validations"] = [
+            {
+                "output": {
+                    "status": "failed_validation",
+                    "classification": "worker_failure",
+                    "summary": "failed_validation",
+                    "actionable_failures": [
+                        {
+                            "name": "worker",
+                            "category": "worker_failure",
+                            "reason": "worker exited 1",
+                            "log_path": "/tmp/ledger/runs/validate/validation-evidence/logs/validation.log",
+                            "excerpt": "Zone |   Error    | Connect Connection [default] Failed to connect to database",
+                        }
+                    ],
+                    "checkout": {"start_commit": "abc123"},
+                    "validation": {"requested_profile": "tier1"},
+                },
+                "step_result_path": "/tmp/ledger/runs/validate/step-result.json",
+                "worker_result_path": "/tmp/ledger/runs/validate/worker-result.json",
+            }
+        ]
+
+        record = build_pipeline_retrospective(
+            RetrospectiveContext(
+                state=state,
+                publication={"status": "blocked", "reason": "retry budget exhausted: 5 attempts reached hard_cap=5"},
+                tracker=retrospective_tracker("implemented"),
+            )
+        )
+
+        self.assertEqual(record["signals"][0]["scope"], "target-work")
+        self.assertEqual(record["signals"][1]["scope"], "target-work")
+        self.assertEqual(
+            record["recommended_follow_up"],
+            [
+                {
+                    "summary": "central-umi2.5: Fix worker [worker_failure]: Zone |   Error    | Connect Connection [default] Failed to connect to database",
+                    "labels": ["afk:follow-up", "area:validation", "project:bump-eqemu"],
+                }
+            ],
+        )
+
+    def test_build_pipeline_retrospective_keeps_pipeline_follow_up_for_pipeline_validation_failure(self):
+        state = retrospective_state()
+        state["selected_work"] = [
+            {
+                "external_id": "central-umi2.5",
+                "title": "Align bump-EQEmu validation worker with portable AFK contract",
+                "labels": ["project:bump-eqemu", "ready-for-agent", "validation-worker"],
+            }
+        ]
+        state["validations"] = [
+            {
+                "output": {
+                    "status": "failed_missing_result",
+                    "classification": "missing_worker_result",
+                    "summary": "worker result file was not produced",
+                    "actionable_failures": [
+                        {
+                            "name": "worker",
+                            "status": "failed_missing_result",
+                            "category": "missing_result",
+                            "reason": "worker result file was not produced",
+                            "log_path": "/tmp/ledger/runs/validate/stdout.log",
+                            "excerpt": "worker result file was not produced",
+                        }
+                    ],
+                    "checkout": {"start_commit": "abc123"},
+                    "validation": {"requested_profile": "tier1"},
+                },
+                "step_result_path": "/tmp/ledger/runs/validate/step-result.json",
+                "worker_result_path": "/tmp/ledger/runs/validate/worker-result.json",
+            }
+        ]
+
+        record = build_pipeline_retrospective(
+            RetrospectiveContext(
+                state=state,
+                publication={"status": "blocked", "reason": "validate did not reach validated: failed_missing_result"},
+                tracker=retrospective_tracker("implemented"),
+            )
+        )
+
+        self.assertEqual(record["signals"][0]["scope"], "pipeline-process")
+        self.assertEqual(
+            record["recommended_follow_up"],
+            [
+                {
+                    "summary": "Fix worker [missing_result]: worker result file was not produced",
+                    "labels": ["afk:follow-up", "area:validation", "project:afk-composable-pipeline"],
+                }
+            ],
+        )
