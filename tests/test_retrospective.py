@@ -1,6 +1,7 @@
 import sys
 import unittest
 import warnings
+import json
 from pathlib import Path
 
 
@@ -52,6 +53,99 @@ def retrospective_tracker(status="awaiting-review"):
         "comment": "",
         "pr_url": "https://github.example/pr/17",
         "merge_commit": "",
+    }
+
+
+def persisted_workstream_result_state(*, excerpt: str, log_path: str):
+    return {
+        "selected_work": [
+            {
+                "external_id": "central-umi2.5",
+                "result": "failed",
+                "source_id": "central-beads",
+                "source_type": "beads",
+                "title": "Align bump-EQEmu validation worker with portable AFK contract",
+            }
+        ],
+        "steps": [
+            {
+                "name": "implement",
+                "equivalent_command": [
+                    "afk",
+                    "run-step",
+                    "implement",
+                    "--input",
+                    json.dumps(
+                        {
+                            "work_selection": {
+                                "schema_version": 1,
+                                "selected_work": [
+                                    {
+                                        "external_id": "central-umi2.5",
+                                        "labels": [
+                                            "project:bump-eqemu",
+                                            "ready-for-agent",
+                                            "validation-worker",
+                                        ],
+                                        "source_id": "central-beads",
+                                        "source_type": "beads",
+                                        "title": "Align bump-EQEmu validation worker with portable AFK contract",
+                                    }
+                                ],
+                            }
+                        }
+                    ),
+                    "--ledger",
+                    "dogfood-ledgers/bump-eqemu-2026-07-07-1",
+                    "--project",
+                    "bump-eqemu",
+                ],
+            }
+        ],
+        "retry_attempts": [
+            {
+                "attempt": 6,
+                "retry_number": 5,
+                "repairing_failure_class": "failed_validation",
+                "checkout_path": "/tmp/afk-dogfood-checkouts/bump-EQEmu",
+                "review_branch": "afk/central-umi2-5",
+                "commit": "e711bf2ff829eb5e231c632ba02b4e27026e6e5b",
+                "status": "failed_validation",
+            }
+        ],
+        "pipeline_retrospective": {
+            "health": "failing",
+            "signals": [
+                {
+                    "classification": "worker_failure",
+                    "evidence_paths": [
+                        log_path,
+                        "/tmp/ledger/runs/validate/step-result.json",
+                        "/tmp/ledger/runs/validate/worker-result.json",
+                    ],
+                    "excerpt": excerpt,
+                    "kind": "validation-failure",
+                    "scope": "pipeline-process",
+                    "severity": "error",
+                    "step": "worker",
+                    "summary": excerpt,
+                },
+                {
+                    "evidence_paths": [],
+                    "kind": "retry-or-blocked",
+                    "scope": "pipeline-process",
+                    "severity": "error",
+                    "summary": "repair budget exhausted: 5 attempts reached hard_cap=5",
+                },
+            ],
+            "recommended_follow_up": [
+                {
+                    "labels": ["afk:follow-up", "area:validation", "project:afk-composable-pipeline"],
+                    "summary": f"Fix worker [worker_failure]: {excerpt}",
+                }
+            ],
+        },
+        "cleanup": {"status": "clean", "resources": []},
     }
 
 
@@ -216,3 +310,306 @@ class RetrospectiveModuleTest(unittest.TestCase):
 
         self.assertEqual(record["repair_stop"], {})
         self.assertEqual(record["signals"][0]["scope"], "pipeline-process")
+
+    def test_build_pipeline_retrospective_recommends_target_follow_up_for_target_owned_worker_failure(self):
+        state = retrospective_state()
+        state["selected_work"] = [
+            {
+                "external_id": "central-umi2.5",
+                "title": "Align bump-EQEmu validation worker with portable AFK contract",
+                "labels": ["project:bump-eqemu", "ready-for-agent", "validation-worker"],
+            }
+        ]
+        state["validations"] = [
+            {
+                "output": {
+                    "status": "failed_validation",
+                    "classification": "worker_failure",
+                    "summary": "failed_validation",
+                    "actionable_failures": [
+                        {
+                            "name": "worker",
+                            "category": "worker_failure",
+                            "reason": "worker exited 1",
+                            "log_path": "/tmp/ledger/runs/validate/validation-evidence/logs/validation.log",
+                            "excerpt": "Zone |   Error    | Connect Connection [default] Failed to connect to database",
+                        }
+                    ],
+                    "checkout": {"start_commit": "abc123"},
+                    "validation": {"requested_profile": "tier1"},
+                },
+                "step_result_path": "/tmp/ledger/runs/validate/step-result.json",
+                "worker_result_path": "/tmp/ledger/runs/validate/worker-result.json",
+            }
+        ]
+
+        record = build_pipeline_retrospective(
+            RetrospectiveContext(
+                state=state,
+                publication={"status": "blocked", "reason": "repair budget exhausted: 5 attempts reached hard_cap=5"},
+                tracker=retrospective_tracker("implemented"),
+            )
+        )
+
+        self.assertEqual(record["signals"][0]["scope"], "target-work")
+        self.assertEqual(record["signals"][1]["scope"], "target-work")
+        self.assertEqual(
+            record["recommended_follow_up"],
+            [
+                {
+                    "summary": "central-umi2.5: Fix worker [worker_failure]: Zone |   Error    | Connect Connection [default] Failed to connect to database",
+                    "labels": ["afk:follow-up", "area:validation", "project:bump-eqemu"],
+                }
+            ],
+        )
+
+    def test_build_pipeline_retrospective_keeps_stack_binding_worker_failure_pipeline_owned(self):
+        state = retrospective_state()
+        state["selected_work"] = [
+            {
+                "external_id": "central-umi2.5",
+                "title": "Align bump-EQEmu validation worker with portable AFK contract",
+                "labels": ["project:bump-eqemu", "ready-for-agent", "validation-worker"],
+            }
+        ]
+        state["validations"] = [
+            {
+                "output": {
+                    "status": "failed_validation",
+                    "classification": "worker_failure",
+                    "summary": "failed_validation",
+                    "actionable_failures": [
+                        {
+                            "name": "worker",
+                            "category": "worker_failure",
+                            "reason": "failed_validation",
+                            "log_path": "/tmp/ledger/runs/validate/validation-evidence/logs/stack.log",
+                            "excerpt": "2026-07-01T02:30:42Z binding validation stack /tmp/stack code to /tmp/checkout",
+                        }
+                    ],
+                    "checkout": {"start_commit": "abc123"},
+                    "validation": {"requested_profile": "tier1"},
+                },
+                "step_result_path": "/tmp/ledger/runs/validate/step-result.json",
+                "worker_result_path": "/tmp/ledger/runs/validate/worker-result.json",
+            }
+        ]
+
+        record = build_pipeline_retrospective(
+            RetrospectiveContext(
+                state=state,
+                publication={"status": "blocked", "reason": "repair budget exhausted: 5 attempts reached hard_cap=5"},
+                tracker=retrospective_tracker("implemented"),
+            )
+        )
+
+        self.assertEqual(record["signals"][0]["scope"], "pipeline-process")
+        self.assertEqual(record["signals"][1]["scope"], "pipeline-process")
+        self.assertEqual(
+            record["recommended_follow_up"],
+            [
+                {
+                    "summary": "Fix worker [worker_failure]: 2026-07-01T02:30:42Z binding validation stack /tmp/stack code to /tmp/checkout",
+                    "labels": ["afk:follow-up", "area:validation", "project:afk-composable-pipeline"],
+                }
+            ],
+        )
+
+    def test_build_pipeline_retrospective_keeps_pipeline_follow_up_for_pipeline_validation_failure(self):
+        state = retrospective_state()
+        state["selected_work"] = [
+            {
+                "external_id": "central-umi2.5",
+                "title": "Align bump-EQEmu validation worker with portable AFK contract",
+                "labels": ["project:bump-eqemu", "ready-for-agent", "validation-worker"],
+            }
+        ]
+        state["validations"] = [
+            {
+                "output": {
+                    "status": "failed_missing_result",
+                    "classification": "missing_worker_result",
+                    "summary": "worker result file was not produced",
+                    "actionable_failures": [
+                        {
+                            "name": "worker",
+                            "status": "failed_missing_result",
+                            "category": "missing_result",
+                            "reason": "worker result file was not produced",
+                            "log_path": "/tmp/ledger/runs/validate/stdout.log",
+                            "excerpt": "worker result file was not produced",
+                        }
+                    ],
+                    "checkout": {"start_commit": "abc123"},
+                    "validation": {"requested_profile": "tier1"},
+                },
+                "step_result_path": "/tmp/ledger/runs/validate/step-result.json",
+                "worker_result_path": "/tmp/ledger/runs/validate/worker-result.json",
+            }
+        ]
+
+        record = build_pipeline_retrospective(
+            RetrospectiveContext(
+                state=state,
+                publication={"status": "blocked", "reason": "validate did not reach validated: failed_missing_result"},
+                tracker=retrospective_tracker("implemented"),
+            )
+        )
+
+        self.assertEqual(record["signals"][0]["scope"], "pipeline-process")
+        self.assertEqual(
+            record["recommended_follow_up"],
+            [
+                {
+                    "summary": "Fix worker [missing_result]: worker result file was not produced",
+                    "labels": ["afk:follow-up", "area:validation", "project:afk-composable-pipeline"],
+                }
+            ],
+        )
+
+    def test_build_pipeline_retrospective_reclassifies_persisted_target_owned_worker_failure(self):
+        excerpt = "Zone |   Error    | Connect Connection [default] Failed to connect to database"
+        state = persisted_workstream_result_state(
+            excerpt=excerpt,
+            log_path="/tmp/ledger/runs/validate/validation-evidence/logs/validation.log",
+        )
+
+        record = build_pipeline_retrospective(
+            RetrospectiveContext(
+                state=state,
+                publication={"status": "blocked", "reason": "repair budget exhausted: 5 attempts reached hard_cap=5"},
+                tracker=retrospective_tracker("implemented"),
+            )
+        )
+
+        self.assertEqual(record["signals"][0]["scope"], "target-work")
+        self.assertEqual(record["signals"][1]["scope"], "target-work")
+        self.assertEqual(
+            record["recommended_follow_up"],
+            [
+                {
+                    "summary": f"central-umi2.5: Fix worker [worker_failure]: {excerpt}",
+                    "labels": ["afk:follow-up", "area:validation", "project:bump-eqemu"],
+                }
+            ],
+        )
+
+    def test_build_pipeline_retrospective_replays_checked_in_dogfood_artifact(self):
+        artifact_path = (
+            ROOT
+            / "dogfood-ledgers"
+            / "bump-eqemu-2026-07-07-1"
+            / "workstreams"
+            / "20260707T051607132664Z-5f118c15"
+            / "workstream-result.json"
+        )
+        state = json.loads(artifact_path.read_text(encoding="utf-8"))
+
+        record = build_pipeline_retrospective(
+            RetrospectiveContext(
+                state=state,
+                publication=state["publication"],
+                tracker=state["tracker"],
+            )
+        )
+
+        self.assertEqual(record["signals"][0]["scope"], "target-work")
+        self.assertEqual(record["signals"][1]["scope"], "target-work")
+        self.assertEqual(
+            record["recommended_follow_up"],
+            [
+                {
+                    "summary": (
+                        "central-umi2.5: Fix worker [worker_failure]: Zone |   Error    | Connect Connection "
+                        "[default] Failed to connect to database Error [#2002: Can't connect to server on "
+                        "'mariadb' (115)]"
+                    ),
+                    "labels": ["afk:follow-up", "area:validation", "project:bump-eqemu"],
+                }
+            ],
+        )
+
+    def test_build_pipeline_retrospective_ignores_dry_run_title_when_replaying_persisted_target_failure(self):
+        excerpt = "Zone |   Error    | Connect Connection [default] Failed to connect to database"
+        state = persisted_workstream_result_state(
+            excerpt=excerpt,
+            log_path="/tmp/ledger/runs/validate/validation-evidence/logs/validation.log",
+        )
+        state["selected_work"][0]["title"] = "Document dry-run validation smoke coverage"
+
+        record = build_pipeline_retrospective(
+            RetrospectiveContext(
+                state=state,
+                publication={"status": "blocked", "reason": "repair budget exhausted: 5 attempts reached hard_cap=5"},
+                tracker=retrospective_tracker("implemented"),
+            )
+        )
+
+        self.assertEqual(record["signals"][0]["scope"], "target-work")
+        self.assertEqual(record["signals"][1]["scope"], "target-work")
+        self.assertEqual(
+            record["recommended_follow_up"],
+            [
+                {
+                    "summary": f"central-umi2.5: Fix worker [worker_failure]: {excerpt}",
+                    "labels": ["afk:follow-up", "area:validation", "project:bump-eqemu"],
+                }
+            ],
+        )
+
+    def test_build_pipeline_retrospective_does_not_infer_project_label_from_retry_checkout_basename(self):
+        excerpt = "Zone |   Error    | Connect Connection [default] Failed to connect to database"
+        state = persisted_workstream_result_state(
+            excerpt=excerpt,
+            log_path="/tmp/ledger/runs/validate/validation-evidence/logs/validation.log",
+        )
+        state["steps"] = []
+        state["selected_work"][0]["title"] = "Document dry-run validation smoke coverage"
+        state["retry_attempts"][0]["checkout_path"] = "/tmp/afk-dogfood-checkouts/dry-run"
+
+        record = build_pipeline_retrospective(
+            RetrospectiveContext(
+                state=state,
+                publication={"status": "blocked", "reason": "repair budget exhausted: 5 attempts reached hard_cap=5"},
+                tracker=retrospective_tracker("implemented"),
+            )
+        )
+
+        self.assertEqual(record["signals"][0]["scope"], "pipeline-process")
+        self.assertEqual(record["signals"][1]["scope"], "pipeline-process")
+        self.assertEqual(
+            record["recommended_follow_up"],
+            [
+                {
+                    "summary": f"Fix worker [worker_failure]: {excerpt}",
+                    "labels": ["afk:follow-up", "area:validation", "project:afk-composable-pipeline"],
+                }
+            ],
+        )
+
+    def test_build_pipeline_retrospective_keeps_persisted_stack_binding_worker_failure_pipeline_owned(self):
+        excerpt = "2026-07-01T02:30:42Z binding validation stack /tmp/stack code to /tmp/checkout"
+        state = persisted_workstream_result_state(
+            excerpt=excerpt,
+            log_path="/tmp/ledger/runs/validate/validation-evidence/logs/stack.log",
+        )
+
+        record = build_pipeline_retrospective(
+            RetrospectiveContext(
+                state=state,
+                publication={"status": "blocked", "reason": "repair budget exhausted: 5 attempts reached hard_cap=5"},
+                tracker=retrospective_tracker("implemented"),
+            )
+        )
+
+        self.assertEqual(record["signals"][0]["scope"], "pipeline-process")
+        self.assertEqual(record["signals"][1]["scope"], "pipeline-process")
+        self.assertEqual(
+            record["recommended_follow_up"],
+            [
+                {
+                    "summary": f"Fix worker [worker_failure]: {excerpt}",
+                    "labels": ["afk:follow-up", "area:validation", "project:afk-composable-pipeline"],
+                }
+            ],
+        )

@@ -135,6 +135,94 @@ def first_validation_failure(output: dict[str, Any]) -> dict[str, Any] | None:
     return None
 
 
+def selected_work_items(state: dict[str, Any]) -> list[dict[str, Any]]:
+    items = state.get("selected_work")
+    if not isinstance(items, list):
+        return []
+    return [item for item in items if isinstance(item, dict)]
+
+
+def selected_work_external_id(selected_work: list[dict[str, Any]]) -> str:
+    for item in selected_work:
+        external_id = string_field(item, "external_id")
+        if external_id:
+            return external_id
+    return ""
+
+
+def selected_work_target_project_labels(selected_work: list[dict[str, Any]]) -> list[str]:
+    labels: list[str] = []
+    for item in selected_work:
+        item_labels = item.get("labels")
+        if not isinstance(item_labels, list):
+            continue
+        for label in item_labels:
+            if (
+                isinstance(label, str)
+                and label.startswith("project:")
+                and label != "project:afk-composable-pipeline"
+                and label not in labels
+            ):
+                labels.append(label)
+    return labels
+
+
+def inferred_target_project_labels(state: dict[str, Any]) -> list[str]:
+    labels = selected_work_target_project_labels(selected_work_items(state))
+    if labels:
+        return labels
+    labels = selected_work_target_project_labels(_persisted_selected_work_items(state))
+    if labels:
+        return labels
+    project_slug = _persisted_run_project_slug(state)
+    if project_slug and project_slug != "afk-composable-pipeline":
+        return [f"project:{project_slug}"]
+    return []
+
+
+def _persisted_selected_work_items(state: dict[str, Any]) -> list[dict[str, Any]]:
+    for step in state.get("steps", []):
+        if not isinstance(step, dict) or string_field(step, "name") != "implement":
+            continue
+        input_data = _persisted_step_input(step)
+        work_selection = input_data.get("work_selection") if isinstance(input_data.get("work_selection"), dict) else {}
+        selected_work = work_selection.get("selected_work")
+        if isinstance(selected_work, list):
+            return [item for item in selected_work if isinstance(item, dict)]
+    return []
+
+
+def _persisted_run_project_slug(state: dict[str, Any]) -> str:
+    for step in state.get("steps", []):
+        if not isinstance(step, dict):
+            continue
+        project_slug = _persisted_step_option(step, "--project")
+        if project_slug:
+            return project_slug
+    return ""
+
+
+def _persisted_step_input(step: dict[str, Any]) -> dict[str, Any]:
+    raw_input = _persisted_step_option(step, "--input")
+    if not raw_input:
+        return {}
+    try:
+        parsed = json.loads(raw_input)
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _persisted_step_option(step: dict[str, Any], option: str) -> str:
+    command = step.get("equivalent_command")
+    if not isinstance(command, list):
+        return ""
+    for index, part in enumerate(command[:-1]):
+        if part == option and isinstance(command[index + 1], str):
+            return command[index + 1]
+    return ""
+
+
 def review_feedback_pipeline_follow_up(review: dict[str, Any]) -> list[dict[str, Any]]:
     reviewer_result = review.get("reviewer_result") if isinstance(review.get("reviewer_result"), dict) else {}
     findings = reviewer_result.get("findings")
@@ -1814,8 +1902,9 @@ def _validation_retrospective_signals(
     normalized: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     validations = state.get("validations")
-    if not isinstance(validations, list):
-        return []
+    if not isinstance(validations, list) or not validations:
+        return _persisted_validation_retrospective_signals(state)
+    selected_work = selected_work_items(state)
     signals = []
     for index, validation in enumerate(validations):
         if not isinstance(validation, dict):
@@ -1830,7 +1919,12 @@ def _validation_retrospective_signals(
         for failure in actionable_failures:
             if not isinstance(failure, dict):
                 continue
-            signal = _validation_failure_retrospective_signal(validation, output, failure)
+            signal = _validation_failure_retrospective_signal(
+                validation,
+                output,
+                failure,
+                selected_work=selected_work,
+            )
             if signal is not None:
                 if (
                     string_field(signal, "scope") == "target-work"
@@ -1839,6 +1933,49 @@ def _validation_retrospective_signals(
                     signal["consumed_by_repair"] = True
                 signals.append(signal)
                 break
+    return signals
+
+
+def _persisted_validation_retrospective_signals(state: dict[str, Any]) -> list[dict[str, Any]]:
+    pipeline_retrospective = (
+        state.get("pipeline_retrospective") if isinstance(state.get("pipeline_retrospective"), dict) else {}
+    )
+    persisted_signals = pipeline_retrospective.get("signals")
+    if not isinstance(persisted_signals, list):
+        return []
+    selected_work = selected_work_items(state)
+    signals: list[dict[str, Any]] = []
+    for signal in persisted_signals:
+        if not isinstance(signal, dict):
+            continue
+        kind = string_field(signal, "kind") or ""
+        if kind not in {"validation-failure", "missing-tool-or-config"}:
+            continue
+        evidence_paths = [
+            path for path in signal.get("evidence_paths", []) if isinstance(path, str) and path
+        ]
+        scope = _validation_failure_retrospective_scope(
+            {"classification": string_field(signal, "classification") or ""},
+            {
+                "category": string_field(signal, "classification") or "",
+                "excerpt": string_field(signal, "excerpt") or string_field(signal, "summary") or "",
+                "log_path": evidence_paths[0] if evidence_paths else "",
+            },
+            kind=kind,
+            selected_work=selected_work,
+            evidence_paths=evidence_paths,
+            target_project_labels=inferred_target_project_labels(state),
+        )
+        rebuilt = dict(signal)
+        rebuilt["scope"] = scope
+        if scope == "target-work":
+            external_id = selected_work_external_id(selected_work)
+            labels = inferred_target_project_labels(state)
+            if external_id:
+                rebuilt["external_id"] = redact_text(external_id)
+            if labels:
+                rebuilt["labels"] = labels
+        signals.append(rebuilt)
     return signals
 
 
@@ -1904,6 +2041,8 @@ def _validation_failure_retrospective_signal(
     validation: dict[str, Any],
     output: dict[str, Any],
     failure: dict[str, Any],
+    *,
+    selected_work: list[dict[str, Any]],
 ) -> dict[str, Any] | None:
     excerpt = (
         string_field(failure, "excerpt") or string_field(failure, "reason") or string_field(output, "summary") or ""
@@ -1912,11 +2051,22 @@ def _validation_failure_retrospective_signal(
     kind = "missing-tool-or-config" if _retrospective_text_has_missing_tool_or_config(excerpt) else "validation-failure"
     if not log_path and kind != "missing-tool-or-config":
         return None
-    scope = _validation_failure_retrospective_scope(output, failure, kind=kind)
+    evidence_paths = _retrospective_evidence_paths(
+        log_path,
+        string_field(validation, "step_result_path") or "",
+        string_field(validation, "worker_result_path") or "",
+    )
+    scope = _validation_failure_retrospective_scope(
+        output,
+        failure,
+        kind=kind,
+        selected_work=selected_work,
+        evidence_paths=evidence_paths,
+    )
     validation_info = output.get("validation") if isinstance(output.get("validation"), dict) else {}
     step = string_field(failure, "name") or string_field(validation_info, "requested_profile") or "validation"
     classification = string_field(failure, "category") or kind
-    return {
+    signal = {
         "kind": kind,
         "scope": scope,
         "severity": "error",
@@ -1924,21 +2074,68 @@ def _validation_failure_retrospective_signal(
         "step": redact_text(step),
         "classification": redact_text(classification),
         "excerpt": redact_text(excerpt),
-        "evidence_paths": _retrospective_evidence_paths(
-            log_path,
-            string_field(validation, "step_result_path") or "",
-            string_field(validation, "worker_result_path") or "",
-        ),
+        "evidence_paths": evidence_paths,
     }
+    if scope == "target-work":
+        external_id = selected_work_external_id(selected_work)
+        labels = selected_work_target_project_labels(selected_work)
+        if external_id:
+            signal["external_id"] = redact_text(external_id)
+        if labels:
+            signal["labels"] = labels
+    return signal
 
 
-def _validation_failure_retrospective_scope(output: dict[str, Any], failure: dict[str, Any], *, kind: str) -> str:
+def _validation_failure_retrospective_scope(
+    output: dict[str, Any],
+    failure: dict[str, Any],
+    *,
+    kind: str,
+    selected_work: list[dict[str, Any]] | None = None,
+    evidence_paths: list[str] | None = None,
+    target_project_labels: list[str] | None = None,
+) -> str:
     if kind == "missing-tool-or-config":
         return "pipeline-process"
     category = string_field(failure, "category") or string_field(output, "classification") or ""
-    if category in {"runtime", "protocol", "timeout", "missing_result", "prerequisite_skip", "worker_failure"}:
+    if category in {"runtime", "protocol", "timeout", "missing_result", "prerequisite_skip"}:
         return "pipeline-process"
+    if category == "worker_failure":
+        effective_target_project_labels = target_project_labels
+        if effective_target_project_labels is None:
+            effective_target_project_labels = selected_work_target_project_labels(selected_work or [])
+        if not effective_target_project_labels:
+            return "pipeline-process"
+        if _validation_worker_failure_is_pipeline_infrastructure(failure, evidence_paths or []):
+            return "pipeline-process"
+        if not _validation_failure_has_target_repo_evidence(evidence_paths or []):
+            return "pipeline-process"
     return "target-work"
+
+
+def _validation_worker_failure_is_pipeline_infrastructure(
+    failure: dict[str, Any],
+    evidence_paths: list[str],
+) -> bool:
+    log_path = string_field(failure, "log_path") or ""
+    excerpt = string_field(failure, "excerpt") or ""
+    if any(path.endswith("/validation-evidence/logs/stack.log") for path in evidence_paths if isinstance(path, str)):
+        return True
+    if log_path.endswith("/validation-evidence/logs/stack.log"):
+        return True
+    return "binding validation stack " in excerpt.lower()
+
+
+def _validation_failure_has_target_repo_evidence(evidence_paths: list[str]) -> bool:
+    return any(
+        isinstance(path, str)
+        and (
+            "validation-evidence/" in path
+            or path.endswith("/worker-result.json")
+            or path.endswith("/step-result.json")
+        )
+        for path in evidence_paths
+    )
 
 
 def _publication_retrospective_signals(publication: dict[str, Any]) -> list[dict[str, Any]]:
@@ -2188,22 +2385,53 @@ def _blocked_reason_targets_work_item(state: dict[str, Any], reason: str) -> boo
     ):
         validation = latest_validation_record(state)
         if validation is None:
-            return False
+            return _persisted_validation_targets_work_item(state)
         output = validation.get("output") if isinstance(validation.get("output"), dict) else {}
         failure = first_validation_failure(output) or {}
-        return _validation_failure_retrospective_scope(output, failure, kind="validation-failure") == "target-work"
+        return _validation_failure_retrospective_scope(
+            output,
+            failure,
+            kind="validation-failure",
+            selected_work=selected_work_items(state),
+            evidence_paths=_retrospective_evidence_paths(
+                string_field(failure, "log_path") or "",
+                string_field(validation, "step_result_path") or "",
+                string_field(validation, "worker_result_path") or "",
+            ),
+        ) == "target-work"
     if reason.startswith("review did not reach passed: request_revision"):
         return True
-    if reason.startswith("retry budget exhausted:"):
+    if _reason_is_repair_budget_exhausted(reason):
         if string_field(review, "status") == "request_revision":
             return True
         validation = latest_validation_record(state)
         if validation is None:
-            return False
+            return _persisted_validation_targets_work_item(state)
         output = validation.get("output") if isinstance(validation.get("output"), dict) else {}
         failure = first_validation_failure(output) or {}
-        return _validation_failure_retrospective_scope(output, failure, kind="validation-failure") == "target-work"
+        return _validation_failure_retrospective_scope(
+            output,
+            failure,
+            kind="validation-failure",
+            selected_work=selected_work_items(state),
+            evidence_paths=_retrospective_evidence_paths(
+                string_field(failure, "log_path") or "",
+                string_field(validation, "step_result_path") or "",
+                string_field(validation, "worker_result_path") or "",
+            ),
+        ) == "target-work"
     return False
+
+
+def _persisted_validation_targets_work_item(state: dict[str, Any]) -> bool:
+    return any(
+        isinstance(signal, dict) and string_field(signal, "scope") == "target-work"
+        for signal in _persisted_validation_retrospective_signals(state)
+    )
+
+
+def _reason_is_repair_budget_exhausted(reason: str) -> bool:
+    return reason.startswith("retry budget exhausted:") or reason.startswith("repair budget exhausted:")
 
 
 def _cleanup_retrospective_signals(state: dict[str, Any]) -> list[dict[str, Any]]:
@@ -2292,6 +2520,17 @@ def _retrospective_follow_up_record(
             recommended.append(follow_up_item)
             recommended_fingerprints.add(follow_up_item["fingerprint"])
             recommended_identities.add(_retrospective_follow_up_identity_for_item(follow_up_item))
+    repeated_target_validation_follow_up = _repeated_target_validation_follow_up(signals)
+    if (
+        repeated_target_validation_follow_up
+        and repeated_target_validation_follow_up["fingerprint"] not in recommended_fingerprints
+        and repeated_target_validation_follow_up["fingerprint"] not in created_fingerprints
+        and _retrospective_follow_up_identity_for_item(repeated_target_validation_follow_up) not in recommended_identities
+        and _retrospective_follow_up_identity_for_item(repeated_target_validation_follow_up) not in created_identities
+    ):
+        recommended.append(repeated_target_validation_follow_up)
+        recommended_fingerprints.add(repeated_target_validation_follow_up["fingerprint"])
+        recommended_identities.add(_retrospective_follow_up_identity_for_item(repeated_target_validation_follow_up))
     created = _merge_retrospective_created_follow_up([], created)
     return {
         "recommended": _retrospective_uncreated_recommendations(recommended, created),
@@ -2326,6 +2565,8 @@ def _retrospective_follow_up_item(kind: str, summary: str, labels: Any) -> dict[
     normalized_labels = _retrospective_follow_up_labels(labels)
     if not redacted_summary:
         return None
+    if not any(label.startswith("project:") for label in normalized_labels):
+        normalized_labels.append("project:afk-composable-pipeline")
     return {
         "kind": kind,
         "summary": redacted_summary,
@@ -2445,8 +2686,6 @@ def _retrospective_follow_up_labels(labels: Any) -> list[str]:
                 redacted_label = redact_text(label)
                 if redacted_label not in normalized_labels:
                     normalized_labels.append(redacted_label)
-    if "project:afk-composable-pipeline" not in normalized_labels:
-        normalized_labels.append("project:afk-composable-pipeline")
     return normalized_labels
 
 
@@ -2605,6 +2844,31 @@ def _follow_up_for_signal(signal: dict[str, Any]) -> dict[str, Any] | None:
             kind=kind,
             summary="Review and address retrospective judge findings before treating the run as complete.",
             labels=["afk:follow-up", "area:workstream"],
+        )
+    return None
+
+
+def _repeated_target_validation_follow_up(signals: list[dict[str, Any]]) -> dict[str, Any] | None:
+    if not any(
+        isinstance(signal, dict)
+        and string_field(signal, "kind") == "retry-or-blocked"
+        and string_field(signal, "scope") == "target-work"
+        and _reason_is_repair_budget_exhausted(string_field(signal, "summary") or "")
+        for signal in signals
+    ):
+        return None
+    for signal in signals:
+        if not isinstance(signal, dict):
+            continue
+        if string_field(signal, "kind") != "validation-failure" or string_field(signal, "scope") != "target-work":
+            continue
+        if signal.get("consumed_by_repair"):
+            continue
+        external_id = string_field(signal, "external_id") or "selected work"
+        return _retrospective_follow_up_item(
+            kind="target-validation-failure",
+            summary=f"{external_id}: {_follow_up_summary_for_signal(signal, 'Fix')}",
+            labels=["afk:follow-up", "area:validation", *(_retrospective_follow_up_labels(signal.get("labels")))],
         )
     return None
 
