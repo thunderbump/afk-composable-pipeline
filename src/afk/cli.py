@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from afk.checkouts import checkout_path_error
-from afk.contracts import ContractError, ProjectContract, load_project_contract
+from afk.contracts import ContractError, ProjectContract, default_validation_mode, load_project_contract
 from afk.integration import integrate_published_pr, integration_output_dir
 from afk.jsonutil import canonical_json, sha256_json
 from afk.redaction import redact_artifact_value
@@ -677,7 +677,7 @@ def effective_validation_mode(args: argparse.Namespace, *, project_contract: Pro
         return requested_mode
     if args.validation_mode is not None:
         return requested_mode
-    if not project_contract_has_default_worker(project_contract):
+    if default_validation_mode(project_contract) != "project-worker":
         return requested_mode
     if args.validation_profile not in project_contract.validation_profile_requests:
         return requested_mode
@@ -876,7 +876,7 @@ def recipe_validation_input_from_args(args: argparse.Namespace, *, project_contr
                 "timeout_seconds": timeout_seconds,
             },
         }
-    if not project_contract_has_default_worker(project_contract):
+    if default_validation_mode(project_contract) != "project-worker":
         raise ValueError(
             "--validation-mode=project-worker requires a project contract with a default validation worker"
         )
@@ -921,11 +921,6 @@ def project_worker_validation_stack_path_from_args(
     if resolved_stack_path == resolved_checkout_path or resolved_checkout_path in resolved_stack_path.parents:
         raise ValueError("--validation-stack-path must be outside checkout")
     return validation_stack_path
-
-
-def project_contract_has_default_worker(project_contract: ProjectContract) -> bool:
-    return project_contract.project_slug == "bump-eqemu"
-
 
 def resolve_effective_publisher_settings(
     args: argparse.Namespace,

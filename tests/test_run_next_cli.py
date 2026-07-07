@@ -10,7 +10,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from afk.contracts import load_project_contract  # noqa: E402
+from afk.contracts import load_project_contract, materialize_terminal_integration_policy  # noqa: E402
 from afk.pi_workers import PONYTAIL_EXTENSION_SOURCE, build_pi_real_worker_agent  # noqa: E402
 from afk.pi_workers import build_pi_print_command
 from afk.run_next import (
@@ -86,23 +86,25 @@ def init_repo(path: Path) -> None:
     git(path, "commit", "-m", "seed")
 
 
-def write_contract(path: Path, *, project_slug: str, repo_url: str) -> None:
-    path.write_text(
-        json.dumps(
-            {
-                "schema_version": 1,
-                "project_slug": project_slug,
-                "repo_url": repo_url,
-                "base_branch": "main",
-                "beads_labels": [f"project:{project_slug}"],
-                "validation_profiles": ["tier1"],
-                "validation_profile_requests": {"tier1": {"profile": "tier1"}},
-                "artifact_retention": {"ledger_days": 30, "log_days": 30},
-                "pr_target": {"remote": "origin", "branch": "main"},
-            }
-        ),
-        encoding="utf-8",
-    )
+def write_contract(path: Path, *, project_slug: str, repo_url: str, terminal_integration=None) -> None:
+    if terminal_integration is None and project_slug == "bump-eqemu":
+        terminal_integration = {
+            "validation": {"default_mode": "project-worker", "recommended_profiles": ["tier1"]},
+        }
+    payload = {
+        "schema_version": 1,
+        "project_slug": project_slug,
+        "repo_url": repo_url,
+        "base_branch": "main",
+        "beads_labels": [f"project:{project_slug}"],
+        "validation_profiles": ["tier1"],
+        "validation_profile_requests": {"tier1": {"profile": "tier1"}},
+        "artifact_retention": {"ledger_days": 30, "log_days": 30},
+        "pr_target": {"remote": "origin", "branch": "main"},
+    }
+    if terminal_integration is not None:
+        payload["terminal_integration"] = terminal_integration
+    path.write_text(json.dumps(payload), encoding="utf-8")
 
 
 def run_next_execute_dogfood(temp_path: Path, *, extra_args: list[str] | None = None, env: dict[str, str | None] | None = None):
@@ -1634,10 +1636,14 @@ raise SystemExit(9)
             run_next.__globals__["select_work"] = original_select_work
             run_next.__globals__["generate_workstream_recipe"] = original_generate_recipe
 
-        self.assertEqual(payload["recipe"], recipe)
+        expected_recipe = {
+            **recipe,
+            "terminal_integration": materialize_terminal_integration_policy(contract),
+        }
+        self.assertEqual(payload["recipe"], expected_recipe)
         self.assertEqual(payload["workstream_result"]["run_id"], "run-123")
         self.assertEqual(len(runner_calls), 1)
-        self.assertEqual(runner_calls[0][0], recipe)
+        self.assertEqual(runner_calls[0][0], expected_recipe)
         self.assertEqual(runner_calls[0][1], ROOT / "project-contracts")
         self.assertEqual(runner_calls[0][2], contract)
 
@@ -1724,11 +1730,79 @@ raise SystemExit(9)
         self.assertEqual(plan_calls[0].required_labels, ["project:bump-eqemu", "ready-for-agent"])
         self.assertEqual(plan_calls[0].sources[0]["type"], "beads")
         self.assertEqual(len(runner_calls), 1)
-        self.assertEqual(runner_calls[0][0], recipe)
+        expected_recipe = {
+            **recipe,
+            "terminal_integration": materialize_terminal_integration_policy(contract),
+        }
+        self.assertEqual(runner_calls[0][0], expected_recipe)
         self.assertEqual(runner_calls[0][1], ledger_dir)
         self.assertEqual(runner_calls[0][2], contract)
-        self.assertEqual(payload["recipe"], recipe)
+        self.assertEqual(payload["recipe"], expected_recipe)
         self.assertEqual(payload["workstream_result"], {"status": "succeeded", "workstream_id": "central-lve.11"})
+
+    def test_run_next_request_carries_materialized_terminal_integration_policy(self):
+        contract = load_project_contract("bump-eqemu", ROOT / "project-contracts", cwd=ROOT)
+        selection_result = {
+            "schema_version": 1,
+            "source_statuses": [{"source_id": "central-beads", "source_type": "beads", "status": "selected"}],
+            "selected_work": [
+                {
+                    "source_id": "central-beads",
+                    "source_type": "beads",
+                    "external_id": "central-lve.11",
+                    "title": "Carry terminal integration handoff",
+                    "status": "open",
+                    "labels": ["project:bump-eqemu", "ready-for-agent"],
+                    "workstream": "central-lve",
+                    "acceptance_criteria": ["Carry contract-backed terminal integration policy"],
+                    "priority": 2,
+                    "issue_type": "feature",
+                    "description": "Make the handoff policy visible in run-next output.",
+                    "dependencies": [],
+                    "blockers": [],
+                    "dependency_status": "clear",
+                    "afk": {"ready": True},
+                    "raw": {"beads": {"id": "central-lve.11"}},
+                }
+            ],
+            "skipped_candidates": [],
+        }
+        planner_recipe = {"schema_version": 1, "workstream_id": "central-lve.11", "steps": []}
+
+        def fake_selector(*_args, **_kwargs):
+            return selection_result
+
+        def fake_plan_factory(_plan_request):
+            return dict(planner_recipe)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            beads_workspace = temp_path / "beads"
+            checkout_root = temp_path / "checkouts"
+            checkout_path = checkout_root / "bump-EQEmu"
+            beads_workspace.mkdir()
+            checkout_root.mkdir(parents=True)
+            checkout_path.mkdir(parents=True)
+
+            payload = run_next_request(
+                RunNextRequest(
+                    project_contract=contract,
+                    beads_workspace=beads_workspace,
+                    ready_tag="ready-for-agent",
+                    tracker_artifact_root=ROOT,
+                    planner=RunNextPlanRequest(
+                        checkout_root=checkout_root,
+                        checkout_path=checkout_path,
+                        validation_profile="tier1",
+                    ),
+                ),
+                work_selector=fake_selector,
+                plan_factory=fake_plan_factory,
+            )
+
+        expected_policy = materialize_terminal_integration_policy(contract)
+        self.assertEqual(payload["terminal_integration"], expected_policy)
+        self.assertEqual(payload["recipe"]["terminal_integration"], expected_policy)
 
     def test_run_next_execute_mode_preserves_blocked_workstream_summary_from_ledger(self):
         contract = load_project_contract("bump-eqemu", ROOT / "project-contracts", cwd=ROOT)
@@ -1760,8 +1834,13 @@ raise SystemExit(9)
         recipe = {"schema_version": 1, "workstream_id": "central-lve.11", "steps": []}
         runner_secret = "ghp_runner_secret_1234567890"
 
+        expected_recipe = {
+            **recipe,
+            "terminal_integration": materialize_terminal_integration_policy(contract),
+        }
+
         def fake_workstream_runner(recipe_input, *, ledger_dir, project_contract):
-            self.assertEqual(recipe_input, recipe)
+            self.assertEqual(recipe_input, expected_recipe)
             self.assertEqual(project_contract, contract)
             result_dir = ledger_dir / "workstreams" / "run-789"
             result_dir.mkdir(parents=True)
@@ -3316,7 +3395,14 @@ else:
             worker_script.chmod(0o755)
             git(repo, "add", "scripts/validation-worker.sh")
             git(repo, "commit", "-m", "add validation worker")
-            write_contract(contracts_dir / "bump-eqemu.json", project_slug="bump-eqemu", repo_url=str(repo))
+            write_contract(
+                contracts_dir / "bump-eqemu.json",
+                project_slug="bump-eqemu",
+                repo_url=str(repo),
+                terminal_integration={
+                    "validation": {"default_mode": "project-worker", "recommended_profiles": ["tier1"]},
+                },
+            )
 
             secret_dir = beads_workspace / "secrets"
             secret_dir.mkdir(parents=True)
@@ -3647,6 +3733,9 @@ else:
                         "validation_profile_requests": {"tier1": {"profile": "safe"}},
                         "artifact_retention": {"ledger_days": 30, "log_days": 30},
                         "pr_target": {"remote": "origin", "branch": "master"},
+                        "terminal_integration": {
+                            "validation": {"default_mode": "project-worker", "recommended_profiles": ["tier1"]}
+                        },
                     }
                 ),
                 encoding="utf-8",
@@ -3840,6 +3929,9 @@ else:
                         "validation_profile_requests": {"tier1": {"profile": "safe"}},
                         "artifact_retention": {"ledger_days": 30, "log_days": 30},
                         "pr_target": {"remote": "upstream", "branch": "release"},
+                        "terminal_integration": {
+                            "validation": {"default_mode": "project-worker", "recommended_profiles": ["tier1"]}
+                        },
                     }
                 ),
                 encoding="utf-8",
