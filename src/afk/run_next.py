@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlsplit
 
-from afk.contracts import ProjectContract
+from afk.contracts import ProjectContract, materialize_terminal_integration_policy
 from afk.recipes import RUNNABLE_REQUIRED_METADATA, generate_workstream_recipe
 from afk.schema_helpers import scrub_selected_work_value as scrub_selected_work_fields
 from afk.selection import deterministic_candidate
@@ -128,6 +128,11 @@ def run_next_request(
                 beads_workspace=workspace,
             )
         )
+        if isinstance(recipe, dict):
+            recipe = {
+                **recipe,
+                "terminal_integration": materialize_terminal_integration_policy(request.project_contract),
+            }
         if request.execute:
             if workstream_runner is None:
                 raise ValueError("workstream_runner is required when --execute is set")
@@ -142,6 +147,7 @@ def run_next_request(
         "selection_result": annotate_selection_result(selection_result),
         "chosen_work": selected_work_snapshot(chosen),
         "selector": selector_result(chosen),
+        "terminal_integration": materialize_terminal_integration_policy(request.project_contract),
         "recipe": recipe,
         "workstream_result": workstream_result,
     }

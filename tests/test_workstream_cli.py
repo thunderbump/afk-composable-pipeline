@@ -7206,6 +7206,20 @@ Path({str(fake_calls)!r}).write_text("gh should not run\\n", encoding="utf-8")
                 validation_profile_requests={"tier1": {"profile": "tier1"}},
                 artifact_retention={"ledger_days": 30, "log_days": 30},
                 pr_target={"remote": "origin", "branch": "main"},
+                terminal_integration={
+                    "required_checks": [],
+                    "required_check_patterns": [],
+                    "optional_checks": [],
+                    "optional_check_patterns": [],
+                    "neutral_policy": "block",
+                    "skipped_policy": "block",
+                    "merge_method": "merge",
+                    "classify_timeout_seconds": 300,
+                    "merge_timeout_seconds": 300,
+                    "poll_seconds": 300,
+                    "close_tracker_on_merge": True,
+                    "validation": {"default_mode": "fake", "recommended_profiles": []},
+                },
                 identity=ProjectContractIdentity(path="test-project.json", sha256="deadbeef"),
             )
             recipe = generate_workstream_recipe(
@@ -7743,6 +7757,20 @@ Path({str(fake_calls)!r}).write_text("gh should not run\\n", encoding="utf-8")
                 validation_profile_requests={"tier1": {"profile": "tier1"}},
                 artifact_retention={"ledger_days": 30, "log_days": 30},
                 pr_target={"remote": "origin", "branch": "main"},
+                terminal_integration={
+                    "required_checks": [],
+                    "required_check_patterns": [],
+                    "optional_checks": [],
+                    "optional_check_patterns": [],
+                    "neutral_policy": "block",
+                    "skipped_policy": "block",
+                    "merge_method": "merge",
+                    "classify_timeout_seconds": 300,
+                    "merge_timeout_seconds": 300,
+                    "poll_seconds": 300,
+                    "close_tracker_on_merge": True,
+                    "validation": {"default_mode": "fake", "recommended_profiles": []},
+                },
                 identity=ProjectContractIdentity(path="test-project.json", sha256="deadbeef"),
             )
             recipe = generate_workstream_recipe(

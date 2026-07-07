@@ -70,23 +70,25 @@ def write_executable(path, content):
     path.chmod(0o755)
 
 
-def write_contract(path, *, project_slug, repo_url):
-    path.write_text(
-        json.dumps(
-            {
-                "schema_version": 1,
-                "project_slug": project_slug,
-                "repo_url": repo_url,
-                "base_branch": "main",
-                "beads_labels": [f"project:{project_slug}"],
-                "validation_profiles": ["tier1"],
-                "validation_profile_requests": {"tier1": {"profile": "tier1"}},
-                "artifact_retention": {"ledger_days": 30, "log_days": 30},
-                "pr_target": {"remote": "origin", "branch": "main"},
-            }
-        ),
-        encoding="utf-8",
-    )
+def write_contract(path, *, project_slug, repo_url, terminal_integration=None):
+    if terminal_integration is None and project_slug == "bump-eqemu":
+        terminal_integration = {
+            "validation": {"default_mode": "project-worker", "recommended_profiles": ["tier1"]},
+        }
+    payload = {
+        "schema_version": 1,
+        "project_slug": project_slug,
+        "repo_url": repo_url,
+        "base_branch": "main",
+        "beads_labels": [f"project:{project_slug}"],
+        "validation_profiles": ["tier1"],
+        "validation_profile_requests": {"tier1": {"profile": "tier1"}},
+        "artifact_retention": {"ledger_days": 30, "log_days": 30},
+        "pr_target": {"remote": "origin", "branch": "main"},
+    }
+    if terminal_integration is not None:
+        payload["terminal_integration"] = terminal_integration
+    path.write_text(json.dumps(payload), encoding="utf-8")
 
 
 class GenerateRecipeCliTest(unittest.TestCase):

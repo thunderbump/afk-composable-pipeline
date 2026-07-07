@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from afk.checkouts import url_has_secret_material
-from afk.contracts import ProjectContract
+from afk.contracts import ProjectContract, materialize_terminal_integration_policy
 from afk.implement import agent_command_secret_error
 
 
@@ -127,6 +127,7 @@ def generate_workstream_recipe(
             },
         ],
         "publisher": recipe_publisher,
+        "terminal_integration": materialize_terminal_integration_policy(project_contract),
     }
     if "repair_policy" in recipe_plan:
         recipe["repair_policy"] = recipe_plan["repair_policy"]
