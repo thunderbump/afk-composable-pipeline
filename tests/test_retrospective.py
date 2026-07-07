@@ -458,6 +458,34 @@ class RetrospectiveModuleTest(unittest.TestCase):
             ],
         )
 
+    def test_build_pipeline_retrospective_ignores_dry_run_title_when_replaying_persisted_target_failure(self):
+        excerpt = "Zone |   Error    | Connect Connection [default] Failed to connect to database"
+        state = persisted_workstream_result_state(
+            excerpt=excerpt,
+            log_path="/tmp/ledger/runs/validate/validation-evidence/logs/validation.log",
+        )
+        state["selected_work"][0]["title"] = "Document dry-run validation smoke coverage"
+
+        record = build_pipeline_retrospective(
+            RetrospectiveContext(
+                state=state,
+                publication={"status": "blocked", "reason": "repair budget exhausted: 5 attempts reached hard_cap=5"},
+                tracker=retrospective_tracker("implemented"),
+            )
+        )
+
+        self.assertEqual(record["signals"][0]["scope"], "target-work")
+        self.assertEqual(record["signals"][1]["scope"], "target-work")
+        self.assertEqual(
+            record["recommended_follow_up"],
+            [
+                {
+                    "summary": f"central-umi2.5: Fix worker [worker_failure]: {excerpt}",
+                    "labels": ["afk:follow-up", "area:validation", "project:bump-eqemu"],
+                }
+            ],
+        )
+
     def test_build_pipeline_retrospective_keeps_persisted_stack_binding_worker_failure_pipeline_owned(self):
         excerpt = "2026-07-01T02:30:42Z binding validation stack /tmp/stack code to /tmp/checkout"
         state = persisted_workstream_result_state(

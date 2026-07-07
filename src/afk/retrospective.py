@@ -164,10 +164,6 @@ def selected_work_target_project_labels(selected_work: list[dict[str, Any]]) -> 
                 and label not in labels
             ):
                 labels.append(label)
-    if labels:
-        return labels
-    for item in selected_work:
-        labels.extend(_inferred_project_labels_from_text(string_field(item, "title") or "", existing=labels))
     return labels
 
 
