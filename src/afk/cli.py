@@ -122,6 +122,8 @@ def main(argv: list[str] | None = None) -> int:
                 )
             except ContractError as exc:
                 parser.error(str(exc))
+        if args.retrospective_follow_up_mode != "disabled" and project_contract is None:
+            parser.error("--project is required when retrospective follow-up mode is enabled")
 
         try:
             result = run_workstream(
@@ -132,8 +134,19 @@ def main(argv: list[str] | None = None) -> int:
                 parent=args.parent,
                 workstream_id=args.workstream_id,
                 project_contract=project_contract,
+                runtime_retrospective_follow_up=(
+                    recipe_retrospective_follow_up_from_args(
+                        args,
+                        project_contract=project_contract,
+                        beads_workspace=Path(args.beads_workspace),
+                    )
+                    if args.retrospective_follow_up_mode != "disabled" and project_contract is not None
+                    else None
+                ),
             )
         except (UnknownStepError, WorkstreamError) as exc:
+            parser.error(str(exc))
+        except ValueError as exc:
             parser.error(str(exc))
         print(
             canonical_json(
@@ -261,6 +274,11 @@ def main(argv: list[str] | None = None) -> int:
                 args,
                 checkout_path=Path(args.checkout_path),
             )
+            retrospective_follow_up = recipe_retrospective_follow_up_from_args(
+                args,
+                project_contract=project_contract,
+                beads_workspace=Path(args.beads_workspace),
+            )
             workstream_runner = None
             if args.execute:
                 from afk.workstream import run_workstream
@@ -271,6 +289,7 @@ def main(argv: list[str] | None = None) -> int:
                     rerun_ledger_arg=rerun_ledger_argument(args.ledger),
                     step_runner=run_step,
                     project_contract=project_contract,
+                    runtime_retrospective_follow_up=retrospective_follow_up,
                 )
             payload = run_next_request(
                 RunNextRequest(
@@ -283,6 +302,7 @@ def main(argv: list[str] | None = None) -> int:
                         validation_input=validation_input,
                         agent=recipe_agent,
                         reviewer=reviewer,
+                        retrospective_follow_up=retrospective_follow_up,
                         publisher_factory=recipe_publisher_factory,
                         enable_review_feedback=args.role_profile == PRODUCTION_ROLE_PROFILE,
                         expect_generated_smoke_dry_run=(
@@ -359,6 +379,11 @@ def build_parser() -> argparse.ArgumentParser:
         default="project-contracts",
         help="Directory containing project contract JSON files",
     )
+    run_workstream_parser.add_argument(
+        "--beads-workspace",
+        help="Central Beads workspace required for retrospective follow-up beads mode",
+    )
+    add_retrospective_follow_up_flags(run_workstream_parser)
 
     generate_recipe_parser = subcommands.add_parser(
         "generate-recipe",
@@ -647,13 +672,13 @@ def add_retrospective_follow_up_flags(parser: argparse.ArgumentParser) -> None:
         "--retrospective-follow-up-mode",
         choices=("disabled", "beads"),
         default="disabled",
-        help="Deprecated no-op compatibility flag; generated recipes no longer embed runtime retrospective follow-up blocks",
+        help="Runtime retrospective follow-up creation mode; default disabled",
     )
     parser.add_argument(
         "--retrospective-follow-up-label",
         action="append",
         default=[],
-        help="Deprecated no-op compatibility flag",
+        help="Additional labels for retrospective follow-up Beads create mode",
     )
 
 
@@ -854,7 +879,21 @@ def recipe_retrospective_follow_up_from_args(
     project_contract: ProjectContract,
     beads_workspace: Path,
 ) -> dict[str, Any] | None:
-    return None
+    if args.retrospective_follow_up_mode == "disabled":
+        return None
+    if args.retrospective_follow_up_mode != "beads":
+        raise ValueError(
+            f"Unsupported --retrospective-follow-up-mode: {args.retrospective_follow_up_mode}"
+        )
+    if not str(beads_workspace).strip():
+        raise ValueError("--beads-workspace is required when retrospective follow-up mode is beads")
+    workspace = validate_beads_workspace(beads_workspace)
+    return {
+        "enabled": True,
+        "creator": "beads",
+        "beads_workspace": str(workspace),
+        "labels": list(project_contract.beads_labels) + list(args.retrospective_follow_up_label),
+    }
 
 
 def recipe_validation_input_from_args(args: argparse.Namespace, *, project_contract: ProjectContract) -> dict[str, Any]:

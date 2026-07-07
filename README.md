@@ -912,10 +912,10 @@ contains Beads-shaped `recommended` entries with `kind`, `summary`, `labels`,
 and stable redacted `fingerprint` values plus a `creation` record describing
 recommendation-only mode. The legacy `recommended_follow_up` list is preserved
 for compatibility.
-The minimal runtime does not execute a retrospective judge or create follow-up
-Beads. Future self-improvement workers should consume
-`pipeline-retrospective.json` outside the workstream lifecycle if that behavior
-is needed.
+By default the runtime stays recommendation-only. When `run-next --execute` or
+`run-workstream` is launched with `--retrospective-follow-up-mode beads`, the
+runtime can materialize deterministic retrospective recommendations into
+central Beads with fingerprint-based dedupe.
 `retrospective.json`, when present, stores the user-supplied terminal
 retrospective evidence separately from the derived pipeline retrospective.
 `review_cycles` evidence, when supplied, is included in both

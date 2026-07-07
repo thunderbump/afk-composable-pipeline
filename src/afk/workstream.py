@@ -184,12 +184,15 @@ def run_workstream(
     parent: str | None = None,
     workstream_id: str | None = None,
     project_contract: ProjectContract | None = None,
+    runtime_retrospective_follow_up: dict[str, Any] | None = None,
 ) -> WorkstreamResult:
     normalization_input = recipe
     if isinstance(recipe, dict):
         normalization_input = dict(recipe)
         normalization_input.pop("retrospective_judge", None)
         normalization_input.pop("retrospective_follow_up", None)
+        if runtime_retrospective_follow_up is not None:
+            normalization_input["retrospective_follow_up"] = runtime_retrospective_follow_up
     normalized = normalize_recipe(normalization_input, parent=parent, workstream_id=workstream_id)
     normalized["rerun_ledger_arg"] = rerun_ledger_arg
     run_id = new_run_id()
@@ -238,6 +241,19 @@ def run_workstream(
             normalized=normalized,
         )
     )
+    if normalized["retrospective_follow_up"].get("enabled"):
+        follow_up_creation = retrospective_api._run_retrospective_follow_up(
+            normalized=normalized,
+            state=state,
+            publication=publication,
+            tracker=tracker,
+            pipeline_retrospective=pipeline_retrospective,
+            ledger=ledger,
+        )
+        pipeline_retrospective = retrospective_api._apply_retrospective_follow_up_creation(
+            pipeline_retrospective,
+            follow_up_creation,
+        )
 
     ledger.write_json("publication-result.json", publication)
     ledger.write_json("tracker-result.json", tracker)
