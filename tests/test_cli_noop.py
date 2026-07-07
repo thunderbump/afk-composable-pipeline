@@ -30,6 +30,17 @@ def run_afk(*args, cwd=None, env_overrides=None):
 
 
 class NoopCliTest(unittest.TestCase):
+    def test_integrate_pr_help_describes_terminal_merge_behavior(self):
+        completed = run_afk("--help")
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        normalized_stdout = " ".join(completed.stdout.split())
+        self.assertIn(
+            "Classify, merge, and close a published PR when terminal policy gates pass",
+            normalized_stdout,
+        )
+        self.assertNotIn("Classify a published PR head/check state without merging", normalized_stdout)
+
     def test_project_contract_rejects_non_boolean_close_tracker_alias(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             contracts_dir = Path(temp_dir)

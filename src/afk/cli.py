@@ -457,7 +457,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     integrate_parser = subcommands.add_parser(
         "integrate-pr",
-        help="Classify a published PR head/check state without merging",
+        help="Classify, merge, and close a published PR when terminal policy gates pass",
     )
     integrate_parser.add_argument(
         "--published-result",
