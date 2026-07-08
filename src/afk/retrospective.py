@@ -30,6 +30,14 @@ class RetrospectiveContext:
     normalized: dict[str, Any] | None = None
 
 
+@dataclass(frozen=True)
+class TerminalIntegrationRetrospectiveContext:
+    workstream: dict[str, Any]
+    integration: dict[str, Any]
+    follow_up: dict[str, Any] | None = None
+    output_dir: Path | None = None
+
+
 class _RetrospectiveJudgeError(RuntimeError):
     def __init__(
         self,
@@ -77,6 +85,55 @@ def build_pipeline_retrospective(context: RetrospectiveContext) -> dict[str, Any
         context.tracker,
         context.normalized,
     )
+
+
+def build_terminal_integration_retrospective(
+    context: TerminalIntegrationRetrospectiveContext,
+) -> dict[str, Any]:
+    signals = _terminal_integration_retrospective_signals(context.integration)
+    follow_up = _retrospective_follow_up_record(signals, None, {})
+    record = {
+        "schema_version": SCHEMA_VERSION,
+        "status": redact_text(string_field(context.integration, "decision") or "unknown"),
+        "health": _retrospective_health(_process_retrospective_signals(signals)),
+        "integration_decision": redact_text(string_field(context.integration, "decision") or ""),
+        "pr_url": redact_text(string_field(context.integration, "pr_url") or ""),
+        "signals": signals,
+        "recommended_follow_up": _legacy_recommended_follow_up(follow_up["recommended"]),
+        "follow_up": follow_up,
+    }
+    if context.follow_up and context.output_dir is not None:
+        output_dir = context.output_dir
+        output_dir.mkdir(parents=True, exist_ok=True)
+        ledger = _RetrospectiveOutputLedger(
+            run_id=(string_field(context.workstream, "workstream_id") or "terminal-integration") + "-integrate-pr",
+            path=output_dir,
+        )
+        normalized = {
+            "workstream_id": string_field(context.workstream, "workstream_id") or "terminal-integration",
+            "parent": string_field(context.workstream, "parent") or "",
+            "review_branch": string_field(context.workstream, "review_branch") or "",
+            "retrospective_follow_up": context.follow_up,
+        }
+        creation = _run_retrospective_follow_up(
+            normalized=normalized,
+            state={},
+            publication=context.workstream.get("publication") if isinstance(context.workstream.get("publication"), dict) else {},
+            tracker=context.workstream.get("tracker") if isinstance(context.workstream.get("tracker"), dict) else {},
+            pipeline_retrospective=record,
+            ledger=ledger,
+        )
+        record = _apply_retrospective_follow_up_creation(record, creation)
+    return record
+
+
+@dataclass(frozen=True)
+class _RetrospectiveOutputLedger:
+    run_id: str
+    path: Path
+
+    def write_json(self, name: str, payload: dict[str, Any]) -> None:
+        (self.path / name).write_text(canonical_json(payload) + "\n", encoding="utf-8")
 
 
 def redacted_terminal_retrospective(normalized: dict[str, Any], publication: dict[str, Any]) -> dict[str, Any]:
@@ -2458,6 +2515,40 @@ def _cleanup_retrospective_signals(state: dict[str, Any]) -> list[dict[str, Any]
     ]
 
 
+def _terminal_integration_retrospective_signals(integration: dict[str, Any]) -> list[dict[str, Any]]:
+    decision = string_field(integration, "decision") or ""
+    remediation = string_field(integration, "remediation") or ""
+    classification = _terminal_integration_classification(decision, remediation)
+    if not classification:
+        return []
+    return [
+        {
+            "kind": "terminal-integration",
+            "scope": "pipeline-process",
+            "severity": "error",
+            "summary": redact_text(remediation),
+            "step": "integrate-pr",
+            "classification": classification,
+            "excerpt": redact_text(remediation),
+            "evidence_paths": _retrospective_evidence_paths("integration-result.json"),
+        }
+    ]
+
+
+def _terminal_integration_classification(decision: str, remediation: str) -> str:
+    if decision == "checks_pending":
+        return ""
+    if "Exact head mismatch" in remediation:
+        return "exact_head_mismatch"
+    if "cannot integrate blocked workstream artifact" in remediation:
+        return "blocked_artifact_misuse"
+    if remediation.startswith("could not determine "):
+        return "missing_artifact_metadata"
+    if "gh auth status failed" in remediation or "config_dir" in remediation:
+        return "integration_auth_or_config"
+    return ""
+
+
 def _retrospective_follow_up_record(
     signals: list[dict[str, Any]],
     normalized: dict[str, Any] | None,
@@ -2790,6 +2881,12 @@ def _follow_up_for_signal(signal: dict[str, Any]) -> dict[str, Any] | None:
             kind=kind,
             summary="Switch validation to project-worker or another non-dry-run adapter before treating the run as honest dogfood evidence.",
             labels=["afk:follow-up", "area:validation"],
+        )
+    if kind == "terminal-integration":
+        return _retrospective_follow_up_item(
+            kind=kind,
+            summary=_follow_up_summary_for_signal(signal, "Fix terminal integration"),
+            labels=["afk:follow-up", "area:integration"],
         )
     if kind == "publisher-auth":
         return _retrospective_follow_up_item(
