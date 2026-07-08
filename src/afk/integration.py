@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -92,16 +93,18 @@ def integrate_published_pr(
     pr_state = (string_field(view_payload, "state") or "").upper()
     is_draft = bool(view_payload.get("isDraft"))
     check_snapshots = normalize_status_check_rollup(view_payload.get("statusCheckRollup"))
-    checks_by_name = {item["name"] for item in check_snapshots if item["name"]}
-    relevant_snapshots = (
-        [item for item in check_snapshots if item["name"] in request["required_checks"]]
-        if request["required_checks"]
-        else check_snapshots
+    decision_snapshots = decision_check_snapshots(
+        check_snapshots,
+        required_checks=request["required_checks"],
+        required_check_patterns=request["required_check_patterns"],
+        optional_checks=request["optional_checks"],
+        optional_check_patterns=request["optional_check_patterns"],
     )
     needs_pr_checks = (
         not check_snapshots
-        or any(name not in checks_by_name for name in request["required_checks"])
-        or any(item["status"] == "inconclusive" for item in relevant_snapshots)
+        or bool(decision_snapshots["missing_required_checks"])
+        or bool(decision_snapshots["missing_required_patterns"])
+        or any(item["status"] == "inconclusive" for item in decision_snapshots["snapshots"])
     )
     if needs_pr_checks:
         try:
@@ -118,6 +121,13 @@ def integrate_published_pr(
             checks_snapshots = normalize_check_snapshots(checks_payload)
             if checks_snapshots:
                 check_snapshots = merge_check_snapshots(check_snapshots, checks_snapshots)
+                decision_snapshots = decision_check_snapshots(
+                    check_snapshots,
+                    required_checks=request["required_checks"],
+                    required_check_patterns=request["required_check_patterns"],
+                    optional_checks=request["optional_checks"],
+                    optional_check_patterns=request["optional_check_patterns"],
+                )
     if retry_context:
         decision, next_poll_seconds, remediation = (
             "merge_ready",
@@ -131,8 +141,11 @@ def integrate_published_pr(
             pr_state=pr_state,
             is_draft=is_draft,
             merge_state_status=merge_state_status,
-            check_snapshots=check_snapshots,
+            check_snapshots=decision_snapshots["snapshots"],
             required_checks=request["required_checks"],
+            required_check_patterns=request["required_check_patterns"],
+            missing_required_checks=decision_snapshots["missing_required_checks"],
+            missing_required_patterns=decision_snapshots["missing_required_patterns"],
             poll_seconds=request["poll_seconds"],
         )
 
@@ -215,6 +228,9 @@ def normalize_request(
     pr_url = publication_pr_url(publication, workstream)
     expected_head_sha = publication_expected_head(publication, workstream, workstream_dir=workstream_dir)
     required_checks = normalize_required_checks(policy)
+    required_check_patterns = normalize_required_check_patterns(policy)
+    optional_checks = normalize_optional_checks(policy)
+    optional_check_patterns = normalize_optional_check_patterns(policy)
     if not repo:
         raise ValueError("could not determine repo from published artifact")
     if not pr_number:
@@ -248,6 +264,9 @@ def normalize_request(
         "pr_url": pr_url,
         "expected_head_sha": expected_head_sha,
         "required_checks": required_checks,
+        "required_check_patterns": required_check_patterns,
+        "optional_checks": optional_checks,
+        "optional_check_patterns": optional_check_patterns,
         "auth": auth,
         "gh_path": string_field(gh, "path") or "gh",
         "poll_seconds": poll_seconds,
@@ -650,6 +669,100 @@ def normalize_required_checks(policy: dict[str, Any]) -> list[str]:
     return [item for item in value if isinstance(item, str) and item]
 
 
+def normalize_optional_checks(policy: dict[str, Any]) -> list[str]:
+    value = policy.get("optional_checks", policy.get("optionalChecks", []))
+    if not isinstance(value, list):
+        raise ValueError("policy.optional_checks must be a list")
+    return [item for item in value if isinstance(item, str) and item]
+
+
+def normalize_required_check_patterns(policy: dict[str, Any]) -> list[str]:
+    value = policy.get("required_check_patterns", policy.get("requiredCheckPatterns", []))
+    if not isinstance(value, list):
+        raise ValueError("policy.required_check_patterns must be a list")
+    return [item for item in value if isinstance(item, str) and item]
+
+
+def normalize_optional_check_patterns(policy: dict[str, Any]) -> list[str]:
+    value = policy.get("optional_check_patterns", policy.get("optionalCheckPatterns", []))
+    if not isinstance(value, list):
+        raise ValueError("policy.optional_check_patterns must be a list")
+    return [item for item in value if isinstance(item, str) and item]
+
+
+def decision_check_snapshots(
+    check_snapshots: list[dict[str, Any]],
+    *,
+    required_checks: list[str],
+    required_check_patterns: list[str],
+    optional_checks: list[str],
+    optional_check_patterns: list[str],
+) -> dict[str, Any]:
+    required_indices, missing_required_checks, missing_required_patterns = matching_required_checks(
+        check_snapshots,
+        required_checks=required_checks,
+        required_check_patterns=required_check_patterns,
+    )
+    if required_checks or required_check_patterns:
+        decision_indices = required_indices
+    else:
+        optional_indices = matching_optional_checks(
+            check_snapshots,
+            optional_checks=optional_checks,
+            optional_check_patterns=optional_check_patterns,
+        )
+        decision_indices = [index for index in range(len(check_snapshots)) if index not in optional_indices]
+    return {
+        "snapshots": [check_snapshots[index] for index in decision_indices],
+        "missing_required_checks": missing_required_checks,
+        "missing_required_patterns": missing_required_patterns,
+    }
+
+
+def matching_required_checks(
+    check_snapshots: list[dict[str, Any]],
+    *,
+    required_checks: list[str],
+    required_check_patterns: list[str],
+) -> tuple[list[int], list[str], list[str]]:
+    available_names = {item.get("name") for item in check_snapshots if item.get("name")}
+    required_indices = [index for index, item in enumerate(check_snapshots) if item.get("name") in required_checks]
+    missing_required_checks = [name for name in required_checks if name not in available_names]
+    missing_required_patterns: list[str] = []
+    for pattern in required_check_patterns:
+        regex = compile_check_pattern(pattern)
+        matched = False
+        for index, item in enumerate(check_snapshots):
+            if regex.search(item.get("name") or ""):
+                required_indices.append(index)
+                matched = True
+        if not matched:
+            missing_required_patterns.append(pattern)
+    return sorted(set(required_indices)), missing_required_checks, missing_required_patterns
+
+
+def matching_optional_checks(
+    check_snapshots: list[dict[str, Any]],
+    *,
+    optional_checks: list[str],
+    optional_check_patterns: list[str],
+) -> set[int]:
+    optional_indices = {index for index, item in enumerate(check_snapshots) if item.get("name") in optional_checks}
+    for pattern in optional_check_patterns:
+        regex = compile_check_pattern(pattern)
+        for index, item in enumerate(check_snapshots):
+            if regex.search(item.get("name") or ""):
+                optional_indices.add(index)
+    return optional_indices
+
+
+def compile_check_pattern(pattern: str) -> re.Pattern[str]:
+    try:
+        return re.compile(pattern)
+    except re.error as exc:
+        raise ValueError(f"invalid check pattern {pattern!r}: {exc}") from exc
+
+
 def load_json_command(
     command: list[str],
     *,
@@ -752,6 +865,9 @@ def classify_integration(
     merge_state_status: str,
     check_snapshots: list[dict[str, Any]],
     required_checks: list[str],
+    required_check_patterns: list[str],
+    missing_required_checks: list[str],
+    missing_required_patterns: list[str],
     poll_seconds: int,
 ) -> tuple[str, int, str]:
     if expected_head != observed_head:
@@ -766,18 +882,14 @@ def classify_integration(
             0,
             "Merge is blocked by the current PR state. Clear the block before attempting terminal merge.",
         )
-    checks_by_name = {item["name"]: item for item in check_snapshots if item["name"]}
-    if required_checks:
-        missing_checks = [name for name in required_checks if name not in checks_by_name]
-        if missing_checks:
-            return (
-                "checks_pending",
-                poll_seconds,
-                f"Wait for required checks to appear: {', '.join(missing_checks)}.",
-            )
-        snapshots = [checks_by_name[name] for name in required_checks]
-    else:
-        snapshots = check_snapshots
+    if missing_required_checks or missing_required_patterns:
+        pending_requirements = missing_required_checks + [f"pattern:{pattern}" for pattern in missing_required_patterns]
+        return (
+            "checks_pending",
+            poll_seconds,
+            f"Wait for required checks to appear: {', '.join(pending_requirements)}.",
+        )
+    snapshots = check_snapshots
     statuses = {item["status"] for item in snapshots}
     if "pending" in statuses:
         return ("checks_pending", poll_seconds, "Wait for GitHub checks to finish, then rerun terminal integration.")
@@ -825,6 +937,9 @@ def classify_terminal_integration(
         "pr_url": publication_pr_url(publication, workstream),
         "expected_head_sha": publication_expected_head(publication, workstream, workstream_dir=published_path.parent),
         "required_checks": normalize_required_checks(policy if isinstance(policy, dict) else {}),
+        "required_check_patterns": normalize_required_check_patterns(policy if isinstance(policy, dict) else {}),
+        "optional_checks": normalize_optional_checks(policy if isinstance(policy, dict) else {}),
+        "optional_check_patterns": normalize_optional_check_patterns(policy if isinstance(policy, dict) else {}),
         "auth": {
             "configured": True,
             "source": "gh_config_dir",
@@ -866,14 +981,24 @@ def classify_terminal_integration(
         failure_message="gh pr view returned invalid JSON payload",
     )
     observed_head = string_field(view_payload, "headRefOid") or ""
+    decision_snapshots = decision_check_snapshots(
+        normalize_status_check_rollup(view_payload.get("statusCheckRollup")),
+        required_checks=request["required_checks"],
+        required_check_patterns=request["required_check_patterns"],
+        optional_checks=request["optional_checks"],
+        optional_check_patterns=request["optional_check_patterns"],
+    )
     decision, next_poll_seconds, remediation = classify_integration(
         expected_head=request["expected_head_sha"],
         observed_head=observed_head,
         pr_state=(string_field(view_payload, "state") or "").upper(),
         is_draft=bool(view_payload.get("isDraft")),
         merge_state_status=(string_field(view_payload, "mergeStateStatus") or "").upper(),
-        check_snapshots=normalize_status_check_rollup(view_payload.get("statusCheckRollup")),
+        check_snapshots=decision_snapshots["snapshots"],
         required_checks=request["required_checks"],
+        required_check_patterns=request["required_check_patterns"],
+        missing_required_checks=decision_snapshots["missing_required_checks"],
+        missing_required_patterns=decision_snapshots["missing_required_patterns"],
         poll_seconds=request["poll_seconds"],
     )
     result = {
