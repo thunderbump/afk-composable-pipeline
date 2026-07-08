@@ -318,7 +318,7 @@ class NoopCliTest(unittest.TestCase):
             {
                 "required_checks": [],
                 "required_check_patterns": ["EQEMU:.*", "Server build \\(ubuntu-24.04\\)"],
-                "optional_checks": ["Codecov"],
+                "optional_checks": ["Codecov", "Macroscope - Correctness Check"],
                 "optional_check_patterns": [],
                 "neutral_policy": "block",
                 "skipped_policy": "block",

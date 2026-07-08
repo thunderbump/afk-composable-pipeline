@@ -92,14 +92,19 @@ def integrate_published_pr(
     pr_state = (string_field(view_payload, "state") or "").upper()
     is_draft = bool(view_payload.get("isDraft"))
     check_snapshots = normalize_status_check_rollup(view_payload.get("statusCheckRollup"))
-    checks_by_name = {item["name"] for item in check_snapshots if item["name"]}
+    decision_snapshots = decision_check_snapshots(
+        check_snapshots,
+        required_checks=request["required_checks"],
+        optional_checks=request["optional_checks"],
+    )
+    checks_by_name = {item["name"] for item in decision_snapshots if item["name"]}
     relevant_snapshots = (
-        [item for item in check_snapshots if item["name"] in request["required_checks"]]
+        [item for item in decision_snapshots if item["name"] in request["required_checks"]]
         if request["required_checks"]
-        else check_snapshots
+        else decision_snapshots
     )
     needs_pr_checks = (
-        not check_snapshots
+        not decision_snapshots
         or any(name not in checks_by_name for name in request["required_checks"])
         or any(item["status"] == "inconclusive" for item in relevant_snapshots)
     )
@@ -118,6 +123,11 @@ def integrate_published_pr(
             checks_snapshots = normalize_check_snapshots(checks_payload)
             if checks_snapshots:
                 check_snapshots = merge_check_snapshots(check_snapshots, checks_snapshots)
+                decision_snapshots = decision_check_snapshots(
+                    check_snapshots,
+                    required_checks=request["required_checks"],
+                    optional_checks=request["optional_checks"],
+                )
     if retry_context:
         decision, next_poll_seconds, remediation = (
             "merge_ready",
@@ -131,7 +141,7 @@ def integrate_published_pr(
             pr_state=pr_state,
             is_draft=is_draft,
             merge_state_status=merge_state_status,
-            check_snapshots=check_snapshots,
+            check_snapshots=decision_snapshots,
             required_checks=request["required_checks"],
             poll_seconds=request["poll_seconds"],
         )
@@ -215,6 +225,7 @@ def normalize_request(
     pr_url = publication_pr_url(publication, workstream)
     expected_head_sha = publication_expected_head(publication, workstream, workstream_dir=workstream_dir)
     required_checks = normalize_required_checks(policy)
+    optional_checks = normalize_optional_checks(policy)
     if not repo:
         raise ValueError("could not determine repo from published artifact")
     if not pr_number:
@@ -248,6 +259,7 @@ def normalize_request(
         "pr_url": pr_url,
         "expected_head_sha": expected_head_sha,
         "required_checks": required_checks,
+        "optional_checks": optional_checks,
         "auth": auth,
         "gh_path": string_field(gh, "path") or "gh",
         "poll_seconds": poll_seconds,
@@ -648,6 +660,25 @@ def normalize_required_checks(policy: dict[str, Any]) -> list[str]:
     if not isinstance(value, list):
         raise ValueError("policy.required_checks must be a list")
     return [item for item in value if isinstance(item, str) and item]
+
+
+def normalize_optional_checks(policy: dict[str, Any]) -> list[str]:
+    value = policy.get("optional_checks", policy.get("optionalChecks", []))
+    if not isinstance(value, list):
+        raise ValueError("policy.optional_checks must be a list")
+    return [item for item in value if isinstance(item, str) and item]
+
+
+def decision_check_snapshots(
+    check_snapshots: list[dict[str, Any]],
+    *,
+    required_checks: list[str],
+    optional_checks: list[str],
+) -> list[dict[str, Any]]:
+    optional_names = {name for name in optional_checks if name and name not in required_checks}
+    if not optional_names:
+        return check_snapshots
+    return [item for item in check_snapshots if item.get("name") not in optional_names]
 
 
 def load_json_command(

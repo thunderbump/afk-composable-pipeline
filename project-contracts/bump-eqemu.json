@@ -42,7 +42,8 @@
       "Server build \\(ubuntu-24.04\\)"
     ],
     "optional_checks": [
-      "Codecov"
+      "Codecov",
+      "Macroscope - Correctness Check"
     ],
     "classify_timeout_seconds": 900,
     "merge_timeout_seconds": 900,
