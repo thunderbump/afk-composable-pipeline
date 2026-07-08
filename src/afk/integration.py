@@ -141,6 +141,8 @@ def integrate_published_pr(
         "is_draft": is_draft,
         "merge_state_status": merge_state_status,
         "check_snapshots": check_snapshots,
+        "neutral_policy": request["neutral_policy"],
+        "skipped_policy": request["skipped_policy"],
         "decision": decision,
         "next_poll_seconds": next_poll_seconds,
         "remediation": remediation,
@@ -240,6 +242,8 @@ def normalize_request(
         "auth": auth,
         "gh_path": string_field(gh, "path") or "gh",
         "poll_seconds": poll_seconds,
+        "neutral_policy": string_field(policy, "neutral_policy") or "block",
+        "skipped_policy": string_field(policy, "skipped_policy") or "block",
     }
 
 
