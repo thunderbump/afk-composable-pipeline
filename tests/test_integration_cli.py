@@ -1367,7 +1367,77 @@ raise SystemExit(0)
             self.assertEqual(result["expected_head_sha"], "current-sha")
             self.assertEqual(result["observed_head_sha"], "current-sha")
 
-    def test_integrate_pr_uses_tracker_implementation_commit_for_published_repair_cycles(self):
+    def test_integrate_pr_blocks_stale_tracker_commit_when_current_ledger_implement_result_is_newer(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            ledger = temp_path / "ledger"
+            workstream_dir = ledger / "workstreams" / "run-stale-tracker-head"
+            workstream_path = workstream_dir / "workstream-result.json"
+            publication_path = workstream_dir / "publication-result.json"
+            current_result_path = ledger / "runs" / "implement-current" / "step-result.json"
+            current_result_path.parent.mkdir(parents=True, exist_ok=True)
+            current_result_path.write_text(
+                json.dumps({"output": {"git": {"after_commit": "final-sha"}}}),
+                encoding="utf-8",
+            )
+            workstream_path.parent.mkdir(parents=True, exist_ok=True)
+            workstream_path.write_text(
+                json.dumps(
+                    {
+                        "workstream_id": "central-8xvj",
+                        "tracker": {"implementation_commit": "stale-sha"},
+                        "publication": {
+                            "status": "published",
+                            "url": "https://github.com/acme/widgets/pull/17",
+                        },
+                        "steps": [
+                            {"name": "implement", "result_path": "runs/implement-current/step-result.json"},
+                            {"name": "validate"},
+                            {"name": "review"},
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            write_publication_result(publication_path)
+            fake_gh = temp_path / "fake-gh"
+            fake_calls = temp_path / "fake-calls.jsonl"
+            auth_dir = temp_path / "gh-config"
+            auth_dir.mkdir()
+            (auth_dir / "view.json").write_text(
+                json.dumps(
+                    {
+                        "number": 17,
+                        "url": "https://github.com/acme/widgets/pull/17",
+                        "state": "OPEN",
+                        "isDraft": False,
+                        "mergeStateStatus": "CLEAN",
+                        "headRefOid": "stale-sha",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (auth_dir / "checks.json").write_text(json.dumps([]), encoding="utf-8")
+            write_executable(fake_gh, fake_gh_script(fake_calls))
+
+            completed = run_afk(
+                "integrate-pr",
+                "--published-result",
+                str(publication_path),
+                "--policy",
+                json.dumps({"gh": {"path": str(fake_gh)}, "required_checks": []}),
+                "--gh-auth-config-dir",
+                str(auth_dir),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            result = json.loads((output_dir_for(workstream_path) / "integration-result.json").read_text(encoding="utf-8"))
+            self.assertEqual(result["decision"], "merge_blocked")
+            self.assertEqual(result["expected_head_sha"], "final-sha")
+            self.assertEqual(result["observed_head_sha"], "stale-sha")
+            self.assertIn("Exact head mismatch", result["remediation"])
+
+    def test_integrate_pr_uses_tracker_implementation_commit_when_current_repair_head_cannot_be_recovered(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
             ledger = temp_path / "ledger"
@@ -1404,7 +1474,7 @@ raise SystemExit(0)
                             {"name": "validate"},
                             {
                                 "name": "implement",
-                                "result_path": "runs/implement-2/step-result.json",
+                                "result_path": "runs/missing-implement/step-result.json",
                             },
                             {"name": "validate"},
                             {"name": "review"},

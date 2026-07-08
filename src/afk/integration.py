@@ -586,39 +586,39 @@ def publication_expected_head(
         head = string_field(source, "expected_head_sha")
         if head:
             return head
+    steps = workstream.get("steps")
+    if isinstance(steps, list):
+        for step in reversed(steps):
+            if not isinstance(step, dict):
+                continue
+            step_name = string_field(step, "name") or string_field(step, "step")
+            if step_name != "implement":
+                continue
+            output = step.get("output")
+            if isinstance(output, dict):
+                git_info = output.get("git")
+                if isinstance(git_info, dict):
+                    head = string_field(git_info, "after_commit")
+                    if head:
+                        return head
+            if workstream_dir is not None:
+                path = _resolve_step_result_path(step, workstream_dir)
+                if path is not None:
+                    payload = read_json_file(path)
+                    if isinstance(payload, dict):
+                        output = payload.get("output")
+                        if isinstance(output, dict):
+                            git_info = output.get("git")
+                            if isinstance(git_info, dict):
+                                head = string_field(git_info, "after_commit")
+                                if head:
+                                    return head
+            break
     tracker = workstream.get("tracker")
     if isinstance(tracker, dict):
         head = string_field(tracker, "implementation_commit")
         if head:
             return head
-    steps = workstream.get("steps")
-    if not isinstance(steps, list):
-        return ""
-    for step in steps:
-        if not isinstance(step, dict):
-            continue
-        step_name = string_field(step, "name") or string_field(step, "step")
-        if step_name != "implement":
-            continue
-        output = step.get("output")
-        if isinstance(output, dict):
-            git_info = output.get("git")
-            if isinstance(git_info, dict):
-                head = string_field(git_info, "after_commit")
-                if head:
-                    return head
-        if workstream_dir is not None:
-            path = _resolve_step_result_path(step, workstream_dir)
-            if path is not None:
-                payload = read_json_file(path)
-                if isinstance(payload, dict):
-                    output = payload.get("output")
-                    if isinstance(output, dict):
-                        git_info = output.get("git")
-                        if isinstance(git_info, dict):
-                            head = string_field(git_info, "after_commit")
-                            if head:
-                                return head
     return ""
 
 
