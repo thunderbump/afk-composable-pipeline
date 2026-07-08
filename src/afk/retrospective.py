@@ -2518,7 +2518,7 @@ def _cleanup_retrospective_signals(state: dict[str, Any]) -> list[dict[str, Any]
 def _terminal_integration_retrospective_signals(integration: dict[str, Any]) -> list[dict[str, Any]]:
     decision = string_field(integration, "decision") or ""
     remediation = string_field(integration, "remediation") or ""
-    classification = _terminal_integration_classification(decision, remediation)
+    classification = _terminal_integration_classification(integration)
     if not classification:
         return []
     return [
@@ -2535,8 +2535,14 @@ def _terminal_integration_retrospective_signals(integration: dict[str, Any]) -> 
     ]
 
 
-def _terminal_integration_classification(decision: str, remediation: str) -> str:
+def _terminal_integration_classification(integration: dict[str, Any]) -> str:
+    decision = string_field(integration, "decision") or ""
+    remediation = string_field(integration, "remediation") or ""
     if decision == "checks_pending":
+        return ""
+    if decision == "checks_inconclusive":
+        if _terminal_integration_policy_blocks_inconclusive(integration):
+            return "checks_inconclusive_policy"
         return ""
     if "Exact head mismatch" in remediation:
         return "exact_head_mismatch"
@@ -2547,6 +2553,28 @@ def _terminal_integration_classification(decision: str, remediation: str) -> str
     if "gh auth status failed" in remediation or "config_dir" in remediation:
         return "integration_auth_or_config"
     return ""
+
+
+def _terminal_integration_policy_blocks_inconclusive(integration: dict[str, Any]) -> bool:
+    neutral_blocks = string_field(integration, "neutral_policy") == "block"
+    skipped_blocks = string_field(integration, "skipped_policy") == "block"
+    if not neutral_blocks and not skipped_blocks:
+        return False
+    snapshots = integration.get("check_snapshots")
+    if not isinstance(snapshots, list):
+        return neutral_blocks
+    for item in snapshots:
+        if not isinstance(item, dict):
+            continue
+        if string_field(item, "status") != "inconclusive":
+            continue
+        if string_field(item, "bucket") == "skipping" or string_field(item, "state") == "SKIPPED":
+            if skipped_blocks:
+                return True
+            continue
+        if neutral_blocks:
+            return True
+    return False
 
 
 def _retrospective_follow_up_record(

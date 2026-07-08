@@ -93,7 +93,16 @@ def integrate_published_pr(
     is_draft = bool(view_payload.get("isDraft"))
     check_snapshots = normalize_status_check_rollup(view_payload.get("statusCheckRollup"))
     checks_by_name = {item["name"] for item in check_snapshots if item["name"]}
-    needs_pr_checks = not check_snapshots or any(name not in checks_by_name for name in request["required_checks"])
+    relevant_snapshots = (
+        [item for item in check_snapshots if item["name"] in request["required_checks"]]
+        if request["required_checks"]
+        else check_snapshots
+    )
+    needs_pr_checks = (
+        not check_snapshots
+        or any(name not in checks_by_name for name in request["required_checks"])
+        or any(item["status"] == "inconclusive" for item in relevant_snapshots)
+    )
     if needs_pr_checks:
         try:
             checks_payload = load_json_command(
@@ -141,6 +150,8 @@ def integrate_published_pr(
         "is_draft": is_draft,
         "merge_state_status": merge_state_status,
         "check_snapshots": check_snapshots,
+        "neutral_policy": request["neutral_policy"],
+        "skipped_policy": request["skipped_policy"],
         "decision": decision,
         "next_poll_seconds": next_poll_seconds,
         "remediation": remediation,
@@ -240,6 +251,8 @@ def normalize_request(
         "auth": auth,
         "gh_path": string_field(gh, "path") or "gh",
         "poll_seconds": poll_seconds,
+        "neutral_policy": string_field(policy, "neutral_policy") or "block",
+        "skipped_policy": string_field(policy, "skipped_policy") or "block",
     }
 
 
@@ -680,11 +693,12 @@ def normalize_status_check_rollup(payload: Any) -> list[dict[str, Any]]:
             continue
         raw_status = (string_field(item, "status") or "").upper()
         conclusion = (string_field(item, "conclusion") or "").upper()
+        state = conclusion if raw_status == "COMPLETED" and conclusion in INCONCLUSIVE_CHECK_STATES else raw_status
         snapshots.append(
             {
                 "name": string_field(item, "name") or "",
                 "workflow": "",
-                "state": raw_status,
+                "state": state,
                 "bucket": "",
                 "status": rollup_status(raw_status, conclusion),
                 "link": "",
