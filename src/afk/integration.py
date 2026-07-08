@@ -93,7 +93,16 @@ def integrate_published_pr(
     is_draft = bool(view_payload.get("isDraft"))
     check_snapshots = normalize_status_check_rollup(view_payload.get("statusCheckRollup"))
     checks_by_name = {item["name"] for item in check_snapshots if item["name"]}
-    needs_pr_checks = not check_snapshots or any(name not in checks_by_name for name in request["required_checks"])
+    relevant_snapshots = (
+        [item for item in check_snapshots if item["name"] in request["required_checks"]]
+        if request["required_checks"]
+        else check_snapshots
+    )
+    needs_pr_checks = (
+        not check_snapshots
+        or any(name not in checks_by_name for name in request["required_checks"])
+        or any(item["status"] == "inconclusive" for item in relevant_snapshots)
+    )
     if needs_pr_checks:
         try:
             checks_payload = load_json_command(

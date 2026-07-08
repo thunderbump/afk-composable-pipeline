@@ -2556,10 +2556,25 @@ def _terminal_integration_classification(integration: dict[str, Any]) -> str:
 
 
 def _terminal_integration_policy_blocks_inconclusive(integration: dict[str, Any]) -> bool:
-    return any(
-        string_field(integration, key) == "block"
-        for key in ("neutral_policy", "skipped_policy")
-    )
+    neutral_blocks = string_field(integration, "neutral_policy") == "block"
+    skipped_blocks = string_field(integration, "skipped_policy") == "block"
+    if not neutral_blocks and not skipped_blocks:
+        return False
+    snapshots = integration.get("check_snapshots")
+    if not isinstance(snapshots, list):
+        return neutral_blocks
+    for item in snapshots:
+        if not isinstance(item, dict):
+            continue
+        if string_field(item, "status") != "inconclusive":
+            continue
+        if string_field(item, "bucket") == "skipping":
+            if skipped_blocks:
+                return True
+            continue
+        if neutral_blocks:
+            return True
+    return False
 
 
 def _retrospective_follow_up_record(
