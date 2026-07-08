@@ -1331,6 +1331,10 @@ raise SystemExit(9)
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
             workstream_path = temp_path / "ledger" / "workstreams" / "run-blocked-artifact" / "workstream-result.json"
+            contracts_dir = temp_path / "contracts"
+            beads_workspace = temp_path / "beads"
+            fake_calls = temp_path / "fake-bd-calls.jsonl"
+            created_beads = temp_path / "created-beads.json"
             workstream_path.parent.mkdir(parents=True, exist_ok=True)
             workstream_path.write_text(
                 json.dumps(
@@ -1354,22 +1358,85 @@ raise SystemExit(9)
                 ),
                 encoding="utf-8",
             )
+            contracts_dir.mkdir()
+            write_project_contract(contracts_dir / "dogfood.json")
+            beads_workspace.mkdir()
+            (beads_workspace / "secrets").mkdir()
+            (beads_workspace / "secrets" / "dolt_beads_password.txt").write_text("test-password\n", encoding="utf-8")
+            fake_bd = temp_path / "bd"
+            write_executable(
+                fake_bd,
+                f"""#!{sys.executable}
+import json
+import os
+import sys
+from pathlib import Path
+
+calls_path = Path({str(fake_calls)!r})
+created_path = Path({str(created_beads)!r})
+items = json.loads(created_path.read_text(encoding="utf-8")) if created_path.exists() else []
+calls_path.open("a", encoding="utf-8").write(
+    json.dumps({{"argv": sys.argv[1:], "password": os.environ.get("BEADS_DOLT_PASSWORD", "")}}) + "\\n"
+)
+if sys.argv[1:2] == ["list"]:
+    print(json.dumps(items))
+    raise SystemExit(0)
+if sys.argv[1:2] == ["create"]:
+    bead_id = f"central-new.{{len(items) + 1}}"
+    item = {{
+        "id": bead_id,
+        "title": sys.argv[sys.argv.index("--title") + 1],
+        "labels": sys.argv[sys.argv.index("--labels") + 1].split(","),
+        "description": sys.argv[sys.argv.index("--description") + 1],
+        "metadata": json.loads(sys.argv[sys.argv.index("--metadata") + 1]),
+    }}
+    items.append(item)
+    created_path.write_text(json.dumps(items), encoding="utf-8")
+    print(bead_id)
+    raise SystemExit(0)
+raise SystemExit(9)
+""",
+            )
             auth_dir = temp_path / "gh-config"
             auth_dir.mkdir()
 
             completed = run_afk(
                 "integrate-pr",
+                "--project",
+                "dogfood",
+                "--contracts-dir",
+                str(contracts_dir),
+                "--beads-workspace",
+                str(beads_workspace),
+                "--retrospective-follow-up-mode",
+                "beads",
                 "--published-result",
                 str(workstream_path),
                 "--policy",
                 json.dumps({"required_checks": []}),
                 "--gh-auth-config-dir",
                 str(auth_dir),
+                env_extra={"PATH": f"{temp_path}{os.pathsep}{os.environ['PATH']}"},
             )
 
             self.assertNotEqual(completed.returncode, 0)
             self.assertIn("cannot integrate blocked workstream artifact", completed.stderr)
             self.assertIn("repair budget exhausted: 5 attempts reached hard_cap=5", completed.stderr)
+            retrospective = json.loads(
+                (output_dir_for(workstream_path) / "integration-retrospective.json").read_text(encoding="utf-8")
+            )
+            calls = [json.loads(line) for line in fake_calls.read_text(encoding="utf-8").splitlines()]
+            created = json.loads(created_beads.read_text(encoding="utf-8"))
+
+            self.assertEqual(retrospective["integration_decision"], "merge_blocked")
+            self.assertEqual(retrospective["follow_up"]["creation"]["status"], "created")
+            self.assertEqual(retrospective["follow_up"]["created"][0]["id"], "central-new.1")
+            self.assertEqual(retrospective["recommended_follow_up"], [])
+            self.assertEqual(sum(1 for call in calls if call["argv"][0] == "create"), 1)
+            self.assertEqual(
+                created[0]["title"],
+                "Fix terminal integration integrate-pr [blocked_artifact_misuse]: cannot integrate blocked workstream artifact: repair budget exhausted: 5 attempts reached hard_cap=5",
+            )
 
     def test_integrate_pr_records_exact_head_mismatch_from_publication_result_path(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1525,6 +1592,63 @@ raise SystemExit(9)
             self.assertEqual(
                 created[0]["title"],
                 "Fix terminal integration integrate-pr [exact_head_mismatch]: Exact head mismatch. Do not merge; rerun publication or repair so the PR head matches the validated SHA.",
+            )
+
+    def test_integrate_pr_writes_recommendation_only_retrospective_for_exact_head_mismatch(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            workstream_dir = temp_path / "ledger" / "workstreams" / "run-recommendation-only"
+            workstream_path = workstream_dir / "workstream-result.json"
+            publication_path = workstream_dir / "publication-result.json"
+            write_workstream_result(workstream_path, expected_head="abc123")
+            write_publication_result(publication_path)
+            fake_gh = temp_path / "fake-gh"
+            fake_calls = temp_path / "fake-calls.jsonl"
+            auth_dir = temp_path / "gh-config"
+            auth_dir.mkdir()
+            (auth_dir / "view.json").write_text(
+                json.dumps(
+                    {
+                        "number": 17,
+                        "url": "https://github.com/acme/widgets/pull/17",
+                        "state": "OPEN",
+                        "isDraft": False,
+                        "mergeStateStatus": "CLEAN",
+                        "headRefOid": "def456",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (auth_dir / "checks.json").write_text(json.dumps([]), encoding="utf-8")
+            write_executable(fake_gh, fake_gh_script(fake_calls))
+
+            completed = run_afk(
+                "integrate-pr",
+                "--published-result",
+                str(publication_path),
+                "--policy",
+                json.dumps({"gh": {"path": str(fake_gh)}, "required_checks": ["build"]}),
+                "--gh-auth-config-dir",
+                str(auth_dir),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            retrospective_path = output_dir_for(workstream_path) / "integration-retrospective.json"
+            retrospective = json.loads(retrospective_path.read_text(encoding="utf-8"))
+
+            self.assertEqual(summary["integration_retrospective_path"], str(retrospective_path))
+            self.assertEqual(retrospective["integration_decision"], "merge_blocked")
+            self.assertEqual(retrospective["follow_up"]["creation"]["status"], "recommendation-only")
+            self.assertEqual(retrospective["follow_up"]["created"], [])
+            self.assertEqual(
+                retrospective["recommended_follow_up"],
+                [
+                    {
+                        "summary": "Fix terminal integration integrate-pr [exact_head_mismatch]: Exact head mismatch. Do not merge; rerun publication or repair so the PR head matches the validated SHA.",
+                        "labels": ["afk:follow-up", "area:integration", "project:afk-composable-pipeline"],
+                    }
+                ],
             )
 
     def test_integrate_pr_prefers_current_ledger_relative_implement_result_over_stale_absolute_path(self):
@@ -1803,6 +1927,20 @@ raise SystemExit(9)
 
             self.assertNotEqual(completed.returncode, 0)
             self.assertIn("could not determine expected head SHA from published artifact", completed.stderr)
+            retrospective = json.loads(
+                (output_dir_for(workstream_path) / "integration-retrospective.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(retrospective["integration_decision"], "merge_blocked")
+            self.assertEqual(retrospective["follow_up"]["creation"]["status"], "recommendation-only")
+            self.assertEqual(
+                retrospective["recommended_follow_up"],
+                [
+                    {
+                        "summary": "Fix terminal integration integrate-pr [missing_artifact_metadata]: could not determine expected head SHA from published artifact",
+                        "labels": ["afk:follow-up", "area:integration", "project:afk-composable-pipeline"],
+                    }
+                ],
+            )
 
     def test_integrate_pr_rejects_in_ledger_absolute_implement_result_without_current_relative_evidence(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1869,6 +2007,39 @@ raise SystemExit(9)
 
             self.assertNotEqual(completed.returncode, 0)
             self.assertIn("could not determine expected head SHA from published artifact", completed.stderr)
+
+    def test_integrate_pr_records_recommendation_only_retrospective_for_invalid_auth_config(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            workstream_path = temp_path / "ledger" / "workstreams" / "run-bad-auth-config" / "workstream-result.json"
+            write_workstream_result(workstream_path, expected_head="abc123")
+
+            completed = run_afk(
+                "integrate-pr",
+                "--published-result",
+                str(workstream_path),
+                "--policy",
+                json.dumps({"required_checks": []}),
+                "--gh-auth-config-dir",
+                str(temp_path / "missing-gh-config"),
+            )
+
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("publisher.gh.auth.config_dir must be an existing directory", completed.stderr)
+            retrospective = json.loads(
+                (output_dir_for(workstream_path) / "integration-retrospective.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(retrospective["integration_decision"], "merge_blocked")
+            self.assertEqual(retrospective["follow_up"]["creation"]["status"], "recommendation-only")
+            self.assertEqual(
+                retrospective["recommended_follow_up"],
+                [
+                    {
+                        "summary": "Fix terminal integration integrate-pr [integration_auth_or_config]: publisher.gh.auth.config_dir must be an existing directory",
+                        "labels": ["afk:follow-up", "area:integration", "project:afk-composable-pipeline"],
+                    }
+                ],
+            )
 
     def test_integrate_pr_uses_status_check_rollup_when_pr_checks_is_empty(self):
         with tempfile.TemporaryDirectory() as temp_dir:

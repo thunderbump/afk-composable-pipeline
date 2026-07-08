@@ -345,28 +345,17 @@ def main(argv: list[str] | None = None) -> int:
                 gh_auth_config_dir=args.gh_auth_config_dir,
             )
         except Exception as exc:
+            _write_terminal_integration_retrospective(
+                args,
+                integration_result=_terminal_integration_failure_result(exc),
+                project_contract=project_contract,
+            )
             parser.error(str(exc))
-        retrospective_result = None
-        if args.retrospective_follow_up_mode != "disabled" and project_contract is not None:
-            from afk import retrospective as retrospective_api
-
-            published_path = Path(args.published_result).resolve(strict=True)
-            retrospective_result = retrospective_api.build_terminal_integration_retrospective(
-                retrospective_api.TerminalIntegrationRetrospectiveContext(
-                    workstream=load_workstream_payload(published_path),
-                    integration=result,
-                    follow_up=recipe_retrospective_follow_up_from_args(
-                        args,
-                        project_contract=project_contract,
-                        beads_workspace=Path(args.beads_workspace) if args.beads_workspace is not None else None,
-                    ),
-                    output_dir=integration_output_dir(published_path),
-                )
-            )
-            (integration_output_dir(published_path) / "integration-retrospective.json").write_text(
-                canonical_json(retrospective_result) + "\n",
-                encoding="utf-8",
-            )
+        retrospective_result = _write_terminal_integration_retrospective(
+            args,
+            integration_result=result,
+            project_contract=project_contract,
+        )
         print(
             canonical_json(
                 {
@@ -748,6 +737,44 @@ def add_publisher_flags(parser: argparse.ArgumentParser) -> None:
         "--publisher-gh-config-dir",
         help="Absolute mounted gh config dir for publisher create mode",
     )
+
+
+def _terminal_integration_failure_result(exc: Exception) -> dict[str, Any]:
+    return {
+        "decision": "merge_blocked",
+        "remediation": str(exc),
+    }
+
+
+def _write_terminal_integration_retrospective(
+    args: argparse.Namespace,
+    *,
+    integration_result: dict[str, Any],
+    project_contract: ProjectContract | None,
+) -> dict[str, Any]:
+    from afk import retrospective as retrospective_api
+
+    published_path = Path(args.published_result).resolve(strict=True)
+    follow_up = None
+    if args.retrospective_follow_up_mode != "disabled" and project_contract is not None:
+        follow_up = recipe_retrospective_follow_up_from_args(
+            args,
+            project_contract=project_contract,
+            beads_workspace=Path(args.beads_workspace) if args.beads_workspace is not None else None,
+        )
+    retrospective_result = retrospective_api.build_terminal_integration_retrospective(
+        retrospective_api.TerminalIntegrationRetrospectiveContext(
+            workstream=load_workstream_payload(published_path),
+            integration=integration_result,
+            follow_up=follow_up,
+            output_dir=integration_output_dir(published_path),
+        )
+    )
+    (integration_output_dir(published_path) / "integration-retrospective.json").write_text(
+        canonical_json(retrospective_result) + "\n",
+        encoding="utf-8",
+    )
+    return retrospective_result
 
 
 def effective_validation_mode(args: argparse.Namespace, *, project_contract: ProjectContract) -> str:
