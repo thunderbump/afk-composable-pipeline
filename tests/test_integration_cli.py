@@ -3024,6 +3024,220 @@ raise SystemExit(9)
             self.assertEqual(result["decision"], "merge_ready")
             self.assertEqual(result["check_snapshots"][0]["status"], "inconclusive")
 
+    def test_integrate_pr_required_check_pattern_without_matches_stays_pending(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            workstream_path = temp_path / "ledger" / "workstreams" / "run-required-pattern-missing" / "workstream-result.json"
+            write_workstream_result(workstream_path, expected_head="abc123")
+            fake_gh = temp_path / "fake-gh"
+            fake_calls = temp_path / "fake-calls.jsonl"
+            auth_dir = temp_path / "gh-config"
+            auth_dir.mkdir()
+            (auth_dir / "view.json").write_text(
+                json.dumps(
+                    {
+                        "number": 35,
+                        "url": "https://github.com/thunderbump/bump-EQEmu/pull/35",
+                        "state": "OPEN",
+                        "isDraft": False,
+                        "mergeStateStatus": "CLEAN",
+                        "headRefOid": "abc123",
+                        "statusCheckRollup": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (auth_dir / "checks.json").write_text("[]", encoding="utf-8")
+            write_executable(fake_gh, fake_gh_script(fake_calls))
+
+            completed = run_afk(
+                "integrate-pr",
+                "--published-result",
+                str(workstream_path),
+                "--policy",
+                json.dumps(
+                    {
+                        "gh": {"path": str(fake_gh)},
+                        "required_check_patterns": ["EQEMU:.*"],
+                        "poll_seconds": 60,
+                    }
+                ),
+                "--gh-auth-config-dir",
+                str(auth_dir),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            result = json.loads((output_dir_for(workstream_path) / "integration-result.json").read_text(encoding="utf-8"))
+            self.assertEqual(result["decision"], "checks_pending")
+            self.assertEqual(result["next_poll_seconds"], 60)
+
+    def test_integrate_pr_required_pattern_passes_with_optional_neutral_macroscope(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            workstream_path = temp_path / "ledger" / "workstreams" / "run-required-pattern-optional-macroscope" / "workstream-result.json"
+            write_workstream_result(workstream_path, expected_head="abc123")
+            fake_gh = temp_path / "fake-gh"
+            fake_calls = temp_path / "fake-calls.jsonl"
+            auth_dir = temp_path / "gh-config"
+            auth_dir.mkdir()
+            (auth_dir / "view.json").write_text(
+                json.dumps(
+                    {
+                        "number": 35,
+                        "url": "https://github.com/thunderbump/bump-EQEmu/pull/35",
+                        "state": "OPEN",
+                        "isDraft": False,
+                        "mergeStateStatus": "CLEAN",
+                        "headRefOid": "abc123",
+                        "statusCheckRollup": [
+                            {
+                                "name": "EQEMU: unit",
+                                "status": "COMPLETED",
+                                "conclusion": "SUCCESS",
+                            },
+                            {
+                                "name": "Macroscope - Correctness Check",
+                                "status": "COMPLETED",
+                                "conclusion": "NEUTRAL",
+                            },
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (auth_dir / "checks.json").write_text("[]", encoding="utf-8")
+            write_executable(fake_gh, fake_gh_script(fake_calls))
+
+            completed = run_afk(
+                "integrate-pr",
+                "--published-result",
+                str(workstream_path),
+                "--policy",
+                json.dumps(
+                    {
+                        "gh": {"path": str(fake_gh)},
+                        "required_check_patterns": ["EQEMU:.*"],
+                        "optional_checks": ["Macroscope - Correctness Check"],
+                    }
+                ),
+                "--gh-auth-config-dir",
+                str(auth_dir),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            result = json.loads((output_dir_for(workstream_path) / "integration-result.json").read_text(encoding="utf-8"))
+            self.assertEqual(result["decision"], "merge_ready")
+            self.assertEqual([item["name"] for item in result["check_snapshots"]], ["EQEMU: unit", "Macroscope - Correctness Check"])
+
+    def test_integrate_pr_required_pattern_inconclusive_blocks_merge(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            workstream_path = temp_path / "ledger" / "workstreams" / "run-required-pattern-inconclusive" / "workstream-result.json"
+            write_workstream_result(workstream_path, expected_head="abc123")
+            fake_gh = temp_path / "fake-gh"
+            fake_calls = temp_path / "fake-calls.jsonl"
+            auth_dir = temp_path / "gh-config"
+            auth_dir.mkdir()
+            (auth_dir / "view.json").write_text(
+                json.dumps(
+                    {
+                        "number": 35,
+                        "url": "https://github.com/thunderbump/bump-EQEmu/pull/35",
+                        "state": "OPEN",
+                        "isDraft": False,
+                        "mergeStateStatus": "CLEAN",
+                        "headRefOid": "abc123",
+                        "statusCheckRollup": [
+                            {
+                                "name": "EQEMU: unit",
+                                "status": "COMPLETED",
+                                "conclusion": "NEUTRAL",
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (auth_dir / "checks.json").write_text("[]", encoding="utf-8")
+            write_executable(fake_gh, fake_gh_script(fake_calls))
+
+            completed = run_afk(
+                "integrate-pr",
+                "--published-result",
+                str(workstream_path),
+                "--policy",
+                json.dumps(
+                    {
+                        "gh": {"path": str(fake_gh)},
+                        "required_check_patterns": ["EQEMU:.*"],
+                    }
+                ),
+                "--gh-auth-config-dir",
+                str(auth_dir),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            result = json.loads((output_dir_for(workstream_path) / "integration-result.json").read_text(encoding="utf-8"))
+            self.assertEqual(result["decision"], "checks_inconclusive")
+
+    def test_integrate_pr_optional_exact_and_pattern_checks_do_not_block(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            workstream_path = temp_path / "ledger" / "workstreams" / "run-optional-patterns" / "workstream-result.json"
+            write_workstream_result(workstream_path, expected_head="abc123")
+            fake_gh = temp_path / "fake-gh"
+            fake_calls = temp_path / "fake-calls.jsonl"
+            auth_dir = temp_path / "gh-config"
+            auth_dir.mkdir()
+            (auth_dir / "view.json").write_text(
+                json.dumps(
+                    {
+                        "number": 35,
+                        "url": "https://github.com/thunderbump/bump-EQEmu/pull/35",
+                        "state": "OPEN",
+                        "isDraft": False,
+                        "mergeStateStatus": "CLEAN",
+                        "headRefOid": "abc123",
+                        "statusCheckRollup": [
+                            {
+                                "name": "Macroscope - Correctness Check",
+                                "status": "COMPLETED",
+                                "conclusion": "NEUTRAL",
+                            },
+                            {
+                                "name": "Codecov / patch",
+                                "status": "COMPLETED",
+                                "conclusion": "FAILURE",
+                            },
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (auth_dir / "checks.json").write_text("[]", encoding="utf-8")
+            write_executable(fake_gh, fake_gh_script(fake_calls))
+
+            completed = run_afk(
+                "integrate-pr",
+                "--published-result",
+                str(workstream_path),
+                "--policy",
+                json.dumps(
+                    {
+                        "gh": {"path": str(fake_gh)},
+                        "optional_checks": ["Macroscope - Correctness Check"],
+                        "optional_check_patterns": ["Codecov.*"],
+                    }
+                ),
+                "--gh-auth-config-dir",
+                str(auth_dir),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            result = json.loads((output_dir_for(workstream_path) / "integration-result.json").read_text(encoding="utf-8"))
+            self.assertEqual(result["decision"], "merge_ready")
+            self.assertEqual(len(result["check_snapshots"]), 2)
+
     def test_integrate_pr_blocks_neutral_macroscope_check_when_not_optional(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
