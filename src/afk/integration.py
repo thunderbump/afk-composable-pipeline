@@ -586,6 +586,11 @@ def publication_expected_head(
         head = string_field(source, "expected_head_sha")
         if head:
             return head
+    tracker = workstream.get("tracker")
+    if isinstance(tracker, dict):
+        head = string_field(tracker, "implementation_commit")
+        if head:
+            return head
     steps = workstream.get("steps")
     if not isinstance(steps, list):
         return ""
