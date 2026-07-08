@@ -693,11 +693,12 @@ def normalize_status_check_rollup(payload: Any) -> list[dict[str, Any]]:
             continue
         raw_status = (string_field(item, "status") or "").upper()
         conclusion = (string_field(item, "conclusion") or "").upper()
+        state = conclusion if raw_status == "COMPLETED" and conclusion in INCONCLUSIVE_CHECK_STATES else raw_status
         snapshots.append(
             {
                 "name": string_field(item, "name") or "",
                 "workflow": "",
-                "state": raw_status,
+                "state": state,
                 "bucket": "",
                 "status": rollup_status(raw_status, conclusion),
                 "link": "",

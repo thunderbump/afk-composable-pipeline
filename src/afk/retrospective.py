@@ -2568,7 +2568,7 @@ def _terminal_integration_policy_blocks_inconclusive(integration: dict[str, Any]
             continue
         if string_field(item, "status") != "inconclusive":
             continue
-        if string_field(item, "bucket") == "skipping":
+        if string_field(item, "bucket") == "skipping" or string_field(item, "state") == "SKIPPED":
             if skipped_blocks:
                 return True
             continue

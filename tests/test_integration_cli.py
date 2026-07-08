@@ -2651,6 +2651,245 @@ raise SystemExit(9)
                 [["auth", "status"], ["pr", "view"], ["pr", "merge"], ["pr", "view"]],
             )
 
+    def test_integrate_pr_keeps_skipped_identity_when_pr_checks_json_is_unsupported_and_skipped_policy_blocks(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            workstream_path = (
+                temp_path / "ledger" / "workstreams" / "run-rollup-skipped-unsupported-block" / "workstream-result.json"
+            )
+            contracts_dir = temp_path / "contracts"
+            beads_workspace = temp_path / "beads"
+            fake_calls = temp_path / "fake-bd-calls.jsonl"
+            created_beads = temp_path / "created-beads.json"
+            write_workstream_result(workstream_path, expected_head="abc123")
+            contracts_dir.mkdir()
+            write_project_contract(contracts_dir / "dogfood.json")
+            beads_workspace.mkdir()
+            (beads_workspace / "secrets").mkdir()
+            (beads_workspace / "secrets" / "dolt_beads_password.txt").write_text("test-password\n", encoding="utf-8")
+            fake_bd = temp_path / "bd"
+            write_executable(
+                fake_bd,
+                f"""#!{sys.executable}
+import json
+import os
+import sys
+from pathlib import Path
+
+calls_path = Path({str(fake_calls)!r})
+created_path = Path({str(created_beads)!r})
+items = json.loads(created_path.read_text(encoding="utf-8")) if created_path.exists() else []
+calls_path.open("a", encoding="utf-8").write(
+    json.dumps({{"argv": sys.argv[1:], "password": os.environ.get("BEADS_DOLT_PASSWORD", "")}}) + "\\n"
+)
+if sys.argv[1:2] == ["list"]:
+    print(json.dumps(items))
+    raise SystemExit(0)
+if sys.argv[1:2] == ["create"]:
+    items.append({{"id": "central-new.1", "title": sys.argv[2]}})
+    created_path.write_text(json.dumps(items), encoding="utf-8")
+    print("central-new.1")
+    raise SystemExit(0)
+raise SystemExit(9)
+""",
+            )
+            fake_gh = temp_path / "fake-gh"
+            auth_dir = temp_path / "gh-config"
+            auth_dir.mkdir()
+            (auth_dir / "view.json").write_text(
+                json.dumps(
+                    {
+                        "number": 17,
+                        "url": "https://github.com/acme/widgets/pull/17",
+                        "state": "OPEN",
+                        "isDraft": False,
+                        "mergeStateStatus": "CLEAN",
+                        "headRefOid": "abc123",
+                        "statusCheckRollup": [
+                            {"name": "build", "status": "COMPLETED", "conclusion": "SKIPPED"},
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            write_executable(
+                fake_gh,
+                f"""#!{sys.executable}
+import json
+import os
+import sys
+from pathlib import Path
+
+Path({str(fake_calls.with_name("fake-gh-calls.jsonl"))!r}).open("a", encoding="utf-8").write(
+    json.dumps({{"argv": sys.argv[1:], "cwd": os.getcwd(), "gh_config_dir": os.environ.get("GH_CONFIG_DIR", "")}}) + "\\n"
+)
+if sys.argv[1:4] == ["auth", "status", "--hostname"]:
+    raise SystemExit(0)
+if sys.argv[1:3] == ["pr", "view"]:
+    print(Path(os.environ["GH_CONFIG_DIR"]).joinpath("view.json").read_text(encoding="utf-8"))
+    raise SystemExit(0)
+if sys.argv[1:3] == ["pr", "checks"]:
+    sys.stderr.write("unknown flag: --json\\n")
+    raise SystemExit(1)
+raise SystemExit(9)
+""",
+            )
+
+            completed = run_afk(
+                "integrate-pr",
+                "--project",
+                "dogfood",
+                "--contracts-dir",
+                str(contracts_dir),
+                "--beads-workspace",
+                str(beads_workspace),
+                "--retrospective-follow-up-mode",
+                "beads",
+                "--published-result",
+                str(workstream_path),
+                "--policy",
+                json.dumps(
+                    {
+                        "gh": {"path": str(fake_gh)},
+                        "required_checks": ["build"],
+                        "neutral_policy": "allow",
+                        "skipped_policy": "block",
+                    }
+                ),
+                "--gh-auth-config-dir",
+                str(auth_dir),
+                env_extra={"PATH": f"{temp_path}{os.pathsep}{os.environ['PATH']}"},
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            retrospective = json.loads(
+                (output_dir_for(workstream_path) / "integration-retrospective.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(retrospective["signals"][0]["classification"], "checks_inconclusive_policy")
+            self.assertEqual(retrospective["follow_up"]["creation"]["status"], "created")
+            self.assertEqual(retrospective["follow_up"]["created"][0]["id"], "central-new.1")
+
+    def test_integrate_pr_keeps_skipped_identity_when_pr_checks_json_is_unsupported_and_skipped_policy_allows(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            workstream_path = (
+                temp_path / "ledger" / "workstreams" / "run-rollup-skipped-unsupported-allow" / "workstream-result.json"
+            )
+            contracts_dir = temp_path / "contracts"
+            beads_workspace = temp_path / "beads"
+            fake_calls = temp_path / "fake-bd-calls.jsonl"
+            created_beads = temp_path / "created-beads.json"
+            write_workstream_result(workstream_path, expected_head="abc123")
+            contracts_dir.mkdir()
+            write_project_contract(contracts_dir / "dogfood.json")
+            beads_workspace.mkdir()
+            (beads_workspace / "secrets").mkdir()
+            (beads_workspace / "secrets" / "dolt_beads_password.txt").write_text("test-password\n", encoding="utf-8")
+            fake_bd = temp_path / "bd"
+            write_executable(
+                fake_bd,
+                f"""#!{sys.executable}
+import json
+import os
+import sys
+from pathlib import Path
+
+calls_path = Path({str(fake_calls)!r})
+created_path = Path({str(created_beads)!r})
+items = json.loads(created_path.read_text(encoding="utf-8")) if created_path.exists() else []
+calls_path.open("a", encoding="utf-8").write(
+    json.dumps({{"argv": sys.argv[1:], "password": os.environ.get("BEADS_DOLT_PASSWORD", "")}}) + "\\n"
+)
+if sys.argv[1:2] == ["list"]:
+    print(json.dumps(items))
+    raise SystemExit(0)
+if sys.argv[1:2] == ["create"]:
+    raise SystemExit(9)
+raise SystemExit(9)
+""",
+            )
+            fake_gh = temp_path / "fake-gh"
+            auth_dir = temp_path / "gh-config"
+            auth_dir.mkdir()
+            (auth_dir / "view.json").write_text(
+                json.dumps(
+                    {
+                        "number": 17,
+                        "url": "https://github.com/acme/widgets/pull/17",
+                        "state": "OPEN",
+                        "isDraft": False,
+                        "mergeStateStatus": "CLEAN",
+                        "headRefOid": "abc123",
+                        "statusCheckRollup": [
+                            {"name": "build", "status": "COMPLETED", "conclusion": "SKIPPED"},
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            write_executable(
+                fake_gh,
+                f"""#!{sys.executable}
+import json
+import os
+import sys
+from pathlib import Path
+
+Path({str(fake_calls.with_name("fake-gh-calls-allow.jsonl"))!r}).open("a", encoding="utf-8").write(
+    json.dumps({{"argv": sys.argv[1:], "cwd": os.getcwd(), "gh_config_dir": os.environ.get("GH_CONFIG_DIR", "")}}) + "\\n"
+)
+if sys.argv[1:4] == ["auth", "status", "--hostname"]:
+    raise SystemExit(0)
+if sys.argv[1:3] == ["pr", "view"]:
+    print(Path(os.environ["GH_CONFIG_DIR"]).joinpath("view.json").read_text(encoding="utf-8"))
+    raise SystemExit(0)
+if sys.argv[1:3] == ["pr", "checks"]:
+    sys.stderr.write("unknown flag: --json\\n")
+    raise SystemExit(1)
+raise SystemExit(9)
+""",
+            )
+
+            completed = run_afk(
+                "integrate-pr",
+                "--project",
+                "dogfood",
+                "--contracts-dir",
+                str(contracts_dir),
+                "--beads-workspace",
+                str(beads_workspace),
+                "--retrospective-follow-up-mode",
+                "beads",
+                "--published-result",
+                str(workstream_path),
+                "--policy",
+                json.dumps(
+                    {
+                        "gh": {"path": str(fake_gh)},
+                        "required_checks": ["build"],
+                        "neutral_policy": "block",
+                        "skipped_policy": "allow",
+                    }
+                ),
+                "--gh-auth-config-dir",
+                str(auth_dir),
+                env_extra={"PATH": f"{temp_path}{os.pathsep}{os.environ['PATH']}"},
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            retrospective = json.loads(
+                (output_dir_for(workstream_path) / "integration-retrospective.json").read_text(encoding="utf-8")
+            )
+            calls = (
+                [json.loads(line) for line in fake_calls.read_text(encoding="utf-8").splitlines()]
+                if fake_calls.exists()
+                else []
+            )
+            self.assertEqual(retrospective["signals"], [])
+            self.assertEqual(retrospective["follow_up"]["created"], [])
+            self.assertEqual(retrospective["follow_up"]["creation"]["status"], "skipped")
+            self.assertEqual(sum(1 for call in calls if call["argv"][0] == "create"), 0)
+
     def test_integrate_pr_merges_rollup_and_pr_checks_by_required_check_name(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
