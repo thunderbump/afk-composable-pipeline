@@ -1,5 +1,6 @@
 from __future__ import annotations
 import json
+import os
 import subprocess
 import tempfile
 from pathlib import Path
@@ -7,21 +8,13 @@ from typing import Any
 
 from afk import evidence_gate
 from afk.jsonutil import canonical_json
-from afk.pi_workers import (
-    non_openai_pi_mount_error,
-    openai_codex_pi_mount_error,
-    validate_absolute_dir,
-)
+from afk.pi_workers import non_openai_pi_mount_error, openai_codex_pi_mount_error, validate_absolute_dir
 from afk.redaction import is_secret_command_flag, redact_artifact_value, redact_text
 from afk.role_adapters import (
     RoleAdapterRuntimeError,
     read_json_result_file,
 )
-from afk.roles import (
-    execute_role_adapter,
-    log_role_adapter_result,
-    log_role_runtime_error,
-)
+from afk.roles import execute_role_adapter, log_role_adapter_result, log_role_runtime_error
 from afk.schema_helpers import (
     build_selected_work_record,
     is_string_list,
@@ -34,7 +27,7 @@ from afk.schema_helpers import (
 
 SCHEMA_VERSION = 1
 REVIEWER_COMMAND_TYPES = {"fake-reviewer-command", "real-reviewer-command"}
-# Keep inline prompts well below common argv limits; larger requests use the file path.
+# Keep inline prompts well below common argv limits; larger requests use @file.
 MAX_REVIEWER_PROMPT_ARG_BYTES = 32768
 
 
@@ -70,9 +63,7 @@ def review(input_data: Any, *, run_id: str, run_dir: Path | None) -> dict[str, A
     reviewer_request = build_reviewer_request(evidence_pack, run_id=run_id)
     write_json(run_dir / "reviewer-request.json", reviewer_request)
 
-    validation_gate = evidence_gate.required_validation_gate(
-        request["validation"]["required"]
-    )
+    validation_gate = evidence_gate.required_validation_gate(request["validation"]["required"])
     if not validation_gate["passed"]:
         normalized = normalized_reviewer_result(
             status="failed_validation_evidence",
@@ -115,9 +106,7 @@ def review(input_data: Any, *, run_id: str, run_dir: Path | None) -> dict[str, A
             classification="protocol_failure",
             summary=raw_payload["message"],
             findings=[],
-            adapter=adapter_record(
-                request["reviewer"], adapter_result["returncode"], False
-            ),
+            adapter=adapter_record(request["reviewer"], adapter_result["returncode"], False),
             stdout=stdout,
             stderr=stderr,
             result_source=raw_payload.get("result_source"),
@@ -128,9 +117,7 @@ def review(input_data: Any, *, run_id: str, run_dir: Path | None) -> dict[str, A
 
     normalized = normalize_reviewer_payload(
         raw_payload["payload"],
-        adapter=adapter_record(
-            request["reviewer"], adapter_result["returncode"], False
-        ),
+        adapter=adapter_record(request["reviewer"], adapter_result["returncode"], False),
         stdout=stdout,
         stderr=stderr,
         result_source=raw_payload["result_source"],
@@ -147,9 +134,7 @@ def normalize_request(input_data: Any, *, run_id: str) -> dict[str, Any]:
     work_item = normalize_work_item(input_data.get("work_item"))
     if work_item["status"] != "valid":
         return invalid_request(work_item["message"])
-    work_selection = normalize_work_selection(
-        input_data.get("work_selection"), work_item["work_item"]
-    )
+    work_selection = normalize_work_selection(input_data.get("work_selection"), work_item["work_item"])
     if work_selection["status"] != "valid":
         return invalid_request(work_selection["message"])
 
@@ -219,15 +204,9 @@ def normalize_work_item(work_item: Any) -> dict[str, Any]:
     labels = string_list_field(work_item, "labels")
     acceptance_criteria = string_list_field(work_item, "acceptance_criteria")
     if labels is None:
-        return {
-            "status": "invalid",
-            "message": "work_item.labels must be a list of strings",
-        }
+        return {"status": "invalid", "message": "work_item.labels must be a list of strings"}
     if acceptance_criteria is None:
-        return {
-            "status": "invalid",
-            "message": "work_item.acceptance_criteria must be a list of strings",
-        }
+        return {"status": "invalid", "message": "work_item.acceptance_criteria must be a list of strings"}
     normalized = build_selected_work_record(
         work_item,
         external_id=external_id,
@@ -240,34 +219,22 @@ def normalize_work_item(work_item: Any) -> dict[str, Any]:
             if isinstance(work_item.get("dependencies", []), list)
             else []
         ),
-        blockers=(
-            list(work_item.get("blockers", []))
-            if isinstance(work_item.get("blockers", []), list)
-            else []
-        ),
+        blockers=list(work_item.get("blockers", [])) if isinstance(work_item.get("blockers", []), list) else [],
     )
     return {"status": "valid", "work_item": redact_artifact_value(normalized)}
 
 
-def normalize_work_selection(
-    work_selection: Any, fallback_work_item: dict[str, Any]
-) -> dict[str, Any]:
+def normalize_work_selection(work_selection: Any, fallback_work_item: dict[str, Any]) -> dict[str, Any]:
     if work_selection is None:
         return {
             "status": "valid",
-            "work_selection": {
-                "schema_version": SCHEMA_VERSION,
-                "selected_work": [fallback_work_item],
-            },
+            "work_selection": {"schema_version": SCHEMA_VERSION, "selected_work": [fallback_work_item]},
         }
     if not isinstance(work_selection, dict):
         return {"status": "invalid", "message": "work_selection must be an object"}
     selected_work = work_selection.get("selected_work")
     if not isinstance(selected_work, list) or not selected_work:
-        return {
-            "status": "invalid",
-            "message": "work_selection.selected_work must be a non-empty list",
-        }
+        return {"status": "invalid", "message": "work_selection.selected_work must be a non-empty list"}
     normalized_items = []
     for item in selected_work:
         normalized = normalize_work_item(item)
@@ -287,17 +254,13 @@ def normalize_checkout(checkout: Any) -> dict[str, Any]:
     return normalize_prepared_checkout(checkout)
 
 
-def normalize_implementation(
-    implementation: Any, checkout_path: Path
-) -> dict[str, Any]:
+def normalize_implementation(implementation: Any, checkout_path: Path) -> dict[str, Any]:
     if not isinstance(implementation, dict):
         return {"status": "invalid", "message": "implementation must be an object"}
     git_metadata = implementation.get("git")
     if not isinstance(git_metadata, dict):
         git_metadata = infer_git_metadata(checkout_path)
-    normalized_git = normalize_implementation_git(
-        git_metadata, field_name="implementation.git"
-    )
+    normalized_git = normalize_implementation_git(git_metadata, field_name="implementation.git")
     if normalized_git["status"] != "valid":
         return normalized_git
     normalized = {
@@ -317,15 +280,10 @@ def normalize_implementation(
     return {"status": "valid", "implementation": redact_artifact_value(normalized)}
 
 
-def normalize_implementation_git(
-    git_metadata: dict[str, Any], *, field_name: str
-) -> dict[str, Any]:
+def normalize_implementation_git(git_metadata: dict[str, Any], *, field_name: str) -> dict[str, Any]:
     changed_files = string_list_field(git_metadata, "changed_files")
     if changed_files is None:
-        return {
-            "status": "invalid",
-            "message": f"{field_name}.changed_files must be a list of strings",
-        }
+        return {"status": "invalid", "message": f"{field_name}.changed_files must be a list of strings"}
     commits = git_metadata.get("commits", [])
     if not isinstance(commits, list):
         return {"status": "invalid", "message": f"{field_name}.commits must be a list"}
@@ -362,17 +320,11 @@ def normalize_validation(validation: Any) -> dict[str, Any]:
         return {"status": "invalid", "message": "validation must be an object"}
     required_artifacts = validation.get("required_artifacts")
     if not isinstance(required_artifacts, list) or not required_artifacts:
-        return {
-            "status": "invalid",
-            "message": "validation.required_artifacts must be a non-empty list",
-        }
+        return {"status": "invalid", "message": "validation.required_artifacts must be a non-empty list"}
     normalized = []
     for index, artifact in enumerate(required_artifacts):
         if not isinstance(artifact, dict):
-            return {
-                "status": "invalid",
-                "message": "validation.required_artifacts entries must be objects",
-            }
+            return {"status": "invalid", "message": "validation.required_artifacts entries must be objects"}
         name = string_field(artifact, "name") or f"validation-{index + 1}"
         step_result_path = string_field(artifact, "step_result_path")
         worker_result_path = string_field(artifact, "worker_result_path")
@@ -383,17 +335,11 @@ def normalize_validation(validation: Any) -> dict[str, Any]:
             if step_path is None
             else validation_artifact_path_errors(step_path, "step-result.json")
         )
-        worker_path_errors = (
-            ["worker-result.json path is required"] if worker_path is None else []
-        )
+        worker_path_errors = ["worker-result.json path is required"] if worker_path is None else []
         pair_path_errors = []
         if step_path is not None and worker_path is not None:
-            worker_path_errors = validation_artifact_path_errors(
-                worker_path, "worker-result.json"
-            )
-            pair_path_errors = validation_artifact_pair_path_errors(
-                step_path, worker_path
-            )
+            worker_path_errors = validation_artifact_path_errors(worker_path, "worker-result.json")
+            pair_path_errors = validation_artifact_pair_path_errors(step_path, worker_path)
         path_errors = step_path_errors + worker_path_errors + pair_path_errors
         if path_errors:
             step_result = invalid_validation_artifact_path_result(
@@ -407,11 +353,7 @@ def normalize_validation(validation: Any) -> dict[str, Any]:
         else:
             step_result = read_json_artifact(step_path)
             worker_result = read_json_artifact(worker_path)
-        output = (
-            step_result.get("output")
-            if isinstance(step_result.get("output"), dict)
-            else {}
-        )
+        output = step_result.get("output") if isinstance(step_result.get("output"), dict) else {}
         worker_normalized = worker_validation_result(worker_result)
         evidence_errors = list(path_errors)
         if not path_errors:
@@ -453,9 +395,7 @@ def read_validation_artifact(path: Path, expected_filename: str) -> dict[str, An
     return read_json_artifact(path)
 
 
-def invalid_validation_artifact_path_result(
-    path: Path | None, errors: list[str]
-) -> dict[str, Any]:
+def invalid_validation_artifact_path_result(path: Path | None, errors: list[str]) -> dict[str, Any]:
     return {
         "status": "invalid_path",
         "path": str(path) if path is not None else "",
@@ -483,9 +423,7 @@ def validation_artifact_path_errors(path: Path, expected_filename: str) -> list[
     return errors
 
 
-def validation_artifact_pair_path_errors(
-    step_path: Path, worker_path: Path
-) -> list[str]:
+def validation_artifact_pair_path_errors(step_path: Path, worker_path: Path) -> list[str]:
     if not step_path.is_absolute() or not worker_path.is_absolute():
         return []
     if step_path.parent == worker_path.parent:
@@ -502,11 +440,7 @@ def validation_evidence_errors(
     worker_result_path: str | None,
 ) -> list[str]:
     errors = []
-    output = (
-        step_result.get("output")
-        if isinstance(step_result.get("output"), dict)
-        else None
-    )
+    output = step_result.get("output") if isinstance(step_result.get("output"), dict) else None
     if step_result.get("step") != "validate":
         errors.append("step_result step must be validate")
     if step_result.get("status") != "succeeded":
@@ -517,22 +451,12 @@ def validation_evidence_errors(
         if output.get("status") != "validated":
             errors.append("step_result output status must be validated")
         if worker_result_path:
-            artifacts = (
-                output.get("artifacts")
-                if isinstance(output.get("artifacts"), dict)
-                else {}
-            )
+            artifacts = output.get("artifacts") if isinstance(output.get("artifacts"), dict) else {}
             if artifacts.get("worker_result") != Path(worker_result_path).name:
-                errors.append(
-                    "step_result output artifacts must reference worker_result"
-                )
+                errors.append("step_result output artifacts must reference worker_result")
 
     worker_normalized = {}
-    worker_result_result = (
-        worker_result.get("result")
-        if isinstance(worker_result.get("result"), dict)
-        else {}
-    )
+    worker_result_result = worker_result.get("result") if isinstance(worker_result.get("result"), dict) else {}
     if isinstance(worker_result_result.get("normalized"), dict):
         worker_normalized = worker_result_result["normalized"]
     if worker_result.get("step") != "validate":
@@ -562,14 +486,8 @@ def worker_validation_result(worker_result: dict[str, Any]) -> dict[str, str]:
             "classification": "",
             "summary": "",
         }
-    result = (
-        worker_result.get("result")
-        if isinstance(worker_result.get("result"), dict)
-        else {}
-    )
-    normalized = (
-        result.get("normalized") if isinstance(result.get("normalized"), dict) else {}
-    )
+    result = worker_result.get("result") if isinstance(worker_result.get("result"), dict) else {}
+    normalized = result.get("normalized") if isinstance(result.get("normalized"), dict) else {}
     return {
         "status": string_field(normalized, "status") or "missing",
         "classification": string_field(normalized, "classification") or "",
@@ -604,11 +522,7 @@ def normalize_cleanup(cleanup: Any) -> dict[str, Any]:
         return {"status": "invalid", "message": "cleanup must be an object"}
     normalized = {
         "status": string_field(cleanup, "status") or "unknown",
-        "resources": (
-            cleanup.get("resources", [])
-            if isinstance(cleanup.get("resources", []), list)
-            else []
-        ),
+        "resources": cleanup.get("resources", []) if isinstance(cleanup.get("resources", []), list) else [],
     }
     return {"status": "valid", "cleanup": redact_artifact_value(normalized)}
 
@@ -624,31 +538,16 @@ def normalize_reviewer(reviewer: Any, *, checkout_path: Path) -> dict[str, Any]:
         }
     for forbidden_key in ("credentials_path", "auth_file", "token", "api_key"):
         if forbidden_key in reviewer:
-            return {
-                "status": "invalid",
-                "message": f"reviewer.{forbidden_key} is not supported",
-            }
+            return {"status": "invalid", "message": f"reviewer.{forbidden_key} is not supported"}
     command = reviewer.get("command")
     if not is_string_list(command):
-        return {
-            "status": "invalid",
-            "message": "reviewer.command must be a list of strings",
-        }
+        return {"status": "invalid", "message": "reviewer.command must be a list of strings"}
     command_secret_error = command_secret_error_message(command)
     if command_secret_error:
         return {"status": "invalid", "message": command_secret_error}
-    timeout_seconds = reviewer.get(
-        "timeout_seconds", reviewer.get("timeoutSeconds", 120)
-    )
-    if (
-        isinstance(timeout_seconds, bool)
-        or not isinstance(timeout_seconds, (int, float))
-        or timeout_seconds <= 0
-    ):
-        return {
-            "status": "invalid",
-            "message": "reviewer.timeout_seconds must be a positive number",
-        }
+    timeout_seconds = reviewer.get("timeout_seconds", reviewer.get("timeoutSeconds", 120))
+    if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float)) or timeout_seconds <= 0:
+        return {"status": "invalid", "message": "reviewer.timeout_seconds must be a positive number"}
     normalized_reviewer = {
         "type": reviewer_type,
         "command": list(command),
@@ -657,20 +556,14 @@ def normalize_reviewer(reviewer: Any, *, checkout_path: Path) -> dict[str, Any]:
     provider = reviewer.get("provider")
     if provider is not None:
         if not isinstance(provider, str) or not provider.strip():
-            return {
-                "status": "invalid",
-                "message": "reviewer.provider must be a non-empty string",
-            }
+            return {"status": "invalid", "message": "reviewer.provider must be a non-empty string"}
         normalized_reviewer["provider"] = provider.strip()
     for field_name in ("codex_home", "config_home"):
         raw_value = reviewer.get(field_name)
         if raw_value is None:
             continue
         if not isinstance(raw_value, str) or not raw_value.strip():
-            return {
-                "status": "invalid",
-                "message": f"reviewer.{field_name} must be an absolute directory path",
-            }
+            return {"status": "invalid", "message": f"reviewer.{field_name} must be an absolute directory path"}
         try:
             normalized_reviewer[field_name] = validate_absolute_dir(
                 raw_value,
@@ -691,10 +584,7 @@ def normalize_reviewer(reviewer: Any, *, checkout_path: Path) -> dict[str, Any]:
                     "message": "reviewer.env only supports PI_CONFIG_HOME and PI_CODING_AGENT_DIR",
                 }
             if not isinstance(value, str) or not value.strip():
-                return {
-                    "status": "invalid",
-                    "message": f"reviewer.env.{key} must be an absolute directory path",
-                }
+                return {"status": "invalid", "message": f"reviewer.env.{key} must be an absolute directory path"}
             try:
                 normalized_env[key] = validate_absolute_dir(
                     value,
@@ -750,9 +640,7 @@ def build_evidence_pack(request: dict[str, Any]) -> dict[str, Any]:
     return redact_artifact_value(pack)
 
 
-def build_reviewer_request(
-    evidence_pack: dict[str, Any], *, run_id: str
-) -> dict[str, Any]:
+def build_reviewer_request(evidence_pack: dict[str, Any], *, run_id: str) -> dict[str, Any]:
     return {
         "schema_version": SCHEMA_VERSION,
         "run_id": run_id,
@@ -768,16 +656,8 @@ def build_reviewer_request(
 
 
 def required_validation_failures(evidence_pack: dict[str, Any]) -> list[dict[str, Any]]:
-    validation = (
-        evidence_pack.get("validation")
-        if isinstance(evidence_pack.get("validation"), dict)
-        else {}
-    )
-    required = (
-        validation.get("required")
-        if isinstance(validation.get("required"), list)
-        else []
-    )
+    validation = evidence_pack.get("validation") if isinstance(evidence_pack.get("validation"), dict) else {}
+    required = validation.get("required") if isinstance(validation.get("required"), list) else []
     failures = []
     for item in required:
         if not isinstance(item, dict):
@@ -793,23 +673,11 @@ def required_validation_failures(evidence_pack: dict[str, Any]) -> list[dict[str
         name = string_field(item, "name") or "validation"
         worker_status = string_field(item, "worker_status") or "missing"
         evidence_status = string_field(item, "evidence_status") or "invalid"
-        if (
-            status != "validated"
-            or worker_status != "validated"
-            or evidence_status != "valid"
-        ):
-            evidence_errors = (
-                item.get("evidence_errors")
-                if isinstance(item.get("evidence_errors"), list)
-                else []
-            )
-            failure_summary = "; ".join(
-                str(error) for error in evidence_errors if isinstance(error, str)
-            )
+        if status != "validated" or worker_status != "validated" or evidence_status != "valid":
+            evidence_errors = item.get("evidence_errors") if isinstance(item.get("evidence_errors"), list) else []
+            failure_summary = "; ".join(str(error) for error in evidence_errors if isinstance(error, str))
             if not failure_summary:
-                failure_summary = (
-                    string_field(item, "summary") or f"{name} status is {status}"
-                )
+                failure_summary = string_field(item, "summary") or f"{name} status is {status}"
             if status == "validated" and worker_status != "validated":
                 failure_summary = (
                     string_field(item, "worker_summary")
@@ -827,14 +695,9 @@ def required_validation_failures(evidence_pack: dict[str, Any]) -> list[dict[str
                         "evidence_status": evidence_status,
                         "evidence_errors": evidence_errors,
                         "worker_status": worker_status,
-                        "worker_classification": string_field(
-                            item, "worker_classification"
-                        )
-                        or "",
-                        "step_result_path": string_field(item, "step_result_path")
-                        or "",
-                        "worker_result_path": string_field(item, "worker_result_path")
-                        or "",
+                        "worker_classification": string_field(item, "worker_classification") or "",
+                        "step_result_path": string_field(item, "step_result_path") or "",
+                        "worker_result_path": string_field(item, "worker_result_path") or "",
                     },
                 }
             )
@@ -852,24 +715,14 @@ def required_validation_failures(evidence_pack: dict[str, Any]) -> list[dict[str
 def validation_gate_summary(validation_failures: list[dict[str, Any]]) -> str:
     names = []
     for failure in validation_failures:
-        validation = (
-            failure.get("validation")
-            if isinstance(failure.get("validation"), dict)
-            else {}
-        )
+        validation = failure.get("validation") if isinstance(failure.get("validation"), dict) else {}
         name = string_field(validation, "name")
         status = string_field(validation, "status")
         evidence_status = string_field(validation, "evidence_status")
         worker_status = string_field(validation, "worker_status")
         if name and evidence_status and evidence_status != "valid":
             names.append(f"{name} ({evidence_status} evidence)")
-        elif (
-            name
-            and status
-            and worker_status
-            and status == "validated"
-            and worker_status != "validated"
-        ):
+        elif name and status and worker_status and status == "validated" and worker_status != "validated":
             names.append(f"{name} (worker {worker_status})")
         elif name and status:
             names.append(f"{name} ({status})")
@@ -889,10 +742,7 @@ def run_fake_reviewer_command(
     with tempfile.TemporaryDirectory() as temp_dir:
         temp_path = Path(temp_dir)
         result_path = temp_path / "reviewer-result.json"
-        prompt = reviewer_prompt_argument(
-            reviewer_request,
-            request_path=request_path,
-        )
+        prompt = reviewer_prompt_argument(reviewer_request, request_path=request_path)
         adapter_result = execute_role_adapter(
             reviewer,
             cwd=checkout_path,
@@ -917,19 +767,15 @@ def run_fake_reviewer_command(
 
 
 def reviewer_prompt_argument(
-    reviewer_request: dict[str, Any],
-    *,
-    request_path: Path,
+    reviewer_request: dict[str, Any], *, request_path: Path
 ) -> str:
     inline_prompt = canonical_json(reviewer_request)
     if len(inline_prompt.encode("utf-8")) <= MAX_REVIEWER_PROMPT_ARG_BYTES:
         return inline_prompt
-    return str(request_path)
+    return f"@{request_path}"
 
 
-def read_reviewer_payload(
-    path: Path, *, stdout: str, allow_stdout_fallback: bool
-) -> dict[str, Any]:
+def read_reviewer_payload(path: Path, *, stdout: str, allow_stdout_fallback: bool) -> dict[str, Any]:
     result = read_json_result_file(
         path,
         missing_message="reviewer result file was not produced",
@@ -1010,20 +856,13 @@ def normalize_reviewer_payload(
     elif raw_status in {"fail", "failed"}:
         status = "failed"
         classification = "review_failure"
-    elif raw_status in {
-        "request_revision",
-        "request-revision",
-        "request_changes",
-        "needs_revision",
-    }:
+    elif raw_status in {"request_revision", "request-revision", "request_changes", "needs_revision"}:
         status = "request_revision"
         classification = "review_revision_requested"
     else:
         status = "failed_protocol"
         classification = "protocol_failure"
-    findings = (
-        payload.get("findings") if isinstance(payload.get("findings"), list) else []
-    )
+    findings = payload.get("findings") if isinstance(payload.get("findings"), list) else []
     summary = string_field(payload, "summary") or status
     return normalized_reviewer_result(
         status=status,
@@ -1071,9 +910,7 @@ def normalized_reviewer_result(
     }
 
 
-def adapter_record(
-    reviewer: dict[str, Any], returncode: int | None, timed_out: bool
-) -> dict[str, Any]:
+def adapter_record(reviewer: dict[str, Any], returncode: int | None, timed_out: bool) -> dict[str, Any]:
     return {
         "type": reviewer["type"],
         "returncode": returncode,
@@ -1081,9 +918,7 @@ def adapter_record(
     }
 
 
-def write_review_artifacts(
-    run_dir: Path, run_id: str, reviewer_result: dict[str, Any]
-) -> None:
+def write_review_artifacts(run_dir: Path, run_id: str, reviewer_result: dict[str, Any]) -> None:
     write_json(
         run_dir / "reviewer-result.json",
         {
@@ -1094,9 +929,7 @@ def write_review_artifacts(
             "result": reviewer_result,
         },
     )
-    (run_dir / "review-summary.md").write_text(
-        review_summary_markdown(reviewer_result), encoding="utf-8"
-    )
+    (run_dir / "review-summary.md").write_text(review_summary_markdown(reviewer_result), encoding="utf-8")
 
 
 def review_summary_markdown(reviewer_result: dict[str, Any]) -> str:
@@ -1119,11 +952,7 @@ def review_summary_markdown(reviewer_result: dict[str, Any]) -> str:
             lines.append(f"- {redact_text(str(finding))}")
             continue
         status = string_field(finding, "status") or "unknown"
-        title = (
-            string_field(finding, "title")
-            or string_field(finding, "summary")
-            or "Finding"
-        )
+        title = string_field(finding, "title") or string_field(finding, "summary") or "Finding"
         lines.append(f"- [{redact_text(status)}] {redact_text(title)}")
     lines.append("")
     return "\n".join(lines)
@@ -1180,9 +1009,7 @@ def git(checkout_path: Path, args: list[str]) -> str:
 
 
 def write_json(path: Path, payload: dict[str, Any]) -> None:
-    path.write_text(
-        canonical_json(redact_artifact_value(payload)) + "\n", encoding="utf-8"
-    )
+    path.write_text(canonical_json(redact_artifact_value(payload)) + "\n", encoding="utf-8")
 
 
 def command_secret_error_message(command: list[str]) -> str | None:
