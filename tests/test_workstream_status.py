@@ -1596,7 +1596,7 @@ class WorkstreamStatusMappingTest(unittest.TestCase):
             "message": "existing checkout has uncommitted changes; commit, stash, or remove it before reuse",
             "dirty": True,
             "dirty_status": [
-                "?? dogfood-ledgers/",
+                "?? ledgers/dogfood-run/",
                 "?? uv.lock",
                 "?? retry.log",
             ],
@@ -1614,7 +1614,7 @@ class WorkstreamStatusMappingTest(unittest.TestCase):
         self.assertEqual(record["signals"][0]["scope"], "pipeline-process")
         self.assertEqual(record["signals"][0]["step"], "prepare-checkout")
         self.assertEqual(record["signals"][0]["classification"], "failed_dirty_checkout")
-        self.assertIn("dogfood-ledgers/", record["signals"][0]["summary"])
+        self.assertIn("ledgers/dogfood-run/", record["signals"][0]["summary"])
         self.assertIn("uv.lock", record["signals"][0]["summary"])
         self.assertNotIn("retry.log", record["signals"][0]["summary"])
         self.assertEqual(
@@ -1623,7 +1623,7 @@ class WorkstreamStatusMappingTest(unittest.TestCase):
                 {
                     "summary": (
                         "Clean the target checkout before rerunning prepare-checkout; move pipeline artifacts "
-                        "outside the checkout or remove/stash dirty paths such as dogfood-ledgers/, uv.lock, "
+                        "outside the checkout or remove/stash dirty paths such as ledgers/dogfood-run/, uv.lock, "
                         "and 1 more."
                     ),
                     "labels": ["afk:follow-up", "area:cleanup", "project:afk-composable-pipeline"],

@@ -547,8 +547,8 @@ class PrepareCheckoutCliTest(unittest.TestCase):
                 env_overrides={"GIT_ALLOW_PROTOCOL": "file"},
             )
             self.assertEqual(first_run.returncode, 0, first_run.stderr)
-            (checkout_path / "dogfood-ledgers").mkdir()
-            (checkout_path / "dogfood-ledgers" / "run.json").write_text("{}", encoding="utf-8")
+            (checkout_path / "ledgers" / "dogfood-run").mkdir(parents=True)
+            (checkout_path / "ledgers" / "dogfood-run" / "run.json").write_text("{}", encoding="utf-8")
             (checkout_path / "uv.lock").write_text("lockfile\n", encoding="utf-8")
 
             second_run = run_afk(
@@ -569,7 +569,7 @@ class PrepareCheckoutCliTest(unittest.TestCase):
 
             self.assertEqual(failed["status"], "failed_dirty_checkout")
             self.assertEqual(failed["dirty"], True)
-            self.assertEqual(failed["dirty_status"], ["?? dogfood-ledgers/", "?? uv.lock"])
+            self.assertEqual(failed["dirty_status"], ["?? ledgers/", "?? uv.lock"])
 
     def test_prepare_checkout_can_publish_requested_review_branch(self):
         with tempfile.TemporaryDirectory() as temp_dir:
