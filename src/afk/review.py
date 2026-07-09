@@ -1,6 +1,5 @@
 from __future__ import annotations
 import json
-import os
 import subprocess
 import tempfile
 from pathlib import Path
@@ -35,6 +34,7 @@ from afk.schema_helpers import (
 
 SCHEMA_VERSION = 1
 REVIEWER_COMMAND_TYPES = {"fake-reviewer-command", "real-reviewer-command"}
+# Keep inline prompts well below common argv limits; larger requests use the file path.
 MAX_REVIEWER_PROMPT_ARG_BYTES = 32768
 
 

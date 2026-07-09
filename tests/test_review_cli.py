@@ -887,7 +887,8 @@ Path(os.environ["AFK_REVIEWER_RESULT"]).write_text(
                 request = json.loads(prompt)
                 if request["artifact_type"] != "reviewer-request":
                     raise SystemExit("missing reviewer request prompt")
-                if request["evidence_pack"]["work_item"]["external_id"] != "central-lve.8":
+                work_item = request["evidence_pack"]["work_item"]
+                if work_item["external_id"] != "central-lve.8":
                     raise SystemExit("missing evidence pack")
                 request_path = Path(os.environ["AFK_REVIEWER_REQUEST"])
                 if prompt == str(request_path):
@@ -900,7 +901,13 @@ Path(os.environ["AFK_REVIEWER_RESULT"]).write_text(
                 if criteria != expected:
                     raise SystemExit("prompt placeholders were rewritten")
                 Path(os.environ["AFK_REVIEWER_RESULT"]).write_text(
-                    json.dumps({"status": "pass", "summary": "review prompt accepted", "findings": []}),
+                    json.dumps(
+                        {
+                            "status": "pass",
+                            "summary": "review prompt accepted",
+                            "findings": [],
+                        }
+                    ),
                     encoding="utf-8",
                 )
                 """
@@ -982,7 +989,13 @@ Path(os.environ["AFK_REVIEWER_RESULT"]).write_text(
                 if not criteria[0].startswith("large evidence 0 "):
                     raise SystemExit("request file did not preserve full evidence")
                 Path(os.environ["AFK_REVIEWER_RESULT"]).write_text(
-                    json.dumps({"status": "pass", "summary": "request path prompt accepted", "findings": []}),
+                    json.dumps(
+                        {
+                            "status": "pass",
+                            "summary": "request path prompt accepted",
+                            "findings": [],
+                        }
+                    ),
                     encoding="utf-8",
                 )
                 """
