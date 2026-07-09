@@ -45,7 +45,7 @@
       "Codecov",
       "Macroscope - Correctness Check"
     ],
-    "classify_timeout_seconds": 900,
+    "classify_timeout_seconds": 3600,
     "merge_timeout_seconds": 900,
     "poll_seconds": 120,
     "close_tracker_on_merge": true,

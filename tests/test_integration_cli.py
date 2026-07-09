@@ -138,29 +138,50 @@ if "--body-file" in sys.argv:
     body_file = sys.argv[sys.argv.index("--body-file") + 1]
     record["body"] = Path(body_file).read_text(encoding="utf-8")
 Path({str(fake_calls)!r}).open("a", encoding="utf-8").write(json.dumps(record) + "\\n")
+config_dir_text = os.environ.get("GH_CONFIG_DIR", "")
+config_dir = Path(config_dir_text) if config_dir_text else Path(".")
+state_path = config_dir / "poll-state.json"
+
+def next_payload(name):
+    sequence_path = config_dir / f"{{name}}-seq.json"
+    if sequence_path.exists():
+        sequence = json.loads(sequence_path.read_text(encoding="utf-8"))
+        state = (
+            json.loads(state_path.read_text(encoding="utf-8"))
+            if state_path.exists()
+            else {{}}
+        )
+        index = state.get(name, 0)
+        if index >= len(sequence):
+            index = len(sequence) - 1
+        payload = sequence[index]
+        state[name] = state.get(name, 0) + 1
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        return payload
+    return json.loads(config_dir.joinpath(f"{{name}}.json").read_text(encoding="utf-8"))
+
 if sys.argv[1:4] == ["auth", "status", "--hostname"]:
     raise SystemExit(0)
 if sys.argv[1:3] == ["pr", "create"]:
     print("https://github.com/acme/widgets/pull/17")
     raise SystemExit(0)
 if sys.argv[1:3] == ["pr", "view"]:
-    config_dir = Path(os.environ["GH_CONFIG_DIR"])
     if any("mergeCommit" in arg for arg in sys.argv):
         merged_path = config_dir / "view-merged.json"
         if merged_path.exists():
             print(merged_path.read_text(encoding="utf-8"))
         else:
-            open_view = json.loads(config_dir.joinpath("view.json").read_text(encoding="utf-8"))
+            open_view = next_payload("view")
             print(json.dumps({{
                 "url": open_view.get("url", ""),
                 "mergeCommit": {{"oid": "deadbeef"}},
                 "mergedAt": "2026-07-06T12:00:00Z",
             }}))
     else:
-        print(config_dir.joinpath("view.json").read_text(encoding="utf-8"))
+        print(json.dumps(next_payload("view")))
     raise SystemExit(0)
 if sys.argv[1:3] == ["pr", "checks"]:
-    print(Path(os.environ["GH_CONFIG_DIR"]).joinpath("checks.json").read_text(encoding="utf-8"))
+    print(json.dumps(next_payload("checks")))
     raise SystemExit(0)
 if sys.argv[1:3] == ["pr", "merge"]:
     raise SystemExit(0)
@@ -1090,9 +1111,19 @@ from pathlib import Path
 
 calls_path = Path({str(fake_calls)!r})
 created_path = Path({str(created_beads)!r})
-items = json.loads(created_path.read_text(encoding="utf-8")) if created_path.exists() else []
+items = (
+    json.loads(created_path.read_text(encoding="utf-8"))
+    if created_path.exists()
+    else []
+)
 calls_path.open("a", encoding="utf-8").write(
-    json.dumps({{"argv": sys.argv[1:], "password": os.environ.get("BEADS_DOLT_PASSWORD", "")}}) + "\\n"
+    json.dumps(
+        {{
+            "argv": sys.argv[1:],
+            "password": os.environ.get("BEADS_DOLT_PASSWORD", ""),
+        }}
+    )
+    + "\\n"
 )
 if sys.argv[1:2] == ["list"]:
     print(json.dumps(items))
@@ -1154,7 +1185,12 @@ raise SystemExit(9)
                 (output_dir_for(workstream_path) / "integration-retrospective.json").read_text(encoding="utf-8")
             )
             calls = (
-                [json.loads(line) for line in fake_calls.read_text(encoding="utf-8").splitlines()]
+                [
+                    json.loads(line)
+                    for line in fake_calls.read_text(
+                        encoding="utf-8"
+                    ).splitlines()
+                ]
                 if fake_calls.exists()
                 else []
             )
@@ -1193,9 +1229,19 @@ from pathlib import Path
 
 calls_path = Path({str(fake_calls)!r})
 created_path = Path({str(created_beads)!r})
-items = json.loads(created_path.read_text(encoding="utf-8")) if created_path.exists() else []
+items = (
+    json.loads(created_path.read_text(encoding="utf-8"))
+    if created_path.exists()
+    else []
+)
 calls_path.open("a", encoding="utf-8").write(
-    json.dumps({{"argv": sys.argv[1:], "password": os.environ.get("BEADS_DOLT_PASSWORD", "")}}) + "\\n"
+    json.dumps(
+        {{
+            "argv": sys.argv[1:],
+            "password": os.environ.get("BEADS_DOLT_PASSWORD", ""),
+        }}
+    )
+    + "\\n"
 )
 if sys.argv[1:2] == ["list"]:
     print(json.dumps(items))
@@ -1285,7 +1331,12 @@ raise SystemExit(9)
                 (output_dir_for(run_two) / "integration-retrospective.json").read_text(encoding="utf-8")
             )
             calls = (
-                [json.loads(line) for line in fake_calls.read_text(encoding="utf-8").splitlines()]
+                [
+                    json.loads(line)
+                    for line in fake_calls.read_text(
+                        encoding="utf-8"
+                    ).splitlines()
+                ]
                 if fake_calls.exists()
                 else []
             )
@@ -1334,9 +1385,19 @@ from pathlib import Path
 
 calls_path = Path({str(fake_calls)!r})
 created_path = Path({str(created_beads)!r})
-items = json.loads(created_path.read_text(encoding="utf-8")) if created_path.exists() else []
+items = (
+    json.loads(created_path.read_text(encoding="utf-8"))
+    if created_path.exists()
+    else []
+)
 calls_path.open("a", encoding="utf-8").write(
-    json.dumps({{"argv": sys.argv[1:], "password": os.environ.get("BEADS_DOLT_PASSWORD", "")}}) + "\\n"
+    json.dumps(
+        {{
+            "argv": sys.argv[1:],
+            "password": os.environ.get("BEADS_DOLT_PASSWORD", ""),
+        }}
+    )
+    + "\\n"
 )
 if sys.argv[1:2] == ["list"]:
     print(json.dumps(items))
@@ -1410,7 +1471,12 @@ raise SystemExit(9)
                 (output_dir_for(workstream_path) / "integration-retrospective.json").read_text(encoding="utf-8")
             )
             calls = (
-                [json.loads(line) for line in fake_calls.read_text(encoding="utf-8").splitlines()]
+                [
+                    json.loads(line)
+                    for line in fake_calls.read_text(
+                        encoding="utf-8"
+                    ).splitlines()
+                ]
                 if fake_calls.exists()
                 else []
             )
@@ -1448,9 +1514,19 @@ from pathlib import Path
 
 calls_path = Path({str(fake_calls)!r})
 created_path = Path({str(created_beads)!r})
-items = json.loads(created_path.read_text(encoding="utf-8")) if created_path.exists() else []
+items = (
+    json.loads(created_path.read_text(encoding="utf-8"))
+    if created_path.exists()
+    else []
+)
 calls_path.open("a", encoding="utf-8").write(
-    json.dumps({{"argv": sys.argv[1:], "password": os.environ.get("BEADS_DOLT_PASSWORD", "")}}) + "\\n"
+    json.dumps(
+        {{
+            "argv": sys.argv[1:],
+            "password": os.environ.get("BEADS_DOLT_PASSWORD", ""),
+        }}
+    )
+    + "\\n"
 )
 if sys.argv[1:2] == ["list"]:
     print(json.dumps(items))
@@ -1526,14 +1602,22 @@ raise SystemExit(9)
                 (output_dir_for(workstream_path) / "integration-retrospective.json").read_text(encoding="utf-8")
             )
             calls = (
-                [json.loads(line) for line in fake_calls.read_text(encoding="utf-8").splitlines()]
+                [
+                    json.loads(line)
+                    for line in fake_calls.read_text(
+                        encoding="utf-8"
+                    ).splitlines()
+                ]
                 if fake_calls.exists()
                 else []
             )
 
             self.assertEqual(retrospective["integration_decision"], "checks_inconclusive")
             self.assertEqual(retrospective["follow_up"]["creation"]["status"], "created")
-            self.assertEqual(retrospective["follow_up"]["created"][0]["id"], "central-new.1")
+            self.assertEqual(
+                retrospective["follow_up"]["created"][0]["id"],
+                "central-new.1",
+            )
             self.assertEqual(
                 retrospective["signals"][0]["classification"],
                 "checks_inconclusive_policy",
@@ -1640,7 +1724,12 @@ raise SystemExit(9)
                 (output_dir_for(workstream_path) / "integration-retrospective.json").read_text(encoding="utf-8")
             )
             calls = (
-                [json.loads(line) for line in fake_calls.read_text(encoding="utf-8").splitlines()]
+                [
+                    json.loads(line)
+                    for line in fake_calls.read_text(
+                        encoding="utf-8"
+                    ).splitlines()
+                ]
                 if fake_calls.exists()
                 else []
             )
@@ -1700,7 +1789,11 @@ raise SystemExit(9)
             )
 
             self.assertEqual(completed.returncode, 0, completed.stderr)
-            result = json.loads((output_dir_for(workstream_path) / "integration-result.json").read_text(encoding="utf-8"))
+            result = json.loads(
+                (output_dir_for(workstream_path) / "integration-result.json").read_text(
+                    encoding="utf-8",
+                )
+            )
             self.assertEqual(result["decision"], "checks_inconclusive")
             self.assertEqual(result["next_poll_seconds"], 0)
             self.assertIn("Investigate the inconclusive checks", result["remediation"])
@@ -1915,7 +2008,10 @@ raise SystemExit(9)
 
             self.assertEqual(retrospective["integration_decision"], "merge_blocked")
             self.assertEqual(retrospective["follow_up"]["creation"]["status"], "created")
-            self.assertEqual(retrospective["follow_up"]["created"][0]["id"], "central-new.1")
+            self.assertEqual(
+                retrospective["follow_up"]["created"][0]["id"],
+                "central-new.1",
+            )
             self.assertEqual(retrospective["recommended_follow_up"], [])
             self.assertEqual(sum(1 for call in calls if call["argv"][0] == "create"), 1)
             self.assertEqual(
@@ -1967,6 +2063,263 @@ raise SystemExit(9)
             self.assertEqual(result["expected_head_sha"], "abc123")
             self.assertEqual(result["observed_head_sha"], "def456")
             self.assertIn("Exact head mismatch", result["remediation"])
+
+    def test_integrate_pr_times_out_pending_checks_and_creates_follow_up(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            contracts_dir = temp_path / "contracts"
+            beads_workspace = temp_path / "beads"
+            fake_calls = temp_path / "fake-bd-calls.jsonl"
+            created_beads = temp_path / "created-beads.json"
+            workstream_path = (
+                temp_path
+                / "ledger"
+                / "workstreams"
+                / "run-timeout-follow-up"
+                / "workstream-result.json"
+            )
+            write_workstream_result(workstream_path, expected_head="abc123")
+            contracts_dir.mkdir()
+            write_project_contract(contracts_dir / "dogfood.json")
+            beads_workspace.mkdir()
+            (beads_workspace / "secrets").mkdir()
+            (beads_workspace / "secrets" / "dolt_beads_password.txt").write_text(
+                "test-password\n",
+                encoding="utf-8",
+            )
+            fake_bd = temp_path / "bd"
+            write_executable(
+                fake_bd,
+                f"""#!{sys.executable}
+import json
+import os
+import sys
+from pathlib import Path
+
+calls_path = Path({str(fake_calls)!r})
+created_path = Path({str(created_beads)!r})
+items = (
+    json.loads(created_path.read_text(encoding="utf-8"))
+    if created_path.exists()
+    else []
+)
+calls_path.open("a", encoding="utf-8").write(
+    json.dumps(
+        {{
+            "argv": sys.argv[1:],
+            "password": os.environ.get("BEADS_DOLT_PASSWORD", ""),
+        }}
+    )
+    + "\\n"
+)
+if sys.argv[1:2] == ["list"]:
+    print(json.dumps(items))
+    raise SystemExit(0)
+if sys.argv[1:2] == ["create"]:
+    items.append({{"id": "central-new.1", "title": sys.argv[2]}})
+    created_path.write_text(json.dumps(items), encoding="utf-8")
+    print("central-new.1")
+    raise SystemExit(0)
+raise SystemExit(9)
+""",
+            )
+            fake_gh = temp_path / "fake-gh"
+            auth_dir = temp_path / "gh-config"
+            auth_dir.mkdir()
+            (auth_dir / "view.json").write_text(
+                json.dumps(
+                    {
+                        "number": 35,
+                        "url": "https://github.com/thunderbump/bump-EQEmu/pull/35",
+                        "state": "OPEN",
+                        "isDraft": False,
+                        "mergeStateStatus": "CLEAN",
+                        "headRefOid": "abc123",
+                        "statusCheckRollup": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (auth_dir / "checks.json").write_text("[]", encoding="utf-8")
+            write_executable(fake_gh, fake_gh_script(temp_path / "fake-gh-calls.jsonl"))
+
+            completed = run_afk(
+                "integrate-pr",
+                "--project",
+                "dogfood",
+                "--contracts-dir",
+                str(contracts_dir),
+                "--beads-workspace",
+                str(beads_workspace),
+                "--retrospective-follow-up-mode",
+                "beads",
+                "--published-result",
+                str(workstream_path),
+                "--policy",
+                json.dumps(
+                    {
+                        "gh": {"path": str(fake_gh)},
+                        "required_check_patterns": ["EQEMU:.*"],
+                        "poll_seconds": 0,
+                        "classify_timeout_seconds": 0,
+                    }
+                ),
+                "--gh-auth-config-dir",
+                str(auth_dir),
+                env_extra={"PATH": f"{temp_path}{os.pathsep}{os.environ['PATH']}"},
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            result = json.loads(
+                (output_dir_for(workstream_path) / "integration-result.json").read_text(
+                    encoding="utf-8",
+                )
+            )
+            retrospective = json.loads(
+                (
+                    output_dir_for(workstream_path)
+                    / "integration-retrospective.json"
+                ).read_text(encoding="utf-8")
+            )
+            calls = (
+                [
+                    json.loads(line)
+                    for line in fake_calls.read_text(
+                        encoding="utf-8"
+                    ).splitlines()
+                ]
+                if fake_calls.exists()
+                else []
+            )
+
+            self.assertEqual(result["decision"], "merge_blocked")
+            self.assertTrue(result["timed_out"])
+            self.assertEqual(result["classify_timeout_seconds"], 0)
+            self.assertEqual(result["next_poll_seconds"], 0)
+            self.assertIn("timed out", result["remediation"])
+            self.assertEqual(retrospective["integration_decision"], "merge_blocked")
+            self.assertEqual(
+                retrospective["signals"][0]["classification"],
+                "terminal_integration_timeout",
+            )
+            self.assertEqual(
+                retrospective["follow_up"]["created"][0]["id"],
+                "central-new.1",
+            )
+            self.assertEqual(sum(1 for call in calls if call["argv"][0] == "create"), 1)
+
+    def test_integrate_pr_rechecks_exact_head_before_merge_after_pending_poll(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            workstream_path = (
+                temp_path
+                / "ledger"
+                / "workstreams"
+                / "run-head-recheck"
+                / "workstream-result.json"
+            )
+            write_workstream_result(workstream_path, expected_head="abc123")
+            fake_gh = temp_path / "fake-gh"
+            fake_calls = temp_path / "fake-calls.jsonl"
+            auth_dir = temp_path / "gh-config"
+            auth_dir.mkdir()
+            (auth_dir / "view-seq.json").write_text(
+                json.dumps(
+                    [
+                        {
+                            "number": 35,
+                            "url": "https://github.com/thunderbump/bump-EQEmu/pull/35",
+                            "state": "OPEN",
+                            "isDraft": False,
+                            "mergeStateStatus": "CLEAN",
+                            "headRefOid": "abc123",
+                            "statusCheckRollup": [
+                                {
+                                    "name": "build",
+                                    "status": "IN_PROGRESS",
+                                    "conclusion": "",
+                                }
+                            ],
+                        },
+                        {
+                            "number": 35,
+                            "url": "https://github.com/thunderbump/bump-EQEmu/pull/35",
+                            "state": "OPEN",
+                            "isDraft": False,
+                            "mergeStateStatus": "CLEAN",
+                            "headRefOid": "def456",
+                            "statusCheckRollup": [
+                                {
+                                    "name": "build",
+                                    "status": "COMPLETED",
+                                    "conclusion": "SUCCESS",
+                                }
+                            ],
+                        },
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            (auth_dir / "checks-seq.json").write_text(
+                json.dumps(
+                    [
+                        [
+                            {
+                                "name": "build",
+                                "state": "PENDING",
+                                "bucket": "pending",
+                                "workflow": "CI",
+                                "link": "",
+                            }
+                        ],
+                        [
+                            {
+                                "name": "build",
+                                "state": "SUCCESS",
+                                "bucket": "pass",
+                                "workflow": "CI",
+                                "link": "",
+                            }
+                        ],
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            write_executable(fake_gh, fake_gh_script(fake_calls))
+
+            completed = run_afk(
+                "integrate-pr",
+                "--published-result",
+                str(workstream_path),
+                "--policy",
+                json.dumps(
+                    {
+                        "gh": {"path": str(fake_gh)},
+                        "required_checks": ["build"],
+                        "poll_seconds": 0,
+                        "classify_timeout_seconds": 1,
+                    }
+                ),
+                "--gh-auth-config-dir",
+                str(auth_dir),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            result = json.loads(
+                (output_dir_for(workstream_path) / "integration-result.json").read_text(
+                    encoding="utf-8",
+                )
+            )
+            gh_calls = [
+                json.loads(line)
+                for line in fake_calls.read_text(encoding="utf-8").splitlines()
+            ]
+
+            self.assertEqual(result["decision"], "merge_blocked")
+            self.assertEqual(result["observed_head_sha"], "def456")
+            self.assertEqual(result["poll_attempts"][-1]["observed_head_sha"], "def456")
+            self.assertIn("Exact head mismatch", result["remediation"])
+            self.assertNotIn(["pr", "merge"], [call["argv"][:2] for call in gh_calls])
 
     def test_integrate_pr_creates_follow_up_for_exact_head_mismatch_when_enabled(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -3070,6 +3423,120 @@ raise SystemExit(9)
             result = json.loads((output_dir_for(workstream_path) / "integration-result.json").read_text(encoding="utf-8"))
             self.assertEqual(result["decision"], "checks_pending")
             self.assertEqual(result["next_poll_seconds"], 60)
+
+    def test_integrate_pr_polls_until_required_pattern_appears(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            workstream_path = (
+                temp_path
+                / "ledger"
+                / "workstreams"
+                / "run-required-pattern-poll"
+                / "workstream-result.json"
+            )
+            write_workstream_result(workstream_path, expected_head="abc123")
+            fake_gh = temp_path / "fake-gh"
+            fake_calls = temp_path / "fake-calls.jsonl"
+            auth_dir = temp_path / "gh-config"
+            auth_dir.mkdir()
+            (auth_dir / "view-seq.json").write_text(
+                json.dumps(
+                    [
+                        {
+                            "number": 35,
+                            "url": "https://github.com/thunderbump/bump-EQEmu/pull/35",
+                            "state": "OPEN",
+                            "isDraft": False,
+                            "mergeStateStatus": "CLEAN",
+                            "headRefOid": "abc123",
+                            "statusCheckRollup": [],
+                        },
+                        {
+                            "number": 35,
+                            "url": "https://github.com/thunderbump/bump-EQEmu/pull/35",
+                            "state": "OPEN",
+                            "isDraft": False,
+                            "mergeStateStatus": "CLEAN",
+                            "headRefOid": "abc123",
+                            "statusCheckRollup": [
+                                {
+                                    "name": "EQEMU: unit",
+                                    "status": "COMPLETED",
+                                    "conclusion": "SUCCESS",
+                                }
+                            ],
+                        },
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            (auth_dir / "checks-seq.json").write_text(
+                json.dumps(
+                    [
+                        [],
+                        [
+                            {
+                                "name": "EQEMU: unit",
+                                "state": "SUCCESS",
+                                "bucket": "pass",
+                                "workflow": "CI",
+                                "link": "",
+                            }
+                        ],
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            write_executable(fake_gh, fake_gh_script(fake_calls))
+
+            completed = run_afk(
+                "integrate-pr",
+                "--published-result",
+                str(workstream_path),
+                "--policy",
+                json.dumps(
+                    {
+                        "gh": {"path": str(fake_gh)},
+                        "required_check_patterns": ["EQEMU:.*"],
+                        "poll_seconds": 0,
+                        "classify_timeout_seconds": 1,
+                    }
+                ),
+                "--gh-auth-config-dir",
+                str(auth_dir),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            result = json.loads(
+                (output_dir_for(workstream_path) / "integration-result.json").read_text(
+                    encoding="utf-8",
+                )
+            )
+            events = [
+                json.loads(line)
+                for line in (
+                    output_dir_for(workstream_path) / "integration-events.jsonl"
+                ).read_text(encoding="utf-8").splitlines()
+            ]
+            gh_calls = [
+                json.loads(line)
+                for line in fake_calls.read_text(encoding="utf-8").splitlines()
+            ]
+
+            self.assertEqual(result["decision"], "merge_ready")
+            self.assertEqual(result["classify_timeout_seconds"], 1)
+            self.assertEqual(result["poll_attempts"][0]["decision"], "checks_pending")
+            self.assertEqual(result["poll_attempts"][-1]["decision"], "merge_ready")
+            self.assertEqual(len(result["poll_attempts"]), 2)
+            self.assertEqual(
+                sum(1 for event in events if event["event"] == "integration.poll"),
+                2,
+            )
+            self.assertGreaterEqual(
+                sum(1 for call in gh_calls if call["argv"][:2] == ["pr", "view"]),
+                2,
+            )
+            self.assertIn(["pr", "merge"], [call["argv"][:2] for call in gh_calls])
 
     def test_integrate_pr_required_pattern_passes_with_optional_neutral_macroscope(self):
         with tempfile.TemporaryDirectory() as temp_dir:
