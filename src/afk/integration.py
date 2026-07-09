@@ -8,19 +8,52 @@ from typing import Any
 from urllib.parse import urlparse
 
 from afk.jsonutil import canonical_json
-from afk.publication import PublisherError, publisher_auth_artifact, run_publisher_command, validate_publisher_auth_config
+from afk.publication import (
+    PublisherError,
+    publisher_auth_artifact,
+    run_publisher_command,
+    validate_publisher_auth_config,
+)
 from afk.redaction import redact_artifact_value, redact_text
 from afk.schema_helpers import string_field
-from afk.tracking import terminal_review_feedback_status, tracker_close_failure_artifact
-from afk.workstream import close_selected_source_item, publisher_pr_merge_commit, publisher_pr_url
+from afk.tracking import (
+    runtime_terminal_decision,
+    terminal_review_feedback_status,
+    tracker_close_failure_artifact,
+)
+from afk.workstream import (
+    close_selected_source_item,
+    publisher_pr_merge_commit,
+    publisher_pr_url,
+)
 
 
 SCHEMA_VERSION = 1
 DEFAULT_POLL_SECONDS = 300
 DEFAULT_CLASSIFY_TIMEOUT_SECONDS = 0
-PENDING_CHECK_STATES = {"PENDING", "PENDING_DEPLOYMENT", "IN_PROGRESS", "QUEUED", "REQUESTED", "WAITING"}
-FAILED_CHECK_STATES = {"FAILURE", "FAILED", "ERROR", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED"}
-INCONCLUSIVE_CHECK_STATES = {"EXPECTED", "STALE", "NEUTRAL", "SKIPPED", "STARTUP_FAILURE"}
+PENDING_CHECK_STATES = {
+    "PENDING",
+    "PENDING_DEPLOYMENT",
+    "IN_PROGRESS",
+    "QUEUED",
+    "REQUESTED",
+    "WAITING",
+}
+FAILED_CHECK_STATES = {
+    "FAILURE",
+    "FAILED",
+    "ERROR",
+    "TIMED_OUT",
+    "CANCELLED",
+    "ACTION_REQUIRED",
+}
+INCONCLUSIVE_CHECK_STATES = {
+    "EXPECTED",
+    "STALE",
+    "NEUTRAL",
+    "SKIPPED",
+    "STARTUP_FAILURE",
+}
 PASSED_CHECK_STATES = {"SUCCESS", "PASS", "PASSED"}
 BLOCKED_MERGE_STATES = {"BLOCKED", "DIRTY", "UNKNOWN", "UNSTABLE", "BEHIND", "DRAFT"}
 
@@ -274,7 +307,14 @@ def integrate_published_pr(
             "gh_checks": redact_artifact_value(checks_command),
         },
     }
-    if decision == "merge_ready":
+    no_merge_decision = terminal_no_merge_decision(request["workstream"])
+    if no_merge_decision:
+        result = integrate_terminal_no_merge(
+            request=request,
+            result=result,
+            terminal_decision=no_merge_decision,
+        )
+    elif decision == "merge_ready":
         result = integrate_terminal_merge(
             request=request,
             result=result,
@@ -299,7 +339,7 @@ def integrate_published_pr(
                 "remediation": remediation,
                 "timed_out": timed_out,
                 "poll_count": len(poll_attempts),
-            }
+            },
         ],
     )
     return result
@@ -394,7 +434,20 @@ def normalize_request(
     }
 
 
-def blocked_workstream_artifact_reason(publication: dict[str, Any], workstream: dict[str, Any]) -> str:
+def terminal_no_merge_decision(workstream: dict[str, Any]) -> dict[str, str]:
+    tracker = workstream.get("tracker")
+    decision = tracker.get("terminal_decision") if isinstance(tracker, dict) else {}
+    terminal_decision = runtime_terminal_decision(decision)
+    if terminal_decision["status"] == "no-merge" and terminal_decision[
+        "review_feedback_status"
+    ] in {"resolved", "waived"}:
+        return terminal_decision
+    return {}
+
+
+def blocked_workstream_artifact_reason(
+    publication: dict[str, Any], workstream: dict[str, Any]
+) -> str:
     publication_status = string_field(publication, "status")
     workstream_status = string_field(workstream, "status")
     if publication_status != "blocked" and workstream_status != "blocked":
@@ -532,15 +585,20 @@ def retry_tracker_close(
         },
         terminal_decision={
             "status": "merged",
-            "merge_commit": string_field(terminal_decision, "merge_commit") or string_field(retry_context.get("merge"), "merge_commit"),
+            "merge_commit": string_field(terminal_decision, "merge_commit")
+            or string_field(retry_context.get("merge"), "merge_commit"),
             "reason": "",
             "pr_url": string_field(terminal_decision, "pr_url") or request["pr_url"],
-            "review_feedback_status": string_field(terminal_decision, "review_feedback_status")
+            "review_feedback_status": string_field(
+                terminal_decision, "review_feedback_status"
+            )
             or integration_review_feedback_status(request["workstream"]),
         },
         merge_status="already_merged",
         merge_command=merge_command if isinstance(merge_command, list) else [],
-        merged_view_command=merged_view_command if isinstance(merged_view_command, list) else [],
+        merged_view_command=(
+            merged_view_command if isinstance(merged_view_command, list) else []
+        ),
     )
 
 
@@ -566,14 +624,23 @@ def close_tracker_after_merge(
                 "merge_commit": merge_commit,
             },
             "terminal_decision": terminal_decision,
-            "tracker_close": {"status": "not_attempted", "reason": "no selected work item recorded for tracker closure"},
-            "commands": terminal_commands(result["commands"], merge_command, merged_view_command),
+            "tracker_close": {
+                "status": "not_attempted",
+                "reason": "no selected work item recorded for tracker closure",
+            },
+            "commands": terminal_commands(
+                result["commands"], merge_command, merged_view_command
+            ),
         }
     try:
         tracker_close = close_selected_source_item(
             normalized=request["workstream"],
             state=request["workstream"],
-            config={"gh_path": request["gh_path"], "repo": request["repo"], "pr": str(request["pr_number"])},
+            config={
+                "gh_path": request["gh_path"],
+                "repo": request["repo"],
+                "pr": str(request["pr_number"]),
+            },
             checkout_path=request["command_cwd"],
             auth=request["auth"],
             close_reason=f"merged via {merge_commit}",
@@ -594,7 +661,9 @@ def close_tracker_after_merge(
             },
             "terminal_decision": terminal_decision,
             "tracker_close": tracker_close_failure_artifact(exc),
-            "commands": terminal_commands(result["commands"], merge_command, merged_view_command),
+            "commands": terminal_commands(
+                result["commands"], merge_command, merged_view_command
+            ),
         }
 
     return {
@@ -608,8 +677,74 @@ def close_tracker_after_merge(
         },
         "terminal_decision": terminal_decision,
         "tracker_close": tracker_close,
-        "commands": terminal_commands(result["commands"], merge_command, merged_view_command),
+        "terminal_retrospective": terminal_integration_retrospective_status(
+            terminal_decision
+        ),
+        "commands": terminal_commands(
+            result["commands"], merge_command, merged_view_command
+        ),
     }
+
+
+def integrate_terminal_no_merge(
+    *,
+    request: dict[str, Any],
+    result: dict[str, Any],
+    terminal_decision: dict[str, Any],
+) -> dict[str, Any]:
+    selected_work = request["workstream"].get("selected_work")
+    if not isinstance(selected_work, list) or not selected_work:
+        return {
+            **result,
+            "status": "no-merge",
+            "terminal_decision": terminal_decision,
+            "tracker_close": {
+                "status": "not_attempted",
+                "reason": "no selected work item recorded for tracker closure",
+            },
+        }
+    try:
+        tracker_close = close_selected_source_item(
+            normalized=request["workstream"],
+            state=request["workstream"],
+            config={
+                "gh_path": request["gh_path"],
+                "repo": request["repo"],
+                "pr": str(request["pr_number"]),
+            },
+            checkout_path=request["command_cwd"],
+            auth=request["auth"],
+            close_reason=string_field(terminal_decision, "reason") or "no merge",
+        )
+    except PublisherError as exc:
+        return {
+            **result,
+            "status": "tracker_close_failed",
+            "terminal_decision": terminal_decision,
+            "tracker_close": tracker_close_failure_artifact(exc),
+        }
+    return {
+        **result,
+        "status": "tracker-closed",
+        "terminal_decision": terminal_decision,
+        "tracker_close": tracker_close,
+        "terminal_retrospective": terminal_integration_retrospective_status(
+            terminal_decision
+        ),
+    }
+
+
+def terminal_integration_retrospective_status(
+    terminal_decision: dict[str, Any],
+) -> dict[str, str]:
+    decision = runtime_terminal_decision(terminal_decision)
+    if decision["status"] in {"merged", "no-merge"}:
+        return {
+            "status": "ready",
+            "artifact": "integration-retrospective.json",
+            "terminal_decision_status": decision["status"],
+        }
+    return {"status": "not_applicable", "artifact": "", "terminal_decision_status": ""}
 
 
 def terminal_commands(

@@ -13,7 +13,10 @@ from afk.implement import runtime_failure_excerpt
 from afk.jsonutil import canonical_json, sha256_json
 from afk.redaction import redact_artifact_value, redact_text
 from afk.role_adapters import render_command
-from afk.tracking import effective_tracker_terminal_decision, redact_retrospective
+from afk.tracking import (
+    effective_tracker_terminal_decision,
+    redact_retrospective,
+)
 from afk.workstream_lifecycle import repair_stop_record, workstream_status_from_publication
 
 
@@ -95,23 +98,35 @@ def build_terminal_integration_retrospective(
     follow_up = _retrospective_follow_up_record(signals, None, {})
     record = {
         "schema_version": SCHEMA_VERSION,
-        "status": redact_text(string_field(context.integration, "decision") or "unknown"),
+        "status": _terminal_integration_retrospective_status(context.integration),
         "health": _retrospective_health(_process_retrospective_signals(signals)),
-        "integration_decision": redact_text(string_field(context.integration, "decision") or ""),
+        "integration_decision": redact_text(
+            string_field(context.integration, "decision") or ""
+        ),
         "pr_url": redact_text(string_field(context.integration, "pr_url") or ""),
         "signals": signals,
-        "recommended_follow_up": _legacy_recommended_follow_up(follow_up["recommended"]),
+        "recommended_follow_up": _legacy_recommended_follow_up(
+            follow_up["recommended"]
+        ),
         "follow_up": follow_up,
     }
+    terminal = _terminal_integration_retrospective_terminal(context.integration)
+    if terminal:
+        record["terminal"] = terminal
     if context.follow_up and context.output_dir is not None:
         output_dir = context.output_dir
         output_dir.mkdir(parents=True, exist_ok=True)
         ledger = _RetrospectiveOutputLedger(
-            run_id=(string_field(context.workstream, "workstream_id") or "terminal-integration") + "-integrate-pr",
+            run_id=(
+                string_field(context.workstream, "workstream_id")
+                or "terminal-integration"
+            )
+            + "-integrate-pr",
             path=output_dir,
         )
         normalized = {
-            "workstream_id": string_field(context.workstream, "workstream_id") or "terminal-integration",
+            "workstream_id": string_field(context.workstream, "workstream_id")
+            or "terminal-integration",
             "parent": string_field(context.workstream, "parent") or "",
             "review_branch": string_field(context.workstream, "review_branch") or "",
             "retrospective_follow_up": context.follow_up,
@@ -119,12 +134,61 @@ def build_terminal_integration_retrospective(
         creation = _run_retrospective_follow_up(
             normalized=normalized,
             state={},
-            publication=context.workstream.get("publication") if isinstance(context.workstream.get("publication"), dict) else {},
-            tracker=context.workstream.get("tracker") if isinstance(context.workstream.get("tracker"), dict) else {},
+            publication=(
+                context.workstream.get("publication")
+                if isinstance(context.workstream.get("publication"), dict)
+                else {}
+            ),
+            tracker=(
+                context.workstream.get("tracker")
+                if isinstance(context.workstream.get("tracker"), dict)
+                else {}
+            ),
             pipeline_retrospective=record,
             ledger=ledger,
         )
         record = _apply_retrospective_follow_up_creation(record, creation)
+    return record
+
+
+def _terminal_integration_retrospective_status(integration: dict[str, Any]) -> str:
+    if string_field(integration, "status") == "tracker-closed":
+        return "tracker-closed"
+    return redact_text(string_field(integration, "decision") or "unknown")
+
+
+def _terminal_integration_retrospective_terminal(
+    integration: dict[str, Any],
+) -> dict[str, Any]:
+    if string_field(integration, "status") != "tracker-closed":
+        return {}
+    terminal_decision = _terminal_integration_decision_record(
+        integration.get("terminal_decision")
+    )
+    if terminal_decision.get("status") not in {"merged", "no-merge"}:
+        return {}
+    merge = integration.get("merge")
+    tracker_close = integration.get("tracker_close")
+    terminal = {
+        "status": redact_text(string_field(integration, "status") or ""),
+        "decision": terminal_decision,
+    }
+    if isinstance(merge, dict) and "status" in merge:
+        terminal["merge_status"] = redact_text(string_field(merge, "status") or "")
+    if isinstance(tracker_close, dict) and "status" in tracker_close:
+        terminal["tracker_close_status"] = redact_text(
+            string_field(tracker_close, "status") or ""
+        )
+    return terminal
+
+
+def _terminal_integration_decision_record(decision: Any) -> dict[str, str]:
+    if not isinstance(decision, dict):
+        return {}
+    record = {}
+    for key in ("status", "merge_commit", "reason", "pr_url", "review_feedback_status"):
+        if key in decision:
+            record[key] = redact_text(string_field(decision, key) or "")
     return record
 
 

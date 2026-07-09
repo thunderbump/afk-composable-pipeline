@@ -8,7 +8,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from afk.integration import classify_terminal_integration  # noqa: E402
+from afk.integration import (  # noqa: E402
+    classify_terminal_integration,
+    terminal_no_merge_decision,
+    terminal_integration_retrospective_status,
+)
 
 
 def write_executable(path: Path, content: str) -> None:
@@ -130,6 +134,36 @@ raise SystemExit(9)
             self.assertEqual(written["next_poll_seconds"], 0)
             self.assertEqual(written["remediation"], "")
             self.assertGreaterEqual(len(events), 2)
+
+    def test_terminal_retrospective_status_marks_no_merge_ready(self):
+        self.assertEqual(
+            terminal_integration_retrospective_status(
+                {
+                    "status": "no-merge",
+                    "reason": "checks failed",
+                    "pr_url": "https://github.com/acme/widgets/pull/17",
+                }
+            ),
+            {
+                "status": "ready",
+                "artifact": "integration-retrospective.json",
+                "terminal_decision_status": "no-merge",
+            },
+        )
+
+    def test_terminal_no_merge_decision_requires_feedback_resolution(self):
+        workstream = {
+            "tracker": {
+                "terminal_decision": {
+                    "status": "no-merge",
+                    "reason": "checks failed",
+                    "pr_url": "https://github.com/acme/widgets/pull/17",
+                    "review_feedback_status": "",
+                }
+            }
+        }
+
+        self.assertEqual(terminal_no_merge_decision(workstream), {})
 
 
 if __name__ == "__main__":

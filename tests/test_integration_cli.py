@@ -639,30 +639,81 @@ raise SystemExit(0)
             )
 
             self.assertEqual(completed.returncode, 0, completed.stderr)
-            result = json.loads((output_dir_for(workstream_path) / "integration-result.json").read_text(encoding="utf-8"))
-            gh_calls = [json.loads(line) for line in fake_gh_calls.read_text(encoding="utf-8").splitlines()]
-            bd_calls = [json.loads(line) for line in fake_bd_calls.read_text(encoding="utf-8").splitlines()]
+            result = json.loads(
+                (output_dir_for(workstream_path) / "integration-result.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            retrospective_path = (
+                output_dir_for(workstream_path) / "integration-retrospective.json"
+            )
+            retrospective = json.loads(retrospective_path.read_text(encoding="utf-8"))
+            gh_calls = [
+                json.loads(line)
+                for line in fake_gh_calls.read_text(encoding="utf-8").splitlines()
+            ]
+            bd_calls = [
+                json.loads(line)
+                for line in fake_bd_calls.read_text(encoding="utf-8").splitlines()
+            ]
 
             self.assertEqual(result["status"], "tracker-closed")
             self.assertEqual(result["decision"], "merge_ready")
             self.assertEqual(result["terminal_decision"]["status"], "merged")
             self.assertEqual(result["terminal_decision"]["merge_commit"], "deadbeef")
-            self.assertEqual(result["terminal_decision"]["review_feedback_status"], "resolved")
+            self.assertEqual(
+                result["terminal_decision"]["review_feedback_status"], "resolved"
+            )
             self.assertEqual(result["merge"]["status"], "merged")
             self.assertEqual(result["merge"]["method"], "merge")
             self.assertEqual(result["merge"]["matched_head_sha"], "abc123")
             self.assertEqual(result["merge"]["merge_commit"], "deadbeef")
             self.assertEqual(result["tracker_close"]["status"], "closed")
-            self.assertEqual(result["commands"]["gh_merge"][-2:], ["--match-head-commit", "abc123"])
-            self.assertEqual(result["tracker_close"]["command"], ["bd", "close", "central-umi2.2", "--reason", "merged via deadbeef"])
-            self.assertEqual([call["argv"][0:2] for call in gh_calls], [["auth", "status"], ["pr", "view"], ["pr", "merge"], ["pr", "view"]])
+            self.assertEqual(result["terminal_retrospective"]["status"], "ready")
+            self.assertEqual(
+                result["terminal_retrospective"]["artifact"],
+                "integration-retrospective.json",
+            )
+            self.assertEqual(
+                result["terminal_retrospective"]["terminal_decision_status"],
+                "merged",
+            )
+            self.assertEqual(
+                result["commands"]["gh_merge"][-2:], ["--match-head-commit", "abc123"]
+            )
+            self.assertEqual(
+                result["tracker_close"]["command"],
+                ["bd", "close", "central-umi2.2", "--reason", "merged via deadbeef"],
+            )
+            self.assertEqual(retrospective["terminal"]["status"], "tracker-closed")
+            self.assertEqual(retrospective["status"], "tracker-closed")
+            self.assertEqual(retrospective["terminal"]["decision"]["status"], "merged")
+            self.assertEqual(
+                retrospective["terminal"]["decision"]["merge_commit"],
+                "deadbeef",
+            )
+            self.assertEqual(retrospective["terminal"]["merge_status"], "merged")
+            self.assertEqual(
+                retrospective["terminal"]["tracker_close_status"],
+                "closed",
+            )
+            self.assertEqual(
+                [call["argv"][0:2] for call in gh_calls],
+                [["auth", "status"], ["pr", "view"], ["pr", "merge"], ["pr", "view"]],
+            )
             self.assertEqual(bd_calls[0]["argv"][0:2], ["close", "central-umi2.2"])
             self.assertEqual(bd_calls[0]["password"], "secret-password")
 
     def test_integrate_pr_does_not_merge_when_head_changed(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
-            workstream_path = temp_path / "ledger" / "workstreams" / "run-head-changed" / "workstream-result.json"
+            workstream_path = (
+                temp_path
+                / "ledger"
+                / "workstreams"
+                / "run-head-changed"
+                / "workstream-result.json"
+            )
             write_workstream_result(workstream_path, expected_head="abc123")
             fake_gh = temp_path / "fake-gh"
             fake_calls = temp_path / "fake-calls.jsonl"
@@ -678,7 +729,11 @@ raise SystemExit(0)
                         "mergeStateStatus": "CLEAN",
                         "headRefOid": "def456",
                         "statusCheckRollup": [
-                            {"name": "build", "status": "COMPLETED", "conclusion": "SUCCESS"},
+                            {
+                                "name": "build",
+                                "status": "COMPLETED",
+                                "conclusion": "SUCCESS",
+                            },
                         ],
                     }
                 ),
@@ -714,24 +769,225 @@ raise SystemExit(9)
                 "--published-result",
                 str(workstream_path),
                 "--policy",
-                json.dumps({"gh": {"path": str(fake_gh)}, "required_checks": ["build"]}),
+                json.dumps(
+                    {"gh": {"path": str(fake_gh)}, "required_checks": ["build"]}
+                ),
                 "--gh-auth-config-dir",
                 str(auth_dir),
             )
 
             self.assertEqual(completed.returncode, 0, completed.stderr)
-            result = json.loads((output_dir_for(workstream_path) / "integration-result.json").read_text(encoding="utf-8"))
-            calls = [json.loads(line) for line in fake_calls.read_text(encoding="utf-8").splitlines()]
+            result = json.loads(
+                (output_dir_for(workstream_path) / "integration-result.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            calls = [
+                json.loads(line)
+                for line in fake_calls.read_text(encoding="utf-8").splitlines()
+            ]
 
             self.assertEqual(result["status"], "classified")
             self.assertEqual(result["decision"], "merge_blocked")
             self.assertNotIn("merge", result)
-            self.assertEqual([call["argv"][0:2] for call in calls], [["auth", "status"], ["pr", "view"]])
+            self.assertEqual(
+                [call["argv"][0:2] for call in calls],
+                [["auth", "status"], ["pr", "view"]],
+            )
+
+    def test_integrate_pr_closes_no_merge_terminal_decision(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            beads_workspace = temp_path / "beads"
+            (beads_workspace / "secrets").mkdir(parents=True)
+            (beads_workspace / "secrets" / "dolt_beads_password.txt").write_text(
+                "secret-password\n",
+                encoding="utf-8",
+            )
+            workstream_path = (
+                temp_path
+                / "ledger"
+                / "workstreams"
+                / "run-no-merge"
+                / "workstream-result.json"
+            )
+            write_workstream_result(
+                workstream_path,
+                expected_head="abc123",
+                selected_work=[
+                    {
+                        "source_type": "beads",
+                        "source_id": "central",
+                        "external_id": "central-umi2.4",
+                    }
+                ],
+                select_sources=[
+                    {
+                        "id": "central",
+                        "type": "beads",
+                        "workspace": str(beads_workspace),
+                    }
+                ],
+                tracker_terminal_decision={
+                    "status": "no-merge",
+                    "reason": "checks failed after review",
+                    "pr_url": "https://github.com/acme/widgets/pull/17",
+                    "review_feedback_status": "waived",
+                },
+            )
+            fake_bin = temp_path / "bin"
+            fake_bin.mkdir()
+            fake_gh = fake_bin / "gh"
+            fake_bd = fake_bin / "bd"
+            fake_gh_calls = temp_path / "fake-gh-calls.jsonl"
+            fake_bd_calls = temp_path / "fake-bd-calls.jsonl"
+            auth_dir = temp_path / "gh-config"
+            auth_dir.mkdir()
+            (auth_dir / "view.json").write_text(
+                json.dumps(
+                    {
+                        "number": 17,
+                        "url": "https://github.com/acme/widgets/pull/17",
+                        "state": "OPEN",
+                        "isDraft": False,
+                        "mergeStateStatus": "CLEAN",
+                        "headRefOid": "abc123",
+                        "statusCheckRollup": [
+                            {
+                                "name": "build",
+                                "status": "COMPLETED",
+                                "conclusion": "FAILURE",
+                            },
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (auth_dir / "checks.json").write_text(json.dumps([]), encoding="utf-8")
+            write_executable(
+                fake_gh,
+                f"""#!{sys.executable}
+import json
+import os
+import sys
+from pathlib import Path
+
+record = {{
+    "argv": sys.argv[1:],
+    "cwd": os.getcwd(),
+}}
+calls_path = Path({str(fake_gh_calls)!r})
+with calls_path.open("a", encoding="utf-8") as calls:
+    calls.write(json.dumps(record) + "\\n")
+if sys.argv[1:4] == ["auth", "status", "--hostname"]:
+    raise SystemExit(0)
+if sys.argv[1:3] == ["pr", "view"]:
+    config_dir = Path(os.environ["GH_CONFIG_DIR"])
+    print(config_dir.joinpath("view.json").read_text(encoding="utf-8"))
+    raise SystemExit(0)
+if sys.argv[1:3] == ["pr", "checks"]:
+    config_dir = Path(os.environ["GH_CONFIG_DIR"])
+    print(config_dir.joinpath("checks.json").read_text(encoding="utf-8"))
+    raise SystemExit(0)
+if sys.argv[1:3] == ["pr", "merge"]:
+    raise SystemExit(11)
+raise SystemExit(9)
+""",
+            )
+            write_executable(
+                fake_bd,
+                f"""#!{sys.executable}
+import json
+import os
+import sys
+from pathlib import Path
+
+record = {{
+    "argv": sys.argv[1:],
+    "cwd": os.getcwd(),
+    "password": os.environ.get("BEADS_DOLT_PASSWORD", ""),
+}}
+calls_path = Path({str(fake_bd_calls)!r})
+with calls_path.open("a", encoding="utf-8") as calls:
+    calls.write(json.dumps(record) + "\\n")
+raise SystemExit(0)
+""",
+            )
+
+            completed = run_afk(
+                "integrate-pr",
+                "--published-result",
+                str(workstream_path),
+                "--policy",
+                json.dumps(
+                    {"gh": {"path": str(fake_gh)}, "required_checks": ["build"]}
+                ),
+                "--gh-auth-config-dir",
+                str(auth_dir),
+                env_extra={"PATH": f"{fake_bin}:{os.environ['PATH']}"},
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            output_dir = output_dir_for(workstream_path)
+            result = json.loads(
+                (output_dir / "integration-result.json").read_text(encoding="utf-8")
+            )
+            retrospective = json.loads(
+                (output_dir / "integration-retrospective.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            gh_calls = [
+                json.loads(line)
+                for line in fake_gh_calls.read_text(encoding="utf-8").splitlines()
+            ]
+            bd_calls = [
+                json.loads(line)
+                for line in fake_bd_calls.read_text(encoding="utf-8").splitlines()
+            ]
+
+            self.assertEqual(result["status"], "tracker-closed")
+            self.assertEqual(result["decision"], "checks_failed")
+            self.assertEqual(result["terminal_decision"]["status"], "no-merge")
+            self.assertEqual(
+                result["terminal_decision"]["reason"],
+                "checks failed after review",
+            )
+            self.assertEqual(result["tracker_close"]["status"], "closed")
+            self.assertEqual(result["terminal_retrospective"]["status"], "ready")
+            self.assertEqual(retrospective["status"], "tracker-closed")
+            self.assertEqual(
+                retrospective["terminal"]["decision"]["status"],
+                "no-merge",
+            )
+            self.assertEqual(
+                retrospective["terminal"]["decision"]["reason"],
+                "checks failed after review",
+            )
+            self.assertEqual(
+                retrospective["terminal"]["tracker_close_status"],
+                "closed",
+            )
+            self.assertFalse(
+                any(call["argv"][0:2] == ["pr", "merge"] for call in gh_calls)
+            )
+            self.assertEqual(bd_calls[0]["argv"][0:2], ["close", "central-umi2.4"])
+            self.assertEqual(
+                bd_calls[0]["argv"][-2:],
+                ["--reason", "checks failed after review"],
+            )
+            self.assertEqual(bd_calls[0]["password"], "secret-password")
 
     def test_integrate_pr_records_merge_blocked_when_merge_command_fails(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
-            workstream_path = temp_path / "ledger" / "workstreams" / "run-merge-fails" / "workstream-result.json"
+            workstream_path = (
+                temp_path
+                / "ledger"
+                / "workstreams"
+                / "run-merge-fails"
+                / "workstream-result.json"
+            )
             write_workstream_result(workstream_path, expected_head="abc123")
             fake_gh = temp_path / "fake-gh"
             fake_calls = temp_path / "fake-calls.jsonl"
@@ -747,7 +1003,11 @@ raise SystemExit(9)
                         "mergeStateStatus": "CLEAN",
                         "headRefOid": "abc123",
                         "statusCheckRollup": [
-                            {"name": "build", "status": "COMPLETED", "conclusion": "SUCCESS"},
+                            {
+                                "name": "build",
+                                "status": "COMPLETED",
+                                "conclusion": "SUCCESS",
+                            },
                         ],
                     }
                 ),
