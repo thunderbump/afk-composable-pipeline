@@ -9,6 +9,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
 
 
 def run_afk(*args, env_overrides=None):
@@ -89,7 +90,9 @@ def selected_work():
     }
 
 
-def write_validation_artifacts(path, *, status="validated", classification="success", summary="tier1 passed"):
+def write_validation_artifacts(
+    path, *, status="validated", classification="success", summary="tier1 passed"
+):
     path.mkdir(parents=True)
     step_result = {
         "schema_version": 1,
@@ -126,7 +129,9 @@ def write_validation_artifacts(path, *, status="validated", classification="succ
         },
     }
     (path / "step-result.json").write_text(json.dumps(step_result), encoding="utf-8")
-    (path / "worker-result.json").write_text(json.dumps(worker_result), encoding="utf-8")
+    (path / "worker-result.json").write_text(
+        json.dumps(worker_result), encoding="utf-8"
+    )
     return path / "step-result.json", path / "worker-result.json"
 
 
@@ -175,7 +180,9 @@ def review_input(
                 "before_commit": start_commit,
                 "after_commit": head_commit,
                 "changed_files": ["reviewed.txt"],
-                "commits": [{"commit": head_commit, "subject": "implement reviewed work"}],
+                "commits": [
+                    {"commit": head_commit, "subject": "implement reviewed work"}
+                ],
                 "dirty": False,
                 "dirty_status": [],
             },
@@ -190,7 +197,9 @@ def review_input(
             ]
         },
         "guardrails": guardrails if guardrails is not None else [],
-        "cleanup": cleanup if cleanup is not None else {"status": "clean", "resources": []},
+        "cleanup": (
+            cleanup if cleanup is not None else {"status": "clean", "resources": []}
+        ),
         "reviewer": {
             "type": reviewer_type,
             "command": [sys.executable, "-c", reviewer_code],
@@ -206,7 +215,9 @@ class ReviewCliTest(unittest.TestCase):
             checkout = temp_path / "checkout"
             start_commit = init_checkout(checkout)
             head_commit = git(checkout, "rev-parse", "HEAD")
-            validation_step, validation_worker = write_validation_artifacts(temp_path / "validation-run")
+            validation_step, validation_worker = write_validation_artifacts(
+                temp_path / "validation-run"
+            )
             ledger = temp_path / "ledger"
             reviewer_code = textwrap.dedent(
                 """
@@ -264,7 +275,10 @@ class ReviewCliTest(unittest.TestCase):
                                 "after_commit": head_commit,
                                 "changed_files": ["reviewed.txt"],
                                 "commits": [
-                                    {"commit": head_commit, "subject": "implement reviewed work"}
+                                    {
+                                        "commit": head_commit,
+                                        "subject": "implement reviewed work",
+                                    }
                                 ],
                                 "dirty": False,
                                 "dirty_status": [],
@@ -280,7 +294,11 @@ class ReviewCliTest(unittest.TestCase):
                             ]
                         },
                         "guardrails": [
-                            {"name": "no secrets", "status": "pass", "summary": "redaction applied"}
+                            {
+                                "name": "no secrets",
+                                "status": "pass",
+                                "summary": "redaction applied",
+                            }
                         ],
                         "cleanup": {"status": "clean", "resources": []},
                         "reviewer": {
@@ -297,10 +315,18 @@ class ReviewCliTest(unittest.TestCase):
             self.assertEqual(completed.returncode, 0, completed.stderr)
             summary = json.loads(completed.stdout)
             run_dir = ledger / "runs" / summary["run_id"]
-            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
-            evidence_pack = json.loads((run_dir / "evidence-pack.json").read_text(encoding="utf-8"))
-            reviewer_request = json.loads((run_dir / "reviewer-request.json").read_text(encoding="utf-8"))
-            reviewer_result = json.loads((run_dir / "reviewer-result.json").read_text(encoding="utf-8"))
+            result = json.loads(
+                (run_dir / "step-result.json").read_text(encoding="utf-8")
+            )
+            evidence_pack = json.loads(
+                (run_dir / "evidence-pack.json").read_text(encoding="utf-8")
+            )
+            reviewer_request = json.loads(
+                (run_dir / "reviewer-request.json").read_text(encoding="utf-8")
+            )
+            reviewer_result = json.loads(
+                (run_dir / "reviewer-result.json").read_text(encoding="utf-8")
+            )
             review_summary = (run_dir / "review-summary.md").read_text(encoding="utf-8")
 
             self.assertEqual(summary["step"], "review")
@@ -318,33 +344,64 @@ class ReviewCliTest(unittest.TestCase):
                 },
             )
             self.assertEqual(evidence_pack["artifact_type"], "evidence-pack")
-            self.assertEqual(evidence_pack["evidence_pack"]["work_item"]["external_id"], "central-lve.8")
-            self.assertEqual(evidence_pack["evidence_pack"]["acceptance_criteria"], selected_work()["acceptance_criteria"])
-            self.assertEqual(evidence_pack["evidence_pack"]["implementation"]["git"]["changed_files"], ["reviewed.txt"])
-            self.assertEqual(evidence_pack["evidence_pack"]["validation"]["required"][0]["status"], "validated")
-            self.assertEqual(evidence_pack["evidence_pack"]["redaction"]["applied"], True)
-            self.assertEqual(reviewer_request["evidence_pack"], evidence_pack["evidence_pack"])
+            self.assertEqual(
+                evidence_pack["evidence_pack"]["work_item"]["external_id"],
+                "central-lve.8",
+            )
+            self.assertEqual(
+                evidence_pack["evidence_pack"]["acceptance_criteria"],
+                selected_work()["acceptance_criteria"],
+            )
+            self.assertEqual(
+                evidence_pack["evidence_pack"]["implementation"]["git"][
+                    "changed_files"
+                ],
+                ["reviewed.txt"],
+            )
+            self.assertEqual(
+                evidence_pack["evidence_pack"]["validation"]["required"][0]["status"],
+                "validated",
+            )
+            self.assertEqual(
+                evidence_pack["evidence_pack"]["redaction"]["applied"], True
+            )
+            self.assertEqual(
+                reviewer_request["evidence_pack"], evidence_pack["evidence_pack"]
+            )
             self.assertEqual(reviewer_result["artifact_type"], "reviewer-result")
             self.assertEqual(reviewer_result["result"]["status"], "passed")
             self.assertEqual(reviewer_result["result"]["findings"][0]["status"], "pass")
             self.assertIn("final evidence is complete", review_summary)
             self.assertIn("Evidence pack is sufficient", review_summary)
-            self.assertIn("review saw evidence pack", (run_dir / "stdout.log").read_text(encoding="utf-8"))
+            self.assertIn(
+                "review saw evidence pack",
+                (run_dir / "stdout.log").read_text(encoding="utf-8"),
+            )
 
             events = [
                 json.loads(line)
-                for line in (run_dir / "ledger.jsonl").read_text(encoding="utf-8").splitlines()
+                for line in (run_dir / "ledger.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
             ]
-            self.assertEqual(events[2]["artifacts"]["evidence_pack"], "evidence-pack.json")
-            self.assertEqual(events[2]["artifacts"]["review_summary"], "review-summary.md")
+            self.assertEqual(
+                events[2]["artifacts"]["evidence_pack"], "evidence-pack.json"
+            )
+            self.assertEqual(
+                events[2]["artifacts"]["review_summary"], "review-summary.md"
+            )
 
-    def test_review_passes_pi_auth_mounts_through_to_openai_codex_pi_reviewer_command(self):
+    def test_review_passes_pi_auth_mounts_through_to_openai_codex_pi_reviewer_command(
+        self,
+    ):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
             checkout = temp_path / "checkout"
             start_commit = init_checkout(checkout)
             head_commit = git(checkout, "rev-parse", "HEAD")
-            validation_step, validation_worker = write_validation_artifacts(temp_path / "validation-run")
+            validation_step, validation_worker = write_validation_artifacts(
+                temp_path / "validation-run"
+            )
             ledger = temp_path / "ledger"
             codex_home = temp_path / "codex-home"
             config_home = temp_path / "xdg-config"
@@ -384,7 +441,15 @@ Path(os.environ["AFK_REVIEWER_RESULT"]).write_text(
             input_payload["reviewer"] = {
                 "type": "fake-reviewer-command",
                 "provider": "openai-codex",
-                "command": [str(pi_bin), "-p", "{prompt}", "--provider", "openai-codex", "--model", "gpt-5.4-mini"],
+                "command": [
+                    str(pi_bin),
+                    "-p",
+                    "{prompt}",
+                    "--provider",
+                    "openai-codex",
+                    "--model",
+                    "gpt-5.4-mini",
+                ],
                 "timeout_seconds": 10,
                 "codex_home": str(codex_home),
                 "config_home": str(config_home),
@@ -405,9 +470,15 @@ Path(os.environ["AFK_REVIEWER_RESULT"]).write_text(
 
             self.assertEqual(completed.returncode, 0, completed.stderr)
             summary = json.loads(completed.stdout)
-            result = json.loads((ledger / "runs" / summary["run_id"] / "step-result.json").read_text(encoding="utf-8"))
+            result = json.loads(
+                (ledger / "runs" / summary["run_id"] / "step-result.json").read_text(
+                    encoding="utf-8"
+                )
+            )
             self.assertEqual(result["output"]["status"], "passed")
-            self.assertEqual(result["output"]["summary"], "reviewer auth mounts available")
+            self.assertEqual(
+                result["output"]["summary"], "reviewer auth mounts available"
+            )
 
     def test_review_rejects_openai_codex_pi_reviewer_without_required_mounts(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -415,7 +486,9 @@ Path(os.environ["AFK_REVIEWER_RESULT"]).write_text(
             checkout = temp_path / "checkout"
             start_commit = init_checkout(checkout)
             head_commit = git(checkout, "rev-parse", "HEAD")
-            validation_step, validation_worker = write_validation_artifacts(temp_path / "validation-run")
+            validation_step, validation_worker = write_validation_artifacts(
+                temp_path / "validation-run"
+            )
             ledger = temp_path / "ledger"
 
             input_payload = review_input(
@@ -429,7 +502,15 @@ Path(os.environ["AFK_REVIEWER_RESULT"]).write_text(
             input_payload["reviewer"] = {
                 "type": "fake-reviewer-command",
                 "provider": "openai-codex",
-                "command": ["pi", "-p", "{prompt}", "--provider", "openai-codex", "--model", "gpt-5.4-mini"],
+                "command": [
+                    "pi",
+                    "-p",
+                    "{prompt}",
+                    "--provider",
+                    "openai-codex",
+                    "--model",
+                    "gpt-5.4-mini",
+                ],
                 "timeout_seconds": 10,
             }
 
@@ -445,12 +526,16 @@ Path(os.environ["AFK_REVIEWER_RESULT"]).write_text(
             self.assertEqual(completed.returncode, 0, completed.stderr)
             summary = json.loads(completed.stdout)
             run_dir = ledger / "runs" / summary["run_id"]
-            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+            result = json.loads(
+                (run_dir / "step-result.json").read_text(encoding="utf-8")
+            )
 
             self.assertEqual(summary["status"], "failed")
             self.assertEqual(result["output"]["status"], "failed_invalid_payload")
             self.assertIn("reviewer.codex_home", result["output"]["message"])
-            self.assertIn("reviewer.provider is openai-codex", result["output"]["message"])
+            self.assertIn(
+                "reviewer.provider is openai-codex", result["output"]["message"]
+            )
 
     def test_review_requires_structured_openai_codex_provider_for_required_mounts(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -458,15 +543,51 @@ Path(os.environ["AFK_REVIEWER_RESULT"]).write_text(
             checkout = temp_path / "checkout"
             start_commit = init_checkout(checkout)
             head_commit = git(checkout, "rev-parse", "HEAD")
-            validation_step, validation_worker = write_validation_artifacts(temp_path / "validation-run")
+            validation_step, validation_worker = write_validation_artifacts(
+                temp_path / "validation-run"
+            )
             ledger = temp_path / "ledger"
             commands = [
-                ["/usr/bin/env", "pi", "-p", "{prompt}", "--provider", "openai-codex", "--model", "gpt-5.4-mini"],
-                ["python3", "-m", "pi", "-p", "{prompt}", "--provider", "openai-codex", "--model", "gpt-5.4-mini"],
-                ["bash", "-lc", "pi -p '{prompt}' --provider openai-codex --model gpt-5.4-mini"],
-                ["bash", "-lc", "FOO=bar pi -p '{prompt}' --provider openai-codex --model gpt-5.4-mini"],
-                ["bash", "-lc", "exec pi -p '{prompt}' --provider openai-codex --model gpt-5.4-mini"],
-                ["/usr/bin/env", "--split-string=pi -p '{prompt}' --provider openai-codex --model gpt-5.4-mini"],
+                [
+                    "/usr/bin/env",
+                    "pi",
+                    "-p",
+                    "{prompt}",
+                    "--provider",
+                    "openai-codex",
+                    "--model",
+                    "gpt-5.4-mini",
+                ],
+                [
+                    "python3",
+                    "-m",
+                    "pi",
+                    "-p",
+                    "{prompt}",
+                    "--provider",
+                    "openai-codex",
+                    "--model",
+                    "gpt-5.4-mini",
+                ],
+                [
+                    "bash",
+                    "-lc",
+                    "pi -p '{prompt}' --provider openai-codex --model gpt-5.4-mini",
+                ],
+                [
+                    "bash",
+                    "-lc",
+                    "FOO=bar pi -p '{prompt}' --provider openai-codex --model gpt-5.4-mini",
+                ],
+                [
+                    "bash",
+                    "-lc",
+                    "exec pi -p '{prompt}' --provider openai-codex --model gpt-5.4-mini",
+                ],
+                [
+                    "/usr/bin/env",
+                    "--split-string=pi -p '{prompt}' --provider openai-codex --model gpt-5.4-mini",
+                ],
             ]
             for command in commands:
                 with self.subTest(command=command):
@@ -497,19 +618,30 @@ Path(os.environ["AFK_REVIEWER_RESULT"]).write_text(
                     self.assertEqual(completed.returncode, 0, completed.stderr)
                     summary = json.loads(completed.stdout)
                     run_dir = ledger / "runs" / summary["run_id"]
-                    result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+                    result = json.loads(
+                        (run_dir / "step-result.json").read_text(encoding="utf-8")
+                    )
 
                     self.assertEqual(summary["status"], "failed")
-                    self.assertEqual(result["output"]["status"], "failed_invalid_payload")
-                    self.assertIn("required when reviewer.provider is openai-codex", result["output"]["message"])
+                    self.assertEqual(
+                        result["output"]["status"], "failed_invalid_payload"
+                    )
+                    self.assertIn(
+                        "required when reviewer.provider is openai-codex",
+                        result["output"]["message"],
+                    )
 
-    def test_review_rejects_non_openai_pi_reviewer_mounts_for_direct_entry_commands(self):
+    def test_review_rejects_non_openai_pi_reviewer_mounts_for_direct_entry_commands(
+        self,
+    ):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
             checkout = temp_path / "checkout"
             start_commit = init_checkout(checkout)
             head_commit = git(checkout, "rev-parse", "HEAD")
-            validation_step, validation_worker = write_validation_artifacts(temp_path / "validation-run")
+            validation_step, validation_worker = write_validation_artifacts(
+                temp_path / "validation-run"
+            )
             ledger = temp_path / "ledger"
             codex_home = temp_path / "codex-home"
             config_home = temp_path / "xdg-config"
@@ -521,8 +653,27 @@ Path(os.environ["AFK_REVIEWER_RESULT"]).write_text(
             pi_coding_agent_dir.mkdir()
 
             commands = [
-                ["/usr/bin/env", "pi", "-p", "{prompt}", "--provider", "anthropic", "--model", "gpt-5.4-mini"],
-                ["python3", "-m", "pi", "-p", "{prompt}", "--provider", "anthropic", "--model", "gpt-5.4-mini"],
+                [
+                    "/usr/bin/env",
+                    "pi",
+                    "-p",
+                    "{prompt}",
+                    "--provider",
+                    "anthropic",
+                    "--model",
+                    "gpt-5.4-mini",
+                ],
+                [
+                    "python3",
+                    "-m",
+                    "pi",
+                    "-p",
+                    "{prompt}",
+                    "--provider",
+                    "anthropic",
+                    "--model",
+                    "gpt-5.4-mini",
+                ],
             ]
             for command in commands:
                 with self.subTest(command=command):
@@ -559,20 +710,31 @@ Path(os.environ["AFK_REVIEWER_RESULT"]).write_text(
                     self.assertEqual(completed.returncode, 0, completed.stderr)
                     summary = json.loads(completed.stdout)
                     run_dir = ledger / "runs" / summary["run_id"]
-                    result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+                    result = json.loads(
+                        (run_dir / "step-result.json").read_text(encoding="utf-8")
+                    )
 
                     self.assertEqual(summary["status"], "failed")
-                    self.assertEqual(result["output"]["status"], "failed_invalid_payload")
+                    self.assertEqual(
+                        result["output"]["status"], "failed_invalid_payload"
+                    )
                     self.assertIn("reviewer.codex_home", result["output"]["message"])
-                    self.assertIn("only supported when reviewer.provider is openai-codex", result["output"]["message"])
+                    self.assertIn(
+                        "only supported when reviewer.provider is openai-codex",
+                        result["output"]["message"],
+                    )
 
-    def test_review_rejects_unknown_provider_pi_reviewer_mounts_for_direct_entry_commands(self):
+    def test_review_rejects_unknown_provider_pi_reviewer_mounts_for_direct_entry_commands(
+        self,
+    ):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
             checkout = temp_path / "checkout"
             start_commit = init_checkout(checkout)
             head_commit = git(checkout, "rev-parse", "HEAD")
-            validation_step, validation_worker = write_validation_artifacts(temp_path / "validation-run")
+            validation_step, validation_worker = write_validation_artifacts(
+                temp_path / "validation-run"
+            )
             ledger = temp_path / "ledger"
             codex_home = temp_path / "codex-home"
             config_home = temp_path / "xdg-config"
@@ -616,20 +778,29 @@ Path(os.environ["AFK_REVIEWER_RESULT"]).write_text(
             self.assertEqual(completed.returncode, 0, completed.stderr)
             summary = json.loads(completed.stdout)
             run_dir = ledger / "runs" / summary["run_id"]
-            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+            result = json.loads(
+                (run_dir / "step-result.json").read_text(encoding="utf-8")
+            )
 
             self.assertEqual(summary["status"], "failed")
             self.assertEqual(result["output"]["status"], "failed_invalid_payload")
             self.assertIn("reviewer.codex_home", result["output"]["message"])
-            self.assertIn("only supported when reviewer.provider is openai-codex", result["output"]["message"])
+            self.assertIn(
+                "only supported when reviewer.provider is openai-codex",
+                result["output"]["message"],
+            )
 
-    def test_review_rejects_non_pi_reviewer_command_mounts_for_direct_entry_commands(self):
+    def test_review_rejects_non_pi_reviewer_command_mounts_for_direct_entry_commands(
+        self,
+    ):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
             checkout = temp_path / "checkout"
             start_commit = init_checkout(checkout)
             head_commit = git(checkout, "rev-parse", "HEAD")
-            validation_step, validation_worker = write_validation_artifacts(temp_path / "validation-run")
+            validation_step, validation_worker = write_validation_artifacts(
+                temp_path / "validation-run"
+            )
             ledger = temp_path / "ledger"
             codex_home = temp_path / "codex-home"
             config_home = temp_path / "xdg-config"
@@ -650,7 +821,11 @@ Path(os.environ["AFK_REVIEWER_RESULT"]).write_text(
             )
             input_payload["reviewer"] = {
                 "type": "fake-reviewer-command",
-                "command": [sys.executable, "-c", "raise SystemExit('reviewer should not run')"],
+                "command": [
+                    sys.executable,
+                    "-c",
+                    "raise SystemExit('reviewer should not run')",
+                ],
                 "timeout_seconds": 10,
                 "codex_home": str(codex_home),
                 "config_home": str(config_home),
@@ -672,20 +847,27 @@ Path(os.environ["AFK_REVIEWER_RESULT"]).write_text(
             self.assertEqual(completed.returncode, 0, completed.stderr)
             summary = json.loads(completed.stdout)
             run_dir = ledger / "runs" / summary["run_id"]
-            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+            result = json.loads(
+                (run_dir / "step-result.json").read_text(encoding="utf-8")
+            )
 
             self.assertEqual(summary["status"], "failed")
             self.assertEqual(result["output"]["status"], "failed_invalid_payload")
             self.assertIn("reviewer.codex_home", result["output"]["message"])
-            self.assertIn("only supported when reviewer.provider is openai-codex", result["output"]["message"])
+            self.assertIn(
+                "only supported when reviewer.provider is openai-codex",
+                result["output"]["message"],
+            )
 
-    def test_review_substitutes_prompt_for_reviewer_command(self):
+    def test_review_substitutes_inline_prompt_for_reviewer_command_arg(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
             checkout = temp_path / "checkout"
             start_commit = init_checkout(checkout)
             head_commit = git(checkout, "rev-parse", "HEAD")
-            validation_step, validation_worker = write_validation_artifacts(temp_path / "validation-run")
+            validation_step, validation_worker = write_validation_artifacts(
+                temp_path / "validation-run"
+            )
             ledger = temp_path / "ledger"
             work_item = selected_work()
             work_item["acceptance_criteria"] = [
@@ -699,11 +881,17 @@ Path(os.environ["AFK_REVIEWER_RESULT"]).write_text(
                 import sys
                 from pathlib import Path
 
-                request = json.loads(sys.argv[1])
+                if sys.argv[1] != "-p":
+                    raise SystemExit("missing -p flag")
+                prompt = sys.argv[2]
+                request = json.loads(prompt)
                 if request["artifact_type"] != "reviewer-request":
                     raise SystemExit("missing reviewer request prompt")
                 if request["evidence_pack"]["work_item"]["external_id"] != "central-lve.8":
                     raise SystemExit("missing evidence pack")
+                request_path = Path(os.environ["AFK_REVIEWER_REQUEST"])
+                if prompt == str(request_path):
+                    raise SystemExit("small prompt unexpectedly used request path")
                 criteria = request["evidence_pack"]["acceptance_criteria"]
                 expected = [
                     "Keep {" + "request_path} literal",
@@ -735,7 +923,13 @@ Path(os.environ["AFK_REVIEWER_RESULT"]).write_text(
                     | {
                         "reviewer": {
                             "type": "fake-reviewer-command",
-                            "command": [sys.executable, "-c", reviewer_code, "{prompt}"],
+                            "command": [
+                                sys.executable,
+                                "-c",
+                                reviewer_code,
+                                "-p",
+                                "{prompt}",
+                            ],
                             "timeout_seconds": 10,
                         }
                     }
@@ -747,21 +941,29 @@ Path(os.environ["AFK_REVIEWER_RESULT"]).write_text(
             self.assertEqual(completed.returncode, 0, completed.stderr)
             summary = json.loads(completed.stdout)
             run_dir = ledger / "runs" / summary["run_id"]
-            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+            result = json.loads(
+                (run_dir / "step-result.json").read_text(encoding="utf-8")
+            )
 
             self.assertEqual(result["output"]["status"], "passed")
             self.assertEqual(result["output"]["summary"], "review prompt accepted")
 
-    def test_review_uses_request_path_prompt_when_reviewer_request_is_large(self):
+    def test_review_uses_request_path_prompt_arg_when_reviewer_request_is_large(self):
+        from afk.review import review
+
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
             checkout = temp_path / "checkout"
             start_commit = init_checkout(checkout)
             head_commit = git(checkout, "rev-parse", "HEAD")
-            validation_step, validation_worker = write_validation_artifacts(temp_path / "validation-run")
+            validation_step, validation_worker = write_validation_artifacts(
+                temp_path / "validation-run"
+            )
             ledger = temp_path / "ledger"
             work_item = selected_work()
-            work_item["acceptance_criteria"] = ["large evidence " + ("x" * 40000)]
+            work_item["acceptance_criteria"] = [
+                f"large evidence {index} " + ("x" * 400) for index in range(96)
+            ]
             reviewer_code = textwrap.dedent(
                 """
                 import json
@@ -769,15 +971,15 @@ Path(os.environ["AFK_REVIEWER_RESULT"]).write_text(
                 import sys
                 from pathlib import Path
 
-                prompt = sys.argv[1]
-                if len(prompt.encode("utf-8")) > 2000:
-                    raise SystemExit("review prompt was not guarded")
+                if sys.argv[1] != "-p":
+                    raise SystemExit("missing -p flag")
+                prompt = sys.argv[2]
                 request_path = Path(os.environ["AFK_REVIEWER_REQUEST"])
-                if str(request_path) not in prompt:
-                    raise SystemExit("prompt did not point at reviewer request")
+                if prompt != str(request_path):
+                    raise SystemExit("prompt did not resolve to reviewer request path")
                 request = json.loads(request_path.read_text(encoding="utf-8"))
                 criteria = request["evidence_pack"]["acceptance_criteria"]
-                if not criteria[0].startswith("large evidence "):
+                if not criteria[0].startswith("large evidence 0 "):
                     raise SystemExit("request file did not preserve full evidence")
                 Path(os.environ["AFK_REVIEWER_RESULT"]).write_text(
                     json.dumps({"status": "pass", "summary": "request path prompt accepted", "findings": []}),
@@ -786,59 +988,78 @@ Path(os.environ["AFK_REVIEWER_RESULT"]).write_text(
                 """
             ).strip()
 
-            completed = run_afk(
-                "run-step",
-                "review",
-                "--input",
-                json.dumps(
-                    review_input(
-                        checkout=checkout,
-                        start_commit=start_commit,
-                        head_commit=head_commit,
-                        validation_step=validation_step,
-                        validation_worker=validation_worker,
-                        reviewer_code=reviewer_code,
-                        reviewer_type="real-reviewer-command",
-                        work_item=work_item,
-                    )
-                    | {
-                        "reviewer": {
-                            "type": "real-reviewer-command",
-                            "command": [sys.executable, "-c", reviewer_code, "{prompt}"],
-                            "timeout_seconds": 10,
-                        }
+            run_dir = ledger / "runs" / "review-run"
+            run_dir.mkdir(parents=True)
+            result = review(
+                review_input(
+                    checkout=checkout,
+                    start_commit=start_commit,
+                    head_commit=head_commit,
+                    validation_step=validation_step,
+                    validation_worker=validation_worker,
+                    reviewer_code=reviewer_code,
+                    work_item=work_item,
+                )
+                | {
+                    "reviewer": {
+                        "type": "fake-reviewer-command",
+                        "command": [
+                            sys.executable,
+                            "-c",
+                            reviewer_code,
+                            "-p",
+                            "{prompt}",
+                        ],
+                        "timeout_seconds": 10,
                     }
-                ),
-                "--ledger",
-                str(ledger),
+                },
+                run_id="review-run",
+                run_dir=run_dir,
             )
 
-            self.assertEqual(completed.returncode, 0, completed.stderr)
-            summary = json.loads(completed.stdout)
-            run_dir = ledger / "runs" / summary["run_id"]
-            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
-            reviewer_request = json.loads((run_dir / "reviewer-request.json").read_text(encoding="utf-8"))
+            reviewer_request = json.loads(
+                (run_dir / "reviewer-request.json").read_text(encoding="utf-8")
+            )
 
-            self.assertEqual(result["output"]["status"], "passed")
-            self.assertEqual(result["output"]["summary"], "request path prompt accepted")
-            self.assertEqual(reviewer_request["evidence_pack"]["acceptance_criteria"], work_item["acceptance_criteria"])
+            self.assertEqual(result["status"], "passed")
+            self.assertEqual(result["summary"], "request path prompt accepted")
+            self.assertEqual(
+                reviewer_request["evidence_pack"]["acceptance_criteria"],
+                work_item["acceptance_criteria"],
+            )
 
-    def test_review_refuses_pass_when_required_validation_artifact_is_not_validated(self):
+    def test_review_refuses_pass_when_required_validation_artifact_is_not_validated(
+        self,
+    ):
         cases = [
-            ("missing", None, None, "required validation artifact missing is not validated"),
+            (
+                "missing",
+                None,
+                None,
+                "required validation artifact missing is not validated",
+            ),
             ("failed", "failed_validation", "worker_failure", "tests failed"),
             ("skipped", "skipped_profile", "profile_skipped", "profile skipped"),
             ("protocol", "failed_protocol", "protocol_failure", "protocol failed"),
         ]
-        for name, validation_status, validation_classification, validation_summary in cases:
+        for (
+            name,
+            validation_status,
+            validation_classification,
+            validation_summary,
+        ) in cases:
             with self.subTest(name=name), tempfile.TemporaryDirectory() as temp_dir:
                 temp_path = Path(temp_dir)
                 checkout = temp_path / "checkout"
                 start_commit = init_checkout(checkout)
                 head_commit = git(checkout, "rev-parse", "HEAD")
                 if validation_status is None:
-                    validation_step = temp_path / "missing-validation" / "step-result.json"
-                    validation_worker = temp_path / "missing-validation" / "worker-result.json"
+                    validation_step = (
+                        temp_path / "missing-validation" / "step-result.json"
+                    )
+                    validation_worker = (
+                        temp_path / "missing-validation" / "worker-result.json"
+                    )
                 else:
                     validation_step, validation_worker = write_validation_artifacts(
                         temp_path / "validation-run",
@@ -883,7 +1104,10 @@ Path(os.environ["AFK_REVIEWER_RESULT"]).write_text(
                                     "after_commit": head_commit,
                                     "changed_files": ["reviewed.txt"],
                                     "commits": [
-                                        {"commit": head_commit, "subject": "implement reviewed work"}
+                                        {
+                                            "commit": head_commit,
+                                            "subject": "implement reviewed work",
+                                        }
                                     ],
                                     "dirty": False,
                                     "dirty_status": [],
@@ -913,16 +1137,31 @@ Path(os.environ["AFK_REVIEWER_RESULT"]).write_text(
                 self.assertEqual(completed.returncode, 0, completed.stderr)
                 summary = json.loads(completed.stdout)
                 run_dir = ledger / "runs" / summary["run_id"]
-                result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
-                reviewer_result = json.loads((run_dir / "reviewer-result.json").read_text(encoding="utf-8"))
-                review_summary = (run_dir / "review-summary.md").read_text(encoding="utf-8")
+                result = json.loads(
+                    (run_dir / "step-result.json").read_text(encoding="utf-8")
+                )
+                reviewer_result = json.loads(
+                    (run_dir / "reviewer-result.json").read_text(encoding="utf-8")
+                )
+                review_summary = (run_dir / "review-summary.md").read_text(
+                    encoding="utf-8"
+                )
 
-                self.assertEqual(result["output"]["status"], "failed_validation_evidence")
-                self.assertEqual(result["output"]["classification"], "validation_evidence_incomplete")
-                self.assertEqual(reviewer_result["result"]["status"], "failed_validation_evidence")
+                self.assertEqual(
+                    result["output"]["status"], "failed_validation_evidence"
+                )
+                self.assertEqual(
+                    result["output"]["classification"], "validation_evidence_incomplete"
+                )
+                self.assertEqual(
+                    reviewer_result["result"]["status"], "failed_validation_evidence"
+                )
                 self.assertIn("tier1", reviewer_result["result"]["summary"])
                 self.assertIn("tier1", review_summary)
-                self.assertNotIn("reviewer should not run", (run_dir / "stdout.log").read_text(encoding="utf-8"))
+                self.assertNotIn(
+                    "reviewer should not run",
+                    (run_dir / "stdout.log").read_text(encoding="utf-8"),
+                )
 
     def test_review_invalid_payload_marks_top_level_step_status_failed(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -941,7 +1180,9 @@ Path(os.environ["AFK_REVIEWER_RESULT"]).write_text(
             self.assertEqual(completed.returncode, 0, completed.stderr)
             summary = json.loads(completed.stdout)
             run_dir = ledger / "runs" / summary["run_id"]
-            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+            result = json.loads(
+                (run_dir / "step-result.json").read_text(encoding="utf-8")
+            )
 
             self.assertEqual(summary["status"], "failed")
             self.assertEqual(result["status"], "failed")
@@ -953,7 +1194,9 @@ Path(os.environ["AFK_REVIEWER_RESULT"]).write_text(
             checkout = temp_path / "checkout"
             start_commit = init_checkout(checkout)
             head_commit = git(checkout, "rev-parse", "HEAD")
-            validation_step, validation_worker = write_validation_artifacts(temp_path / "validation-run")
+            validation_step, validation_worker = write_validation_artifacts(
+                temp_path / "validation-run"
+            )
             ledger = temp_path / "ledger"
             reviewer_code = "print('reviewer returned no payload')"
 
@@ -978,7 +1221,9 @@ Path(os.environ["AFK_REVIEWER_RESULT"]).write_text(
             self.assertEqual(completed.returncode, 0, completed.stderr)
             summary = json.loads(completed.stdout)
             run_dir = ledger / "runs" / summary["run_id"]
-            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+            result = json.loads(
+                (run_dir / "step-result.json").read_text(encoding="utf-8")
+            )
 
             self.assertEqual(summary["status"], "failed")
             self.assertEqual(result["status"], "failed")
@@ -990,7 +1235,9 @@ Path(os.environ["AFK_REVIEWER_RESULT"]).write_text(
             checkout = temp_path / "checkout"
             start_commit = init_checkout(checkout)
             head_commit = git(checkout, "rev-parse", "HEAD")
-            validation_step, validation_worker = write_validation_artifacts(temp_path / "validation-run")
+            validation_step, validation_worker = write_validation_artifacts(
+                temp_path / "validation-run"
+            )
             ledger = temp_path / "ledger"
             reviewer_code = textwrap.dedent(
                 """
@@ -1036,17 +1283,28 @@ Path(os.environ["AFK_REVIEWER_RESULT"]).write_text(
             self.assertEqual(completed.returncode, 0, completed.stderr)
             summary = json.loads(completed.stdout)
             run_dir = ledger / "runs" / summary["run_id"]
-            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
-            reviewer_result = json.loads((run_dir / "reviewer-result.json").read_text(encoding="utf-8"))
+            result = json.loads(
+                (run_dir / "step-result.json").read_text(encoding="utf-8")
+            )
+            reviewer_result = json.loads(
+                (run_dir / "reviewer-result.json").read_text(encoding="utf-8")
+            )
 
             self.assertEqual(summary["status"], "failed")
             self.assertEqual(result["status"], "failed")
             self.assertEqual(result["output"]["status"], "failed_protocol")
             self.assertEqual(result["output"]["classification"], "protocol_failure")
-            self.assertEqual(result["output"]["summary"], "reviewer result file was not produced")
+            self.assertEqual(
+                result["output"]["summary"], "reviewer result file was not produced"
+            )
             self.assertEqual(reviewer_result["result"]["status"], "failed_protocol")
-            self.assertEqual(reviewer_result["result"]["evidence"]["result_source"], "reviewer_result_file")
-            self.assertEqual(reviewer_result["result"]["evidence"]["result_file_present"], False)
+            self.assertEqual(
+                reviewer_result["result"]["evidence"]["result_source"],
+                "reviewer_result_file",
+            )
+            self.assertEqual(
+                reviewer_result["result"]["evidence"]["result_file_present"], False
+            )
 
     def test_review_requires_result_file_when_bare_stdout_json_is_present(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1054,7 +1312,9 @@ Path(os.environ["AFK_REVIEWER_RESULT"]).write_text(
             checkout = temp_path / "checkout"
             start_commit = init_checkout(checkout)
             head_commit = git(checkout, "rev-parse", "HEAD")
-            validation_step, validation_worker = write_validation_artifacts(temp_path / "validation-run")
+            validation_step, validation_worker = write_validation_artifacts(
+                temp_path / "validation-run"
+            )
             ledger = temp_path / "ledger"
             reviewer_code = textwrap.dedent(
                 """
@@ -1099,25 +1359,40 @@ Path(os.environ["AFK_REVIEWER_RESULT"]).write_text(
             self.assertEqual(completed.returncode, 0, completed.stderr)
             summary = json.loads(completed.stdout)
             run_dir = ledger / "runs" / summary["run_id"]
-            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
-            reviewer_result = json.loads((run_dir / "reviewer-result.json").read_text(encoding="utf-8"))
+            result = json.loads(
+                (run_dir / "step-result.json").read_text(encoding="utf-8")
+            )
+            reviewer_result = json.loads(
+                (run_dir / "reviewer-result.json").read_text(encoding="utf-8")
+            )
 
             self.assertEqual(summary["status"], "failed")
             self.assertEqual(result["status"], "failed")
             self.assertEqual(result["output"]["status"], "failed_protocol")
             self.assertEqual(result["output"]["classification"], "protocol_failure")
-            self.assertEqual(result["output"]["summary"], "reviewer result file was not produced")
+            self.assertEqual(
+                result["output"]["summary"], "reviewer result file was not produced"
+            )
             self.assertEqual(reviewer_result["result"]["status"], "failed_protocol")
-            self.assertEqual(reviewer_result["result"]["evidence"]["result_source"], "reviewer_result_file")
-            self.assertEqual(reviewer_result["result"]["evidence"]["result_file_present"], False)
+            self.assertEqual(
+                reviewer_result["result"]["evidence"]["result_source"],
+                "reviewer_result_file",
+            )
+            self.assertEqual(
+                reviewer_result["result"]["evidence"]["result_file_present"], False
+            )
 
-    def test_review_accepts_real_reviewer_bare_stdout_json_when_result_file_is_absent(self):
+    def test_review_accepts_real_reviewer_bare_stdout_json_when_result_file_is_absent(
+        self,
+    ):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
             checkout = temp_path / "checkout"
             start_commit = init_checkout(checkout)
             head_commit = git(checkout, "rev-parse", "HEAD")
-            validation_step, validation_worker = write_validation_artifacts(temp_path / "validation-run")
+            validation_step, validation_worker = write_validation_artifacts(
+                temp_path / "validation-run"
+            )
             ledger = temp_path / "ledger"
             reviewer_code = textwrap.dedent(
                 """
@@ -1149,18 +1424,29 @@ Path(os.environ["AFK_REVIEWER_RESULT"]).write_text(
             self.assertEqual(completed.returncode, 0, completed.stderr)
             summary = json.loads(completed.stdout)
             run_dir = ledger / "runs" / summary["run_id"]
-            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
-            reviewer_result = json.loads((run_dir / "reviewer-result.json").read_text(encoding="utf-8"))
+            result = json.loads(
+                (run_dir / "step-result.json").read_text(encoding="utf-8")
+            )
+            reviewer_result = json.loads(
+                (run_dir / "reviewer-result.json").read_text(encoding="utf-8")
+            )
 
             self.assertEqual(summary["status"], "succeeded")
             self.assertEqual(result["status"], "succeeded")
             self.assertEqual(result["output"]["status"], "passed")
             self.assertEqual(result["output"]["summary"], "pi review passed")
-            self.assertEqual(reviewer_result["result"]["adapter"]["type"], "real-reviewer-command")
+            self.assertEqual(
+                reviewer_result["result"]["adapter"]["type"], "real-reviewer-command"
+            )
             self.assertEqual(reviewer_result["result"]["status"], "passed")
             self.assertEqual(reviewer_result["result"]["summary"], "pi review passed")
-            self.assertEqual(reviewer_result["result"]["evidence"]["result_source"], "stdout_fallback")
-            self.assertEqual(reviewer_result["result"]["evidence"]["result_file_present"], False)
+            self.assertEqual(
+                reviewer_result["result"]["evidence"]["result_source"],
+                "stdout_fallback",
+            )
+            self.assertEqual(
+                reviewer_result["result"]["evidence"]["result_file_present"], False
+            )
 
     def test_review_rejects_status_only_stdout_json_when_result_file_is_absent(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1168,7 +1454,9 @@ Path(os.environ["AFK_REVIEWER_RESULT"]).write_text(
             checkout = temp_path / "checkout"
             start_commit = init_checkout(checkout)
             head_commit = git(checkout, "rev-parse", "HEAD")
-            validation_step, validation_worker = write_validation_artifacts(temp_path / "validation-run")
+            validation_step, validation_worker = write_validation_artifacts(
+                temp_path / "validation-run"
+            )
             ledger = temp_path / "ledger"
             reviewer_code = textwrap.dedent(
                 """
@@ -1199,16 +1487,27 @@ Path(os.environ["AFK_REVIEWER_RESULT"]).write_text(
             self.assertEqual(completed.returncode, 0, completed.stderr)
             summary = json.loads(completed.stdout)
             run_dir = ledger / "runs" / summary["run_id"]
-            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
-            reviewer_result = json.loads((run_dir / "reviewer-result.json").read_text(encoding="utf-8"))
+            result = json.loads(
+                (run_dir / "step-result.json").read_text(encoding="utf-8")
+            )
+            reviewer_result = json.loads(
+                (run_dir / "reviewer-result.json").read_text(encoding="utf-8")
+            )
 
             self.assertEqual(summary["status"], "failed")
             self.assertEqual(result["status"], "failed")
             self.assertEqual(result["output"]["status"], "failed_protocol")
             self.assertEqual(result["output"]["classification"], "protocol_failure")
-            self.assertEqual(result["output"]["summary"], "reviewer result file was not produced")
-            self.assertEqual(reviewer_result["result"]["evidence"]["result_source"], "reviewer_result_file")
-            self.assertEqual(reviewer_result["result"]["evidence"]["result_file_present"], False)
+            self.assertEqual(
+                result["output"]["summary"], "reviewer result file was not produced"
+            )
+            self.assertEqual(
+                reviewer_result["result"]["evidence"]["result_source"],
+                "reviewer_result_file",
+            )
+            self.assertEqual(
+                reviewer_result["result"]["evidence"]["result_file_present"], False
+            )
 
     def test_review_rejects_stdout_json_when_findings_is_not_a_list(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1216,7 +1515,9 @@ Path(os.environ["AFK_REVIEWER_RESULT"]).write_text(
             checkout = temp_path / "checkout"
             start_commit = init_checkout(checkout)
             head_commit = git(checkout, "rev-parse", "HEAD")
-            validation_step, validation_worker = write_validation_artifacts(temp_path / "validation-run")
+            validation_step, validation_worker = write_validation_artifacts(
+                temp_path / "validation-run"
+            )
             ledger = temp_path / "ledger"
             reviewer_code = textwrap.dedent(
                 """
@@ -1247,16 +1548,27 @@ Path(os.environ["AFK_REVIEWER_RESULT"]).write_text(
             self.assertEqual(completed.returncode, 0, completed.stderr)
             summary = json.loads(completed.stdout)
             run_dir = ledger / "runs" / summary["run_id"]
-            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
-            reviewer_result = json.loads((run_dir / "reviewer-result.json").read_text(encoding="utf-8"))
+            result = json.loads(
+                (run_dir / "step-result.json").read_text(encoding="utf-8")
+            )
+            reviewer_result = json.loads(
+                (run_dir / "reviewer-result.json").read_text(encoding="utf-8")
+            )
 
             self.assertEqual(summary["status"], "failed")
             self.assertEqual(result["status"], "failed")
             self.assertEqual(result["output"]["status"], "failed_protocol")
             self.assertEqual(result["output"]["classification"], "protocol_failure")
-            self.assertEqual(result["output"]["summary"], "reviewer result file was not produced")
-            self.assertEqual(reviewer_result["result"]["evidence"]["result_source"], "reviewer_result_file")
-            self.assertEqual(reviewer_result["result"]["evidence"]["result_file_present"], False)
+            self.assertEqual(
+                result["output"]["summary"], "reviewer result file was not produced"
+            )
+            self.assertEqual(
+                reviewer_result["result"]["evidence"]["result_source"],
+                "reviewer_result_file",
+            )
+            self.assertEqual(
+                reviewer_result["result"]["evidence"]["result_file_present"], False
+            )
 
     def test_review_rejects_generic_stdout_json_when_result_file_is_absent(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1264,7 +1576,9 @@ Path(os.environ["AFK_REVIEWER_RESULT"]).write_text(
             checkout = temp_path / "checkout"
             start_commit = init_checkout(checkout)
             head_commit = git(checkout, "rev-parse", "HEAD")
-            validation_step, validation_worker = write_validation_artifacts(temp_path / "validation-run")
+            validation_step, validation_worker = write_validation_artifacts(
+                temp_path / "validation-run"
+            )
             ledger = temp_path / "ledger"
             reviewer_code = textwrap.dedent(
                 """
@@ -1295,8 +1609,12 @@ Path(os.environ["AFK_REVIEWER_RESULT"]).write_text(
             self.assertEqual(completed.returncode, 0, completed.stderr)
             summary = json.loads(completed.stdout)
             run_dir = ledger / "runs" / summary["run_id"]
-            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
-            reviewer_result = json.loads((run_dir / "reviewer-result.json").read_text(encoding="utf-8"))
+            result = json.loads(
+                (run_dir / "step-result.json").read_text(encoding="utf-8")
+            )
+            reviewer_result = json.loads(
+                (run_dir / "reviewer-result.json").read_text(encoding="utf-8")
+            )
 
             self.assertEqual(summary["status"], "failed")
             self.assertEqual(result["status"], "failed")
@@ -1306,8 +1624,13 @@ Path(os.environ["AFK_REVIEWER_RESULT"]).write_text(
                 result["output"]["summary"],
                 "reviewer result file was not produced",
             )
-            self.assertEqual(reviewer_result["result"]["evidence"]["result_source"], "reviewer_result_file")
-            self.assertEqual(reviewer_result["result"]["evidence"]["result_file_present"], False)
+            self.assertEqual(
+                reviewer_result["result"]["evidence"]["result_source"],
+                "reviewer_result_file",
+            )
+            self.assertEqual(
+                reviewer_result["result"]["evidence"]["result_file_present"], False
+            )
 
     def test_review_reports_malformed_stdout_when_result_file_is_absent(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1315,7 +1638,9 @@ Path(os.environ["AFK_REVIEWER_RESULT"]).write_text(
             checkout = temp_path / "checkout"
             start_commit = init_checkout(checkout)
             head_commit = git(checkout, "rev-parse", "HEAD")
-            validation_step, validation_worker = write_validation_artifacts(temp_path / "validation-run")
+            validation_step, validation_worker = write_validation_artifacts(
+                temp_path / "validation-run"
+            )
             ledger = temp_path / "ledger"
             reviewer_code = textwrap.dedent(
                 """
@@ -1344,25 +1669,43 @@ Path(os.environ["AFK_REVIEWER_RESULT"]).write_text(
             self.assertEqual(completed.returncode, 0, completed.stderr)
             summary = json.loads(completed.stdout)
             run_dir = ledger / "runs" / summary["run_id"]
-            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
-            reviewer_result = json.loads((run_dir / "reviewer-result.json").read_text(encoding="utf-8"))
+            result = json.loads(
+                (run_dir / "step-result.json").read_text(encoding="utf-8")
+            )
+            reviewer_result = json.loads(
+                (run_dir / "reviewer-result.json").read_text(encoding="utf-8")
+            )
 
             self.assertEqual(summary["status"], "failed")
             self.assertEqual(result["status"], "failed")
             self.assertEqual(result["output"]["status"], "failed_protocol")
             self.assertEqual(result["output"]["classification"], "protocol_failure")
-            self.assertEqual(result["output"]["summary"], "reviewer result file was not produced")
-            self.assertEqual(reviewer_result["result"]["evidence"]["result_source"], "reviewer_result_file")
-            self.assertEqual(reviewer_result["result"]["evidence"]["result_file_present"], False)
-            self.assertIn("reviewer: starting up", reviewer_result["result"]["evidence"]["stdout_excerpt"])
+            self.assertEqual(
+                result["output"]["summary"], "reviewer result file was not produced"
+            )
+            self.assertEqual(
+                reviewer_result["result"]["evidence"]["result_source"],
+                "reviewer_result_file",
+            )
+            self.assertEqual(
+                reviewer_result["result"]["evidence"]["result_file_present"], False
+            )
+            self.assertIn(
+                "reviewer: starting up",
+                reviewer_result["result"]["evidence"]["stdout_excerpt"],
+            )
 
-    def test_review_reports_missing_result_file_when_reviewer_exits_zero_with_silent_stdout(self):
+    def test_review_reports_missing_result_file_when_reviewer_exits_zero_with_silent_stdout(
+        self,
+    ):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
             checkout = temp_path / "checkout"
             start_commit = init_checkout(checkout)
             head_commit = git(checkout, "rev-parse", "HEAD")
-            validation_step, validation_worker = write_validation_artifacts(temp_path / "validation-run")
+            validation_step, validation_worker = write_validation_artifacts(
+                temp_path / "validation-run"
+            )
             ledger = temp_path / "ledger"
             reviewer_code = textwrap.dedent(
                 """
@@ -1391,17 +1734,31 @@ Path(os.environ["AFK_REVIEWER_RESULT"]).write_text(
             self.assertEqual(completed.returncode, 0, completed.stderr)
             summary = json.loads(completed.stdout)
             run_dir = ledger / "runs" / summary["run_id"]
-            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
-            reviewer_result = json.loads((run_dir / "reviewer-result.json").read_text(encoding="utf-8"))
+            result = json.loads(
+                (run_dir / "step-result.json").read_text(encoding="utf-8")
+            )
+            reviewer_result = json.loads(
+                (run_dir / "reviewer-result.json").read_text(encoding="utf-8")
+            )
 
             self.assertEqual(summary["status"], "failed")
             self.assertEqual(result["status"], "failed")
             self.assertEqual(result["output"]["status"], "failed_protocol")
             self.assertEqual(result["output"]["classification"], "protocol_failure")
-            self.assertEqual(result["output"]["summary"], "reviewer result file was not produced")
-            self.assertEqual(reviewer_result["result"]["summary"], "reviewer result file was not produced")
-            self.assertEqual(reviewer_result["result"]["evidence"]["result_source"], "reviewer_result_file")
-            self.assertEqual(reviewer_result["result"]["evidence"]["result_file_present"], False)
+            self.assertEqual(
+                result["output"]["summary"], "reviewer result file was not produced"
+            )
+            self.assertEqual(
+                reviewer_result["result"]["summary"],
+                "reviewer result file was not produced",
+            )
+            self.assertEqual(
+                reviewer_result["result"]["evidence"]["result_source"],
+                "reviewer_result_file",
+            )
+            self.assertEqual(
+                reviewer_result["result"]["evidence"]["result_file_present"], False
+            )
 
     def test_review_prefers_valid_result_file_over_noisy_stdout(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1409,7 +1766,9 @@ Path(os.environ["AFK_REVIEWER_RESULT"]).write_text(
             checkout = temp_path / "checkout"
             start_commit = init_checkout(checkout)
             head_commit = git(checkout, "rev-parse", "HEAD")
-            validation_step, validation_worker = write_validation_artifacts(temp_path / "validation-run")
+            validation_step, validation_worker = write_validation_artifacts(
+                temp_path / "validation-run"
+            )
             ledger = temp_path / "ledger"
             reviewer_code = textwrap.dedent(
                 """
@@ -1452,16 +1811,25 @@ Path(os.environ["AFK_REVIEWER_RESULT"]).write_text(
             self.assertEqual(completed.returncode, 0, completed.stderr)
             summary = json.loads(completed.stdout)
             run_dir = ledger / "runs" / summary["run_id"]
-            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
-            reviewer_result = json.loads((run_dir / "reviewer-result.json").read_text(encoding="utf-8"))
+            result = json.loads(
+                (run_dir / "step-result.json").read_text(encoding="utf-8")
+            )
+            reviewer_result = json.loads(
+                (run_dir / "reviewer-result.json").read_text(encoding="utf-8")
+            )
 
             self.assertEqual(summary["status"], "succeeded")
             self.assertEqual(result["status"], "succeeded")
             self.assertEqual(result["output"]["status"], "passed")
             self.assertEqual(result["output"]["summary"], "file result wins")
             self.assertEqual(reviewer_result["result"]["summary"], "file result wins")
-            self.assertEqual(reviewer_result["result"]["evidence"]["result_source"], "reviewer_result_file")
-            self.assertEqual(reviewer_result["result"]["evidence"]["result_file_present"], True)
+            self.assertEqual(
+                reviewer_result["result"]["evidence"]["result_source"],
+                "reviewer_result_file",
+            )
+            self.assertEqual(
+                reviewer_result["result"]["evidence"]["result_file_present"], True
+            )
 
     def test_review_does_not_fallback_to_stdout_when_result_file_is_invalid(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1469,7 +1837,9 @@ Path(os.environ["AFK_REVIEWER_RESULT"]).write_text(
             checkout = temp_path / "checkout"
             start_commit = init_checkout(checkout)
             head_commit = git(checkout, "rev-parse", "HEAD")
-            validation_step, validation_worker = write_validation_artifacts(temp_path / "validation-run")
+            validation_step, validation_worker = write_validation_artifacts(
+                temp_path / "validation-run"
+            )
             ledger = temp_path / "ledger"
             reviewer_code = textwrap.dedent(
                 """
@@ -1503,18 +1873,31 @@ Path(os.environ["AFK_REVIEWER_RESULT"]).write_text(
             self.assertEqual(completed.returncode, 0, completed.stderr)
             summary = json.loads(completed.stdout)
             run_dir = ledger / "runs" / summary["run_id"]
-            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
-            reviewer_result = json.loads((run_dir / "reviewer-result.json").read_text(encoding="utf-8"))
+            result = json.loads(
+                (run_dir / "step-result.json").read_text(encoding="utf-8")
+            )
+            reviewer_result = json.loads(
+                (run_dir / "reviewer-result.json").read_text(encoding="utf-8")
+            )
 
             self.assertEqual(summary["status"], "failed")
             self.assertEqual(result["status"], "failed")
             self.assertEqual(result["output"]["status"], "failed_protocol")
             self.assertEqual(result["output"]["classification"], "protocol_failure")
-            self.assertEqual(result["output"]["summary"], "reviewer result file is not valid JSON")
-            self.assertEqual(reviewer_result["result"]["evidence"]["result_source"], "reviewer_result_file")
-            self.assertEqual(reviewer_result["result"]["evidence"]["result_file_present"], True)
+            self.assertEqual(
+                result["output"]["summary"], "reviewer result file is not valid JSON"
+            )
+            self.assertEqual(
+                reviewer_result["result"]["evidence"]["result_source"],
+                "reviewer_result_file",
+            )
+            self.assertEqual(
+                reviewer_result["result"]["evidence"]["result_file_present"], True
+            )
 
-    def test_review_refuses_missing_required_validation_artifact_paths_as_validation_evidence(self):
+    def test_review_refuses_missing_required_validation_artifact_paths_as_validation_evidence(
+        self,
+    ):
         cases = [
             (
                 "step_result_path",
@@ -1530,12 +1913,17 @@ Path(os.environ["AFK_REVIEWER_RESULT"]).write_text(
             ),
         ]
         for missing_path, expected_error, result_key, path_key in cases:
-            with self.subTest(missing_path=missing_path), tempfile.TemporaryDirectory() as temp_dir:
+            with (
+                self.subTest(missing_path=missing_path),
+                tempfile.TemporaryDirectory() as temp_dir,
+            ):
                 temp_path = Path(temp_dir)
                 checkout = temp_path / "checkout"
                 start_commit = init_checkout(checkout)
                 head_commit = git(checkout, "rev-parse", "HEAD")
-                validation_step, validation_worker = write_validation_artifacts(temp_path / "validation-run")
+                validation_step, validation_worker = write_validation_artifacts(
+                    temp_path / "validation-run"
+                )
                 ledger = temp_path / "ledger"
                 reviewer_code = textwrap.dedent(
                     """
@@ -1572,24 +1960,42 @@ Path(os.environ["AFK_REVIEWER_RESULT"]).write_text(
                 self.assertEqual(completed.returncode, 0, completed.stderr)
                 summary = json.loads(completed.stdout)
                 run_dir = ledger / "runs" / summary["run_id"]
-                result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
-                reviewer_result = json.loads((run_dir / "reviewer-result.json").read_text(encoding="utf-8"))
-                evidence_pack = json.loads((run_dir / "evidence-pack.json").read_text(encoding="utf-8"))
+                result = json.loads(
+                    (run_dir / "step-result.json").read_text(encoding="utf-8")
+                )
+                reviewer_result = json.loads(
+                    (run_dir / "reviewer-result.json").read_text(encoding="utf-8")
+                )
+                evidence_pack = json.loads(
+                    (run_dir / "evidence-pack.json").read_text(encoding="utf-8")
+                )
                 required = evidence_pack["evidence_pack"]["validation"]["required"][0]
                 finding = reviewer_result["result"]["findings"][0]
 
-                self.assertEqual(result["output"]["status"], "failed_validation_evidence")
-                self.assertEqual(result["output"]["classification"], "validation_evidence_incomplete")
+                self.assertEqual(
+                    result["output"]["status"], "failed_validation_evidence"
+                )
+                self.assertEqual(
+                    result["output"]["classification"], "validation_evidence_incomplete"
+                )
                 self.assertEqual(reviewer_result["artifact_type"], "reviewer-result")
-                self.assertEqual(reviewer_result["result"]["status"], "failed_validation_evidence")
-                self.assertEqual(reviewer_result["result"]["classification"], "validation_evidence_incomplete")
+                self.assertEqual(
+                    reviewer_result["result"]["status"], "failed_validation_evidence"
+                )
+                self.assertEqual(
+                    reviewer_result["result"]["classification"],
+                    "validation_evidence_incomplete",
+                )
                 self.assertEqual(required["evidence_status"], "invalid")
                 self.assertEqual(required[path_key], "")
                 self.assertEqual(required[result_key]["status"], "invalid_path")
                 self.assertIn(expected_error, required["evidence_errors"])
                 self.assertIn(expected_error, finding["summary"])
                 self.assertEqual(finding["validation"]["name"], "tier1")
-                self.assertNotIn("reviewer should not run", (run_dir / "stdout.log").read_text(encoding="utf-8"))
+                self.assertNotIn(
+                    "reviewer should not run",
+                    (run_dir / "stdout.log").read_text(encoding="utf-8"),
+                )
 
     def test_review_refuses_pass_when_required_worker_result_artifact_is_missing(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1597,7 +2003,9 @@ Path(os.environ["AFK_REVIEWER_RESULT"]).write_text(
             checkout = temp_path / "checkout"
             start_commit = init_checkout(checkout)
             head_commit = git(checkout, "rev-parse", "HEAD")
-            validation_step, validation_worker = write_validation_artifacts(temp_path / "validation-run")
+            validation_step, validation_worker = write_validation_artifacts(
+                temp_path / "validation-run"
+            )
             validation_worker.unlink()
             ledger = temp_path / "ledger"
             reviewer_code = textwrap.dedent(
@@ -1635,26 +2043,43 @@ Path(os.environ["AFK_REVIEWER_RESULT"]).write_text(
             self.assertEqual(completed.returncode, 0, completed.stderr)
             summary = json.loads(completed.stdout)
             run_dir = ledger / "runs" / summary["run_id"]
-            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
-            reviewer_result = json.loads((run_dir / "reviewer-result.json").read_text(encoding="utf-8"))
-            evidence_pack = json.loads((run_dir / "evidence-pack.json").read_text(encoding="utf-8"))
+            result = json.loads(
+                (run_dir / "step-result.json").read_text(encoding="utf-8")
+            )
+            reviewer_result = json.loads(
+                (run_dir / "reviewer-result.json").read_text(encoding="utf-8")
+            )
+            evidence_pack = json.loads(
+                (run_dir / "evidence-pack.json").read_text(encoding="utf-8")
+            )
 
             self.assertEqual(result["output"]["status"], "failed_validation_evidence")
-            self.assertEqual(reviewer_result["result"]["status"], "failed_validation_evidence")
+            self.assertEqual(
+                reviewer_result["result"]["status"], "failed_validation_evidence"
+            )
             self.assertIn("tier1", reviewer_result["result"]["summary"])
             self.assertEqual(
-                evidence_pack["evidence_pack"]["validation"]["required"][0]["worker_status"],
+                evidence_pack["evidence_pack"]["validation"]["required"][0][
+                    "worker_status"
+                ],
                 "missing",
             )
-            self.assertNotIn("reviewer should not run", (run_dir / "stdout.log").read_text(encoding="utf-8"))
+            self.assertNotIn(
+                "reviewer should not run",
+                (run_dir / "stdout.log").read_text(encoding="utf-8"),
+            )
 
-    def test_review_refuses_forged_validation_artifacts_with_validated_nested_statuses(self):
+    def test_review_refuses_forged_validation_artifacts_with_validated_nested_statuses(
+        self,
+    ):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
             checkout = temp_path / "checkout"
             start_commit = init_checkout(checkout)
             head_commit = git(checkout, "rev-parse", "HEAD")
-            validation_step, validation_worker = write_validation_artifacts(temp_path / "validation-run")
+            validation_step, validation_worker = write_validation_artifacts(
+                temp_path / "validation-run"
+            )
             step_payload = json.loads(validation_step.read_text(encoding="utf-8"))
             step_payload["step"] = "review"
             step_payload["status"] = "failed"
@@ -1698,19 +2123,35 @@ Path(os.environ["AFK_REVIEWER_RESULT"]).write_text(
             self.assertEqual(completed.returncode, 0, completed.stderr)
             summary = json.loads(completed.stdout)
             run_dir = ledger / "runs" / summary["run_id"]
-            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
-            reviewer_result = json.loads((run_dir / "reviewer-result.json").read_text(encoding="utf-8"))
-            evidence_pack = json.loads((run_dir / "evidence-pack.json").read_text(encoding="utf-8"))
+            result = json.loads(
+                (run_dir / "step-result.json").read_text(encoding="utf-8")
+            )
+            reviewer_result = json.loads(
+                (run_dir / "reviewer-result.json").read_text(encoding="utf-8")
+            )
+            evidence_pack = json.loads(
+                (run_dir / "evidence-pack.json").read_text(encoding="utf-8")
+            )
 
             self.assertEqual(result["output"]["status"], "failed_validation_evidence")
-            self.assertEqual(reviewer_result["result"]["status"], "failed_validation_evidence")
-            self.assertIn("tier1", reviewer_result["result"]["summary"])
-            self.assertEqual(evidence_pack["evidence_pack"]["validation"]["required"][0]["status"], "validated")
             self.assertEqual(
-                evidence_pack["evidence_pack"]["validation"]["required"][0]["evidence_status"],
+                reviewer_result["result"]["status"], "failed_validation_evidence"
+            )
+            self.assertIn("tier1", reviewer_result["result"]["summary"])
+            self.assertEqual(
+                evidence_pack["evidence_pack"]["validation"]["required"][0]["status"],
+                "validated",
+            )
+            self.assertEqual(
+                evidence_pack["evidence_pack"]["validation"]["required"][0][
+                    "evidence_status"
+                ],
                 "invalid",
             )
-            self.assertNotIn("reviewer should not run", (run_dir / "stdout.log").read_text(encoding="utf-8"))
+            self.assertNotIn(
+                "reviewer should not run",
+                (run_dir / "stdout.log").read_text(encoding="utf-8"),
+            )
 
     def test_review_refuses_validation_artifacts_missing_run_id_values(self):
         cases = [
@@ -1718,12 +2159,17 @@ Path(os.environ["AFK_REVIEWER_RESULT"]).write_text(
             ("worker", "worker_result run_id is required"),
         ]
         for missing_artifact, expected_error in cases:
-            with self.subTest(missing_artifact=missing_artifact), tempfile.TemporaryDirectory() as temp_dir:
+            with (
+                self.subTest(missing_artifact=missing_artifact),
+                tempfile.TemporaryDirectory() as temp_dir,
+            ):
                 temp_path = Path(temp_dir)
                 checkout = temp_path / "checkout"
                 start_commit = init_checkout(checkout)
                 head_commit = git(checkout, "rev-parse", "HEAD")
-                validation_step, validation_worker = write_validation_artifacts(temp_path / "validation-run")
+                validation_step, validation_worker = write_validation_artifacts(
+                    temp_path / "validation-run"
+                )
                 if missing_artifact == "step":
                     payload = json.loads(validation_step.read_text(encoding="utf-8"))
                     del payload["run_id"]
@@ -1768,26 +2214,47 @@ Path(os.environ["AFK_REVIEWER_RESULT"]).write_text(
                 self.assertEqual(completed.returncode, 0, completed.stderr)
                 summary = json.loads(completed.stdout)
                 run_dir = ledger / "runs" / summary["run_id"]
-                result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
-                reviewer_result = json.loads((run_dir / "reviewer-result.json").read_text(encoding="utf-8"))
-                evidence_pack = json.loads((run_dir / "evidence-pack.json").read_text(encoding="utf-8"))
+                result = json.loads(
+                    (run_dir / "step-result.json").read_text(encoding="utf-8")
+                )
+                reviewer_result = json.loads(
+                    (run_dir / "reviewer-result.json").read_text(encoding="utf-8")
+                )
+                evidence_pack = json.loads(
+                    (run_dir / "evidence-pack.json").read_text(encoding="utf-8")
+                )
                 required = evidence_pack["evidence_pack"]["validation"]["required"][0]
 
-                self.assertEqual(result["output"]["status"], "failed_validation_evidence")
-                self.assertEqual(result["output"]["classification"], "validation_evidence_incomplete")
-                self.assertEqual(reviewer_result["result"]["status"], "failed_validation_evidence")
+                self.assertEqual(
+                    result["output"]["status"], "failed_validation_evidence"
+                )
+                self.assertEqual(
+                    result["output"]["classification"], "validation_evidence_incomplete"
+                )
+                self.assertEqual(
+                    reviewer_result["result"]["status"], "failed_validation_evidence"
+                )
                 self.assertEqual(required["evidence_status"], "invalid")
                 self.assertIn(expected_error, required["evidence_errors"])
-                self.assertIn(expected_error, reviewer_result["result"]["findings"][0]["summary"])
-                self.assertNotIn("reviewer should not run", (run_dir / "stdout.log").read_text(encoding="utf-8"))
+                self.assertIn(
+                    expected_error, reviewer_result["result"]["findings"][0]["summary"]
+                )
+                self.assertNotIn(
+                    "reviewer should not run",
+                    (run_dir / "stdout.log").read_text(encoding="utf-8"),
+                )
 
-    def test_review_rejects_arbitrary_validation_artifact_filenames_without_reading_them(self):
+    def test_review_rejects_arbitrary_validation_artifact_filenames_without_reading_them(
+        self,
+    ):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
             checkout = temp_path / "checkout"
             start_commit = init_checkout(checkout)
             head_commit = git(checkout, "rev-parse", "HEAD")
-            validation_step, validation_worker = write_validation_artifacts(temp_path / "validation-run")
+            validation_step, validation_worker = write_validation_artifacts(
+                temp_path / "validation-run"
+            )
             arbitrary_artifact = validation_step.with_name("secrets.json")
             step_payload = json.loads(validation_step.read_text(encoding="utf-8"))
             step_payload["leak"] = "arbitrary-json-secret"
@@ -1832,28 +2299,45 @@ Path(os.environ["AFK_REVIEWER_RESULT"]).write_text(
             self.assertEqual(completed.returncode, 0, completed.stderr)
             summary = json.loads(completed.stdout)
             run_dir = ledger / "runs" / summary["run_id"]
-            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
-            reviewer_result = json.loads((run_dir / "reviewer-result.json").read_text(encoding="utf-8"))
-            evidence_pack = json.loads((run_dir / "evidence-pack.json").read_text(encoding="utf-8"))
+            result = json.loads(
+                (run_dir / "step-result.json").read_text(encoding="utf-8")
+            )
+            reviewer_result = json.loads(
+                (run_dir / "reviewer-result.json").read_text(encoding="utf-8")
+            )
+            evidence_pack = json.loads(
+                (run_dir / "evidence-pack.json").read_text(encoding="utf-8")
+            )
             artifact_text = run_dir_text(run_dir)
 
             self.assertEqual(result["output"]["status"], "failed_validation_evidence")
-            self.assertEqual(reviewer_result["result"]["status"], "failed_validation_evidence")
             self.assertEqual(
-                evidence_pack["evidence_pack"]["validation"]["required"][0]["step_result"]["status"],
+                reviewer_result["result"]["status"], "failed_validation_evidence"
+            )
+            self.assertEqual(
+                evidence_pack["evidence_pack"]["validation"]["required"][0][
+                    "step_result"
+                ]["status"],
                 "invalid_path",
             )
             self.assertNotIn("arbitrary-json-secret", artifact_text)
             self.assertNotIn(opposite_worker_secret, artifact_text)
-            self.assertNotIn("reviewer should not run", (run_dir / "stdout.log").read_text(encoding="utf-8"))
+            self.assertNotIn(
+                "reviewer should not run",
+                (run_dir / "stdout.log").read_text(encoding="utf-8"),
+            )
 
-    def test_review_rejects_arbitrary_worker_artifact_filename_without_reading_step_artifact(self):
+    def test_review_rejects_arbitrary_worker_artifact_filename_without_reading_step_artifact(
+        self,
+    ):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
             checkout = temp_path / "checkout"
             start_commit = init_checkout(checkout)
             head_commit = git(checkout, "rev-parse", "HEAD")
-            validation_step, validation_worker = write_validation_artifacts(temp_path / "validation-run")
+            validation_step, validation_worker = write_validation_artifacts(
+                temp_path / "validation-run"
+            )
             opposite_step_secret = "ghp_step_pair_sentinel_123"
             step_payload = json.loads(validation_step.read_text(encoding="utf-8"))
             step_payload["evidence_marker"] = opposite_step_secret
@@ -1861,7 +2345,9 @@ Path(os.environ["AFK_REVIEWER_RESULT"]).write_text(
             arbitrary_worker_artifact = validation_worker.with_name("secrets.json")
             worker_payload = json.loads(validation_worker.read_text(encoding="utf-8"))
             worker_payload["result"]["raw"]["leak"] = "arbitrary-worker-json-secret"
-            arbitrary_worker_artifact.write_text(json.dumps(worker_payload), encoding="utf-8")
+            arbitrary_worker_artifact.write_text(
+                json.dumps(worker_payload), encoding="utf-8"
+            )
             ledger = temp_path / "ledger"
             reviewer_code = textwrap.dedent(
                 """
@@ -1898,31 +2384,51 @@ Path(os.environ["AFK_REVIEWER_RESULT"]).write_text(
             self.assertEqual(completed.returncode, 0, completed.stderr)
             summary = json.loads(completed.stdout)
             run_dir = ledger / "runs" / summary["run_id"]
-            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
-            reviewer_result = json.loads((run_dir / "reviewer-result.json").read_text(encoding="utf-8"))
-            evidence_pack = json.loads((run_dir / "evidence-pack.json").read_text(encoding="utf-8"))
+            result = json.loads(
+                (run_dir / "step-result.json").read_text(encoding="utf-8")
+            )
+            reviewer_result = json.loads(
+                (run_dir / "reviewer-result.json").read_text(encoding="utf-8")
+            )
+            evidence_pack = json.loads(
+                (run_dir / "evidence-pack.json").read_text(encoding="utf-8")
+            )
             artifact_text = run_dir_text(run_dir)
 
             self.assertEqual(result["output"]["status"], "failed_validation_evidence")
-            self.assertEqual(reviewer_result["result"]["status"], "failed_validation_evidence")
             self.assertEqual(
-                evidence_pack["evidence_pack"]["validation"]["required"][0]["worker_result"]["status"],
+                reviewer_result["result"]["status"], "failed_validation_evidence"
+            )
+            self.assertEqual(
+                evidence_pack["evidence_pack"]["validation"]["required"][0][
+                    "worker_result"
+                ]["status"],
                 "invalid_path",
             )
             self.assertNotIn(opposite_step_secret, artifact_text)
             self.assertNotIn("arbitrary-worker-json-secret", artifact_text)
-            self.assertNotIn("reviewer should not run", (run_dir / "stdout.log").read_text(encoding="utf-8"))
+            self.assertNotIn(
+                "reviewer should not run",
+                (run_dir / "stdout.log").read_text(encoding="utf-8"),
+            )
 
     def test_review_rejects_non_sibling_validation_artifacts_without_reading_them(self):
         cases = ["step", "worker"]
         for secret_artifact in cases:
-            with self.subTest(secret_artifact=secret_artifact), tempfile.TemporaryDirectory() as temp_dir:
+            with (
+                self.subTest(secret_artifact=secret_artifact),
+                tempfile.TemporaryDirectory() as temp_dir,
+            ):
                 temp_path = Path(temp_dir)
                 checkout = temp_path / "checkout"
                 start_commit = init_checkout(checkout)
                 head_commit = git(checkout, "rev-parse", "HEAD")
-                trusted_step, trusted_worker = write_validation_artifacts(temp_path / "validation-run")
-                outside_step, outside_worker = write_validation_artifacts(temp_path / "outside" / "validation-run")
+                trusted_step, trusted_worker = write_validation_artifacts(
+                    temp_path / "validation-run"
+                )
+                outside_step, outside_worker = write_validation_artifacts(
+                    temp_path / "outside" / "validation-run"
+                )
                 non_sibling_secret = f"non-sibling-{secret_artifact}-artifact-secret"
                 if secret_artifact == "step":
                     step_payload = json.loads(outside_step.read_text(encoding="utf-8"))
@@ -1931,9 +2437,13 @@ Path(os.environ["AFK_REVIEWER_RESULT"]).write_text(
                     validation_step = outside_step
                     validation_worker = trusted_worker
                 else:
-                    worker_payload = json.loads(outside_worker.read_text(encoding="utf-8"))
+                    worker_payload = json.loads(
+                        outside_worker.read_text(encoding="utf-8")
+                    )
                     worker_payload["result"]["raw"]["note"] = non_sibling_secret
-                    outside_worker.write_text(json.dumps(worker_payload), encoding="utf-8")
+                    outside_worker.write_text(
+                        json.dumps(worker_payload), encoding="utf-8"
+                    )
                     validation_step = trusted_step
                     validation_worker = outside_worker
                 ledger = temp_path / "ledger"
@@ -1979,33 +2489,65 @@ Path(os.environ["AFK_REVIEWER_RESULT"]).write_text(
                 self.assertEqual(completed.returncode, 0, completed.stderr)
                 summary = json.loads(completed.stdout)
                 run_dir = ledger / "runs" / summary["run_id"]
-                result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
-                reviewer_result = json.loads((run_dir / "reviewer-result.json").read_text(encoding="utf-8"))
-                evidence_pack = json.loads((run_dir / "evidence-pack.json").read_text(encoding="utf-8"))
+                result = json.loads(
+                    (run_dir / "step-result.json").read_text(encoding="utf-8")
+                )
+                reviewer_result = json.loads(
+                    (run_dir / "reviewer-result.json").read_text(encoding="utf-8")
+                )
+                evidence_pack = json.loads(
+                    (run_dir / "evidence-pack.json").read_text(encoding="utf-8")
+                )
                 artifact_text = run_dir_text(run_dir)
 
-                self.assertEqual(result["output"]["status"], "failed_validation_evidence")
-                self.assertEqual(result["output"]["classification"], "validation_evidence_incomplete")
-                self.assertEqual(reviewer_result["result"]["status"], "failed_validation_evidence")
+                self.assertEqual(
+                    result["output"]["status"], "failed_validation_evidence"
+                )
+                self.assertEqual(
+                    result["output"]["classification"], "validation_evidence_incomplete"
+                )
+                self.assertEqual(
+                    reviewer_result["result"]["status"], "failed_validation_evidence"
+                )
                 self.assertIn(
                     "validation artifacts must be in the same or sibling ledger run directory",
-                    evidence_pack["evidence_pack"]["validation"]["required"][0]["evidence_errors"],
+                    evidence_pack["evidence_pack"]["validation"]["required"][0][
+                        "evidence_errors"
+                    ],
                 )
                 self.assertNotIn(non_sibling_secret, artifact_text)
-                self.assertNotIn("reviewer should not run", (run_dir / "stdout.log").read_text(encoding="utf-8"))
+                self.assertNotIn(
+                    "reviewer should not run",
+                    (run_dir / "stdout.log").read_text(encoding="utf-8"),
+                )
 
     def test_review_records_reviewer_fail_and_request_revision_statuses(self):
         cases = [
             ("fail", "failed", "review_failure", "failed"),
-            ("request_revision", "request_revision", "review_revision_requested", "succeeded"),
+            (
+                "request_revision",
+                "request_revision",
+                "review_revision_requested",
+                "succeeded",
+            ),
         ]
-        for raw_status, expected_status, expected_classification, expected_step_status in cases:
-            with self.subTest(raw_status=raw_status), tempfile.TemporaryDirectory() as temp_dir:
+        for (
+            raw_status,
+            expected_status,
+            expected_classification,
+            expected_step_status,
+        ) in cases:
+            with (
+                self.subTest(raw_status=raw_status),
+                tempfile.TemporaryDirectory() as temp_dir,
+            ):
                 temp_path = Path(temp_dir)
                 checkout = temp_path / "checkout"
                 start_commit = init_checkout(checkout)
                 head_commit = git(checkout, "rev-parse", "HEAD")
-                validation_step, validation_worker = write_validation_artifacts(temp_path / "validation-run")
+                validation_step, validation_worker = write_validation_artifacts(
+                    temp_path / "validation-run"
+                )
                 ledger = temp_path / "ledger"
                 reviewer_code = textwrap.dedent(
                     f"""
@@ -2055,17 +2597,29 @@ Path(os.environ["AFK_REVIEWER_RESULT"]).write_text(
                 self.assertEqual(completed.returncode, 0, completed.stderr)
                 summary = json.loads(completed.stdout)
                 run_dir = ledger / "runs" / summary["run_id"]
-                result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
-                reviewer_result = json.loads((run_dir / "reviewer-result.json").read_text(encoding="utf-8"))
-                review_summary = (run_dir / "review-summary.md").read_text(encoding="utf-8")
+                result = json.loads(
+                    (run_dir / "step-result.json").read_text(encoding="utf-8")
+                )
+                reviewer_result = json.loads(
+                    (run_dir / "reviewer-result.json").read_text(encoding="utf-8")
+                )
+                review_summary = (run_dir / "review-summary.md").read_text(
+                    encoding="utf-8"
+                )
 
                 self.assertEqual(summary["status"], expected_step_status)
                 self.assertEqual(result["status"], expected_step_status)
                 self.assertEqual(result["output"]["status"], expected_status)
-                self.assertEqual(result["output"]["classification"], expected_classification)
+                self.assertEqual(
+                    result["output"]["classification"], expected_classification
+                )
                 self.assertEqual(reviewer_result["result"]["status"], expected_status)
-                self.assertEqual(reviewer_result["result"]["classification"], expected_classification)
-                self.assertEqual(reviewer_result["result"]["findings"][0]["status"], raw_status)
+                self.assertEqual(
+                    reviewer_result["result"]["classification"], expected_classification
+                )
+                self.assertEqual(
+                    reviewer_result["result"]["findings"][0]["status"], raw_status
+                )
                 self.assertIn(f"Reviewer finding for {raw_status}", review_summary)
 
     def test_review_redacts_nested_evidence_and_reviewer_output(self):
@@ -2074,14 +2628,24 @@ Path(os.environ["AFK_REVIEWER_RESULT"]).write_text(
             checkout = temp_path / "checkout"
             start_commit = init_checkout(checkout)
             head_commit = git(checkout, "rev-parse", "HEAD")
-            validation_step, validation_worker = write_validation_artifacts(temp_path / "validation-run")
+            validation_step, validation_worker = write_validation_artifacts(
+                temp_path / "validation-run"
+            )
             validation_secret = "validation-token-secret"
-            validation_payload = json.loads(validation_worker.read_text(encoding="utf-8"))
+            validation_payload = json.loads(
+                validation_worker.read_text(encoding="utf-8")
+            )
             validation_payload["result"]["raw"]["token"] = validation_secret
             validation_payload["result"]["raw"]["steps"].append(
-                {"name": "secret_check", "status": "pass", "message": "API_TOKEN=" + validation_secret}
+                {
+                    "name": "secret_check",
+                    "status": "pass",
+                    "message": "API_TOKEN=" + validation_secret,
+                }
             )
-            validation_worker.write_text(json.dumps(validation_payload), encoding="utf-8")
+            validation_worker.write_text(
+                json.dumps(validation_payload), encoding="utf-8"
+            )
             ledger = temp_path / "ledger"
             ambient_secret = "ambient-reviewer-secret"
             reviewer_code = textwrap.dedent(
@@ -2145,7 +2709,9 @@ Path(os.environ["AFK_REVIEWER_RESULT"]).write_text(
                         ],
                         cleanup={
                             "status": "clean",
-                            "resources": [{"name": "temp", "password": "cleanup-password-secret"}],
+                            "resources": [
+                                {"name": "temp", "password": "cleanup-password-secret"}
+                            ],
                         },
                     )
                 ),
@@ -2160,27 +2726,48 @@ Path(os.environ["AFK_REVIEWER_RESULT"]).write_text(
             self.assertEqual(completed.returncode, 0, completed.stderr)
             summary = json.loads(completed.stdout)
             run_dir = ledger / "runs" / summary["run_id"]
-            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
-            evidence_pack = json.loads((run_dir / "evidence-pack.json").read_text(encoding="utf-8"))
-            reviewer_result = json.loads((run_dir / "reviewer-result.json").read_text(encoding="utf-8"))
+            result = json.loads(
+                (run_dir / "step-result.json").read_text(encoding="utf-8")
+            )
+            evidence_pack = json.loads(
+                (run_dir / "evidence-pack.json").read_text(encoding="utf-8")
+            )
+            reviewer_result = json.loads(
+                (run_dir / "reviewer-result.json").read_text(encoding="utf-8")
+            )
             stdout_log = (run_dir / "stdout.log").read_text(encoding="utf-8")
             stderr_log = (run_dir / "stderr.log").read_text(encoding="utf-8")
             artifact_text = run_dir_text(run_dir)
 
             self.assertEqual(result["output"]["status"], "passed")
-            self.assertEqual(evidence_pack["evidence_pack"]["redaction"]["applied"], True)
             self.assertEqual(
-                evidence_pack["evidence_pack"]["validation"]["required"][0]["worker_result"]["result"]["raw"]["token"],
+                evidence_pack["evidence_pack"]["redaction"]["applied"], True
+            )
+            self.assertEqual(
+                evidence_pack["evidence_pack"]["validation"]["required"][0][
+                    "worker_result"
+                ]["result"]["raw"]["token"],
                 "[REDACTED]",
             )
-            self.assertEqual(reviewer_result["result"]["summary"], "API_TOKEN=[REDACTED]")
-            self.assertEqual(reviewer_result["result"]["findings"][0]["details"], "PASSWORD=[REDACTED]")
+            self.assertEqual(
+                reviewer_result["result"]["summary"], "API_TOKEN=[REDACTED]"
+            )
+            self.assertEqual(
+                reviewer_result["result"]["findings"][0]["details"],
+                "PASSWORD=[REDACTED]",
+            )
             self.assertIn("REVIEW_TOKEN=[REDACTED]", artifact_text)
             self.assertIn('"token": "[REDACTED]"', stdout_log)
             self.assertIn('"api_key": "[REDACTED]"', stdout_log)
             self.assertIn('"password": "[REDACTED]"', stderr_log)
-            self.assertIn('"token": "[REDACTED]"', reviewer_result["result"]["evidence"]["stdout_excerpt"])
-            self.assertIn('"password": "[REDACTED]"', reviewer_result["result"]["evidence"]["stderr_excerpt"])
+            self.assertIn(
+                '"token": "[REDACTED]"',
+                reviewer_result["result"]["evidence"]["stdout_excerpt"],
+            )
+            self.assertIn(
+                '"password": "[REDACTED]"',
+                reviewer_result["result"]["evidence"]["stderr_excerpt"],
+            )
             self.assertIn("GITHUB_TOKEN=[REDACTED]", artifact_text)
             self.assertNotIn(validation_secret, artifact_text)
             self.assertNotIn("work-item-token-secret", artifact_text)
