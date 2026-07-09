@@ -57,13 +57,16 @@ within `gpt-5.4` or lower assumptions.
 
 ### PR review cycle
 
-- Every implementation PR gets two review passes from sub-agents:
-  - one reviewer checks correctness against the Bead requirements
-  - one reviewer looks for bugs, regressions, and missing validation
-- Put each reviewer's findings on the PR.
-- Address feedback one item at a time through sequential sub-agents, and reply
-  on the PR with what changed for each item.
-- If the changes are substantial or new risk appears, run another two-reviewer
+- Every implementation PR review cycle uses `$code-review`.
+  - Use this skill for two-axis review (standards + spec), with the full review
+    cycle requirements.
+  - `$code-review` requires `CODING_STANDARDS.md` and uses it as the workflow
+    baseline.
+  - `$code-review` is the source of the Standards-axis and Spec-axis findings
+    for the PR response.
+- Put review findings on the PR and address them one item at a time through
+  sequential sub-agents, replying on the PR with what changed for each item.
+- If the changes are substantial or new risk appears, run another `$code-review`
   cycle and repeat the same sequential response loop.
 - Close or merge the PR only after feedback has been addressed and the
   implemented HEAD has both final validation evidence and passed final review
