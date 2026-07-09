@@ -752,6 +752,77 @@ Path(os.environ["AFK_REVIEWER_RESULT"]).write_text(
             self.assertEqual(result["output"]["status"], "passed")
             self.assertEqual(result["output"]["summary"], "review prompt accepted")
 
+    def test_review_uses_request_path_prompt_when_reviewer_request_is_large(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            checkout = temp_path / "checkout"
+            start_commit = init_checkout(checkout)
+            head_commit = git(checkout, "rev-parse", "HEAD")
+            validation_step, validation_worker = write_validation_artifacts(temp_path / "validation-run")
+            ledger = temp_path / "ledger"
+            work_item = selected_work()
+            work_item["acceptance_criteria"] = ["large evidence " + ("x" * 40000)]
+            reviewer_code = textwrap.dedent(
+                """
+                import json
+                import os
+                import sys
+                from pathlib import Path
+
+                prompt = sys.argv[1]
+                if len(prompt.encode("utf-8")) > 2000:
+                    raise SystemExit("review prompt was not guarded")
+                request_path = Path(os.environ["AFK_REVIEWER_REQUEST"])
+                if str(request_path) not in prompt:
+                    raise SystemExit("prompt did not point at reviewer request")
+                request = json.loads(request_path.read_text(encoding="utf-8"))
+                criteria = request["evidence_pack"]["acceptance_criteria"]
+                if not criteria[0].startswith("large evidence "):
+                    raise SystemExit("request file did not preserve full evidence")
+                Path(os.environ["AFK_REVIEWER_RESULT"]).write_text(
+                    json.dumps({"status": "pass", "summary": "request path prompt accepted", "findings": []}),
+                    encoding="utf-8",
+                )
+                """
+            ).strip()
+
+            completed = run_afk(
+                "run-step",
+                "review",
+                "--input",
+                json.dumps(
+                    review_input(
+                        checkout=checkout,
+                        start_commit=start_commit,
+                        head_commit=head_commit,
+                        validation_step=validation_step,
+                        validation_worker=validation_worker,
+                        reviewer_code=reviewer_code,
+                        reviewer_type="real-reviewer-command",
+                        work_item=work_item,
+                    )
+                    | {
+                        "reviewer": {
+                            "type": "real-reviewer-command",
+                            "command": [sys.executable, "-c", reviewer_code, "{prompt}"],
+                            "timeout_seconds": 10,
+                        }
+                    }
+                ),
+                "--ledger",
+                str(ledger),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+            reviewer_request = json.loads((run_dir / "reviewer-request.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(result["output"]["status"], "passed")
+            self.assertEqual(result["output"]["summary"], "request path prompt accepted")
+            self.assertEqual(reviewer_request["evidence_pack"]["acceptance_criteria"], work_item["acceptance_criteria"])
+
     def test_review_refuses_pass_when_required_validation_artifact_is_not_validated(self):
         cases = [
             ("missing", None, None, "required validation artifact missing is not validated"),

@@ -27,6 +27,7 @@ from afk.schema_helpers import (
 
 SCHEMA_VERSION = 1
 REVIEWER_COMMAND_TYPES = {"fake-reviewer-command", "real-reviewer-command"}
+MAX_REVIEWER_PROMPT_ARG_BYTES = 32768
 
 
 ReviewerRuntimeError = RoleAdapterRuntimeError
@@ -740,6 +741,11 @@ def run_fake_reviewer_command(
     with tempfile.TemporaryDirectory() as temp_dir:
         temp_path = Path(temp_dir)
         result_path = temp_path / "reviewer-result.json"
+        prompt = reviewer_prompt_argument(
+            reviewer_request,
+            request_path=request_path,
+            result_path=result_path,
+        )
         adapter_result = execute_role_adapter(
             reviewer,
             cwd=checkout_path,
@@ -749,7 +755,7 @@ def run_fake_reviewer_command(
                 "AFK_REVIEWER_RESULT": str(result_path),
             },
             replacements={
-                "{prompt}": canonical_json(reviewer_request),
+                "{prompt}": prompt,
                 "{request_path}": str(request_path),
                 "{result_path}": str(result_path),
             },
@@ -761,6 +767,23 @@ def run_fake_reviewer_command(
             stdout=adapter_result["stdout"],
             allow_stdout_fallback=reviewer["type"] == "real-reviewer-command",
         )
+
+
+def reviewer_prompt_argument(
+    reviewer_request: dict[str, Any],
+    *,
+    request_path: Path,
+    result_path: Path,
+) -> str:
+    inline_prompt = canonical_json(reviewer_request)
+    if len(inline_prompt.encode("utf-8")) <= MAX_REVIEWER_PROMPT_ARG_BYTES:
+        return inline_prompt
+    return (
+        "Review the AFK reviewer request JSON at "
+        f"{request_path}. Write reviewer result JSON to {result_path}. "
+        'Result schema: {"status":"pass|fail|request_revision","summary":"string","findings":[]}.'
+    )
+
 
 def read_reviewer_payload(path: Path, *, stdout: str, allow_stdout_fallback: bool) -> dict[str, Any]:
     result = read_json_result_file(
