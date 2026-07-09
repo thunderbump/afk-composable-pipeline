@@ -3016,6 +3016,92 @@ class ImplementCliTest(unittest.TestCase):
             self.assertEqual(agent_result["result"]["status"], "failed_protocol")
             self.assertIn("Validation: smoke passed.", agent_result["result"]["evidence"]["stdout_excerpt"])
 
+    def test_implement_requires_result_file_with_success_and_exhaustion_stdout(self):
+        cases = [
+            "Usage-limit reached. Please try again later.",
+            "Quota exceeded. Please try again later.",
+            "Rate-limit exceeded. Please try again later.",
+            "Auth exhausted. Please refresh credentials.",
+        ]
+        for exhaustion_message in cases:
+            with self.subTest(exhaustion_message=exhaustion_message), tempfile.TemporaryDirectory() as temp_dir:
+                temp_path = Path(temp_dir)
+                checkout = temp_path / "checkout"
+                start_commit = init_checkout(checkout)
+                ledger = temp_path / "ledger"
+                codex_home = temp_path / "codex-home"
+                config_home = temp_path / "config-home"
+                pi_config_home = temp_path / "pi-config"
+                codex_home.mkdir()
+                config_home.mkdir()
+                pi_config_home.mkdir()
+                agent_code = textwrap.dedent(
+                    f"""
+                    import subprocess
+                    from pathlib import Path
+
+                    Path("implemented.txt").write_text("mixed stdout\\n", encoding="utf-8")
+                    subprocess.run(["git", "add", "implemented.txt"], check=True)
+                    subprocess.run(["git", "commit", "-m", "mixed stdout"], check=True)
+                    print("Implemented in commit.")
+                    print({exhaustion_message!r})
+                    """
+                ).strip()
+
+                completed = run_afk(
+                    "run-step",
+                    "implement",
+                    "--input",
+                    json.dumps(
+                        {
+                            "work_selection": {"schema_version": 1, "selected_work": [selected_work()]},
+                            "checkout": {
+                                "status": "prepared",
+                                "checkout_path": str(checkout),
+                                "review_branch": "afk/test-work",
+                                "requested_ref": "main",
+                                "start_commit": start_commit,
+                            },
+                            "guardrails": [],
+                            "validation": {"profile": "tier1", "commands": []},
+                            "agent": {
+                                "type": "real-agent-command",
+                                "command": [sys.executable, "-c", agent_code],
+                                "result_path": "agent-result.json",
+                                "timeout_seconds": 10,
+                                "codex_home": str(codex_home),
+                                "config_home": str(config_home),
+                                "env": {"PI_CONFIG_HOME": str(pi_config_home)},
+                            },
+                        }
+                    ),
+                    "--ledger",
+                    str(ledger),
+                    env_overrides={
+                        "GIT_AUTHOR_NAME": "AFK Test",
+                        "GIT_AUTHOR_EMAIL": "afk-test@example.test",
+                        "GIT_COMMITTER_NAME": "AFK Test",
+                        "GIT_COMMITTER_EMAIL": "afk-test@example.test",
+                    },
+                )
+
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                summary = json.loads(completed.stdout)
+                run_dir = ledger / "runs" / summary["run_id"]
+                result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+                agent_result = json.loads((run_dir / "agent-result.json").read_text(encoding="utf-8"))
+
+                self.assertEqual(result["output"]["status"], "failed_protocol")
+                self.assertEqual(result["output"]["classification"], "protocol_failure")
+                self.assertEqual(result["output"]["summary"], "agent result file was not produced")
+                self.assertEqual(result["output"]["git"]["dirty"], False)
+                self.assertEqual(result["output"]["git"]["changed_files"], ["implemented.txt"])
+                self.assertEqual(agent_result["result"]["status"], "failed_protocol")
+                self.assertIn(
+                    exhaustion_message,
+                    agent_result["result"]["evidence"]["stdout_excerpt"],
+                )
+
     def test_implement_does_not_recover_missing_real_agent_result_with_dirty_checkout(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
