@@ -2537,9 +2537,11 @@ def _terminal_integration_retrospective_signals(integration: dict[str, Any]) -> 
 
 def _terminal_integration_classification(integration: dict[str, Any]) -> str:
     decision = string_field(integration, "decision") or ""
-    remediation = string_field(integration, "remediation") or ""
     if decision == "checks_pending":
         return ""
+    if integration.get("timed_out") is True:
+        return "terminal_integration_timeout"
+    remediation = string_field(integration, "remediation") or ""
     if decision == "checks_inconclusive":
         if _terminal_integration_policy_blocks_inconclusive(integration):
             return "checks_inconclusive_policy"

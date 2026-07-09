@@ -8,7 +8,8 @@ from typing import Any
 
 
 SCHEMA_VERSION = 1
-DEFAULT_TERMINAL_POLICY_TIMEOUT_SECONDS = 300
+DEFAULT_TERMINAL_CLASSIFY_TIMEOUT_SECONDS = 3600
+DEFAULT_TERMINAL_MERGE_TIMEOUT_SECONDS = 300
 DEFAULT_TERMINAL_POLICY_POLL_SECONDS = 300
 ALLOWED_TERMINAL_POLICY_ACTIONS = {"allow", "block"}
 ALLOWED_TERMINAL_MERGE_METHODS = {"merge", "squash", "rebase"}
@@ -292,14 +293,14 @@ def optional_terminal_integration(
         "classify_timeout_seconds": optional_positive_int(
             value,
             "classify_timeout_seconds",
-            DEFAULT_TERMINAL_POLICY_TIMEOUT_SECONDS,
+            DEFAULT_TERMINAL_CLASSIFY_TIMEOUT_SECONDS,
             path,
             prefix=f"{key}.",
         ),
         "merge_timeout_seconds": optional_positive_int(
             value,
             "merge_timeout_seconds",
-            DEFAULT_TERMINAL_POLICY_TIMEOUT_SECONDS,
+            DEFAULT_TERMINAL_MERGE_TIMEOUT_SECONDS,
             path,
             prefix=f"{key}.",
         ),

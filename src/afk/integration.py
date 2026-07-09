@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -16,6 +17,7 @@ from afk.workstream import close_selected_source_item, publisher_pr_merge_commit
 
 SCHEMA_VERSION = 1
 DEFAULT_POLL_SECONDS = 300
+DEFAULT_CLASSIFY_TIMEOUT_SECONDS = 0
 PENDING_CHECK_STATES = {"PENDING", "PENDING_DEPLOYMENT", "IN_PROGRESS", "QUEUED", "REQUESTED", "WAITING"}
 FAILED_CHECK_STATES = {"FAILURE", "FAILED", "ERROR", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED"}
 INCONCLUSIVE_CHECK_STATES = {"EXPECTED", "STALE", "NEUTRAL", "SKIPPED", "STARTUP_FAILURE"}
@@ -81,73 +83,165 @@ def integrate_published_pr(
         auth=request["auth"],
         message_on_failure="gh auth status failed",
     )
-    view_payload = load_json_command(
-        view_command,
-        cwd=request["command_cwd"],
-        auth=request["auth"],
-        failure_message="gh pr view returned invalid JSON payload",
-    )
     retry_context = prior_tracker_close_failure(request["output_dir"])
-    observed_head = string_field(view_payload, "headRefOid") or ""
-    merge_state_status = (string_field(view_payload, "mergeStateStatus") or "").upper()
-    pr_state = (string_field(view_payload, "state") or "").upper()
-    is_draft = bool(view_payload.get("isDraft"))
-    check_snapshots = normalize_status_check_rollup(view_payload.get("statusCheckRollup"))
-    decision_snapshots = decision_check_snapshots(
-        check_snapshots,
-        required_checks=request["required_checks"],
-        required_check_patterns=request["required_check_patterns"],
-        optional_checks=request["optional_checks"],
-        optional_check_patterns=request["optional_check_patterns"],
-    )
-    needs_pr_checks = (
-        not check_snapshots
-        or bool(decision_snapshots["missing_required_checks"])
-        or bool(decision_snapshots["missing_required_patterns"])
-        or any(item["status"] == "inconclusive" for item in decision_snapshots["snapshots"])
-    )
-    if needs_pr_checks:
-        try:
-            checks_payload = load_json_command(
-                checks_command,
-                cwd=request["command_cwd"],
-                auth=request["auth"],
-                failure_message="gh pr checks returned invalid JSON payload",
-            )
-        except (PublisherError, ValueError):
-            if not check_snapshots:
-                raise
-        else:
-            checks_snapshots = normalize_check_snapshots(checks_payload)
-            if checks_snapshots:
-                check_snapshots = merge_check_snapshots(check_snapshots, checks_snapshots)
-                decision_snapshots = decision_check_snapshots(
-                    check_snapshots,
-                    required_checks=request["required_checks"],
-                    required_check_patterns=request["required_check_patterns"],
-                    optional_checks=request["optional_checks"],
-                    optional_check_patterns=request["optional_check_patterns"],
-                )
-    if retry_context:
-        decision, next_poll_seconds, remediation = (
-            "merge_ready",
-            0,
-            "Retry the recorded tracker close for the already-merged PR without attempting another merge.",
+    poll_started_at = time.monotonic()
+    poll_attempts: list[dict[str, Any]] = []
+    events: list[dict[str, Any]] = []
+    timed_out = False
+    observed_head = ""
+    merge_state_status = ""
+    pr_state = ""
+    is_draft = False
+    check_snapshots: list[dict[str, Any]] = []
+    decision = "checks_pending"
+    next_poll_seconds = request["poll_seconds"]
+    remediation = ""
+
+    while True:
+        view_payload = load_json_command(
+            view_command,
+            cwd=request["command_cwd"],
+            auth=request["auth"],
+            failure_message="gh pr view returned invalid JSON payload",
         )
-    else:
-        decision, next_poll_seconds, remediation = classify_integration(
-            expected_head=request["expected_head_sha"],
-            observed_head=observed_head,
-            pr_state=pr_state,
-            is_draft=is_draft,
-            merge_state_status=merge_state_status,
-            check_snapshots=decision_snapshots["snapshots"],
+        observed_head = string_field(view_payload, "headRefOid") or ""
+        merge_state_status = (
+            string_field(view_payload, "mergeStateStatus") or ""
+        ).upper()
+        pr_state = (string_field(view_payload, "state") or "").upper()
+        is_draft = bool(view_payload.get("isDraft"))
+        check_snapshots = normalize_status_check_rollup(
+            view_payload.get("statusCheckRollup")
+        )
+        decision_snapshots = decision_check_snapshots(
+            check_snapshots,
             required_checks=request["required_checks"],
             required_check_patterns=request["required_check_patterns"],
-            missing_required_checks=decision_snapshots["missing_required_checks"],
-            missing_required_patterns=decision_snapshots["missing_required_patterns"],
-            poll_seconds=request["poll_seconds"],
+            optional_checks=request["optional_checks"],
+            optional_check_patterns=request["optional_check_patterns"],
         )
+        needs_pr_checks = (
+            not check_snapshots
+            or bool(decision_snapshots["missing_required_checks"])
+            or bool(decision_snapshots["missing_required_patterns"])
+            or any(
+                item["status"] == "inconclusive"
+                for item in decision_snapshots["snapshots"]
+            )
+        )
+        if needs_pr_checks:
+            try:
+                checks_payload = load_json_command(
+                    checks_command,
+                    cwd=request["command_cwd"],
+                    auth=request["auth"],
+                    failure_message="gh pr checks returned invalid JSON payload",
+                )
+            except (PublisherError, ValueError):
+                if not check_snapshots:
+                    raise
+            else:
+                checks_snapshots = normalize_check_snapshots(checks_payload)
+                if checks_snapshots:
+                    check_snapshots = merge_check_snapshots(
+                        check_snapshots,
+                        checks_snapshots,
+                    )
+                    decision_snapshots = decision_check_snapshots(
+                        check_snapshots,
+                        required_checks=request["required_checks"],
+                        required_check_patterns=request["required_check_patterns"],
+                        optional_checks=request["optional_checks"],
+                        optional_check_patterns=request["optional_check_patterns"],
+                    )
+        if retry_context:
+            decision, next_poll_seconds, remediation = (
+                "merge_ready",
+                0,
+                "Retry the recorded tracker close for the already-merged PR "
+                "without attempting another merge.",
+            )
+        else:
+            decision, next_poll_seconds, remediation = classify_integration(
+                expected_head=request["expected_head_sha"],
+                observed_head=observed_head,
+                pr_state=pr_state,
+                is_draft=is_draft,
+                merge_state_status=merge_state_status,
+                check_snapshots=decision_snapshots["snapshots"],
+                required_checks=request["required_checks"],
+                required_check_patterns=request["required_check_patterns"],
+                missing_required_checks=decision_snapshots["missing_required_checks"],
+                missing_required_patterns=decision_snapshots[
+                    "missing_required_patterns"
+                ],
+                poll_seconds=request["poll_seconds"],
+            )
+        elapsed_seconds = round(time.monotonic() - poll_started_at, 6)
+        poll_attempts.append(
+            {
+                "attempt": len(poll_attempts) + 1,
+                "elapsed_seconds": elapsed_seconds,
+                "observed_head_sha": observed_head,
+                "pr_state": pr_state,
+                "is_draft": is_draft,
+                "merge_state_status": merge_state_status,
+                "check_snapshots": check_snapshots,
+                "decision": decision,
+                "next_poll_seconds": next_poll_seconds,
+                "remediation": remediation,
+            }
+        )
+        events.append(
+            {
+                "schema_version": SCHEMA_VERSION,
+                "event": "integration.poll",
+                "attempt": len(poll_attempts),
+                "repo": request["repo"],
+                "pr_number": request["pr_number"],
+                "expected_head_sha": request["expected_head_sha"],
+                "observed_head_sha": observed_head,
+                "decision": decision,
+                "next_poll_seconds": next_poll_seconds,
+                "elapsed_seconds": elapsed_seconds,
+                "remediation": remediation,
+            }
+        )
+        if decision != "checks_pending" or not request["classify_timeout_configured"]:
+            break
+        if elapsed_seconds >= request["classify_timeout_seconds"]:
+            timed_out = True
+            decision = "merge_blocked"
+            next_poll_seconds = 0
+            remediation = (
+                "Terminal integration timed out while checks were still pending. "
+                "Investigate why the required checks did not appear or finish, "
+                "then rerun terminal integration."
+            )
+            events.append(
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "event": "integration.timeout",
+                    "attempt": len(poll_attempts),
+                    "repo": request["repo"],
+                    "pr_number": request["pr_number"],
+                    "expected_head_sha": request["expected_head_sha"],
+                    "observed_head_sha": observed_head,
+                    "decision": decision,
+                    "next_poll_seconds": next_poll_seconds,
+                    "elapsed_seconds": elapsed_seconds,
+                    "remediation": remediation,
+                }
+            )
+            break
+        sleep_seconds = next_poll_seconds
+        if request["classify_timeout_seconds"] > 0:
+            sleep_seconds = min(
+                sleep_seconds,
+                max(request["classify_timeout_seconds"] - elapsed_seconds, 0),
+            )
+        if sleep_seconds > 0:
+            time.sleep(sleep_seconds)
 
     result = {
         "schema_version": SCHEMA_VERSION,
@@ -163,6 +257,11 @@ def integrate_published_pr(
         "is_draft": is_draft,
         "merge_state_status": merge_state_status,
         "check_snapshots": check_snapshots,
+        "poll_attempts": poll_attempts,
+        "poll_count": len(poll_attempts),
+        "elapsed_seconds": round(time.monotonic() - poll_started_at, 6),
+        "classify_timeout_seconds": request["classify_timeout_seconds"],
+        "timed_out": timed_out,
         "neutral_policy": request["neutral_policy"],
         "skipped_policy": request["skipped_policy"],
         "decision": decision,
@@ -187,6 +286,7 @@ def integrate_published_pr(
     write_events(
         request["output_dir"] / "integration-events.jsonl",
         [
+            *events,
             {
                 "schema_version": SCHEMA_VERSION,
                 "event": "integration.classified",
@@ -197,6 +297,8 @@ def integrate_published_pr(
                 "decision": decision,
                 "next_poll_seconds": next_poll_seconds,
                 "remediation": remediation,
+                "timed_out": timed_out,
+                "poll_count": len(poll_attempts),
             }
         ],
     )
@@ -249,9 +351,24 @@ def normalize_request(
     gh = policy.get("gh", {})
     if not isinstance(gh, dict):
         raise ValueError("policy.gh must be an object when present")
-    poll_seconds = policy.get("poll_seconds", policy.get("poll_interval_seconds", DEFAULT_POLL_SECONDS))
+    poll_seconds = policy.get(
+        "poll_seconds",
+        policy.get("poll_interval_seconds", DEFAULT_POLL_SECONDS),
+    )
     if not isinstance(poll_seconds, int) or poll_seconds < 0:
         raise ValueError("policy.poll_seconds must be a non-negative integer")
+    classify_timeout_configured = "classify_timeout_seconds" in policy
+    classify_timeout_seconds = policy.get(
+        "classify_timeout_seconds",
+        DEFAULT_CLASSIFY_TIMEOUT_SECONDS,
+    )
+    if (
+        not isinstance(classify_timeout_seconds, int)
+        or classify_timeout_seconds < 0
+    ):
+        raise ValueError(
+            "policy.classify_timeout_seconds must be a non-negative integer"
+        )
 
     return {
         "published_result_path": published_path,
@@ -270,6 +387,8 @@ def normalize_request(
         "auth": auth,
         "gh_path": string_field(gh, "path") or "gh",
         "poll_seconds": poll_seconds,
+        "classify_timeout_seconds": classify_timeout_seconds,
+        "classify_timeout_configured": classify_timeout_configured,
         "neutral_policy": string_field(policy, "neutral_policy") or "block",
         "skipped_policy": string_field(policy, "skipped_policy") or "block",
     }
