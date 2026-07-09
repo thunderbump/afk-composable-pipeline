@@ -317,8 +317,8 @@ class NoopCliTest(unittest.TestCase):
             materialize_terminal_integration_policy(contract),
             {
                 "required_checks": [],
-                "required_check_patterns": ["EQEMU:.*", "Server build \\(ubuntu-24.04\\)"],
-                "optional_checks": ["Codecov", "Macroscope - Correctness Check"],
+                "required_check_patterns": [],
+                "optional_checks": ["Macroscope - Correctness Check"],
                 "optional_check_patterns": [],
                 "neutral_policy": "block",
                 "skipped_policy": "block",

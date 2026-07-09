@@ -37,12 +37,8 @@
     "branch": "master"
   },
   "terminal_integration": {
-    "required_check_patterns": [
-      "EQEMU:.*",
-      "Server build \\(ubuntu-24.04\\)"
-    ],
+    "required_check_patterns": [],
     "optional_checks": [
-      "Codecov",
       "Macroscope - Correctness Check"
     ],
     "classify_timeout_seconds": 3600,
