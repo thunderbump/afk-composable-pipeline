@@ -96,7 +96,7 @@ def persisted_workstream_result_state(*, excerpt: str, log_path: str):
                         }
                     ),
                     "--ledger",
-                    "dogfood-ledgers/bump-eqemu-2026-07-07-1",
+                    "ledgers/dogfood/bump-eqemu-2026-07-07-1",
                     "--project",
                     "bump-eqemu",
                 ],
@@ -497,7 +497,8 @@ class RetrospectiveModuleTest(unittest.TestCase):
     def test_build_pipeline_retrospective_replays_checked_in_dogfood_artifact(self):
         artifact_path = (
             ROOT
-            / "dogfood-ledgers"
+            / "ledgers"
+            / "dogfood"
             / "bump-eqemu-2026-07-07-1"
             / "workstreams"
             / "20260707T051607132664Z-5f118c15"
