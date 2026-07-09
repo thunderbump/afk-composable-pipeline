@@ -5,10 +5,37 @@ from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
 from afk.role_adapters import RoleAdapterRuntimeError
+from afk.role_adapters import render_command
 from afk.roles import execute_role_adapter, log_role_adapter_result, log_role_runtime_error
 
 
 class RolesTest(unittest.TestCase):
+    def test_render_command_replaces_only_exact_placeholder_arguments(self):
+        command = [
+            "python",
+            "-c",
+            'print("{request_path}")',
+            "{request_path}",
+            "--output={result_path}",
+        ]
+
+        self.assertEqual(
+            render_command(
+                command,
+                {
+                    "{request_path}": "/tmp/request.json",
+                    "{result_path}": "/tmp/result.json",
+                },
+            ),
+            [
+                "python",
+                "-c",
+                'print("{request_path}")',
+                "/tmp/request.json",
+                "--output={result_path}",
+            ],
+        )
+
     def test_execute_role_adapter_renders_command_and_builds_environment(self):
         captured: dict[str, object] = {}
 
@@ -77,4 +104,3 @@ class RolesTest(unittest.TestCase):
             stderr_log,
         ):
             self.assertNotIn("super-secret", value)
-

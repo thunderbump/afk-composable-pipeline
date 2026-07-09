@@ -1810,7 +1810,9 @@ raise SystemExit(9)
                 "command": [
                     "bash",
                     "-lc",
-                    "PI_WRAPPER_MODE=wrapped exec ./bin/pi -p '{prompt}' --provider openai-codex --model gpt-5.4-mini",
+                    "PI_WRAPPER_MODE=wrapped exec ./bin/pi -p \"$1\" --provider openai-codex --model gpt-5.4-mini",
+                    "_",
+                    "{prompt}",
                 ],
                 "result_path": "agent-result.json",
                 "timeout_seconds": 10,

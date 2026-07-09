@@ -711,8 +711,8 @@ Path(os.environ["AFK_REVIEWER_RESULT"]).write_text(
                     raise SystemExit("small prompt unexpectedly used request file")
                 criteria = request["evidence_pack"]["acceptance_criteria"]
                 expected = [
-                    "Keep {" + "request_path} literal",
-                    "Keep {" + "result_path} literal",
+                    "Keep {request_path} literal",
+                    "Keep {result_path} literal",
                 ]
                 if criteria != expected:
                     raise SystemExit("prompt placeholders were rewritten")
@@ -762,6 +762,85 @@ Path(os.environ["AFK_REVIEWER_RESULT"]).write_text(
 
             self.assertEqual(result["output"]["status"], "passed")
             self.assertEqual(result["output"]["summary"], "review prompt accepted")
+
+    def test_review_preserves_literal_prompt_placeholders_inside_python_code(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            checkout = temp_path / "checkout"
+            start_commit = init_checkout(checkout)
+            head_commit = git(checkout, "rev-parse", "HEAD")
+            validation_step, validation_worker = write_validation_artifacts(
+                temp_path / "validation-run"
+            )
+            ledger = temp_path / "ledger"
+            reviewer_code = textwrap.dedent(
+                """
+                import json
+                import os
+                import sys
+                from pathlib import Path
+
+                literals = {
+                    "prompt": "{prompt}",
+                    "request_path": "{request_path}",
+                    "result_path": "{result_path}",
+                }
+                if literals != {
+                    "prompt": "{prompt}",
+                    "request_path": "{request_path}",
+                    "result_path": "{result_path}",
+                }:
+                    raise SystemExit("inline placeholder literals were rewritten")
+                if sys.argv[1] != "-p":
+                    raise SystemExit("missing -p flag")
+                request = json.loads(sys.argv[2])
+                if request["artifact_type"] != "reviewer-request":
+                    raise SystemExit("missing reviewer request prompt")
+                Path(os.environ["AFK_REVIEWER_RESULT"]).write_text(
+                    json.dumps({"status": "pass", "summary": "literal placeholders preserved", "findings": []}),
+                    encoding="utf-8",
+                )
+                """
+            ).strip()
+
+            completed = run_afk(
+                "run-step",
+                "review",
+                "--input",
+                json.dumps(
+                    review_input(
+                        checkout=checkout,
+                        start_commit=start_commit,
+                        head_commit=head_commit,
+                        validation_step=validation_step,
+                        validation_worker=validation_worker,
+                        reviewer_code=reviewer_code,
+                    )
+                    | {
+                        "reviewer": {
+                            "type": "fake-reviewer-command",
+                            "command": [
+                                sys.executable,
+                                "-c",
+                                reviewer_code,
+                                "-p",
+                                "{prompt}",
+                            ],
+                            "timeout_seconds": 10,
+                        }
+                    }
+                ),
+                "--ledger",
+                str(ledger),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(result["output"]["status"], "passed")
+            self.assertEqual(result["output"]["summary"], "literal placeholders preserved")
 
     def test_review_uses_at_file_prompt_arg_when_reviewer_request_is_large(self):
         with tempfile.TemporaryDirectory() as temp_dir:
