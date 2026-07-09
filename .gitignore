@@ -7,4 +7,5 @@ build/
 dist/
 ledger/
 ledgers/
+dogfood-ledgers/
 .pytest_cache/
