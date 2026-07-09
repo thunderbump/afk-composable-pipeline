@@ -678,6 +678,86 @@ class ImplementCliTest(unittest.TestCase):
             )
             self.assertNotIn("{prompt}", json.dumps(rendered_prompt))
 
+    def test_implement_preserves_literal_prompt_placeholder_inside_python_code(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            checkout = temp_path / "checkout"
+            start_commit = init_checkout(checkout)
+            ledger = temp_path / "ledger"
+            codex_home = temp_path / "codex-home"
+            config_home = temp_path / "config-home"
+            pi_config_home = temp_path / "pi-config"
+            codex_home.mkdir()
+            config_home.mkdir()
+            pi_config_home.mkdir()
+            agent_code = textwrap.dedent(
+                """
+                import json
+                import os
+                import subprocess
+                import sys
+                from pathlib import Path
+
+                if "{prompt}" != "{" + "prompt}":
+                    raise SystemExit("inline placeholder literal was rewritten")
+                request = json.loads(sys.argv[1])
+                if request["work_item"]["external_id"] != "central-lve.5":
+                    raise SystemExit("exact prompt argument was not rendered")
+                Path("implemented.txt").write_text("literal prompt placeholder", encoding="utf-8")
+                subprocess.run(["git", "add", "implemented.txt"], check=True)
+                subprocess.run(["git", "commit", "-m", "literal prompt placeholder"], check=True)
+                Path(os.environ["AFK_AGENT_RESULT_PATH"]).write_text(
+                    json.dumps({"status": "completed", "summary": "literal prompt placeholder"}),
+                    encoding="utf-8",
+                )
+                """
+            ).strip()
+
+            completed = run_afk(
+                "run-step",
+                "implement",
+                "--input",
+                json.dumps(
+                    {
+                        "work_selection": {"schema_version": 1, "selected_work": [selected_work()]},
+                        "checkout": {
+                            "status": "prepared",
+                            "checkout_path": str(checkout),
+                            "review_branch": "afk/test-work",
+                            "requested_ref": "main",
+                            "start_commit": start_commit,
+                        },
+                        "guardrails": [],
+                        "validation": {"profile": "tier1", "commands": []},
+                        "agent": {
+                            "type": "real-agent-command",
+                            "command": [sys.executable, "-c", agent_code, "{prompt}"],
+                            "result_path": "agent-result.json",
+                            "timeout_seconds": 10,
+                            "codex_home": str(codex_home),
+                            "config_home": str(config_home),
+                            "env": {"PI_CONFIG_HOME": str(pi_config_home)},
+                        },
+                    }
+                ),
+                "--ledger",
+                str(ledger),
+                env_overrides={
+                    "GIT_AUTHOR_NAME": "AFK Test",
+                    "GIT_AUTHOR_EMAIL": "afk-test@example.test",
+                    "GIT_COMMITTER_NAME": "AFK Test",
+                    "GIT_COMMITTER_EMAIL": "afk-test@example.test",
+                },
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(result["output"]["status"], "implemented")
+            self.assertEqual(result["output"]["summary"], "literal prompt placeholder")
+
     def test_implement_real_agent_prompt_keeps_worker_home_without_stack_guidance(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)

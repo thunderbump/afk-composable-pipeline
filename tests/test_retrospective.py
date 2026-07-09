@@ -150,6 +150,120 @@ def persisted_workstream_result_state(*, excerpt: str, log_path: str):
 
 
 class RetrospectiveModuleTest(unittest.TestCase):
+    def test_retrospective_judge_runtime_preserves_literal_placeholders_in_python_code(self):
+        import tempfile
+        import textwrap
+
+        judge_code = textwrap.dedent(
+            """
+            import json
+            import sys
+            from pathlib import Path
+
+            if "{request_path}" != "{" + "request_path}":
+                raise SystemExit("request_path literal was rewritten")
+            if "{result_path}" != "{" + "result_path}":
+                raise SystemExit("result_path literal was rewritten")
+            if "{prompt}" != "{" + "prompt}":
+                raise SystemExit("prompt literal was rewritten")
+            prompt = json.loads(sys.argv[1])
+            if prompt["artifact_type"] != "retrospective-judge-request":
+                raise SystemExit("prompt argument was not rendered")
+            request_path = Path(sys.argv[2])
+            result_path = Path(sys.argv[3])
+            if not request_path.exists():
+                raise SystemExit("request path argument was not rendered")
+            result_path.write_text(
+                json.dumps({"status": "pass", "summary": "runtime placeholders preserved"}),
+                encoding="utf-8",
+            )
+            """
+        ).strip()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            request_path = temp_path / "retrospective-judge-request.json"
+            result_path = temp_path / "retrospective-judge-result.json"
+            request = {"artifact_type": "retrospective-judge-request"}
+            request_path.write_text(json.dumps(request), encoding="utf-8")
+            adapter_result, raw_payload, raw_source = retrospective_api._run_retrospective_judge_command(
+                {
+                    "command": [
+                        sys.executable,
+                        "-c",
+                        judge_code,
+                        "{prompt}",
+                        "{request_path}",
+                        "{result_path}",
+                    ],
+                    "timeout_seconds": 10,
+                },
+                checkout_path=temp_path,
+                request=request,
+                request_prompt=request,
+                request_path=request_path,
+                result_path=result_path,
+            )
+
+        self.assertEqual(adapter_result["returncode"], 0)
+        self.assertEqual(raw_source, "file")
+        self.assertIn("runtime placeholders preserved", raw_payload)
+
+    def test_retrospective_follow_up_runtime_preserves_literal_placeholders_in_python_code(self):
+        import tempfile
+        import textwrap
+
+        follow_up_code = textwrap.dedent(
+            """
+            import json
+            import os
+            import sys
+            from pathlib import Path
+
+            if "{request_path}" != "{" + "request_path}":
+                raise SystemExit("request_path literal was rewritten")
+            if "{result_path}" != "{" + "result_path}":
+                raise SystemExit("result_path literal was rewritten")
+            request_path = Path(sys.argv[1])
+            result_path = Path(sys.argv[2])
+            if request_path != Path(os.environ["AFK_RETROSPECTIVE_FOLLOW_UP_REQUEST"]):
+                raise SystemExit("request path argument was not rendered")
+            if result_path != Path(os.environ["AFK_RETROSPECTIVE_FOLLOW_UP_RESULT"]):
+                raise SystemExit("result path argument was not rendered")
+            if not request_path.exists():
+                raise SystemExit("request path does not exist")
+            result_path.write_text(
+                json.dumps({"status": "pass", "summary": "follow-up placeholders preserved"}),
+                encoding="utf-8",
+            )
+            """
+        ).strip()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            request_path = temp_path / "retrospective-follow-up-request.json"
+            result_path = temp_path / "retrospective-follow-up-result.json"
+            request_path.write_text(
+                json.dumps({"artifact_type": "retrospective-follow-up-request"}),
+                encoding="utf-8",
+            )
+            adapter_result, raw_payload = retrospective_api._run_retrospective_follow_up_command(
+                {
+                    "command": [
+                        sys.executable,
+                        "-c",
+                        follow_up_code,
+                        "{request_path}",
+                        "{result_path}",
+                    ],
+                    "timeout_seconds": 10,
+                },
+                checkout_path=temp_path,
+                request_path=request_path,
+                result_path=result_path,
+            )
+
+        self.assertEqual(adapter_result["returncode"], 0)
+        self.assertIn("follow-up placeholders preserved", raw_payload)
+
     def test_workstream_does_not_expose_private_retrospective_internals(self):
         for symbol in (
             "_apply_retrospective_judge",

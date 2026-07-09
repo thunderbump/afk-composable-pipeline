@@ -165,6 +165,15 @@ PYTHONPATH=src python3 -m afk run-workstream \
 Omit `--ledger` here to write under `./ledgers`, or set `AFK_LEDGER_DIR` when a
 runner should direct artifacts somewhere else without changing every command.
 
+Role command placeholders use an exact-argument contract. AFK replaces
+placeholder argv elements such as `"{prompt}"`, `"{request_path}"`, and
+`"{result_path}"` only when the entire argv element is the placeholder. Embedded
+placeholder text inside inline code or combined flags is treated as literal
+text. For flags, pass the flag and placeholder as separate argv elements, such
+as `["tool", "--request", "{request_path}"]`; for shell wrappers, pass
+placeholder values as separate positional arguments and read them from the
+script.
+
 The recipe schema is intentionally small:
 
 - `workstream_id`, `parent`, and `review_branch` identify the workstream and

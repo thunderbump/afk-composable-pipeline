@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import subprocess
 import sys
 import tempfile
@@ -72,8 +71,12 @@ def minimal_command_environment(temp_path: Path, *, config_home: str = "") -> di
 
 
 def render_command(command: list[str], replacements: dict[str, str]) -> list[str]:
-    pattern = re.compile("|".join(sorted((re.escape(token) for token in replacements), key=len, reverse=True)))
-    return [pattern.sub(lambda match: replacements[match.group(0)], part) for part in command]
+    """Render only whole-argument placeholders in role command argv.
+
+    Placeholder text embedded inside inline code or combined flags is literal.
+    Pass flags and placeholder values as separate argv elements.
+    """
+    return [replacements.get(part, part) for part in command]
 
 
 def execute_role_command(

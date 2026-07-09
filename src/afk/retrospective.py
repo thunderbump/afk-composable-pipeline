@@ -12,6 +12,7 @@ from typing import Any
 from afk.implement import runtime_failure_excerpt
 from afk.jsonutil import canonical_json, sha256_json
 from afk.redaction import redact_artifact_value, redact_text
+from afk.role_adapters import render_command
 from afk.tracking import effective_tracker_terminal_decision, redact_retrospective
 from afk.workstream_lifecycle import repair_stop_record, workstream_status_from_publication
 
@@ -715,7 +716,7 @@ def _render_retrospective_judge_command(
     request_path: Path,
     result_path: Path,
 ) -> list[str]:
-    rendered = _render_retrospective_command(
+    rendered = render_command(
         command,
         {
             PI_JUDGE_REQUEST_PATH_PLACEHOLDER: str(request_path),
@@ -733,32 +734,13 @@ def _render_retrospective_follow_up_command(
     request_path: Path,
     result_path: Path,
 ) -> list[str]:
-    return _render_retrospective_command(
+    return render_command(
         command,
         {
             PI_JUDGE_REQUEST_PATH_PLACEHOLDER: str(request_path),
             PI_JUDGE_RESULT_PATH_PLACEHOLDER: str(result_path),
         },
     )
-
-
-def _render_retrospective_command(
-    command: list[str],
-    replacements: dict[str, str],
-) -> list[str]:
-    if not replacements:
-        return list(command)
-    pattern = re.compile(
-        "|".join(sorted((re.escape(token) for token in replacements), key=len, reverse=True))
-    )
-
-    def replace_placeholder(match: re.Match[str]) -> str:
-        return replacements[match.group(0)]
-
-    rendered: list[str] = []
-    for part in command:
-        rendered.append(pattern.sub(replace_placeholder, part))
-    return rendered
 
 
 def _retrospective_judge_prompt_request(request: dict[str, Any]) -> dict[str, Any]:
