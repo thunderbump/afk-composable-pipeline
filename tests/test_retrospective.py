@@ -10,12 +10,19 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from afk import workstream  # noqa: E402
 from afk import retrospective as retrospective_api  # noqa: E402
-from afk.retrospective import RetrospectiveContext, build_pipeline_retrospective  # noqa: E402
+from afk.retrospective import (  # noqa: E402
+    RetrospectiveContext,
+    TerminalIntegrationRetrospectiveContext,
+    build_pipeline_retrospective,
+    build_terminal_integration_retrospective,
+)
 
 
 def retrospective_state():
     return {
-        "selected_work": [{"external_id": "central-afk-pr.17", "title": "Delay tracker closure"}],
+        "selected_work": [
+            {"external_id": "central-afk-pr.17", "title": "Delay tracker closure"}
+        ],
         "implementation": {
             "status": "implemented",
             "git": {"after_commit": "abc123"},
@@ -150,6 +157,97 @@ def persisted_workstream_result_state(*, excerpt: str, log_path: str):
 
 
 class RetrospectiveModuleTest(unittest.TestCase):
+    def test_terminal_retrospective_records_merged_terminal_closure(self):
+        record = build_terminal_integration_retrospective(
+            TerminalIntegrationRetrospectiveContext(
+                workstream={"workstream_id": "run-1"},
+                integration={
+                    "status": "tracker-closed",
+                    "decision": "merge_ready",
+                    "pr_url": "https://github.example/pr/17",
+                    "terminal_decision": {
+                        "status": "merged",
+                        "merge_commit": "deadbeef",
+                    },
+                    "merge": {"status": "merged"},
+                    "tracker_close": {"status": "closed"},
+                },
+            )
+        )
+
+        self.assertEqual(record["status"], "tracker-closed")
+        self.assertEqual(record["terminal"]["status"], "tracker-closed")
+        self.assertEqual(record["terminal"]["decision"]["status"], "merged")
+        self.assertEqual(
+            record["terminal"]["decision"]["merge_commit"],
+            "deadbeef",
+        )
+        self.assertEqual(record["terminal"]["merge_status"], "merged")
+        self.assertEqual(record["terminal"]["tracker_close_status"], "closed")
+
+    def test_terminal_retrospective_records_no_merge_terminal_closure(self):
+        record = build_terminal_integration_retrospective(
+            TerminalIntegrationRetrospectiveContext(
+                workstream={"workstream_id": "run-1"},
+                integration={
+                    "status": "tracker-closed",
+                    "decision": "no_merge",
+                    "terminal_decision": {
+                        "status": "no-merge",
+                        "reason": "checks failed",
+                    },
+                    "tracker_close": {"status": "closed"},
+                },
+            )
+        )
+
+        self.assertEqual(record["status"], "tracker-closed")
+        self.assertEqual(record["terminal"]["status"], "tracker-closed")
+        self.assertEqual(record["terminal"]["decision"]["status"], "no-merge")
+        self.assertEqual(
+            record["terminal"]["decision"]["reason"],
+            "checks failed",
+        )
+        self.assertNotIn("merge_status", record["terminal"])
+        self.assertEqual(record["terminal"]["tracker_close_status"], "closed")
+
+    def test_terminal_retrospective_omits_terminal_block_before_closure(self):
+        record = build_terminal_integration_retrospective(
+            TerminalIntegrationRetrospectiveContext(
+                workstream={"workstream_id": "run-1"},
+                integration={
+                    "status": "merge-ready",
+                    "decision": "merge_ready",
+                    "terminal_decision": {
+                        "status": "merged",
+                        "merge_commit": "deadbeef",
+                    },
+                    "merge": {"status": "merged"},
+                },
+            )
+        )
+
+        self.assertNotIn("terminal", record)
+
+    def test_terminal_retrospective_omits_when_tracker_close_failed(self):
+        record = build_terminal_integration_retrospective(
+            TerminalIntegrationRetrospectiveContext(
+                workstream={"workstream_id": "run-1"},
+                integration={
+                    "status": "tracker-close-failed",
+                    "decision": "merge_ready",
+                    "terminal_decision": {
+                        "status": "merged",
+                        "merge_commit": "deadbeef",
+                    },
+                    "merge": {"status": "merged"},
+                    "tracker_close": {"status": "failed"},
+                },
+            )
+        )
+
+        self.assertNotIn("terminal", record)
+
     def test_retrospective_judge_runtime_preserves_literal_placeholders_in_python_code(self):
         import tempfile
         import textwrap
