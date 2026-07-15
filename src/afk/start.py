@@ -141,10 +141,16 @@ def resume_run(*, note: str | None = None) -> tuple[str, int]:
         if "worker_exit_code" in projection:
             attention = projection.get("attention", {})
             if (
-                projection["checkpoint"] == "worktree_ready"
+                projection["checkpoint"] in {"worktree_ready", "change_committed"}
                 and isinstance(attention, dict)
-                and attention.get("scope") == "implementation"
-                and attention.get("kind") == "unavailable"
+                and (
+                    attention.get("scope") == "candidate"
+                    or (
+                        projection["checkpoint"] == "worktree_ready"
+                        and attention.get("scope") == "implementation"
+                        and attention.get("kind") == "unavailable"
+                    )
+                )
             ):
                 return run_id, _advance_candidate(store, run_id)
             return run_id, projection["worker_exit_code"]

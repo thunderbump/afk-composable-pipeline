@@ -685,6 +685,68 @@ class StartCliTest(unittest.TestCase):
         commands = self.command_log.read_text(encoding="utf-8")
         self.assertNotIn('"command":"systemctl"', commands)
 
+    def test_resume_reconciles_a_candidate_push_completed_before_confirmation(self):
+        home = str(self.temp)
+        started = self.run_afk("start", "central-bnkl.1.1", HOME=home)
+        run_id = started.stdout.strip()
+
+        interrupted = self.run_afk(
+            "_worker_unit", run_id, HOME=home, AFK_FAKE_PUSH_INTERRUPTED="1"
+        )
+
+        self.assertEqual(interrupted.returncode, 2, interrupted.stderr)
+        before = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(before["checkpoint"], "change_committed")
+        self.assertEqual(before["attention"]["scope"], "candidate")
+        push_effect = RunStore(self.state_home / "afk").effect(
+            run_id, f'branch-push-{"d" * 40}'
+        )
+        self.assertEqual(push_effect["status"], "prepared")
+
+        resumed = self.run_afk("resume", HOME=home)
+
+        self.assertEqual(resumed.returncode, 2, resumed.stderr)
+        after = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(after["checkpoint"], "candidate_ready")
+        self.assertEqual(after["attention"]["scope"], "validation")
+        push_effect = RunStore(self.state_home / "afk").effect(
+            run_id, f'branch-push-{"d" * 40}'
+        )
+        self.assertEqual(push_effect["status"], "confirmed")
+
+    def test_resume_reconciles_a_candidate_pr_completed_before_confirmation(self):
+        home = str(self.temp)
+        started = self.run_afk("start", "central-bnkl.1.1", HOME=home)
+        run_id = started.stdout.strip()
+
+        interrupted = self.run_afk(
+            "_worker_unit", run_id, HOME=home, AFK_FAKE_PR_INTERRUPTED="1"
+        )
+
+        self.assertEqual(interrupted.returncode, 2, interrupted.stderr)
+        before = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(before["checkpoint"], "change_committed")
+        self.assertEqual(before["attention"]["scope"], "candidate")
+        store = RunStore(self.state_home / "afk")
+        self.assertEqual(store.effect(run_id, "pr-create")["status"], "prepared")
+
+        resumed = self.run_afk("resume", HOME=home)
+
+        self.assertEqual(resumed.returncode, 2, resumed.stderr)
+        after = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(after["checkpoint"], "candidate_ready")
+        self.assertEqual(after["attention"]["scope"], "validation")
+        self.assertEqual(store.effect(run_id, "pr-create")["status"], "confirmed")
+        commands = self.command_log.read_text(encoding="utf-8")
+        self.assertEqual(commands.count('"command":"gh","args":["pr","create"'), 1)
+
+        terminal_resume = self.run_afk("resume", HOME=home)
+
+        self.assertEqual(terminal_resume.returncode, 2, terminal_resume.stderr)
+        terminal = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(terminal["checkpoint"], "candidate_ready")
+        self.assertEqual(terminal["attention"]["scope"], "validation")
+
     def test_resume_requires_attention_for_confirmed_collected_worker_without_terminal(
         self,
     ):
@@ -1181,6 +1243,8 @@ class StartCliTest(unittest.TestCase):
                         pass
                     elif args[:1] == ["push"]:
                         pushed_marker.write_text(candidate_sha, encoding="utf-8")
+                        if os.environ.get("AFK_FAKE_PUSH_INTERRUPTED"):
+                            raise SystemExit(1)
                     else:
                         raise SystemExit(f"unexpected git args: {args}")
                 elif command == "gh":
@@ -1198,6 +1262,8 @@ class StartCliTest(unittest.TestCase):
                         }
                         pr_state.write_text(json.dumps(value), encoding="utf-8")
                         print(value["url"])
+                        if os.environ.get("AFK_FAKE_PR_INTERRUPTED"):
+                            raise SystemExit(1)
                     elif os.environ.get("AFK_FAKE_GH_NON_OBJECT"):
                         print("[]")
                     else:
