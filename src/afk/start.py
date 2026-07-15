@@ -489,9 +489,11 @@ def _claim_bead(bead_id: str, claimant: str, workspace: Path) -> dict[str, str]:
     if bead.get("status") == "open" and not bead.get("assignee"):
         result = _bd_json(["bd", "update", bead_id, "--claim", "--json"], cwd=workspace)
         if isinstance(result, list):
-            result = result[0] if result else {}
-        if not isinstance(result, dict):
-            raise StartError(f"Bead claim returned invalid data: {bead_id}")
+            if len(result) != 1 or not isinstance(result[0], dict):
+                raise _malformed_beads_output()
+            result = result[0]
+        elif not isinstance(result, dict):
+            raise _malformed_beads_output()
         bead = result
     if bead.get("id") != bead_id:
         raise StartError(f"Bead claim returned unexpected Bead: {bead_id}")
@@ -561,7 +563,7 @@ def _show_bead(bead_id: str, workspace: Path) -> dict[str, Any]:
         or len(result) != 1
         or not isinstance(result[0], dict)
     ):
-        raise StartError(f"Bead lookup was ambiguous: {bead_id}")
+        raise _malformed_beads_output()
     return result[0]
 
 
@@ -685,9 +687,11 @@ def _bd_json(command: list[str], *, cwd: Path) -> Any:
     try:
         return json.loads(output)
     except json.JSONDecodeError as exc:
-        raise ExternalCommandError(
-            "malformed_output", "Beads returned malformed output"
-        ) from exc
+        raise _malformed_beads_output() from exc
+
+
+def _malformed_beads_output() -> ExternalCommandError:
+    return ExternalCommandError("malformed_output", "Beads returned malformed output")
 
 
 def _error_classification(error: StartError) -> str | None:

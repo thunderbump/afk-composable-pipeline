@@ -814,6 +814,40 @@ class StartCliTest(unittest.TestCase):
         self.assertNotIn(b"dogfood.internal:3306", artifacts)
         self.assertNotIn("Traceback", completed.stderr)
 
+    def test_structurally_malformed_claim_result_uses_fixed_attention(self):
+        for shape in ("null", "empty", "multi", "non-object"):
+            with self.subTest(shape=shape):
+                state_home = self.temp / f"claim-{shape}"
+                started = self.run_afk(
+                    "start",
+                    "central-bnkl.1.1",
+                    XDG_STATE_HOME=str(state_home),
+                )
+                run_id = started.stdout.strip()
+
+                completed = self.run_afk(
+                    "_worker",
+                    run_id,
+                    XDG_STATE_HOME=str(state_home),
+                    AFK_FAKE_CLAIM_SHAPE=shape,
+                )
+
+                self.assertEqual(completed.returncode, 2)
+                status = RunStore(state_home / "afk").status(run_id)
+                self.assertEqual(
+                    status["attention"]["classification"], "malformed_output"
+                )
+                self.assertEqual(
+                    status["attention"]["summary"],
+                    "Beads returned malformed output",
+                )
+                run_dir = state_home / "afk" / "runs" / run_id
+                artifacts = b"\n".join(
+                    path.read_bytes() for path in run_dir.rglob("*") if path.is_file()
+                )
+                self.assertNotIn(b"raw-database-user", artifacts)
+                self.assertNotIn(b"dogfood.internal:3306", artifacts)
+
     def test_mismatched_claim_result_stops_at_created_checkpoint(self):
         run_id = self.run_afk("start", "central-bnkl.1.1").stdout.strip()
 
@@ -1102,6 +1136,24 @@ class StartCliTest(unittest.TestCase):
                                 '{"database_user":"raw-database-user",'
                                 '"endpoint":"dogfood.internal:3306"'
                             )
+                            raise SystemExit(0)
+                        shape = os.environ.get("AFK_FAKE_CLAIM_SHAPE")
+                        if shape:
+                            payload = {
+                                "null": None,
+                                "empty": [],
+                                "multi": [
+                                    {
+                                        "database_user": "raw-database-user",
+                                        "endpoint": "dogfood.internal:3306",
+                                    },
+                                    {},
+                                ],
+                                "non-object": [
+                                    "raw-database-user@dogfood.internal:3306"
+                                ],
+                            }[shape]
+                            print(json.dumps(payload))
                             raise SystemExit(0)
                         print(json.dumps({
                             "id": (
