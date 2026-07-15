@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from afk.run_store import RunStore  # noqa: E402
-from afk.start import StartError, start_run  # noqa: E402
+from afk.start import StartError, _beads_password, start_run  # noqa: E402
 
 
 BASE_SHA = "a" * 40
@@ -218,6 +218,146 @@ class StartCliTest(unittest.TestCase):
         self.assertIn("credential", status["attention"]["summary"].lower())
         self.assertNotIn(self.secret_value, json.dumps(status))
 
+    def test_initial_missing_credential_config_creates_attention_without_launch(self):
+        (self.config_home / "afk" / "config.toml").unlink()
+
+        completed = self.run_afk("start", "central-bnkl.1.1")
+
+        self.assertEqual(completed.returncode, 2)
+        run_id = completed.stdout.strip()
+        self.assertTrue(run_id)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(status["checkpoint"], "created")
+        self.assertEqual(status["attention"]["scope"], "bead_preflight")
+        self.assertEqual(status["attention"]["kind"], "unavailable")
+        self.assertIn("credential", status["attention"]["summary"].lower())
+        commands = self.command_log.read_text(encoding="utf-8")
+        self.assertNotIn('"command":"systemd-run"', commands)
+        run_dir = self.state_home / "afk" / "runs" / run_id
+        self.assertFalse(
+            any(
+                self.secret_value.encode() in path.read_bytes()
+                for path in run_dir.rglob("*")
+                if path.is_file()
+            )
+        )
+
+    def test_initial_missing_password_file_creates_attention_without_launch(self):
+        self.secret_path.unlink()
+
+        completed = self.run_afk("start", "central-bnkl.1.1")
+
+        self.assertEqual(completed.returncode, 2)
+        run_id = completed.stdout.strip()
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(status["checkpoint"], "created")
+        self.assertEqual(status["attention"]["scope"], "bead_preflight")
+        self.assertEqual(status["attention"]["kind"], "unavailable")
+        commands = self.command_log.read_text(encoding="utf-8")
+        self.assertNotIn('"command":"systemd-run"', commands)
+
+    def test_initial_rejected_password_creates_attention_without_leak_or_launch(self):
+        rejected_password = "initial-rejected-password"
+        self.secret_path.write_text(rejected_password + "\n", encoding="utf-8")
+
+        completed = self.run_afk(
+            "start", "central-bnkl.1.1", AFK_FAKE_REJECT_CREDENTIAL="1"
+        )
+
+        self.assertEqual(completed.returncode, 2)
+        run_id = completed.stdout.strip()
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(status["checkpoint"], "created")
+        self.assertEqual(status["attention"]["scope"], "bead_preflight")
+        self.assertEqual(status["attention"]["kind"], "unavailable")
+        self.assertNotIn(rejected_password, json.dumps(status))
+        commands = self.command_log.read_text(encoding="utf-8")
+        self.assertNotIn(rejected_password, commands)
+        self.assertNotIn('"command":"systemd-run"', commands)
+        run_dir = self.state_home / "afk" / "runs" / run_id
+        self.assertFalse(
+            any(
+                rejected_password.encode() in path.read_bytes()
+                for path in run_dir.rglob("*")
+                if path.is_file()
+            )
+        )
+
+    def test_credential_reads_use_the_same_inodes_they_validate(self):
+        config_path = self.config_home / "afk" / "config.toml"
+        replacement_config = self.temp / "replacement-config.toml"
+        replacement_secret = self.temp / "replacement-secret.txt"
+        replacement_secret.write_text("replacement-password\n", encoding="utf-8")
+        replacement_secret.chmod(0o600)
+        replacement_config.write_text(
+            "schema_version = 1\n"
+            "[beads]\n"
+            f'password_file = "{replacement_secret}"\n',
+            encoding="utf-8",
+        )
+        replacement_config.chmod(0o600)
+        real_stat = Path.stat
+
+        config_stats = 0
+
+        def replace_config_after_validation(path, *args, **kwargs):
+            nonlocal config_stats
+            result = real_stat(path, *args, **kwargs)
+            if path == config_path:
+                config_stats += 1
+                if config_stats == 3:
+                    path.unlink()
+                    path.symlink_to(replacement_config)
+            return result
+
+        with patch.dict(os.environ, {"XDG_CONFIG_HOME": str(self.config_home)}):
+            with patch.object(Path, "stat", replace_config_after_validation):
+                self.assertEqual(_beads_password(), self.secret_value)
+
+        config_path.unlink()
+        config_path.write_text(
+            "schema_version = 1\n"
+            "[beads]\n"
+            f'password_file = "{self.secret_path}"\n',
+            encoding="utf-8",
+        )
+        config_path.chmod(0o600)
+        password_stats = 0
+
+        def replace_password_after_validation(path, *args, **kwargs):
+            nonlocal password_stats
+            result = real_stat(path, *args, **kwargs)
+            if path == self.secret_path:
+                password_stats += 1
+                if password_stats == 4:
+                    path.unlink()
+                    path.symlink_to(replacement_secret)
+            return result
+
+        with patch.dict(os.environ, {"XDG_CONFIG_HOME": str(self.config_home)}):
+            with patch.object(Path, "stat", replace_password_after_validation):
+                self.assertEqual(_beads_password(), self.secret_value)
+
+    def test_credential_reader_rejects_symlinked_files(self):
+        config_path = self.config_home / "afk" / "config.toml"
+        real_config = self.temp / "real-config.toml"
+        config_path.rename(real_config)
+        config_path.symlink_to(real_config)
+
+        with patch.dict(os.environ, {"XDG_CONFIG_HOME": str(self.config_home)}):
+            with self.assertRaisesRegex(StartError, "missing or invalid"):
+                _beads_password()
+
+        config_path.unlink()
+        real_config.rename(config_path)
+        real_secret = self.temp / "real-secret.txt"
+        self.secret_path.rename(real_secret)
+        self.secret_path.symlink_to(real_secret)
+
+        with patch.dict(os.environ, {"XDG_CONFIG_HOME": str(self.config_home)}):
+            with self.assertRaisesRegex(StartError, "missing or invalid"):
+                _beads_password()
+
     def test_rejected_worker_password_enters_attention_without_secret(self):
         started = self.run_afk("start", "central-bnkl.1.1")
         run_id = started.stdout.strip()
@@ -227,10 +367,19 @@ class StartCliTest(unittest.TestCase):
         completed = self.run_afk("_worker", run_id, AFK_FAKE_REJECT_CREDENTIAL="1")
 
         self.assertEqual(completed.returncode, 2)
+        self.assertNotIn(rejected_password, completed.stderr)
         status = json.loads(self.run_afk("status", run_id, "--json").stdout)
         self.assertEqual(status["checkpoint"], "created")
-        self.assertIn("authentication denied", status["attention"]["summary"])
+        self.assertIn("Beads command failed", status["attention"]["summary"])
         self.assertNotIn(rejected_password, json.dumps(status))
+        run_dir = self.state_home / "afk" / "runs" / run_id
+        self.assertFalse(
+            any(
+                rejected_password.encode() in path.read_bytes()
+                for path in run_dir.rglob("*")
+                if path.is_file()
+            )
+        )
 
     def test_resume_confirms_launch_that_succeeded_before_effect_confirmation(self):
         store = RunStore(self.state_home / "afk")
@@ -499,8 +648,41 @@ class StartCliTest(unittest.TestCase):
         )
 
         self.assertEqual(completed.returncode, 2)
-        self.assertIn("Bead labels", completed.stderr)
+        run_id = completed.stdout.strip()
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(status["checkpoint"], "created")
+        self.assertEqual(status["attention"]["scope"], "bead_preflight")
+        self.assertEqual(status["attention"]["kind"], "invalid")
+        self.assertIn("Bead labels", status["attention"]["summary"])
         self.assertNotIn("Traceback", completed.stderr)
+
+    def test_start_records_closed_bead_as_durable_invalid_attention(self):
+        completed = self.run_afk(
+            "start", "central-bnkl.1.1", AFK_FAKE_BEAD_STATUS="closed"
+        )
+
+        self.assertEqual(completed.returncode, 2)
+        run_id = completed.stdout.strip()
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(status["checkpoint"], "created")
+        self.assertEqual(status["attention"]["scope"], "bead_preflight")
+        self.assertEqual(status["attention"]["kind"], "invalid")
+        self.assertIn("not open and exact", status["attention"]["summary"])
+
+    def test_start_records_wrong_project_as_durable_invalid_attention(self):
+        completed = self.run_afk(
+            "start",
+            "central-bnkl.1.1",
+            AFK_FAKE_PROJECT_LABEL="project:another-project",
+        )
+
+        self.assertEqual(completed.returncode, 2)
+        run_id = completed.stdout.strip()
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(status["checkpoint"], "created")
+        self.assertEqual(status["attention"]["scope"], "bead_preflight")
+        self.assertEqual(status["attention"]["kind"], "invalid")
+        self.assertIn("does not belong", status["attention"]["summary"])
 
     def _write_fake_commands(self):
         script = self.fake_bin / "fake-command"
@@ -598,14 +780,22 @@ class StartCliTest(unittest.TestCase):
                         os.environ.get("AFK_FAKE_REJECT_CREDENTIAL")
                         and not record["credential_present"]
                     ):
-                        print("authentication denied", file=sys.stderr)
+                        print(
+                            "authentication denied: "
+                            + os.environ["BEADS_DOLT_PASSWORD"],
+                            file=sys.stderr,
+                        )
                         raise SystemExit(1)
                     status = os.environ["AFK_FAKE_BEAD_STATUS"]
                     assignee = os.environ["AFK_FAKE_ASSIGNEE"]
                     labels = (
                         None
                         if os.environ.get("AFK_FAKE_INVALID_LABELS")
-                        else ["project:beads-webui"]
+                        else [
+                            os.environ.get(
+                                "AFK_FAKE_PROJECT_LABEL", "project:beads-webui"
+                            )
+                        ]
                     )
                     if args[:1] == ["show"]:
                         print(json.dumps([{
