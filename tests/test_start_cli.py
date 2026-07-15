@@ -304,6 +304,16 @@ class StartCliTest(unittest.TestCase):
         self.assertEqual(status["checkpoint"], "created")
         self.assertNotIn("Traceback", completed.stderr)
 
+    def test_mismatched_claim_result_stops_at_created_checkpoint(self):
+        run_id = self.run_afk("start", "central-bnkl.1.1").stdout.strip()
+
+        completed = self.run_afk("_worker", run_id, AFK_FAKE_CLAIM_MISMATCH="1")
+
+        self.assertEqual(completed.returncode, 2)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(status["checkpoint"], "created")
+        self.assertIn("central-bnkl.1.1", status["attention"]["summary"])
+
     def test_worktree_failure_stops_at_claimed_checkpoint(self):
         run_id = self.run_afk("start", "central-bnkl.1.1").stdout.strip()
 
@@ -483,7 +493,11 @@ class StartCliTest(unittest.TestCase):
                             print("null")
                             raise SystemExit(0)
                         print(json.dumps({
-                            "id": os.environ["AFK_FAKE_BEAD"],
+                            "id": (
+                                "central-other.1"
+                                if os.environ.get("AFK_FAKE_CLAIM_MISMATCH")
+                                else os.environ["AFK_FAKE_BEAD"]
+                            ),
                             "status": "in_progress",
                             "assignee": os.environ["USER"],
                         }))

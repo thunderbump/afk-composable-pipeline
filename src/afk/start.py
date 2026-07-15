@@ -384,6 +384,8 @@ def _claim_bead(bead_id: str, claimant: str, workspace: Path) -> dict[str, str]:
         if not isinstance(result, dict):
             raise StartError(f"Bead claim returned invalid data: {bead_id}")
         bead = result
+    if bead.get("id") != bead_id:
+        raise StartError(f"Bead claim returned unexpected Bead: {bead_id}")
     if bead.get("status") != "in_progress" or bead.get("assignee") != claimant:
         raise StartError(f"Bead claim conflicts with current owner: {bead_id}")
     return {"bead_id": bead_id, "claimant": claimant}
