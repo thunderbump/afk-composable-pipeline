@@ -3,6 +3,7 @@ from __future__ import annotations
 import getpass
 import json
 import os
+import stat
 import subprocess
 import sys
 import time
@@ -17,6 +18,7 @@ from afk.run_store import RunStore, RunStoreBusy, RunStoreError
 WORKER_LOCK_ATTEMPTS = 40
 WORKER_LOCK_RETRY_SECONDS = 0.05
 COMMAND_TIMEOUT_SECONDS = 30
+CREDENTIAL_FILE_BYTE_LIMIT = 4096
 
 
 class StartError(RuntimeError):
@@ -61,6 +63,32 @@ def start_run(
             },
         )
         run_id = projection["run_id"]
+        try:
+            bead = _show_bead(bead_id, context.beads_workspace)
+        except StartError as exc:
+            _attention(
+                store,
+                run_id,
+                checkpoint="created",
+                scope="bead_preflight",
+                kind="unavailable",
+                summary=str(exc),
+                validation_contract=context.validation_contract,
+            )
+            return run_id, 2
+        try:
+            _validate_start_bead(bead, bead_id, context.repository)
+        except StartError as exc:
+            _attention(
+                store,
+                run_id,
+                checkpoint="created",
+                scope="bead_preflight",
+                kind="invalid",
+                summary=str(exc),
+                validation_contract=context.validation_contract,
+            )
+            return run_id, 2
         unit = worker_unit(run_id)
         lingering = _lingering(context.claimant)
         store.prepare_effect(
@@ -327,17 +355,6 @@ def preflight(
     ).resolve()
     if not workspace.is_dir():
         raise StartError(f"Beads workspace does not exist: {workspace}")
-    bead = _show_bead(bead_id, workspace)
-    if bead.get("id") != bead_id or bead.get("status") != "open":
-        raise StartError(f"Bead is not open and exact: {bead_id}")
-    project_label = f"project:{repository.rsplit('/', 1)[-1]}"
-    labels = bead.get("labels")
-    if not isinstance(labels, list) or not all(
-        isinstance(label, str) for label in labels
-    ):
-        raise StartError(f"Bead labels are invalid: {bead_id}")
-    if project_label not in labels:
-        raise StartError(f"Bead does not belong to {project_label}")
     claimant = (
         os.environ.get("BEADS_ACTOR") or os.environ.get("USER") or getpass.getuser()
     )
@@ -364,6 +381,7 @@ def _launch_worker(run_id: str, unit: str) -> None:
         "PATH",
         "PYTHONPATH",
         "USER",
+        "XDG_CONFIG_HOME",
         "XDG_STATE_HOME",
         "AFK_BEADS_WORKSPACE",
     ):
@@ -395,9 +413,7 @@ def _launch_worker(run_id: str, unit: str) -> None:
 def _claim_bead(bead_id: str, claimant: str, workspace: Path) -> dict[str, str]:
     bead = _show_bead(bead_id, workspace)
     if bead.get("status") == "open" and not bead.get("assignee"):
-        result = _json_command(
-            ["bd", "update", bead_id, "--claim", "--json"], cwd=workspace
-        )
+        result = _bd_json(["bd", "update", bead_id, "--claim", "--json"], cwd=workspace)
         if isinstance(result, list):
             result = result[0] if result else {}
         if not isinstance(result, dict):
@@ -465,7 +481,7 @@ def _prepare_worktree(store: RunStore, identity: dict[str, Any]) -> tuple[Path, 
 
 
 def _show_bead(bead_id: str, workspace: Path) -> dict[str, Any]:
-    result = _json_command(["bd", "show", bead_id, "--json"], cwd=workspace)
+    result = _bd_json(["bd", "show", bead_id, "--json"], cwd=workspace)
     if (
         not isinstance(result, list)
         or len(result) != 1
@@ -473,6 +489,19 @@ def _show_bead(bead_id: str, workspace: Path) -> dict[str, Any]:
     ):
         raise StartError(f"Bead lookup was ambiguous: {bead_id}")
     return result[0]
+
+
+def _validate_start_bead(bead: dict[str, Any], bead_id: str, repository: str) -> None:
+    if bead.get("id") != bead_id or bead.get("status") != "open":
+        raise StartError(f"Bead is not open and exact: {bead_id}")
+    project_label = f"project:{repository.rsplit('/', 1)[-1]}"
+    labels = bead.get("labels")
+    if not isinstance(labels, list) or not all(
+        isinstance(label, str) for label in labels
+    ):
+        raise StartError(f"Bead labels are invalid: {bead_id}")
+    if project_label not in labels:
+        raise StartError(f"Bead does not belong to {project_label}")
 
 
 def _pinned_validation_contract(
@@ -547,8 +576,10 @@ def _attention(
     )
 
 
-def _required(command: list[str], *, cwd: Path) -> str:
-    completed = _command(command, cwd=cwd, check=False)
+def _required(
+    command: list[str], *, cwd: Path, env: dict[str, str] | None = None
+) -> str:
+    completed = _command(command, cwd=cwd, check=False, env=env)
     if completed.returncode != 0:
         raise StartError(completed.stderr.strip() or f"command failed: {command[0]}")
     return completed.stdout.strip()
@@ -562,8 +593,83 @@ def _json_command(command: list[str], *, cwd: Path) -> Any:
         raise StartError(f"invalid JSON from {command[0]}") from exc
 
 
+def _bd_json(command: list[str], *, cwd: Path) -> Any:
+    environment = os.environ.copy()
+    environment["BEADS_DOLT_PASSWORD"] = _beads_password()
+    completed = _command(command, cwd=cwd, check=False, env=environment)
+    if completed.returncode != 0:
+        raise StartError("Beads command failed")
+    output = completed.stdout.strip()
+    try:
+        return json.loads(output)
+    except json.JSONDecodeError as exc:
+        raise StartError("invalid JSON from bd") from exc
+
+
+def _beads_password() -> str:
+    config_home = Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config")))
+    config_path = config_home / "afk" / "config.toml"
+    try:
+        config = tomllib.loads(_read_private_text(config_path))
+        beads = config.get("beads")
+        if (
+            set(config) != {"schema_version", "beads"}
+            or type(config.get("schema_version")) is not int
+            or config["schema_version"] != 1
+            or not isinstance(beads, dict)
+            or set(beads) != {"password_file"}
+            or not isinstance(beads["password_file"], str)
+        ):
+            raise ValueError
+        password_path = Path(beads["password_file"])
+        if not password_path.is_absolute():
+            raise ValueError
+        lines = _read_private_text(password_path).splitlines()
+        if not lines or not lines[0]:
+            raise ValueError
+        return lines[0]
+    except (OSError, UnicodeDecodeError, ValueError, tomllib.TOMLDecodeError) as exc:
+        raise StartError(
+            "Beads credential configuration is missing or invalid"
+        ) from exc
+
+
+def _read_private_text(path: Path) -> str:
+    descriptor = os.open(
+        path,
+        os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+    )
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(metadata.st_mode) & 0o077
+            or metadata.st_size > CREDENTIAL_FILE_BYTE_LIMIT
+        ):
+            raise ValueError
+        chunks = []
+        remaining = CREDENTIAL_FILE_BYTE_LIMIT + 1
+        while remaining:
+            chunk = os.read(descriptor, remaining)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        payload = b"".join(chunks)
+        if len(payload) > CREDENTIAL_FILE_BYTE_LIMIT:
+            raise ValueError
+        return payload.decode("utf-8")
+    finally:
+        os.close(descriptor)
+
+
 def _command(
-    command: list[str], *, cwd: Path, check: bool
+    command: list[str],
+    *,
+    cwd: Path,
+    check: bool,
+    env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     try:
         return subprocess.run(
@@ -572,6 +678,7 @@ def _command(
             text=True,
             capture_output=True,
             check=check,
+            env=env,
             timeout=COMMAND_TIMEOUT_SECONDS,
         )
     except subprocess.TimeoutExpired as exc:
