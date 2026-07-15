@@ -248,11 +248,29 @@ def run_worker(run_id: str) -> int:
 
 def run_worker_unit(run_id: str) -> int:
     exit_code = run_worker(run_id)
+    worker_result = {
+        0: "completed",
+        2: "attention_required",
+    }.get(exit_code, "failed")
     store = RunStore()
     while True:
         try:
             with store.lock():
                 projection = store.status(run_id)
+                terminal_keys = ("worker_exit_code", "worker_result")
+                terminal_fields = [key for key in terminal_keys if key in projection]
+                if terminal_fields:
+                    if len(terminal_fields) != len(terminal_keys):
+                        raise StartError("worker terminal observation is incomplete")
+                    if (
+                        type(projection["worker_exit_code"]) is int
+                        and projection["worker_exit_code"] == exit_code
+                        and projection["worker_result"] == worker_result
+                    ):
+                        return exit_code
+                    raise StartError(
+                        "worker terminal observation conflicts with result"
+                    )
                 store.append_event(
                     run_id,
                     "worker.terminal",
@@ -260,10 +278,7 @@ def run_worker_unit(run_id: str) -> int:
                         "checkpoint": projection["checkpoint"],
                         "unit": worker_unit(run_id),
                         "worker_exit_code": exit_code,
-                        "worker_result": {
-                            0: "completed",
-                            2: "attention_required",
-                        }.get(exit_code, "failed"),
+                        "worker_result": worker_result,
                     },
                 )
             return exit_code

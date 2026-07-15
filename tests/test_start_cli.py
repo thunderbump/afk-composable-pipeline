@@ -15,6 +15,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+import afk.run_store as run_store_module  # noqa: E402
 from afk.run_store import RunStore, RunStoreBusy  # noqa: E402
 from afk.start import (  # noqa: E402
     StartError,
@@ -509,6 +510,81 @@ class StartCliTest(unittest.TestCase):
         status = store.status("terminal-run")
         self.assertEqual(status["worker_exit_code"], 2)
         self.assertEqual(status["worker_result"], "attention_required")
+
+    def test_worker_unit_deduplicates_terminal_after_projection_write_failure(self):
+        store = RunStore(self.state_home / "afk")
+        store.create_run(
+            bead_id="central-bnkl.1.1",
+            repository="thunderbump/beads-webui",
+            base_branch="main",
+            base_sha=BASE_SHA,
+            start_request={"repository_root": str(self.project)},
+            run_id="terminal-run",
+        )
+        original_atomic_json = run_store_module._atomic_json
+        projection_failed = False
+
+        def fail_terminal_projection_once(path, value):
+            nonlocal projection_failed
+            if value.get("last_event") == "worker.terminal" and not projection_failed:
+                projection_failed = True
+                raise OSError("projection write failed after event fsync")
+            return original_atomic_json(path, value)
+
+        with patch.dict(os.environ, {"XDG_STATE_HOME": str(self.state_home)}):
+            with patch("afk.start.run_worker", return_value=2):
+                with patch(
+                    "afk.run_store._atomic_json", new=fail_terminal_projection_once
+                ):
+                    with patch("afk.start.time.sleep"):
+                        with patch("afk.start.sys.stderr", new_callable=StringIO):
+                            self.assertEqual(run_worker_unit("terminal-run"), 2)
+
+        events_path = self.state_home / "afk" / "runs" / "terminal-run" / "events.jsonl"
+        events = [json.loads(line) for line in events_path.read_text().splitlines()]
+        self.assertEqual(
+            [event["event"] for event in events].count("worker.terminal"), 1
+        )
+        resumed = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="absent")
+        self.assertEqual(resumed.returncode, 2)
+        self.assertFalse(self.command_log.exists())
+
+    def test_worker_unit_rejects_partial_or_conflicting_terminal_observation(self):
+        for name, terminal_data in (
+            ("partial", {"worker_exit_code": 2}),
+            ("conflict", {"worker_exit_code": 1, "worker_result": "failed"}),
+        ):
+            with self.subTest(name=name):
+                state_home = self.temp / name
+                store = RunStore(state_home / "afk")
+                store.create_run(
+                    bead_id="central-bnkl.1.1",
+                    repository="thunderbump/beads-webui",
+                    base_branch="main",
+                    base_sha=BASE_SHA,
+                    run_id="terminal-run",
+                )
+                store.append_event(
+                    "terminal-run",
+                    "worker.terminal",
+                    data={"checkpoint": "created", **terminal_data},
+                )
+
+                with patch.dict(os.environ, {"XDG_STATE_HOME": str(state_home)}):
+                    with patch("afk.start.run_worker", return_value=2):
+                        with self.assertRaisesRegex(StartError, "terminal observation"):
+                            run_worker_unit("terminal-run")
+
+                events_path = (
+                    state_home / "afk" / "runs" / "terminal-run" / "events.jsonl"
+                )
+                events = [
+                    json.loads(line) for line in events_path.read_text().splitlines()
+                ]
+                self.assertEqual(
+                    [event["event"] for event in events].count("worker.terminal"),
+                    1,
+                )
 
     def test_resume_uses_terminal_observation_after_unit_collection(self):
         store = RunStore(self.state_home / "afk")
