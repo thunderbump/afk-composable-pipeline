@@ -40,6 +40,22 @@ class StartCliTest(unittest.TestCase):
             encoding="utf-8",
         )
         self.state_home = self.temp / "state"
+        self.secret_value = "dogfood-password-value"
+        self.secret_path = self.temp / "secrets" / "beads-password.txt"
+        self.secret_path.parent.mkdir(mode=0o700)
+        self.secret_path.write_text(self.secret_value + "\n", encoding="utf-8")
+        self.secret_path.chmod(0o600)
+        self.config_home = self.temp / "config"
+        config_dir = self.config_home / "afk"
+        config_dir.mkdir(parents=True)
+        config_path = config_dir / "config.toml"
+        config_path.write_text(
+            "schema_version = 1\n"
+            "[beads]\n"
+            f'password_file = "{self.secret_path}"\n',
+            encoding="utf-8",
+        )
+        config_path.chmod(0o600)
         (self.temp / "beads").mkdir()
         self.fake_bin = self.temp / "bin"
         self.fake_bin.mkdir()
@@ -56,6 +72,7 @@ class StartCliTest(unittest.TestCase):
                 "PYTHONPATH": str(ROOT / "src"),
                 "PATH": f"{self.fake_bin}:{env['PATH']}",
                 "XDG_STATE_HOME": str(self.state_home),
+                "XDG_CONFIG_HOME": str(self.config_home),
                 "AFK_BEADS_WORKSPACE": str(self.temp / "beads"),
                 "AFK_FAKE_LOG": str(self.command_log),
                 "AFK_FAKE_PROJECT": str(self.project),
@@ -64,6 +81,7 @@ class StartCliTest(unittest.TestCase):
                 "AFK_FAKE_BEAD_STATUS": "open",
                 "AFK_FAKE_ASSIGNEE": "",
                 "AFK_FAKE_PINNED_CONTRACT": "present",
+                "AFK_FAKE_EXPECTED_PASSWORD": self.secret_value,
                 "USER": "bump",
             }
         )
@@ -159,6 +177,60 @@ class StartCliTest(unittest.TestCase):
             '"command":"bd","args":["update","central-bnkl.1.1","--claim"', commands
         )
         self.assertIn(BASE_SHA, commands)
+
+    def test_beads_password_is_scoped_to_bd_children_and_never_persisted(self):
+        started = self.run_afk("start", "central-bnkl.1.1")
+        run_id = started.stdout.strip()
+
+        completed = self.run_afk("_worker", run_id)
+
+        self.assertEqual(completed.returncode, 2, completed.stderr)
+        records = [
+            json.loads(line)
+            for line in self.command_log.read_text(encoding="utf-8").splitlines()
+        ]
+        bd_records = [record for record in records if record["command"] == "bd"]
+        self.assertTrue(bd_records)
+        self.assertTrue(all(record["credential_present"] for record in bd_records))
+        systemd = next(
+            record for record in records if record["command"] == "systemd-run"
+        )
+        self.assertNotIn(self.secret_value, json.dumps(systemd))
+        run_dir = self.state_home / "afk" / "runs" / run_id
+        self.assertFalse(
+            any(
+                self.secret_value.encode() in path.read_bytes()
+                for path in run_dir.rglob("*")
+                if path.is_file()
+            )
+        )
+
+    def test_missing_worker_password_file_enters_attention_without_secret(self):
+        started = self.run_afk("start", "central-bnkl.1.1")
+        run_id = started.stdout.strip()
+        self.secret_path.unlink()
+
+        completed = self.run_afk("_worker", run_id)
+
+        self.assertEqual(completed.returncode, 2)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(status["checkpoint"], "created")
+        self.assertIn("credential", status["attention"]["summary"].lower())
+        self.assertNotIn(self.secret_value, json.dumps(status))
+
+    def test_rejected_worker_password_enters_attention_without_secret(self):
+        started = self.run_afk("start", "central-bnkl.1.1")
+        run_id = started.stdout.strip()
+        rejected_password = "rejected-password-value"
+        self.secret_path.write_text(rejected_password + "\n", encoding="utf-8")
+
+        completed = self.run_afk("_worker", run_id, AFK_FAKE_REJECT_CREDENTIAL="1")
+
+        self.assertEqual(completed.returncode, 2)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(status["checkpoint"], "created")
+        self.assertIn("authentication denied", status["attention"]["summary"])
+        self.assertNotIn(rejected_password, json.dumps(status))
 
     def test_resume_confirms_launch_that_succeeded_before_effect_confirmation(self):
         store = RunStore(self.state_home / "afk")
@@ -447,6 +519,11 @@ class StartCliTest(unittest.TestCase):
                 log_path = Path(os.environ["AFK_FAKE_LOG"])
                 with log_path.open("a", encoding="utf-8") as log:
                     record = {"command": command, "args": args}
+                    if command == "bd":
+                        record["credential_present"] = (
+                            os.environ.get("BEADS_DOLT_PASSWORD")
+                            == os.environ["AFK_FAKE_EXPECTED_PASSWORD"]
+                        )
                     log.write(json.dumps(record, separators=(",", ":")) + "\\n")
 
                 project = os.environ["AFK_FAKE_PROJECT"]
@@ -517,6 +594,12 @@ class StartCliTest(unittest.TestCase):
                             "defaultBranchRef": {"name": "main"},
                         }))
                 elif command == "bd":
+                    if (
+                        os.environ.get("AFK_FAKE_REJECT_CREDENTIAL")
+                        and not record["credential_present"]
+                    ):
+                        print("authentication denied", file=sys.stderr)
+                        raise SystemExit(1)
                     status = os.environ["AFK_FAKE_BEAD_STATUS"]
                     assignee = os.environ["AFK_FAKE_ASSIGNEE"]
                     labels = (

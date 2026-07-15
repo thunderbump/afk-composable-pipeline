@@ -364,6 +364,7 @@ def _launch_worker(run_id: str, unit: str) -> None:
         "PATH",
         "PYTHONPATH",
         "USER",
+        "XDG_CONFIG_HOME",
         "XDG_STATE_HOME",
         "AFK_BEADS_WORKSPACE",
     ):
@@ -395,9 +396,7 @@ def _launch_worker(run_id: str, unit: str) -> None:
 def _claim_bead(bead_id: str, claimant: str, workspace: Path) -> dict[str, str]:
     bead = _show_bead(bead_id, workspace)
     if bead.get("status") == "open" and not bead.get("assignee"):
-        result = _json_command(
-            ["bd", "update", bead_id, "--claim", "--json"], cwd=workspace
-        )
+        result = _bd_json(["bd", "update", bead_id, "--claim", "--json"], cwd=workspace)
         if isinstance(result, list):
             result = result[0] if result else {}
         if not isinstance(result, dict):
@@ -465,7 +464,7 @@ def _prepare_worktree(store: RunStore, identity: dict[str, Any]) -> tuple[Path, 
 
 
 def _show_bead(bead_id: str, workspace: Path) -> dict[str, Any]:
-    result = _json_command(["bd", "show", bead_id, "--json"], cwd=workspace)
+    result = _bd_json(["bd", "show", bead_id, "--json"], cwd=workspace)
     if (
         not isinstance(result, list)
         or len(result) != 1
@@ -547,8 +546,10 @@ def _attention(
     )
 
 
-def _required(command: list[str], *, cwd: Path) -> str:
-    completed = _command(command, cwd=cwd, check=False)
+def _required(
+    command: list[str], *, cwd: Path, env: dict[str, str] | None = None
+) -> str:
+    completed = _command(command, cwd=cwd, check=False, env=env)
     if completed.returncode != 0:
         raise StartError(completed.stderr.strip() or f"command failed: {command[0]}")
     return completed.stdout.strip()
@@ -562,8 +563,59 @@ def _json_command(command: list[str], *, cwd: Path) -> Any:
         raise StartError(f"invalid JSON from {command[0]}") from exc
 
 
+def _bd_json(command: list[str], *, cwd: Path) -> Any:
+    environment = os.environ.copy()
+    environment["BEADS_DOLT_PASSWORD"] = _beads_password()
+    output = _required(command, cwd=cwd, env=environment)
+    try:
+        return json.loads(output)
+    except json.JSONDecodeError as exc:
+        raise StartError("invalid JSON from bd") from exc
+
+
+def _beads_password() -> str:
+    config_home = Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config")))
+    config_path = config_home / "afk" / "config.toml"
+    invalid = StartError("Beads credential configuration is missing or invalid")
+    try:
+        if config_path.is_symlink() or not config_path.is_file():
+            raise invalid
+        if config_path.stat().st_mode & 0o077:
+            raise invalid
+        config = tomllib.loads(config_path.read_text(encoding="utf-8"))
+        beads = config.get("beads")
+        if (
+            set(config) != {"schema_version", "beads"}
+            or type(config.get("schema_version")) is not int
+            or config["schema_version"] != 1
+            or not isinstance(beads, dict)
+            or set(beads) != {"password_file"}
+            or not isinstance(beads["password_file"], str)
+        ):
+            raise invalid
+        password_path = Path(beads["password_file"])
+        if (
+            not password_path.is_absolute()
+            or password_path.is_symlink()
+            or not password_path.is_file()
+            or password_path.stat().st_mode & 0o077
+            or password_path.stat().st_size > 4096
+        ):
+            raise invalid
+        lines = password_path.read_text(encoding="utf-8").splitlines()
+        if not lines or not lines[0]:
+            raise invalid
+        return lines[0]
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+        raise invalid from exc
+
+
 def _command(
-    command: list[str], *, cwd: Path, check: bool
+    command: list[str],
+    *,
+    cwd: Path,
+    check: bool,
+    env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     try:
         return subprocess.run(
@@ -572,6 +624,7 @@ def _command(
             text=True,
             capture_output=True,
             check=check,
+            env=env,
             timeout=COMMAND_TIMEOUT_SECONDS,
         )
     except subprocess.TimeoutExpired as exc:
