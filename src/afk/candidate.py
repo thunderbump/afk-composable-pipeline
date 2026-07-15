@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 from pathlib import Path
@@ -210,7 +211,6 @@ def _codex_permission_args(worktree: Path, branch: str) -> list[str]:
     branch_log_directory = common_dir / "logs" / "refs" / "heads" / Path(branch).parent
     filesystem = {
         ":minimal": "read",
-        str(Path.home().resolve()): "deny",
         str(worktree.resolve()): "write",
         str((worktree / ".git").resolve()): "read",
         str(common_dir): "read",
@@ -219,6 +219,9 @@ def _codex_permission_args(worktree: Path, branch: str) -> list[str]:
         str(branch_ref_directory): "write",
         str(branch_log_directory): "write",
     }
+    codex_package = _codex_package_beneath_home()
+    if codex_package is not None:
+        filesystem[str(codex_package)] = "read"
     shell_environment = {
         "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
         "HOME": str(command_home),
@@ -245,6 +248,22 @@ def _codex_permission_args(worktree: Path, branch: str) -> list[str]:
         "-c",
         f"shell_environment_policy={shell_policy}",
     ]
+
+
+def _codex_package_beneath_home() -> Path | None:
+    executable = shutil.which("codex")
+    if executable is None:
+        raise CandidateError("Codex executable is unavailable")
+    resolved = Path(executable).resolve()
+    home = Path.home().resolve()
+    if not resolved.is_relative_to(home):
+        return None
+    if resolved.name != "codex.js" or resolved.parent.name != "bin":
+        return None
+    package = resolved.parent.parent
+    if package == home:
+        return None
+    return package
 
 
 def _resolved_git_path(worktree: Path, argument: str) -> Path:
