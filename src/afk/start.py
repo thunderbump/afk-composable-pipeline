@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from afk.candidate import CandidateError, produce_candidate
 from afk.run_store import RunStore, RunStoreBusy, RunStoreError
 
 
@@ -138,6 +139,20 @@ def resume_run(*, note: str | None = None) -> tuple[str, int]:
         projection = store.status()
         run_id = projection["run_id"]
         if "worker_exit_code" in projection:
+            attention = projection.get("attention", {})
+            if (
+                projection["checkpoint"] in {"worktree_ready", "change_committed"}
+                and isinstance(attention, dict)
+                and (
+                    attention.get("scope") == "candidate"
+                    or (
+                        projection["checkpoint"] == "worktree_ready"
+                        and attention.get("scope") == "implementation"
+                        and attention.get("kind") == "unavailable"
+                    )
+                )
+            ):
+                return run_id, _advance_candidate(store, run_id)
             return run_id, projection["worker_exit_code"]
         effect = store.effect(run_id, "worker-launch-1")
         unit = effect["intended"]["unit"]
@@ -347,18 +362,7 @@ def _run_worker_with_lock(store: RunStore, run_id: str) -> int:
                     "branch": branch,
                 },
             )
-            _attention(
-                store,
-                run_id,
-                checkpoint="worktree_ready",
-                scope="implementation",
-                kind="unavailable",
-                summary="implementation is not available in this AFK slice",
-                unit=worker_unit(run_id),
-                worktree_path=str(worktree_path),
-                branch=branch,
-            )
-            return 2
+            return _advance_candidate(store, run_id)
     except RunStoreBusy:
         raise
     except (KeyError, OSError, StartError, RunStoreError, ValueError) as exc:
@@ -379,6 +383,48 @@ def _run_worker_with_lock(store: RunStore, run_id: str) -> int:
             return 2
         except (RunStoreError, OSError):
             return 1
+
+
+def _advance_candidate(store: RunStore, run_id: str) -> int:
+    identity = store.identity(run_id)
+    request = identity.get("start_request", {})
+    try:
+        bead = _show_bead(identity["bead_id"], Path(request["beads_workspace"]))
+        produce_candidate(store, run_id, bead=bead)
+    except CandidateError as exc:
+        checkpoint = store.status(run_id)["checkpoint"]
+        _attention(
+            store,
+            run_id,
+            checkpoint=checkpoint,
+            scope="candidate",
+            kind=exc.kind,
+            summary=exc.summary,
+        )
+        return 2
+    except (KeyError, OSError, StartError, RunStoreError, ValueError) as exc:
+        checkpoint = store.status(run_id)["checkpoint"]
+        _attention(
+            store,
+            run_id,
+            checkpoint=checkpoint,
+            scope="candidate",
+            kind="unavailable",
+            summary=str(exc),
+            classification=(
+                _error_classification(exc) if isinstance(exc, StartError) else None
+            ),
+        )
+        return 2
+    _attention(
+        store,
+        run_id,
+        checkpoint="candidate_ready",
+        scope="validation",
+        kind="unavailable",
+        summary="validation is not available in this AFK slice",
+    )
+    return 2
 
 
 def preflight(

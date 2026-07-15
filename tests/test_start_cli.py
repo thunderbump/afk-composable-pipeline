@@ -161,11 +161,11 @@ class StartCliTest(unittest.TestCase):
             if projection["state"] == "attention_required":
                 break
             time.sleep(0.05)
-        self.assertEqual(projection["checkpoint"], "worktree_ready")
+        self.assertEqual(projection["checkpoint"], "candidate_ready")
         effect = RunStore(self.state_home / "afk").effect(run_id, "worker-launch-1")
         self.assertEqual(effect["status"], "confirmed")
 
-    def test_worker_claims_exact_bead_prepares_clean_pinned_worktree_and_stops(self):
+    def test_worker_claims_exact_bead_and_publishes_candidate_before_stopping(self):
         started = self.run_afk("start", "central-bnkl.1.1")
         run_id = started.stdout.strip()
 
@@ -174,8 +174,11 @@ class StartCliTest(unittest.TestCase):
         self.assertEqual(completed.returncode, 2, completed.stderr)
         projection = json.loads(self.run_afk("status", run_id, "--json").stdout)
         self.assertEqual(projection["state"], "attention_required")
-        self.assertEqual(projection["checkpoint"], "worktree_ready")
+        self.assertEqual(projection["checkpoint"], "candidate_ready")
         self.assertEqual(projection["attention"]["kind"], "unavailable")
+        self.assertEqual(projection["attention"]["scope"], "validation")
+        self.assertEqual(projection["candidate_sha"], "d" * 40)
+        self.assertEqual(projection["pr_number"], 17)
         self.assertTrue(Path(projection["worktree_path"]).is_dir())
         effect = RunStore(self.state_home / "afk").effect(run_id, "worker-launch-1")
         self.assertEqual(effect["status"], "confirmed")
@@ -184,6 +187,23 @@ class StartCliTest(unittest.TestCase):
             '"command":"bd","args":["update","central-bnkl.1.1","--claim"', commands
         )
         self.assertIn(BASE_SHA, commands)
+
+    def test_worker_requires_attention_when_target_branch_drifts_before_candidate_ready(
+        self,
+    ):
+        home = str(self.temp)
+        started = self.run_afk("start", "central-bnkl.1.1", HOME=home)
+        run_id = started.stdout.strip()
+
+        completed = self.run_afk(
+            "_worker_unit", run_id, HOME=home, AFK_FAKE_TARGET_DRIFT_ON_PR="1"
+        )
+
+        self.assertEqual(completed.returncode, 2, completed.stderr)
+        projection = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(projection["checkpoint"], "change_committed")
+        self.assertEqual(projection["attention"]["scope"], "candidate")
+        self.assertIn("target branch", projection["attention"]["summary"])
 
     def test_beads_password_is_scoped_to_bd_children_and_never_persisted(self):
         started = self.run_afk("start", "central-bnkl.1.1")
@@ -621,6 +641,129 @@ class StartCliTest(unittest.TestCase):
         self.assertEqual(resumed.stdout.strip(), "collected-run")
         self.assertFalse(self.command_log.exists())
 
+    def test_resume_advances_the_prior_implementation_unavailable_checkpoint(self):
+        store = RunStore(self.state_home / "afk")
+        run_id = "prior-slice-run"
+        branch = "afk/central-bnkl-1-1-prior-slice-run"
+        worktree = self.state_home / "afk" / "worktrees" / run_id
+        worktree.mkdir(parents=True)
+        store.create_run(
+            bead_id="central-bnkl.1.1",
+            repository="thunderbump/beads-webui",
+            base_branch="main",
+            base_sha=BASE_SHA,
+            start_request={
+                "repository_root": str(self.project),
+                "beads_workspace": str(self.temp / "beads"),
+                "claimant": "bump",
+            },
+            run_id=run_id,
+        )
+        store.append_event(
+            run_id,
+            "worktree.ready",
+            state="worktree_ready",
+            data={
+                "checkpoint": "worktree_ready",
+                "worktree_path": str(worktree),
+                "branch": branch,
+            },
+        )
+        store.append_event(
+            run_id,
+            "run.attention_required",
+            state="attention_required",
+            data={
+                "checkpoint": "worktree_ready",
+                "attention": {
+                    "scope": "implementation",
+                    "kind": "unavailable",
+                    "summary": "implementation is not available in this AFK slice",
+                },
+            },
+        )
+        store.append_event(
+            run_id,
+            "worker.terminal",
+            data={
+                "checkpoint": "worktree_ready",
+                "unit": f"afk-{run_id}-worker-1",
+                "worker_exit_code": 2,
+                "worker_result": "attention_required",
+            },
+        )
+
+        resumed = self.run_afk("resume")
+
+        self.assertEqual(resumed.returncode, 2, resumed.stderr)
+        projection = store.status(run_id)
+        self.assertEqual(projection["checkpoint"], "candidate_ready")
+        self.assertEqual(projection["attention"]["scope"], "validation")
+        commands = self.command_log.read_text(encoding="utf-8")
+        self.assertNotIn('"command":"systemctl"', commands)
+
+    def test_resume_reconciles_a_candidate_push_completed_before_confirmation(self):
+        home = str(self.temp)
+        started = self.run_afk("start", "central-bnkl.1.1", HOME=home)
+        run_id = started.stdout.strip()
+
+        interrupted = self.run_afk(
+            "_worker_unit", run_id, HOME=home, AFK_FAKE_PUSH_INTERRUPTED="1"
+        )
+
+        self.assertEqual(interrupted.returncode, 2, interrupted.stderr)
+        before = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(before["checkpoint"], "change_committed")
+        self.assertEqual(before["attention"]["scope"], "candidate")
+        push_effect = RunStore(self.state_home / "afk").effect(
+            run_id, f'branch-push-{"d" * 40}'
+        )
+        self.assertEqual(push_effect["status"], "prepared")
+
+        resumed = self.run_afk("resume", HOME=home)
+
+        self.assertEqual(resumed.returncode, 2, resumed.stderr)
+        after = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(after["checkpoint"], "candidate_ready")
+        self.assertEqual(after["attention"]["scope"], "validation")
+        push_effect = RunStore(self.state_home / "afk").effect(
+            run_id, f'branch-push-{"d" * 40}'
+        )
+        self.assertEqual(push_effect["status"], "confirmed")
+
+    def test_resume_reconciles_a_candidate_pr_completed_before_confirmation(self):
+        home = str(self.temp)
+        started = self.run_afk("start", "central-bnkl.1.1", HOME=home)
+        run_id = started.stdout.strip()
+
+        interrupted = self.run_afk(
+            "_worker_unit", run_id, HOME=home, AFK_FAKE_PR_INTERRUPTED="1"
+        )
+
+        self.assertEqual(interrupted.returncode, 2, interrupted.stderr)
+        before = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(before["checkpoint"], "change_committed")
+        self.assertEqual(before["attention"]["scope"], "candidate")
+        store = RunStore(self.state_home / "afk")
+        self.assertEqual(store.effect(run_id, "pr-create")["status"], "prepared")
+
+        resumed = self.run_afk("resume", HOME=home)
+
+        self.assertEqual(resumed.returncode, 2, resumed.stderr)
+        after = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(after["checkpoint"], "candidate_ready")
+        self.assertEqual(after["attention"]["scope"], "validation")
+        self.assertEqual(store.effect(run_id, "pr-create")["status"], "confirmed")
+        commands = self.command_log.read_text(encoding="utf-8")
+        self.assertEqual(commands.count('"command":"gh","args":["pr","create"'), 1)
+
+        terminal_resume = self.run_afk("resume", HOME=home)
+
+        self.assertEqual(terminal_resume.returncode, 2, terminal_resume.stderr)
+        terminal = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(terminal["checkpoint"], "candidate_ready")
+        self.assertEqual(terminal["attention"]["scope"], "validation")
+
     def test_resume_requires_attention_for_confirmed_collected_worker_without_terminal(
         self,
     ):
@@ -1032,13 +1175,23 @@ class StartCliTest(unittest.TestCase):
 
                 project = os.environ["AFK_FAKE_PROJECT"]
                 sha = os.environ["AFK_FAKE_SHA"]
+                candidate_sha = "d" * 40
+                candidate_marker = Path(os.environ["HOME"]) / ".fake-candidate"
+                pushed_marker = Path(os.environ["HOME"]) / ".fake-pushed"
+                pr_state = Path(os.environ["XDG_STATE_HOME"]) / "fake-pr.json"
+                target_drift = Path(os.environ["XDG_STATE_HOME"]) / "fake-target-drift"
                 if command == "git":
                     if args[:2] == ["rev-parse", "--show-toplevel"]:
                         print(project)
                     elif args[:2] == ["remote", "get-url"]:
                         print("git@github.com:thunderbump/beads-webui.git")
                     elif args[:1] == ["ls-remote"]:
-                        print(sha + "\\trefs/heads/main")
+                        requested = args[-1]
+                        if requested == "refs/heads/main":
+                            target_sha = "e" * 40 if target_drift.exists() else sha
+                            print(target_sha + "\\trefs/heads/main")
+                        elif pushed_marker.exists():
+                            print(candidate_sha + "\\t" + requested)
                     elif args[:1] == ["fetch"]:
                         pass
                     elif args[:1] == ["ls-tree"]:
@@ -1049,8 +1202,21 @@ class StartCliTest(unittest.TestCase):
                         print("[validation]")
                         print('command = ["./scripts/validation-worker.sh", "run"]')
                         print("timeout_seconds = 2700")
+                    elif args[:2] == ["rev-parse", "--git-dir"]:
+                        git_dir = (
+                            Path(os.environ["XDG_STATE_HOME"])
+                            / "fake-git"
+                            / "worktrees"
+                            / Path.cwd().name
+                        )
+                        git_dir.mkdir(parents=True, exist_ok=True)
+                        print(git_dir)
+                    elif args[:2] == ["rev-parse", "--git-common-dir"]:
+                        common_dir = Path(os.environ["XDG_STATE_HOME"]) / "fake-git"
+                        common_dir.mkdir(parents=True, exist_ok=True)
+                        print(common_dir)
                     elif args[:1] == ["rev-parse"]:
-                        print(sha)
+                        print(candidate_sha if candidate_marker.exists() and Path.cwd() != Path(project) else sha)  # noqa: E501
                     elif args[:2] == ["worktree", "add"]:
                         if os.environ.get("AFK_FAKE_WORKTREE_FAILURE"):
                             print("worktree failed", file=sys.stderr)
@@ -1087,10 +1253,39 @@ class StartCliTest(unittest.TestCase):
                                 print()
                     elif args[:2] == ["status", "--porcelain"]:
                         pass
+                    elif args[:2] == ["branch", "--show-current"]:
+                        run_id = Path.cwd().name
+                        print("afk/" + os.environ["AFK_FAKE_BEAD"].replace(".", "-") + "-" + run_id)  # noqa: E501
+                    elif args[:2] == ["merge-base", "--is-ancestor"]:
+                        pass
+                    elif args[:1] == ["rev-list"]:
+                        pass
+                    elif args[:1] == ["push"]:
+                        pushed_marker.write_text(candidate_sha, encoding="utf-8")
+                        if os.environ.get("AFK_FAKE_PUSH_INTERRUPTED"):
+                            raise SystemExit(1)
                     else:
                         raise SystemExit(f"unexpected git args: {args}")
                 elif command == "gh":
-                    if os.environ.get("AFK_FAKE_GH_NON_OBJECT"):
+                    if args[:2] == ["pr", "list"]:
+                        print(json.dumps([json.loads(pr_state.read_text())] if pr_state.exists() else []))  # noqa: E501
+                    elif args[:2] == ["pr", "create"]:
+                        value = {
+                            "number": 17,
+                            "url": "https://example.test/pr/17",
+                            "state": "OPEN",
+                            "isDraft": True,
+                            "headRefOid": candidate_sha,
+                            "headRefName": args[args.index("--head") + 1],
+                            "baseRefName": args[args.index("--base") + 1],
+                        }
+                        pr_state.write_text(json.dumps(value), encoding="utf-8")
+                        print(value["url"])
+                        if os.environ.get("AFK_FAKE_TARGET_DRIFT_ON_PR"):
+                            target_drift.write_text("drifted", encoding="utf-8")
+                        if os.environ.get("AFK_FAKE_PR_INTERRUPTED"):
+                            raise SystemExit(1)
+                    elif os.environ.get("AFK_FAKE_GH_NON_OBJECT"):
                         print("[]")
                     else:
                         print(json.dumps({
@@ -1123,6 +1318,9 @@ class StartCliTest(unittest.TestCase):
                     if args[:1] == ["show"]:
                         print(json.dumps([{
                             "id": os.environ["AFK_FAKE_BEAD"],
+                            "title": "Create the first slice",
+                            "description": "Implement one candidate.",
+                            "acceptance_criteria": "Candidate is committed.",
                             "status": status,
                             "assignee": assignee,
                             "labels": labels,
@@ -1215,6 +1413,37 @@ class StartCliTest(unittest.TestCase):
         script.chmod(script.stat().st_mode | stat.S_IXUSR)
         for name in ("git", "gh", "bd", "systemd-run", "systemctl", "loginctl"):
             (self.fake_bin / name).symlink_to(script)
+        codex = self.fake_bin / "codex"
+        codex.write_text(
+            textwrap.dedent(
+                """
+                #!/usr/bin/env python3
+                import json
+                import os
+                import sys
+                from pathlib import Path
+
+                args = sys.argv[1:]
+                base_sha = "a" * 40
+                candidate_sha = "d" * 40
+                report = Path(args[args.index("--output-last-message") + 1])
+                (Path(os.environ["HOME"]) / ".fake-candidate").write_text(
+                    candidate_sha, encoding="utf-8"
+                )
+                report.write_text(json.dumps({
+                    "status": "completed",
+                    "starting_sha": base_sha,
+                    "ending_sha": candidate_sha,
+                    "summary": "implemented",
+                    "checks": [],
+                    "changed_areas": ["candidate.txt"],
+                }), encoding="utf-8")
+                print(json.dumps({"type": "result"}))
+                """
+            ).lstrip(),
+            encoding="utf-8",
+        )
+        codex.chmod(codex.stat().st_mode | stat.S_IXUSR)
 
 
 if __name__ == "__main__":
