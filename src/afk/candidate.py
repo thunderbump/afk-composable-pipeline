@@ -261,7 +261,11 @@ def _codex_package_beneath_home() -> Path | None:
     if resolved.name != "codex.js" or resolved.parent.name != "bin":
         return None
     package = resolved.parent.parent
-    if package == home:
+    if (
+        package.name != "codex"
+        or package.parent.name != "@openai"
+        or package.parent.parent.name != "node_modules"
+    ):
         return None
     return package
 

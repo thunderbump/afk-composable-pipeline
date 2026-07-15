@@ -238,6 +238,21 @@ class CandidateTest(unittest.TestCase):
         self.assertNotIn(f'"{self.home}" = "write"', config)
         self.assertIn("ignore_default_excludes = false", config)
 
+    def test_does_not_allow_a_home_lookalike_codex_package(self):
+        lookalike = self.home / "private"
+        wrapper = lookalike / "bin/codex.js"
+        wrapper.parent.mkdir(parents=True)
+        (self.bin / "codex").replace(wrapper)
+        (self.bin / "codex").symlink_to(wrapper)
+
+        self.produce()
+
+        args = json.loads(self.codex_args.read_text(encoding="utf-8"))
+        config = "\n".join(
+            args[index + 1] for index, arg in enumerate(args) if arg == "-c"
+        )
+        self.assertNotIn(f'"{lookalike}" = "read"', config)
+
     def test_no_change_and_dirty_results_require_attention(self):
         with self.subTest("no change"):
             with self.assertRaisesRegex(CandidateError, "no_change"):
