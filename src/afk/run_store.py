@@ -207,6 +207,93 @@ class RunStore:
         events, _ = self._read_events(selected)
         return _project(identity, events)
 
+    def identity(self, run_id: str) -> dict[str, Any]:
+        return self._identity(run_id)
+
+    def prepare_effect(
+        self,
+        run_id: str,
+        effect_id: str,
+        *,
+        kind: str,
+        intended: dict[str, Any],
+    ) -> dict[str, Any]:
+        _validate_run_id(effect_id)
+        record = redact_artifact_value(
+            {
+                "schema_version": SCHEMA_VERSION,
+                "effect_id": effect_id,
+                "kind": kind,
+                "status": "prepared",
+                "intended": intended,
+            }
+        )
+        with self.lock():
+            path = self._run_dir(run_id) / "effects" / f"{effect_id}.json"
+            if path.exists():
+                existing = self.effect(run_id, effect_id)
+                if (
+                    existing["kind"] != kind
+                    or existing["intended"] != record["intended"]
+                ):
+                    raise RunStoreError(f"Effect identity conflict: {effect_id}")
+                return existing
+            _write_new_json(path, record)
+            return record
+
+    def effect(self, run_id: str, effect_id: str) -> dict[str, Any]:
+        _validate_run_id(effect_id)
+        path = self._run_dir(run_id) / "effects" / f"{effect_id}.json"
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RunStoreError(f"Effect is missing or invalid: {effect_id}") from exc
+        if not isinstance(record, dict):
+            raise RunStoreError(f"Effect is invalid: {effect_id}")
+        status = record.get("status")
+        expected_keys = {
+            "schema_version",
+            "effect_id",
+            "kind",
+            "status",
+            "intended",
+        }
+        if status == "confirmed":
+            expected_keys.add("observed")
+        if (
+            set(record) != expected_keys
+            or type(record.get("schema_version")) is not int
+            or record["schema_version"] != SCHEMA_VERSION
+            or record.get("effect_id") != effect_id
+            or not isinstance(record.get("kind"), str)
+            or not record["kind"].strip()
+            or status not in {"prepared", "confirmed"}
+            or not isinstance(record.get("intended"), dict)
+            or (status == "confirmed" and not isinstance(record.get("observed"), dict))
+        ):
+            raise RunStoreError(f"Effect is invalid: {effect_id}")
+        return record
+
+    def confirm_effect(
+        self, run_id: str, effect_id: str, *, observed: dict[str, Any]
+    ) -> dict[str, Any]:
+        with self.lock():
+            record = self.effect(run_id, effect_id)
+            if record["status"] == "confirmed":
+                if record.get("observed") != redact_artifact_value(observed):
+                    raise RunStoreError(f"Effect observation conflict: {effect_id}")
+                return record
+            confirmed = {
+                **record,
+                "status": "confirmed",
+                "observed": redact_artifact_value(observed),
+            }
+            _atomic_json(
+                self._run_dir(run_id) / "effects" / f"{effect_id}.json",
+                confirmed,
+            )
+            return confirmed
+
     def write_evidence_text(self, run_id: str, relative_path: str, value: str) -> Path:
         with self.lock():
             path = self._evidence_path(run_id, relative_path)
@@ -469,8 +556,17 @@ def _project(identity: dict[str, Any], events: list[dict[str, Any]]) -> dict[str
             state = event["state"]
     if not isinstance(state, str) or not state:
         raise EventHistoryCorrupt("Event History has no Run State")
+    details: dict[str, Any] = {}
+    checkpoint = "created"
+    for event in events:
+        data = event.get("data")
+        if isinstance(data, dict):
+            details.update(data)
+        event_state = event.get("state")
+        if isinstance(event_state, str) and event_state != "attention_required":
+            checkpoint = event_state
     last = events[-1]
-    return {
+    projection = {
         "schema_version": SCHEMA_VERSION,
         "run_id": identity["run_id"],
         "bead_id": identity["bead_id"],
@@ -482,7 +578,12 @@ def _project(identity: dict[str, Any], events: list[dict[str, Any]]) -> dict[str
         "last_sequence": last["sequence"],
         "last_event": last["event"],
         "updated_at": last["recorded_at"],
+        "checkpoint": details.get("checkpoint", checkpoint),
     }
+    for key in ("unit", "worktree_path", "branch", "attention", "lingering"):
+        if key in details:
+            projection[key] = details[key]
+    return projection
 
 
 def _secure_directory(path: Path) -> None:

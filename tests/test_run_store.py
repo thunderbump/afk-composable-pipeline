@@ -22,6 +22,7 @@ from afk.run_store import (  # noqa: E402
     RunNotFound,
     RunStore,
     RunStoreBusy,
+    RunStoreError,
 )
 
 
@@ -160,6 +161,33 @@ class RunStoreTest(unittest.TestCase):
         self.assertEqual(self.store.status(), attention)
         with self.assertRaises(ActiveRunExists):
             self.create_run("run-002")
+
+    def test_effect_rejects_malformed_durable_record_shapes(self):
+        self.create_run()
+        prepared = self.store.prepare_effect(
+            "run-001",
+            "worker-launch-1",
+            kind="worker-launch",
+            intended={"unit": "afk-run-001-worker-1"},
+        )
+        effect_path = (
+            self.root / "runs" / "run-001" / "effects" / "worker-launch-1.json"
+        )
+        cases = {
+            "kind": {**prepared, "kind": ""},
+            "intended": {**prepared, "intended": []},
+            "confirmed observed": {
+                **prepared,
+                "status": "confirmed",
+                "observed": [],
+            },
+        }
+
+        for field, record in cases.items():
+            with self.subTest(field=field):
+                effect_path.write_text(json.dumps(record), encoding="utf-8")
+                with self.assertRaises(RunStoreError):
+                    self.store.effect("run-001", "worker-launch-1")
 
     def test_completed_evidence_is_redacted_manifested_read_only_and_verified(self):
         self.create_run()

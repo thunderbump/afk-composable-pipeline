@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -43,6 +44,7 @@ from afk.registry import (
     default_step_registry,
 )
 from afk.run_store import RunStore, RunStoreError
+from afk.start import StartError, resume_run, run_worker, start_run
 
 
 SCHEMA_VERSION = 1
@@ -57,6 +59,27 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
+    if args.command == "start":
+        try:
+            run_id, exit_code = start_run(args.bead_id)
+        except (StartError, RunStoreError) as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        print(run_id)
+        return exit_code
+
+    if args.command == "resume":
+        try:
+            run_id, exit_code = resume_run(note=args.note)
+        except (StartError, RunStoreError) as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        print(run_id)
+        return exit_code
+
+    if args.command == "_worker":
+        return run_worker(args.run_id)
+
     if args.command == "status":
         try:
             projection = RunStore().status(args.run_id)
@@ -65,10 +88,16 @@ def main(argv: list[str] | None = None) -> int:
         if args.json:
             print(canonical_json(projection))
         else:
-            print(
-                f"{projection['run_id']} {projection['state']} "
-                f"bead={projection['bead_id']} sequence={projection['last_sequence']}"
-            )
+            fields = [
+                projection["run_id"],
+                projection["state"],
+                f"bead={projection['bead_id']}",
+                f"sequence={projection['last_sequence']}",
+            ]
+            for key in ("checkpoint", "unit"):
+                if key in projection:
+                    fields.append(f"{key}={projection[key]}")
+            print(" ".join(fields))
         return 0
 
     if args.command == "run-step":
@@ -399,6 +428,15 @@ def main(argv: list[str] | None = None) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="afk")
     subcommands = parser.add_subparsers(dest="command")
+
+    start_parser = subcommands.add_parser("start", help="Start one durable AFK Run")
+    start_parser.add_argument("bead_id")
+
+    resume_parser = subcommands.add_parser("resume", help="Reconcile the Active Run")
+    resume_parser.add_argument("--note")
+
+    worker_parser = subcommands.add_parser("_worker", help=argparse.SUPPRESS)
+    worker_parser.add_argument("run_id")
 
     status_parser = subcommands.add_parser("status", help="Inspect a durable Run")
     status_parser.add_argument(
