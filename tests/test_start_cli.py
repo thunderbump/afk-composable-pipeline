@@ -188,6 +188,23 @@ class StartCliTest(unittest.TestCase):
         )
         self.assertIn(BASE_SHA, commands)
 
+    def test_worker_requires_attention_when_target_branch_drifts_before_candidate_ready(
+        self,
+    ):
+        home = str(self.temp)
+        started = self.run_afk("start", "central-bnkl.1.1", HOME=home)
+        run_id = started.stdout.strip()
+
+        completed = self.run_afk(
+            "_worker_unit", run_id, HOME=home, AFK_FAKE_TARGET_DRIFT_ON_PR="1"
+        )
+
+        self.assertEqual(completed.returncode, 2, completed.stderr)
+        projection = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(projection["checkpoint"], "change_committed")
+        self.assertEqual(projection["attention"]["scope"], "candidate")
+        self.assertIn("target branch", projection["attention"]["summary"])
+
     def test_beads_password_is_scoped_to_bd_children_and_never_persisted(self):
         started = self.run_afk("start", "central-bnkl.1.1")
         run_id = started.stdout.strip()
@@ -1162,6 +1179,7 @@ class StartCliTest(unittest.TestCase):
                 candidate_marker = Path(os.environ["HOME"]) / ".fake-candidate"
                 pushed_marker = Path(os.environ["HOME"]) / ".fake-pushed"
                 pr_state = Path(os.environ["XDG_STATE_HOME"]) / "fake-pr.json"
+                target_drift = Path(os.environ["XDG_STATE_HOME"]) / "fake-target-drift"
                 if command == "git":
                     if args[:2] == ["rev-parse", "--show-toplevel"]:
                         print(project)
@@ -1170,7 +1188,8 @@ class StartCliTest(unittest.TestCase):
                     elif args[:1] == ["ls-remote"]:
                         requested = args[-1]
                         if requested == "refs/heads/main":
-                            print(sha + "\\trefs/heads/main")
+                            target_sha = "e" * 40 if target_drift.exists() else sha
+                            print(target_sha + "\\trefs/heads/main")
                         elif pushed_marker.exists():
                             print(candidate_sha + "\\t" + requested)
                     elif args[:1] == ["fetch"]:
@@ -1262,6 +1281,8 @@ class StartCliTest(unittest.TestCase):
                         }
                         pr_state.write_text(json.dumps(value), encoding="utf-8")
                         print(value["url"])
+                        if os.environ.get("AFK_FAKE_TARGET_DRIFT_ON_PR"):
+                            target_drift.write_text("drifted", encoding="utf-8")
                         if os.environ.get("AFK_FAKE_PR_INTERRUPTED"):
                             raise SystemExit(1)
                     elif os.environ.get("AFK_FAKE_GH_NON_OBJECT"):

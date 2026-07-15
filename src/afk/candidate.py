@@ -450,6 +450,9 @@ def _verify_published(
 ) -> None:
     local = _git(worktree, "rev-parse", "HEAD")
     remote = _remote_sha(worktree, branch)
+    target = _remote_sha(worktree, identity["base_branch"])
+    if target != identity["base_sha"]:
+        raise CandidateError("target branch no longer equals the pinned base")
     if (
         local != candidate_sha
         or remote != candidate_sha
