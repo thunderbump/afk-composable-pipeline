@@ -558,7 +558,7 @@ def _prepare_worktree(store: RunStore, identity: dict[str, Any]) -> tuple[Path, 
     run_id = identity["run_id"]
     root = Path(identity["start_request"]["repository_root"])
     worktree = store.root / "worktrees" / run_id
-    branch = f"afk/{identity['bead_id'].replace('.', '-')}-{run_id}"
+    branch = f"afk/{identity['bead_id'].replace('.', '-')}-{run_id}/candidate"
     if not worktree.exists():
         worktree.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         completed = _command(

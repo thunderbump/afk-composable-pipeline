@@ -77,7 +77,7 @@ class CandidateTest(unittest.TestCase):
             capture_output=True,
             check=True,
         ).stdout.strip()
-        self.branch = "afk/central-test-1-run-1"
+        self.branch = "afk/central-test-1-run-1/candidate"
         subprocess.run(
             ["git", "worktree", "add", "-b", self.branch, str(self.checkout)],
             cwd=self.primary_checkout,
@@ -193,8 +193,8 @@ class CandidateTest(unittest.TestCase):
             f'"{git_dir}" = "write"',
             f'"{common_dir}" = "read"',
             f'"{common_dir / "objects"}" = "write"',
-            f'"{common_dir / "refs" / "heads" / "afk"}" = "write"',
-            f'"{common_dir / "logs" / "refs" / "heads" / "afk"}" = "write"',
+            f'"{common_dir / "refs" / "heads" / "afk" / "central-test-1-run-1"}" = "write"',  # noqa: E501
+            f'"{common_dir / "logs" / "refs" / "heads" / "afk" / "central-test-1-run-1"}" = "write"',  # noqa: E501
             f'"{git_dir / "afk-tmp" / "home"}"',
             f'"{git_dir / "afk-tmp"}"',
             "enabled = false",
@@ -204,6 +204,13 @@ class CandidateTest(unittest.TestCase):
             f'"{common_dir / "refs" / "heads" / self.branch}" = "write"',
             config,
         )
+        for forbidden in (
+            common_dir / "refs" / "heads" / "afk",
+            common_dir / "logs" / "refs" / "heads" / "afk",
+            common_dir / "refs" / "heads" / "afk" / "sibling-run",
+            common_dir / "logs" / "refs" / "heads" / "afk" / "sibling-run",
+        ):
+            self.assertNotIn(f'"{forbidden}" = "write"', config)
         self.assertNotIn("CODEX_HOME", config)
         self.assertEqual(
             self.store.effect("run-1", f"branch-push-{candidate_sha}")["status"],
@@ -221,6 +228,12 @@ class CandidateTest(unittest.TestCase):
         with self.subTest("dirty"):
             with self.assertRaisesRegex(CandidateError, "dirty"):
                 self.produce(CODEX_FAKE_OUTCOME="dirty")
+
+    def test_legacy_flat_candidate_branch_fails_closed(self):
+        with self.assertRaisesRegex(CandidateError, "per-Run namespace"):
+            candidate_module._codex_permission_args(
+                self.checkout, "afk/central-test-1-run-1"
+            )
 
     def test_rejects_nonzero_malformed_and_merge_results(self):
         for outcome, message in (

@@ -191,6 +191,14 @@ def _codex_environment() -> dict[str, str]:
 
 
 def _codex_permission_args(worktree: Path, branch: str) -> list[str]:
+    branch_parts = Path(branch).parts
+    if (
+        len(branch_parts) != 3
+        or branch_parts[0] != "afk"
+        or not branch_parts[1]
+        or branch_parts[2] != "candidate"
+    ):
+        raise CandidateError("Candidate branch lacks a private per-Run namespace")
     git_dir = _resolved_git_path(worktree, "--git-dir")
     common_dir = _resolved_git_path(worktree, "--git-common-dir")
     temporary = git_dir / "afk-tmp"

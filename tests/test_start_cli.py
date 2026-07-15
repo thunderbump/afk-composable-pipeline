@@ -179,6 +179,10 @@ class StartCliTest(unittest.TestCase):
         self.assertEqual(projection["attention"]["scope"], "validation")
         self.assertEqual(projection["candidate_sha"], "d" * 40)
         self.assertEqual(projection["pr_number"], 17)
+        self.assertEqual(
+            projection["branch"],
+            f"afk/central-bnkl-1-1-{run_id}/candidate",
+        )
         self.assertTrue(Path(projection["worktree_path"]).is_dir())
         effect = RunStore(self.state_home / "afk").effect(run_id, "worker-launch-1")
         self.assertEqual(effect["status"], "confirmed")
@@ -644,7 +648,7 @@ class StartCliTest(unittest.TestCase):
     def test_resume_advances_the_prior_implementation_unavailable_checkpoint(self):
         store = RunStore(self.state_home / "afk")
         run_id = "prior-slice-run"
-        branch = "afk/central-bnkl-1-1-prior-slice-run"
+        branch = "afk/central-bnkl-1-1-prior-slice-run/candidate"
         worktree = self.state_home / "afk" / "worktrees" / run_id
         worktree.mkdir(parents=True)
         store.create_run(
@@ -705,7 +709,7 @@ class StartCliTest(unittest.TestCase):
     def test_resume_advances_legacy_collected_worker_without_terminal_observation(self):
         store = RunStore(self.state_home / "afk")
         run_id = "legacy-prior-slice-run"
-        branch = "afk/central-bnkl-1-1-legacy-prior-slice-run"
+        branch = "afk/central-bnkl-1-1-legacy-prior-slice-run/candidate"
         worktree = self.state_home / "afk" / "worktrees" / run_id
         worktree.mkdir(parents=True)
         store.create_run(
@@ -1307,6 +1311,7 @@ class StartCliTest(unittest.TestCase):
                                     + os.environ["AFK_FAKE_BEAD"].replace(".", "-")
                                     + "-"
                                     + run_id
+                                    + "/candidate"
                                 )
                                 print("worktree " + str(checkout))
                                 print("HEAD " + head)
@@ -1316,7 +1321,7 @@ class StartCliTest(unittest.TestCase):
                         pass
                     elif args[:2] == ["branch", "--show-current"]:
                         run_id = Path.cwd().name
-                        print("afk/" + os.environ["AFK_FAKE_BEAD"].replace(".", "-") + "-" + run_id)  # noqa: E501
+                        print("afk/" + os.environ["AFK_FAKE_BEAD"].replace(".", "-") + "-" + run_id + "/candidate")  # noqa: E501
                     elif args[:2] == ["merge-base", "--is-ancestor"]:
                         pass
                     elif args[:1] == ["rev-list"]:
