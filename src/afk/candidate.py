@@ -191,6 +191,14 @@ def _codex_environment() -> dict[str, str]:
 
 
 def _codex_permission_args(worktree: Path, branch: str) -> list[str]:
+    branch_parts = Path(branch).parts
+    if (
+        len(branch_parts) != 3
+        or branch_parts[0] != "afk"
+        or not branch_parts[1]
+        or branch_parts[2] != "candidate"
+    ):
+        raise CandidateError("Candidate branch lacks a private per-Run namespace")
     git_dir = _resolved_git_path(worktree, "--git-dir")
     common_dir = _resolved_git_path(worktree, "--git-common-dir")
     temporary = git_dir / "afk-tmp"
@@ -198,8 +206,8 @@ def _codex_permission_args(worktree: Path, branch: str) -> list[str]:
     temporary.mkdir(mode=0o700, exist_ok=True)
     command_home.mkdir(mode=0o700, exist_ok=True)
 
-    branch_ref = common_dir / "refs" / "heads" / branch
-    branch_log = common_dir / "logs" / "refs" / "heads" / branch
+    branch_ref_directory = common_dir / "refs" / "heads" / Path(branch).parent
+    branch_log_directory = common_dir / "logs" / "refs" / "heads" / Path(branch).parent
     filesystem = {
         ":minimal": "read",
         str(Path.home().resolve()): "deny",
@@ -208,10 +216,8 @@ def _codex_permission_args(worktree: Path, branch: str) -> list[str]:
         str(common_dir): "read",
         str(git_dir): "write",
         str(common_dir / "objects"): "write",
-        str(branch_ref): "write",
-        str(Path(f"{branch_ref}.lock")): "write",
-        str(branch_log): "write",
-        str(Path(f"{branch_log}.lock")): "write",
+        str(branch_ref_directory): "write",
+        str(branch_log_directory): "write",
     }
     shell_environment = {
         "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
