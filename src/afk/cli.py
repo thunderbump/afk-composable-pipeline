@@ -44,7 +44,7 @@ from afk.registry import (
     default_step_registry,
 )
 from afk.run_store import RunStore, RunStoreError
-from afk.start import StartError, resume_run, run_worker, start_run
+from afk.start import StartError, resume_run, run_worker, run_worker_unit, start_run
 
 
 SCHEMA_VERSION = 1
@@ -83,6 +83,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "_worker":
         return run_worker(args.run_id)
 
+    if args.command == "_worker_unit":
+        return run_worker_unit(args.run_id)
+
     if args.command == "status":
         try:
             projection = RunStore().status(args.run_id)
@@ -97,7 +100,12 @@ def main(argv: list[str] | None = None) -> int:
                 f"bead={projection['bead_id']}",
                 f"sequence={projection['last_sequence']}",
             ]
-            for key in ("checkpoint", "unit"):
+            for key in (
+                "checkpoint",
+                "unit",
+                "worker_exit_code",
+                "worker_result",
+            ):
                 if key in projection:
                     fields.append(f"{key}={projection[key]}")
             print(" ".join(fields))
@@ -445,6 +453,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     worker_parser = subcommands.add_parser("_worker", help=argparse.SUPPRESS)
     worker_parser.add_argument("run_id")
+
+    worker_unit_parser = subcommands.add_parser("_worker_unit", help=argparse.SUPPRESS)
+    worker_unit_parser.add_argument("run_id")
 
     status_parser = subcommands.add_parser("status", help="Inspect a durable Run")
     status_parser.add_argument(
