@@ -139,19 +139,7 @@ def resume_run(*, note: str | None = None) -> tuple[str, int]:
         projection = store.status()
         run_id = projection["run_id"]
         if "worker_exit_code" in projection:
-            attention = projection.get("attention", {})
-            if (
-                projection["checkpoint"] in {"worktree_ready", "change_committed"}
-                and isinstance(attention, dict)
-                and (
-                    attention.get("scope") == "candidate"
-                    or (
-                        projection["checkpoint"] == "worktree_ready"
-                        and attention.get("scope") == "implementation"
-                        and attention.get("kind") == "unavailable"
-                    )
-                )
-            ):
+            if _candidate_resume_ready(projection):
                 return run_id, _advance_candidate(store, run_id)
             return run_id, projection["worker_exit_code"]
         effect = store.effect(run_id, "worker-launch-1")
@@ -211,6 +199,8 @@ def resume_run(*, note: str | None = None) -> tuple[str, int]:
             return run_id, 0
         if absent:
             if effect["status"] == "confirmed":
+                if _candidate_resume_ready(projection):
+                    return run_id, _advance_candidate(store, run_id)
                 _attention(
                     store,
                     run_id,
@@ -258,6 +248,22 @@ def resume_run(*, note: str | None = None) -> tuple[str, int]:
             unit=unit,
         )
         return run_id, 2
+
+
+def _candidate_resume_ready(projection: dict[str, Any]) -> bool:
+    attention = projection.get("attention", {})
+    return (
+        projection["checkpoint"] in {"worktree_ready", "change_committed"}
+        and isinstance(attention, dict)
+        and (
+            attention.get("scope") == "candidate"
+            or (
+                projection["checkpoint"] == "worktree_ready"
+                and attention.get("scope") == "implementation"
+                and attention.get("kind") == "unavailable"
+            )
+        )
+    )
 
 
 def run_worker(run_id: str) -> int:
