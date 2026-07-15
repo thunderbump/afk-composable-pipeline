@@ -13,6 +13,7 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+import afk.candidate as candidate_module  # noqa: E402
 from afk.candidate import CandidateError, produce_candidate  # noqa: E402
 from afk.run_store import RunStore  # noqa: E402
 
@@ -213,6 +214,40 @@ class CandidateTest(unittest.TestCase):
 
         self.assertEqual(reconciled["candidate_sha"], candidate_sha)
         self.assertEqual(self.store.effect("run-1", "pr-create")["status"], "confirmed")
+
+    def test_pushes_verified_candidate_sha_when_local_head_moves(self):
+        original_remote_sha = candidate_module._remote_sha
+        observed = {}
+
+        def move_head_after_candidate_verification(worktree, branch):
+            remote_sha = original_remote_sha(worktree, branch)
+            if "candidate_sha" not in observed and not remote_sha:
+                observed["candidate_sha"] = self.git("rev-parse", "HEAD")
+                (self.checkout / "later.txt").write_text("later\n", encoding="utf-8")
+                subprocess.run(
+                    ["git", "add", "later.txt"], cwd=self.checkout, check=True
+                )
+                subprocess.run(
+                    ["git", "commit", "-m", "later"],
+                    cwd=self.checkout,
+                    check=True,
+                    capture_output=True,
+                )
+                observed["moved_sha"] = self.git("rev-parse", "HEAD")
+            return remote_sha
+
+        with mock.patch(
+            "afk.candidate._remote_sha",
+            side_effect=move_head_after_candidate_verification,
+        ):
+            with self.assertRaises(CandidateError):
+                self.produce()
+
+        remote_sha = self.git(
+            "ls-remote", "origin", f"refs/heads/{self.branch}"
+        ).split()[0]
+        self.assertEqual(remote_sha, observed["candidate_sha"])
+        self.assertNotEqual(remote_sha, observed["moved_sha"])
 
     def _write_fakes(self):
         codex = self.bin / "codex"

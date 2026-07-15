@@ -268,7 +268,8 @@ def _reconcile_push(
         raise CandidateError("remote Candidate branch has a contradictory head")
     if not remote_sha:
         pushed = _run(
-            ["git", "push", "origin", f"HEAD:refs/heads/{branch}"], cwd=worktree
+            ["git", "push", "origin", f"{candidate_sha}:refs/heads/{branch}"],
+            cwd=worktree,
         )
         if pushed.returncode != 0:
             raise CandidateError("Candidate branch push failed")
