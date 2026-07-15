@@ -42,6 +42,7 @@ from afk.registry import (
     UnknownStepError,
     default_step_registry,
 )
+from afk.run_store import RunStore, RunStoreError
 
 
 SCHEMA_VERSION = 1
@@ -55,6 +56,20 @@ DEFAULT_LEDGER_DIR = "ledgers"
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+
+    if args.command == "status":
+        try:
+            projection = RunStore().status(args.run_id)
+        except RunStoreError as exc:
+            parser.error(str(exc))
+        if args.json:
+            print(canonical_json(projection))
+        else:
+            print(
+                f"{projection['run_id']} {projection['state']} "
+                f"bead={projection['bead_id']} sequence={projection['last_sequence']}"
+            )
+        return 0
 
     if args.command == "run-step":
         try:
@@ -384,6 +399,14 @@ def main(argv: list[str] | None = None) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="afk")
     subcommands = parser.add_subparsers(dest="command")
+
+    status_parser = subcommands.add_parser("status", help="Inspect a durable Run")
+    status_parser.add_argument(
+        "run_id", nargs="?", help="Run id; defaults to the Active Run"
+    )
+    status_parser.add_argument(
+        "--json", action="store_true", help="Print the Run projection as JSON"
+    )
 
     run_step_parser = subcommands.add_parser("run-step", help="Run one pipeline step")
     run_step_parser.add_argument("step")
