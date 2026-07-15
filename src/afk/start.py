@@ -5,12 +5,18 @@ import json
 import os
 import subprocess
 import sys
+import time
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from afk.run_store import RunStore, RunStoreError
+from afk.run_store import RunStore, RunStoreBusy, RunStoreError
+
+
+WORKER_LOCK_ATTEMPTS = 40
+WORKER_LOCK_RETRY_SECONDS = 0.05
+COMMAND_TIMEOUT_SECONDS = 30
 
 
 class StartError(RuntimeError):
@@ -31,65 +37,136 @@ class StartContext:
 def start_run(bead_id: str, *, cwd: Path | None = None) -> tuple[str, int]:
     context = preflight(bead_id, cwd=cwd or Path.cwd())
     store = RunStore()
-    projection = store.create_run(
-        bead_id=bead_id,
-        repository=context.repository,
-        base_branch=context.base_branch,
-        base_sha=context.base_sha,
-        start_request={
-            "repository_root": str(context.root),
-            "beads_workspace": str(context.beads_workspace),
-            "claimant": context.claimant,
-        },
-    )
-    run_id = projection["run_id"]
-    unit = worker_unit(run_id)
-    lingering = _lingering(context.claimant)
-    store.prepare_effect(
-        run_id,
-        "worker-launch-1",
-        kind="worker-launch",
-        intended={"unit": unit},
-    )
-    store.append_event(
-        run_id,
-        "worker.launch_prepared",
-        data={
-            "unit": unit,
-            "checkpoint": "created",
-            "lingering": lingering,
-        },
-    )
-    try:
-        _launch_worker(run_id, unit)
-    except StartError as exc:
-        _attention(
-            store,
-            run_id,
-            checkpoint="created",
-            scope="worker_launch",
-            kind="unavailable",
-            summary=str(exc),
-            unit=unit,
+    with store.lock():
+        projection = store.create_run(
+            bead_id=bead_id,
+            repository=context.repository,
+            base_branch=context.base_branch,
+            base_sha=context.base_sha,
+            start_request={
+                "repository_root": str(context.root),
+                "beads_workspace": str(context.beads_workspace),
+                "claimant": context.claimant,
+            },
         )
-        return run_id, 2
+        run_id = projection["run_id"]
+        unit = worker_unit(run_id)
+        lingering = _lingering(context.claimant)
+        store.prepare_effect(
+            run_id,
+            "worker-launch-1",
+            kind="worker-launch",
+            intended={"unit": unit},
+        )
+        store.append_event(
+            run_id,
+            "worker.launch_prepared",
+            data={
+                "unit": unit,
+                "checkpoint": "created",
+                "lingering": lingering,
+            },
+        )
+        try:
+            _launch_worker(run_id, unit)
+        except StartError as exc:
+            _attention(
+                store,
+                run_id,
+                checkpoint="created",
+                scope="worker_launch",
+                kind="unavailable",
+                summary=str(exc),
+                unit=unit,
+            )
+            return run_id, 2
     return run_id, 0
 
 
 def resume_run(*, note: str | None = None) -> tuple[str, int]:
     store = RunStore()
-    projection = store.status()
-    run_id = projection["run_id"]
-    effect = store.effect(run_id, "worker-launch-1")
-    if effect["status"] == "confirmed":
-        return run_id, 0
-    unit = effect["intended"]["unit"]
-    completed = _command(
-        ["systemctl", "--user", "show", unit, "--property=ActiveState"],
-        cwd=Path.cwd(),
-        check=False,
-    )
-    if completed.returncode != 0 or "ActiveState=active" not in completed.stdout:
+    with store.lock():
+        projection = store.status()
+        run_id = projection["run_id"]
+        effect = store.effect(run_id, "worker-launch-1")
+        if effect["status"] == "confirmed":
+            return run_id, 0
+        unit = effect["intended"]["unit"]
+        try:
+            completed = _command(
+                [
+                    "systemctl",
+                    "--user",
+                    "show",
+                    unit,
+                    "--property=LoadState",
+                    "--property=ActiveState",
+                ],
+                cwd=Path.cwd(),
+                check=False,
+            )
+        except StartError as exc:
+            _attention(
+                store,
+                run_id,
+                checkpoint=projection["checkpoint"],
+                scope="worker_launch",
+                kind="unavailable",
+                summary=str(exc),
+                unit=unit,
+            )
+            return run_id, 2
+        properties: dict[str, str] = {}
+        for line in completed.stdout.splitlines():
+            key, separator, value = line.partition("=")
+            if not separator or key in properties:
+                properties = {}
+                break
+            properties[key] = value
+        active = completed.returncode == 0 and properties == {
+            "LoadState": "loaded",
+            "ActiveState": "active",
+        }
+        absent = properties == {
+            "LoadState": "not-found",
+            "ActiveState": "inactive",
+        }
+        if active:
+            store.confirm_effect(run_id, "worker-launch-1", observed={"unit": unit})
+            store.append_event(
+                run_id,
+                "worker.launch_reconciled",
+                data={
+                    "unit": unit,
+                    "checkpoint": projection["checkpoint"],
+                    "note": note or "",
+                },
+            )
+            return run_id, 0
+        if absent:
+            try:
+                _launch_worker(run_id, unit)
+            except StartError as exc:
+                _attention(
+                    store,
+                    run_id,
+                    checkpoint=projection["checkpoint"],
+                    scope="worker_launch",
+                    kind="unavailable",
+                    summary=str(exc),
+                    unit=unit,
+                )
+                return run_id, 2
+            store.append_event(
+                run_id,
+                "worker.launch_retried",
+                data={
+                    "unit": unit,
+                    "checkpoint": projection["checkpoint"],
+                    "note": note or "",
+                },
+            )
+            return run_id, 0
         _attention(
             store,
             run_id,
@@ -100,17 +177,21 @@ def resume_run(*, note: str | None = None) -> tuple[str, int]:
             unit=unit,
         )
         return run_id, 2
-    store.confirm_effect(run_id, "worker-launch-1", observed={"unit": unit})
-    store.append_event(
-        run_id,
-        "worker.launch_reconciled",
-        data={"unit": unit, "checkpoint": projection["checkpoint"], "note": note or ""},
-    )
-    return run_id, 0
 
 
 def run_worker(run_id: str) -> int:
     store = RunStore()
+    for attempt in range(WORKER_LOCK_ATTEMPTS):
+        try:
+            return _run_worker_with_lock(store, run_id)
+        except RunStoreBusy:
+            if attempt + 1 == WORKER_LOCK_ATTEMPTS:
+                return 1
+            time.sleep(WORKER_LOCK_RETRY_SECONDS)
+    return 1
+
+
+def _run_worker_with_lock(store: RunStore, run_id: str) -> int:
     try:
         with store.lock():
             identity = store.identity(run_id)
@@ -167,6 +248,8 @@ def run_worker(run_id: str) -> int:
                 branch=branch,
             )
             return 2
+    except RunStoreBusy:
+        raise
     except (KeyError, OSError, StartError, RunStoreError, ValueError) as exc:
         try:
             checkpoint = store.status(run_id)["checkpoint"]
@@ -191,9 +274,21 @@ def preflight(bead_id: str, *, cwd: Path) -> StartContext:
         ["gh", "repo", "view", "--json", "nameWithOwner,defaultBranchRef"],
         cwd=root,
     )
+    if not isinstance(repository_data, dict):
+        raise StartError("GitHub repository or default branch is unavailable")
     repository = repository_data.get("nameWithOwner")
-    default_branch = repository_data.get("defaultBranchRef", {}).get("name")
-    if not isinstance(repository, str) or not isinstance(default_branch, str):
+    default_branch_data = repository_data.get("defaultBranchRef")
+    default_branch = (
+        default_branch_data.get("name")
+        if isinstance(default_branch_data, dict)
+        else None
+    )
+    if (
+        not isinstance(repository, str)
+        or not repository
+        or not isinstance(default_branch, str)
+        or not default_branch
+    ):
         raise StartError("GitHub repository or default branch is unavailable")
     remote_ref = f"refs/heads/{default_branch}"
     remote_line = _required(
@@ -218,7 +313,12 @@ def preflight(bead_id: str, *, cwd: Path) -> StartContext:
     if bead.get("id") != bead_id or bead.get("status") != "open":
         raise StartError(f"Bead is not open and exact: {bead_id}")
     project_label = f"project:{repository.rsplit('/', 1)[-1]}"
-    if project_label not in bead.get("labels", []):
+    labels = bead.get("labels")
+    if not isinstance(labels, list) or not all(
+        isinstance(label, str) for label in labels
+    ):
+        raise StartError(f"Bead labels are invalid: {bead_id}")
+    if project_label not in labels:
         raise StartError(f"Bead does not belong to {project_label}")
     claimant = (
         os.environ.get("BEADS_ACTOR") or os.environ.get("USER") or getpass.getuser()
@@ -281,6 +381,8 @@ def _claim_bead(bead_id: str, claimant: str, workspace: Path) -> dict[str, str]:
         )
         if isinstance(result, list):
             result = result[0] if result else {}
+        if not isinstance(result, dict):
+            raise StartError(f"Bead claim returned invalid data: {bead_id}")
         bead = result
     if bead.get("status") != "in_progress" or bead.get("assignee") != claimant:
         raise StartError(f"Bead claim conflicts with current owner: {bead_id}")
@@ -309,6 +411,32 @@ def _prepare_worktree(store: RunStore, identity: dict[str, Any]) -> tuple[Path, 
         )
         if completed.returncode != 0:
             raise StartError(completed.stderr.strip() or "worktree preparation failed")
+    listing = _required(["git", "worktree", "list", "--porcelain"], cwd=root)
+    records: list[dict[str, str]] = []
+    record: dict[str, str] = {}
+    for line in [*listing.splitlines(), ""]:
+        if not line:
+            if record:
+                records.append(record)
+                record = {}
+            continue
+        key, _, value = line.partition(" ")
+        record[key] = value
+    registered = next(
+        (
+            item
+            for item in records
+            if item.get("worktree")
+            and Path(item["worktree"]).resolve() == worktree.resolve()
+        ),
+        None,
+    )
+    if registered is None:
+        raise StartError("prepared worktree is not registered")
+    if registered.get("HEAD") != identity["base_sha"]:
+        raise StartError("prepared worktree is not at pinned base")
+    if registered.get("branch") != f"refs/heads/{branch}":
+        raise StartError("prepared worktree is not on the intended branch")
     dirty = _required(["git", "status", "--porcelain"], cwd=worktree)
     if dirty:
         raise StartError("prepared worktree is dirty")
@@ -405,6 +533,11 @@ def _command(
             text=True,
             capture_output=True,
             check=check,
+            timeout=COMMAND_TIMEOUT_SECONDS,
         )
+    except subprocess.TimeoutExpired as exc:
+        raise StartError(
+            f"{command[0]} timed out after {COMMAND_TIMEOUT_SECONDS} seconds"
+        ) from exc
     except OSError as exc:
         raise StartError(f"could not execute {command[0]}: {exc}") from exc

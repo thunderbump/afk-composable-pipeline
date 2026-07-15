@@ -88,10 +88,16 @@ def main(argv: list[str] | None = None) -> int:
         if args.json:
             print(canonical_json(projection))
         else:
-            print(
-                f"{projection['run_id']} {projection['state']} "
-                f"bead={projection['bead_id']} sequence={projection['last_sequence']}"
-            )
+            fields = [
+                projection["run_id"],
+                projection["state"],
+                f"bead={projection['bead_id']}",
+                f"sequence={projection['last_sequence']}",
+            ]
+            for key in ("checkpoint", "unit"):
+                if key in projection:
+                    fields.append(f"{key}={projection[key]}")
+            print(" ".join(fields))
         return 0
 
     if args.command == "run-step":

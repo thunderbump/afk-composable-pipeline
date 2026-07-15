@@ -248,10 +248,28 @@ class RunStore:
             record = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise RunStoreError(f"Effect is missing or invalid: {effect_id}") from exc
+        if not isinstance(record, dict):
+            raise RunStoreError(f"Effect is invalid: {effect_id}")
+        status = record.get("status")
+        expected_keys = {
+            "schema_version",
+            "effect_id",
+            "kind",
+            "status",
+            "intended",
+        }
+        if status == "confirmed":
+            expected_keys.add("observed")
         if (
-            not isinstance(record, dict)
+            set(record) != expected_keys
+            or type(record.get("schema_version")) is not int
+            or record["schema_version"] != SCHEMA_VERSION
             or record.get("effect_id") != effect_id
-            or record.get("status") not in {"prepared", "confirmed"}
+            or not isinstance(record.get("kind"), str)
+            or not record["kind"].strip()
+            or status not in {"prepared", "confirmed"}
+            or not isinstance(record.get("intended"), dict)
+            or (status == "confirmed" and not isinstance(record.get("observed"), dict))
         ):
             raise RunStoreError(f"Effect is invalid: {effect_id}")
         return record
