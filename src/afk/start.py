@@ -128,6 +128,8 @@ def resume_run(*, note: str | None = None) -> tuple[str, int]:
     with store.lock():
         projection = store.status()
         run_id = projection["run_id"]
+        if "worker_exit_code" in projection:
+            return run_id, projection["worker_exit_code"]
         effect = store.effect(run_id, "worker-launch-1")
         if effect["status"] == "confirmed":
             return run_id, 0
@@ -229,6 +231,36 @@ def run_worker(run_id: str) -> int:
                 return 1
             time.sleep(WORKER_LOCK_RETRY_SECONDS)
     return 1
+
+
+def run_worker_unit(run_id: str) -> int:
+    exit_code = run_worker(run_id)
+    store = RunStore()
+    for attempt in range(WORKER_LOCK_ATTEMPTS):
+        try:
+            with store.lock():
+                projection = store.status(run_id)
+                store.append_event(
+                    run_id,
+                    "worker.terminal",
+                    data={
+                        "checkpoint": projection["checkpoint"],
+                        "unit": worker_unit(run_id),
+                        "worker_exit_code": exit_code,
+                        "worker_result": {
+                            0: "completed",
+                            2: "attention_required",
+                        }.get(exit_code, "failed"),
+                    },
+                )
+            break
+        except RunStoreBusy:
+            if attempt + 1 == WORKER_LOCK_ATTEMPTS:
+                break
+            time.sleep(WORKER_LOCK_RETRY_SECONDS)
+        except (OSError, RunStoreError):
+            break
+    return exit_code
 
 
 def _run_worker_with_lock(store: RunStore, run_id: str) -> int:
@@ -402,7 +434,7 @@ def _launch_worker(run_id: str, unit: str) -> None:
         sys.executable,
         "-m",
         "afk",
-        "_worker",
+        "_worker_unit",
         run_id,
     ]
     completed = _command(command, cwd=Path.cwd(), check=False)
