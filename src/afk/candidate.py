@@ -85,13 +85,13 @@ def produce_candidate(
         )
         with tempfile.TemporaryDirectory(prefix="afk-candidate-") as temporary:
             report_path = Path(temporary) / "report.json"
+            permission_args = _codex_permission_args(worktree, branch)
             command = [
                 "codex",
                 "exec",
                 "--ephemeral",
                 "--ignore-user-config",
-                "--sandbox",
-                "workspace-write",
+                *permission_args,
                 "--cd",
                 str(worktree),
                 "--output-schema",
@@ -188,6 +188,69 @@ commit is needed and `blocked` when safe completion is impossible.
 def _codex_environment() -> dict[str, str]:
     allowed = ("HOME", "PATH", "USER", "LOGNAME", "LANG", "LC_ALL", "CODEX_HOME")
     return {name: os.environ[name] for name in allowed if name in os.environ}
+
+
+def _codex_permission_args(worktree: Path, branch: str) -> list[str]:
+    git_dir = _resolved_git_path(worktree, "--git-dir")
+    common_dir = _resolved_git_path(worktree, "--git-common-dir")
+    temporary = git_dir / "afk-tmp"
+    command_home = temporary / "home"
+    temporary.mkdir(mode=0o700, exist_ok=True)
+    command_home.mkdir(mode=0o700, exist_ok=True)
+
+    branch_ref = common_dir / "refs" / "heads" / branch
+    branch_log = common_dir / "logs" / "refs" / "heads" / branch
+    filesystem = {
+        ":minimal": "read",
+        str(Path.home().resolve()): "deny",
+        str(worktree.resolve()): "write",
+        str((worktree / ".git").resolve()): "read",
+        str(common_dir): "read",
+        str(git_dir): "write",
+        str(common_dir / "objects"): "write",
+        str(branch_ref): "write",
+        str(Path(f"{branch_ref}.lock")): "write",
+        str(branch_log): "write",
+        str(Path(f"{branch_log}.lock")): "write",
+    }
+    shell_environment = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "HOME": str(command_home),
+        "TMPDIR": str(temporary),
+        "GIT_TERMINAL_PROMPT": "0",
+    }
+    profile = (
+        '{ description = "AFK Candidate implementation", filesystem = '
+        f"{_toml_table(filesystem)}, network = {{ enabled = false }} }}"
+    )
+    shell_policy = (
+        '{ inherit = "none", ignore_default_excludes = false, set = '
+        f"{_toml_table(shell_environment)} }}"
+    )
+    return [
+        "-c",
+        'default_permissions="afk_candidate"',
+        "-c",
+        f"permissions.afk_candidate={profile}",
+        "-c",
+        'approval_policy="never"',
+        "-c",
+        'web_search="disabled"',
+        "-c",
+        f"shell_environment_policy={shell_policy}",
+    ]
+
+
+def _resolved_git_path(worktree: Path, argument: str) -> Path:
+    path = Path(_git(worktree, "rev-parse", argument))
+    return path.resolve() if path.is_absolute() else (worktree / path).resolve()
+
+
+def _toml_table(values: dict[str, str]) -> str:
+    fields = ", ".join(
+        f"{json.dumps(key)} = {json.dumps(value)}" for key, value in values.items()
+    )
+    return f"{{ {fields} }}"
 
 
 def _read_report(path: Path) -> dict[str, Any]:

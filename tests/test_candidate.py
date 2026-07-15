@@ -29,47 +29,58 @@ class CandidateTest(unittest.TestCase):
         self.codex_home = self.home / ".codex"
         self.codex_home.mkdir()
         self.remote = self.temp / "remote.git"
+        self.primary_checkout = self.temp / "primary"
         self.checkout = self.temp / "checkout"
         subprocess.run(
             ["git", "init", "--bare", str(self.remote)], check=True, capture_output=True
         )
         subprocess.run(
-            ["git", "init", "-b", "main", str(self.checkout)],
+            ["git", "init", "-b", "main", str(self.primary_checkout)],
             check=True,
             capture_output=True,
         )
         subprocess.run(
-            ["git", "config", "user.name", "AFK Test"], cwd=self.checkout, check=True
+            ["git", "config", "user.name", "AFK Test"],
+            cwd=self.primary_checkout,
+            check=True,
         )
         subprocess.run(
             ["git", "config", "user.email", "afk@example.test"],
-            cwd=self.checkout,
+            cwd=self.primary_checkout,
             check=True,
         )
-        (self.checkout / "README.md").write_text("base\n", encoding="utf-8")
-        subprocess.run(["git", "add", "README.md"], cwd=self.checkout, check=True)
+        (self.primary_checkout / "README.md").write_text("base\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "add", "README.md"], cwd=self.primary_checkout, check=True
+        )
         subprocess.run(
             ["git", "commit", "-m", "base"],
-            cwd=self.checkout,
+            cwd=self.primary_checkout,
             check=True,
             capture_output=True,
         )
         subprocess.run(
             ["git", "remote", "add", "origin", str(self.remote)],
-            cwd=self.checkout,
+            cwd=self.primary_checkout,
             check=True,
         )
         subprocess.run(
             ["git", "push", "origin", "main"],
-            cwd=self.checkout,
+            cwd=self.primary_checkout,
             check=True,
             capture_output=True,
         )
-        self.base_sha = self.git("rev-parse", "HEAD")
+        self.base_sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=self.primary_checkout,
+            text=True,
+            capture_output=True,
+            check=True,
+        ).stdout.strip()
         self.branch = "afk/central-test-1-run-1"
         subprocess.run(
-            ["git", "switch", "-c", self.branch],
-            cwd=self.checkout,
+            ["git", "worktree", "add", "-b", self.branch, str(self.checkout)],
+            cwd=self.primary_checkout,
             check=True,
             capture_output=True,
         )
@@ -95,6 +106,7 @@ class CandidateTest(unittest.TestCase):
         )
         self.gh_state = self.temp / "gh-state.json"
         self.codex_env = self.temp / "codex-env.json"
+        self.codex_args = self.temp / "codex-args.json"
         self._write_fakes()
 
     def tearDown(self):
@@ -163,6 +175,34 @@ class CandidateTest(unittest.TestCase):
         captured_env = json.loads(self.codex_env.read_text(encoding="utf-8"))
         self.assertNotIn("GITHUB_TOKEN", captured_env)
         self.assertNotIn("BEADS_DOLT_PASSWORD", captured_env)
+        self.assertEqual(captured_env["HOME"], str(self.home))
+        self.assertEqual(captured_env["CODEX_HOME"], str(self.codex_home))
+        args = json.loads(self.codex_args.read_text(encoding="utf-8"))
+        self.assertNotIn("--sandbox", args)
+        configs = [args[index + 1] for index, arg in enumerate(args) if arg == "-c"]
+        config = "\n".join(configs)
+        git_dir = Path(self.git("rev-parse", "--git-dir")).resolve()
+        common_dir = Path(self.git("rev-parse", "--git-common-dir")).resolve()
+        for expected in (
+            'default_permissions="afk_candidate"',
+            'web_search="disabled"',
+            'inherit = "none"',
+            f'"{self.home}" = "deny"',
+            f'"{self.checkout}" = "write"',
+            f'"{self.checkout / ".git"}" = "read"',
+            f'"{git_dir}" = "write"',
+            f'"{common_dir}" = "read"',
+            f'"{common_dir / "objects"}" = "write"',
+            f'"{common_dir / "refs" / "heads" / self.branch}" = "write"',
+            f'"{common_dir / "refs" / "heads" / self.branch}.lock" = "write"',
+            f'"{common_dir / "logs" / "refs" / "heads" / self.branch}" = "write"',
+            f'"{common_dir / "logs" / "refs" / "heads" / self.branch}.lock" = "write"',
+            f'"{git_dir / "afk-tmp" / "home"}"',
+            f'"{git_dir / "afk-tmp"}"',
+            "enabled = false",
+        ):
+            self.assertIn(expected, config)
+        self.assertNotIn("CODEX_HOME", config)
         self.assertEqual(
             self.store.effect("run-1", f"branch-push-{candidate_sha}")["status"],
             "confirmed",
@@ -261,6 +301,7 @@ class CandidateTest(unittest.TestCase):
                 cwd = Path(args[args.index("--cd") + 1])
                 report = Path(args[args.index("--output-last-message") + 1])
                 Path({str(self.codex_env)!r}).write_text(json.dumps(dict(os.environ)), encoding="utf-8")  # noqa: E501
+                Path({str(self.codex_args)!r}).write_text(json.dumps(args), encoding="utf-8")  # noqa: E501
                 outcome = (Path(os.environ["CODEX_HOME"]) / "fake-outcome").read_text()
                 start = subprocess.run(["git", "rev-parse", "HEAD"], cwd=cwd, text=True, capture_output=True, check=True).stdout.strip()  # noqa: E501
                 if outcome not in {"no_change", "nonzero", "malformed"}:

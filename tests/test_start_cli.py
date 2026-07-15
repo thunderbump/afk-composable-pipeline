@@ -1121,6 +1121,19 @@ class StartCliTest(unittest.TestCase):
                         print("[validation]")
                         print('command = ["./scripts/validation-worker.sh", "run"]')
                         print("timeout_seconds = 2700")
+                    elif args[:2] == ["rev-parse", "--git-dir"]:
+                        git_dir = (
+                            Path(os.environ["XDG_STATE_HOME"])
+                            / "fake-git"
+                            / "worktrees"
+                            / Path.cwd().name
+                        )
+                        git_dir.mkdir(parents=True, exist_ok=True)
+                        print(git_dir)
+                    elif args[:2] == ["rev-parse", "--git-common-dir"]:
+                        common_dir = Path(os.environ["XDG_STATE_HOME"]) / "fake-git"
+                        common_dir.mkdir(parents=True, exist_ok=True)
+                        print(common_dir)
                     elif args[:1] == ["rev-parse"]:
                         print(candidate_sha if candidate_marker.exists() and Path.cwd() != Path(project) else sha)  # noqa: E501
                     elif args[:2] == ["worktree", "add"]:
