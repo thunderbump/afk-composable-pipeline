@@ -25,6 +25,12 @@ class StartError(RuntimeError):
     pass
 
 
+class ExternalCommandError(StartError):
+    def __init__(self, classification: str, summary: str):
+        super().__init__(summary)
+        self.classification = classification
+
+
 @dataclass(frozen=True)
 class StartContext:
     root: Path
@@ -73,6 +79,7 @@ def start_run(
                 scope="bead_preflight",
                 kind="unavailable",
                 summary=str(exc),
+                classification=_error_classification(exc),
                 validation_contract=context.validation_contract,
             )
             return run_id, 2
@@ -86,6 +93,7 @@ def start_run(
                 scope="bead_preflight",
                 kind="invalid",
                 summary=str(exc),
+                classification=_error_classification(exc),
                 validation_contract=context.validation_contract,
             )
             return run_id, 2
@@ -117,6 +125,7 @@ def start_run(
                 scope="worker_launch",
                 kind="unavailable",
                 summary=str(exc),
+                classification=_error_classification(exc),
                 unit=unit,
             )
             return run_id, 2
@@ -153,6 +162,7 @@ def resume_run(*, note: str | None = None) -> tuple[str, int]:
                 scope="worker_launch",
                 kind="unavailable",
                 summary=str(exc),
+                classification=_error_classification(exc),
                 unit=unit,
             )
             return run_id, 2
@@ -209,6 +219,7 @@ def resume_run(*, note: str | None = None) -> tuple[str, int]:
                     scope="worker_launch",
                     kind="unavailable",
                     summary=str(exc),
+                    classification=_error_classification(exc),
                     unit=unit,
                 )
                 return run_id, 2
@@ -360,6 +371,9 @@ def _run_worker_with_lock(store: RunStore, run_id: str) -> int:
                 scope="worker",
                 kind="unavailable",
                 summary=str(exc),
+                classification=(
+                    _error_classification(exc) if isinstance(exc, StartError) else None
+                ),
                 unit=worker_unit(run_id),
             )
             return 2
@@ -467,7 +481,7 @@ def _launch_worker(run_id: str, unit: str) -> None:
     ]
     completed = _command(command, cwd=Path.cwd(), check=False)
     if completed.returncode != 0:
-        raise StartError(completed.stderr.strip() or "systemd worker launch failed")
+        raise _external_failure(command[0], completed)
 
 
 def _claim_bead(bead_id: str, claimant: str, workspace: Path) -> dict[str, str]:
@@ -507,7 +521,7 @@ def _prepare_worktree(store: RunStore, identity: dict[str, Any]) -> tuple[Path, 
             check=False,
         )
         if completed.returncode != 0:
-            raise StartError(completed.stderr.strip() or "worktree preparation failed")
+            raise _external_failure("git", completed)
     listing = _required(["git", "worktree", "list", "--porcelain"], cwd=root)
     records: list[dict[str, str]] = []
     record: dict[str, str] = {}
@@ -622,6 +636,7 @@ def _attention(
     scope: str,
     kind: str,
     summary: str,
+    classification: str | None = None,
     **details: Any,
 ) -> None:
     store.append_event(
@@ -630,7 +645,12 @@ def _attention(
         state="attention_required",
         data={
             "checkpoint": checkpoint,
-            "attention": {"scope": scope, "kind": kind, "summary": summary},
+            "attention": {
+                "scope": scope,
+                "kind": kind,
+                "summary": summary,
+                **({"classification": classification} if classification else {}),
+            },
             **details,
         },
     )
@@ -641,7 +661,7 @@ def _required(
 ) -> str:
     completed = _command(command, cwd=cwd, check=False, env=env)
     if completed.returncode != 0:
-        raise StartError(completed.stderr.strip() or f"command failed: {command[0]}")
+        raise _external_failure(command[0], completed)
     return completed.stdout.strip()
 
 
@@ -650,7 +670,9 @@ def _json_command(command: list[str], *, cwd: Path) -> Any:
     try:
         return json.loads(output)
     except json.JSONDecodeError as exc:
-        raise StartError(f"invalid JSON from {command[0]}") from exc
+        raise ExternalCommandError(
+            "malformed_output", f"{_tool_name(command[0])} returned malformed output"
+        ) from exc
 
 
 def _bd_json(command: list[str], *, cwd: Path) -> Any:
@@ -658,12 +680,42 @@ def _bd_json(command: list[str], *, cwd: Path) -> Any:
     environment["BEADS_DOLT_PASSWORD"] = _beads_password()
     completed = _command(command, cwd=cwd, check=False, env=environment)
     if completed.returncode != 0:
-        raise StartError("Beads command failed")
+        raise _external_failure("bd", completed)
     output = completed.stdout.strip()
     try:
         return json.loads(output)
     except json.JSONDecodeError as exc:
-        raise StartError("invalid JSON from bd") from exc
+        raise ExternalCommandError(
+            "malformed_output", "Beads returned malformed output"
+        ) from exc
+
+
+def _error_classification(error: StartError) -> str | None:
+    value = getattr(error, "classification", None)
+    return value if isinstance(value, str) else None
+
+
+def _external_failure(
+    tool: str, completed: subprocess.CompletedProcess[str]
+) -> ExternalCommandError:
+    raw = f"{completed.stdout}\n{completed.stderr}".lower()
+    authentication_markers = (
+        "authentication denied",
+        "authentication failed",
+        "access denied",
+        "unauthorized",
+        "invalid password",
+    )
+    name = _tool_name(tool)
+    if any(marker in raw for marker in authentication_markers):
+        return ExternalCommandError(
+            "authentication_denied", f"{name} authentication failed"
+        )
+    return ExternalCommandError("command_failed", f"{name} command failed")
+
+
+def _tool_name(tool: str) -> str:
+    return {"bd": "Beads", "gh": "GitHub"}.get(tool, tool)
 
 
 def _beads_password() -> str:
@@ -742,8 +794,10 @@ def _command(
             timeout=COMMAND_TIMEOUT_SECONDS,
         )
     except subprocess.TimeoutExpired as exc:
-        raise StartError(
-            f"{command[0]} timed out after {COMMAND_TIMEOUT_SECONDS} seconds"
+        raise ExternalCommandError(
+            "command_timeout", f"{_tool_name(command[0])} command timed out"
         ) from exc
     except OSError as exc:
-        raise StartError(f"could not execute {command[0]}: {exc}") from exc
+        raise ExternalCommandError(
+            "command_unavailable", f"{_tool_name(command[0])} command is unavailable"
+        ) from exc
