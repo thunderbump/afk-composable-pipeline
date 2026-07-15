@@ -580,7 +580,14 @@ def _project(identity: dict[str, Any], events: list[dict[str, Any]]) -> dict[str
         "updated_at": last["recorded_at"],
         "checkpoint": details.get("checkpoint", checkpoint),
     }
-    for key in ("unit", "worktree_path", "branch", "attention", "lingering"):
+    for key in (
+        "unit",
+        "worktree_path",
+        "branch",
+        "attention",
+        "lingering",
+        "validation_contract",
+    ):
         if key in details:
             projection[key] = details[key]
     return projection

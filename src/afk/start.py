@@ -32,10 +32,20 @@ class StartContext:
     bead_id: str
     claimant: str
     beads_workspace: Path
+    validation_contract: str
 
 
-def start_run(bead_id: str, *, cwd: Path | None = None) -> tuple[str, int]:
-    context = preflight(bead_id, cwd=cwd or Path.cwd())
+def start_run(
+    bead_id: str,
+    *,
+    cwd: Path | None = None,
+    bootstrap_contract: bool = False,
+) -> tuple[str, int]:
+    context = preflight(
+        bead_id,
+        cwd=cwd or Path.cwd(),
+        bootstrap_contract=bootstrap_contract,
+    )
     store = RunStore()
     with store.lock():
         projection = store.create_run(
@@ -47,6 +57,7 @@ def start_run(bead_id: str, *, cwd: Path | None = None) -> tuple[str, int]:
                 "repository_root": str(context.root),
                 "beads_workspace": str(context.beads_workspace),
                 "claimant": context.claimant,
+                "validation_contract": context.validation_contract,
             },
         )
         run_id = projection["run_id"]
@@ -65,6 +76,7 @@ def start_run(bead_id: str, *, cwd: Path | None = None) -> tuple[str, int]:
                 "unit": unit,
                 "checkpoint": "created",
                 "lingering": lingering,
+                "validation_contract": context.validation_contract,
             },
         )
         try:
@@ -267,9 +279,10 @@ def _run_worker_with_lock(store: RunStore, run_id: str) -> int:
             return 1
 
 
-def preflight(bead_id: str, *, cwd: Path) -> StartContext:
+def preflight(
+    bead_id: str, *, cwd: Path, bootstrap_contract: bool = False
+) -> StartContext:
     root = Path(_required(["git", "rev-parse", "--show-toplevel"], cwd=cwd)).resolve()
-    _validate_contract(root / "afk.toml")
     repository_data = _json_command(
         ["gh", "repo", "view", "--json", "nameWithOwner,defaultBranchRef"],
         cwd=root,
@@ -304,6 +317,11 @@ def preflight(bead_id: str, *, cwd: Path) -> StartContext:
     fetched_sha = _required(["git", "rev-parse", "FETCH_HEAD"], cwd=root)
     if fetched_sha != base_sha:
         raise StartError("fetched default branch does not match the pinned GitHub SHA")
+    validation_contract = _pinned_validation_contract(
+        root,
+        base_sha,
+        bootstrap_contract=bootstrap_contract,
+    )
     workspace = Path(
         os.environ.get("AFK_BEADS_WORKSPACE", "/home/bump/Projects/beads")
     ).resolve()
@@ -331,6 +349,7 @@ def preflight(bead_id: str, *, cwd: Path) -> StartContext:
         bead_id=bead_id,
         claimant=claimant,
         beads_workspace=workspace,
+        validation_contract=validation_contract,
     )
 
 
@@ -456,10 +475,28 @@ def _show_bead(bead_id: str, workspace: Path) -> dict[str, Any]:
     return result[0]
 
 
-def _validate_contract(path: Path) -> None:
+def _pinned_validation_contract(
+    root: Path, base_sha: str, *, bootstrap_contract: bool
+) -> str:
+    listing = _required(["git", "ls-tree", base_sha, "--", "afk.toml"], cwd=root)
+    if not listing:
+        if bootstrap_contract:
+            return "bootstrap_required"
+        raise StartError("pinned base does not contain afk.toml")
+    fields = listing.split()
+    if len(fields) != 4 or fields[0] != "100644" or fields[1] != "blob":
+        raise StartError("pinned afk.toml must be one regular file")
+    if bootstrap_contract:
+        raise StartError("pinned base already contains afk.toml")
+    value = _required(["git", "cat-file", "blob", f"{base_sha}:afk.toml"], cwd=root)
+    _validate_contract(value)
+    return "pinned"
+
+
+def _validate_contract(value: str) -> None:
     try:
-        contract = tomllib.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+        contract = tomllib.loads(value)
+    except tomllib.TOMLDecodeError as exc:
         raise StartError(f"invalid afk.toml: {exc}") from exc
     validation = contract.get("validation")
     if (

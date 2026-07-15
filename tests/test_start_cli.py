@@ -63,6 +63,7 @@ class StartCliTest(unittest.TestCase):
                 "AFK_FAKE_BEAD": "central-bnkl.1.1",
                 "AFK_FAKE_BEAD_STATUS": "open",
                 "AFK_FAKE_ASSIGNEE": "",
+                "AFK_FAKE_PINNED_CONTRACT": "present",
                 "USER": "bump",
             }
         )
@@ -356,14 +357,51 @@ class StartCliTest(unittest.TestCase):
         self.assertEqual(status["checkpoint"], "claimed")
         self.assertIn("intended branch", status["attention"]["summary"])
 
-    def test_preflight_rejects_missing_contract_without_creating_a_run(self):
-        (self.project / "afk.toml").unlink()
-
-        completed = self.run_afk("start", "central-bnkl.1.1")
+    def test_preflight_rejects_missing_pinned_contract_without_bootstrap(self):
+        completed = self.run_afk(
+            "start",
+            "central-bnkl.1.1",
+            AFK_FAKE_PINNED_CONTRACT="missing",
+        )
 
         self.assertEqual(completed.returncode, 2)
         self.assertIn("afk.toml", completed.stderr)
         self.assertFalse((self.state_home / "afk" / "runs").exists())
+
+    def test_explicit_bootstrap_starts_only_when_pinned_contract_is_missing(self):
+        completed = self.run_afk(
+            "start",
+            "central-bnkl.1.1",
+            "--bootstrap-contract",
+            AFK_FAKE_PINNED_CONTRACT="missing",
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        status = json.loads(
+            self.run_afk("status", completed.stdout.strip(), "--json").stdout
+        )
+        self.assertEqual(status["validation_contract"], "bootstrap_required")
+
+        rejected = self.run_afk(
+            "start",
+            "central-bnkl.1.1",
+            "--bootstrap-contract",
+            AFK_FAKE_PINNED_CONTRACT="present",
+            XDG_STATE_HOME=str(self.temp / "second-state"),
+        )
+        self.assertEqual(rejected.returncode, 2)
+        self.assertIn("already contains afk.toml", rejected.stderr)
+
+    def test_normal_start_uses_pinned_contract_not_local_worktree_content(self):
+        (self.project / "afk.toml").write_text("invalid local shim\n", encoding="utf-8")
+
+        completed = self.run_afk("start", "central-bnkl.1.1")
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        status = json.loads(
+            self.run_afk("status", completed.stdout.strip(), "--json").stdout
+        )
+        self.assertEqual(status["validation_contract"], "pinned")
 
     def test_start_classifies_a_preflight_command_timeout(self):
         expired = subprocess.TimeoutExpired(["git", "rev-parse"], timeout=30)
@@ -422,6 +460,14 @@ class StartCliTest(unittest.TestCase):
                         print(sha + "\\trefs/heads/main")
                     elif args[:1] == ["fetch"]:
                         pass
+                    elif args[:1] == ["ls-tree"]:
+                        if os.environ["AFK_FAKE_PINNED_CONTRACT"] == "present":
+                            print("100644 blob " + "c" * 40 + "\\tafk.toml")
+                    elif args[:2] == ["cat-file", "blob"]:
+                        print("schema_version = 1")
+                        print("[validation]")
+                        print('command = ["./scripts/validation-worker.sh", "run"]')
+                        print("timeout_seconds = 2700")
                     elif args[:1] == ["rev-parse"]:
                         print(sha)
                     elif args[:2] == ["worktree", "add"]:

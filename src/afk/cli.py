@@ -61,7 +61,10 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "start":
         try:
-            run_id, exit_code = start_run(args.bead_id)
+            run_id, exit_code = start_run(
+                args.bead_id,
+                bootstrap_contract=args.bootstrap_contract,
+            )
         except (StartError, RunStoreError) as exc:
             print(str(exc), file=sys.stderr)
             return 2
@@ -431,6 +434,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     start_parser = subcommands.add_parser("start", help="Start one durable AFK Run")
     start_parser.add_argument("bead_id")
+    start_parser.add_argument(
+        "--bootstrap-contract",
+        action="store_true",
+        help="Start only when the pinned base lacks afk.toml",
+    )
 
     resume_parser = subcommands.add_parser("resume", help="Reconcile the Active Run")
     resume_parser.add_argument("--note")
