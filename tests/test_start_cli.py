@@ -7,6 +7,7 @@ import tempfile
 import textwrap
 import time
 import unittest
+from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
 
@@ -14,7 +15,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from afk.run_store import RunStore  # noqa: E402
+from afk.run_store import RunStore, RunStoreBusy  # noqa: E402
 from afk.start import (  # noqa: E402
     StartError,
     _beads_password,
@@ -436,6 +437,79 @@ class StartCliTest(unittest.TestCase):
                 self.assertEqual(status["worker_exit_code"], exit_code)
                 self.assertEqual(status["worker_result"], result)
 
+    def test_readable_status_reports_terminal_worker_observation(self):
+        store = RunStore(self.state_home / "afk")
+        store.create_run(
+            bead_id="central-bnkl.1.1",
+            repository="thunderbump/beads-webui",
+            base_branch="main",
+            base_sha=BASE_SHA,
+            run_id="terminal-run",
+        )
+        store.append_event(
+            "terminal-run",
+            "worker.terminal",
+            data={
+                "checkpoint": "created",
+                "unit": "afk-terminal-run-worker-1",
+                "worker_exit_code": 2,
+                "worker_result": "attention_required",
+            },
+        )
+
+        completed = self.run_afk("status", "terminal-run")
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(
+            completed.stdout,
+            "terminal-run created bead=central-bnkl.1.1 sequence=2 "
+            "checkpoint=created unit=afk-terminal-run-worker-1 "
+            "worker_exit_code=2 worker_result=attention_required\n",
+        )
+
+    def test_worker_unit_retries_transient_terminal_persistence_failure(self):
+        store = RunStore(self.state_home / "afk")
+        store.create_run(
+            bead_id="central-bnkl.1.1",
+            repository="thunderbump/beads-webui",
+            base_branch="main",
+            base_sha=BASE_SHA,
+            start_request={"repository_root": str(self.project)},
+            run_id="terminal-run",
+        )
+        original_append_event = RunStore.append_event
+        failures = iter(
+            (
+                RunStoreBusy("temporary lock contention"),
+                OSError("temporary storage failure"),
+            )
+        )
+        terminal_attempts = 0
+
+        def flaky_append_event(store, run_id, event, **kwargs):
+            nonlocal terminal_attempts
+            if event == "worker.terminal" and terminal_attempts < 2:
+                failure = next(failures)
+                terminal_attempts += 1
+                raise failure
+            return original_append_event(store, run_id, event, **kwargs)
+
+        with patch.dict(os.environ, {"XDG_STATE_HOME": str(self.state_home)}):
+            with patch("afk.start.run_worker", return_value=2):
+                with patch.object(RunStore, "append_event", new=flaky_append_event):
+                    with patch("afk.start.time.sleep"):
+                        with patch(
+                            "afk.start.sys.stderr", new_callable=StringIO
+                        ) as stderr:
+                            self.assertEqual(run_worker_unit("terminal-run"), 2)
+
+        self.assertEqual(terminal_attempts, 2)
+        self.assertIn("temporary lock contention", stderr.getvalue())
+        self.assertIn("temporary storage failure", stderr.getvalue())
+        status = store.status("terminal-run")
+        self.assertEqual(status["worker_exit_code"], 2)
+        self.assertEqual(status["worker_result"], "attention_required")
+
     def test_resume_uses_terminal_observation_after_unit_collection(self):
         store = RunStore(self.state_home / "afk")
         store.create_run(
@@ -462,6 +536,70 @@ class StartCliTest(unittest.TestCase):
         self.assertEqual(resumed.returncode, 2)
         self.assertEqual(resumed.stdout.strip(), "collected-run")
         self.assertFalse(self.command_log.exists())
+
+    def test_resume_requires_attention_for_confirmed_collected_worker_without_terminal(
+        self,
+    ):
+        store = RunStore(self.state_home / "afk")
+        store.create_run(
+            bead_id="central-bnkl.1.1",
+            repository="thunderbump/beads-webui",
+            base_branch="main",
+            base_sha=BASE_SHA,
+            start_request={"repository_root": str(self.project)},
+            run_id="missing-terminal-run",
+        )
+        store.prepare_effect(
+            "missing-terminal-run",
+            "worker-launch-1",
+            kind="worker-launch",
+            intended={"unit": "afk-missing-terminal-run-worker-1"},
+        )
+        store.confirm_effect(
+            "missing-terminal-run",
+            "worker-launch-1",
+            observed={"unit": "afk-missing-terminal-run-worker-1"},
+        )
+
+        resumed = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="absent")
+
+        self.assertEqual(resumed.returncode, 2)
+        status = store.status("missing-terminal-run")
+        self.assertEqual(status["state"], "attention_required")
+        self.assertEqual(status["attention"]["kind"], "inconclusive")
+        commands = self.command_log.read_text(encoding="utf-8")
+        self.assertIn('"command":"systemctl"', commands)
+        self.assertNotIn('"command":"systemd-run"', commands)
+
+    def test_resume_leaves_confirmed_active_worker_running(self):
+        store = RunStore(self.state_home / "afk")
+        store.create_run(
+            bead_id="central-bnkl.1.1",
+            repository="thunderbump/beads-webui",
+            base_branch="main",
+            base_sha=BASE_SHA,
+            start_request={"repository_root": str(self.project)},
+            run_id="active-worker-run",
+        )
+        store.prepare_effect(
+            "active-worker-run",
+            "worker-launch-1",
+            kind="worker-launch",
+            intended={"unit": "afk-active-worker-run-worker-1"},
+        )
+        store.confirm_effect(
+            "active-worker-run",
+            "worker-launch-1",
+            observed={"unit": "afk-active-worker-run-worker-1"},
+        )
+
+        resumed = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="active")
+
+        self.assertEqual(resumed.returncode, 0)
+        self.assertEqual(store.status("active-worker-run")["state"], "created")
+        commands = self.command_log.read_text(encoding="utf-8")
+        self.assertIn('"command":"systemctl"', commands)
+        self.assertNotIn('"command":"systemd-run"', commands)
 
     def test_resume_does_not_confirm_an_activating_unit(self):
         store = RunStore(self.state_home / "afk")

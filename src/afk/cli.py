@@ -100,7 +100,12 @@ def main(argv: list[str] | None = None) -> int:
                 f"bead={projection['bead_id']}",
                 f"sequence={projection['last_sequence']}",
             ]
-            for key in ("checkpoint", "unit"):
+            for key in (
+                "checkpoint",
+                "unit",
+                "worker_exit_code",
+                "worker_result",
+            ):
                 if key in projection:
                     fields.append(f"{key}={projection[key]}")
             print(" ".join(fields))

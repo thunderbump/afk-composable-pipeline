@@ -131,8 +131,6 @@ def resume_run(*, note: str | None = None) -> tuple[str, int]:
         if "worker_exit_code" in projection:
             return run_id, projection["worker_exit_code"]
         effect = store.effect(run_id, "worker-launch-1")
-        if effect["status"] == "confirmed":
-            return run_id, 0
         unit = effect["intended"]["unit"]
         try:
             completed = _command(
@@ -174,18 +172,33 @@ def resume_run(*, note: str | None = None) -> tuple[str, int]:
             "ActiveState": "inactive",
         }
         if active:
-            store.confirm_effect(run_id, "worker-launch-1", observed={"unit": unit})
-            store.append_event(
-                run_id,
-                "worker.launch_reconciled",
-                data={
-                    "unit": unit,
-                    "checkpoint": projection["checkpoint"],
-                    "note": note or "",
-                },
-            )
+            if effect["status"] != "confirmed":
+                store.confirm_effect(run_id, "worker-launch-1", observed={"unit": unit})
+                store.append_event(
+                    run_id,
+                    "worker.launch_reconciled",
+                    data={
+                        "unit": unit,
+                        "checkpoint": projection["checkpoint"],
+                        "note": note or "",
+                    },
+                )
             return run_id, 0
         if absent:
+            if effect["status"] == "confirmed":
+                _attention(
+                    store,
+                    run_id,
+                    checkpoint=projection["checkpoint"],
+                    scope="worker_launch",
+                    kind="inconclusive",
+                    summary=(
+                        "confirmed worker launch was collected without a terminal "
+                        "observation"
+                    ),
+                    unit=unit,
+                )
+                return run_id, 2
             try:
                 _launch_worker(run_id, unit)
             except StartError as exc:
@@ -236,7 +249,7 @@ def run_worker(run_id: str) -> int:
 def run_worker_unit(run_id: str) -> int:
     exit_code = run_worker(run_id)
     store = RunStore()
-    for attempt in range(WORKER_LOCK_ATTEMPTS):
+    while True:
         try:
             with store.lock():
                 projection = store.status(run_id)
@@ -253,14 +266,14 @@ def run_worker_unit(run_id: str) -> int:
                         }.get(exit_code, "failed"),
                     },
                 )
-            break
-        except RunStoreBusy:
-            if attempt + 1 == WORKER_LOCK_ATTEMPTS:
-                break
+            return exit_code
+        except (OSError, RunStoreError) as exc:
+            print(
+                f"worker terminal observation pending: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
             time.sleep(WORKER_LOCK_RETRY_SECONDS)
-        except (OSError, RunStoreError):
-            break
-    return exit_code
 
 
 def _run_worker_with_lock(store: RunStore, run_id: str) -> int:
