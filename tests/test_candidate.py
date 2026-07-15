@@ -187,7 +187,6 @@ class CandidateTest(unittest.TestCase):
             'default_permissions="afk_candidate"',
             'web_search="disabled"',
             'inherit = "none"',
-            f'"{self.home}" = "deny"',
             f'"{self.checkout}" = "write"',
             f'"{self.checkout / ".git"}" = "read"',
             f'"{git_dir}" = "write"',
@@ -200,6 +199,9 @@ class CandidateTest(unittest.TestCase):
             "enabled = false",
         ):
             self.assertIn(expected, config)
+        self.assertNotIn(f'"{self.home}" = "read"', config)
+        self.assertNotIn(f'"{self.home}" = "write"', config)
+        self.assertIn("ignore_default_excludes = false", config)
         self.assertNotIn(
             f'"{common_dir / "refs" / "heads" / self.branch}" = "write"',
             config,
@@ -217,6 +219,39 @@ class CandidateTest(unittest.TestCase):
             "confirmed",
         )
         self.assertEqual(self.store.effect("run-1", "pr-create")["status"], "confirmed")
+
+    def test_allows_only_codex_package_when_installed_beneath_home(self):
+        package = self.home / ".local/lib/node_modules/@openai/codex"
+        wrapper = package / "bin/codex.js"
+        wrapper.parent.mkdir(parents=True)
+        (self.bin / "codex").replace(wrapper)
+        (self.bin / "codex").symlink_to(wrapper)
+
+        self.produce()
+
+        args = json.loads(self.codex_args.read_text(encoding="utf-8"))
+        config = "\n".join(
+            args[index + 1] for index, arg in enumerate(args) if arg == "-c"
+        )
+        self.assertIn(f'"{package}" = "read"', config)
+        self.assertNotIn(f'"{self.home}" = "read"', config)
+        self.assertNotIn(f'"{self.home}" = "write"', config)
+        self.assertIn("ignore_default_excludes = false", config)
+
+    def test_does_not_allow_a_home_lookalike_codex_package(self):
+        lookalike = self.home / "private"
+        wrapper = lookalike / "bin/codex.js"
+        wrapper.parent.mkdir(parents=True)
+        (self.bin / "codex").replace(wrapper)
+        (self.bin / "codex").symlink_to(wrapper)
+
+        self.produce()
+
+        args = json.loads(self.codex_args.read_text(encoding="utf-8"))
+        config = "\n".join(
+            args[index + 1] for index, arg in enumerate(args) if arg == "-c"
+        )
+        self.assertNotIn(f'"{lookalike}" = "read"', config)
 
     def test_no_change_and_dirty_results_require_attention(self):
         with self.subTest("no change"):
