@@ -19,6 +19,7 @@ from afk.run_store import (  # noqa: E402
     EvidenceError,
     EvidenceTampered,
     EvidenceTooLarge,
+    RunNotFound,
     RunStore,
     RunStoreBusy,
 )
@@ -105,10 +106,18 @@ class RunStoreTest(unittest.TestCase):
         self.assertEqual(projection["last_sequence"], 2)
         self.assertEqual(projection["last_event"], "bead.claimed")
 
-    def test_global_lock_refuses_a_second_mutator(self):
+    def test_global_lock_is_reentrant_and_refuses_a_distinct_mutator(self):
+        other_store = RunStore(self.root)
+
         with self.store.lock():
+            self.create_run()
             with self.assertRaises(RunStoreBusy):
-                self.create_run()
+                other_store.append_event("run-001", "bead.claimed", state="claimed")
+
+        projection = other_store.append_event(
+            "run-001", "bead.claimed", state="claimed"
+        )
+        self.assertEqual(projection["state"], "claimed")
 
     def test_one_active_run_prevents_another_run_from_being_created(self):
         self.create_run()
@@ -121,6 +130,34 @@ class RunStoreTest(unittest.TestCase):
         (self.root / "active.json").unlink()
 
         self.assertEqual(self.store.status()["run_id"], "run-001")
+        with self.assertRaises(ActiveRunExists):
+            self.create_run("run-002")
+
+    def test_completing_a_run_clears_active_pointer_and_allows_the_next_run(self):
+        self.create_run()
+
+        completed = self.store.append_event(
+            "run-001", "run.completed", state="completed"
+        )
+
+        self.assertFalse((self.root / "active.json").exists())
+        with self.assertRaises(RunNotFound):
+            self.store.status()
+        self.assertEqual(self.store.status("run-001"), completed)
+
+        next_run = self.create_run("run-002")
+        self.assertEqual(next_run["run_id"], "run-002")
+
+    def test_attention_required_run_remains_active(self):
+        self.create_run()
+
+        attention = self.store.append_event(
+            "run-001", "run.attention_required", state="attention_required"
+        )
+
+        active = json.loads((self.root / "active.json").read_text(encoding="utf-8"))
+        self.assertEqual(active, {"run_id": "run-001"})
+        self.assertEqual(self.store.status(), attention)
         with self.assertRaises(ActiveRunExists):
             self.create_run("run-002")
 
@@ -147,6 +184,57 @@ class RunStoreTest(unittest.TestCase):
         evidence_path.write_text("tampered\n", encoding="utf-8")
         with self.assertRaises(EvidenceTampered):
             self.store.verify_evidence("run-001", "attempts/attempt-1")
+
+    def test_sealing_redacts_raw_evidence_before_hashing_it(self):
+        self.create_run()
+        evidence_path = (
+            self.root / "runs" / "run-001" / "attempts" / "attempt-1" / "raw.txt"
+        )
+        evidence_path.parent.mkdir(parents=True)
+        evidence_path.write_text("token=plain-secret-value\n", encoding="utf-8")
+
+        manifest = self.store.seal_evidence("run-001", "attempts/attempt-1")
+
+        self.assertEqual(
+            evidence_path.read_text(encoding="utf-8"), "token=[REDACTED]\n"
+        )
+        self.assertEqual(
+            manifest["files"][0]["sha256"],
+            "6f878ef066794d2e71b92b9d70e321cf7cbd1d0361168fca105df2b87e7a3b9a",
+        )
+
+    def test_verification_rejects_a_tampered_manifest_total(self):
+        self.create_run()
+        self.store.write_evidence_text(
+            "run-001", "attempts/attempt-1/output.txt", "complete\n"
+        )
+        self.store.seal_evidence("run-001", "attempts/attempt-1")
+        manifest_path = (
+            self.root / "runs" / "run-001" / "attempts" / "attempt-1" / "manifest.json"
+        )
+        manifest_path.chmod(0o600)
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["total_bytes"] += 1
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        manifest_path.chmod(0o400)
+
+        with self.assertRaises(EvidenceTampered):
+            self.store.verify_evidence("run-001", "attempts/attempt-1")
+
+    def test_verification_rejects_writable_sealed_directories(self):
+        self.create_run()
+        self.store.write_evidence_text(
+            "run-001", "attempts/attempt-1/nested/output.txt", "complete\n"
+        )
+        self.store.seal_evidence("run-001", "attempts/attempt-1")
+        sealed_root = self.root / "runs" / "run-001" / "attempts" / "attempt-1"
+
+        for directory in (sealed_root, sealed_root / "nested"):
+            with self.subTest(directory=directory.relative_to(sealed_root)):
+                directory.chmod(0o700)
+                with self.assertRaises(EvidenceTampered):
+                    self.store.verify_evidence("run-001", "attempts/attempt-1")
+                directory.chmod(0o500)
 
     def test_stream_byte_limit_is_enforced_before_manifest_hashing(self):
         self.create_run()

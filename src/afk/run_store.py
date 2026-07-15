@@ -11,6 +11,7 @@ import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+from threading import get_ident
 from typing import Any, Iterator
 
 from afk.jsonutil import canonical_json
@@ -72,9 +73,23 @@ def utc_now() -> str:
 class RunStore:
     def __init__(self, root: Path | None = None):
         self.root = root or default_state_root()
+        self._lock_descriptor: int | None = None
+        self._lock_owner: int | None = None
+        self._lock_depth = 0
 
     @contextmanager
     def lock(self) -> Iterator[None]:
+        owner = get_ident()
+        if self._lock_descriptor is not None:
+            if self._lock_owner != owner:
+                raise RunStoreBusy("another AFK mutator holds the global lock")
+            self._lock_depth += 1
+            try:
+                yield
+            finally:
+                self._lock_depth -= 1
+            return
+
         _secure_directory(self.root)
         lock_path = self.root / "afk.lock"
         descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
@@ -84,11 +99,20 @@ class RunStore:
                 fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError as exc:
                 raise RunStoreBusy("another AFK mutator holds the global lock") from exc
+            self._lock_descriptor = descriptor
+            self._lock_owner = owner
+            self._lock_depth = 1
             yield
         finally:
-            try:
-                fcntl.flock(descriptor, fcntl.LOCK_UN)
-            finally:
+            if self._lock_descriptor == descriptor:
+                self._lock_depth -= 1
+                self._lock_descriptor = None
+                self._lock_owner = None
+                try:
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+                finally:
+                    os.close(descriptor)
+            else:
                 os.close(descriptor)
 
     def create_run(
@@ -167,13 +191,18 @@ class RunStore:
         recorded_at: str | None = None,
     ) -> dict[str, Any]:
         with self.lock():
-            return self._append_event_unlocked(
+            projection = self._append_event_unlocked(
                 run_id,
                 event,
                 state=state,
                 data=data,
                 recorded_at=recorded_at,
             )
+            active_path = self.root / "active.json"
+            if projection["state"] == "completed" and self._active_run_id() is None:
+                active_path.unlink(missing_ok=True)
+                _fsync_directory(self.root)
+            return projection
 
     def status(self, run_id: str | None = None) -> dict[str, Any]:
         selected = run_id or self._active_run_id()
@@ -212,6 +241,8 @@ class RunStore:
                 raise EvidenceError("evidence is already sealed")
             files = _evidence_files(directory)
             limit = _tree_limit(relative_directory)
+            _validate_evidence_sizes(files, limit)
+            _redact_evidence_files(files)
             entries = _manifest_entries(directory, files, limit)
             manifest = {
                 "schema_version": SCHEMA_VERSION,
@@ -254,7 +285,18 @@ class RunStore:
             raise EvidenceTampered(str(exc)) from exc
         if observed != expected:
             raise EvidenceTampered("evidence does not match its manifest")
-        for path in [*files, manifest_path]:
+        total_bytes = manifest.get("total_bytes")
+        if (
+            not isinstance(total_bytes, int)
+            or isinstance(total_bytes, bool)
+            or total_bytes != sum(entry["bytes"] for entry in observed)
+        ):
+            raise EvidenceTampered("evidence manifest total is invalid")
+        directories = [
+            directory,
+            *(path for path in directory.rglob("*") if path.is_dir()),
+        ]
+        for path in [*files, manifest_path, *directories]:
             if stat.S_IMODE(path.stat().st_mode) & 0o222:
                 raise EvidenceTampered("sealed evidence is writable")
         return True
@@ -446,8 +488,12 @@ def _write_new_bytes(path: Path, value: bytes) -> None:
 
 
 def _atomic_json(path: Path, value: Any) -> None:
-    _secure_directory(path.parent)
     payload = f"{canonical_json(redact_artifact_value(value))}\n".encode("utf-8")
+    _atomic_bytes(path, payload)
+
+
+def _atomic_bytes(path: Path, payload: bytes) -> None:
+    _secure_directory(path.parent)
     descriptor, temporary_name = tempfile.mkstemp(
         prefix=f".{path.name}.", dir=path.parent
     )
@@ -469,6 +515,21 @@ def _atomic_json(path: Path, value: Any) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def _redact_evidence_files(files: list[Path]) -> None:
+    replacements = []
+    for path in files:
+        payload = path.read_bytes()
+        try:
+            text = payload.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise EvidenceError("evidence must be regular UTF-8 text") from exc
+        redacted = redact_text(text).encode("utf-8")
+        if redacted != payload:
+            replacements.append((path, redacted))
+    for path, payload in replacements:
+        _atomic_bytes(path, payload)
+
+
 def _evidence_files(directory: Path) -> list[Path]:
     files = []
     for path in directory.rglob("*"):
@@ -487,15 +548,10 @@ def _evidence_files(directory: Path) -> list[Path]:
 def _manifest_entries(
     directory: Path, files: list[Path], byte_limit: int
 ) -> list[dict[str, Any]]:
-    total = 0
+    _validate_evidence_sizes(files, byte_limit)
     entries = []
     for path in files:
         size = path.stat().st_size
-        if _is_stream(path) and size > STREAM_BYTE_LIMIT:
-            raise EvidenceTooLarge(f"evidence stream exceeds {STREAM_BYTE_LIMIT} bytes")
-        total += size
-        if total > byte_limit:
-            raise EvidenceTooLarge(f"evidence tree exceeds {byte_limit} bytes")
         try:
             payload = path.read_bytes()
             payload.decode("utf-8")
@@ -509,6 +565,17 @@ def _manifest_entries(
             }
         )
     return entries
+
+
+def _validate_evidence_sizes(files: list[Path], byte_limit: int) -> None:
+    total = 0
+    for path in files:
+        size = path.stat().st_size
+        if _is_stream(path) and size > STREAM_BYTE_LIMIT:
+            raise EvidenceTooLarge(f"evidence stream exceeds {STREAM_BYTE_LIMIT} bytes")
+        total += size
+        if total > byte_limit:
+            raise EvidenceTooLarge(f"evidence tree exceeds {byte_limit} bytes")
 
 
 def _is_stream(path: Path) -> bool:
