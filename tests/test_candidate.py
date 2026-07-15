@@ -193,15 +193,17 @@ class CandidateTest(unittest.TestCase):
             f'"{git_dir}" = "write"',
             f'"{common_dir}" = "read"',
             f'"{common_dir / "objects"}" = "write"',
-            f'"{common_dir / "refs" / "heads" / self.branch}" = "write"',
-            f'"{common_dir / "refs" / "heads" / self.branch}.lock" = "write"',
-            f'"{common_dir / "logs" / "refs" / "heads" / self.branch}" = "write"',
-            f'"{common_dir / "logs" / "refs" / "heads" / self.branch}.lock" = "write"',
+            f'"{common_dir / "refs" / "heads" / "afk"}" = "write"',
+            f'"{common_dir / "logs" / "refs" / "heads" / "afk"}" = "write"',
             f'"{git_dir / "afk-tmp" / "home"}"',
             f'"{git_dir / "afk-tmp"}"',
             "enabled = false",
         ):
             self.assertIn(expected, config)
+        self.assertNotIn(
+            f'"{common_dir / "refs" / "heads" / self.branch}" = "write"',
+            config,
+        )
         self.assertNotIn("CODEX_HOME", config)
         self.assertEqual(
             self.store.effect("run-1", f"branch-push-{candidate_sha}")["status"],
