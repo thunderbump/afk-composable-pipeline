@@ -185,7 +185,35 @@ class RunStoreTest(unittest.TestCase):
         with self.assertRaises(EvidenceTampered):
             self.store.verify_evidence("run-001", "attempts/attempt-1")
 
-    def test_sealing_redacts_raw_evidence_before_hashing_it(self):
+    def test_evidence_ingestion_redacts_before_writing_to_the_run_store(self):
+        self.create_run()
+        source_path = self.state_home / "worker-output.txt"
+        source_path.write_text("token=plain-secret-value\n", encoding="utf-8")
+
+        evidence_path = self.store.ingest_evidence_file(
+            "run-001",
+            "attempts/attempt-1/raw.txt",
+            source_path,
+        )
+        manifest = self.store.seal_evidence("run-001", "attempts/attempt-1")
+
+        self.assertEqual(
+            evidence_path.read_text(encoding="utf-8"), "token=[REDACTED]\n"
+        )
+        run_dir = self.root / "runs" / "run-001"
+        self.assertFalse(
+            any(
+                b"plain-secret-value" in path.read_bytes()
+                for path in run_dir.rglob("*")
+                if path.is_file()
+            )
+        )
+        self.assertEqual(
+            manifest["files"][0]["sha256"],
+            "6f878ef066794d2e71b92b9d70e321cf7cbd1d0361168fca105df2b87e7a3b9a",
+        )
+
+    def test_sealing_refuses_evidence_that_bypassed_ingestion(self):
         self.create_run()
         evidence_path = (
             self.root / "runs" / "run-001" / "attempts" / "attempt-1" / "raw.txt"
@@ -193,15 +221,10 @@ class RunStoreTest(unittest.TestCase):
         evidence_path.parent.mkdir(parents=True)
         evidence_path.write_text("token=plain-secret-value\n", encoding="utf-8")
 
-        manifest = self.store.seal_evidence("run-001", "attempts/attempt-1")
+        with self.assertRaises(EvidenceError):
+            self.store.seal_evidence("run-001", "attempts/attempt-1")
 
-        self.assertEqual(
-            evidence_path.read_text(encoding="utf-8"), "token=[REDACTED]\n"
-        )
-        self.assertEqual(
-            manifest["files"][0]["sha256"],
-            "6f878ef066794d2e71b92b9d70e321cf7cbd1d0361168fca105df2b87e7a3b9a",
-        )
+        self.assertFalse((evidence_path.parent / "manifest.json").exists())
 
     def test_verification_rejects_a_tampered_manifest_total(self):
         self.create_run()
@@ -220,6 +243,29 @@ class RunStoreTest(unittest.TestCase):
 
         with self.assertRaises(EvidenceTampered):
             self.store.verify_evidence("run-001", "attempts/attempt-1")
+
+    def test_verification_rejects_booleans_in_manifest_integer_fields(self):
+        self.create_run()
+        self.store.write_evidence_text("run-001", "attempts/attempt-1/output.txt", "x")
+        self.store.seal_evidence("run-001", "attempts/attempt-1")
+        manifest_path = (
+            self.root / "runs" / "run-001" / "attempts" / "attempt-1" / "manifest.json"
+        )
+        original = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+        for field in ("schema_version", "file_bytes"):
+            with self.subTest(field=field):
+                manifest = json.loads(json.dumps(original))
+                if field == "schema_version":
+                    manifest["schema_version"] = True
+                else:
+                    manifest["files"][0]["bytes"] = True
+                manifest_path.chmod(0o600)
+                manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+                manifest_path.chmod(0o400)
+
+                with self.assertRaises(EvidenceTampered):
+                    self.store.verify_evidence("run-001", "attempts/attempt-1")
 
     def test_verification_rejects_writable_sealed_directories(self):
         self.create_run()

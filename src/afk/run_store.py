@@ -24,6 +24,7 @@ ATTEMPT_BYTE_LIMIT = 256 * 1024 * 1024
 GATE_BYTE_LIMIT = 512 * 1024 * 1024
 RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
+SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 EVIDENCE_ROOTS = {"attempts", "gates", "retrospective"}
 
 
@@ -75,7 +76,6 @@ class RunStore:
         self.root = root or default_state_root()
         self._lock_descriptor: int | None = None
         self._lock_owner: int | None = None
-        self._lock_depth = 0
 
     @contextmanager
     def lock(self) -> Iterator[None]:
@@ -83,11 +83,7 @@ class RunStore:
         if self._lock_descriptor is not None:
             if self._lock_owner != owner:
                 raise RunStoreBusy("another AFK mutator holds the global lock")
-            self._lock_depth += 1
-            try:
-                yield
-            finally:
-                self._lock_depth -= 1
+            yield
             return
 
         _secure_directory(self.root)
@@ -101,11 +97,9 @@ class RunStore:
                 raise RunStoreBusy("another AFK mutator holds the global lock") from exc
             self._lock_descriptor = descriptor
             self._lock_owner = owner
-            self._lock_depth = 1
             yield
         finally:
             if self._lock_descriptor == descriptor:
-                self._lock_depth -= 1
                 self._lock_descriptor = None
                 self._lock_owner = None
                 try:
@@ -229,6 +223,25 @@ class RunStore:
             _write_new_bytes(path, encoded)
             return path
 
+    def ingest_evidence_file(
+        self, run_id: str, relative_path: str, source_path: Path
+    ) -> Path:
+        if source_path.is_symlink() or not source_path.is_file():
+            raise EvidenceError("evidence source must be a regular file")
+        source_size = source_path.stat().st_size
+        target = Path(relative_path)
+        if _is_stream(target) and source_size > STREAM_BYTE_LIMIT:
+            raise EvidenceTooLarge(f"evidence stream exceeds {STREAM_BYTE_LIMIT} bytes")
+        if source_size > _tree_limit(relative_path):
+            raise EvidenceTooLarge(
+                f"evidence tree exceeds {_tree_limit(relative_path)} bytes"
+            )
+        try:
+            value = source_path.read_text(encoding="utf-8")
+        except UnicodeDecodeError as exc:
+            raise EvidenceError("evidence must be regular UTF-8 text") from exc
+        return self.write_evidence_text(run_id, relative_path, value)
+
     def seal_evidence(self, run_id: str, relative_directory: str) -> dict[str, Any]:
         with self.lock():
             directory = self._evidence_path(run_id, relative_directory)
@@ -242,7 +255,6 @@ class RunStore:
             files = _evidence_files(directory)
             limit = _tree_limit(relative_directory)
             _validate_evidence_sizes(files, limit)
-            _redact_evidence_files(files)
             entries = _manifest_entries(directory, files, limit)
             manifest = {
                 "schema_version": SCHEMA_VERSION,
@@ -268,14 +280,7 @@ class RunStore:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise EvidenceTampered("evidence manifest is missing or invalid") from exc
-        if (
-            not isinstance(manifest, dict)
-            or manifest.get("schema_version") != SCHEMA_VERSION
-        ):
-            raise EvidenceTampered("evidence manifest schema is invalid")
-        expected = manifest.get("files")
-        if not isinstance(expected, list):
-            raise EvidenceTampered("evidence manifest files are invalid")
+        expected = _validate_manifest(manifest)
         try:
             files = _evidence_files(directory)
             observed = _manifest_entries(
@@ -286,11 +291,7 @@ class RunStore:
         if observed != expected:
             raise EvidenceTampered("evidence does not match its manifest")
         total_bytes = manifest.get("total_bytes")
-        if (
-            not isinstance(total_bytes, int)
-            or isinstance(total_bytes, bool)
-            or total_bytes != sum(entry["bytes"] for entry in observed)
-        ):
+        if total_bytes != sum(entry["bytes"] for entry in observed):
             raise EvidenceTampered("evidence manifest total is invalid")
         directories = [
             directory,
@@ -434,6 +435,31 @@ def _validate_run_id(run_id: str) -> None:
         raise RunStoreError("run_id contains unsupported characters")
 
 
+def _validate_manifest(manifest: Any) -> list[dict[str, Any]]:
+    if (
+        not isinstance(manifest, dict)
+        or set(manifest) != {"schema_version", "files", "total_bytes"}
+        or type(manifest["schema_version"]) is not int
+        or manifest["schema_version"] != SCHEMA_VERSION
+        or type(manifest["total_bytes"]) is not int
+        or manifest["total_bytes"] < 0
+        or not isinstance(manifest["files"], list)
+    ):
+        raise EvidenceTampered("evidence manifest schema is invalid")
+    for entry in manifest["files"]:
+        if (
+            not isinstance(entry, dict)
+            or set(entry) != {"path", "bytes", "sha256"}
+            or not isinstance(entry["path"], str)
+            or type(entry["bytes"]) is not int
+            or entry["bytes"] < 0
+            or not isinstance(entry["sha256"], str)
+            or not SHA256_PATTERN.fullmatch(entry["sha256"])
+        ):
+            raise EvidenceTampered("evidence manifest files are invalid")
+    return manifest["files"]
+
+
 def _project(identity: dict[str, Any], events: list[dict[str, Any]]) -> dict[str, Any]:
     if not events:
         raise EventHistoryCorrupt("Event History has no durable facts")
@@ -515,21 +541,6 @@ def _atomic_bytes(path: Path, payload: bytes) -> None:
         temporary.unlink(missing_ok=True)
 
 
-def _redact_evidence_files(files: list[Path]) -> None:
-    replacements = []
-    for path in files:
-        payload = path.read_bytes()
-        try:
-            text = payload.decode("utf-8")
-        except UnicodeDecodeError as exc:
-            raise EvidenceError("evidence must be regular UTF-8 text") from exc
-        redacted = redact_text(text).encode("utf-8")
-        if redacted != payload:
-            replacements.append((path, redacted))
-    for path, payload in replacements:
-        _atomic_bytes(path, payload)
-
-
 def _evidence_files(directory: Path) -> list[Path]:
     files = []
     for path in directory.rglob("*"):
@@ -554,9 +565,13 @@ def _manifest_entries(
         size = path.stat().st_size
         try:
             payload = path.read_bytes()
-            payload.decode("utf-8")
+            text = payload.decode("utf-8")
         except UnicodeDecodeError as exc:
             raise EvidenceError("evidence must be regular UTF-8 text") from exc
+        if redact_text(text) != text:
+            raise EvidenceError(
+                "evidence must cross the redaction boundary before sealing"
+            )
         entries.append(
             {
                 "path": path.relative_to(directory).as_posix(),
