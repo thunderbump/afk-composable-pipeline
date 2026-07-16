@@ -466,6 +466,7 @@ def _read_result(
             for check in checks
         )
         or len({check["name"] for check in checks}) != len(checks)
+        or _checks_resume_after_not_run(checks)
         or (
             status == "rejected"
             and not any(check["status"] == "rejected" for check in checks)
@@ -479,6 +480,16 @@ def _read_result(
             "invalid", "validation exit, result, or checks disagree"
         )
     return result
+
+
+def _checks_resume_after_not_run(checks: list[dict[str, Any]]) -> bool:
+    skipped = False
+    for check in checks:
+        if check["status"] == "not_run":
+            skipped = True
+        elif skipped:
+            return True
+    return False
 
 
 def _contained_relative_path(value: str) -> bool:

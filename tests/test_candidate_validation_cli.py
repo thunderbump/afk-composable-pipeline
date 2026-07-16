@@ -204,6 +204,49 @@ class CandidateValidationCliTest(unittest.TestCase):
         self.assertEqual(status["last_event"], "validation.rejected")
         self.assertEqual(status["validation"]["status"], "rejected")
 
+    def test_validation_rejects_an_executed_check_after_not_run(self):
+        self.write_contract_worker(
+            status="rejected",
+            exit_code=1,
+            checks=[
+                {"name": "preflight", "status": "not_run", "log_path": "tests.log"},
+                {"name": "tier1", "status": "rejected", "log_path": "tests.log"},
+                {"name": "tier2", "status": "passed", "log_path": "tests.log"},
+            ],
+        )
+        run_id, _ = self.candidate_ready_run()
+
+        completed = self.run_afk("resume")
+
+        self.assertEqual(completed.returncode, 2)
+        status = self.status(run_id)
+        self.assertEqual(status["attention"]["kind"], "invalid")
+        self.assertIn("checks disagree", status["attention"]["summary"])
+
+    def test_inconclusive_validation_accepts_a_not_run_suffix(self):
+        self.write_contract_worker(
+            status="inconclusive",
+            exit_code=2,
+            checks=[
+                {"name": "preflight", "status": "passed", "log_path": "tests.log"},
+                {
+                    "name": "tier1",
+                    "status": "inconclusive",
+                    "log_path": "tests.log",
+                },
+                {"name": "tier2", "status": "not_run", "log_path": "tests.log"},
+                {"name": "tier3", "status": "not_run", "log_path": "tests.log"},
+            ],
+        )
+        run_id, _ = self.candidate_ready_run()
+
+        completed = self.run_afk("resume")
+
+        self.assertEqual(completed.returncode, 2, completed.stderr)
+        status = self.status(run_id)
+        self.assertEqual(status["attention"]["kind"], "inconclusive")
+        self.assertEqual(status["validation"]["status"], "inconclusive")
+
     def test_inconclusive_validation_requires_attention(self):
         self.write_contract_worker(
             status="inconclusive",
