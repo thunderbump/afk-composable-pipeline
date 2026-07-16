@@ -297,9 +297,10 @@ class RunStore:
     def write_evidence_text(self, run_id: str, relative_path: str, value: str) -> Path:
         with self.lock():
             path = self._evidence_path(run_id, relative_path)
-            if path.name == "manifest.json":
+            run_dir = self._run_dir(run_id)
+            if path == _evidence_unit_root(path, run_dir) / "manifest.json":
                 raise EvidenceError("manifest.json is reserved")
-            if _sealed_ancestor(path, self._run_dir(run_id)):
+            if _sealed_ancestor(path, run_dir):
                 raise EvidenceError("completed evidence is read-only")
             encoded = redact_text(value).encode("utf-8")
             if _is_stream(path) and len(encoded) > STREAM_BYTE_LIMIT:
@@ -593,6 +594,8 @@ def _project(identity: dict[str, Any], events: list[dict[str, Any]]) -> dict[str
         "pr_number",
         "pr_url",
         "pr_head_sha",
+        "validation",
+        "validation_attempt",
     ):
         if key in details:
             projection[key] = details[key]
@@ -657,8 +660,9 @@ def _atomic_bytes(path: Path, payload: bytes) -> None:
 
 def _evidence_files(directory: Path) -> list[Path]:
     files = []
+    root_manifest = directory / "manifest.json"
     for path in directory.rglob("*"):
-        if path.name == "manifest.json":
+        if path == root_manifest:
             continue
         if path.is_symlink():
             raise EvidenceError("evidence must not contain symlinks")
@@ -718,13 +722,13 @@ def _tree_limit(relative_directory: str) -> int:
 
 
 def _sealed_ancestor(path: Path, run_dir: Path) -> bool:
-    current = path.parent
-    while current != run_dir:
-        manifest = current / "manifest.json"
-        if manifest.exists() or manifest.is_symlink():
-            return True
-        current = current.parent
-    return False
+    manifest = _evidence_unit_root(path, run_dir) / "manifest.json"
+    return manifest.exists() or manifest.is_symlink()
+
+
+def _evidence_unit_root(path: Path, run_dir: Path) -> Path:
+    relative = path.relative_to(run_dir)
+    return run_dir.joinpath(*relative.parts[:2])
 
 
 def _fsync_directory(path: Path) -> None:

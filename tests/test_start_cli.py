@@ -135,6 +135,41 @@ class StartCliTest(unittest.TestCase):
         self.assertIn('"--property=Restart=no"', commands)
         self.assertIn('"--property=UMask=0077"', commands)
 
+    def test_start_forwards_only_approved_validation_execution_context(self):
+        approved = {
+            "TMPDIR": str(self.temp / "operator-tmp"),
+            "XDG_RUNTIME_DIR": str(self.temp / "operator-runtime"),
+            "DOCKER_HOST": "unix:///run/user/1000/docker.sock",
+            "DOCKER_CONTEXT": "akkstack",
+            "DOCKER_TLS_VERIFY": "1",
+            "DOCKER_CERT_PATH": str(self.temp / "docker-certs"),
+            "DOCKER_CONFIG": str(self.temp / "docker-config"),
+        }
+        denied = {
+            "UNRELATED_SECRET": "must-not-cross",
+            "GH_TOKEN": "github-secret",
+            "BEADS_DOLT_PASSWORD": "beads-secret",
+            "OPENAI_API_KEY": "model-secret",
+            "DOCKER_AUTH_CONFIG": "docker-auth-secret",
+        }
+
+        completed = self.run_afk("start", "central-bnkl.1.1", **approved, **denied)
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        records = [
+            json.loads(line)
+            for line in self.command_log.read_text(encoding="utf-8").splitlines()
+        ]
+        systemd = next(
+            record for record in records if record["command"] == "systemd-run"
+        )
+        for name, value in approved.items():
+            self.assertIn(f"--setenv={name}={value}", systemd["args"])
+        serialized = json.dumps(systemd)
+        for name, value in denied.items():
+            self.assertNotIn(f"--setenv={name}=", serialized)
+            self.assertNotIn(value, serialized)
+
     def test_start_holds_global_lock_through_systemd_handoff(self):
         completed = self.run_afk(
             "start", "central-bnkl.1.1", AFK_FAKE_RESUME_DURING_LAUNCH="1"
@@ -158,25 +193,24 @@ class StartCliTest(unittest.TestCase):
         while time.monotonic() < deadline:
             status = self.run_afk("status", run_id, "--json")
             projection = json.loads(status.stdout)
-            if projection["state"] == "attention_required":
+            if projection["state"] in {"attention_required", "validated"}:
                 break
             time.sleep(0.05)
-        self.assertEqual(projection["checkpoint"], "candidate_ready")
+        self.assertEqual(projection["checkpoint"], "validated")
         effect = RunStore(self.state_home / "afk").effect(run_id, "worker-launch-1")
         self.assertEqual(effect["status"], "confirmed")
 
-    def test_worker_claims_exact_bead_and_publishes_candidate_before_stopping(self):
+    def test_worker_claims_publishes_and_validates_the_exact_candidate(self):
         started = self.run_afk("start", "central-bnkl.1.1")
         run_id = started.stdout.strip()
 
         completed = self.run_afk("_worker", run_id)
 
-        self.assertEqual(completed.returncode, 2, completed.stderr)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
         projection = json.loads(self.run_afk("status", run_id, "--json").stdout)
-        self.assertEqual(projection["state"], "attention_required")
-        self.assertEqual(projection["checkpoint"], "candidate_ready")
-        self.assertEqual(projection["attention"]["kind"], "unavailable")
-        self.assertEqual(projection["attention"]["scope"], "validation")
+        self.assertEqual(projection["state"], "validated")
+        self.assertEqual(projection["checkpoint"], "validated")
+        self.assertEqual(projection["validation"]["status"], "passed")
         self.assertEqual(projection["candidate_sha"], "d" * 40)
         self.assertEqual(projection["pr_number"], 17)
         self.assertEqual(
@@ -203,6 +237,8 @@ class StartCliTest(unittest.TestCase):
         self.assertEqual(completed.returncode, 2, completed.stderr)
         projection = json.loads(self.run_afk("status", run_id, "--json").stdout)
         self.assertEqual(projection["checkpoint"], "candidate_ready")
+        self.assertEqual(projection["attention"]["scope"], "validation")
+        self.assertEqual(projection["attention"]["kind"], "invalid")
         self.assertEqual(
             projection["validation_contract"],
             {
@@ -244,7 +280,7 @@ class StartCliTest(unittest.TestCase):
 
         completed = self.run_afk("_worker", run_id)
 
-        self.assertEqual(completed.returncode, 2, completed.stderr)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
         records = [
             json.loads(line)
             for line in self.command_log.read_text(encoding="utf-8").splitlines()
@@ -732,6 +768,7 @@ class StartCliTest(unittest.TestCase):
         projection = store.status(run_id)
         self.assertEqual(projection["checkpoint"], "candidate_ready")
         self.assertEqual(projection["attention"]["scope"], "validation")
+        self.assertEqual(projection["attention"]["kind"], "invalid")
         commands = self.command_log.read_text(encoding="utf-8")
         self.assertNotIn('"command":"systemctl"', commands)
 
@@ -795,6 +832,7 @@ class StartCliTest(unittest.TestCase):
         projection = store.status(run_id)
         self.assertEqual(projection["checkpoint"], "candidate_ready")
         self.assertEqual(projection["attention"]["scope"], "validation")
+        self.assertEqual(projection["attention"]["kind"], "invalid")
 
     def test_resume_reconciles_a_candidate_push_completed_before_confirmation(self):
         home = str(self.temp)
@@ -816,10 +854,10 @@ class StartCliTest(unittest.TestCase):
 
         resumed = self.run_afk("resume", HOME=home)
 
-        self.assertEqual(resumed.returncode, 2, resumed.stderr)
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
         after = json.loads(self.run_afk("status", run_id, "--json").stdout)
-        self.assertEqual(after["checkpoint"], "candidate_ready")
-        self.assertEqual(after["attention"]["scope"], "validation")
+        self.assertEqual(after["checkpoint"], "validated")
+        self.assertEqual(after["validation"]["status"], "passed")
         push_effect = RunStore(self.state_home / "afk").effect(
             run_id, f'branch-push-{"d" * 40}'
         )
@@ -843,20 +881,20 @@ class StartCliTest(unittest.TestCase):
 
         resumed = self.run_afk("resume", HOME=home)
 
-        self.assertEqual(resumed.returncode, 2, resumed.stderr)
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
         after = json.loads(self.run_afk("status", run_id, "--json").stdout)
-        self.assertEqual(after["checkpoint"], "candidate_ready")
-        self.assertEqual(after["attention"]["scope"], "validation")
+        self.assertEqual(after["checkpoint"], "validated")
+        self.assertEqual(after["validation"]["status"], "passed")
         self.assertEqual(store.effect(run_id, "pr-create")["status"], "confirmed")
         commands = self.command_log.read_text(encoding="utf-8")
         self.assertEqual(commands.count('"command":"gh","args":["pr","create"'), 1)
 
         terminal_resume = self.run_afk("resume", HOME=home)
 
-        self.assertEqual(terminal_resume.returncode, 2, terminal_resume.stderr)
+        self.assertEqual(terminal_resume.returncode, 0, terminal_resume.stderr)
         terminal = json.loads(self.run_afk("status", run_id, "--json").stdout)
-        self.assertEqual(terminal["checkpoint"], "candidate_ready")
-        self.assertEqual(terminal["attention"]["scope"], "validation")
+        self.assertEqual(terminal["checkpoint"], "validated")
+        self.assertEqual(terminal["validation"]["status"], "passed")
 
     def test_resume_requires_attention_for_confirmed_collected_worker_without_terminal(
         self,
@@ -1303,13 +1341,25 @@ class StartCliTest(unittest.TestCase):
                     elif args[:1] == ["fetch"]:
                         pass
                     elif args[:1] == ["ls-tree"]:
-                        if os.environ["AFK_FAKE_PINNED_CONTRACT"] == "present":
+                        requested = args[-1]
+                        if "-z" in args and requested == "scripts/validation-worker.sh":
+                            changed = (
+                                args[2] == candidate_sha
+                                and (Path(os.environ["HOME"]) / ".fake-contract-proposal").exists()
+                            )
+                            blob = "f" * 40 if changed else "b" * 40
+                            sys.stdout.buffer.write(
+                                ("100755 blob " + blob + "\\t" + requested + "\\0").encode()
+                            )
+                        elif os.environ["AFK_FAKE_PINNED_CONTRACT"] == "present":
                             print("100644 blob " + "c" * 40 + "\\tafk.toml")
                     elif args[:2] == ["cat-file", "blob"]:
                         print("schema_version = 1")
                         print("[validation]")
                         print('command = ["./scripts/validation-worker.sh", "run"]')
                         print("timeout_seconds = 2700")
+                    elif args[:1] == ["rev-parse"] and args[-1].endswith(":afk.toml"):
+                        print("c" * 40)
                     elif args[:2] == ["rev-parse", "--git-dir"]:
                         git_dir = (
                             Path(os.environ["XDG_STATE_HOME"])
@@ -1333,6 +1383,23 @@ class StartCliTest(unittest.TestCase):
                         checkout.mkdir(parents=True)
                         git_file = checkout / ".git"
                         git_file.write_text("gitdir: fake\\n", encoding="utf-8")
+                        scripts = checkout / "scripts"
+                        scripts.mkdir()
+                        validation_worker = scripts / "validation-worker.sh"
+                        validation_worker.write_text(
+                            "#!/usr/bin/env python3\\n"
+                            "import json, sys\\n"
+                            "from pathlib import Path\\n"
+                            "request = json.loads(Path(sys.argv[sys.argv.index('--request') + 1]).read_text())\\n"
+                            "evidence = Path(request['evidence_dir'])\\n"
+                            "(evidence / 'tests.log').write_text('passed\\\\n')\\n"
+                            "(evidence / 'result.json').write_text(json.dumps({"
+                            "'schema_version': 1, 'candidate_sha': request['candidate_sha'], "
+                            "'status': 'passed', 'summary': 'validation passed', "
+                            "'checks': [{'name': 'tests', 'status': 'passed', 'log_path': 'tests.log'}]}))\\n",
+                            encoding="utf-8",
+                        )
+                        validation_worker.chmod(0o700)
                     elif args[:3] == ["worktree", "list", "--porcelain"]:
                         if not os.environ.get("AFK_FAKE_UNREGISTERED_WORKTREE"):
                             worktrees = (
