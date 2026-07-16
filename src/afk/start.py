@@ -434,13 +434,14 @@ def _finish_validation_attempt(
 ) -> dict[str, str]:
     evidence = attempt["evidence"]
     evidence_path = store.root / "runs" / run_id / evidence
+    metadata = evidence_path / "afk"
     for name, value in (("stdout.log", stdout), ("stderr.log", stderr)):
-        if not (evidence_path / name).exists():
-            store.write_evidence_text(run_id, f"{evidence}/{name}", value or "")
-    if not (evidence_path / "outcome.json").exists():
+        if not (metadata / name).exists():
+            store.write_evidence_text(run_id, f"{evidence}/afk/{name}", value or "")
+    if not (metadata / "outcome.json").exists():
         store.write_evidence_text(
             run_id,
-            f"{evidence}/outcome.json",
+            f"{evidence}/afk/outcome.json",
             canonical_json(
                 {
                     "schema_version": 1,

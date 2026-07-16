@@ -30,6 +30,8 @@ PROCESS_CLEANUP_SECONDS = 1
 PR_SET_CHILD_SUBREAPER = 36
 PR_GET_CHILD_SUBREAPER = 37
 TRUSTED_SCRIPT_INTERPRETERS = {"python", "python3"}
+AFK_EVIDENCE_NAMESPACE = "afk"
+CONTRACT_EVIDENCE_NAMESPACE = "contract"
 
 
 class CandidateValidationError(RuntimeError):
@@ -86,7 +88,9 @@ def validate_candidate(
         request_path.write_text(canonical_json(request) + "\n", encoding="utf-8")
         request_path.chmod(0o400)
         store.write_evidence_text(
-            run_id, f"{attempt_evidence}/request.json", canonical_json(request) + "\n"
+            run_id,
+            f"{attempt_evidence}/{AFK_EVIDENCE_NAMESPACE}/request.json",
+            canonical_json(request) + "\n",
         )
         try:
             completed = _run_contract(
@@ -100,23 +104,33 @@ def validate_candidate(
                 "invalid", "validation command is unavailable or not executable"
             ) from exc
         store.write_evidence_text(
-            run_id, f"{attempt_evidence}/stdout.log", completed.stdout
+            run_id,
+            f"{attempt_evidence}/{AFK_EVIDENCE_NAMESPACE}/stdout.log",
+            completed.stdout,
         )
         store.write_evidence_text(
-            run_id, f"{attempt_evidence}/stderr.log", completed.stderr
+            run_id,
+            f"{attempt_evidence}/{AFK_EVIDENCE_NAMESPACE}/stderr.log",
+            completed.stderr,
         )
         _require_immutable_candidate(worktree, candidate_sha)
         result = _read_result(evidence / "result.json", candidate_sha, completed)
         evidence_files = _require_evidence_tree(evidence)
         _require_regular_logs(evidence_files, result["checks"])
         store.write_evidence_text(
-            run_id, f"{evidence_relative}/request.json", canonical_json(request) + "\n"
+            run_id,
+            f"{evidence_relative}/{AFK_EVIDENCE_NAMESPACE}/request.json",
+            canonical_json(request) + "\n",
         )
         store.write_evidence_text(
-            run_id, f"{evidence_relative}/stdout.log", completed.stdout
+            run_id,
+            f"{evidence_relative}/{AFK_EVIDENCE_NAMESPACE}/stdout.log",
+            completed.stdout,
         )
         store.write_evidence_text(
-            run_id, f"{evidence_relative}/stderr.log", completed.stderr
+            run_id,
+            f"{evidence_relative}/{AFK_EVIDENCE_NAMESPACE}/stderr.log",
+            completed.stderr,
         )
         outcome = {
             "schema_version": 1,
@@ -127,14 +141,16 @@ def validate_candidate(
         }
         store.write_evidence_text(
             run_id,
-            f"{evidence_relative}/outcome.json",
+            f"{evidence_relative}/{AFK_EVIDENCE_NAMESPACE}/outcome.json",
             canonical_json(outcome) + "\n",
         )
         for path in sorted(evidence.rglob("*")):
             if path.is_file():
                 relative = path.relative_to(evidence).as_posix()
                 store.ingest_evidence_file(
-                    run_id, f"{evidence_relative}/{relative}", path
+                    run_id,
+                    f"{evidence_relative}/{CONTRACT_EVIDENCE_NAMESPACE}/{relative}",
+                    path,
                 )
     manifest = store.seal_evidence(run_id, evidence_relative)
     validation = {

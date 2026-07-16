@@ -62,7 +62,7 @@ class CandidateValidationCliTest(unittest.TestCase):
         )
         self.assertTrue((evidence / "manifest.json").is_file())
         self.assertEqual(
-            json.loads((evidence / "outcome.json").read_text(encoding="utf-8")),
+            json.loads((evidence / "afk" / "outcome.json").read_text(encoding="utf-8")),
             {
                 "schema_version": 1,
                 "candidate_sha": candidate_sha,
@@ -72,8 +72,46 @@ class CandidateValidationCliTest(unittest.TestCase):
             },
         )
         manifest = json.loads((evidence / "manifest.json").read_text(encoding="utf-8"))
-        self.assertIn("outcome.json", {entry["path"] for entry in manifest["files"]})
+        self.assertIn(
+            "afk/outcome.json", {entry["path"] for entry in manifest["files"]}
+        )
         self.assertEqual(stat.S_IMODE(evidence.stat().st_mode), 0o500)
+
+    def test_contract_evidence_names_do_not_collide_with_afk_metadata(self):
+        formerly_reserved = ("request.json", "stdout.log", "stderr.log", "outcome.json")
+        self.write_contract_worker(
+            status="passed",
+            exit_code=0,
+            checks=[
+                {"name": name, "status": "passed", "log_path": name}
+                for name in formerly_reserved
+            ],
+            evidence_line="; ".join(
+                f'evidence.joinpath({name!r}).write_text("contract {name}\\n", '
+                'encoding="utf-8")'
+                for name in formerly_reserved
+            ),
+        )
+        run_id, _ = self.candidate_ready_run()
+
+        completed = self.run_afk("resume")
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        status = self.status(run_id)
+        gate = (
+            self.state_home / "afk" / "runs" / run_id / status["validation"]["evidence"]
+        )
+        for name in formerly_reserved:
+            self.assertEqual(
+                (gate / "contract" / name).read_text(encoding="utf-8"),
+                f"contract {name}\n",
+            )
+            self.assertTrue((gate / "afk" / name).is_file())
+        manifest = json.loads((gate / "manifest.json").read_text(encoding="utf-8"))
+        paths = {entry["path"] for entry in manifest["files"]}
+        for name in formerly_reserved:
+            self.assertIn(f"contract/{name}", paths)
+            self.assertIn(f"afk/{name}", paths)
 
     def test_rejected_validation_preserves_evidence_and_prepares_repair(self):
         self.write_contract_worker(
@@ -212,7 +250,7 @@ class CandidateValidationCliTest(unittest.TestCase):
         )
         store.write_evidence_text(
             run_id,
-            f"{attempt['evidence']}/partial.log",
+            f"{attempt['evidence']}/contract/partial.log",
             "password=crash-secret\n",
         )
 
@@ -231,7 +269,7 @@ class CandidateValidationCliTest(unittest.TestCase):
         )
         self.assertTrue((evidence / "manifest.json").is_file())
         self.assertEqual(
-            (evidence / "partial.log").read_text(encoding="utf-8"),
+            (evidence / "contract" / "partial.log").read_text(encoding="utf-8"),
             "password=[REDACTED]\n",
         )
         self.assertEqual(stat.S_IMODE(evidence.stat().st_mode), 0o500)
@@ -733,12 +771,14 @@ class CandidateValidationCliTest(unittest.TestCase):
         evidence = (
             self.state_home / "afk" / "runs" / run_id / status["validation"]["evidence"]
         )
-        observed = json.loads((evidence / "tests.log").read_text(encoding="utf-8"))
+        observed = json.loads(
+            (evidence / "contract" / "tests.log").read_text(encoding="utf-8")
+        )
         self.assertEqual(
             observed, {"raw_output_exists": False, "raw_secret_present": False}
         )
         self.assertEqual(
-            (evidence / "stdout.log").read_text(encoding="utf-8"),
+            (evidence / "afk" / "stdout.log").read_text(encoding="utf-8"),
             "password=[REDACTED]\n",
         )
         for path in (self.state_home / "afk" / "runs" / run_id).rglob("*"):
@@ -773,7 +813,7 @@ class CandidateValidationCliTest(unittest.TestCase):
         evidence = self.state_home / "afk" / "runs" / run_id / attempt["evidence"]
         self.assertTrue((evidence / "manifest.json").is_file())
         self.assertEqual(
-            (evidence / "stdout.log").read_text(encoding="utf-8"),
+            (evidence / "afk" / "stdout.log").read_text(encoding="utf-8"),
             "password=[REDACTED]\n",
         )
         self.assertEqual(stat.S_IMODE(evidence.stat().st_mode), 0o500)
@@ -925,7 +965,7 @@ class CandidateValidationCliTest(unittest.TestCase):
         evidence_line = (
             f'destination = Path({str(self.state_home)!r}) / "afk" / "runs" / '
             'request["run_id"] / f"gates/validation-{request[\'candidate_sha\']}" / '
-            '"request.json"; '
+            '"afk/request.json"; '
             f'child = subprocess.Popen([sys.executable, "-c", {child_program!r}, '
             f"str(evidence), str(destination), {str(mutation_path)!r}, "
             f"{str(child_ready_path)!r}]); "
@@ -960,7 +1000,7 @@ class CandidateValidationCliTest(unittest.TestCase):
                 / status["validation"]["evidence"]
             )
             self.assertEqual(
-                (evidence / "tests.log").read_text(encoding="utf-8"),
+                (evidence / "contract" / "tests.log").read_text(encoding="utf-8"),
                 "passed\n",
             )
         finally:
@@ -1022,10 +1062,12 @@ class CandidateValidationCliTest(unittest.TestCase):
         evidence = self.state_home / "afk" / "runs" / run_id / attempt["evidence"]
         self.assertTrue((evidence / "manifest.json").is_file())
         self.assertEqual(
-            (evidence / "stdout.log").read_text(encoding="utf-8"),
+            (evidence / "afk" / "stdout.log").read_text(encoding="utf-8"),
             "password=[REDACTED]\n",
         )
-        outcome = json.loads((evidence / "outcome.json").read_text(encoding="utf-8"))
+        outcome = json.loads(
+            (evidence / "afk" / "outcome.json").read_text(encoding="utf-8")
+        )
         self.assertEqual(outcome["status"], "invalid")
         self.assertEqual(stat.S_IMODE(evidence.stat().st_mode), 0o500)
 
@@ -1069,7 +1111,9 @@ class CandidateValidationCliTest(unittest.TestCase):
         status = self.status(run_id)
         evidence_relative = status["validation"]["evidence"]
         evidence = self.state_home / "afk" / "runs" / run_id / evidence_relative
-        log = json.loads((evidence / "tests.log").read_text(encoding="utf-8"))
+        log = json.loads(
+            (evidence / "contract" / "tests.log").read_text(encoding="utf-8")
+        )
         self.assertNotIn("UNRELATED_SECRET", log["environment"])
         self.assertEqual(log["password"], "[REDACTED]")
 
