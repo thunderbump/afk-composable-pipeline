@@ -107,6 +107,44 @@ class CandidateValidationCliTest(unittest.TestCase):
         self.assertEqual(status["validation"]["candidate_sha"], candidate_sha)
         self.assertEqual(status["validation"]["next_action"], "attention")
 
+    def test_boolean_contract_schema_version_is_invalid(self):
+        self.write_contract_worker(
+            status="passed",
+            exit_code=0,
+            checks=[{"name": "tests", "status": "passed", "log_path": "tests.log"}],
+        )
+        contract = (self.repository / "afk.toml").read_text(encoding="utf-8")
+        (self.repository / "afk.toml").write_text(
+            contract.replace("schema_version = 1", "schema_version = true"),
+            encoding="utf-8",
+        )
+        run_id, _ = self.candidate_ready_run()
+
+        completed = self.run_afk("resume")
+
+        self.assertEqual(completed.returncode, 2)
+        status = self.status(run_id)
+        self.assertEqual(status["attention"]["kind"], "invalid")
+
+    def test_boolean_contract_timeout_is_invalid(self):
+        self.write_contract_worker(
+            status="passed",
+            exit_code=0,
+            checks=[{"name": "tests", "status": "passed", "log_path": "tests.log"}],
+        )
+        contract = (self.repository / "afk.toml").read_text(encoding="utf-8")
+        (self.repository / "afk.toml").write_text(
+            contract.replace("timeout_seconds = 5", "timeout_seconds = true"),
+            encoding="utf-8",
+        )
+        run_id, _ = self.candidate_ready_run()
+
+        completed = self.run_afk("resume")
+
+        self.assertEqual(completed.returncode, 2)
+        status = self.status(run_id)
+        self.assertEqual(status["attention"]["kind"], "invalid")
+
     def test_pinned_contract_content_ignores_candidate_afk_toml_changes(self):
         self.write_contract_worker(
             status="passed",

@@ -15,6 +15,7 @@ from typing import Any
 from afk.candidate import CandidateError, produce_candidate
 from afk.candidate_validation import CandidateValidationError, validate_candidate
 from afk.run_store import RunStore, RunStoreBusy, RunStoreError
+from afk.validation_contract import ValidationContractError, parse_validation_contract
 
 
 WORKER_LOCK_ATTEMPTS = 40
@@ -710,23 +711,9 @@ def _is_full_git_sha(value: str) -> bool:
 
 def _validate_contract(value: str) -> None:
     try:
-        contract = tomllib.loads(value)
-    except tomllib.TOMLDecodeError as exc:
+        parse_validation_contract(value)
+    except ValidationContractError as exc:
         raise StartError(f"invalid afk.toml: {exc}") from exc
-    validation = contract.get("validation")
-    if (
-        set(contract) != {"schema_version", "validation"}
-        or type(contract.get("schema_version")) is not int
-        or contract["schema_version"] != 1
-        or not isinstance(validation, dict)
-        or set(validation) != {"command", "timeout_seconds"}
-        or not isinstance(validation.get("command"), list)
-        or not validation["command"]
-        or not all(isinstance(item, str) and item for item in validation["command"])
-        or type(validation.get("timeout_seconds")) is not int
-        or validation["timeout_seconds"] <= 0
-    ):
-        raise StartError("invalid afk.toml Validation Contract")
 
 
 def _lingering(claimant: str) -> str:
