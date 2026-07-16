@@ -143,6 +143,8 @@ def resume_run(*, note: str | None = None) -> tuple[str, int]:
         run_id = projection["run_id"]
         if projection["checkpoint"] == "validated":
             return run_id, 0
+        if projection["last_event"] == "validation.rejected":
+            return run_id, 0
         if "worker_exit_code" in projection:
             if _candidate_resume_ready(projection):
                 return run_id, _advance_candidate(store, run_id)
@@ -302,6 +304,18 @@ def _advance_validation(store: RunStore, run_id: str) -> int:
             "validation.passed",
             state="validated",
             data={"checkpoint": "validated", "validation": validation},
+        )
+        return 0
+    if validation["status"] == "rejected":
+        store.append_event(
+            run_id,
+            "validation.rejected",
+            state="candidate_ready",
+            data={
+                "checkpoint": "candidate_ready",
+                "attention": {},
+                "validation": validation,
+            },
         )
         return 0
     _attention(

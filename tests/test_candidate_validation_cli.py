@@ -72,10 +72,12 @@ class CandidateValidationCliTest(unittest.TestCase):
 
         completed = self.run_afk("resume")
 
-        self.assertEqual(completed.returncode, 2, completed.stderr)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
         status = self.status(run_id)
+        self.assertEqual(status["state"], "candidate_ready")
         self.assertEqual(status["checkpoint"], "candidate_ready")
-        self.assertEqual(status["attention"]["kind"], "rejected")
+        self.assertEqual(status["last_event"], "validation.rejected")
+        self.assertEqual(status["attention"], {})
         self.assertEqual(status["validation"]["status"], "rejected")
         self.assertEqual(status["validation"]["candidate_sha"], candidate_sha)
         self.assertEqual(status["validation"]["next_action"], "repair")
@@ -83,6 +85,11 @@ class CandidateValidationCliTest(unittest.TestCase):
             self.state_home / "afk" / "runs" / run_id / status["validation"]["evidence"]
         )
         self.assertTrue((evidence / "manifest.json").is_file())
+
+        resumed = self.run_afk("resume")
+
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        self.assertEqual(self.status(run_id)["last_sequence"], status["last_sequence"])
 
     def test_inconclusive_validation_requires_attention(self):
         self.write_contract_worker(
