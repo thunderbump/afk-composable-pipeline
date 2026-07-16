@@ -108,6 +108,18 @@ def validate_candidate(
         store.write_evidence_text(
             run_id, f"{evidence_relative}/stderr.log", completed.stderr
         )
+        outcome = {
+            "schema_version": 1,
+            "candidate_sha": candidate_sha,
+            "exit_code": completed.returncode,
+            "status": result["status"],
+            "summary": result["summary"],
+        }
+        store.write_evidence_text(
+            run_id,
+            f"{evidence_relative}/outcome.json",
+            canonical_json(outcome) + "\n",
+        )
         for path in sorted(evidence.rglob("*")):
             if path.is_file():
                 relative = path.relative_to(evidence).as_posix()
@@ -118,6 +130,7 @@ def validate_candidate(
     validation = {
         "status": result["status"],
         "candidate_sha": candidate_sha,
+        "exit_code": completed.returncode,
         "summary": result["summary"],
         "evidence": evidence_relative,
         "manifest_sha256": _manifest_digest(manifest),

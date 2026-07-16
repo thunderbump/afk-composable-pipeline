@@ -56,10 +56,23 @@ class CandidateValidationCliTest(unittest.TestCase):
         self.assertEqual(status["checkpoint"], "validated")
         self.assertEqual(status["validation"]["status"], "passed")
         self.assertEqual(status["validation"]["candidate_sha"], candidate_sha)
+        self.assertEqual(status["validation"]["exit_code"], 0)
         evidence = (
             self.state_home / "afk" / "runs" / run_id / status["validation"]["evidence"]
         )
         self.assertTrue((evidence / "manifest.json").is_file())
+        self.assertEqual(
+            json.loads((evidence / "outcome.json").read_text(encoding="utf-8")),
+            {
+                "schema_version": 1,
+                "candidate_sha": candidate_sha,
+                "exit_code": 0,
+                "status": "passed",
+                "summary": "validation passed",
+            },
+        )
+        manifest = json.loads((evidence / "manifest.json").read_text(encoding="utf-8"))
+        self.assertIn("outcome.json", {entry["path"] for entry in manifest["files"]})
         self.assertEqual(stat.S_IMODE(evidence.stat().st_mode), 0o500)
 
     def test_rejected_validation_preserves_evidence_and_prepares_repair(self):
