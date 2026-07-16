@@ -16,6 +16,7 @@ from afk.candidate import CandidateError, produce_candidate
 from afk.candidate_validation import (
     CandidateValidationError,
     VALIDATION_ENVIRONMENT_ALLOWLIST,
+    approve_bootstrap_contract,
     recover_candidate_validation,
     validate_candidate,
 )
@@ -267,6 +268,44 @@ def resume_run(*, note: str | None = None) -> tuple[str, int]:
             unit=unit,
         )
         return run_id, 2
+
+
+def approve_bootstrap_validation(
+    harness_path: str,
+    *,
+    timeout_seconds: int,
+    run_id: str | None = None,
+) -> str:
+    store = RunStore()
+    with store.lock():
+        projection = store.status(run_id)
+        if projection["checkpoint"] != "candidate_ready":
+            raise StartError("bootstrap approval requires candidate_ready")
+        try:
+            contract = approve_bootstrap_contract(
+                Path(projection["worktree_path"]),
+                projection["candidate_sha"],
+                projection["validation_contract"],
+                harness_path,
+                timeout_seconds,
+            )
+        except (KeyError, CandidateValidationError) as exc:
+            raise StartError(str(exc)) from exc
+        store.append_event(
+            projection["run_id"],
+            "validation.bootstrap_approved",
+            state="attention_required",
+            data={
+                "checkpoint": "candidate_ready",
+                "validation_contract": contract,
+                "attention": {
+                    "scope": "validation",
+                    "kind": "unavailable",
+                    "summary": "approved bootstrap validation is ready",
+                },
+            },
+        )
+        return projection["run_id"]
 
 
 def _candidate_resume_ready(projection: dict[str, Any]) -> bool:
