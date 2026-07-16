@@ -803,6 +803,52 @@ class CandidateValidationCliTest(unittest.TestCase):
             time.sleep(0.02)
         self.assertFalse(Path(f"/proc/{child_pid}").exists())
 
+    def test_successful_worker_kills_detached_term_resistant_descendant(self):
+        child_pid_path = self.temp / "detached-child.pid"
+        child_program = textwrap.dedent(
+            """
+            import os
+            import signal
+            import sys
+            import time
+            from pathlib import Path
+
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            Path(sys.argv[1]).write_text(str(os.getpid()), encoding="utf-8")
+            time.sleep(3)
+            """
+        ).lstrip()
+        self.write_contract_worker(
+            status="passed",
+            exit_code=0,
+            checks=[{"name": "tests", "status": "passed", "log_path": "tests.log"}],
+            evidence_line=(
+                f"subprocess.Popen([sys.executable, '-c', {child_program!r}, "
+                f"{str(child_pid_path)!r}], start_new_session=True); "
+                f'exec("while not Path({str(child_pid_path)!r}).exists():\\n" '
+                '"    time.sleep(0.001)"); ' + WRITE_PASSED_LOG
+            ),
+        )
+        run_id, _ = self.candidate_ready_run()
+
+        started = time.monotonic()
+        completed = self.run_afk("resume")
+        elapsed = time.monotonic() - started
+
+        child_pid = int(child_pid_path.read_text(encoding="utf-8"))
+        try:
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertLess(elapsed, 2)
+            deadline = time.monotonic() + 2
+            while Path(f"/proc/{child_pid}").exists() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertFalse(Path(f"/proc/{child_pid}").exists())
+        finally:
+            try:
+                os.kill(child_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
     def test_successful_worker_is_drained_before_evidence_is_ingested(self):
         child_pid_path = self.temp / "resistant-child.pid"
         child_ready_path = self.temp / "resistant-child.ready"
