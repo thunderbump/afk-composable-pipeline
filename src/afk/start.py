@@ -213,6 +213,8 @@ def resume_run(*, note: str | None = None) -> tuple[str, int]:
             if effect["status"] == "confirmed":
                 if _candidate_resume_ready(projection):
                     return run_id, _advance_candidate(store, run_id)
+                if _validation_resume_ready(projection):
+                    return run_id, _advance_validation(store, run_id)
                 _attention(
                     store,
                     run_id,
@@ -284,7 +286,7 @@ def _validation_resume_ready(projection: dict[str, Any]) -> bool:
         projection["checkpoint"] == "candidate_ready"
         and isinstance(attention, dict)
         and attention.get("scope") == "validation"
-        and attention.get("kind") == "unavailable"
+        and attention.get("kind") in {"unavailable", "inconclusive", "interrupted"}
     )
 
 
@@ -332,7 +334,10 @@ def _advance_validation(store: RunStore, run_id: str) -> int:
     attempt = _start_validation_attempt(store, run_id, projection["candidate_sha"])
     try:
         validation = validate_candidate(
-            store, run_id, attempt_evidence=attempt["evidence"]
+            store,
+            run_id,
+            attempt_evidence=attempt["evidence"],
+            gate_evidence=f"gates/{attempt['attempt_id']}",
         )
     except CandidateValidationError as exc:
         attempt = _finish_validation_attempt(
@@ -396,7 +401,13 @@ def _advance_validation(store: RunStore, run_id: str) -> int:
 def _start_validation_attempt(
     store: RunStore, run_id: str, candidate_sha: str
 ) -> dict[str, str]:
-    attempt_id = f"validation-{candidate_sha[:12]}"
+    projection = store.status(run_id)
+    base_attempt_id = f"validation-{candidate_sha[:12]}"
+    attempt_id = (
+        f"{base_attempt_id}-{projection['last_sequence'] + 1}"
+        if "validation_attempt" in projection
+        else base_attempt_id
+    )
     attempt = {
         "attempt_id": attempt_id,
         "candidate_sha": candidate_sha,

@@ -49,7 +49,11 @@ class CandidateValidationError(RuntimeError):
 
 
 def validate_candidate(
-    store: RunStore, run_id: str, *, attempt_evidence: str
+    store: RunStore,
+    run_id: str,
+    *,
+    attempt_evidence: str,
+    gate_evidence: str,
 ) -> dict[str, Any]:
     projection = store.status(run_id)
     identity = store.identity(run_id)
@@ -62,7 +66,7 @@ def validate_candidate(
             "invalid", "Run lacks exact Candidate validation identity"
         ) from exc
     contract = _load_contract(worktree, contract_identity)
-    evidence_relative = f"gates/validation-{candidate_sha}"
+    evidence_relative = gate_evidence
 
     _require_immutable_candidate(worktree, candidate_sha)
     _require_trusted_harness(

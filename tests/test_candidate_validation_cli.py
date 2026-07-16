@@ -151,6 +151,29 @@ class CandidateValidationCliTest(unittest.TestCase):
         self.assertEqual(status["validation"]["status"], "inconclusive")
         self.assertEqual(status["validation"]["candidate_sha"], candidate_sha)
         self.assertEqual(status["validation"]["next_action"], "attention")
+        first_attempt = status["validation_attempt"]
+        first_gate = status["validation"]["evidence"]
+
+        resumed = self.run_afk("resume")
+
+        self.assertEqual(resumed.returncode, 2, resumed.stderr)
+        retried = self.status(run_id)
+        self.assertEqual(retried["attention"]["kind"], "inconclusive")
+        self.assertNotEqual(
+            retried["validation_attempt"]["attempt_id"], first_attempt["attempt_id"]
+        )
+        self.assertNotEqual(
+            retried["validation_attempt"]["evidence"], first_attempt["evidence"]
+        )
+        self.assertNotEqual(retried["validation"]["evidence"], first_gate)
+        run = self.state_home / "afk" / "runs" / run_id
+        for relative in (
+            first_attempt["evidence"],
+            first_gate,
+            retried["validation_attempt"]["evidence"],
+            retried["validation"]["evidence"],
+        ):
+            self.assertTrue((run / relative / "manifest.json").is_file())
 
     def test_inconclusive_validation_requires_an_inconclusive_check(self):
         self.write_contract_worker(
@@ -216,8 +239,24 @@ class CandidateValidationCliTest(unittest.TestCase):
 
         resumed = self.run_afk("resume")
 
-        self.assertEqual(resumed.returncode, 2, resumed.stderr)
-        self.assertEqual(self.status(run_id)["last_sequence"], sequence)
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        retried = self.status(run_id)
+        self.assertEqual(retried["checkpoint"], "validated")
+        self.assertGreater(retried["last_sequence"], sequence)
+        self.assertNotEqual(
+            retried["validation_attempt"]["attempt_id"], attempt["attempt_id"]
+        )
+        self.assertNotEqual(
+            retried["validation_attempt"]["evidence"], attempt["evidence"]
+        )
+        retry_evidence = (
+            self.state_home
+            / "afk"
+            / "runs"
+            / run_id
+            / retried["validation_attempt"]["evidence"]
+        )
+        self.assertTrue((retry_evidence / "manifest.json").is_file())
 
     def test_boolean_contract_schema_version_is_invalid(self):
         self.write_contract_worker(
