@@ -450,15 +450,8 @@ def _run_contract(
         overflow.wait(0.01)
     if overflow.is_set():
         _terminate_process_group(process)
-        for reader in readers:
-            reader.join()
-        raise CandidateValidationError(
-            "invalid",
-            "validation output exceeds the size limit",
-            stdout="",
-            stderr="",
-        )
-    _drain_process_group(process.pid)
+    else:
+        _drain_process_group(process.pid)
     for reader in readers:
         reader.join()
     if overflow.is_set():
