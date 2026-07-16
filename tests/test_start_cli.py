@@ -192,6 +192,35 @@ class StartCliTest(unittest.TestCase):
         )
         self.assertIn(BASE_SHA, commands)
 
+    def test_candidate_contract_changes_remain_proposals_for_later_validation(self):
+        home = self.temp
+        (home / ".fake-contract-proposal").write_text("enabled", encoding="utf-8")
+        started = self.run_afk("start", "central-bnkl.1.1", HOME=str(home))
+        run_id = started.stdout.strip()
+
+        completed = self.run_afk("_worker", run_id, HOME=str(home))
+
+        self.assertEqual(completed.returncode, 2, completed.stderr)
+        projection = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(projection["checkpoint"], "candidate_ready")
+        self.assertEqual(
+            projection["validation_contract"],
+            {
+                "source": "pinned_base",
+                "base_sha": BASE_SHA,
+                "blob_sha": "c" * 40,
+            },
+        )
+        worktree = Path(projection["worktree_path"])
+        self.assertEqual(
+            (worktree / "afk.toml").read_text(encoding="utf-8"),
+            "candidate contract proposal\n",
+        )
+        self.assertEqual(
+            (worktree / "scripts/validation-worker.sh").read_text(encoding="utf-8"),
+            "candidate harness proposal\n",
+        )
+
     def test_worker_requires_attention_when_target_branch_drifts_before_candidate_ready(
         self,
     ):
@@ -1506,10 +1535,20 @@ class StartCliTest(unittest.TestCase):
                 args = sys.argv[1:]
                 base_sha = "a" * 40
                 candidate_sha = "d" * 40
+                worktree = Path(args[args.index("--cd") + 1])
                 report = Path(args[args.index("--output-last-message") + 1])
                 (Path(os.environ["HOME"]) / ".fake-candidate").write_text(
                     candidate_sha, encoding="utf-8"
                 )
+                if (Path(os.environ["HOME"]) / ".fake-contract-proposal").exists():
+                    (worktree / "afk.toml").write_text(
+                        "candidate contract proposal\\n", encoding="utf-8"
+                    )
+                    scripts = worktree / "scripts"
+                    scripts.mkdir(exist_ok=True)
+                    (scripts / "validation-worker.sh").write_text(
+                        "candidate harness proposal\\n", encoding="utf-8"
+                    )
                 report.write_text(json.dumps({
                     "status": "completed",
                     "starting_sha": base_sha,
