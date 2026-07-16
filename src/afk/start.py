@@ -20,6 +20,7 @@ WORKER_LOCK_ATTEMPTS = 40
 WORKER_LOCK_RETRY_SECONDS = 0.05
 COMMAND_TIMEOUT_SECONDS = 30
 CREDENTIAL_FILE_BYTE_LIMIT = 4096
+BOOTSTRAP_VALIDATION_ADAPTER = "afk.builtin.bootstrap-validation/v1"
 
 
 class StartError(RuntimeError):
@@ -636,7 +637,11 @@ def _pinned_validation_contract(
     listing = _required(["git", "ls-tree", base_sha, "--", "afk.toml"], cwd=root)
     if not listing:
         if bootstrap_contract:
-            return {"source": "bootstrap_required", "base_sha": base_sha}
+            return {
+                "source": "approved_bootstrap",
+                "base_sha": base_sha,
+                "adapter_id": BOOTSTRAP_VALIDATION_ADAPTER,
+            }
         raise StartError("pinned base does not contain afk.toml")
     fields = listing.split()
     if (

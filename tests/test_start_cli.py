@@ -1133,7 +1133,11 @@ class StartCliTest(unittest.TestCase):
         )
         self.assertEqual(
             status["validation_contract"],
-            {"source": "bootstrap_required", "base_sha": BASE_SHA},
+            {
+                "source": "approved_bootstrap",
+                "base_sha": BASE_SHA,
+                "adapter_id": "afk.builtin.bootstrap-validation/v1",
+            },
         )
 
         rejected = self.run_afk(
