@@ -1306,7 +1306,17 @@ class StartCliTest(unittest.TestCase):
                     elif args[:1] == ["fetch"]:
                         pass
                     elif args[:1] == ["ls-tree"]:
-                        if os.environ["AFK_FAKE_PINNED_CONTRACT"] == "present":
+                        requested = args[-1]
+                        if "-z" in args and requested == "scripts/validation-worker.sh":
+                            changed = (
+                                args[2] == candidate_sha
+                                and (Path(os.environ["HOME"]) / ".fake-contract-proposal").exists()
+                            )
+                            blob = "f" * 40 if changed else "b" * 40
+                            sys.stdout.buffer.write(
+                                ("100755 blob " + blob + "\\t" + requested + "\\0").encode()
+                            )
+                        elif os.environ["AFK_FAKE_PINNED_CONTRACT"] == "present":
                             print("100644 blob " + "c" * 40 + "\\tafk.toml")
                     elif args[:2] == ["cat-file", "blob"]:
                         print("schema_version = 1")

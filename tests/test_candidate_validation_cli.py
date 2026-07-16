@@ -482,6 +482,50 @@ class CandidateValidationCliTest(unittest.TestCase):
         self.assertIn("harness", status["attention"]["summary"])
         self.assertFalse(marker.exists())
 
+    def test_pinned_symlink_cannot_load_candidate_modified_harness(self):
+        self.write_contract_worker(
+            status="passed",
+            exit_code=0,
+            checks=[{"name": "tests", "status": "passed", "log_path": "tests.log"}],
+        )
+        (self.repository / "validate.py").rename(self.repository / "runner.py")
+        (self.repository / "validate.py").symlink_to("runner.py")
+        self.git("add", ".")
+        self.git("commit", "-m", "trusted symlink harness")
+        base_sha = self.git("rev-parse", "HEAD")
+        blob_sha = self.git("rev-parse", "HEAD:afk.toml")
+
+        marker = self.temp / "untrusted-symlink-target-ran"
+        runner = (self.repository / "runner.py").read_text(encoding="utf-8")
+        (self.repository / "runner.py").write_text(
+            runner.replace(
+                WRITE_SAFE_LOG,
+                f'Path({str(marker)!r}).write_text("ran", encoding="utf-8"); '
+                + WRITE_PASSED_LOG,
+            ),
+            encoding="utf-8",
+        )
+        self.git("add", ".")
+        self.git("commit", "-m", "propose symlink target change")
+        candidate_sha = self.git("rev-parse", "HEAD")
+        run_id = self.create_ready_run(
+            candidate_sha=candidate_sha,
+            base_sha=base_sha,
+            validation_contract={
+                "source": "pinned_base",
+                "base_sha": base_sha,
+                "blob_sha": blob_sha,
+            },
+        )
+
+        completed = self.run_afk("resume")
+
+        self.assertEqual(completed.returncode, 2)
+        status = self.status(run_id)
+        self.assertEqual(status["attention"]["kind"], "invalid")
+        self.assertIn("regular tracked file", status["attention"]["summary"])
+        self.assertFalse(marker.exists())
+
     def test_pinned_python_module_harness_change_is_not_executed(self):
         self.assert_pinned_indirect_harness_is_rejected(["python3", "-m", "validate"])
 

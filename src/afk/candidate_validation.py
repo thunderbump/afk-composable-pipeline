@@ -274,29 +274,44 @@ def _require_trusted_harness(
             raise CandidateValidationError(
                 "invalid", "pinned validation harness path is invalid"
             )
-        trusted = subprocess.run(
-            ["git", "rev-parse", f"{identity['base_sha']}:{relative}"],
-            cwd=worktree,
-            text=True,
-            capture_output=True,
-            check=False,
+        trusted = _tracked_regular_file_identity(
+            worktree, identity["base_sha"], relative
         )
-        candidate = subprocess.run(
-            ["git", "rev-parse", f"{candidate_sha}:{relative}"],
-            cwd=worktree,
-            text=True,
-            capture_output=True,
-            check=False,
-        )
-        if (
-            trusted.returncode != 0
-            or candidate.returncode != 0
-            or trusted.stdout.strip() != candidate.stdout.strip()
-        ):
+        candidate = _tracked_regular_file_identity(worktree, candidate_sha, relative)
+        if trusted is None or candidate is None:
+            raise CandidateValidationError(
+                "invalid",
+                "pinned validation harness must be a regular tracked file",
+            )
+        if trusted != candidate:
             raise CandidateValidationError(
                 "invalid",
                 "Candidate validation harness differs from the trusted pinned base",
             )
+
+
+def _tracked_regular_file_identity(
+    worktree: Path, commit_sha: str, relative: str
+) -> tuple[str, str] | None:
+    observed = subprocess.run(
+        ["git", "ls-tree", "-z", commit_sha, "--", relative],
+        cwd=worktree,
+        capture_output=True,
+        check=False,
+    )
+    records = observed.stdout.rstrip(b"\0").split(b"\0")
+    if observed.returncode != 0 or len(records) != 1 or b"\t" not in records[0]:
+        return None
+    metadata, path = records[0].split(b"\t", 1)
+    fields = metadata.split()
+    if (
+        len(fields) != 3
+        or fields[0] not in {b"100644", b"100755"}
+        or fields[1] != b"blob"
+        or path != os.fsencode(relative)
+    ):
+        return None
+    return fields[0].decode("ascii"), fields[2].decode("ascii")
 
 
 def _read_result(
