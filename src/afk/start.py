@@ -463,9 +463,7 @@ def preflight(
     )
     fields = remote_line.split()
     base_sha = fields[0] if len(fields) == 2 and fields[1] == remote_ref else ""
-    if len(base_sha) != 40 or any(
-        character not in "0123456789abcdef" for character in base_sha
-    ):
+    if not _is_full_git_sha(base_sha):
         raise StartError("GitHub default branch does not resolve to a full Git SHA")
     _required(["git", "fetch", "--no-tags", "origin", remote_ref], cwd=root)
     fetched_sha = _required(["git", "rev-parse", "FETCH_HEAD"], cwd=root)
@@ -645,8 +643,7 @@ def _pinned_validation_contract(
         len(fields) != 4
         or fields[0] != "100644"
         or fields[1] != "blob"
-        or len(fields[2]) != 40
-        or any(character not in "0123456789abcdef" for character in fields[2])
+        or not _is_full_git_sha(fields[2])
     ):
         raise StartError("pinned afk.toml must be one regular file")
     if bootstrap_contract:
@@ -658,6 +655,12 @@ def _pinned_validation_contract(
         "base_sha": base_sha,
         "blob_sha": fields[2],
     }
+
+
+def _is_full_git_sha(value: str) -> bool:
+    return len(value) == 40 and all(
+        character in "0123456789abcdef" for character in value
+    )
 
 
 def _validate_contract(value: str) -> None:
