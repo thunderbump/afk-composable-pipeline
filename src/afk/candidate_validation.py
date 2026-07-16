@@ -170,10 +170,18 @@ def _require_trusted_harness(
     identity: dict[str, str],
     command: list[str],
 ) -> None:
-    for argument in command:
-        if not argument.startswith("./"):
-            continue
+    for position, argument in enumerate(command):
         relative = argument.removeprefix("./")
+        if not argument.startswith("./"):
+            path = Path(argument)
+            if (
+                argument.startswith("-")
+                or path.is_absolute()
+                or (position == 0 and "/" not in argument)
+                or not _contained_relative_path(argument)
+                or not os.path.lexists(worktree / path)
+            ):
+                continue
         if not _contained_relative_path(relative):
             raise CandidateValidationError(
                 "invalid", "pinned validation harness path is invalid"

@@ -219,6 +219,58 @@ class CandidateValidationCliTest(unittest.TestCase):
         self.assertIn("harness", status["attention"]["summary"])
         self.assertFalse(marker.exists())
 
+    def test_pinned_relative_candidate_harness_change_is_not_executed(self):
+        self.write_contract_worker(
+            status="passed",
+            exit_code=0,
+            checks=[{"name": "tests", "status": "passed", "log_path": "tests.log"}],
+        )
+        scripts = self.repository / "scripts"
+        scripts.mkdir()
+        (self.repository / "validate.py").replace(scripts / "validation.py")
+        (self.repository / "afk.toml").write_text(
+            "schema_version = 1\n\n[validation]\n"
+            'command = ["python3", "scripts/validation.py"]\n'
+            "timeout_seconds = 5\n",
+            encoding="utf-8",
+        )
+        self.git("add", ".")
+        self.git("commit", "-m", "trusted relative harness")
+        base_sha = self.git("rev-parse", "HEAD")
+        blob_sha = self.git("rev-parse", "HEAD:afk.toml")
+
+        marker = self.temp / "untrusted-relative-harness-ran"
+        self.write_contract_worker(
+            status="passed",
+            exit_code=0,
+            checks=[{"name": "tests", "status": "passed", "log_path": "tests.log"}],
+            evidence_line=(
+                f'Path({str(marker)!r}).write_text("ran", encoding="utf-8"); '
+                + WRITE_PASSED_LOG
+            ),
+        )
+        (self.repository / "validate.py").replace(scripts / "validation.py")
+        self.git("add", ".")
+        self.git("commit", "-m", "propose relative harness change")
+        candidate_sha = self.git("rev-parse", "HEAD")
+        run_id = self.create_ready_run(
+            candidate_sha=candidate_sha,
+            base_sha=base_sha,
+            validation_contract={
+                "source": "pinned_base",
+                "base_sha": base_sha,
+                "blob_sha": blob_sha,
+            },
+        )
+
+        completed = self.run_afk("resume")
+
+        self.assertEqual(completed.returncode, 2)
+        status = self.status(run_id)
+        self.assertEqual(status["attention"]["kind"], "invalid")
+        self.assertIn("harness", status["attention"]["summary"])
+        self.assertFalse(marker.exists())
+
     def test_bootstrap_ignores_candidate_selected_validation_policy(self):
         self.write_contract_worker(
             status="passed",
