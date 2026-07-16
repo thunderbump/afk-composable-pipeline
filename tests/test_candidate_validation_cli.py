@@ -817,6 +817,85 @@ class CandidateValidationCliTest(unittest.TestCase):
         self.assertEqual(status["validation"]["status"], "passed")
         self.assertTrue(marker.is_file())
 
+    def test_approved_legacy_bootstrap_preserves_docker_context_secret_safety(self):
+        self.git("commit", "--allow-empty", "-m", "base without validation contract")
+        base_sha = self.git("rev-parse", "HEAD")
+        scripts = self.repository / "scripts"
+        scripts.mkdir()
+        harness = scripts / "validate.sh"
+        harness.write_text(
+            "#!/bin/sh\n"
+            "set -eu\n"
+            'candidate="${1:-}"\n'
+            'test "$(git rev-parse HEAD)" = "$candidate"\n'
+            'test "$DOCKER_CONTEXT" = "beads-webui-test"\n'
+            'test "$XDG_RUNTIME_DIR" = "/run/user/1000"\n'
+            'test -z "${UNRELATED_SECRET+x}"\n'
+            'printf \'{"candidate":"%s","docker_context":"%s",'
+            '"registry":"https://docker-user:docker-password@registry.example"}\\n\' '
+            '"$candidate" "$DOCKER_CONTEXT"\n',
+            encoding="utf-8",
+        )
+        harness.chmod(0o755)
+        (self.repository / "afk.toml").write_text(
+            'version = 1\n[validation]\ncommand = "./scripts/validate.sh"\n',
+            encoding="utf-8",
+        )
+        self.git("add", ".")
+        self.git("commit", "-m", "propose Beads WebUI validation harness")
+        candidate_sha = self.git("rev-parse", "HEAD")
+        run_id = self.create_ready_run(
+            candidate_sha=candidate_sha,
+            base_sha=base_sha,
+            validation_contract={
+                "source": "approved_bootstrap",
+                "base_sha": base_sha,
+                "adapter_id": "afk.builtin.bootstrap-validation/v1",
+            },
+        )
+        approval = self.run_bootstrap_approval(
+            "scripts/validate.sh", "--timeout-seconds", "5"
+        )
+        self.assertEqual(approval.returncode, 0, approval.stderr)
+
+        completed = self.run_afk(
+            "resume",
+            DOCKER_CONTEXT="beads-webui-test",
+            XDG_RUNTIME_DIR="/run/user/1000",
+            UNRELATED_SECRET="must-not-cross",
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        status = self.status(run_id)
+        self.assertEqual(status["checkpoint"], "validated")
+        self.assertEqual(status["validation"]["status"], "passed")
+        gate = (
+            self.state_home / "afk" / "runs" / run_id / status["validation"]["evidence"]
+        )
+        result = json.loads(
+            (gate / "contract" / "result.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(result["candidate_sha"], candidate_sha)
+        self.assertEqual(result["status"], "passed")
+        self.assertEqual(
+            result["checks"],
+            [
+                {
+                    "name": "bootstrap",
+                    "status": "passed",
+                    "log_path": "bootstrap.log",
+                }
+            ],
+        )
+        stdout = (gate / "afk" / "stdout.log").read_text(encoding="utf-8")
+        self.assertIn(candidate_sha, stdout)
+        self.assertIn('"docker_context":"beads-webui-test"', stdout)
+        self.assertIn("https://registry.example", stdout)
+        self.assertNotIn("docker-user", stdout)
+        self.assertNotIn("docker-password", stdout)
+        self.assertNotIn("must-not-cross", stdout)
+        self.assertTrue((gate / "manifest.json").is_file())
+
     def test_bootstrap_fails_closed_without_a_preserved_harness(self):
         self.git("commit", "--allow-empty", "-m", "base without validation harness")
         base_sha = self.git("rev-parse", "HEAD")
