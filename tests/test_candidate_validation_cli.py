@@ -238,6 +238,26 @@ class CandidateValidationCliTest(unittest.TestCase):
         status = self.status(run_id)
         self.assertEqual(status["attention"]["kind"], "invalid")
 
+    def test_boolean_result_schema_version_is_invalid(self):
+        self.write_contract_worker(
+            status="passed",
+            exit_code=0,
+            checks=[{"name": "tests", "status": "passed", "log_path": "tests.log"}],
+        )
+        worker = (self.repository / "validate.py").read_text(encoding="utf-8")
+        (self.repository / "validate.py").write_text(
+            worker.replace('"schema_version": 1,', '"schema_version": True,'),
+            encoding="utf-8",
+        )
+        run_id, _ = self.candidate_ready_run()
+
+        completed = self.run_afk("resume")
+
+        self.assertEqual(completed.returncode, 2)
+        status = self.status(run_id)
+        self.assertEqual(status["checkpoint"], "candidate_ready")
+        self.assertEqual(status["attention"]["kind"], "invalid")
+
     def test_boolean_contract_timeout_is_invalid(self):
         self.write_contract_worker(
             status="passed",

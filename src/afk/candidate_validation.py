@@ -285,6 +285,7 @@ def _read_result(
         or not isinstance(result, dict)
         or set(result)
         != {"schema_version", "candidate_sha", "status", "summary", "checks"}
+        or type(result.get("schema_version")) is not int
         or result.get("schema_version") != 1
         or result.get("candidate_sha") != candidate_sha
         or status not in {"passed", "rejected", "inconclusive"}
