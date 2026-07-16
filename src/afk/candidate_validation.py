@@ -15,15 +15,13 @@ from typing import Any
 
 from afk.jsonutil import canonical_json
 from afk.redaction import redact_text
-from afk.run_store import RunStore
+from afk.run_store import GATE_BYTE_LIMIT, RunStore
 from afk.validation_contract import ValidationContractError, parse_validation_contract
 
 
 BOOTSTRAP_ADAPTER = "afk.builtin.bootstrap-validation/v1"
 BOOTSTRAP_COMMAND = ["./scripts/validation-worker.sh", "run"]
 BOOTSTRAP_TIMEOUT_SECONDS = 2700
-EVIDENCE_FILE_BYTE_LIMIT = 16 * 1024 * 1024
-EVIDENCE_TOTAL_BYTE_LIMIT = 64 * 1024 * 1024
 RESULT_BYTE_LIMIT = 1024 * 1024
 OUTPUT_BYTE_LIMIT = 64 * 1024 * 1024
 PROCESS_CLEANUP_SECONDS = 1
@@ -115,8 +113,28 @@ def validate_candidate(
         )
         _require_immutable_candidate(worktree, candidate_sha)
         result = _read_result(evidence / "result.json", candidate_sha, completed)
-        evidence_files = _require_evidence_tree(evidence)
+        evidence_files, contract_evidence_bytes = _require_evidence_tree(evidence)
         _require_regular_logs(evidence_files, result["checks"])
+        outcome = {
+            "schema_version": 1,
+            "candidate_sha": candidate_sha,
+            "exit_code": completed.returncode,
+            "status": result["status"],
+            "summary": result["summary"],
+        }
+        gate_metadata = (
+            canonical_json(request) + "\n",
+            completed.stdout,
+            completed.stderr,
+            canonical_json(outcome) + "\n",
+        )
+        gate_bytes = contract_evidence_bytes + sum(
+            len(redact_text(value).encode("utf-8")) for value in gate_metadata
+        )
+        if gate_bytes > GATE_BYTE_LIMIT:
+            raise CandidateValidationError(
+                "invalid", "validation Gate evidence exceeds the size limit"
+            )
         store.write_evidence_text(
             run_id,
             f"{evidence_relative}/{AFK_EVIDENCE_NAMESPACE}/request.json",
@@ -132,13 +150,6 @@ def validate_candidate(
             f"{evidence_relative}/{AFK_EVIDENCE_NAMESPACE}/stderr.log",
             completed.stderr,
         )
-        outcome = {
-            "schema_version": 1,
-            "candidate_sha": candidate_sha,
-            "exit_code": completed.returncode,
-            "status": result["status"],
-            "summary": result["summary"],
-        }
         store.write_evidence_text(
             run_id,
             f"{evidence_relative}/{AFK_EVIDENCE_NAMESPACE}/outcome.json",
@@ -376,7 +387,7 @@ def _require_regular_logs(
             )
 
 
-def _require_evidence_tree(evidence: Path) -> set[str]:
+def _require_evidence_tree(evidence: Path) -> tuple[set[str], int]:
     total = 0
     files: set[str] = set()
     for path in evidence.rglob("*"):
@@ -390,24 +401,19 @@ def _require_evidence_tree(evidence: Path) -> set[str]:
             raise CandidateValidationError(
                 "invalid", "validation evidence must contain only regular files"
             )
-        size = path.stat().st_size
-        if size > EVIDENCE_FILE_BYTE_LIMIT:
-            raise CandidateValidationError(
-                "invalid", "validation evidence file exceeds the size limit"
-            )
-        total += size
-        if total > EVIDENCE_TOTAL_BYTE_LIMIT:
-            raise CandidateValidationError(
-                "invalid", "validation evidence tree exceeds the size limit"
-            )
         try:
-            path.read_text(encoding="utf-8")
+            value = path.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError) as exc:
             raise CandidateValidationError(
                 "invalid", "validation evidence must be UTF-8 text"
             ) from exc
+        total += len(redact_text(value).encode("utf-8"))
+        if total > GATE_BYTE_LIMIT:
+            raise CandidateValidationError(
+                "invalid", "validation Gate evidence exceeds the size limit"
+            )
         files.add(path.relative_to(evidence).as_posix())
-    return files
+    return files, total
 
 
 def _require_immutable_candidate(worktree: Path, candidate_sha: str) -> None:
@@ -466,13 +472,11 @@ def _run_contract(
         descendants.track(process.pid)
         assert process.stdout is not None and process.stderr is not None
         captured = {"stdout": bytearray(), "stderr": bytearray()}
-        captured_bytes = [0]
-        capture_lock = threading.Lock()
         overflow = threading.Event()
         readers = [
             threading.Thread(
                 target=_capture_output,
-                args=(stream, captured[name], captured_bytes, capture_lock, overflow),
+                args=(stream, captured[name], overflow),
                 daemon=True,
             )
             for name, stream in (
@@ -537,17 +541,16 @@ def _run_contract(
 def _capture_output(
     stream: Any,
     captured: bytearray,
-    captured_bytes: list[int],
-    lock: threading.Lock,
     overflow: threading.Event,
 ) -> None:
-    while chunk := stream.read(64 * 1024):
-        with lock:
-            if captured_bytes[0] + len(chunk) > OUTPUT_BYTE_LIMIT:
+    try:
+        while chunk := stream.read(64 * 1024):
+            if len(captured) + len(chunk) > OUTPUT_BYTE_LIMIT:
                 overflow.set()
             elif not overflow.is_set():
                 captured.extend(chunk)
-                captured_bytes[0] += len(chunk)
+    finally:
+        stream.close()
 
 
 def _diagnostic_output(captured: dict[str, bytearray]) -> tuple[str, str]:

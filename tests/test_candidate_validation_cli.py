@@ -9,11 +9,13 @@ import textwrap
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+from afk import candidate_validation  # noqa: E402
 from afk.run_store import RunStore  # noqa: E402
 
 
@@ -704,24 +706,38 @@ class CandidateValidationCliTest(unittest.TestCase):
         self.assertEqual(status["attention"]["kind"], "invalid")
         self.assertIn("UTF-8", status["attention"]["summary"])
 
-    def test_evidence_log_size_is_bounded(self):
-        self.write_contract_worker(
-            status="passed",
-            exit_code=0,
-            checks=[{"name": "tests", "status": "passed", "log_path": "tests.log"}],
-            evidence_line=(
-                'evidence.joinpath("tests.log").write_text('
-                '"x" * (16 * 1024 * 1024 + 1), encoding="utf-8")'
-            ),
-        )
-        run_id, _ = self.candidate_ready_run()
+    def test_gate_evidence_uses_one_authoritative_total_limit(self):
+        evidence = self.temp / "gate-boundary"
+        evidence.mkdir()
+        (evidence / "first.log").write_text("a" * 8, encoding="utf-8")
+        (evidence / "second.log").write_text("b" * 8, encoding="utf-8")
 
-        completed = self.run_afk("resume")
+        with patch.object(candidate_validation, "GATE_BYTE_LIMIT", 16):
+            files, total = candidate_validation._require_evidence_tree(evidence)
+            self.assertEqual(files, {"first.log", "second.log"})
+            self.assertEqual(total, 16)
 
-        self.assertEqual(completed.returncode, 2)
-        status = self.status(run_id)
-        self.assertEqual(status["attention"]["kind"], "invalid")
-        self.assertIn("size", status["attention"]["summary"])
+            (evidence / "third.log").write_text("c", encoding="utf-8")
+            with self.assertRaises(candidate_validation.CandidateValidationError):
+                candidate_validation._require_evidence_tree(evidence)
+
+    def test_validation_output_limits_are_independent_per_stream(self):
+        command = [
+            sys.executable,
+            "-c",
+            "import os; os.write(1, b'a' * 16); os.write(2, b'b' * 16)",
+        ]
+
+        with patch.object(candidate_validation, "OUTPUT_BYTE_LIMIT", 16):
+            completed = candidate_validation._run_contract(
+                command,
+                cwd=self.repository,
+                environment={"PATH": os.environ.get("PATH", "/usr/bin:/bin")},
+                timeout_seconds=2,
+            )
+
+        self.assertEqual(completed.stdout, "a" * 16)
+        self.assertEqual(completed.stderr, "b" * 16)
 
     def test_validation_output_size_is_bounded(self):
         completed_marker = self.temp / "oversized-output-completed"
