@@ -1303,20 +1303,42 @@ class CandidateValidationCliTest(unittest.TestCase):
         self.assertIn("changed", status["attention"]["summary"])
 
     def test_validation_environment_is_allowlisted_and_evidence_is_redacted(self):
+        approved = {
+            "HOME": str(self.temp / "operator-home"),
+            "TMPDIR": str(self.temp / "operator-tmp"),
+            "XDG_CONFIG_HOME": str(self.temp / "operator-config"),
+            "XDG_RUNTIME_DIR": str(self.temp / "operator-runtime"),
+            "DOCKER_HOST": ("tcp://docker-user:docker-password@example.invalid:2376"),
+            "DOCKER_CONTEXT": "akkstack",
+            "DOCKER_TLS_VERIFY": "1",
+            "DOCKER_CERT_PATH": str(self.temp / "docker-certs"),
+            "DOCKER_CONFIG": str(self.temp / "docker-config"),
+        }
+        for name in ("HOME", "TMPDIR", "XDG_CONFIG_HOME", "XDG_RUNTIME_DIR"):
+            Path(approved[name]).mkdir()
         self.write_contract_worker(
             status="passed",
             exit_code=0,
             checks=[{"name": "tests", "status": "passed", "log_path": "tests.log"}],
             evidence_line=(
                 'evidence.joinpath("tests.log").write_text('
-                'json.dumps({"environment": sorted(os.environ), '
+                'json.dumps({"environment": dict(os.environ), '
                 '"password": "hunter2"}), '
                 'encoding="utf-8")'
             ),
         )
         run_id, _ = self.candidate_ready_run()
 
-        completed = self.run_afk("resume", UNRELATED_SECRET="must-not-cross")
+        denied = {
+            "UNRELATED_SECRET": "must-not-cross",
+            "GH_TOKEN": "github-secret",
+            "BEADS_DOLT_PASSWORD": "beads-secret",
+            "OPENAI_API_KEY": "model-secret",
+            "DOCKER_AUTH_CONFIG": "docker-auth-secret",
+            "SSH_AUTH_SOCK": "/tmp/credential-agent.sock",
+            "CODEX_HOME": str(self.temp / "codex-home"),
+        }
+        completed = self.run_afk("resume", **approved, **denied)
 
         self.assertEqual(completed.returncode, 0, completed.stderr)
         status = self.status(run_id)
@@ -1325,7 +1347,22 @@ class CandidateValidationCliTest(unittest.TestCase):
         log = json.loads(
             (evidence / "contract" / "tests.log").read_text(encoding="utf-8")
         )
-        self.assertNotIn("UNRELATED_SECRET", log["environment"])
+        for name, value in approved.items():
+            if name == "DOCKER_HOST":
+                continue
+            self.assertEqual(log["environment"][name], value)
+        self.assertEqual(
+            log["environment"]["DOCKER_HOST"], "tcp://example.invalid:2376"
+        )
+        for name in denied:
+            self.assertNotIn(name, log["environment"])
+        self.assertNotIn("PYTHONPATH", log["environment"])
+        self.assertNotIn("XDG_STATE_HOME", log["environment"])
+        serialized = json.dumps(log)
+        for value in denied.values():
+            self.assertNotIn(value, serialized)
+        self.assertNotIn("docker-user", serialized)
+        self.assertNotIn("docker-password", serialized)
         self.assertEqual(log["password"], "[REDACTED]")
 
     def write_contract_worker(

@@ -32,6 +32,22 @@ PR_GET_CHILD_SUBREAPER = 37
 TRUSTED_SCRIPT_INTERPRETERS = {"python", "python3"}
 AFK_EVIDENCE_NAMESPACE = "afk"
 CONTRACT_EVIDENCE_NAMESPACE = "contract"
+VALIDATION_ENVIRONMENT_ALLOWLIST = (
+    "HOME",
+    "PATH",
+    "USER",
+    "LOGNAME",
+    "LANG",
+    "LC_ALL",
+    "TMPDIR",
+    "XDG_CONFIG_HOME",
+    "XDG_RUNTIME_DIR",
+    "DOCKER_HOST",
+    "DOCKER_CONTEXT",
+    "DOCKER_TLS_VERIFY",
+    "DOCKER_CERT_PATH",
+    "DOCKER_CONFIG",
+)
 
 
 class CandidateValidationError(RuntimeError):
@@ -553,14 +569,23 @@ def _require_immutable_candidate(worktree: Path, candidate_sha: str) -> None:
 
 
 def _validation_environment(temporary: Path) -> dict[str, str]:
-    home = temporary / "home"
-    home.mkdir(mode=0o700)
-    return {
-        "HOME": str(home),
-        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
-        "LANG": os.environ.get("LANG", "C.UTF-8"),
-        "LC_ALL": os.environ.get("LC_ALL", "C.UTF-8"),
+    environment = {
+        name: os.environ[name]
+        for name in VALIDATION_ENVIRONMENT_ALLOWLIST
+        if name in os.environ
     }
+    environment.setdefault("PATH", "/usr/bin:/bin")
+    environment.setdefault("LANG", "C.UTF-8")
+    environment.setdefault("LC_ALL", "C.UTF-8")
+    if "HOME" not in environment:
+        home = temporary / "home"
+        home.mkdir(mode=0o700)
+        environment["HOME"] = str(home)
+    if "TMPDIR" not in environment:
+        tmp = temporary / "tmp"
+        tmp.mkdir(mode=0o700)
+        environment["TMPDIR"] = str(tmp)
+    return environment
 
 
 def _run_contract(
