@@ -8,6 +8,7 @@ import select
 import signal
 import stat
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -18,12 +19,15 @@ from typing import Any
 from afk.jsonutil import canonical_json
 from afk.redaction import redact_text
 from afk.run_store import GATE_BYTE_LIMIT, RunStore, RunStoreError
-from afk.validation_contract import ValidationContractError, parse_validation_contract
+from afk.validation_contract import (
+    VALIDATION_STATUS_EXIT_CODES,
+    ValidationContractError,
+    parse_validation_contract,
+)
 
 
 BOOTSTRAP_ADAPTER = "afk.builtin.bootstrap-validation/v1"
-BOOTSTRAP_COMMAND = ["./scripts/validation-worker.sh", "run"]
-BOOTSTRAP_TIMEOUT_SECONDS = 2700
+BOOTSTRAP_RUNNER = Path(__file__).with_name("bootstrap_adapter.py")
 RESULT_BYTE_LIMIT = 1024 * 1024
 OUTPUT_BYTE_LIMIT = 64 * 1024 * 1024
 PROCESS_CLEANUP_SECONDS = 1
@@ -75,11 +79,10 @@ def validate_candidate(
     gate_evidence: str,
 ) -> dict[str, Any]:
     projection = store.status(run_id)
-    identity = store.identity(run_id)
     try:
         candidate_sha = projection["candidate_sha"]
         worktree = Path(projection["worktree_path"])
-        contract_identity = identity["start_request"]["validation_contract"]
+        contract_identity = projection["validation_contract"]
     except (KeyError, TypeError, ValueError) as exc:
         raise CandidateValidationError(
             "invalid", "Run lacks exact Candidate validation identity"
@@ -113,6 +116,13 @@ def validate_candidate(
         }
         request_path.write_text(canonical_json(request) + "\n", encoding="utf-8")
         request_path.chmod(0o400)
+        command = list(contract["command"])
+        if "bootstrap_harness" in contract:
+            harness = staging / "approved-bootstrap-harness"
+            _materialize_bootstrap_harness(
+                worktree, contract["bootstrap_harness"], harness
+            )
+            command.extend(["--harness", str(harness)])
         store.write_evidence_text(
             run_id,
             f"{attempt_evidence}/{AFK_EVIDENCE_NAMESPACE}/request.json",
@@ -120,7 +130,7 @@ def validate_candidate(
         )
         try:
             completed = _run_contract(
-                [*contract["command"], "--request", str(request_path.resolve())],
+                [*command, "--request", str(request_path.resolve())],
                 cwd=worktree,
                 environment=_validation_environment(staging),
                 timeout_seconds=contract["timeout_seconds"],
@@ -232,10 +242,9 @@ def recover_candidate_validation(
                 encoding="utf-8"
             )
         )
-        contract = store.identity(run_id)["start_request"]["validation_contract"]
+        contract = store.status(run_id)["validation_contract"]
     except (KeyError, OSError, UnicodeDecodeError, json.JSONDecodeError, RunStoreError):
         return None
-    expected_exit = {"passed": 0, "rejected": 1, "inconclusive": 2}
     if (
         not isinstance(outcome, dict)
         or set(outcome)
@@ -253,7 +262,8 @@ def recover_candidate_validation(
         or outcome.get("candidate_sha") != candidate_sha
         or not isinstance(outcome.get("status"), str)
         or type(outcome.get("exit_code")) is not int
-        or outcome.get("exit_code") != expected_exit.get(outcome.get("status"))
+        or outcome.get("exit_code")
+        != VALIDATION_STATUS_EXIT_CODES.get(outcome.get("status"))
         or not isinstance(outcome.get("summary"), str)
         or not outcome["summary"].strip()
         or not isinstance(contract, dict)
@@ -279,16 +289,14 @@ def _load_contract(worktree: Path, identity: Any) -> dict[str, Any]:
     if not isinstance(identity, dict):
         raise CandidateValidationError("invalid", "validation identity is invalid")
     if identity.get("source") == "approved_bootstrap":
-        if (
-            set(identity) != {"source", "base_sha", "adapter_id"}
-            or identity.get("adapter_id") != BOOTSTRAP_ADAPTER
-        ):
-            raise CandidateValidationError(
-                "invalid", "approved bootstrap identity is invalid"
-            )
+        approval = _bootstrap_approval(identity)
         return {
-            "command": list(BOOTSTRAP_COMMAND),
-            "timeout_seconds": BOOTSTRAP_TIMEOUT_SECONDS,
+            "command": [
+                sys.executable,
+                str(BOOTSTRAP_RUNNER),
+            ],
+            "timeout_seconds": approval["timeout_seconds"],
+            "bootstrap_harness": approval["harness"],
         }
     if identity.get("source") != "pinned_base" or set(identity) != {
         "source",
@@ -336,6 +344,21 @@ def _require_trusted_harness(
     identity: dict[str, str],
     command: list[str],
 ) -> None:
+    if identity.get("source") == "approved_bootstrap":
+        approval = _bootstrap_approval(identity)
+        if approval["candidate_sha"] != candidate_sha:
+            raise CandidateValidationError(
+                "invalid", "bootstrap approval is bound to another Candidate"
+            )
+        harness = approval["harness"]
+        observed = _tracked_regular_file_identity(
+            worktree, candidate_sha, harness["path"]
+        )
+        if observed != (harness["mode"], harness["blob_sha"]):
+            raise CandidateValidationError(
+                "invalid", "approved bootstrap harness identity has drifted"
+            )
+        return
     executable = command[0]
     if executable.startswith("./"):
         harness_start = 0
@@ -408,6 +431,108 @@ def _tracked_regular_file_identity(
     return fields[0].decode("ascii"), fields[2].decode("ascii")
 
 
+def approve_bootstrap_contract(
+    worktree: Path,
+    candidate_sha: str,
+    identity: Any,
+    harness_path: str,
+    timeout_seconds: int,
+) -> dict[str, Any]:
+    if (
+        not isinstance(identity, dict)
+        or set(identity) != {"source", "base_sha", "adapter_id"}
+        or identity.get("source") != "approved_bootstrap"
+        or identity.get("adapter_id") != BOOTSTRAP_ADAPTER
+    ):
+        raise CandidateValidationError(
+            "invalid", "Run does not have an unapproved bootstrap identity"
+        )
+    if type(timeout_seconds) is not int or not 1 <= timeout_seconds <= 86400:
+        raise CandidateValidationError(
+            "invalid", "bootstrap timeout_seconds must be between 1 and 86400"
+        )
+    relative = Path(harness_path.removeprefix("./")).as_posix()
+    if not _contained_relative_path(relative):
+        raise CandidateValidationError("invalid", "bootstrap harness path is invalid")
+    _require_immutable_candidate(worktree, candidate_sha)
+    observed = _tracked_regular_file_identity(worktree, candidate_sha, relative)
+    if observed is None or observed[0] != "100755":
+        raise CandidateValidationError(
+            "invalid", "bootstrap harness must be a tracked executable regular file"
+        )
+    return {
+        **identity,
+        "approval": {
+            "schema_version": 1,
+            "candidate_sha": candidate_sha,
+            "command": [f"./{relative}"],
+            "timeout_seconds": timeout_seconds,
+            "harness": {
+                "path": relative,
+                "mode": observed[0],
+                "blob_sha": observed[1],
+            },
+        },
+    }
+
+
+def _bootstrap_approval(identity: dict[str, Any]) -> dict[str, Any]:
+    if (
+        set(identity) != {"source", "base_sha", "adapter_id", "approval"}
+        or identity.get("adapter_id") != BOOTSTRAP_ADAPTER
+        or not isinstance(identity.get("approval"), dict)
+    ):
+        raise CandidateValidationError(
+            "invalid", "approved bootstrap policy is unavailable"
+        )
+    approval = identity["approval"]
+    harness = approval.get("harness")
+    if (
+        set(approval)
+        != {
+            "schema_version",
+            "candidate_sha",
+            "command",
+            "timeout_seconds",
+            "harness",
+        }
+        or type(approval.get("schema_version")) is not int
+        or approval["schema_version"] != 1
+        or not isinstance(approval.get("candidate_sha"), str)
+        or not isinstance(harness, dict)
+    ):
+        raise CandidateValidationError("invalid", "bootstrap approval is invalid")
+    if (
+        type(approval.get("timeout_seconds")) is not int
+        or not 1 <= approval["timeout_seconds"] <= 86400
+        or set(harness) != {"path", "mode", "blob_sha"}
+        or harness.get("mode") != "100755"
+        or not isinstance(harness.get("blob_sha"), str)
+        or len(harness["blob_sha"]) != 40
+        or not _contained_relative_path(harness.get("path", ""))
+        or approval.get("command") != [f"./{harness['path']}"]
+    ):
+        raise CandidateValidationError("invalid", "bootstrap approval is invalid")
+    return approval
+
+
+def _materialize_bootstrap_harness(
+    worktree: Path, harness: dict[str, str], destination: Path
+) -> None:
+    content = subprocess.run(
+        ["git", "cat-file", "blob", harness["blob_sha"]],
+        cwd=worktree,
+        capture_output=True,
+        check=False,
+    )
+    if content.returncode != 0:
+        raise CandidateValidationError(
+            "invalid", "approved bootstrap harness blob is unavailable"
+        )
+    destination.write_bytes(content.stdout)
+    destination.chmod(0o500)
+
+
 def _read_result(
     path: Path, candidate_sha: str, completed: subprocess.CompletedProcess[str]
 ) -> dict[str, Any]:
@@ -427,7 +552,7 @@ def _read_result(
         ) from exc
     checks = result.get("checks") if isinstance(result, dict) else None
     status = result.get("status") if isinstance(result, dict) else None
-    expected_exit = {"passed": 0, "rejected": 1, "inconclusive": 2}.get(status)
+    expected_exit = VALIDATION_STATUS_EXIT_CODES.get(status)
     allowed_check_status = {
         "passed": {"passed"},
         "rejected": {"passed", "rejected", "inconclusive", "not_run"},

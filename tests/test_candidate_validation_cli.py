@@ -710,7 +710,9 @@ class CandidateValidationCliTest(unittest.TestCase):
         )
         scripts = self.repository / "scripts"
         scripts.mkdir()
-        (self.repository / "validate.py").replace(scripts / "validation-worker.sh")
+        approved = scripts / "approved.sh"
+        approved.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        approved.chmod(0o755)
         (self.repository / "afk.toml").unlink()
         self.git("add", ".")
         self.git("commit", "-m", "trusted bootstrap harness")
@@ -739,11 +741,175 @@ class CandidateValidationCliTest(unittest.TestCase):
             },
         )
 
+        approval = self.run_bootstrap_approval(
+            "scripts/approved.sh", "--timeout-seconds", "5"
+        )
+        self.assertEqual(approval.returncode, 0, approval.stderr)
+
         completed = self.run_afk("resume")
 
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertEqual(self.status(run_id)["checkpoint"], "validated")
         self.assertFalse(marker.exists())
+
+    def test_operator_approved_candidate_bound_bootstrap_reaches_a_gate(self):
+        self.git("commit", "--allow-empty", "-m", "base without validation harness")
+        base_sha = self.git("rev-parse", "HEAD")
+        marker = self.temp / "approved-bootstrap-ran"
+        scripts = self.repository / "scripts"
+        scripts.mkdir()
+        harness = scripts / "validate.sh"
+        harness.write_text(
+            "#!/bin/sh\n"
+            "set -eu\n"
+            'test "$(git rev-parse HEAD)" = "$1"\n'
+            f"printf ran > {str(marker)!r}\n",
+            encoding="utf-8",
+        )
+        harness.chmod(0o755)
+        self.git("add", ".")
+        self.git("commit", "-m", "propose bootstrap validation harness")
+        candidate_sha = self.git("rev-parse", "HEAD")
+        harness_blob = self.git("rev-parse", "HEAD:scripts/validate.sh")
+        run_id = self.create_ready_run(
+            candidate_sha=candidate_sha,
+            base_sha=base_sha,
+            validation_contract={
+                "source": "approved_bootstrap",
+                "base_sha": base_sha,
+                "adapter_id": "afk.builtin.bootstrap-validation/v1",
+            },
+        )
+
+        approved = self.run_bootstrap_approval(
+            "scripts/validate.sh",
+            "--timeout-seconds",
+            "5",
+        )
+
+        self.assertEqual(approved.returncode, 0, approved.stderr)
+        approval = self.status(run_id)["validation_contract"]
+        self.assertEqual(
+            approval,
+            {
+                "source": "approved_bootstrap",
+                "base_sha": base_sha,
+                "adapter_id": "afk.builtin.bootstrap-validation/v1",
+                "approval": {
+                    "schema_version": 1,
+                    "candidate_sha": candidate_sha,
+                    "command": ["./scripts/validate.sh"],
+                    "timeout_seconds": 5,
+                    "harness": {
+                        "path": "scripts/validate.sh",
+                        "mode": "100755",
+                        "blob_sha": harness_blob,
+                    },
+                },
+            },
+        )
+
+        completed = self.run_afk("resume")
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        status = self.status(run_id)
+        self.assertEqual(status["checkpoint"], "validated")
+        self.assertEqual(status["validation"]["status"], "passed")
+        self.assertTrue(marker.is_file())
+
+    def test_bootstrap_adapter_imports_as_a_package_module(self):
+        environment = os.environ.copy()
+        environment["PYTHONPATH"] = str(ROOT / "src")
+
+        completed = subprocess.run(
+            [sys.executable, "-c", "import afk.bootstrap_adapter"],
+            cwd=self.repository,
+            env=environment,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def test_approved_legacy_bootstrap_preserves_docker_context_secret_safety(self):
+        self.git("commit", "--allow-empty", "-m", "base without validation contract")
+        base_sha = self.git("rev-parse", "HEAD")
+        scripts = self.repository / "scripts"
+        scripts.mkdir()
+        harness = scripts / "validate.sh"
+        harness.write_text(
+            "#!/bin/sh\n"
+            "set -eu\n"
+            'candidate="${1:-}"\n'
+            'test "$(git rev-parse HEAD)" = "$candidate"\n'
+            'test "$DOCKER_CONTEXT" = "beads-webui-test"\n'
+            'test "$XDG_RUNTIME_DIR" = "/run/user/1000"\n'
+            'test -z "${UNRELATED_SECRET+x}"\n'
+            'printf \'{"candidate":"%s","docker_context":"%s",'
+            '"registry":"https://docker-user:docker-password@registry.example"}\\n\' '
+            '"$candidate" "$DOCKER_CONTEXT"\n',
+            encoding="utf-8",
+        )
+        harness.chmod(0o755)
+        (self.repository / "afk.toml").write_text(
+            'version = 1\n[validation]\ncommand = "./scripts/validate.sh"\n',
+            encoding="utf-8",
+        )
+        self.git("add", ".")
+        self.git("commit", "-m", "propose Beads WebUI validation harness")
+        candidate_sha = self.git("rev-parse", "HEAD")
+        run_id = self.create_ready_run(
+            candidate_sha=candidate_sha,
+            base_sha=base_sha,
+            validation_contract={
+                "source": "approved_bootstrap",
+                "base_sha": base_sha,
+                "adapter_id": "afk.builtin.bootstrap-validation/v1",
+            },
+        )
+        approval = self.run_bootstrap_approval(
+            "scripts/validate.sh", "--timeout-seconds", "5"
+        )
+        self.assertEqual(approval.returncode, 0, approval.stderr)
+
+        completed = self.run_afk(
+            "resume",
+            DOCKER_CONTEXT="beads-webui-test",
+            XDG_RUNTIME_DIR="/run/user/1000",
+            UNRELATED_SECRET="must-not-cross",
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        status = self.status(run_id)
+        self.assertEqual(status["checkpoint"], "validated")
+        self.assertEqual(status["validation"]["status"], "passed")
+        gate = (
+            self.state_home / "afk" / "runs" / run_id / status["validation"]["evidence"]
+        )
+        result = json.loads(
+            (gate / "contract" / "result.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(result["candidate_sha"], candidate_sha)
+        self.assertEqual(result["status"], "passed")
+        self.assertEqual(
+            result["checks"],
+            [
+                {
+                    "name": "bootstrap",
+                    "status": "passed",
+                    "log_path": "bootstrap.log",
+                }
+            ],
+        )
+        stdout = (gate / "afk" / "stdout.log").read_text(encoding="utf-8")
+        self.assertIn(candidate_sha, stdout)
+        self.assertIn('"docker_context":"beads-webui-test"', stdout)
+        self.assertIn("https://registry.example", stdout)
+        self.assertNotIn("docker-user", stdout)
+        self.assertNotIn("docker-password", stdout)
+        self.assertNotIn("must-not-cross", stdout)
+        self.assertTrue((gate / "manifest.json").is_file())
 
     def test_bootstrap_fails_closed_without_a_preserved_harness(self):
         self.git("commit", "--allow-empty", "-m", "base without validation harness")
@@ -776,8 +942,79 @@ class CandidateValidationCliTest(unittest.TestCase):
         self.assertEqual(completed.returncode, 2)
         status = self.status(run_id)
         self.assertEqual(status["attention"]["kind"], "invalid")
-        self.assertIn("harness", status["attention"]["summary"])
+        self.assertIn("policy", status["attention"]["summary"])
         self.assertFalse(marker.exists())
+
+    def test_bootstrap_approval_cannot_cross_candidate_shas(self):
+        self.git("commit", "--allow-empty", "-m", "base without validation harness")
+        base_sha = self.git("rev-parse", "HEAD")
+        scripts = self.repository / "scripts"
+        scripts.mkdir()
+        harness = scripts / "validate.sh"
+        harness.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        harness.chmod(0o755)
+        self.git("add", ".")
+        self.git("commit", "-m", "first Candidate")
+        first_candidate = self.git("rev-parse", "HEAD")
+        run_id = self.create_ready_run(
+            candidate_sha=first_candidate,
+            base_sha=base_sha,
+            validation_contract={
+                "source": "approved_bootstrap",
+                "base_sha": base_sha,
+                "adapter_id": "afk.builtin.bootstrap-validation/v1",
+            },
+        )
+        approved = self.run_bootstrap_approval(
+            "scripts/validate.sh", "--timeout-seconds", "5"
+        )
+        self.assertEqual(approved.returncode, 0, approved.stderr)
+        self.git("commit", "--allow-empty", "-m", "replacement Candidate")
+        replacement_candidate = self.git("rev-parse", "HEAD")
+        store = RunStore(self.state_home / "afk")
+        store.append_event(
+            run_id,
+            "candidate.ready",
+            state="candidate_ready",
+            data={
+                "checkpoint": "candidate_ready",
+                "candidate_sha": replacement_candidate,
+                "pr_head_sha": replacement_candidate,
+            },
+        )
+
+        completed = self.run_afk("resume")
+
+        self.assertEqual(completed.returncode, 2)
+        status = self.status(run_id)
+        self.assertEqual(status["attention"]["kind"], "invalid")
+        self.assertIn("another Candidate", status["attention"]["summary"])
+
+    def test_bootstrap_approval_rejects_a_nonexecutable_harness(self):
+        self.git("commit", "--allow-empty", "-m", "base without validation harness")
+        base_sha = self.git("rev-parse", "HEAD")
+        scripts = self.repository / "scripts"
+        scripts.mkdir()
+        harness = scripts / "validate.sh"
+        harness.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        self.git("add", ".")
+        self.git("commit", "-m", "propose non-executable harness")
+        candidate_sha = self.git("rev-parse", "HEAD")
+        run_id = self.create_ready_run(
+            candidate_sha=candidate_sha,
+            base_sha=base_sha,
+            validation_contract={
+                "source": "approved_bootstrap",
+                "base_sha": base_sha,
+                "adapter_id": "afk.builtin.bootstrap-validation/v1",
+            },
+        )
+
+        completed = self.run_bootstrap_approval("scripts/validate.sh")
+
+        self.assertEqual(completed.returncode, 2)
+        self.assertIn("tracked executable", completed.stderr)
+        self.assertNotIn("approval", self.status(run_id)["validation_contract"])
 
     def test_contract_rejects_fields_outside_version_one(self):
         marker = self.temp / "invalid-contract-ran"
@@ -1594,6 +1831,24 @@ class CandidateValidationCliTest(unittest.TestCase):
         environment.update(overrides)
         return subprocess.run(
             [sys.executable, "-m", "afk", *args],
+            cwd=self.repository,
+            env=environment,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+    def run_bootstrap_approval(self, *args, **overrides):
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "PYTHONPATH": str(ROOT / "src"),
+                "XDG_STATE_HOME": str(self.state_home),
+            }
+        )
+        environment.update(overrides)
+        return subprocess.run(
+            [sys.executable, "-m", "afk.bootstrap_approval", *args],
             cwd=self.repository,
             env=environment,
             text=True,

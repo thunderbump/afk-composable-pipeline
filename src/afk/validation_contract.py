@@ -4,6 +4,13 @@ import tomllib
 from typing import Any
 
 
+VALIDATION_STATUS_EXIT_CODES = {
+    "passed": 0,
+    "rejected": 1,
+    "inconclusive": 2,
+}
+
+
 class ValidationContractError(ValueError):
     pass
 

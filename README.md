@@ -27,6 +27,24 @@ PYTHONPATH=src python3 -m afk run-step noop --input '{"message":"hello"}'
 The CLI prints a JSON summary containing the `run_id`, step, status, and result
 path.
 
+When a Run was explicitly started with `--bootstrap-contract`, its Candidate
+validation policy remains unavailable until an operator approves one exact
+tracked executable from that exact Candidate:
+
+```sh
+PYTHONPATH=src python3 -m afk.bootstrap_approval \
+  scripts/validate.sh --timeout-seconds 300
+PYTHONPATH=src python3 -m afk resume
+```
+
+Approval records the Candidate SHA, command, timeout, Git mode, and harness
+blob in the durable Run. The built-in adapter invokes that approved legacy
+`<harness> <candidate-sha>` interface and converts exit `0`, `1`, or another
+exit into a structured passed, rejected, or inconclusive Validation Gate.
+Candidate `afk.toml` content is not consulted. Missing, untracked,
+non-executable, changed, or differently bound harnesses fail closed before
+execution.
+
 When `--ledger` is omitted, AFK resolves ledger output with this precedence:
 `--ledger` > `AFK_LEDGER_DIR` > `./ledgers`. Preview-only `run-next` does not
 create `./ledgers`; the directory is only created when execution actually writes
