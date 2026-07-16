@@ -172,6 +172,14 @@ class CandidateTest(unittest.TestCase):
         prompt = (attempt / "prompt.md").read_text(encoding="utf-8")
         self.assertIn("central-test.1", prompt)
         self.assertIn(self.base_sha, prompt)
+        self.assertIn(
+            "Commit after the safe checks available inside this sandbox", prompt
+        )
+        self.assertIn("AFK runs the full Validation Contract afterward", prompt)
+        self.assertIn("Do not access Docker, the Docker socket, or systemd", prompt)
+        self.assertIn(
+            "Do not report blocked solely because privileged validation", prompt
+        )
         captured_env = json.loads(self.codex_env.read_text(encoding="utf-8"))
         self.assertNotIn("GITHUB_TOKEN", captured_env)
         self.assertNotIn("BEADS_DOLT_PASSWORD", captured_env)

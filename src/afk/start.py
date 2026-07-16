@@ -20,6 +20,7 @@ WORKER_LOCK_ATTEMPTS = 40
 WORKER_LOCK_RETRY_SECONDS = 0.05
 COMMAND_TIMEOUT_SECONDS = 30
 CREDENTIAL_FILE_BYTE_LIMIT = 4096
+BOOTSTRAP_VALIDATION_ADAPTER = "afk.builtin.bootstrap-validation/v1"
 
 
 class StartError(RuntimeError):
@@ -41,7 +42,7 @@ class StartContext:
     bead_id: str
     claimant: str
     beads_workspace: Path
-    validation_contract: str
+    validation_contract: dict[str, str]
 
 
 def start_run(
@@ -463,9 +464,7 @@ def preflight(
     )
     fields = remote_line.split()
     base_sha = fields[0] if len(fields) == 2 and fields[1] == remote_ref else ""
-    if len(base_sha) != 40 or any(
-        character not in "0123456789abcdef" for character in base_sha
-    ):
+    if not _is_full_git_sha(base_sha):
         raise StartError("GitHub default branch does not resolve to a full Git SHA")
     _required(["git", "fetch", "--no-tags", "origin", remote_ref], cwd=root)
     fetched_sha = _required(["git", "rev-parse", "FETCH_HEAD"], cwd=root)
@@ -634,20 +633,39 @@ def _validate_start_bead(bead: dict[str, Any], bead_id: str, repository: str) ->
 
 def _pinned_validation_contract(
     root: Path, base_sha: str, *, bootstrap_contract: bool
-) -> str:
+) -> dict[str, str]:
     listing = _required(["git", "ls-tree", base_sha, "--", "afk.toml"], cwd=root)
     if not listing:
         if bootstrap_contract:
-            return "bootstrap_required"
+            return {
+                "source": "approved_bootstrap",
+                "base_sha": base_sha,
+                "adapter_id": BOOTSTRAP_VALIDATION_ADAPTER,
+            }
         raise StartError("pinned base does not contain afk.toml")
     fields = listing.split()
-    if len(fields) != 4 or fields[0] != "100644" or fields[1] != "blob":
+    if (
+        len(fields) != 4
+        or fields[0] != "100644"
+        or fields[1] != "blob"
+        or not _is_full_git_sha(fields[2])
+    ):
         raise StartError("pinned afk.toml must be one regular file")
     if bootstrap_contract:
         raise StartError("pinned base already contains afk.toml")
     value = _required(["git", "cat-file", "blob", f"{base_sha}:afk.toml"], cwd=root)
     _validate_contract(value)
-    return "pinned"
+    return {
+        "source": "pinned_base",
+        "base_sha": base_sha,
+        "blob_sha": fields[2],
+    }
+
+
+def _is_full_git_sha(value: str) -> bool:
+    return len(value) == 40 and all(
+        character in "0123456789abcdef" for character in value
+    )
 
 
 def _validate_contract(value: str) -> None:
