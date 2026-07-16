@@ -15,6 +15,8 @@ from afk.validation_contract import ValidationContractError, parse_validation_co
 
 
 BOOTSTRAP_ADAPTER = "afk.builtin.bootstrap-validation/v1"
+BOOTSTRAP_COMMAND = ["./scripts/validation-worker.sh", "run"]
+BOOTSTRAP_TIMEOUT_SECONDS = 2700
 EVIDENCE_FILE_BYTE_LIMIT = 16 * 1024 * 1024
 EVIDENCE_TOTAL_BYTE_LIMIT = 64 * 1024 * 1024
 RESULT_BYTE_LIMIT = 1024 * 1024
@@ -118,13 +120,10 @@ def _load_contract(worktree: Path, identity: Any) -> dict[str, Any]:
             raise CandidateValidationError(
                 "invalid", "approved bootstrap identity is invalid"
             )
-        try:
-            value = (worktree / "afk.toml").read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError) as exc:
-            raise CandidateValidationError(
-                "invalid", "afk.toml is missing or invalid"
-            ) from exc
-        return _parse_contract(value)
+        return {
+            "command": list(BOOTSTRAP_COMMAND),
+            "timeout_seconds": BOOTSTRAP_TIMEOUT_SECONDS,
+        }
     if identity.get("source") != "pinned_base" or set(identity) != {
         "source",
         "base_sha",
@@ -171,8 +170,6 @@ def _require_trusted_harness(
     identity: dict[str, str],
     command: list[str],
 ) -> None:
-    if identity["source"] != "pinned_base":
-        return
     for argument in command:
         if not argument.startswith("./"):
             continue

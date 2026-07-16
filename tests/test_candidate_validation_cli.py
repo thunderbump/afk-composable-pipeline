@@ -219,7 +219,84 @@ class CandidateValidationCliTest(unittest.TestCase):
         self.assertIn("harness", status["attention"]["summary"])
         self.assertFalse(marker.exists())
 
-    def test_bootstrap_rejects_contract_fields_outside_version_one(self):
+    def test_bootstrap_ignores_candidate_selected_validation_policy(self):
+        self.write_contract_worker(
+            status="passed",
+            exit_code=0,
+            checks=[{"name": "tests", "status": "passed", "log_path": "tests.log"}],
+        )
+        scripts = self.repository / "scripts"
+        scripts.mkdir()
+        (self.repository / "validate.py").replace(scripts / "validation-worker.sh")
+        (self.repository / "afk.toml").unlink()
+        self.git("add", ".")
+        self.git("commit", "-m", "trusted bootstrap harness")
+        base_sha = self.git("rev-parse", "HEAD")
+
+        marker = self.temp / "candidate-policy-ran"
+        self.write_contract_worker(
+            status="passed",
+            exit_code=0,
+            checks=[{"name": "tests", "status": "passed", "log_path": "tests.log"}],
+            evidence_line=(
+                f'Path({str(marker)!r}).write_text("ran", encoding="utf-8"); '
+                + WRITE_PASSED_LOG
+            ),
+        )
+        self.git("add", ".")
+        self.git("commit", "-m", "candidate validation policy proposal")
+        candidate_sha = self.git("rev-parse", "HEAD")
+        run_id = self.create_ready_run(
+            candidate_sha=candidate_sha,
+            base_sha=base_sha,
+            validation_contract={
+                "source": "approved_bootstrap",
+                "base_sha": base_sha,
+                "adapter_id": "afk.builtin.bootstrap-validation/v1",
+            },
+        )
+
+        completed = self.run_afk("resume")
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(self.status(run_id)["checkpoint"], "validated")
+        self.assertFalse(marker.exists())
+
+    def test_bootstrap_fails_closed_without_a_preserved_harness(self):
+        self.git("commit", "--allow-empty", "-m", "base without validation harness")
+        base_sha = self.git("rev-parse", "HEAD")
+        marker = self.temp / "untrusted-bootstrap-policy-ran"
+        self.write_contract_worker(
+            status="passed",
+            exit_code=0,
+            checks=[{"name": "tests", "status": "passed", "log_path": "tests.log"}],
+            evidence_line=(
+                f'Path({str(marker)!r}).write_text("ran", encoding="utf-8"); '
+                + WRITE_PASSED_LOG
+            ),
+        )
+        self.git("add", ".")
+        self.git("commit", "-m", "candidate bootstrap policy proposal")
+        candidate_sha = self.git("rev-parse", "HEAD")
+        run_id = self.create_ready_run(
+            candidate_sha=candidate_sha,
+            base_sha=base_sha,
+            validation_contract={
+                "source": "approved_bootstrap",
+                "base_sha": base_sha,
+                "adapter_id": "afk.builtin.bootstrap-validation/v1",
+            },
+        )
+
+        completed = self.run_afk("resume")
+
+        self.assertEqual(completed.returncode, 2)
+        status = self.status(run_id)
+        self.assertEqual(status["attention"]["kind"], "invalid")
+        self.assertIn("harness", status["attention"]["summary"])
+        self.assertFalse(marker.exists())
+
+    def test_contract_rejects_fields_outside_version_one(self):
         marker = self.temp / "invalid-contract-ran"
         self.write_contract_worker(
             status="passed",
@@ -564,16 +641,19 @@ class CandidateValidationCliTest(unittest.TestCase):
 
     def candidate_ready_run(self):
         self.git("add", ".")
-        self.git("commit", "-m", "candidate")
+        self.git("commit", "-m", "trusted validation base")
+        base_sha = self.git("rev-parse", "HEAD")
+        blob_sha = self.git("rev-parse", "HEAD:afk.toml")
+        self.git("commit", "--allow-empty", "-m", "candidate")
         candidate_sha = self.git("rev-parse", "HEAD")
         return (
             self.create_ready_run(
                 candidate_sha=candidate_sha,
-                base_sha=candidate_sha,
+                base_sha=base_sha,
                 validation_contract={
-                    "source": "approved_bootstrap",
-                    "base_sha": candidate_sha,
-                    "adapter_id": "afk.builtin.bootstrap-validation/v1",
+                    "source": "pinned_base",
+                    "base_sha": base_sha,
+                    "blob_sha": blob_sha,
                 },
             ),
             candidate_sha,
