@@ -115,6 +115,41 @@ class CandidateValidationCliTest(unittest.TestCase):
             self.assertIn(f"contract/{name}", paths)
             self.assertIn(f"afk/{name}", paths)
 
+    def test_contract_manifest_name_is_bound_by_gate_root_manifest(self):
+        self.write_contract_worker(
+            status="passed",
+            exit_code=0,
+            checks=[
+                {
+                    "name": "contract-manifest",
+                    "status": "passed",
+                    "log_path": "manifest.json",
+                }
+            ],
+            evidence_line=(
+                'evidence.joinpath("manifest.json").write_text('
+                '"contract manifest\\n", encoding="utf-8")'
+            ),
+        )
+        run_id, _ = self.candidate_ready_run()
+
+        completed = self.run_afk("resume")
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        status = self.status(run_id)
+        gate = (
+            self.state_home / "afk" / "runs" / run_id / status["validation"]["evidence"]
+        )
+        self.assertEqual(
+            (gate / "contract" / "manifest.json").read_text(encoding="utf-8"),
+            "contract manifest\n",
+        )
+        root_manifest = json.loads((gate / "manifest.json").read_text(encoding="utf-8"))
+        self.assertIn(
+            "contract/manifest.json",
+            {entry["path"] for entry in root_manifest["files"]},
+        )
+
     def test_rejected_validation_preserves_evidence_and_prepares_repair(self):
         self.write_contract_worker(
             status="rejected",
