@@ -19,7 +19,11 @@ from typing import Any
 from afk.jsonutil import canonical_json
 from afk.redaction import redact_text
 from afk.run_store import GATE_BYTE_LIMIT, RunStore, RunStoreError
-from afk.validation_contract import ValidationContractError, parse_validation_contract
+from afk.validation_contract import (
+    VALIDATION_STATUS_EXIT_CODES,
+    ValidationContractError,
+    parse_validation_contract,
+)
 
 
 BOOTSTRAP_ADAPTER = "afk.builtin.bootstrap-validation/v1"
@@ -241,7 +245,6 @@ def recover_candidate_validation(
         contract = store.status(run_id)["validation_contract"]
     except (KeyError, OSError, UnicodeDecodeError, json.JSONDecodeError, RunStoreError):
         return None
-    expected_exit = {"passed": 0, "rejected": 1, "inconclusive": 2}
     if (
         not isinstance(outcome, dict)
         or set(outcome)
@@ -259,7 +262,8 @@ def recover_candidate_validation(
         or outcome.get("candidate_sha") != candidate_sha
         or not isinstance(outcome.get("status"), str)
         or type(outcome.get("exit_code")) is not int
-        or outcome.get("exit_code") != expected_exit.get(outcome.get("status"))
+        or outcome.get("exit_code")
+        != VALIDATION_STATUS_EXIT_CODES.get(outcome.get("status"))
         or not isinstance(outcome.get("summary"), str)
         or not outcome["summary"].strip()
         or not isinstance(contract, dict)
@@ -548,7 +552,7 @@ def _read_result(
         ) from exc
     checks = result.get("checks") if isinstance(result, dict) else None
     status = result.get("status") if isinstance(result, dict) else None
-    expected_exit = {"passed": 0, "rejected": 1, "inconclusive": 2}.get(status)
+    expected_exit = VALIDATION_STATUS_EXIT_CODES.get(status)
     allowed_check_status = {
         "passed": {"passed"},
         "rejected": {"passed", "rejected", "inconclusive", "not_run"},

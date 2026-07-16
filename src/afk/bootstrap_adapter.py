@@ -6,6 +6,8 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+from validation_contract import VALIDATION_STATUS_EXIT_CODES
+
 
 def main() -> int:
     parser = argparse.ArgumentParser()
@@ -17,7 +19,10 @@ def main() -> int:
         [args.harness, request["candidate_sha"]],
         check=False,
     )
-    status = {0: "passed", 1: "rejected"}.get(completed.returncode, "inconclusive")
+    statuses_by_exit_code = {
+        exit_code: status for status, exit_code in VALIDATION_STATUS_EXIT_CODES.items()
+    }
+    status = statuses_by_exit_code.get(completed.returncode, "inconclusive")
     evidence = Path(request["evidence_dir"])
     (evidence / "bootstrap.log").write_text(
         f"approved bootstrap harness exited {completed.returncode}\n",
@@ -44,7 +49,7 @@ def main() -> int:
         + "\n",
         encoding="utf-8",
     )
-    return {"passed": 0, "rejected": 1, "inconclusive": 2}[status]
+    return VALIDATION_STATUS_EXIT_CODES[status]
 
 
 def _request(path: Path) -> dict[str, Any]:
