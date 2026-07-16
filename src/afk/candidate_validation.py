@@ -73,8 +73,8 @@ def validate_candidate(store: RunStore, run_id: str) -> dict[str, Any]:
             ) from exc
         _require_immutable_candidate(worktree, candidate_sha)
         result = _read_result(evidence / "result.json", candidate_sha, completed)
-        _require_regular_logs(evidence, result["checks"])
-        _require_evidence_tree(evidence)
+        evidence_files = _require_evidence_tree(evidence)
+        _require_regular_logs(evidence_files, result["checks"])
         store.write_evidence_text(
             run_id, f"{evidence_relative}/request.json", canonical_json(request) + "\n"
         )
@@ -285,31 +285,23 @@ def _contained_relative_path(value: str) -> bool:
     return not path.is_absolute() and value not in {"", "."} and ".." not in path.parts
 
 
-def _require_regular_logs(evidence: Path, checks: list[dict[str, Any]]) -> None:
+def _require_regular_logs(
+    evidence_files: set[str], checks: list[dict[str, Any]]
+) -> None:
     for check in checks:
-        path = evidence / check["log_path"]
-        if path.is_symlink() or not path.is_file():
+        if Path(check["log_path"]).as_posix() not in evidence_files:
             raise CandidateValidationError(
                 "invalid", "validation evidence log must be a regular file"
             )
-        if path.stat().st_size > EVIDENCE_FILE_BYTE_LIMIT:
-            raise CandidateValidationError(
-                "invalid", "validation evidence log exceeds the size limit"
-            )
-        try:
-            path.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError) as exc:
-            raise CandidateValidationError(
-                "invalid", "validation evidence log must be UTF-8 text"
-            ) from exc
 
 
-def _require_evidence_tree(evidence: Path) -> None:
+def _require_evidence_tree(evidence: Path) -> set[str]:
     total = 0
+    files: set[str] = set()
     for path in evidence.rglob("*"):
         if path.is_symlink():
             raise CandidateValidationError(
-                "invalid", "validation evidence must not contain symlinks"
+                "invalid", "validation evidence must contain only regular files"
             )
         if path.is_dir():
             continue
@@ -333,6 +325,8 @@ def _require_evidence_tree(evidence: Path) -> None:
             raise CandidateValidationError(
                 "invalid", "validation evidence must be UTF-8 text"
             ) from exc
+        files.add(path.relative_to(evidence).as_posix())
+    return files
 
 
 def _require_immutable_candidate(worktree: Path, candidate_sha: str) -> None:

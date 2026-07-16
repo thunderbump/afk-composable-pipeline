@@ -263,6 +263,22 @@ class CandidateValidationCliTest(unittest.TestCase):
         self.assertEqual(status["attention"]["kind"], "invalid")
         self.assertIn("evidence", status["attention"]["summary"])
 
+    def test_declared_log_must_be_in_the_validated_evidence_tree(self):
+        self.write_contract_worker(
+            status="passed",
+            exit_code=0,
+            checks=[{"name": "tests", "status": "passed", "log_path": "tests.log"}],
+            evidence_line='evidence.joinpath("other.log").write_text("passed\\n")',
+        )
+        run_id, _ = self.candidate_ready_run()
+
+        completed = self.run_afk("resume")
+
+        self.assertEqual(completed.returncode, 2)
+        status = self.status(run_id)
+        self.assertEqual(status["attention"]["kind"], "invalid")
+        self.assertIn("regular", status["attention"]["summary"])
+
     def test_evidence_log_must_not_be_a_symlink(self):
         self.write_contract_worker(
             status="passed",
