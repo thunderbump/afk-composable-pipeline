@@ -6,6 +6,7 @@ import os
 import signal
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
@@ -409,10 +410,7 @@ def _run_contract(
                 "interrupted",
                 "validation timed out and its process group was terminated",
             ) from exc
-    try:
-        os.killpg(process.pid, signal.SIGTERM)
-    except ProcessLookupError:
-        pass
+    _drain_process_group(process.pid)
     if process.returncode < 0:
         signal_number = -process.returncode
         try:
@@ -437,6 +435,34 @@ def _run_contract(
             "invalid", "validation output must be UTF-8 text"
         ) from exc
     return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+
+
+def _drain_process_group(process_group: int) -> None:
+    try:
+        os.killpg(process_group, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    if _wait_for_process_group_exit(process_group):
+        return
+    try:
+        os.killpg(process_group, signal.SIGKILL)
+    except ProcessLookupError:
+        return
+    if not _wait_for_process_group_exit(process_group):
+        raise CandidateValidationError(
+            "interrupted", "validation process group could not be terminated"
+        )
+
+
+def _wait_for_process_group_exit(process_group: int) -> bool:
+    deadline = time.monotonic() + 1
+    while time.monotonic() < deadline:
+        try:
+            os.killpg(process_group, 0)
+        except ProcessLookupError:
+            return True
+        time.sleep(0.01)
+    return False
 
 
 def _manifest_digest(manifest: dict[str, Any]) -> str:

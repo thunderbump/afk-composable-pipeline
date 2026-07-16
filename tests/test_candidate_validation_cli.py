@@ -1,5 +1,6 @@
 import json
 import os
+import signal
 import stat
 import subprocess
 import sys
@@ -570,6 +571,74 @@ class CandidateValidationCliTest(unittest.TestCase):
         while Path(f"/proc/{child_pid}").exists() and time.monotonic() < deadline:
             time.sleep(0.02)
         self.assertFalse(Path(f"/proc/{child_pid}").exists())
+
+    def test_successful_worker_is_drained_before_evidence_is_ingested(self):
+        child_pid_path = self.temp / "resistant-child.pid"
+        child_ready_path = self.temp / "resistant-child.ready"
+        mutation_path = self.temp / "evidence-mutated"
+        child_program = textwrap.dedent(
+            """
+            import signal
+            import sys
+            import time
+            from pathlib import Path
+
+            evidence, destination, mutation, ready = map(Path, sys.argv[1:])
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            ready.write_text("ready", encoding="utf-8")
+            while not destination.exists():
+                time.sleep(0.001)
+            mutation.write_text("mutated", encoding="utf-8")
+            evidence.joinpath("tests.log").write_text("mutated\\n", encoding="utf-8")
+            time.sleep(60)
+            """
+        ).lstrip()
+        evidence_line = (
+            f'destination = Path({str(self.state_home)!r}) / "afk" / "runs" / '
+            'request["run_id"] / f"gates/validation-{request[\'candidate_sha\']}" / '
+            '"request.json"; '
+            f'child = subprocess.Popen([sys.executable, "-c", {child_program!r}, '
+            f"str(evidence), str(destination), {str(mutation_path)!r}, "
+            f"{str(child_ready_path)!r}]); "
+            f"Path({str(child_pid_path)!r}).write_text("
+            'str(child.pid), encoding="utf-8"); '
+            f'exec("while not Path({str(child_ready_path)!r}).exists():\\n" '
+            '"    time.sleep(0.001)"); ' + WRITE_PASSED_LOG
+        )
+        self.write_contract_worker(
+            status="passed",
+            exit_code=0,
+            checks=[{"name": "tests", "status": "passed", "log_path": "tests.log"}],
+            evidence_line=evidence_line,
+        )
+        run_id, _ = self.candidate_ready_run()
+
+        completed = self.run_afk("resume")
+
+        child_pid = int(child_pid_path.read_text(encoding="utf-8"))
+        try:
+            deadline = time.monotonic() + 2
+            while not mutation_path.exists() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertFalse(mutation_path.exists())
+            status = self.status(run_id)
+            evidence = (
+                self.state_home
+                / "afk"
+                / "runs"
+                / run_id
+                / status["validation"]["evidence"]
+            )
+            self.assertEqual(
+                (evidence / "tests.log").read_text(encoding="utf-8"),
+                "passed\n",
+            )
+        finally:
+            try:
+                os.kill(child_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
 
     def test_validation_signal_requires_interrupted_attention(self):
         self.write_contract_worker(
