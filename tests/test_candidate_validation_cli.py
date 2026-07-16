@@ -549,13 +549,18 @@ class CandidateValidationCliTest(unittest.TestCase):
         self.assertIn("size", status["attention"]["summary"])
 
     def test_validation_output_size_is_bounded(self):
+        completed_marker = self.temp / "oversized-output-completed"
         self.write_contract_worker(
             status="passed",
             exit_code=0,
             checks=[{"name": "tests", "status": "passed", "log_path": "tests.log"}],
             evidence_line=(
-                'sys.stdout.write("x" * (1024 * 1024 + 1)); ' + WRITE_PASSED_LOG
+                'exec("for _ in range(1280):\\n" '
+                "\"    os.write(1, b'x' * 65536)\"); "
+                f"Path({str(completed_marker)!r}).write_text("
+                '"completed", encoding="utf-8"); ' + WRITE_PASSED_LOG
             ),
+            timeout_seconds=10,
         )
         run_id, _ = self.candidate_ready_run()
 
@@ -566,6 +571,42 @@ class CandidateValidationCliTest(unittest.TestCase):
         self.assertEqual(status["attention"]["kind"], "invalid")
         self.assertIn("output", status["attention"]["summary"])
         self.assertIn("size", status["attention"]["summary"])
+        self.assertFalse(completed_marker.exists())
+
+    def test_validation_output_is_redacted_without_a_raw_temporary_copy(self):
+        self.write_contract_worker(
+            status="passed",
+            exit_code=0,
+            checks=[{"name": "tests", "status": "passed", "log_path": "tests.log"}],
+            evidence_line=(
+                'sys.stdout.write("password=hunter2\\n"); sys.stdout.flush(); '
+                'raw = request_path.parent / "stdout.raw"; '
+                'evidence.joinpath("tests.log").write_text(json.dumps({'
+                '"raw_output_exists": raw.exists(), '
+                '"raw_secret_present": raw.exists() and "hunter2" in '
+                'raw.read_text(encoding="utf-8")}), encoding="utf-8")'
+            ),
+        )
+        run_id, _ = self.candidate_ready_run()
+
+        completed = self.run_afk("resume")
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        status = self.status(run_id)
+        evidence = (
+            self.state_home / "afk" / "runs" / run_id / status["validation"]["evidence"]
+        )
+        observed = json.loads((evidence / "tests.log").read_text(encoding="utf-8"))
+        self.assertEqual(
+            observed, {"raw_output_exists": False, "raw_secret_present": False}
+        )
+        self.assertEqual(
+            (evidence / "stdout.log").read_text(encoding="utf-8"),
+            "password=[REDACTED]\n",
+        )
+        for path in (self.state_home / "afk" / "runs" / run_id).rglob("*"):
+            if path.is_file():
+                self.assertNotIn(b"hunter2", path.read_bytes())
 
     def test_timeout_terminates_the_validation_process_group(self):
         child_pid_path = self.temp / "child.pid"

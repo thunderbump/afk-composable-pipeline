@@ -6,11 +6,13 @@ import os
 import signal
 import subprocess
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Any
 
 from afk.jsonutil import canonical_json
+from afk.redaction import redact_text
 from afk.run_store import RunStore
 from afk.validation_contract import ValidationContractError, parse_validation_contract
 
@@ -21,7 +23,7 @@ BOOTSTRAP_TIMEOUT_SECONDS = 2700
 EVIDENCE_FILE_BYTE_LIMIT = 16 * 1024 * 1024
 EVIDENCE_TOTAL_BYTE_LIMIT = 64 * 1024 * 1024
 RESULT_BYTE_LIMIT = 1024 * 1024
-OUTPUT_BYTE_LIMIT = 1024 * 1024
+OUTPUT_BYTE_LIMIT = 64 * 1024 * 1024
 
 
 class CandidateValidationError(RuntimeError):
@@ -68,7 +70,6 @@ def validate_candidate(store: RunStore, run_id: str) -> dict[str, Any]:
                 cwd=worktree,
                 environment=_validation_environment(staging),
                 timeout_seconds=contract["timeout_seconds"],
-                output_directory=staging,
             )
         except OSError as exc:
             raise CandidateValidationError(
@@ -376,40 +377,54 @@ def _run_contract(
     cwd: Path,
     environment: dict[str, str],
     timeout_seconds: int,
-    output_directory: Path,
 ) -> subprocess.CompletedProcess[str]:
-    stdout_path = output_directory / "stdout.raw"
-    stderr_path = output_directory / "stderr.raw"
-    with stdout_path.open("wb") as stdout_file, stderr_path.open("wb") as stderr_file:
-        process = subprocess.Popen(
-            command,
-            cwd=cwd,
-            env=environment,
-            stdout=stdout_file,
-            stderr=stderr_file,
-            start_new_session=True,
+    process = subprocess.Popen(
+        command,
+        cwd=cwd,
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    assert process.stdout is not None and process.stderr is not None
+    captured = {"stdout": bytearray(), "stderr": bytearray()}
+    captured_bytes = [0]
+    capture_lock = threading.Lock()
+    overflow = threading.Event()
+    readers = [
+        threading.Thread(
+            target=_capture_output,
+            args=(stream, captured[name], captured_bytes, capture_lock, overflow),
         )
-        try:
-            process.communicate(timeout=timeout_seconds)
-        except subprocess.TimeoutExpired as exc:
-            try:
-                os.killpg(process.pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-            try:
-                process.communicate(timeout=1)
-            except subprocess.TimeoutExpired:
-                try:
-                    os.killpg(process.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                process.communicate()
-            _drain_process_group(process.pid)
+        for name, stream in (("stdout", process.stdout), ("stderr", process.stderr))
+    ]
+    for reader in readers:
+        reader.start()
+    deadline = time.monotonic() + timeout_seconds
+    while process.poll() is None and not overflow.is_set():
+        if time.monotonic() >= deadline:
+            _terminate_process_group(process)
+            for reader in readers:
+                reader.join()
             raise CandidateValidationError(
                 "interrupted",
                 "validation timed out and its process group was terminated",
-            ) from exc
+            )
+        overflow.wait(0.01)
+    if overflow.is_set():
+        _terminate_process_group(process)
+        for reader in readers:
+            reader.join()
+        raise CandidateValidationError(
+            "invalid", "validation output exceeds the size limit"
+        )
     _drain_process_group(process.pid)
+    for reader in readers:
+        reader.join()
+    if overflow.is_set():
+        raise CandidateValidationError(
+            "invalid", "validation output exceeds the size limit"
+        )
     if process.returncode < 0:
         signal_number = -process.returncode
         try:
@@ -419,21 +434,48 @@ def _run_contract(
         raise CandidateValidationError(
             "interrupted", f"validation exited after signal {signal_name}"
         )
-    if (
-        stdout_path.stat().st_size > OUTPUT_BYTE_LIMIT
-        or stderr_path.stat().st_size > OUTPUT_BYTE_LIMIT
-    ):
-        raise CandidateValidationError(
-            "invalid", "validation output exceeds the size limit"
-        )
     try:
-        stdout = stdout_path.read_text(encoding="utf-8")
-        stderr = stderr_path.read_text(encoding="utf-8")
+        stdout = bytes(captured["stdout"]).decode("utf-8")
+        stderr = bytes(captured["stderr"]).decode("utf-8")
     except UnicodeDecodeError as exc:
         raise CandidateValidationError(
             "invalid", "validation output must be UTF-8 text"
         ) from exc
-    return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+    return subprocess.CompletedProcess(
+        command, process.returncode, redact_text(stdout), redact_text(stderr)
+    )
+
+
+def _capture_output(
+    stream: Any,
+    captured: bytearray,
+    captured_bytes: list[int],
+    lock: threading.Lock,
+    overflow: threading.Event,
+) -> None:
+    while chunk := stream.read(64 * 1024):
+        with lock:
+            if captured_bytes[0] + len(chunk) > OUTPUT_BYTE_LIMIT:
+                overflow.set()
+            elif not overflow.is_set():
+                captured.extend(chunk)
+                captured_bytes[0] += len(chunk)
+
+
+def _terminate_process_group(process: subprocess.Popen[bytes]) -> None:
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    try:
+        process.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.wait()
+    _drain_process_group(process.pid)
 
 
 def _drain_process_group(process_group: int) -> None:
