@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from afk.candidate import CandidateError, produce_candidate
+from afk.candidate_validation import CandidateValidationError, validate_candidate
 from afk.run_store import RunStore, RunStoreBusy, RunStoreError
 
 
@@ -139,9 +140,13 @@ def resume_run(*, note: str | None = None) -> tuple[str, int]:
     with store.lock():
         projection = store.status()
         run_id = projection["run_id"]
+        if projection["checkpoint"] == "validated":
+            return run_id, 0
         if "worker_exit_code" in projection:
             if _candidate_resume_ready(projection):
                 return run_id, _advance_candidate(store, run_id)
+            if _validation_resume_ready(projection):
+                return run_id, _advance_validation(store, run_id)
             return run_id, projection["worker_exit_code"]
         effect = store.effect(run_id, "worker-launch-1")
         unit = effect["intended"]["unit"]
@@ -265,6 +270,49 @@ def _candidate_resume_ready(projection: dict[str, Any]) -> bool:
             )
         )
     )
+
+
+def _validation_resume_ready(projection: dict[str, Any]) -> bool:
+    attention = projection.get("attention", {})
+    return (
+        projection["checkpoint"] == "candidate_ready"
+        and isinstance(attention, dict)
+        and attention.get("scope") == "validation"
+        and attention.get("kind") == "unavailable"
+    )
+
+
+def _advance_validation(store: RunStore, run_id: str) -> int:
+    try:
+        validation = validate_candidate(store, run_id)
+    except CandidateValidationError as exc:
+        _attention(
+            store,
+            run_id,
+            checkpoint="candidate_ready",
+            scope="validation",
+            kind=exc.kind,
+            summary=exc.summary,
+        )
+        return 2
+    if validation["status"] == "passed":
+        store.append_event(
+            run_id,
+            "validation.passed",
+            state="validated",
+            data={"checkpoint": "validated", "validation": validation},
+        )
+        return 0
+    _attention(
+        store,
+        run_id,
+        checkpoint="candidate_ready",
+        scope="validation",
+        kind=validation["status"],
+        summary=validation["summary"],
+        validation=validation,
+    )
+    return 2
 
 
 def run_worker(run_id: str) -> int:
@@ -423,15 +471,7 @@ def _advance_candidate(store: RunStore, run_id: str) -> int:
             ),
         )
         return 2
-    _attention(
-        store,
-        run_id,
-        checkpoint="candidate_ready",
-        scope="validation",
-        kind="unavailable",
-        summary="validation is not available in this AFK slice",
-    )
-    return 2
+    return _advance_validation(store, run_id)
 
 
 def preflight(
