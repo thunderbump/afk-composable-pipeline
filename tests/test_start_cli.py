@@ -135,6 +135,41 @@ class StartCliTest(unittest.TestCase):
         self.assertIn('"--property=Restart=no"', commands)
         self.assertIn('"--property=UMask=0077"', commands)
 
+    def test_start_forwards_only_approved_validation_execution_context(self):
+        approved = {
+            "TMPDIR": str(self.temp / "operator-tmp"),
+            "XDG_RUNTIME_DIR": str(self.temp / "operator-runtime"),
+            "DOCKER_HOST": "unix:///run/user/1000/docker.sock",
+            "DOCKER_CONTEXT": "akkstack",
+            "DOCKER_TLS_VERIFY": "1",
+            "DOCKER_CERT_PATH": str(self.temp / "docker-certs"),
+            "DOCKER_CONFIG": str(self.temp / "docker-config"),
+        }
+        denied = {
+            "UNRELATED_SECRET": "must-not-cross",
+            "GH_TOKEN": "github-secret",
+            "BEADS_DOLT_PASSWORD": "beads-secret",
+            "OPENAI_API_KEY": "model-secret",
+            "DOCKER_AUTH_CONFIG": "docker-auth-secret",
+        }
+
+        completed = self.run_afk("start", "central-bnkl.1.1", **approved, **denied)
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        records = [
+            json.loads(line)
+            for line in self.command_log.read_text(encoding="utf-8").splitlines()
+        ]
+        systemd = next(
+            record for record in records if record["command"] == "systemd-run"
+        )
+        for name, value in approved.items():
+            self.assertIn(f"--setenv={name}={value}", systemd["args"])
+        serialized = json.dumps(systemd)
+        for name, value in denied.items():
+            self.assertNotIn(f"--setenv={name}=", serialized)
+            self.assertNotIn(value, serialized)
+
     def test_start_holds_global_lock_through_systemd_handoff(self):
         completed = self.run_afk(
             "start", "central-bnkl.1.1", AFK_FAKE_RESUME_DURING_LAUNCH="1"

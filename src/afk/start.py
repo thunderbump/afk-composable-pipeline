@@ -15,6 +15,7 @@ from typing import Any
 from afk.candidate import CandidateError, produce_candidate
 from afk.candidate_validation import (
     CandidateValidationError,
+    VALIDATION_ENVIRONMENT_ALLOWLIST,
     recover_candidate_validation,
     validate_candidate,
 )
@@ -724,11 +725,8 @@ def worker_unit(run_id: str) -> str:
 def _launch_worker(run_id: str, unit: str) -> None:
     environment = []
     for name in (
-        "HOME",
-        "PATH",
+        *VALIDATION_ENVIRONMENT_ALLOWLIST,
         "PYTHONPATH",
-        "USER",
-        "XDG_CONFIG_HOME",
         "XDG_STATE_HOME",
         "AFK_BEADS_WORKSPACE",
     ):
