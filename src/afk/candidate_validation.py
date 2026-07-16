@@ -6,10 +6,12 @@ import json
 import os
 import select
 import signal
+import stat
 import subprocess
 import tempfile
 import threading
 import time
+from contextlib import ExitStack
 from pathlib import Path
 from typing import Any
 
@@ -72,10 +74,19 @@ def validate_candidate(
     _require_trusted_harness(
         worktree, candidate_sha, contract_identity, contract["command"]
     )
-    with tempfile.TemporaryDirectory(prefix="afk-validation-") as temporary:
+    with (
+        tempfile.TemporaryDirectory(prefix="afk-validation-") as temporary,
+        ExitStack() as cleanup,
+    ):
         staging = Path(temporary)
         evidence = staging / "evidence"
         evidence.mkdir(mode=0o700)
+        evidence_descriptor = os.open(
+            evidence,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+        )
+        cleanup.callback(os.close, evidence_descriptor)
+        evidence_view = Path(f"/proc/self/fd/{evidence_descriptor}")
         request_path = staging / "request.json"
         request = {
             "schema_version": 1,
@@ -112,8 +123,9 @@ def validate_candidate(
             completed.stderr,
         )
         _require_immutable_candidate(worktree, candidate_sha)
-        result = _read_result(evidence / "result.json", candidate_sha, completed)
-        evidence_files, contract_evidence_bytes = _require_evidence_tree(evidence)
+        _require_original_evidence_directory(evidence, evidence_descriptor)
+        result = _read_result(evidence_view / "result.json", candidate_sha, completed)
+        evidence_files, contract_evidence_bytes = _require_evidence_tree(evidence_view)
         _require_regular_logs(evidence_files, result["checks"])
         outcome = {
             "schema_version": 1,
@@ -155,14 +167,16 @@ def validate_candidate(
             f"{evidence_relative}/{AFK_EVIDENCE_NAMESPACE}/outcome.json",
             canonical_json(outcome) + "\n",
         )
-        for path in sorted(evidence.rglob("*")):
+        _require_original_evidence_directory(evidence, evidence_descriptor)
+        for path in sorted(evidence_view.rglob("*")):
             if path.is_file():
-                relative = path.relative_to(evidence).as_posix()
+                relative = path.relative_to(evidence_view).as_posix()
                 store.ingest_evidence_file(
                     run_id,
                     f"{evidence_relative}/{CONTRACT_EVIDENCE_NAMESPACE}/{relative}",
                     path,
                 )
+        _require_original_evidence_directory(evidence, evidence_descriptor)
     manifest = store.seal_evidence(run_id, evidence_relative)
     validation = {
         "status": result["status"],
@@ -429,6 +443,23 @@ def _require_evidence_tree(evidence: Path) -> tuple[set[str], int]:
             )
         files.add(path.relative_to(evidence).as_posix())
     return files, total
+
+
+def _require_original_evidence_directory(path: Path, descriptor: int) -> None:
+    try:
+        expected = os.fstat(descriptor)
+        observed = os.stat(path, follow_symlinks=False)
+    except OSError as exc:
+        raise CandidateValidationError(
+            "invalid", "validation evidence directory was replaced"
+        ) from exc
+    if not stat.S_ISDIR(observed.st_mode) or (observed.st_dev, observed.st_ino) != (
+        expected.st_dev,
+        expected.st_ino,
+    ):
+        raise CandidateValidationError(
+            "invalid", "validation evidence directory was replaced"
+        )
 
 
 def _require_immutable_candidate(worktree: Path, candidate_sha: str) -> None:

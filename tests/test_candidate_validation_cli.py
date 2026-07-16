@@ -727,6 +727,37 @@ class CandidateValidationCliTest(unittest.TestCase):
         self.assertEqual(status["attention"]["kind"], "invalid")
         self.assertIn("regular", status["attention"]["summary"])
 
+    def test_evidence_root_cannot_be_replaced_by_an_external_symlink(self):
+        outside = self.temp / "outside-evidence"
+        self.write_contract_worker(
+            status="passed",
+            exit_code=0,
+            checks=[{"name": "tests", "status": "passed", "log_path": "tests.log"}],
+            evidence_line=(
+                f"outside = Path({str(outside)!r}); "
+                "outside.mkdir(); evidence.rmdir(); "
+                "evidence.symlink_to(outside, target_is_directory=True); "
+                "evidence = outside; " + WRITE_PASSED_LOG
+            ),
+        )
+        run_id, _ = self.candidate_ready_run()
+
+        completed = self.run_afk("resume")
+
+        self.assertEqual(completed.returncode, 2)
+        status = self.status(run_id)
+        self.assertEqual(status["attention"]["kind"], "invalid")
+        self.assertIn("evidence directory", status["attention"]["summary"])
+        gate = (
+            self.state_home
+            / "afk"
+            / "runs"
+            / run_id
+            / "gates"
+            / status["validation_attempt"]["attempt_id"]
+        )
+        self.assertFalse(gate.exists())
+
     def test_validation_result_must_not_be_a_symlink(self):
         outside = self.temp / "outside-result.json"
         self.write_contract_worker(
