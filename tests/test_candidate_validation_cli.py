@@ -154,6 +154,58 @@ class CandidateValidationCliTest(unittest.TestCase):
         self.assertEqual(status["attention"]["kind"], "invalid")
         self.assertIn("disagree", status["attention"]["summary"])
 
+    def test_resume_seals_an_open_validation_attempt_as_interrupted(self):
+        self.write_contract_worker(
+            status="passed",
+            exit_code=0,
+            checks=[{"name": "tests", "status": "passed", "log_path": "tests.log"}],
+        )
+        run_id, candidate_sha = self.candidate_ready_run()
+        store = RunStore(self.state_home / "afk")
+        attempt_id = f"validation-{candidate_sha[:12]}"
+        attempt = {
+            "attempt_id": attempt_id,
+            "candidate_sha": candidate_sha,
+            "status": "started",
+            "evidence": f"attempts/{attempt_id}",
+        }
+        store.append_event(
+            run_id,
+            "validation.attempt_started",
+            data={"checkpoint": "candidate_ready", "validation_attempt": attempt},
+        )
+        store.write_evidence_text(
+            run_id,
+            f"{attempt['evidence']}/partial.log",
+            "password=crash-secret\n",
+        )
+
+        completed = self.run_afk("resume")
+
+        self.assertEqual(completed.returncode, 2, completed.stderr)
+        status = self.status(run_id)
+        self.assertEqual(status["attention"]["kind"], "interrupted")
+        self.assertEqual(status["validation_attempt"]["status"], "interrupted")
+        evidence = (
+            self.state_home
+            / "afk"
+            / "runs"
+            / run_id
+            / status["validation_attempt"]["evidence"]
+        )
+        self.assertTrue((evidence / "manifest.json").is_file())
+        self.assertEqual(
+            (evidence / "partial.log").read_text(encoding="utf-8"),
+            "password=[REDACTED]\n",
+        )
+        self.assertEqual(stat.S_IMODE(evidence.stat().st_mode), 0o500)
+        sequence = status["last_sequence"]
+
+        resumed = self.run_afk("resume")
+
+        self.assertEqual(resumed.returncode, 2, resumed.stderr)
+        self.assertEqual(self.status(run_id)["last_sequence"], sequence)
+
     def test_boolean_contract_schema_version_is_invalid(self):
         self.write_contract_worker(
             status="passed",
@@ -615,7 +667,8 @@ class CandidateValidationCliTest(unittest.TestCase):
             exit_code=0,
             checks=[{"name": "tests", "status": "passed", "log_path": "tests.log"}],
             evidence_line=(
-                'child = subprocess.Popen(["sleep", "60"]); '
+                'sys.stdout.write("password=timeout-secret\\n"); '
+                'sys.stdout.flush(); child = subprocess.Popen(["sleep", "60"]); '
                 f"Path({str(child_pid_path)!r}).write_text("
                 'str(child.pid), encoding="utf-8"); '
                 "time.sleep(60)"
@@ -630,6 +683,15 @@ class CandidateValidationCliTest(unittest.TestCase):
         status = self.status(run_id)
         self.assertEqual(status["attention"]["kind"], "interrupted")
         self.assertIn("timed out", status["attention"]["summary"])
+        attempt = status["validation_attempt"]
+        self.assertEqual(attempt["status"], "interrupted")
+        evidence = self.state_home / "afk" / "runs" / run_id / attempt["evidence"]
+        self.assertTrue((evidence / "manifest.json").is_file())
+        self.assertEqual(
+            (evidence / "stdout.log").read_text(encoding="utf-8"),
+            "password=[REDACTED]\n",
+        )
+        self.assertEqual(stat.S_IMODE(evidence.stat().st_mode), 0o500)
         child_pid = int(child_pid_path.read_text(encoding="utf-8"))
         deadline = time.monotonic() + 2
         while Path(f"/proc/{child_pid}").exists() and time.monotonic() < deadline:
@@ -806,6 +868,35 @@ class CandidateValidationCliTest(unittest.TestCase):
         status = self.status(run_id)
         self.assertEqual(status["attention"]["kind"], "invalid")
         self.assertIn("disagree", status["attention"]["summary"])
+
+    def test_malformed_result_retains_sealed_redacted_attempt_diagnostics(self):
+        self.write_contract_worker(
+            status="passed",
+            exit_code=0,
+            checks=[{"name": "tests", "status": "passed", "log_path": "tests.log"}],
+            evidence_line=(
+                'sys.stdout.write("password=malformed-secret\\n"); '
+                "sys.stdout.flush(); raise SystemExit(0)"
+            ),
+        )
+        run_id, _ = self.candidate_ready_run()
+
+        completed = self.run_afk("resume")
+
+        self.assertEqual(completed.returncode, 2)
+        status = self.status(run_id)
+        self.assertEqual(status["attention"]["kind"], "invalid")
+        attempt = status["validation_attempt"]
+        self.assertEqual(attempt["status"], "invalid")
+        evidence = self.state_home / "afk" / "runs" / run_id / attempt["evidence"]
+        self.assertTrue((evidence / "manifest.json").is_file())
+        self.assertEqual(
+            (evidence / "stdout.log").read_text(encoding="utf-8"),
+            "password=[REDACTED]\n",
+        )
+        outcome = json.loads((evidence / "outcome.json").read_text(encoding="utf-8"))
+        self.assertEqual(outcome["status"], "invalid")
+        self.assertEqual(stat.S_IMODE(evidence.stat().st_mode), 0o500)
 
     def test_candidate_mutation_invalidates_validation(self):
         (self.repository / "README.md").write_text("original\n", encoding="utf-8")

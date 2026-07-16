@@ -14,6 +14,7 @@ from typing import Any
 
 from afk.candidate import CandidateError, produce_candidate
 from afk.candidate_validation import CandidateValidationError, validate_candidate
+from afk.jsonutil import canonical_json
 from afk.run_store import RunStore, RunStoreBusy, RunStoreError
 from afk.validation_contract import ValidationContractError, parse_validation_contract
 
@@ -141,6 +142,8 @@ def resume_run(*, note: str | None = None) -> tuple[str, int]:
     with store.lock():
         projection = store.status()
         run_id = projection["run_id"]
+        if _validation_attempt_open(projection):
+            return run_id, _recover_validation_attempt(store, run_id, projection)
         if projection["checkpoint"] == "validated":
             return run_id, 0
         if projection["last_event"] == "validation.rejected":
@@ -285,10 +288,62 @@ def _validation_resume_ready(projection: dict[str, Any]) -> bool:
     )
 
 
+def _validation_attempt_open(projection: dict[str, Any]) -> bool:
+    attempt = projection.get("validation_attempt")
+    return isinstance(attempt, dict) and attempt.get("status") == "started"
+
+
+def _recover_validation_attempt(
+    store: RunStore, run_id: str, projection: dict[str, Any]
+) -> int:
+    attempt = projection["validation_attempt"]
+    summary = "validation attempt was interrupted before completion"
+    evidence_path = store.root / "runs" / run_id / attempt["evidence"]
+    if (evidence_path / "manifest.json").exists():
+        store.verify_evidence(run_id, attempt["evidence"])
+        attempt = {**attempt, "status": "interrupted"}
+        store.append_event(
+            run_id,
+            "validation.attempt_finished",
+            data={"checkpoint": "candidate_ready", "validation_attempt": attempt},
+        )
+    else:
+        attempt = _finish_validation_attempt(
+            store,
+            run_id,
+            attempt,
+            status="interrupted",
+            summary=summary,
+        )
+    _attention(
+        store,
+        run_id,
+        checkpoint="candidate_ready",
+        scope="validation",
+        kind="interrupted",
+        summary=summary,
+        validation_attempt=attempt,
+    )
+    return 2
+
+
 def _advance_validation(store: RunStore, run_id: str) -> int:
+    projection = store.status(run_id)
+    attempt = _start_validation_attempt(store, run_id, projection["candidate_sha"])
     try:
-        validation = validate_candidate(store, run_id)
+        validation = validate_candidate(
+            store, run_id, attempt_evidence=attempt["evidence"]
+        )
     except CandidateValidationError as exc:
+        attempt = _finish_validation_attempt(
+            store,
+            run_id,
+            attempt,
+            status=exc.kind,
+            summary=exc.summary,
+            stdout=exc.stdout,
+            stderr=exc.stderr,
+        )
         _attention(
             store,
             run_id,
@@ -296,8 +351,16 @@ def _advance_validation(store: RunStore, run_id: str) -> int:
             scope="validation",
             kind=exc.kind,
             summary=exc.summary,
+            validation_attempt=attempt,
         )
         return 2
+    attempt = _finish_validation_attempt(
+        store,
+        run_id,
+        attempt,
+        status=validation["status"],
+        summary=validation["summary"],
+    )
     if validation["status"] == "passed":
         store.append_event(
             run_id,
@@ -328,6 +391,64 @@ def _advance_validation(store: RunStore, run_id: str) -> int:
         validation=validation,
     )
     return 2
+
+
+def _start_validation_attempt(
+    store: RunStore, run_id: str, candidate_sha: str
+) -> dict[str, str]:
+    attempt_id = f"validation-{candidate_sha[:12]}"
+    attempt = {
+        "attempt_id": attempt_id,
+        "candidate_sha": candidate_sha,
+        "status": "started",
+        "evidence": f"attempts/{attempt_id}",
+    }
+    store.append_event(
+        run_id,
+        "validation.attempt_started",
+        data={"checkpoint": "candidate_ready", "validation_attempt": attempt},
+    )
+    return attempt
+
+
+def _finish_validation_attempt(
+    store: RunStore,
+    run_id: str,
+    attempt: dict[str, str],
+    *,
+    status: str,
+    summary: str,
+    stdout: str | None = None,
+    stderr: str | None = None,
+) -> dict[str, str]:
+    evidence = attempt["evidence"]
+    evidence_path = store.root / "runs" / run_id / evidence
+    for name, value in (("stdout.log", stdout), ("stderr.log", stderr)):
+        if not (evidence_path / name).exists():
+            store.write_evidence_text(run_id, f"{evidence}/{name}", value or "")
+    if not (evidence_path / "outcome.json").exists():
+        store.write_evidence_text(
+            run_id,
+            f"{evidence}/outcome.json",
+            canonical_json(
+                {
+                    "schema_version": 1,
+                    "attempt_id": attempt["attempt_id"],
+                    "candidate_sha": attempt["candidate_sha"],
+                    "status": status,
+                    "summary": summary,
+                }
+            )
+            + "\n",
+        )
+    store.seal_evidence(run_id, evidence)
+    finished = {**attempt, "status": status}
+    store.append_event(
+        run_id,
+        "validation.attempt_finished",
+        data={"checkpoint": "candidate_ready", "validation_attempt": finished},
+    )
+    return finished
 
 
 def run_worker(run_id: str) -> int:

@@ -27,13 +27,24 @@ OUTPUT_BYTE_LIMIT = 64 * 1024 * 1024
 
 
 class CandidateValidationError(RuntimeError):
-    def __init__(self, kind: str, summary: str):
+    def __init__(
+        self,
+        kind: str,
+        summary: str,
+        *,
+        stdout: str | None = None,
+        stderr: str | None = None,
+    ):
         super().__init__(summary)
         self.kind = kind
         self.summary = summary
+        self.stdout = stdout
+        self.stderr = stderr
 
 
-def validate_candidate(store: RunStore, run_id: str) -> dict[str, Any]:
+def validate_candidate(
+    store: RunStore, run_id: str, *, attempt_evidence: str
+) -> dict[str, Any]:
     projection = store.status(run_id)
     identity = store.identity(run_id)
     try:
@@ -64,6 +75,9 @@ def validate_candidate(store: RunStore, run_id: str) -> dict[str, Any]:
         }
         request_path.write_text(canonical_json(request) + "\n", encoding="utf-8")
         request_path.chmod(0o400)
+        store.write_evidence_text(
+            run_id, f"{attempt_evidence}/request.json", canonical_json(request) + "\n"
+        )
         try:
             completed = _run_contract(
                 [*contract["command"], "--request", str(request_path.resolve())],
@@ -75,6 +89,12 @@ def validate_candidate(store: RunStore, run_id: str) -> dict[str, Any]:
             raise CandidateValidationError(
                 "invalid", "validation command is unavailable or not executable"
             ) from exc
+        store.write_evidence_text(
+            run_id, f"{attempt_evidence}/stdout.log", completed.stdout
+        )
+        store.write_evidence_text(
+            run_id, f"{attempt_evidence}/stderr.log", completed.stderr
+        )
         _require_immutable_candidate(worktree, candidate_sha)
         result = _read_result(evidence / "result.json", candidate_sha, completed)
         evidence_files = _require_evidence_tree(evidence)
@@ -406,9 +426,12 @@ def _run_contract(
             _terminate_process_group(process)
             for reader in readers:
                 reader.join()
+            stdout, stderr = _diagnostic_output(captured)
             raise CandidateValidationError(
                 "interrupted",
                 "validation timed out and its process group was terminated",
+                stdout=stdout,
+                stderr=stderr,
             )
         overflow.wait(0.01)
     if overflow.is_set():
@@ -416,14 +439,20 @@ def _run_contract(
         for reader in readers:
             reader.join()
         raise CandidateValidationError(
-            "invalid", "validation output exceeds the size limit"
+            "invalid",
+            "validation output exceeds the size limit",
+            stdout="",
+            stderr="",
         )
     _drain_process_group(process.pid)
     for reader in readers:
         reader.join()
     if overflow.is_set():
         raise CandidateValidationError(
-            "invalid", "validation output exceeds the size limit"
+            "invalid",
+            "validation output exceeds the size limit",
+            stdout="",
+            stderr="",
         )
     if process.returncode < 0:
         signal_number = -process.returncode
@@ -431,15 +460,23 @@ def _run_contract(
             signal_name = signal.Signals(signal_number).name
         except ValueError:
             signal_name = str(signal_number)
+        stdout, stderr = _diagnostic_output(captured)
         raise CandidateValidationError(
-            "interrupted", f"validation exited after signal {signal_name}"
+            "interrupted",
+            f"validation exited after signal {signal_name}",
+            stdout=stdout,
+            stderr=stderr,
         )
     try:
         stdout = bytes(captured["stdout"]).decode("utf-8")
         stderr = bytes(captured["stderr"]).decode("utf-8")
     except UnicodeDecodeError as exc:
+        diagnostic_stdout, diagnostic_stderr = _diagnostic_output(captured)
         raise CandidateValidationError(
-            "invalid", "validation output must be UTF-8 text"
+            "invalid",
+            "validation output must be UTF-8 text",
+            stdout=diagnostic_stdout,
+            stderr=diagnostic_stderr,
         ) from exc
     return subprocess.CompletedProcess(
         command, process.returncode, redact_text(stdout), redact_text(stderr)
@@ -460,6 +497,13 @@ def _capture_output(
             elif not overflow.is_set():
                 captured.extend(chunk)
                 captured_bytes[0] += len(chunk)
+
+
+def _diagnostic_output(captured: dict[str, bytearray]) -> tuple[str, str]:
+    return tuple(
+        redact_text(bytes(captured[name]).decode("utf-8", errors="replace"))
+        for name in ("stdout", "stderr")
+    )
 
 
 def _terminate_process_group(process: subprocess.Popen[bytes]) -> None:
