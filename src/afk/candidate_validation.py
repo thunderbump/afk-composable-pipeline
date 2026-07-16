@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import signal
@@ -456,6 +457,4 @@ def _run_contract(
 
 
 def _manifest_digest(manifest: dict[str, Any]) -> str:
-    import hashlib
-
     return hashlib.sha256(canonical_json(manifest).encode("utf-8")).hexdigest()
