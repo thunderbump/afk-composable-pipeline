@@ -403,6 +403,19 @@ class CandidateValidationCliTest(unittest.TestCase):
         self.assertIn("harness", status["attention"]["summary"])
         self.assertFalse(marker.exists())
 
+    def test_pinned_python_module_harness_change_is_not_executed(self):
+        self.assert_pinned_indirect_harness_is_rejected(["python3", "-m", "validate"])
+
+    def test_pinned_python_inline_harness_change_is_not_executed(self):
+        self.assert_pinned_indirect_harness_is_rejected(
+            ["python3", "-c", "import validate"]
+        )
+
+    def test_pinned_shell_inline_harness_change_is_not_executed(self):
+        self.assert_pinned_indirect_harness_is_rejected(
+            ["sh", "-c", './validate.py "$@"', "validation"]
+        )
+
     def test_bootstrap_ignores_candidate_selected_validation_policy(self):
         self.write_contract_worker(
             status="passed",
@@ -1063,6 +1076,58 @@ class CandidateValidationCliTest(unittest.TestCase):
         (self.repository / "afk.toml").write_text(
             'schema_version = 1\n\n[validation]\ncommand = ["./validate.py"]\n'
             f"timeout_seconds = {timeout_seconds}\n",
+            encoding="utf-8",
+        )
+
+    def assert_pinned_indirect_harness_is_rejected(self, command):
+        self.write_contract_worker(
+            status="passed",
+            exit_code=0,
+            checks=[{"name": "tests", "status": "passed", "log_path": "tests.log"}],
+        )
+        self.write_contract_command(command)
+        self.git("add", ".")
+        self.git("commit", "-m", "trusted indirect harness")
+        base_sha = self.git("rev-parse", "HEAD")
+        blob_sha = self.git("rev-parse", "HEAD:afk.toml")
+
+        marker = self.temp / "untrusted-indirect-harness-ran"
+        self.write_contract_worker(
+            status="passed",
+            exit_code=0,
+            checks=[{"name": "tests", "status": "passed", "log_path": "tests.log"}],
+            evidence_line=(
+                f'Path({str(marker)!r}).write_text("ran", encoding="utf-8"); '
+                + WRITE_PASSED_LOG
+            ),
+        )
+        self.write_contract_command(command)
+        self.git("add", ".")
+        self.git("commit", "-m", "propose indirect harness change")
+        candidate_sha = self.git("rev-parse", "HEAD")
+        run_id = self.create_ready_run(
+            candidate_sha=candidate_sha,
+            base_sha=base_sha,
+            validation_contract={
+                "source": "pinned_base",
+                "base_sha": base_sha,
+                "blob_sha": blob_sha,
+            },
+        )
+
+        completed = self.run_afk("resume")
+
+        self.assertEqual(completed.returncode, 2)
+        status = self.status(run_id)
+        self.assertEqual(status["attention"]["kind"], "invalid")
+        self.assertIn("command grammar", status["attention"]["summary"])
+        self.assertFalse(marker.exists())
+
+    def write_contract_command(self, command):
+        (self.repository / "afk.toml").write_text(
+            "schema_version = 1\n\n[validation]\n"
+            f"command = {json.dumps(command)}\n"
+            "timeout_seconds = 5\n",
             encoding="utf-8",
         )
 

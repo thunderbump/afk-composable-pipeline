@@ -29,6 +29,7 @@ OUTPUT_BYTE_LIMIT = 64 * 1024 * 1024
 PROCESS_CLEANUP_SECONDS = 1
 PR_SET_CHILD_SUBREAPER = 36
 PR_GET_CHILD_SUBREAPER = 37
+TRUSTED_SCRIPT_INTERPRETERS = {"python", "python3"}
 
 
 class CandidateValidationError(RuntimeError):
@@ -210,14 +211,30 @@ def _require_trusted_harness(
     identity: dict[str, str],
     command: list[str],
 ) -> None:
-    for position, argument in enumerate(command):
+    executable = command[0]
+    if executable.startswith("./"):
+        harness_start = 0
+    elif (
+        executable in TRUSTED_SCRIPT_INTERPRETERS
+        and len(command) >= 2
+        and not command[1].startswith("-")
+        and _contained_relative_path(command[1].removeprefix("./"))
+        and os.path.lexists(worktree / command[1])
+    ):
+        harness_start = 1
+    else:
+        raise CandidateValidationError(
+            "invalid",
+            "pinned validation command grammar requires a direct ./ executable or "
+            "python/python3 followed immediately by a relative repository script",
+        )
+    for argument in command[harness_start:]:
         relative = argument.removeprefix("./")
         if not argument.startswith("./"):
             path = Path(argument)
             if (
                 argument.startswith("-")
                 or path.is_absolute()
-                or (position == 0 and "/" not in argument)
                 or not _contained_relative_path(argument)
                 or not os.path.lexists(worktree / path)
             ):
