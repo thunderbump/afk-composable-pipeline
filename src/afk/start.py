@@ -13,7 +13,11 @@ from pathlib import Path
 from typing import Any
 
 from afk.candidate import CandidateError, produce_candidate
-from afk.candidate_validation import CandidateValidationError, validate_candidate
+from afk.candidate_validation import (
+    CandidateValidationError,
+    recover_candidate_validation,
+    validate_candidate,
+)
 from afk.jsonutil import canonical_json
 from afk.run_store import RunStore, RunStoreBusy, RunStoreError
 from afk.validation_contract import ValidationContractError, parse_validation_contract
@@ -299,6 +303,29 @@ def _recover_validation_attempt(
     store: RunStore, run_id: str, projection: dict[str, Any]
 ) -> int:
     attempt = projection["validation_attempt"]
+    validation = recover_candidate_validation(store, run_id, attempt)
+    if validation is not None:
+        attempt_evidence = store.root / "runs" / run_id / attempt["evidence"]
+        if (attempt_evidence / "manifest.json").exists():
+            store.verify_evidence(run_id, attempt["evidence"])
+            attempt = {**attempt, "status": validation["status"]}
+            store.append_event(
+                run_id,
+                "validation.attempt_finished",
+                data={
+                    "checkpoint": "candidate_ready",
+                    "validation_attempt": attempt,
+                },
+            )
+        else:
+            attempt = _finish_validation_attempt(
+                store,
+                run_id,
+                attempt,
+                status=validation["status"],
+                summary=validation["summary"],
+            )
+        return _record_validation_outcome(store, run_id, validation)
     summary = "validation attempt was interrupted before completion"
     evidence_path = store.root / "runs" / run_id / attempt["evidence"]
     if (evidence_path / "manifest.json").exists():
@@ -336,6 +363,7 @@ def _advance_validation(store: RunStore, run_id: str) -> int:
         validation = validate_candidate(
             store,
             run_id,
+            attempt_id=attempt["attempt_id"],
             attempt_evidence=attempt["evidence"],
             gate_evidence=f"gates/{attempt['attempt_id']}",
         )
@@ -366,6 +394,12 @@ def _advance_validation(store: RunStore, run_id: str) -> int:
         status=validation["status"],
         summary=validation["summary"],
     )
+    return _record_validation_outcome(store, run_id, validation)
+
+
+def _record_validation_outcome(
+    store: RunStore, run_id: str, validation: dict[str, Any]
+) -> int:
     if validation["status"] == "passed":
         store.append_event(
             run_id,

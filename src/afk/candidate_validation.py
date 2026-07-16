@@ -17,7 +17,7 @@ from typing import Any
 
 from afk.jsonutil import canonical_json
 from afk.redaction import redact_text
-from afk.run_store import GATE_BYTE_LIMIT, RunStore
+from afk.run_store import GATE_BYTE_LIMIT, RunStore, RunStoreError
 from afk.validation_contract import ValidationContractError, parse_validation_contract
 
 
@@ -54,6 +54,7 @@ def validate_candidate(
     store: RunStore,
     run_id: str,
     *,
+    attempt_id: str,
     attempt_evidence: str,
     gate_evidence: str,
 ) -> dict[str, Any]:
@@ -129,6 +130,7 @@ def validate_candidate(
         _require_regular_logs(evidence_files, result["checks"])
         outcome = {
             "schema_version": 1,
+            "attempt_id": attempt_id,
             "candidate_sha": candidate_sha,
             "exit_code": completed.returncode,
             "status": result["status"],
@@ -193,6 +195,68 @@ def validate_candidate(
         }[result["status"]],
     }
     return validation
+
+
+def recover_candidate_validation(
+    store: RunStore, run_id: str, attempt: dict[str, str]
+) -> dict[str, Any] | None:
+    attempt_id = attempt.get("attempt_id")
+    candidate_sha = attempt.get("candidate_sha")
+    if not isinstance(attempt_id, str) or not isinstance(candidate_sha, str):
+        return None
+    evidence_relative = f"gates/{attempt_id}"
+    manifest_path = store.root / "runs" / run_id / evidence_relative / "manifest.json"
+    if not manifest_path.is_file() or manifest_path.is_symlink():
+        return None
+    try:
+        store.verify_evidence(run_id, evidence_relative)
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        outcome = json.loads(
+            (manifest_path.parent / AFK_EVIDENCE_NAMESPACE / "outcome.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        contract = store.identity(run_id)["start_request"]["validation_contract"]
+    except (KeyError, OSError, UnicodeDecodeError, json.JSONDecodeError, RunStoreError):
+        return None
+    expected_exit = {"passed": 0, "rejected": 1, "inconclusive": 2}
+    if (
+        not isinstance(outcome, dict)
+        or set(outcome)
+        != {
+            "schema_version",
+            "attempt_id",
+            "candidate_sha",
+            "exit_code",
+            "status",
+            "summary",
+        }
+        or type(outcome.get("schema_version")) is not int
+        or outcome["schema_version"] != 1
+        or outcome.get("attempt_id") != attempt_id
+        or outcome.get("candidate_sha") != candidate_sha
+        or not isinstance(outcome.get("status"), str)
+        or type(outcome.get("exit_code")) is not int
+        or outcome.get("exit_code") != expected_exit.get(outcome.get("status"))
+        or not isinstance(outcome.get("summary"), str)
+        or not outcome["summary"].strip()
+        or not isinstance(contract, dict)
+    ):
+        return None
+    return {
+        "status": outcome["status"],
+        "candidate_sha": candidate_sha,
+        "exit_code": outcome["exit_code"],
+        "summary": outcome["summary"],
+        "evidence": evidence_relative,
+        "manifest_sha256": _manifest_digest(manifest),
+        "contract": contract,
+        "next_action": {
+            "passed": "advance",
+            "rejected": "repair",
+            "inconclusive": "attention",
+        }[outcome["status"]],
+    }
 
 
 def _load_contract(worktree: Path, identity: Any) -> dict[str, Any]:

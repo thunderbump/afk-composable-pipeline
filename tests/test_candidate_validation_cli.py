@@ -67,6 +67,7 @@ class CandidateValidationCliTest(unittest.TestCase):
             json.loads((evidence / "afk" / "outcome.json").read_text(encoding="utf-8")),
             {
                 "schema_version": 1,
+                "attempt_id": status["validation_attempt"]["attempt_id"],
                 "candidate_sha": candidate_sha,
                 "exit_code": 0,
                 "status": "passed",
@@ -290,6 +291,23 @@ class CandidateValidationCliTest(unittest.TestCase):
             f"{attempt['evidence']}/contract/partial.log",
             "password=crash-secret\n",
         )
+        invalid_gate = f"gates/{attempt_id}"
+        store.write_evidence_text(
+            run_id,
+            f"{invalid_gate}/afk/outcome.json",
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "attempt_id": attempt_id,
+                    "candidate_sha": "f" * 40,
+                    "exit_code": 0,
+                    "status": "passed",
+                    "summary": "outcome for the wrong Candidate",
+                }
+            )
+            + "\n",
+        )
+        store.seal_evidence(run_id, invalid_gate)
 
         completed = self.run_afk("resume")
 
@@ -332,6 +350,73 @@ class CandidateValidationCliTest(unittest.TestCase):
             / retried["validation_attempt"]["evidence"]
         )
         self.assertTrue((retry_evidence / "manifest.json").is_file())
+
+    def test_resume_reuses_a_completed_gate_for_an_open_validation_attempt(self):
+        marker = self.temp / "validation-reran"
+        self.write_contract_worker(
+            status="passed",
+            exit_code=0,
+            checks=[{"name": "tests", "status": "passed", "log_path": "tests.log"}],
+            evidence_line=(
+                f'Path({str(marker)!r}).write_text("ran", encoding="utf-8"); '
+                + WRITE_PASSED_LOG
+            ),
+        )
+        run_id, candidate_sha = self.candidate_ready_run()
+        store = RunStore(self.state_home / "afk")
+        attempt_id = f"validation-{candidate_sha[:12]}"
+        attempt = {
+            "attempt_id": attempt_id,
+            "candidate_sha": candidate_sha,
+            "status": "started",
+            "evidence": f"attempts/{attempt_id}",
+        }
+        store.append_event(
+            run_id,
+            "validation.attempt_started",
+            data={"checkpoint": "candidate_ready", "validation_attempt": attempt},
+        )
+        store.write_evidence_text(
+            run_id, f"{attempt['evidence']}/afk/request.json", "{}\n"
+        )
+        store.seal_evidence(run_id, attempt["evidence"])
+        gate = f"gates/{attempt_id}"
+        store.write_evidence_text(
+            run_id,
+            f"{gate}/afk/outcome.json",
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "attempt_id": attempt_id,
+                    "candidate_sha": candidate_sha,
+                    "exit_code": 0,
+                    "status": "passed",
+                    "summary": "validation passed before the crash",
+                }
+            )
+            + "\n",
+        )
+        store.write_evidence_text(run_id, f"{gate}/contract/tests.log", "passed\n")
+        store.seal_evidence(run_id, gate)
+
+        completed = self.run_afk("resume")
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        status = self.status(run_id)
+        self.assertEqual(status["checkpoint"], "validated")
+        self.assertEqual(status["validation_attempt"]["status"], "passed")
+        self.assertEqual(status["validation"]["evidence"], gate)
+        self.assertEqual(
+            status["validation"]["summary"], "validation passed before the crash"
+        )
+        self.assertFalse(marker.exists())
+        sequence = status["last_sequence"]
+
+        resumed = self.run_afk("resume")
+
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        self.assertEqual(self.status(run_id)["last_sequence"], sequence)
+        self.assertFalse(marker.exists())
 
     def test_boolean_contract_schema_version_is_invalid(self):
         self.write_contract_worker(
