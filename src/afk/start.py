@@ -41,7 +41,7 @@ class StartContext:
     bead_id: str
     claimant: str
     beads_workspace: Path
-    validation_contract: str
+    validation_contract: dict[str, str]
 
 
 def start_run(
@@ -634,20 +634,30 @@ def _validate_start_bead(bead: dict[str, Any], bead_id: str, repository: str) ->
 
 def _pinned_validation_contract(
     root: Path, base_sha: str, *, bootstrap_contract: bool
-) -> str:
+) -> dict[str, str]:
     listing = _required(["git", "ls-tree", base_sha, "--", "afk.toml"], cwd=root)
     if not listing:
         if bootstrap_contract:
-            return "bootstrap_required"
+            return {"source": "bootstrap_required", "base_sha": base_sha}
         raise StartError("pinned base does not contain afk.toml")
     fields = listing.split()
-    if len(fields) != 4 or fields[0] != "100644" or fields[1] != "blob":
+    if (
+        len(fields) != 4
+        or fields[0] != "100644"
+        or fields[1] != "blob"
+        or len(fields[2]) != 40
+        or any(character not in "0123456789abcdef" for character in fields[2])
+    ):
         raise StartError("pinned afk.toml must be one regular file")
     if bootstrap_contract:
         raise StartError("pinned base already contains afk.toml")
     value = _required(["git", "cat-file", "blob", f"{base_sha}:afk.toml"], cwd=root)
     _validate_contract(value)
-    return "pinned"
+    return {
+        "source": "pinned_base",
+        "base_sha": base_sha,
+        "blob_sha": fields[2],
+    }
 
 
 def _validate_contract(value: str) -> None:

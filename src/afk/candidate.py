@@ -176,7 +176,15 @@ Acceptance criteria: {_field(bead, 'acceptance_criteria')}
 ## Contract
 
 Work only in the dedicated worktree. Follow the repository's AGENTS.md files.
-Implement the exact Bead, run appropriate local checks, and commit the result.
+Implement the exact Bead and run safe, unprivileged local checks.
+Commit after the safe checks available inside this sandbox pass.
+AFK runs the full Validation Contract afterward against the immutable commit.
+If repository instructions
+require privileged or full-contract validation before commit, defer that check
+to AFK. Do not report blocked solely because privileged validation is unavailable.
+Candidate changes to `afk.toml` or its validation harness are proposals until
+merged; they do not become privileged executable policy in this Run.
+Do not access Docker, the Docker socket, or systemd.
 Do not use the network, GitHub, Beads, AFK state, or credentials. Do not merge,
 rewrite the starting commit, push, or create a pull request.
 

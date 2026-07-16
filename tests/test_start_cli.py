@@ -1131,7 +1131,10 @@ class StartCliTest(unittest.TestCase):
         status = json.loads(
             self.run_afk("status", completed.stdout.strip(), "--json").stdout
         )
-        self.assertEqual(status["validation_contract"], "bootstrap_required")
+        self.assertEqual(
+            status["validation_contract"],
+            {"source": "bootstrap_required", "base_sha": BASE_SHA},
+        )
 
         rejected = self.run_afk(
             "start",
@@ -1152,7 +1155,14 @@ class StartCliTest(unittest.TestCase):
         status = json.loads(
             self.run_afk("status", completed.stdout.strip(), "--json").stdout
         )
-        self.assertEqual(status["validation_contract"], "pinned")
+        self.assertEqual(
+            status["validation_contract"],
+            {
+                "source": "pinned_base",
+                "base_sha": BASE_SHA,
+                "blob_sha": "c" * 40,
+            },
+        )
 
     def test_start_classifies_a_preflight_command_timeout(self):
         expired = subprocess.TimeoutExpired(["git", "rev-parse"], timeout=30)
