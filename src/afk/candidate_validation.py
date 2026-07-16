@@ -406,6 +406,7 @@ def _run_contract(
                 except ProcessLookupError:
                     pass
                 process.communicate()
+            _drain_process_group(process.pid)
             raise CandidateValidationError(
                 "interrupted",
                 "validation timed out and its process group was terminated",

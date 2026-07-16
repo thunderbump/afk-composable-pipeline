@@ -556,6 +556,55 @@ class CandidateValidationCliTest(unittest.TestCase):
             time.sleep(0.02)
         self.assertFalse(Path(f"/proc/{child_pid}").exists())
 
+    def test_timeout_kills_term_resistant_validation_descendant(self):
+        child_pid_path = self.temp / "resistant-timeout-child.pid"
+        child_program = textwrap.dedent(
+            """
+            import os
+            import signal
+            import sys
+            import time
+            from pathlib import Path
+
+            pid_path = Path(sys.argv[1])
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            pid_path.write_text(str(os.getpid()), encoding="utf-8")
+            time.sleep(60)
+            """
+        ).lstrip()
+        self.write_contract_worker(
+            status="passed",
+            exit_code=0,
+            checks=[{"name": "tests", "status": "passed", "log_path": "tests.log"}],
+            evidence_line=(
+                f'child = subprocess.Popen([sys.executable, "-c", {child_program!r}, '
+                f"{str(child_pid_path)!r}]); "
+                f'exec("while not Path({str(child_pid_path)!r}).exists():\\n" '
+                '"    time.sleep(0.001)"); '
+                "time.sleep(60)"
+            ),
+            timeout_seconds=1,
+        )
+        run_id, _ = self.candidate_ready_run()
+
+        completed = self.run_afk("resume")
+
+        child_pid = int(child_pid_path.read_text(encoding="utf-8"))
+        try:
+            self.assertEqual(completed.returncode, 2)
+            status = self.status(run_id)
+            self.assertEqual(status["attention"]["kind"], "interrupted")
+            self.assertIn("timed out", status["attention"]["summary"])
+            deadline = time.monotonic() + 2
+            while Path(f"/proc/{child_pid}").exists() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertFalse(Path(f"/proc/{child_pid}").exists())
+        finally:
+            try:
+                os.kill(child_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
     def test_successful_worker_cannot_leave_descendants_running(self):
         child_pid_path = self.temp / "successful-child.pid"
         self.write_contract_worker(
