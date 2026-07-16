@@ -91,6 +91,30 @@ class CandidateValidationCliTest(unittest.TestCase):
         self.assertEqual(resumed.returncode, 0, resumed.stderr)
         self.assertEqual(self.status(run_id)["last_sequence"], status["last_sequence"])
 
+    def test_rejected_validation_accepts_mixed_check_outcomes(self):
+        self.write_contract_worker(
+            status="rejected",
+            exit_code=1,
+            checks=[
+                {"name": "preflight", "status": "passed", "log_path": "tests.log"},
+                {"name": "tier1", "status": "rejected", "log_path": "tests.log"},
+                {
+                    "name": "cleanup",
+                    "status": "inconclusive",
+                    "log_path": "tests.log",
+                },
+                {"name": "tier2", "status": "not_run", "log_path": "tests.log"},
+            ],
+        )
+        run_id, _ = self.candidate_ready_run()
+
+        completed = self.run_afk("resume")
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        status = self.status(run_id)
+        self.assertEqual(status["last_event"], "validation.rejected")
+        self.assertEqual(status["validation"]["status"], "rejected")
+
     def test_inconclusive_validation_requires_attention(self):
         self.write_contract_worker(
             status="inconclusive",
@@ -114,6 +138,21 @@ class CandidateValidationCliTest(unittest.TestCase):
         self.assertEqual(status["validation"]["status"], "inconclusive")
         self.assertEqual(status["validation"]["candidate_sha"], candidate_sha)
         self.assertEqual(status["validation"]["next_action"], "attention")
+
+    def test_inconclusive_validation_requires_an_inconclusive_check(self):
+        self.write_contract_worker(
+            status="inconclusive",
+            exit_code=2,
+            checks=[{"name": "tier1", "status": "not_run", "log_path": "tests.log"}],
+        )
+        run_id, _ = self.candidate_ready_run()
+
+        completed = self.run_afk("resume")
+
+        self.assertEqual(completed.returncode, 2)
+        status = self.status(run_id)
+        self.assertEqual(status["attention"]["kind"], "invalid")
+        self.assertIn("disagree", status["attention"]["summary"])
 
     def test_boolean_contract_schema_version_is_invalid(self):
         self.write_contract_worker(

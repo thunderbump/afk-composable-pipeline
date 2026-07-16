@@ -234,7 +234,7 @@ def _read_result(
     expected_exit = {"passed": 0, "rejected": 1, "inconclusive": 2}.get(status)
     allowed_check_status = {
         "passed": {"passed"},
-        "rejected": {"passed", "rejected"},
+        "rejected": {"passed", "rejected", "inconclusive", "not_run"},
         "inconclusive": {"passed", "inconclusive", "not_run"},
     }.get(status, set())
     if isinstance(checks, list) and any(
@@ -275,9 +275,7 @@ def _read_result(
         )
         or (
             status == "inconclusive"
-            and not any(
-                check["status"] in {"inconclusive", "not_run"} for check in checks
-            )
+            and not any(check["status"] == "inconclusive" for check in checks)
         )
     ):
         raise CandidateValidationError(
