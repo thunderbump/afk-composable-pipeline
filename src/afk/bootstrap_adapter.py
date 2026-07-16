@@ -6,7 +6,10 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-from validation_contract import VALIDATION_STATUS_EXIT_CODES
+if __package__:
+    from afk.validation_contract import VALIDATION_STATUS_EXIT_CODES
+else:
+    from validation_contract import VALIDATION_STATUS_EXIT_CODES
 
 
 def main() -> int:

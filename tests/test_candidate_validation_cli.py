@@ -817,6 +817,21 @@ class CandidateValidationCliTest(unittest.TestCase):
         self.assertEqual(status["validation"]["status"], "passed")
         self.assertTrue(marker.is_file())
 
+    def test_bootstrap_adapter_imports_as_a_package_module(self):
+        environment = os.environ.copy()
+        environment["PYTHONPATH"] = str(ROOT / "src")
+
+        completed = subprocess.run(
+            [sys.executable, "-c", "import afk.bootstrap_adapter"],
+            cwd=self.repository,
+            env=environment,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
     def test_approved_legacy_bootstrap_preserves_docker_context_secret_safety(self):
         self.git("commit", "--allow-empty", "-m", "base without validation contract")
         base_sha = self.git("rev-parse", "HEAD")
