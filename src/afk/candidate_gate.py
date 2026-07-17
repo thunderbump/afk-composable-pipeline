@@ -943,22 +943,29 @@ def _github_comments(
             "api",
             f"repos/{owner}/{name}/issues/{pr_number}/comments",
             "--paginate",
-            "--slurp",
         ],
         worktree,
     )
+    pages = []
+    decoder = json.JSONDecoder()
+    offset = 0
     try:
-        value = json.loads(completed.stdout)
+        while offset < len(completed.stdout):
+            while offset < len(completed.stdout) and completed.stdout[offset].isspace():
+                offset += 1
+            if offset < len(completed.stdout):
+                page, offset = decoder.raw_decode(completed.stdout, offset)
+                pages.append(page)
     except json.JSONDecodeError as exc:
         raise GateError(
             "GitHub comment observation was malformed", kind="inconclusive"
         ) from exc
-    if not isinstance(value, list) or not all(
+    if not pages or not all(
         isinstance(page, list) and all(isinstance(item, dict) for item in page)
-        for page in value
+        for page in pages
     ):
         raise GateError("GitHub comment observation was malformed", kind="inconclusive")
-    return [item for page in value for item in page]
+    return [item for page in pages for item in page]
 
 
 def _post_gate_comment(

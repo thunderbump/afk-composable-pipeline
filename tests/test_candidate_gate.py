@@ -1425,9 +1425,12 @@ class CandidateGateTest(unittest.TestCase):
             ]
 
             def paginated(command, worktree, **kwargs):
-                self.assertIn("--slurp", command)
+                self.assertNotIn("--slurp", command)
                 return subprocess.CompletedProcess(
-                    command, 0, stdout=json.dumps(pages), stderr=""
+                    command,
+                    0,
+                    stdout="\n".join(json.dumps(page) for page in pages),
+                    stderr="",
                 )
 
             with (

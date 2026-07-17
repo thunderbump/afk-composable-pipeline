@@ -1514,7 +1514,7 @@ class StartCliTest(unittest.TestCase):
                                 if comment_state.exists()
                                 else []
                             )
-                            print(json.dumps([comments]))
+                            print(json.dumps(comments))
                     elif os.environ.get("AFK_FAKE_GH_NON_OBJECT"):
                         print("[]")
                     else:
