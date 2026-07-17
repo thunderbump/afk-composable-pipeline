@@ -9,6 +9,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+from afk.codex_permissions import codex_environment, codex_permission_args
 from afk.jsonutil import canonical_json
 from afk.run_store import RunStore, RunStoreError
 
@@ -124,7 +125,7 @@ def produce_candidate(
             completed = _run(
                 command,
                 cwd=worktree,
-                env=_codex_environment(),
+                env=codex_environment(),
                 input_text=prompt,
                 timeout=COMMAND_TIMEOUT_SECONDS,
             )
@@ -234,7 +235,7 @@ def produce_repair_candidate(
         completed = _run(
             command,
             cwd=worktree,
-            env=_codex_environment(),
+            env=codex_environment(),
             input_text=prompt,
             timeout=COMMAND_TIMEOUT_SECONDS,
         )
@@ -385,11 +386,6 @@ the audit trail; the next full validation and review cycle decides correctness.
 """
 
 
-def _codex_environment() -> dict[str, str]:
-    allowed = ("HOME", "PATH", "USER", "LOGNAME", "LANG", "LC_ALL", "CODEX_HOME")
-    return {name: os.environ[name] for name in allowed if name in os.environ}
-
-
 def _codex_permission_args(worktree: Path, branch: str) -> list[str]:
     branch_parts = Path(branch).parts
     if (
@@ -427,26 +423,12 @@ def _codex_permission_args(worktree: Path, branch: str) -> list[str]:
         "TMPDIR": str(temporary),
         "GIT_TERMINAL_PROMPT": "0",
     }
-    profile = (
-        '{ description = "AFK Candidate implementation", filesystem = '
-        f"{_toml_table(filesystem)}, network = {{ enabled = false }} }}"
+    return codex_permission_args(
+        profile_name="afk_candidate",
+        description="AFK Candidate implementation",
+        filesystem=filesystem,
+        shell_environment=shell_environment,
     )
-    shell_policy = (
-        '{ inherit = "none", ignore_default_excludes = false, set = '
-        f"{_toml_table(shell_environment)} }}"
-    )
-    return [
-        "-c",
-        'default_permissions="afk_candidate"',
-        "-c",
-        f"permissions.afk_candidate={profile}",
-        "-c",
-        'approval_policy="never"',
-        "-c",
-        'web_search="disabled"',
-        "-c",
-        f"shell_environment_policy={shell_policy}",
-    ]
 
 
 def _codex_package_beneath_home() -> Path | None:
@@ -472,13 +454,6 @@ def _codex_package_beneath_home() -> Path | None:
 def _resolved_git_path(worktree: Path, argument: str) -> Path:
     path = Path(_git(worktree, "rev-parse", argument))
     return path.resolve() if path.is_absolute() else (worktree / path).resolve()
-
-
-def _toml_table(values: dict[str, str]) -> str:
-    fields = ", ".join(
-        f"{json.dumps(key)} = {json.dumps(value)}" for key, value in values.items()
-    )
-    return f"{{ {fields} }}"
 
 
 def _read_report(path: Path) -> dict[str, Any]:

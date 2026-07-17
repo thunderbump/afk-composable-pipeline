@@ -10,6 +10,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+from afk import candidate_gate as candidate_gate_module  # noqa: E402
 from afk.candidate_gate import (  # noqa: E402
     GateError,
     build_repair_brief,
@@ -23,6 +24,31 @@ from afk.start import _advance_completed_gate  # noqa: E402
 
 
 class CandidateGateTest(unittest.TestCase):
+    def test_review_permission_profile_keeps_inputs_read_only(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            worktree = root / "worktree"
+            bundle = root / "bundle"
+            output = root / "output"
+            worktree.mkdir()
+            bundle.mkdir()
+            output.mkdir()
+
+            args = candidate_gate_module._review_permission_args(
+                worktree, bundle, output
+            )
+
+            config = "\n".join(
+                args[index + 1] for index, value in enumerate(args) if value == "-c"
+            )
+            self.assertIn('default_permissions="afk_review"', config)
+            self.assertIn(f'"{worktree}" = "read"', config)
+            self.assertIn(f'"{bundle}" = "read"', config)
+            self.assertIn(f'"{output}" = "write"', config)
+            self.assertNotIn(f'"{worktree}" = "write"', config)
+            self.assertNotIn(f'"{bundle}" = "write"', config)
+            self.assertIn("network = { enabled = false }", config)
+
     def test_repaired_bootstrap_candidate_pauses_for_explicit_reapproval(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

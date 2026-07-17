@@ -9,6 +9,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+from afk.codex_permissions import codex_environment, codex_permission_args
 from afk.jsonutil import canonical_json
 from afk.run_store import RunStore
 
@@ -624,7 +625,7 @@ def _execute_reviewer(
             completed = subprocess.run(
                 command,
                 cwd=worktree,
-                env=_codex_environment(),
+                env=codex_environment(),
                 input=prompt,
                 text=True,
                 capture_output=True,
@@ -675,39 +676,18 @@ def _review_permission_args(
         str(bundle_path.resolve()): "read",
         str(temporary.resolve()): "write",
     }
-    profile = (
-        '{ description = "AFK Candidate review", filesystem = '
-        f"{_toml_table(filesystem)}, network = {{ enabled = false }} }}"
-    )
     shell_environment = {
         "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
         "HOME": str(home),
         "TMPDIR": str(temporary),
         "GIT_TERMINAL_PROMPT": "0",
     }
-    shell_policy = (
-        '{ inherit = "none", ignore_default_excludes = false, set = '
-        f"{_toml_table(shell_environment)} }}"
+    return codex_permission_args(
+        profile_name="afk_review",
+        description="AFK Candidate review",
+        filesystem=filesystem,
+        shell_environment=shell_environment,
     )
-    return [
-        "-c",
-        'default_permissions="afk_review"',
-        "-c",
-        f"permissions.afk_review={profile}",
-        "-c",
-        'approval_policy="never"',
-        "-c",
-        'web_search="disabled"',
-        "-c",
-        f"shell_environment_policy={shell_policy}",
-    ]
-
-
-def _toml_table(values: dict[str, str]) -> str:
-    fields = ", ".join(
-        f"{json.dumps(key)} = {json.dumps(value)}" for key, value in values.items()
-    )
-    return f"{{ {fields} }}"
 
 
 def _repository_instructions(
@@ -809,11 +789,6 @@ def _required_text(value: dict[str, Any], key: str) -> str:
     if not isinstance(item, str) or not item:
         raise GateError(f"required Gate field is missing: {key}")
     return item
-
-
-def _codex_environment() -> dict[str, str]:
-    allowed = ("HOME", "PATH", "USER", "LOGNAME", "LANG", "LC_ALL", "CODEX_HOME")
-    return {name: os.environ[name] for name in allowed if name in os.environ}
 
 
 def _gate_comment_body(gate: dict[str, Any], marker: str) -> str:
