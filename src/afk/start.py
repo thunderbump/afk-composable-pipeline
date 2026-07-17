@@ -743,7 +743,11 @@ def _advance_completed_gate(
     projection = store.status(run_id)
     if outcome is None:
         cycles = projection.get("gate_cycles", [])
-        if not isinstance(cycles, list) or not cycles or not isinstance(cycles[-1], dict):
+        if (
+            not isinstance(cycles, list)
+            or not cycles
+            or not isinstance(cycles[-1], dict)
+        ):
             _attention(
                 store,
                 run_id,

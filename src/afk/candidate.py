@@ -59,9 +59,7 @@ REPAIR_REPORT_SCHEMA = {
                 "required": ["finding_id", "disposition"],
                 "properties": {
                     "finding_id": {"type": "string", "minLength": 1},
-                    "disposition": {
-                        "enum": ["addressed", "not_addressed", "disputed"]
-                    },
+                    "disposition": {"enum": ["addressed", "not_addressed", "disputed"]},
                 },
             },
         },
@@ -256,9 +254,7 @@ def produce_repair_candidate(
             f"repair agent exited with status {completed.returncode}"
         )
         if report_error is not None:
-            store.write_evidence_text(
-                run_id, f"{attempt}/raw-report.txt", raw_report
-            )
+            store.write_evidence_text(run_id, f"{attempt}/raw-report.txt", raw_report)
         store.write_evidence_text(
             run_id,
             f"{attempt}/outcome.json",
@@ -496,9 +492,7 @@ def _read_report(path: Path) -> dict[str, Any]:
     return value
 
 
-def _read_repair_report(
-    path: Path, repair_brief: dict[str, Any]
-) -> dict[str, Any]:
+def _read_repair_report(path: Path, repair_brief: dict[str, Any]) -> dict[str, Any]:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:

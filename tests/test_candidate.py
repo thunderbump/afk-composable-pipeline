@@ -309,9 +309,7 @@ class CandidateTest(unittest.TestCase):
 
         attempt = self.state / "runs" / "run-1" / "attempts" / "repair-1"
         self.assertTrue((attempt / "manifest.json").is_file())
-        self.assertEqual(
-            self.store.status("run-1")["repair_attempts_used"], 1
-        )
+        self.assertEqual(self.store.status("run-1")["repair_attempts_used"], 1)
 
     def _candidate_environment(self):
         environment = os.environ.copy()

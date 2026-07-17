@@ -67,7 +67,10 @@ def complete_gate_cycle(
     projection = store.status(run_id)
     candidate_sha = _required_text(projection, "candidate_sha")
     validation_record = projection.get("validation")
-    if not isinstance(validation_record, dict) or validation_record.get("candidate_sha") != candidate_sha:
+    if (
+        not isinstance(validation_record, dict)
+        or validation_record.get("candidate_sha") != candidate_sha
+    ):
         raise GateError("Gate Cycle validation does not match the current Candidate")
     if validation_record.get("status") not in {"passed", "rejected"}:
         raise GateError("Gate Cycle requires a conclusive validation result")
@@ -89,7 +92,9 @@ def complete_gate_cycle(
             raise GateError("Gate Cycle evidence could not be verified")
         outcome = _read_json(evidence_path / "outcome.json")
     elif evidence_path.exists():
-        raise GateError("Gate Cycle was interrupted before evidence was sealed", kind="inconclusive")
+        raise GateError(
+            "Gate Cycle was interrupted before evidence was sealed", kind="inconclusive"
+        )
     else:
         reviews = (
             run_candidate_reviews(store, run_id, cycle=cycle, bead=bead)
@@ -135,7 +140,9 @@ def complete_gate_cycle(
 
     pr_number = projection.get("pr_number")
     if type(pr_number) is not int or pr_number <= 0:
-        raise GateError("Gate Cycle requires the stable draft PR number", kind="inconclusive")
+        raise GateError(
+            "Gate Cycle requires the stable draft PR number", kind="inconclusive"
+        )
     reconcile_gate_comment(
         store,
         run_id,
@@ -155,9 +162,17 @@ def complete_gate_cycle(
         store.append_event(
             run_id,
             "gate.cycle_completed",
-            state="reviewed" if outcome["next_action"] == "complete" else "candidate_ready",
+            state=(
+                "reviewed"
+                if outcome["next_action"] == "complete"
+                else "candidate_ready"
+            ),
             data={
-                "checkpoint": "reviewed" if outcome["next_action"] == "complete" else "candidate_ready",
+                "checkpoint": (
+                    "reviewed"
+                    if outcome["next_action"] == "complete"
+                    else "candidate_ready"
+                ),
                 "gate_cycles": [*cycles, outcome],
                 "attention": {},
             },
@@ -194,9 +209,7 @@ def reconcile_gate_comment(
     )
     matching = [
         comment
-        for comment in _github_comments(
-            identity["repository"], pr_number, worktree
-        )
+        for comment in _github_comments(identity["repository"], pr_number, worktree)
         if marker in str(comment.get("body", ""))
     ]
     if len(matching) > 1:
@@ -204,9 +217,7 @@ def reconcile_gate_comment(
     if matching:
         url = matching[0].get("html_url") or matching[0].get("url")
     else:
-        url = _post_gate_comment(
-            identity["repository"], pr_number, body, worktree
-        )
+        url = _post_gate_comment(identity["repository"], pr_number, body, worktree)
     if not isinstance(url, str) or not url:
         raise GateError("Gate Cycle PR evidence comment has no URL")
     observed = {"url": url, "marker": marker}
@@ -227,7 +238,10 @@ def run_candidate_reviews(
     candidate_sha = _required_text(projection, "candidate_sha")
     worktree = Path(_required_text(projection, "worktree_path"))
     validation_record = projection.get("validation")
-    if not isinstance(validation_record, dict) or validation_record.get("status") != "passed":
+    if (
+        not isinstance(validation_record, dict)
+        or validation_record.get("status") != "passed"
+    ):
         raise GateError("Candidate reviews require passed validation")
     if validation_record.get("candidate_sha") != candidate_sha:
         raise GateError("validation evidence belongs to another Candidate")
@@ -271,9 +285,7 @@ def run_candidate_reviews(
                         identity["base_sha"],
                         candidate_sha,
                     ),
-                    "prior_dispositions": projection.get(
-                        "repair_dispositions", []
-                    ),
+                    "prior_dispositions": projection.get("repair_dispositions", []),
                     "prior_gate_cycles": projection.get("gate_cycles", []),
                 }
             )
@@ -302,9 +314,7 @@ def run_candidate_reviews(
         store.write_evidence_text(run_id, f"{attempt}/events.jsonl", stdout)
         store.write_evidence_text(run_id, f"{attempt}/stderr.txt", stderr)
         try:
-            result = normalize_review_result(
-                axis, payload, process_exit_code=exit_code
-            )
+            result = normalize_review_result(axis, payload, process_exit_code=exit_code)
         except GateError as exc:
             store.write_evidence_text(
                 run_id,
@@ -330,9 +340,18 @@ def normalize_review_result(
     axis: str, payload: Any, *, process_exit_code: int
 ) -> dict[str, Any]:
     if process_exit_code != 0:
-        raise GateError(f"{axis} reviewer exited with status {process_exit_code}", kind="inconclusive")
-    if not isinstance(payload, dict) or set(payload) != {"status", "summary", "findings"}:
-        raise GateError(f"{axis} review output must contain status, summary, and findings")
+        raise GateError(
+            f"{axis} reviewer exited with status {process_exit_code}",
+            kind="inconclusive",
+        )
+    if not isinstance(payload, dict) or set(payload) != {
+        "status",
+        "summary",
+        "findings",
+    }:
+        raise GateError(
+            f"{axis} review output must contain status, summary, and findings"
+        )
     status = payload["status"]
     summary = payload["summary"]
     findings = payload["findings"]
@@ -367,14 +386,21 @@ def _normalize_finding(axis: str, value: Any, index: int) -> dict[str, Any]:
     required = {"id", "priority", "title", "body", "path", "line", "blocking"}
     if not isinstance(value, dict) or set(value) != required:
         raise GateError(f"{axis} review findings[{index - 1}] is invalid")
-    if any(not isinstance(value[key], str) for key in ("id", "priority", "title", "body", "path")):
+    if any(
+        not isinstance(value[key], str)
+        for key in ("id", "priority", "title", "body", "path")
+    ):
         raise GateError(f"{axis} review findings[{index - 1}] has invalid text")
     if not all(value[key].strip() for key in ("id", "priority", "title", "body")):
         raise GateError(f"{axis} review findings[{index - 1}] has empty required text")
-    if value["line"] is not None and (type(value["line"]) is not int or value["line"] <= 0):
+    if value["line"] is not None and (
+        type(value["line"]) is not int or value["line"] <= 0
+    ):
         raise GateError(f"{axis} review findings[{index - 1}] has invalid line")
     if type(value["blocking"]) is not bool:
-        raise GateError(f"{axis} review findings[{index - 1}] has invalid blocking flag")
+        raise GateError(
+            f"{axis} review findings[{index - 1}] has invalid blocking flag"
+        )
     return {**value, "id": f"{axis}-{_identifier(value['id'])}"}
 
 
@@ -495,7 +521,9 @@ def _execute_reviewer(
         except subprocess.TimeoutExpired as exc:
             raise GateError(f"{axis} reviewer timed out", kind="inconclusive") from exc
         except OSError as exc:
-            raise GateError(f"{axis} reviewer is unavailable", kind="inconclusive") from exc
+            raise GateError(
+                f"{axis} reviewer is unavailable", kind="inconclusive"
+            ) from exc
         payload: Any = None
         if completed.returncode == 0:
             try:
@@ -508,7 +536,9 @@ def _execute_reviewer(
 
 def _review_prompt(axis: str, bundle_path: Path) -> str:
     focus = {
-        "standards": "repository instructions, correctness, safety, maintainability, and tests",
+        "standards": (
+            "repository instructions, correctness, safety, maintainability, and tests"
+        ),
         "spec": "the exact Bead description and acceptance criteria",
     }[axis]
     return f"""# AFK {axis} review
@@ -567,7 +597,9 @@ def _toml_table(values: dict[str, str]) -> str:
     return f"{{ {fields} }}"
 
 
-def _repository_instructions(worktree: Path, candidate_sha: str) -> list[dict[str, str]]:
+def _repository_instructions(
+    worktree: Path, candidate_sha: str
+) -> list[dict[str, str]]:
     paths = _git(
         worktree,
         "ls-tree",
@@ -578,7 +610,16 @@ def _repository_instructions(worktree: Path, candidate_sha: str) -> list[dict[st
     selected = [
         path
         for path in paths
-        if path == "CODING_STANDARDS.md" or path.endswith("/AGENTS.md") or path == "AGENTS.md"
+        if path == "CODING_STANDARDS.md"
+        or path.endswith("/AGENTS.md")
+        or path == "AGENTS.md"
+    ]
+    return [
+        {
+            "path": path,
+            "content": _git(worktree, "show", f"{candidate_sha}:{path}"),
+        }
+        for path in selected
     ]
 
 
@@ -624,13 +665,6 @@ def _validation_snapshot(
         diagnostics.append({"path": path, "content": content})
     snapshot["diagnostics"] = diagnostics
     return snapshot
-    return [
-        {
-            "path": path,
-            "content": _git(worktree, "show", f"{candidate_sha}:{path}"),
-        }
-        for path in selected
-    ]
 
 
 def _git(worktree: Path, *args: str) -> str:
@@ -677,7 +711,10 @@ def _gate_comment_body(gate: dict[str, Any], marker: str) -> str:
         f"## AFK Gate Cycle {gate['cycle']}",
         "",
         f"Candidate: `{gate.get('candidate_sha', '')}`",
-        f"Validation: **{validation.get('status', 'not_run')}** — {validation.get('summary', '')}",
+        (
+            f"Validation: **{validation.get('status', 'not_run')}** — "
+            f"{validation.get('summary', '')}"
+        ),
     ]
     for check in validation.get("checks", []):
         if check.get("status") != "passed":
@@ -700,7 +737,8 @@ def _gate_comment_body(gate: dict[str, Any], marker: str) -> str:
         lines.extend(["", "Prior repair dispositions:"])
         for disposition in dispositions:
             lines.append(
-                f"- `{disposition.get('finding_id', '')}`: {disposition.get('disposition', '')}"
+                f"- `{disposition.get('finding_id', '')}`: "
+                f"{disposition.get('disposition', '')}"
             )
     lines.extend(["", f"Next action: **{gate.get('next_action', 'attention')}**"])
     return "\n".join(lines) + "\n"
@@ -711,13 +749,20 @@ def _github_comments(
 ) -> list[dict[str, Any]]:
     owner, name = _repository_parts(repository)
     completed = _run_gh(
-        ["gh", "api", f"repos/{owner}/{name}/issues/{pr_number}/comments", "--paginate"],
+        [
+            "gh",
+            "api",
+            f"repos/{owner}/{name}/issues/{pr_number}/comments",
+            "--paginate",
+        ],
         worktree,
     )
     try:
         value = json.loads(completed.stdout)
     except json.JSONDecodeError as exc:
-        raise GateError("GitHub comment observation was malformed", kind="inconclusive") from exc
+        raise GateError(
+            "GitHub comment observation was malformed", kind="inconclusive"
+        ) from exc
     if not isinstance(value, list) or not all(isinstance(item, dict) for item in value):
         raise GateError("GitHub comment observation was malformed", kind="inconclusive")
     return value
@@ -743,7 +788,9 @@ def _post_gate_comment(
     try:
         value = json.loads(completed.stdout)
     except json.JSONDecodeError as exc:
-        raise GateError("GitHub comment response was malformed", kind="inconclusive") from exc
+        raise GateError(
+            "GitHub comment response was malformed", kind="inconclusive"
+        ) from exc
     url = value.get("html_url") if isinstance(value, dict) else None
     if not isinstance(url, str) or not url:
         raise GateError("GitHub comment response was malformed", kind="inconclusive")
@@ -764,7 +811,9 @@ def _run_gh(
             timeout=30,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
-        raise GateError("GitHub comment command is unavailable", kind="inconclusive") from exc
+        raise GateError(
+            "GitHub comment command is unavailable", kind="inconclusive"
+        ) from exc
     if completed.returncode != 0:
         raise GateError("GitHub comment command failed", kind="inconclusive")
     return completed

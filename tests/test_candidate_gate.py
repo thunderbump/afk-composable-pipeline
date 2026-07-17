@@ -111,15 +111,25 @@ class CandidateGateTest(unittest.TestCase):
                 },
             )
             reviews = [
-                {"axis": axis, "process_status": "succeeded", "status": "passed", "summary": "passed", "findings": []}
+                {
+                    "axis": axis,
+                    "process_status": "succeeded",
+                    "status": "passed",
+                    "summary": "passed",
+                    "findings": [],
+                }
                 for axis in ("standards", "spec")
             ]
 
             with (
-                mock.patch("afk.candidate_gate.run_candidate_reviews", return_value=reviews) as run_reviews,
+                mock.patch(
+                    "afk.candidate_gate.run_candidate_reviews", return_value=reviews
+                ) as run_reviews,
                 mock.patch("afk.candidate_gate.reconcile_gate_comment"),
             ):
-                outcome = complete_gate_cycle(store, run_id, bead={"id": "central-test.1"})
+                outcome = complete_gate_cycle(
+                    store, run_id, bead={"id": "central-test.1"}
+                )
 
             self.assertEqual(outcome["next_action"], "complete")
             self.assertEqual(store.status(run_id)["checkpoint"], "reviewed")
@@ -156,13 +166,21 @@ class CandidateGateTest(unittest.TestCase):
                         "candidate_sha": "b" * 40,
                         "summary": "still failing",
                         "evidence": "gates/validation-b",
-                        "checks": [{"name": "smoke", "status": "rejected", "log_path": "smoke.log"}],
+                        "checks": [
+                            {
+                                "name": "smoke",
+                                "status": "rejected",
+                                "log_path": "smoke.log",
+                            }
+                        ],
                     },
                 },
             )
 
             with mock.patch("afk.candidate_gate.reconcile_gate_comment"):
-                outcome = complete_gate_cycle(store, run_id, bead={"id": "central-test.1"})
+                outcome = complete_gate_cycle(
+                    store, run_id, bead={"id": "central-test.1"}
+                )
 
             self.assertEqual(outcome["next_action"], "attention")
             self.assertIn("four", outcome["stop_reason"])
@@ -199,7 +217,11 @@ class CandidateGateTest(unittest.TestCase):
                         "summary": "smoke failed",
                         "evidence": "gates/validation-b",
                         "checks": [
-                            {"name": "smoke", "status": "rejected", "log_path": "smoke.log"}
+                            {
+                                "name": "smoke",
+                                "status": "rejected",
+                                "log_path": "smoke.log",
+                            }
                         ],
                     },
                 },
@@ -222,7 +244,9 @@ class CandidateGateTest(unittest.TestCase):
             gate = root / "state" / "runs" / run_id / outcome["evidence"]
             self.assertTrue((gate / "manifest.json").is_file())
 
-    def test_gate_comment_reconciles_a_post_confirmation_crash_without_duplication(self):
+    def test_gate_comment_reconciles_a_post_confirmation_crash_without_duplication(
+        self,
+    ):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             store = RunStore(root / "state")
@@ -251,37 +275,85 @@ class CandidateGateTest(unittest.TestCase):
 
             original_confirm = store.confirm_effect
             with (
-                mock.patch("afk.candidate_gate._github_comments", side_effect=lambda *args: list(comments)),
+                mock.patch(
+                    "afk.candidate_gate._github_comments",
+                    side_effect=lambda *args: list(comments),
+                ),
                 mock.patch("afk.candidate_gate._post_gate_comment", side_effect=post),
-                mock.patch.object(store, "confirm_effect", side_effect=RuntimeError("crash")),
+                mock.patch.object(
+                    store, "confirm_effect", side_effect=RuntimeError("crash")
+                ),
                 self.assertRaisesRegex(RuntimeError, "crash"),
             ):
-                reconcile_gate_comment(store, run_id, pr_number=7, worktree=root, gate=gate)
+                reconcile_gate_comment(
+                    store, run_id, pr_number=7, worktree=root, gate=gate
+                )
 
-            with mock.patch("afk.candidate_gate._github_comments", return_value=comments):
+            with mock.patch(
+                "afk.candidate_gate._github_comments", return_value=comments
+            ):
                 with mock.patch("afk.candidate_gate._post_gate_comment") as duplicate:
-                    with mock.patch.object(store, "confirm_effect", side_effect=original_confirm):
-                        reconcile_gate_comment(store, run_id, pr_number=7, worktree=root, gate=gate)
+                    with mock.patch.object(
+                        store, "confirm_effect", side_effect=original_confirm
+                    ):
+                        reconcile_gate_comment(
+                            store, run_id, pr_number=7, worktree=root, gate=gate
+                        )
 
             self.assertEqual(len(posted), 1)
             duplicate.assert_not_called()
-            self.assertEqual(store.effect(run_id, "gate-comment-1")["status"], "confirmed")
+            self.assertEqual(
+                store.effect(run_id, "gate-comment-1")["status"], "confirmed"
+            )
 
     def test_two_fresh_axes_consume_the_same_sealed_review_bundle(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             checkout = root / "checkout"
             checkout.mkdir()
-            subprocess.run(["git", "init", "-b", "main"], cwd=checkout, check=True, capture_output=True)
-            subprocess.run(["git", "config", "user.email", "afk@example.test"], cwd=checkout, check=True)
-            subprocess.run(["git", "config", "user.name", "AFK Test"], cwd=checkout, check=True)
+            subprocess.run(
+                ["git", "init", "-b", "main"],
+                cwd=checkout,
+                check=True,
+                capture_output=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.email", "afk@example.test"],
+                cwd=checkout,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.name", "AFK Test"], cwd=checkout, check=True
+            )
             (checkout / "app.txt").write_text("base\n", encoding="utf-8")
             subprocess.run(["git", "add", "app.txt"], cwd=checkout, check=True)
-            subprocess.run(["git", "commit", "-m", "base"], cwd=checkout, check=True, capture_output=True)
-            base_sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=checkout, text=True, capture_output=True, check=True).stdout.strip()
+            subprocess.run(
+                ["git", "commit", "-m", "base"],
+                cwd=checkout,
+                check=True,
+                capture_output=True,
+            )
+            base_sha = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=checkout,
+                text=True,
+                capture_output=True,
+                check=True,
+            ).stdout.strip()
             (checkout / "app.txt").write_text("candidate\n", encoding="utf-8")
-            subprocess.run(["git", "commit", "-am", "candidate"], cwd=checkout, check=True, capture_output=True)
-            candidate_sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=checkout, text=True, capture_output=True, check=True).stdout.strip()
+            subprocess.run(
+                ["git", "commit", "-am", "candidate"],
+                cwd=checkout,
+                check=True,
+                capture_output=True,
+            )
+            candidate_sha = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=checkout,
+                text=True,
+                capture_output=True,
+                check=True,
+            ).stdout.strip()
             store = RunStore(root / "state")
             run_id = store.create_run(
                 bead_id="central-test.1",
@@ -314,13 +386,20 @@ class CandidateGateTest(unittest.TestCase):
             def reviewer(axis, bundle_path, attempt_path, worktree):
                 calls.append((axis, bundle_path, attempt_path))
                 self.assertTrue((bundle_path / "manifest.json").is_file())
-                return 0, {
-                    "status": "passed",
-                    "summary": f"{axis} passed",
-                    "findings": [],
-                }, "", ""
+                return (
+                    0,
+                    {
+                        "status": "passed",
+                        "summary": f"{axis} passed",
+                        "findings": [],
+                    },
+                    "",
+                    "",
+                )
 
-            with mock.patch("afk.candidate_gate._execute_reviewer", side_effect=reviewer):
+            with mock.patch(
+                "afk.candidate_gate._execute_reviewer", side_effect=reviewer
+            ):
                 reviews = run_candidate_reviews(
                     store,
                     run_id,
@@ -333,7 +412,9 @@ class CandidateGateTest(unittest.TestCase):
                     },
                 )
 
-            self.assertEqual([review["axis"] for review in reviews], ["standards", "spec"])
+            self.assertEqual(
+                [review["axis"] for review in reviews], ["standards", "spec"]
+            )
             self.assertEqual(calls[0][1], calls[1][1])
             self.assertNotEqual(calls[0][2], calls[1][2])
             self.assertTrue((calls[0][2] / "manifest.json").is_file())
@@ -391,8 +472,14 @@ class CandidateGateTest(unittest.TestCase):
                     {"name": "smoke", "status": "rejected", "log_path": "smoke.log"},
                 ],
                 "diagnostics": [
-                    {"path": "afk/stderr.log", "content": "Docker smoke failed: fetch failed"},
-                    {"path": "contract/smoke.log", "content": "health endpoint unavailable"},
+                    {
+                        "path": "afk/stderr.log",
+                        "content": "Docker smoke failed: fetch failed",
+                    },
+                    {
+                        "path": "contract/smoke.log",
+                        "content": "health endpoint unavailable",
+                    },
                 ],
             },
             reviews=[
