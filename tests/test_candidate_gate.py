@@ -306,6 +306,58 @@ class CandidateGateTest(unittest.TestCase):
                 store.effect(run_id, "gate-comment-1")["status"], "confirmed"
             )
 
+            marker = posted[0].splitlines()[0]
+            mismatches = {
+                "edited": posted[0] + "edited\n",
+                "truncated": marker,
+                "marker collision": f"{marker}\nunrelated evidence\n",
+            }
+            for label, mismatched_body in mismatches.items():
+                with self.subTest(label=label):
+                    comments[0]["body"] = mismatched_body
+                    with (
+                        mock.patch(
+                            "afk.candidate_gate._github_comments",
+                            return_value=comments,
+                        ),
+                        mock.patch(
+                            "afk.candidate_gate._post_gate_comment"
+                        ) as replacement,
+                        self.assertRaisesRegex(GateError, "content"),
+                    ):
+                        reconcile_gate_comment(
+                            store, run_id, pr_number=7, worktree=root, gate=gate
+                        )
+                    replacement.assert_not_called()
+
+            duplicate_cases = {
+                "two exact": [posted[0], posted[0]],
+                "exact and marker collision": [posted[0], marker],
+            }
+            for label, bodies in duplicate_cases.items():
+                with self.subTest(label=label):
+                    duplicates = [
+                        {
+                            "url": f"https://example.test/comment/{index}",
+                            "body": duplicate_body,
+                        }
+                        for index, duplicate_body in enumerate(bodies, start=1)
+                    ]
+                    with (
+                        mock.patch(
+                            "afk.candidate_gate._github_comments",
+                            return_value=duplicates,
+                        ),
+                        mock.patch(
+                            "afk.candidate_gate._post_gate_comment"
+                        ) as replacement,
+                        self.assertRaisesRegex(GateError, "duplicate"),
+                    ):
+                        reconcile_gate_comment(
+                            store, run_id, pr_number=7, worktree=root, gate=gate
+                        )
+                    replacement.assert_not_called()
+
     def test_gate_review_recovery_reuses_only_manifest_valid_completed_work(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

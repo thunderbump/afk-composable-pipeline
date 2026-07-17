@@ -232,6 +232,11 @@ def reconcile_gate_comment(
     if len(matching) > 1:
         raise GateError("Gate Cycle has duplicate PR evidence comments")
     if matching:
+        if matching[0].get("body") != body:
+            raise GateError(
+                "Gate Cycle PR evidence comment content does not match",
+                kind="inconclusive",
+            )
         url = matching[0].get("html_url") or matching[0].get("url")
     else:
         url = _post_gate_comment(identity["repository"], pr_number, body, worktree)
