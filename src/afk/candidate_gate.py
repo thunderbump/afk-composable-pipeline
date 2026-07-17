@@ -308,14 +308,36 @@ def run_candidate_reviews(
             f"{attempt}/schema.json",
             canonical_json(REVIEW_REPORT_SCHEMA) + "\n",
         )
-        exit_code, payload, stdout, stderr = _execute_reviewer(
-            axis, bundle_path, attempt_path, worktree
-        )
+        try:
+            exit_code, payload, stdout, stderr = _execute_reviewer(
+                axis, bundle_path, attempt_path, worktree
+            )
+        except GateError as exc:
+            result = {
+                "axis": axis,
+                "process_status": "failed",
+                "status": "inconclusive",
+                "summary": exc.summary,
+                "findings": [],
+            }
+            store.write_evidence_text(
+                run_id, f"{attempt}/outcome.json", canonical_json(result) + "\n"
+            )
+            store.seal_evidence(run_id, attempt)
+            reviews.append(result)
+            continue
         store.write_evidence_text(run_id, f"{attempt}/events.jsonl", stdout)
         store.write_evidence_text(run_id, f"{attempt}/stderr.txt", stderr)
         try:
             result = normalize_review_result(axis, payload, process_exit_code=exit_code)
         except GateError as exc:
+            result = {
+                "axis": axis,
+                "process_status": "failed" if exit_code != 0 else "succeeded",
+                "status": "inconclusive",
+                "summary": exc.summary,
+                "findings": [],
+            }
             store.write_evidence_text(
                 run_id,
                 f"{attempt}/raw-report.txt",
@@ -324,10 +346,11 @@ def run_candidate_reviews(
             store.write_evidence_text(
                 run_id,
                 f"{attempt}/outcome.json",
-                canonical_json({"status": exc.kind, "summary": exc.summary}) + "\n",
+                canonical_json(result) + "\n",
             )
             store.seal_evidence(run_id, attempt)
-            raise
+            reviews.append(result)
+            continue
         store.write_evidence_text(
             run_id, f"{attempt}/report.json", canonical_json(result) + "\n"
         )

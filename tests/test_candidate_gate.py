@@ -445,6 +445,181 @@ class CandidateGateTest(unittest.TestCase):
         self.assertEqual(result["status"], "rejected")
         self.assertEqual(result["findings"][0]["id"], "standards-1")
 
+    def test_failed_review_process_or_protocol_does_not_prevent_the_other_axis(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout = root / "checkout"
+            checkout.mkdir()
+            subprocess.run(
+                ["git", "init", "-b", "main"],
+                cwd=checkout,
+                check=True,
+                capture_output=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.email", "afk@example.test"],
+                cwd=checkout,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.name", "AFK Test"],
+                cwd=checkout,
+                check=True,
+            )
+            (checkout / "app.txt").write_text("base\n", encoding="utf-8")
+            subprocess.run(["git", "add", "app.txt"], cwd=checkout, check=True)
+            subprocess.run(
+                ["git", "commit", "-m", "base"],
+                cwd=checkout,
+                check=True,
+                capture_output=True,
+            )
+            base_sha = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=checkout,
+                text=True,
+                capture_output=True,
+                check=True,
+            ).stdout.strip()
+            (checkout / "app.txt").write_text("candidate\n", encoding="utf-8")
+            subprocess.run(
+                ["git", "commit", "-am", "candidate"],
+                cwd=checkout,
+                check=True,
+                capture_output=True,
+            )
+            candidate_sha = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=checkout,
+                text=True,
+                capture_output=True,
+                check=True,
+            ).stdout.strip()
+            store = RunStore(root / "state")
+            run_id = store.create_run(
+                bead_id="central-test.1",
+                repository="owner/project",
+                base_branch="main",
+                base_sha=base_sha,
+                start_request={"repository_root": str(checkout)},
+                run_id="run-1",
+            )["run_id"]
+            store.write_evidence_text(run_id, "gates/validation-b/result.json", "{}\n")
+            store.seal_evidence(run_id, "gates/validation-b")
+            store.append_event(
+                run_id,
+                "candidate.ready",
+                state="candidate_ready",
+                data={
+                    "checkpoint": "candidate_ready",
+                    "candidate_sha": candidate_sha,
+                    "worktree_path": str(checkout),
+                    "pr_number": 7,
+                    "validation": {
+                        "status": "passed",
+                        "candidate_sha": candidate_sha,
+                        "evidence": "gates/validation-b",
+                    },
+                },
+            )
+
+            def reviewer(axis, bundle_path, attempt_path, worktree):
+                if axis == "standards":
+                    raise GateError("standards reviewer timed out", kind="inconclusive")
+                return (
+                    0,
+                    {"status": "passed", "summary": "spec passed", "findings": []},
+                    "spec events\n",
+                    "",
+                )
+
+            with mock.patch(
+                "afk.candidate_gate._execute_reviewer", side_effect=reviewer
+            ):
+                reviews = run_candidate_reviews(
+                    store,
+                    run_id,
+                    cycle=1,
+                    bead={"id": "central-test.1"},
+                )
+
+            self.assertEqual(
+                reviews,
+                [
+                    {
+                        "axis": "standards",
+                        "process_status": "failed",
+                        "status": "inconclusive",
+                        "summary": "standards reviewer timed out",
+                        "findings": [],
+                    },
+                    {
+                        "axis": "spec",
+                        "process_status": "succeeded",
+                        "status": "passed",
+                        "summary": "spec passed",
+                        "findings": [],
+                    },
+                ],
+            )
+            standards = (
+                root / "state" / "runs" / run_id / "attempts/review-cycle-1-standards"
+            )
+            self.assertTrue((standards / "manifest.json").is_file())
+            self.assertTrue((standards / "outcome.json").is_file())
+
+            def malformed_reviewer(axis, bundle_path, attempt_path, worktree):
+                if axis == "standards":
+                    return 0, {"summary": "missing fields"}, "bad report\n", ""
+                return (
+                    0,
+                    {"status": "passed", "summary": "spec passed", "findings": []},
+                    "spec events\n",
+                    "",
+                )
+
+            with mock.patch(
+                "afk.candidate_gate._execute_reviewer",
+                side_effect=malformed_reviewer,
+            ):
+                protocol_reviews = run_candidate_reviews(
+                    store,
+                    run_id,
+                    cycle=2,
+                    bead={"id": "central-test.1"},
+                )
+
+            self.assertEqual(
+                [review["axis"] for review in protocol_reviews],
+                ["standards", "spec"],
+            )
+            self.assertEqual(protocol_reviews[0]["process_status"], "succeeded")
+            self.assertEqual(protocol_reviews[0]["status"], "inconclusive")
+            self.assertEqual(protocol_reviews[1]["status"], "passed")
+            protocol_attempt = (
+                root / "state" / "runs" / run_id / "attempts/review-cycle-2-standards"
+            )
+            self.assertTrue((protocol_attempt / "manifest.json").is_file())
+            self.assertTrue((protocol_attempt / "raw-report.txt").is_file())
+
+            store.append_event(
+                run_id,
+                "repair.started",
+                data={"checkpoint": "candidate_ready", "repair_attempts_used": 2},
+            )
+            with (
+                mock.patch(
+                    "afk.candidate_gate.run_candidate_reviews",
+                    return_value=protocol_reviews,
+                ),
+                mock.patch("afk.candidate_gate.reconcile_gate_comment"),
+            ):
+                outcome = complete_gate_cycle(
+                    store, run_id, bead={"id": "central-test.1"}
+                )
+
+            self.assertEqual(outcome["next_action"], "attention")
+
     def test_review_rejects_malformed_or_contradictory_output(self):
         with self.assertRaisesRegex(GateError, "findings"):
             normalize_review_result(
