@@ -9,6 +9,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from afk.candidate_validation import (
+    CandidateValidationError,
+    tracked_regular_file_identity,
+)
 from afk.checkouts import checkout_path_error
 from afk.contracts import ContractError, ProjectContract, default_validation_mode, load_project_contract
 from afk.integration import integrate_published_pr, integration_output_dir, load_workstream_payload
@@ -114,9 +118,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "report":
         try:
             projection = RunStore().status(args.run_id)
-        except RunStoreError as exc:
+            report = _run_report(projection)
+        except (CandidateValidationError, RunStoreError) as exc:
             parser.error(str(exc))
-        print(canonical_json(_run_report(projection)))
+        print(canonical_json(report))
         return 0
 
     if args.command == "run-step":
@@ -666,10 +671,21 @@ def _run_report(projection: dict[str, Any]) -> dict[str, Any]:
     ):
         approval = contract["approval"]
         harness = approval["harness"]
+        observed = tracked_regular_file_identity(
+            Path(projection["worktree_path"]), candidate_sha, harness["path"]
+        )
+        if observed is None:
+            raise CandidateValidationError(
+                "invalid", "current Candidate bootstrap harness identity is unavailable"
+            )
         report["authorization"] = {
             "status": "required",
             "candidate_sha": candidate_sha,
-            "artifact": harness,
+            "artifact": {
+                "path": harness["path"],
+                "mode": observed[0],
+                "blob_sha": observed[1],
+            },
             "reason": (
                 "bootstrap approval is Candidate-bound; prior approval targets "
                 f"{approval.get('candidate_sha')}"
@@ -680,10 +696,13 @@ def _run_report(projection: dict[str, Any]) -> dict[str, Any]:
                     "-m",
                     "afk.bootstrap_approval",
                     harness.get("path"),
+                    "--run-id",
+                    projection["run_id"],
                     "--timeout-seconds",
                     str(approval.get("timeout_seconds")),
                 ],
                 "resume": [sys.executable, "-m", "afk", "resume"],
+                "resume_precondition": {"active_run_id": projection["run_id"]},
             },
         }
     return redact_artifact_value(report)

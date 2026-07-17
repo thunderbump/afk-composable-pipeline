@@ -1069,7 +1069,10 @@ class CandidateValidationCliTest(unittest.TestCase):
             "scripts/validate.sh", "--timeout-seconds", "5"
         )
         self.assertEqual(approved.returncode, 0, approved.stderr)
-        self.git("commit", "--allow-empty", "-m", "repaired Candidate")
+        harness.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+        harness.chmod(0o755)
+        self.git("add", "scripts/validate.sh")
+        self.git("commit", "-m", "repaired Candidate")
         repaired_candidate = self.git("rev-parse", "HEAD")
         store = RunStore(self.state_home / "afk")
         store.append_event(
@@ -1116,7 +1119,7 @@ class CandidateValidationCliTest(unittest.TestCase):
                     "path": "scripts/validate.sh",
                     "mode": "100755",
                     "blob_sha": self.git(
-                        "rev-parse", f"{first_candidate}:scripts/validate.sh"
+                        "rev-parse", f"{repaired_candidate}:scripts/validate.sh"
                     ),
                 },
                 "reason": (
@@ -1129,12 +1132,51 @@ class CandidateValidationCliTest(unittest.TestCase):
                         "-m",
                         "afk.bootstrap_approval",
                         "scripts/validate.sh",
+                        "--run-id",
+                        run_id,
                         "--timeout-seconds",
                         "5",
                     ],
                     "resume": [sys.executable, "-m", "afk", "resume"],
+                    "resume_precondition": {"active_run_id": run_id},
                 },
             },
+        )
+
+        self.git("rm", "scripts/validate.sh")
+        self.git("commit", "-m", "remove repaired Candidate harness")
+        unavailable_candidate = self.git("rev-parse", "HEAD")
+        store.append_event(
+            run_id,
+            "candidate.repaired",
+            state="candidate_ready",
+            data={
+                "checkpoint": "candidate_ready",
+                "candidate_sha": unavailable_candidate,
+                "pr_head_sha": unavailable_candidate,
+            },
+        )
+        store.append_event(
+            run_id,
+            "run.attention_required",
+            state="attention_required",
+            data={
+                "checkpoint": "candidate_ready",
+                "attention": {
+                    "scope": "validation",
+                    "kind": "unavailable",
+                    "summary": "repaired bootstrap Candidate requires reapproval",
+                },
+            },
+        )
+
+        unavailable = self.run_afk("report", run_id)
+
+        self.assertEqual(unavailable.returncode, 2)
+        self.assertEqual(unavailable.stdout, "")
+        self.assertIn(
+            "current Candidate bootstrap harness identity is unavailable",
+            unavailable.stderr,
         )
 
         store.append_event(

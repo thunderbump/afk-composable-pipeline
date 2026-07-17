@@ -351,7 +351,7 @@ def _require_trusted_harness(
                 "invalid", "bootstrap approval is bound to another Candidate"
             )
         harness = approval["harness"]
-        observed = _tracked_regular_file_identity(
+        observed = tracked_regular_file_identity(
             worktree, candidate_sha, harness["path"]
         )
         if observed != (harness["mode"], harness["blob_sha"]):
@@ -391,10 +391,10 @@ def _require_trusted_harness(
             raise CandidateValidationError(
                 "invalid", "pinned validation harness path is invalid"
             )
-        trusted = _tracked_regular_file_identity(
+        trusted = tracked_regular_file_identity(
             worktree, identity["base_sha"], relative
         )
-        candidate = _tracked_regular_file_identity(worktree, candidate_sha, relative)
+        candidate = tracked_regular_file_identity(worktree, candidate_sha, relative)
         if trusted is None or candidate is None:
             raise CandidateValidationError(
                 "invalid",
@@ -407,7 +407,7 @@ def _require_trusted_harness(
             )
 
 
-def _tracked_regular_file_identity(
+def tracked_regular_file_identity(
     worktree: Path, commit_sha: str, relative: str
 ) -> tuple[str, str] | None:
     observed = subprocess.run(
@@ -467,7 +467,7 @@ def approve_bootstrap_contract(
     if not _contained_relative_path(relative):
         raise CandidateValidationError("invalid", "bootstrap harness path is invalid")
     _require_immutable_candidate(worktree, candidate_sha)
-    observed = _tracked_regular_file_identity(worktree, candidate_sha, relative)
+    observed = tracked_regular_file_identity(worktree, candidate_sha, relative)
     if observed is None or observed[0] != "100755":
         raise CandidateValidationError(
             "invalid", "bootstrap harness must be a tracked executable regular file"
