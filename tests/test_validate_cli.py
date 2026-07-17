@@ -393,6 +393,60 @@ class ValidateCliTest(unittest.TestCase):
             self.assertEqual(request["repo"]["path"], str(checkout))
             self.assertEqual(request["repo"]["commit"], candidate)
 
+    def test_validate_rejects_a_linked_worktree_when_start_commit_is_not_head(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repository = temp_path / "repository"
+            checkout_head = init_checkout(repository)
+            checkout = temp_path / "linked-checkout"
+            git(repository, "worktree", "add", "-b", "afk/linked", str(checkout))
+            (repository / "README.md").write_text("later\n", encoding="utf-8")
+            git(repository, "commit", "-am", "later")
+            different_valid_commit = git(repository, "rev-parse", "HEAD")
+            ledger = temp_path / "ledger"
+
+            completed = run_afk(
+                "run-step",
+                "validate",
+                "--profile",
+                "tier1",
+                "--input",
+                json.dumps(
+                    {
+                        "checkout": {
+                            "status": "prepared",
+                            "checkout_path": str(checkout),
+                            "review_branch": "afk/linked",
+                            "requested_ref": "main",
+                            "start_commit": different_valid_commit,
+                        },
+                        "worker": {
+                            "type": "local-command",
+                            "command": [
+                                sys.executable,
+                                "-c",
+                                "raise SystemExit(99)",
+                            ],
+                        },
+                    }
+                ),
+                "--ledger",
+                str(ledger),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text())
+
+            self.assertNotEqual(checkout_head, different_valid_commit)
+            self.assertEqual(result["output"]["status"], "failed_invalid_payload")
+            self.assertEqual(
+                result["output"]["message"],
+                "checkout HEAD does not match checkout.start_commit",
+            )
+            self.assertFalse((run_dir / "worker-request.json").exists())
+
     def test_validate_rejects_a_malformed_git_worktree_marker(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)

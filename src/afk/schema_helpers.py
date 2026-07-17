@@ -119,23 +119,9 @@ def normalize_prepared_checkout(
 
 def _is_git_checkout(checkout_path: Path) -> bool:
     try:
-        completed = subprocess.run(
-            [
-                "git",
-                "-C",
-                str(checkout_path),
-                "rev-parse",
-                "--show-toplevel",
-                "--is-inside-work-tree",
-            ],
-            env={
-                key: value
-                for key, value in os.environ.items()
-                if not key.startswith("GIT_")
-            },
-            text=True,
-            capture_output=True,
-            check=False,
+        completed = _run_git(
+            checkout_path,
+            ["rev-parse", "--show-toplevel", "--is-inside-work-tree"],
         )
         top_level, inside_work_tree = completed.stdout.splitlines()
         return (
@@ -145,6 +131,33 @@ def _is_git_checkout(checkout_path: Path) -> bool:
         )
     except (OSError, ValueError):
         return False
+
+
+def resolve_git_commit(checkout_path: Path, revision: str) -> str | None:
+    try:
+        completed = _run_git(
+            checkout_path,
+            ["rev-parse", "--verify", "--end-of-options", f"{revision}^{{commit}}"],
+        )
+        if completed.returncode != 0:
+            return None
+        return completed.stdout.strip() or None
+    except OSError:
+        return None
+
+
+def _run_git(checkout_path: Path, args: list[str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", "-C", str(checkout_path), *args],
+        env={
+            key: value
+            for key, value in os.environ.items()
+            if not key.startswith("GIT_")
+        },
+        text=True,
+        capture_output=True,
+        check=False,
+    )
 
 
 def validation_artifact_ref(

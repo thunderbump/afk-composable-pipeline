@@ -19,7 +19,12 @@ from afk.role_adapters import (
     read_json_result_file,
 )
 from afk.roles import execute_role_adapter, log_role_adapter_result, log_role_runtime_error
-from afk.schema_helpers import is_string_list, normalize_prepared_checkout, string_field
+from afk.schema_helpers import (
+    is_string_list,
+    normalize_prepared_checkout,
+    resolve_git_commit,
+    string_field,
+)
 
 
 SCHEMA_VERSION = 1
@@ -227,7 +232,21 @@ def invalid_request(message: str) -> dict[str, Any]:
 
 
 def normalize_checkout(checkout: Any) -> dict[str, Any]:
-    return normalize_prepared_checkout(checkout, include_repo_url=True, redact_repo_url=redact_url)
+    normalized = normalize_prepared_checkout(
+        checkout, include_repo_url=True, redact_repo_url=redact_url
+    )
+    if normalized["status"] != "valid":
+        return normalized
+    prepared = normalized["checkout"]
+    checkout_path = Path(prepared["path"])
+    head = resolve_git_commit(checkout_path, "HEAD")
+    start_commit = resolve_git_commit(checkout_path, prepared["start_commit"])
+    if not head or not start_commit or head != start_commit:
+        return {
+            "status": "invalid",
+            "message": "checkout HEAD does not match checkout.start_commit",
+        }
+    return normalized
 
 
 def normalize_validation(
