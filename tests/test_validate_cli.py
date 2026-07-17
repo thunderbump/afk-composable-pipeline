@@ -78,6 +78,40 @@ def run_dir_text(run_dir):
 class ValidateCliTest(unittest.TestCase):
     COMPILER_LOG_FIXTURE = (ROOT / "tests" / "fixtures" / "validation-compiler-error.log").read_text(encoding="utf-8")
 
+    def assert_invalid_checkout(self, checkout, ledger):
+        completed = run_afk(
+            "run-step",
+            "validate",
+            "--profile",
+            "tier1",
+            "--input",
+            json.dumps(
+                {
+                    "checkout": {
+                        "status": "prepared",
+                        "checkout_path": str(checkout),
+                        "review_branch": "afk/fake",
+                        "requested_ref": "main",
+                        "start_commit": "a" * 40,
+                    },
+                    "validation": {"dry_run": False},
+                }
+            ),
+            "--ledger",
+            str(ledger),
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        summary = json.loads(completed.stdout)
+        run_dir = ledger / "runs" / summary["run_id"]
+        result = json.loads((run_dir / "step-result.json").read_text())
+        self.assertEqual(result["output"]["status"], "failed_invalid_payload")
+        self.assertEqual(
+            result["output"]["message"],
+            "checkout.checkout_path must be a git checkout",
+        )
+        self.assertFalse((run_dir / "worker-request.json").exists())
+
     def test_validate_default_project_worker_uses_absolute_artifact_paths_with_relative_ledger(self):
         with tempfile.TemporaryDirectory(dir=ROOT) as temp_dir:
             temp_path = Path(temp_dir)
@@ -300,6 +334,157 @@ class ValidateCliTest(unittest.TestCase):
                 "fake validation worker complete",
                 (run_dir / "stdout.log").read_text(encoding="utf-8"),
             )
+
+    def test_validate_canonicalizes_a_linked_worktree_abbreviated_start_commit(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repository = temp_path / "repository"
+            init_checkout(repository)
+            checkout = temp_path / "linked-checkout"
+            git(repository, "worktree", "add", "-b", "afk/linked", str(checkout))
+            candidate = git(checkout, "rev-parse", "HEAD")
+            ledger = temp_path / "ledger"
+            worker_code = textwrap.dedent(
+                """
+                import json
+                import os
+                from pathlib import Path
+
+                request = json.loads(Path(os.environ["AFK_WORKER_REQUEST"]).read_text())
+                Path(os.environ["AFK_WORKER_RESULT"]).write_text(
+                    json.dumps({"status": "pass", "steps": []}), encoding="utf-8"
+                )
+                """
+            ).strip()
+
+            completed = run_afk(
+                "run-step",
+                "validate",
+                "--profile",
+                "tier1",
+                "--input",
+                json.dumps(
+                    {
+                        "checkout": {
+                            "status": "prepared",
+                            "checkout_path": str(checkout),
+                            "review_branch": "afk/linked",
+                            "requested_ref": "main",
+                            "start_commit": candidate[:12],
+                        },
+                        "validation": {"dry_run": False, "timeout_seconds": 30},
+                        "worker": {
+                            "type": "local-command",
+                            "command": [sys.executable, "-c", worker_code],
+                        },
+                    }
+                ),
+                "--ledger",
+                str(ledger),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text())
+
+            self.assertEqual(result["output"]["status"], "validated")
+            request = json.loads((run_dir / "worker-request.json").read_text())
+            self.assertEqual(request["repo"]["path"], str(checkout))
+            self.assertEqual(request["repo"]["commit"], candidate)
+
+    def test_validate_rejects_a_linked_worktree_when_start_commit_is_not_head(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repository = temp_path / "repository"
+            checkout_head = init_checkout(repository)
+            checkout = temp_path / "linked-checkout"
+            git(repository, "worktree", "add", "-b", "afk/linked", str(checkout))
+            (repository / "README.md").write_text("later\n", encoding="utf-8")
+            git(repository, "commit", "-am", "later")
+            different_valid_commit = git(repository, "rev-parse", "HEAD")
+            ledger = temp_path / "ledger"
+
+            completed = run_afk(
+                "run-step",
+                "validate",
+                "--profile",
+                "tier1",
+                "--input",
+                json.dumps(
+                    {
+                        "checkout": {
+                            "status": "prepared",
+                            "checkout_path": str(checkout),
+                            "review_branch": "afk/linked",
+                            "requested_ref": "main",
+                            "start_commit": different_valid_commit,
+                        },
+                        "worker": {
+                            "type": "local-command",
+                            "command": [
+                                sys.executable,
+                                "-c",
+                                "raise SystemExit(99)",
+                            ],
+                        },
+                    }
+                ),
+                "--ledger",
+                str(ledger),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            run_dir = ledger / "runs" / summary["run_id"]
+            result = json.loads((run_dir / "step-result.json").read_text())
+
+            self.assertNotEqual(checkout_head, different_valid_commit)
+            self.assertEqual(result["output"]["status"], "failed_invalid_payload")
+            self.assertEqual(
+                result["output"]["message"],
+                "checkout HEAD does not match checkout.start_commit",
+            )
+            self.assertFalse((run_dir / "worker-request.json").exists())
+
+    def test_validate_rejects_a_malformed_git_worktree_marker(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            checkout = temp_path / "not-a-checkout"
+            checkout.mkdir()
+            (checkout / ".git").write_text("gitdir: missing\n", encoding="utf-8")
+            self.assert_invalid_checkout(checkout, temp_path / "ledger")
+
+    def test_validate_rejects_git_shaped_paths_that_are_not_repositories(self):
+        for metadata_shape in ("empty-directory", "fabricated-worktree-marker"):
+            with (
+                self.subTest(metadata_shape=metadata_shape),
+                tempfile.TemporaryDirectory() as temp_dir,
+            ):
+                temp_path = Path(temp_dir)
+                checkout = temp_path / "not-a-checkout"
+                checkout.mkdir()
+                if metadata_shape == "empty-directory":
+                    (checkout / ".git").mkdir()
+                else:
+                    fake_git_dir = temp_path / "fake-git-dir"
+                    fake_git_dir.mkdir()
+                    marker = checkout / ".git"
+                    marker.write_text("gitdir: ../fake-git-dir\n", encoding="utf-8")
+                    (fake_git_dir / "gitdir").write_text(str(marker), encoding="utf-8")
+                self.assert_invalid_checkout(checkout, temp_path / "ledger")
+
+    def test_validate_rejects_gitdir_indirection_through_a_symlink_loop(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            checkout = temp_path / "not-a-checkout"
+            checkout.mkdir()
+            loop_a = temp_path / "loop-a"
+            loop_b = temp_path / "loop-b"
+            loop_a.symlink_to(loop_b.name)
+            loop_b.symlink_to(loop_a.name)
+            (checkout / ".git").write_text("gitdir: ../loop-a\n", encoding="utf-8")
+            self.assert_invalid_checkout(checkout, temp_path / "ledger")
 
     def test_run_command_adapter_allows_repeated_runs_with_same_evidence_dir(self):
         with tempfile.TemporaryDirectory() as temp_dir:
