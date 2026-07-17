@@ -776,7 +776,7 @@ def run_supervised_command(
         try:
             descendants.track(process.pid)
         except CandidateValidationError:
-            _terminate_untracked_process_group(process)
+            descendants.terminate_untracked(process)
             raise
         assert process.stdout is not None and process.stderr is not None
         input_bytes = memoryview(input_text.encode("utf-8")) if input_text else None
@@ -885,32 +885,6 @@ def _close_process_input(process: subprocess.Popen[bytes]) -> None:
         process.stdin = None
 
 
-def _terminate_untracked_process_group(process: subprocess.Popen[bytes]) -> None:
-    failure: OSError | subprocess.TimeoutExpired | None = None
-    try:
-        os.killpg(process.pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
-    except OSError as exc:
-        failure = exc
-        try:
-            process.kill()
-        except OSError:
-            pass
-    try:
-        process.wait(timeout=PROCESS_CLEANUP_SECONDS)
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        failure = failure or exc
-    finally:
-        for stream in (process.stdin, process.stdout, process.stderr):
-            if stream is not None:
-                stream.close()
-    if failure is not None:
-        raise CandidateValidationError(
-            "interrupted", "untracked process group could not be terminated"
-        ) from failure
-
-
 def _capture_output(
     stream: Any,
     captured: bytearray,
@@ -1007,6 +981,58 @@ class _LinuxDescendantSupervisor:
         raise CandidateValidationError(
             "interrupted", "validation process tree could not be terminated"
         )
+
+    def terminate_untracked(self, process: subprocess.Popen[bytes]) -> None:
+        failure: OSError | None = None
+        deadline = time.monotonic() + PROCESS_CLEANUP_SECONDS
+        try:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except OSError as exc:
+                failure = exc
+            while time.monotonic() < deadline:
+                process.poll()
+                children = [
+                    pid
+                    for pid in _proc_children(os.getpid())
+                    if pid not in self._baseline
+                ]
+                for pid in children:
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    except OSError as exc:
+                        failure = failure or exc
+                for pid in children:
+                    if pid == process.pid:
+                        continue
+                    try:
+                        os.waitpid(pid, os.WNOHANG)
+                    except ChildProcessError:
+                        pass
+                    except OSError as exc:
+                        failure = failure or exc
+                process.poll()
+                remaining = [
+                    pid
+                    for pid in _proc_children(os.getpid())
+                    if pid not in self._baseline
+                ]
+                if process.returncode is not None and not remaining:
+                    if failure is None:
+                        return
+                    break
+                time.sleep(0.01)
+        finally:
+            for stream in (process.stdin, process.stdout, process.stderr):
+                if stream is not None:
+                    stream.close()
+        raise CandidateValidationError(
+            "interrupted", "untracked process tree could not be terminated"
+        ) from failure
 
     def _wait_for_exit(self, root_pid: int, requested_signal: signal.Signals) -> bool:
         deadline = time.monotonic() + PROCESS_CLEANUP_SECONDS

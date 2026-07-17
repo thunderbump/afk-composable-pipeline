@@ -55,20 +55,36 @@ class SupervisedCommandTest(unittest.TestCase):
 
         self.assertLess(time.monotonic() - started, 0.8)
 
-    def test_initial_tracking_failure_terminates_child_before_mutation(self):
+    def test_initial_tracking_failure_terminates_detached_child_before_mutation(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             marker = root / "late-mutation"
-            command = (
-                "import time; time.sleep(0.2);"
+            ready = root / "detached-ready"
+            child = (
+                "import time; time.sleep(0.3);"
                 f"open({str(marker)!r},'w').write('mutated')"
             )
+            command = (
+                "import subprocess,sys,time;"
+                f"subprocess.Popen([sys.executable,'-c',{child!r}],"
+                "start_new_session=True);"
+                f"open({str(ready)!r},'w').write('ready');"
+                "time.sleep(30)"
+            )
+
+            def fail_after_detach(_pid):
+                deadline = time.monotonic() + 1
+                while not ready.exists() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                if not ready.exists():
+                    raise AssertionError("detached child was not launched")
+                raise OSError("unavailable")
 
             with (
                 mock.patch.object(
                     candidate_validation.os,
                     "pidfd_open",
-                    side_effect=OSError("unavailable"),
+                    side_effect=fail_after_detach,
                 ),
                 self.assertRaisesRegex(
                     CandidateValidationError, "supervision is unavailable"
@@ -82,7 +98,7 @@ class SupervisedCommandTest(unittest.TestCase):
                     label="Codex",
                 )
 
-            time.sleep(0.3)
+            time.sleep(0.4)
             self.assertFalse(marker.exists())
 
     def test_each_output_stream_is_independently_size_limited(self):
