@@ -25,6 +25,8 @@ from afk.run_store import RunStore, RunStoreError
 
 
 COMMAND_TIMEOUT_SECONDS = 3600
+BEAD_COMMENT_CONTEXT_MAX_CHARS = 4_000
+BEAD_COMMENT_CONTEXT_MAX_ITEMS = 8
 REPORT_SCHEMA = {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "type": "object",
@@ -482,6 +484,7 @@ def _implementation_prompt(
     worktree: Path,
     branch: str,
 ) -> str:
+    bead = redact_artifact_value(bead)
     return f"""# AFK implementation attempt
 
 Run: {identity['run_id']}
@@ -497,6 +500,10 @@ ID: {_field(bead, 'id')}
 Title: {_field(bead, 'title')}
 Description: {_field(bead, 'description')}
 Acceptance criteria: {_field(bead, 'acceptance_criteria')}
+
+## Immutable Bead comments (latest first)
+
+{_bead_comment_context(bead)}
 
 ## Contract
 
@@ -517,6 +524,23 @@ Finish with the schema-constrained report. `completed` means HEAD advanced with
 one or more ordinary commits and the worktree is clean. Use `no_change` when no
 commit is needed and `blocked` when safe completion is impossible.
 """
+
+
+def _bead_comment_context(bead: dict[str, Any]) -> str:
+    comments = bead.get("comments")
+    if not isinstance(comments, list) or not comments:
+        return "(none)"
+    lines = []
+    remaining = BEAD_COMMENT_CONTEXT_MAX_CHARS
+    for comment in reversed(comments[-BEAD_COMMENT_CONTEXT_MAX_ITEMS:]):
+        if remaining <= 0:
+            break
+        line = "- " + canonical_json(comment)
+        if len(line) > remaining:
+            line = line[: max(0, remaining - 1)] + "…"
+        lines.append(line)
+        remaining -= len(line) + 1
+    return "\n".join(lines)
 
 
 def _repair_prompt(

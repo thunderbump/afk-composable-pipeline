@@ -241,6 +241,53 @@ class CandidateTest(unittest.TestCase):
         )
         self.assertEqual(self.store.effect("run-1", "pr-create")["status"], "confirmed")
 
+    def test_implementation_prompt_includes_bounded_redacted_immutable_comments(self):
+        comments = [
+            {"text": f"historical-{index} " + "noise " * 180} for index in range(10)
+        ]
+        comments.extend(
+            [
+                {"text": "previous unresolved diagnostic"},
+                {
+                    "text": (
+                        "latest unresolved diagnostic: runtime assets are mode 0600; "
+                        "password=comment-secret"
+                    )
+                },
+            ]
+        )
+        persist_bead_spec(
+            self.store,
+            "run-1",
+            {
+                "id": "central-test.1",
+                "title": "Implement the thing",
+                "description": "Change one file.",
+                "acceptance_criteria": "The file exists.",
+                "status": "open",
+                "comments": comments,
+            },
+        )
+
+        self.produce()
+
+        prompt = (
+            self.state / "runs/run-1/attempts/implementation-1/prompt.md"
+        ).read_text(encoding="utf-8")
+        context = prompt.split("## Immutable Bead comments (latest first)\n\n", 1)[
+            1
+        ].split("\n\n## Contract", 1)[0]
+        self.assertLessEqual(len(context), 4_000)
+        self.assertIn("latest unresolved diagnostic", context)
+        self.assertIn("previous unresolved diagnostic", context)
+        self.assertLess(
+            context.index("latest unresolved diagnostic"),
+            context.index("previous unresolved diagnostic"),
+        )
+        self.assertNotIn("historical-0", context)
+        self.assertNotIn("comment-secret", prompt)
+        self.assertIn("password=[REDACTED]", context)
+
     def test_repair_prompt_redacts_structured_bead_and_brief(self):
         prompt = candidate_module._repair_prompt(
             {"run_id": "run-1", "repository": "owner/project"},

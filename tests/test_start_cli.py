@@ -399,6 +399,109 @@ class StartCliTest(unittest.TestCase):
         self.assertEqual(bundle["bead"]["status"], "open")
         self.assertEqual(bundle["bead"].get("comments", []), [])
 
+    def test_start_seals_tracker_comments_for_the_candidate_prompt(self):
+        comments = [
+            {
+                "id": "comment-1",
+                "issue_id": "central-bnkl.1.1",
+                "author": "bump",
+                "text": "previous tracker diagnostic",
+                "created_at": "2026-07-17T20:00:00Z",
+            },
+            {
+                "id": "comment-2",
+                "issue_id": "central-bnkl.1.1",
+                "author": "bump",
+                "text": (
+                    "latest tracker diagnostic: runtime assets are mode 0600; "
+                    "password=comment-secret"
+                ),
+                "created_at": "2026-07-17T21:00:00Z",
+            },
+        ]
+
+        started = self.run_afk(
+            "start",
+            "central-bnkl.1.1",
+            AFK_FAKE_BEAD_COMMENTS=json.dumps(comments),
+        )
+
+        self.assertEqual(started.returncode, 0, started.stderr)
+        run_id = started.stdout.strip()
+        sealed_bead = json.loads(
+            (
+                self.state_home
+                / "afk"
+                / "runs"
+                / run_id
+                / "attempts/start-bead-spec/bead.json"
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual(sealed_bead["comments"][0], comments[0])
+        self.assertEqual(
+            sealed_bead["comments"][1]["text"],
+            "latest tracker diagnostic: runtime assets are mode 0600; "
+            "password=[REDACTED]",
+        )
+
+        completed = self.run_afk("_worker", run_id)
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        prompt = (
+            self.state_home
+            / "afk"
+            / "runs"
+            / run_id
+            / "attempts/implementation-1/prompt.md"
+        ).read_text(encoding="utf-8")
+        self.assertIn("latest tracker diagnostic", prompt)
+        self.assertNotIn("comment-secret", prompt)
+        self.assertLess(
+            prompt.index("latest tracker diagnostic"),
+            prompt.index("previous tracker diagnostic"),
+        )
+        commands = [
+            json.loads(line)
+            for line in self.command_log.read_text(encoding="utf-8").splitlines()
+        ]
+        bd_args = [record["args"] for record in commands if record["command"] == "bd"]
+        self.assertIn(["show", "central-bnkl.1.1", "--json"], bd_args)
+        self.assertIn(["comments", "central-bnkl.1.1", "--json"], bd_args)
+
+    def test_start_fails_closed_on_a_malformed_tracker_comment(self):
+        malformed = [
+            {
+                "id": "",
+                "issue_id": "central-bnkl.1.1",
+                "author": "bump",
+                "text": "diagnostic",
+                "created_at": "2026-07-17T21:00:00Z",
+            }
+        ]
+
+        completed = self.run_afk(
+            "start",
+            "central-bnkl.1.1",
+            AFK_FAKE_BEAD_COMMENTS=json.dumps(malformed),
+        )
+
+        self.assertEqual(completed.returncode, 2)
+        run_id = completed.stdout.strip()
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(status["checkpoint"], "created")
+        self.assertEqual(status["attention"]["scope"], "bead_preflight")
+        self.assertEqual(status["attention"]["kind"], "invalid")
+        self.assertEqual(status["attention"]["classification"], "malformed_output")
+        self.assertFalse(
+            (
+                self.state_home / "afk" / "runs" / run_id / "attempts/start-bead-spec"
+            ).exists()
+        )
+        self.assertNotIn(
+            '"command":"systemd-run"',
+            self.command_log.read_text(encoding="utf-8"),
+        )
+
     def test_candidate_contract_changes_remain_proposals_for_later_validation(self):
         home = self.temp
         (home / ".fake-contract-proposal").write_text("enabled", encoding="utf-8")
@@ -1731,11 +1834,12 @@ class StartCliTest(unittest.TestCase):
                             "title": "Create the first slice",
                             "description": os.environ["AFK_FAKE_BEAD_DESCRIPTION"],
                             "acceptance_criteria": "Candidate is committed.",
-                            "comments": json.loads(os.environ["AFK_FAKE_BEAD_COMMENTS"]),
                             "status": status,
                             "assignee": assignee,
                             "labels": labels,
                         }]))
+                    elif args[:1] == ["comments"]:
+                        print(os.environ["AFK_FAKE_BEAD_COMMENTS"])
                     elif args[:1] == ["update"]:
                         if os.environ.get("AFK_FAKE_CLAIM_FAILURE"):
                             print("claim failed", file=sys.stderr)

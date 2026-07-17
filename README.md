@@ -67,6 +67,11 @@ repaired bootstrap Candidate awaiting approval includes its exact Candidate
 and harness identity, why the prior approval no longer applies, and the
 approval and resume commands. It does not introduce a new Run State.
 
+The initial Candidate implementation prompt uses the immutable Bead snapshot
+recorded at Run start. It includes at most the newest eight Bead comments in
+latest-first order under a 4,000-character section budget, after structured
+secret redaction. Live tracker changes cannot alter that context.
+
 When `--ledger` is omitted, AFK resolves ledger output with this precedence:
 `--ledger` > `AFK_LEDGER_DIR` > `./ledgers`. Preview-only `run-next` does not
 create `./ledgers`; the directory is only created when execution actually writes
