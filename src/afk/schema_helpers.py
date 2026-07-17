@@ -101,7 +101,7 @@ def normalize_prepared_checkout(
     checkout_path = Path(path)
     if not checkout_path.is_absolute():
         return {"status": "invalid", "message": "checkout.checkout_path must be absolute"}
-    if not (checkout_path / ".git").is_dir():
+    if not _is_git_checkout(checkout_path):
         return {"status": "invalid", "message": "checkout.checkout_path must be a git checkout"}
     normalized = {
         "path": str(checkout_path),
@@ -113,6 +113,25 @@ def normalize_prepared_checkout(
         repo_url = string_field(checkout, "repo_url") or ""
         normalized["repo_url"] = redact_repo_url(repo_url) if redact_repo_url is not None else repo_url
     return {"status": "valid", "checkout": normalized}
+
+
+def _is_git_checkout(checkout_path: Path) -> bool:
+    dot_git = checkout_path / ".git"
+    if dot_git.is_dir():
+        return True
+    if not dot_git.is_file():
+        return False
+    try:
+        marker = dot_git.read_text(encoding="utf-8").strip()
+        if not marker.startswith("gitdir: "):
+            return False
+        git_dir = Path(marker.removeprefix("gitdir: "))
+        if not git_dir.is_absolute():
+            git_dir = dot_git.parent / git_dir
+        backlink = Path((git_dir / "gitdir").read_text(encoding="utf-8").strip())
+        return git_dir.is_dir() and backlink.resolve() == dot_git.resolve()
+    except (OSError, UnicodeDecodeError):
+        return False
 
 
 def validation_artifact_ref(
