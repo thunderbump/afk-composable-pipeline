@@ -18,9 +18,64 @@ from afk.candidate_gate import (  # noqa: E402
     run_candidate_reviews,
 )
 from afk.run_store import RunStore  # noqa: E402
+from afk.start import _advance_completed_gate  # noqa: E402
 
 
 class CandidateGateTest(unittest.TestCase):
+    def test_repaired_bootstrap_candidate_pauses_for_explicit_reapproval(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store = RunStore(root / "state")
+            run_id = store.create_run(
+                bead_id="central-test.1",
+                repository="owner/project",
+                base_branch="main",
+                base_sha="a" * 40,
+                start_request={},
+                run_id="run-1",
+            )["run_id"]
+            store.append_event(
+                run_id,
+                "gate.cycle_completed",
+                state="candidate_ready",
+                data={
+                    "checkpoint": "candidate_ready",
+                    "candidate_sha": "b" * 40,
+                    "validation_contract": {
+                        "source": "approved_bootstrap",
+                        "base_sha": "a" * 40,
+                        "adapter_id": "afk.builtin.bootstrap-validation/v1",
+                        "approval": {},
+                    },
+                },
+            )
+            outcome = {
+                "next_action": "repair",
+                "repair_brief": {
+                    "candidate_sha": "b" * 40,
+                    "repair_attempt": 1,
+                    "blocking_findings": [],
+                },
+            }
+
+            with (
+                mock.patch("afk.start.produce_repair_candidate"),
+                mock.patch("afk.start._advance_validation") as validation,
+            ):
+                exit_code = _advance_completed_gate(
+                    store,
+                    run_id,
+                    outcome=outcome,
+                    bead={"id": "central-test.1"},
+                )
+
+            self.assertEqual(exit_code, 2)
+            validation.assert_not_called()
+            status = store.status(run_id)
+            self.assertEqual(status["attention"]["scope"], "validation")
+            self.assertEqual(status["attention"]["kind"], "unavailable")
+            self.assertIn("reapproval", status["attention"]["summary"])
+
     def test_passed_validation_and_both_reviews_reach_reviewed(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

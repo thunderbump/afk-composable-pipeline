@@ -811,6 +811,22 @@ def _advance_completed_gate(
             ),
         )
         return 2
+    validation_contract = store.status(run_id).get("validation_contract", {})
+    if (
+        isinstance(validation_contract, dict)
+        and validation_contract.get("source") == "approved_bootstrap"
+    ):
+        _attention(
+            store,
+            run_id,
+            checkpoint="candidate_ready",
+            scope="validation",
+            kind="unavailable",
+            summary=(
+                "repaired bootstrap Candidate requires explicit operator reapproval"
+            ),
+        )
+        return 2
     return _advance_validation(store, run_id)
 
 
