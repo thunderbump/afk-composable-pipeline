@@ -767,6 +767,115 @@ class CandidateGateTest(unittest.TestCase):
             status = store.status(run_id)
             self.assertEqual(status["repair_attempts_used"], 4)
             self.assertEqual(status["attention"]["kind"], "exhausted")
+            self.assertEqual(status["interrupted_repair"]["status"], "exhausted")
+            last_sequence = status["last_sequence"]
+
+            with (
+                mock.patch("afk.start.RunStore", return_value=store),
+                mock.patch("afk.start.produce_repair_candidate") as retried_repair,
+            ):
+                resumed_again = resume_run()
+
+            self.assertEqual(resumed_again, (run_id, 2))
+            self.assertEqual(store.status(run_id)["last_sequence"], last_sequence)
+            retried_repair.assert_not_called()
+
+    def test_resume_keeps_interrupted_repair_continuation_after_attention(self):
+        for checkpoint in ("validated", "candidate_ready"):
+            with (
+                self.subTest(checkpoint=checkpoint),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                root = Path(temporary)
+                store = RunStore(root / "state")
+                run_id = store.create_run(
+                    bead_id="central-test.1",
+                    repository="owner/project",
+                    base_branch="main",
+                    base_sha="a" * 40,
+                    start_request={},
+                    run_id="run-1",
+                )["run_id"]
+                first_brief = {
+                    "schema_version": 1,
+                    "candidate_sha": "b" * 40,
+                    "repair_attempt": 1,
+                    "blocking_findings": [],
+                }
+                next_brief = {**first_brief, "repair_attempt": 2}
+                interruption = {
+                    "schema_version": 1,
+                    "candidate_sha": "b" * 40,
+                    "repair_attempt": 1,
+                    "status": "interrupted",
+                    "summary": "repair execution ended before evidence was sealed",
+                }
+                store.append_event(
+                    run_id,
+                    "gate.cycle_completed",
+                    state=checkpoint,
+                    data={
+                        "checkpoint": checkpoint,
+                        "candidate_sha": "b" * 40,
+                        "worker_exit_code": 0,
+                        "gate_cycles": [
+                            {"next_action": "repair", "repair_brief": first_brief}
+                        ],
+                    },
+                )
+                store.append_event(
+                    run_id,
+                    "repair.started",
+                    data={
+                        "checkpoint": checkpoint,
+                        "repair_attempts_used": 1,
+                        "repair_brief": first_brief,
+                    },
+                )
+                store.write_evidence_value(
+                    run_id, "attempts/repair-1/interruption.json", interruption
+                )
+                store.seal_evidence(run_id, "attempts/repair-1")
+                store.append_event(
+                    run_id,
+                    "repair.interrupted",
+                    data={
+                        "checkpoint": checkpoint,
+                        "repair_attempts_used": 1,
+                        "repair_brief": next_brief,
+                        "interrupted_repair": interruption,
+                    },
+                )
+                store.append_event(
+                    run_id,
+                    "run.attention_required",
+                    state="attention_required",
+                    data={
+                        "checkpoint": checkpoint,
+                        "attention": {
+                            "scope": "repair",
+                            "kind": "unavailable",
+                            "summary": "transient failure",
+                        },
+                    },
+                )
+
+                with (
+                    mock.patch("afk.start.RunStore", return_value=store),
+                    mock.patch(
+                        "afk.start._advance_completed_gate", return_value=0
+                    ) as repair,
+                    mock.patch("afk.start._advance_gate") as gate,
+                ):
+                    resumed = resume_run()
+
+                self.assertEqual(resumed, (run_id, 0))
+                repair.assert_called_once_with(
+                    store,
+                    run_id,
+                    outcome={"next_action": "repair", "repair_brief": next_brief},
+                )
+                gate.assert_not_called()
 
     def test_passed_validation_and_both_reviews_reach_reviewed(self):
         with tempfile.TemporaryDirectory() as temporary:

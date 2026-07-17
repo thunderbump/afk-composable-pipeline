@@ -248,6 +248,7 @@ def produce_repair_candidate(
             "checkpoint": projection["checkpoint"],
             "repair_attempts_used": attempt_number,
             "repair_brief": repair_brief,
+            "interrupted_repair": {},
         },
     )
     prompt = _repair_prompt(identity, bead, repair_brief, worktree, branch)

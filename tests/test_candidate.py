@@ -445,6 +445,7 @@ class CandidateTest(unittest.TestCase):
         self.assertTrue((second_attempt / "report.json").is_file())
         self.assertTrue((second_attempt / "manifest.json").is_file())
         self.assertEqual(self.store.status("run-1")["repair_attempts_used"], 2)
+        self.assertEqual(self.store.status("run-1")["interrupted_repair"], {})
 
     def test_timed_out_repair_seals_evidence_and_leaves_no_descendant_mutation(self):
         first = self.produce()

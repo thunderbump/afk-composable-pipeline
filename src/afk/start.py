@@ -160,7 +160,12 @@ def resume_run(*, note: str | None = None) -> tuple[str, int]:
             return run_id, _recover_validation_attempt(store, run_id, projection)
         if _repair_interruption_pending(store, run_id, projection):
             return run_id, _recover_interrupted_repair(store, run_id, projection)
-        if projection["last_event"] == "repair.interrupted":
+        if _interrupted_repair_terminal(projection):
+            return run_id, 2
+        if (
+            _interrupted_repair_resume_ready(projection)
+            or projection["last_event"] == "repair.interrupted"
+        ):
             return run_id, _advance_interrupted_repair(store, run_id, projection)
         if _repair_resume_ready(projection):
             return run_id, _advance_completed_gate(store, run_id)
@@ -382,6 +387,41 @@ def _repair_interruption_pending(
     )
 
 
+def _interrupted_repair_resume_ready(projection: dict[str, Any]) -> bool:
+    interruption = projection.get("interrupted_repair")
+    brief = projection.get("repair_brief")
+    used = projection.get("repair_attempts_used")
+    return (
+        isinstance(interruption, dict)
+        and interruption.get("schema_version") == 1
+        and interruption.get("status") == "interrupted"
+        and interruption.get("candidate_sha") == projection.get("candidate_sha")
+        and interruption.get("repair_attempt") == used
+        and type(used) is int
+        and 1 <= used <= 4
+        and isinstance(brief, dict)
+        and (
+            brief == {}
+            if used == 4
+            else brief.get("candidate_sha") == projection.get("candidate_sha")
+            and brief.get("repair_attempt") == used + 1
+        )
+    )
+
+
+def _interrupted_repair_terminal(projection: dict[str, Any]) -> bool:
+    interruption = projection.get("interrupted_repair")
+    return (
+        isinstance(interruption, dict)
+        and interruption.get("schema_version") == 1
+        and interruption.get("status") == "exhausted"
+        and interruption.get("candidate_sha") == projection.get("candidate_sha")
+        and interruption.get("repair_attempt") == 4
+        and projection.get("repair_attempts_used") == 4
+        and projection.get("repair_brief") == {}
+    )
+
+
 def _recover_interrupted_repair(
     store: RunStore, run_id: str, projection: dict[str, Any]
 ) -> int:
@@ -423,24 +463,7 @@ def _advance_interrupted_repair(
     store: RunStore, run_id: str, projection: dict[str, Any]
 ) -> int:
     used = projection.get("repair_attempts_used")
-    if used == 4:
-        _attention(
-            store,
-            run_id,
-            checkpoint=projection["checkpoint"],
-            scope="repair",
-            kind="exhausted",
-            summary="repair budget exhausted after interrupted fourth attempt",
-        )
-        return 2
-    brief = projection.get("repair_brief")
-    if (
-        type(used) is not int
-        or not 1 <= used < 4
-        or not isinstance(brief, dict)
-        or brief.get("repair_attempt") != used + 1
-        or brief.get("candidate_sha") != projection.get("candidate_sha")
-    ):
+    if not _interrupted_repair_resume_ready(projection):
         _attention(
             store,
             run_id,
@@ -450,6 +473,19 @@ def _advance_interrupted_repair(
             summary="interrupted repair continuation is invalid",
         )
         return 2
+    if used == 4:
+        interruption = projection.get("interrupted_repair", {})
+        _attention(
+            store,
+            run_id,
+            checkpoint=projection["checkpoint"],
+            scope="repair",
+            kind="exhausted",
+            summary="repair budget exhausted after interrupted fourth attempt",
+            interrupted_repair={**interruption, "status": "exhausted"},
+        )
+        return 2
+    brief = projection["repair_brief"]
     return _advance_completed_gate(
         store,
         run_id,
