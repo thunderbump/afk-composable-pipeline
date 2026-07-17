@@ -170,6 +170,9 @@ def resume_run(*, note: str | None = None) -> tuple[str, int]:
             return run_id, _advance_interrupted_repair(store, run_id, projection)
         if _repair_resume_ready(projection):
             return run_id, _advance_completed_gate(store, run_id)
+        attention = projection.get("attention")
+        if isinstance(attention, dict) and attention.get("scope") == "gate":
+            return run_id, _advance_gate(store, run_id)
         if projection["checkpoint"] == "reviewed":
             return run_id, 0
         if projection["checkpoint"] == "validated":

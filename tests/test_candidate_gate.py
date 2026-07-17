@@ -853,6 +853,51 @@ class CandidateGateTest(unittest.TestCase):
             self.assertEqual(status["attention"]["kind"], "exhausted")
             self.assertEqual(status["interrupted_repair"]["status"], "exhausted")
 
+    def test_resume_retries_gate_reconciliation_after_gate_attention(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store = RunStore(root / "state")
+            run_id = store.create_run(
+                bead_id="central-test.1",
+                repository="owner/project",
+                base_branch="main",
+                base_sha="a" * 40,
+                start_request={},
+                run_id="run-1",
+            )["run_id"]
+            store.append_event(
+                run_id,
+                "validation.rejected",
+                state="candidate_ready",
+                data={
+                    "checkpoint": "candidate_ready",
+                    "candidate_sha": "b" * 40,
+                    "worker_exit_code": 2,
+                },
+            )
+            store.append_event(
+                run_id,
+                "run.attention_required",
+                state="attention_required",
+                data={
+                    "checkpoint": "candidate_ready",
+                    "attention": {
+                        "scope": "gate",
+                        "kind": "inconclusive",
+                        "summary": "GitHub comment command failed",
+                    },
+                },
+            )
+
+            with (
+                mock.patch("afk.start.RunStore", return_value=store),
+                mock.patch("afk.start._advance_gate", return_value=0) as gate,
+            ):
+                resumed = resume_run()
+
+            self.assertEqual(resumed, (run_id, 0))
+            gate.assert_called_once_with(store, run_id)
+
     def test_resume_keeps_interrupted_repair_continuation_after_attention(self):
         for checkpoint in ("validated", "candidate_ready"):
             with (
