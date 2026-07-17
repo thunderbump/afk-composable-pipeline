@@ -190,20 +190,17 @@ def complete_gate_cycle(
         and item.get("candidate_sha") == candidate_sha
         for item in cycles
     ):
+        checkpoint = (
+            "reviewed"
+            if outcome["next_action"] == "complete"
+            else "validated" if validation["status"] == "passed" else "candidate_ready"
+        )
         store.append_event(
             run_id,
             "gate.cycle_completed",
-            state=(
-                "reviewed"
-                if outcome["next_action"] == "complete"
-                else "candidate_ready"
-            ),
+            state=checkpoint,
             data={
-                "checkpoint": (
-                    "reviewed"
-                    if outcome["next_action"] == "complete"
-                    else "candidate_ready"
-                ),
+                "checkpoint": checkpoint,
                 "gate_cycles": [*cycles, outcome],
                 "attention": {},
             },

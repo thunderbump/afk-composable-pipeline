@@ -168,6 +168,56 @@ class CandidateGateTest(unittest.TestCase):
                     self.assertEqual(attention["kind"], "unavailable")
                     self.assertIn("reapproval", attention["summary"])
 
+    def test_resume_continues_validated_repair_attempt(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store = RunStore(Path(temporary) / "state")
+            run_id = store.create_run(
+                bead_id="central-test.1",
+                repository="owner/project",
+                base_branch="main",
+                base_sha="a" * 40,
+                start_request={},
+                run_id="run-1",
+            )["run_id"]
+            brief = {
+                "candidate_sha": "b" * 40,
+                "repair_attempt": 1,
+                "blocking_findings": [],
+            }
+            outcome = {"next_action": "repair", "repair_brief": brief}
+            store.append_event(
+                run_id,
+                "gate.cycle_completed",
+                state="validated",
+                data={
+                    "checkpoint": "validated",
+                    "candidate_sha": "b" * 40,
+                    "gate_cycles": [outcome],
+                },
+            )
+            store.append_event(
+                run_id,
+                "repair.started",
+                data={
+                    "checkpoint": "validated",
+                    "repair_attempts_used": 1,
+                    "repair_brief": brief,
+                },
+            )
+
+            with (
+                mock.patch("afk.start.RunStore", return_value=store),
+                mock.patch(
+                    "afk.start._advance_completed_gate", return_value=0
+                ) as repair,
+                mock.patch("afk.start._advance_gate") as gate,
+            ):
+                resumed = resume_run()
+
+            self.assertEqual(resumed, (run_id, 0))
+            repair.assert_called_once_with(store, run_id)
+            gate.assert_not_called()
+
     def test_passed_validation_and_both_reviews_reach_reviewed(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -227,6 +277,70 @@ class CandidateGateTest(unittest.TestCase):
             self.assertEqual(store.status(run_id)["checkpoint"], "reviewed")
             run_reviews.assert_called_once()
 
+    def test_inconclusive_review_preserves_validated_checkpoint(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout = root / "checkout"
+            checkout.mkdir()
+            store = RunStore(root / "state")
+            run_id = store.create_run(
+                bead_id="central-test.1",
+                repository="owner/project",
+                base_branch="main",
+                base_sha="a" * 40,
+                start_request={},
+                run_id="run-1",
+            )["run_id"]
+            store.write_evidence_text(run_id, "gates/validation-b/result.json", "{}\n")
+            store.seal_evidence(run_id, "gates/validation-b")
+            store.append_event(
+                run_id,
+                "validation.passed",
+                state="validated",
+                data={
+                    "checkpoint": "validated",
+                    "candidate_sha": "b" * 40,
+                    "worktree_path": str(checkout),
+                    "pr_number": 7,
+                    "validation": {
+                        "status": "passed",
+                        "candidate_sha": "b" * 40,
+                        "summary": "passed",
+                        "evidence": "gates/validation-b",
+                        "checks": [],
+                    },
+                },
+            )
+            reviews = [
+                {
+                    "axis": "standards",
+                    "process_status": "failed",
+                    "status": "inconclusive",
+                    "summary": "reviewer timed out",
+                    "findings": [],
+                },
+                {
+                    "axis": "spec",
+                    "process_status": "succeeded",
+                    "status": "passed",
+                    "summary": "passed",
+                    "findings": [],
+                },
+            ]
+
+            with (
+                mock.patch(
+                    "afk.candidate_gate.run_candidate_reviews", return_value=reviews
+                ),
+                mock.patch("afk.candidate_gate.reconcile_gate_comment"),
+            ):
+                outcome = complete_gate_cycle(
+                    store, run_id, bead={"id": "central-test.1"}
+                )
+
+            self.assertEqual(outcome["next_action"], "attention")
+            self.assertEqual(store.status(run_id)["checkpoint"], "validated")
+
     def test_four_rejected_repairs_exhaust_the_budget_without_a_fifth_brief(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -277,6 +391,83 @@ class CandidateGateTest(unittest.TestCase):
             self.assertEqual(outcome["next_action"], "attention")
             self.assertIn("four", outcome["stop_reason"])
             self.assertNotIn("repair_brief", outcome)
+            self.assertEqual(store.status(run_id)["checkpoint"], "candidate_ready")
+
+    def test_fourth_review_rejection_exhaustion_preserves_validated_checkpoint(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout = root / "checkout"
+            checkout.mkdir()
+            store = RunStore(root / "state")
+            run_id = store.create_run(
+                bead_id="central-test.1",
+                repository="owner/project",
+                base_branch="main",
+                base_sha="a" * 40,
+                start_request={},
+                run_id="run-1",
+            )["run_id"]
+            store.write_evidence_text(run_id, "gates/validation-b/result.json", "{}\n")
+            store.seal_evidence(run_id, "gates/validation-b")
+            store.append_event(
+                run_id,
+                "validation.passed",
+                state="validated",
+                data={
+                    "checkpoint": "validated",
+                    "candidate_sha": "b" * 40,
+                    "worktree_path": str(checkout),
+                    "pr_number": 7,
+                    "repair_attempts_used": 4,
+                    "validation": {
+                        "status": "passed",
+                        "candidate_sha": "b" * 40,
+                        "summary": "passed",
+                        "evidence": "gates/validation-b",
+                        "checks": [],
+                    },
+                },
+            )
+            reviews = [
+                {
+                    "axis": "standards",
+                    "process_status": "succeeded",
+                    "status": "rejected",
+                    "summary": "still rejected",
+                    "findings": [
+                        {
+                            "id": "standards-blocker",
+                            "priority": "high",
+                            "title": "Blocking issue",
+                            "body": "The issue remains.",
+                            "path": "app.py",
+                            "line": 1,
+                            "blocking": True,
+                        }
+                    ],
+                },
+                {
+                    "axis": "spec",
+                    "process_status": "succeeded",
+                    "status": "passed",
+                    "summary": "passed",
+                    "findings": [],
+                },
+            ]
+
+            with (
+                mock.patch(
+                    "afk.candidate_gate.run_candidate_reviews", return_value=reviews
+                ),
+                mock.patch("afk.candidate_gate.reconcile_gate_comment"),
+            ):
+                outcome = complete_gate_cycle(
+                    store, run_id, bead={"id": "central-test.1"}
+                )
+
+            self.assertEqual(outcome["next_action"], "attention")
+            self.assertIn("four", outcome["stop_reason"])
+            self.assertEqual(store.status(run_id)["checkpoint"], "validated")
 
     def test_rejected_validation_completes_cycle_and_returns_one_repair_brief(self):
         with tempfile.TemporaryDirectory() as temporary:

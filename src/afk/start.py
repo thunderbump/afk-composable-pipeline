@@ -151,6 +151,8 @@ def resume_run(*, note: str | None = None) -> tuple[str, int]:
         run_id = projection["run_id"]
         if _validation_attempt_open(projection):
             return run_id, _recover_validation_attempt(store, run_id, projection)
+        if _repair_resume_ready(projection):
+            return run_id, _advance_completed_gate(store, run_id)
         if projection["checkpoint"] == "reviewed":
             return run_id, 0
         if projection["checkpoint"] == "validated":
@@ -161,8 +163,6 @@ def resume_run(*, note: str | None = None) -> tuple[str, int]:
             return run_id, _advance_completed_gate(store, run_id)
         if projection["last_event"] == "candidate.repaired":
             return run_id, _advance_repaired_candidate(store, run_id)
-        if _repair_resume_ready(projection):
-            return run_id, _advance_completed_gate(store, run_id)
         if "worker_exit_code" in projection:
             if _candidate_resume_ready(projection):
                 return run_id, _advance_candidate(store, run_id)
@@ -346,7 +346,7 @@ def _validation_resume_ready(projection: dict[str, Any]) -> bool:
 def _repair_resume_ready(projection: dict[str, Any]) -> bool:
     brief = projection.get("repair_brief")
     return (
-        projection["checkpoint"] == "candidate_ready"
+        projection["checkpoint"] in {"candidate_ready", "validated"}
         and isinstance(brief, dict)
         and brief.get("candidate_sha") == projection.get("candidate_sha")
         and brief.get("repair_attempt") == projection.get("repair_attempts_used")

@@ -333,6 +333,15 @@ class CandidateTest(unittest.TestCase):
                 }
             ],
         }
+        self.store.append_event(
+            "run-1",
+            "gate.cycle_completed",
+            state="validated",
+            data={
+                "checkpoint": "validated",
+                "repair_brief": brief,
+            },
+        )
         (self.codex_home / "fake-outcome").write_text("timeout", encoding="utf-8")
 
         with (
@@ -359,6 +368,7 @@ class CandidateTest(unittest.TestCase):
         self.assertTrue((attempt / "manifest.json").is_file())
         outcome = json.loads((attempt / "outcome.json").read_text(encoding="utf-8"))
         self.assertEqual(outcome["status"], "interrupted")
+        self.assertEqual(self.store.status("run-1")["checkpoint"], "validated")
 
     def test_repair_resume_reconciles_crash_windows_without_rerunning_codex(self):
         first = self.produce()

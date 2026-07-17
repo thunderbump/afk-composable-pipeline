@@ -241,7 +241,7 @@ def produce_repair_candidate(
         run_id,
         "repair.started",
         data={
-            "checkpoint": "candidate_ready",
+            "checkpoint": projection["checkpoint"],
             "repair_attempts_used": attempt_number,
             "repair_brief": repair_brief,
         },
