@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import subprocess
 from pathlib import Path
 from typing import Any, Callable
 
@@ -116,21 +118,32 @@ def normalize_prepared_checkout(
 
 
 def _is_git_checkout(checkout_path: Path) -> bool:
-    dot_git = checkout_path / ".git"
-    if dot_git.is_dir():
-        return True
-    if not dot_git.is_file():
-        return False
     try:
-        marker = dot_git.read_text(encoding="utf-8").strip()
-        if not marker.startswith("gitdir: "):
-            return False
-        git_dir = Path(marker.removeprefix("gitdir: "))
-        if not git_dir.is_absolute():
-            git_dir = dot_git.parent / git_dir
-        backlink = Path((git_dir / "gitdir").read_text(encoding="utf-8").strip())
-        return git_dir.is_dir() and backlink.resolve() == dot_git.resolve()
-    except (OSError, UnicodeDecodeError):
+        completed = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(checkout_path),
+                "rev-parse",
+                "--show-toplevel",
+                "--is-inside-work-tree",
+            ],
+            env={
+                key: value
+                for key, value in os.environ.items()
+                if not key.startswith("GIT_")
+            },
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        top_level, inside_work_tree = completed.stdout.splitlines()
+        return (
+            completed.returncode == 0
+            and inside_work_tree == "true"
+            and os.path.samefile(checkout_path, top_level)
+        )
+    except (OSError, ValueError):
         return False
 
 

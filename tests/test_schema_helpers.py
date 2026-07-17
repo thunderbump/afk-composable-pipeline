@@ -1,3 +1,4 @@
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -26,7 +27,11 @@ class SchemaHelpersTest(unittest.TestCase):
     def test_normalize_prepared_checkout_supports_optional_repo_url(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             checkout = Path(temp_dir) / "checkout"
-            (checkout / ".git").mkdir(parents=True)
+            subprocess.run(
+                ["git", "init", "--quiet", str(checkout)],
+                check=True,
+                capture_output=True,
+            )
 
             normalized = normalize_prepared_checkout(
                 {
