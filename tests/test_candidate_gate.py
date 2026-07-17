@@ -537,13 +537,39 @@ class CandidateGateTest(unittest.TestCase):
                 },
             )
             calls = []
-            bundle = (
-                f"gates/gate-cycle-1-{candidate_sha[:12]}/review-bundle/bundle.json"
-            )
-            store.write_evidence_text(run_id, bundle, "{}\n")
-            store.seal_evidence(
-                run_id, f"gates/gate-cycle-1-{candidate_sha[:12]}/review-bundle"
-            )
+            full_bead = {
+                "id": "central-test.1",
+                "title": "Test",
+                "description": "Test the gate.",
+                "acceptance_criteria": "Both axes pass.",
+            }
+
+            def seal_bundle_before_crash(cycle, bead):
+                bundle = f"gates/gate-cycle-{cycle}-{candidate_sha[:12]}/review-bundle"
+                original_seal = store.seal_evidence
+
+                def seal_then_crash(observed_run_id, relative_directory):
+                    manifest = original_seal(observed_run_id, relative_directory)
+                    if relative_directory == bundle:
+                        raise RuntimeError("crash after review bundle seal")
+                    return manifest
+
+                with (
+                    mock.patch.object(
+                        store, "seal_evidence", side_effect=seal_then_crash
+                    ),
+                    mock.patch("afk.candidate_gate._execute_reviewer") as reviewer,
+                    self.assertRaisesRegex(RuntimeError, "review bundle seal"),
+                ):
+                    run_candidate_reviews(
+                        store,
+                        run_id,
+                        cycle=cycle,
+                        bead=bead,
+                    )
+                reviewer.assert_not_called()
+
+            seal_bundle_before_crash(1, full_bead)
 
             def reviewer(axis, bundle_path, attempt_path, worktree):
                 calls.append((axis, bundle_path, attempt_path))
@@ -568,12 +594,7 @@ class CandidateGateTest(unittest.TestCase):
                 outcome = complete_gate_cycle(
                     store,
                     run_id,
-                    bead={
-                        "id": "central-test.1",
-                        "title": "Test",
-                        "description": "Test the gate.",
-                        "acceptance_criteria": "Both axes pass.",
-                    },
+                    bead=full_bead,
                 )
             reviews = outcome["reviews"]
 
@@ -586,9 +607,7 @@ class CandidateGateTest(unittest.TestCase):
             self.assertTrue((calls[1][2] / "manifest.json").is_file())
             self.assertEqual(outcome["next_action"], "complete")
 
-            second_bundle = f"gates/gate-cycle-2-{candidate_sha[:12]}/review-bundle"
-            store.write_evidence_text(run_id, f"{second_bundle}/bundle.json", "{}\n")
-            store.seal_evidence(run_id, second_bundle)
+            seal_bundle_before_crash(2, {"id": "central-test.1"})
             completed_standards = {
                 "axis": "standards",
                 "process_status": "succeeded",
@@ -683,9 +702,7 @@ class CandidateGateTest(unittest.TestCase):
                 "repair.started",
                 data={"checkpoint": "candidate_ready", "repair_attempts_used": 2},
             )
-            third_bundle = f"gates/gate-cycle-3-{candidate_sha[:12]}/review-bundle"
-            store.write_evidence_text(run_id, f"{third_bundle}/bundle.json", "{}\n")
-            store.seal_evidence(run_id, third_bundle)
+            seal_bundle_before_crash(3, {"id": "central-test.1"})
             store.write_evidence_text(
                 run_id, "attempts/review-cycle-3-standards/prompt.md", "started\n"
             )
@@ -702,9 +719,7 @@ class CandidateGateTest(unittest.TestCase):
                 "repair.started",
                 data={"checkpoint": "candidate_ready", "repair_attempts_used": 3},
             )
-            fourth_bundle = f"gates/gate-cycle-4-{candidate_sha[:12]}/review-bundle"
-            store.write_evidence_text(run_id, f"{fourth_bundle}/bundle.json", "{}\n")
-            store.seal_evidence(run_id, fourth_bundle)
+            seal_bundle_before_crash(4, {"id": "central-test.1"})
             tampered_attempt = (
                 root / "state" / "runs" / run_id / "attempts/review-cycle-4-standards"
             )
@@ -743,6 +758,87 @@ class CandidateGateTest(unittest.TestCase):
             ):
                 complete_gate_cycle(store, run_id, bead={"id": "central-test.1"})
             unsafe_retry.assert_not_called()
+
+            invalid_bundle = f"gates/gate-cycle-6-{candidate_sha[:12]}/review-bundle"
+            store.write_evidence_text(run_id, f"{invalid_bundle}/bundle.json", "{}\n")
+            store.seal_evidence(run_id, invalid_bundle)
+            with (
+                mock.patch("afk.candidate_gate._execute_reviewer") as unsafe_review,
+                self.assertRaisesRegex(GateError, "bundle"),
+            ):
+                run_candidate_reviews(
+                    store,
+                    run_id,
+                    cycle=6,
+                    bead={"id": "central-test.1"},
+                )
+            unsafe_review.assert_not_called()
+
+            exact_bead = {"id": "central-test.1"}
+            seal_bundle_before_crash(7, exact_bead)
+            valid_bundle_path = (
+                root
+                / "state"
+                / "runs"
+                / run_id
+                / f"gates/gate-cycle-7-{candidate_sha[:12]}/review-bundle/bundle.json"
+            )
+            valid_bundle = json.loads(valid_bundle_path.read_text(encoding="utf-8"))
+            contradictions = {
+                "extra field": lambda value: value.update(extra=True),
+                "run": lambda value: value.update(run_id="other-run"),
+                "repository": lambda value: value.update(repository="other/project"),
+                "base": lambda value: value.update(base_sha="f" * 40),
+                "candidate crossing": lambda value: value.update(
+                    candidate_sha="e" * 40
+                ),
+                "bead": lambda value: value.update(bead={"id": "central-other.1"}),
+                "validation": lambda value: value.update(validation={}),
+                "validation manifest": lambda value: value.update(
+                    validation_manifest={}
+                ),
+                "diff": lambda value: value.update(diff="different diff"),
+                "instructions": lambda value: value.update(
+                    repository_instructions=[
+                        {"path": "AGENTS.md", "content": "different"}
+                    ]
+                ),
+                "prior cycles": lambda value: value.update(prior_gate_cycles=[]),
+                "prior dispositions": lambda value: value.update(
+                    prior_dispositions=[
+                        {"finding_id": "other", "disposition": "addressed"}
+                    ]
+                ),
+            }
+            for cycle, (label, contradict) in enumerate(
+                contradictions.items(), start=8
+            ):
+                with self.subTest(label=label):
+                    contradicted = json.loads(json.dumps(valid_bundle))
+                    contradict(contradicted)
+                    contradicted_bundle = (
+                        f"gates/gate-cycle-{cycle}-{candidate_sha[:12]}"
+                        "/review-bundle"
+                    )
+                    store.write_evidence_text(
+                        run_id,
+                        f"{contradicted_bundle}/bundle.json",
+                        json.dumps(contradicted),
+                    )
+                    store.seal_evidence(run_id, contradicted_bundle)
+                    with (
+                        mock.patch(
+                            "afk.candidate_gate._execute_reviewer"
+                        ) as contradicted_review,
+                        self.assertRaisesRegex(GateError, "bundle"),
+                    ):
+                        run_candidate_reviews(
+                            store,
+                            run_id,
+                            cycle=cycle,
+                            bead=exact_bead,
+                        )
+                    contradicted_review.assert_not_called()
 
     def test_review_process_success_is_distinct_from_rejected_verdict(self):
         result = normalize_review_result(

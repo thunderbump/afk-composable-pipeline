@@ -268,55 +268,51 @@ def run_candidate_reviews(
         raise GateError("Candidate reviews require passed validation")
     if validation_record.get("candidate_sha") != candidate_sha:
         raise GateError("validation evidence belongs to another Candidate")
+    validation_evidence = _required_text(validation_record, "evidence")
+    if not store.verify_evidence(run_id, validation_evidence):
+        raise GateError("validation evidence could not be verified")
     validation = _validation_snapshot(
         store, run_id, validation_record, candidate_sha=candidate_sha
     )
+    expected_bundle = {
+        "schema_version": 1,
+        "run_id": run_id,
+        "base_sha": identity["base_sha"],
+        "candidate_sha": candidate_sha,
+        "repository": identity["repository"],
+        "bead": bead,
+        "validation": validation,
+        "validation_manifest": _read_json(
+            store.root / "runs" / run_id / validation_evidence / "manifest.json"
+        ),
+        "repository_instructions": _repository_instructions(worktree, candidate_sha),
+        "diff": _git(
+            worktree,
+            "diff",
+            "--no-ext-diff",
+            "--binary",
+            identity["base_sha"],
+            candidate_sha,
+        ),
+        "prior_dispositions": projection.get("repair_dispositions", []),
+        "prior_gate_cycles": projection.get("gate_cycles", []),
+    }
 
     bundle = f"gates/gate-cycle-{cycle}-{candidate_sha[:12]}/review-bundle"
     bundle_path = store.root / "runs" / run_id / bundle
     if not bundle_path.exists():
-        validation_evidence = _required_text(validation, "evidence")
-        if not store.verify_evidence(run_id, validation_evidence):
-            raise GateError("validation evidence could not be verified")
         store.write_evidence_text(
             run_id,
             f"{bundle}/bundle.json",
-            canonical_json(
-                {
-                    "schema_version": 1,
-                    "run_id": run_id,
-                    "base_sha": identity["base_sha"],
-                    "candidate_sha": candidate_sha,
-                    "repository": identity["repository"],
-                    "bead": bead,
-                    "validation": validation,
-                    "validation_manifest": _read_json(
-                        store.root
-                        / "runs"
-                        / run_id
-                        / validation_evidence
-                        / "manifest.json"
-                    ),
-                    "repository_instructions": _repository_instructions(
-                        worktree, candidate_sha
-                    ),
-                    "diff": _git(
-                        worktree,
-                        "diff",
-                        "--no-ext-diff",
-                        "--binary",
-                        identity["base_sha"],
-                        candidate_sha,
-                    ),
-                    "prior_dispositions": projection.get("repair_dispositions", []),
-                    "prior_gate_cycles": projection.get("gate_cycles", []),
-                }
-            )
-            + "\n",
+            canonical_json(expected_bundle) + "\n",
         )
         store.seal_evidence(run_id, bundle)
-    elif not store.verify_evidence(run_id, bundle):
-        raise GateError("review bundle could not be verified")
+    else:
+        if not store.verify_evidence(run_id, bundle):
+            raise GateError("review bundle could not be verified")
+        observed_bundle = _read_json(bundle_path / "bundle.json")
+        if observed_bundle != expected_bundle:
+            raise GateError("review bundle does not match current Candidate facts")
 
     reviews = []
     for axis in REVIEW_AXES:
