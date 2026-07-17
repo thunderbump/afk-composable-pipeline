@@ -617,6 +617,7 @@ def _project(identity: dict[str, Any], events: list[dict[str, Any]]) -> dict[str
         "repair_dispositions",
         "gate_cycles",
         "gate_retry",
+        "completion",
         "bead_spec",
         "interrupted_repair",
     ):

@@ -29,6 +29,7 @@ from afk.candidate_validation import (
     validate_candidate,
 )
 from afk.jsonutil import canonical_json
+from afk.redaction import redact_artifact_value
 from afk.run_store import RunStore, RunStoreBusy, RunStoreError
 from afk.validation_contract import ValidationContractError, parse_validation_contract
 
@@ -315,6 +316,156 @@ def resume_run(*, note: str | None = None) -> tuple[str, int]:
             unit=unit,
         )
         return run_id, 2
+
+
+def complete_run(run_id: str | None = None) -> dict[str, Any]:
+    store = RunStore()
+    with store.lock():
+        projection = store.status(run_id)
+        run_id = projection["run_id"]
+        identity = store.identity(run_id)
+        if projection["state"] not in {"reviewed", "completed"}:
+            raise StartError("completion requires a reviewed Run")
+        candidate_sha = projection.get("candidate_sha")
+        cycles = projection.get("gate_cycles")
+        if (
+            not isinstance(candidate_sha, str)
+            or not _is_full_git_sha(candidate_sha)
+            or not isinstance(cycles, list)
+            or not cycles
+            or not isinstance(cycles[-1], dict)
+            or cycles[-1].get("candidate_sha") != candidate_sha
+            or cycles[-1].get("next_action") != "complete"
+            or not isinstance(cycles[-1].get("evidence"), str)
+            or not store.verify_evidence(run_id, cycles[-1]["evidence"])
+        ):
+            raise StartError("completion requires exact passed Gate evidence")
+        worktree = Path(_required_projection_text(projection, "worktree_path"))
+        pr_number = projection.get("pr_number")
+        if type(pr_number) is not int or pr_number <= 0:
+            raise StartError("completion requires a stable Candidate PR")
+        pr = _json_command(
+            [
+                "gh",
+                "pr",
+                "view",
+                str(pr_number),
+                "--repo",
+                identity["repository"],
+                "--json",
+                (
+                    "number,url,state,isDraft,headRefOid,headRefName,"
+                    "baseRefName,mergeCommit"
+                ),
+            ],
+            cwd=worktree,
+        )
+        merge_commit = _verified_terminal_pr(identity, projection, pr)
+        request = identity.get("start_request")
+        workspace_value = (
+            request.get("beads_workspace") if isinstance(request, dict) else None
+        )
+        if not isinstance(workspace_value, str) or not workspace_value:
+            raise StartError("completion requires the pinned Beads workspace")
+        bead = _show_bead(identity["bead_id"], Path(workspace_value))
+        _validate_terminal_bead(bead, identity["bead_id"], identity["repository"])
+
+        evidence = f"gates/completion-{candidate_sha[:12]}"
+        record = redact_artifact_value(
+            {
+                "schema_version": 1,
+                "candidate_sha": candidate_sha,
+                "gate_evidence": cycles[-1]["evidence"],
+                "pr_number": pr_number,
+                "pr_url": pr["url"],
+                "merge_commit": merge_commit,
+                "bead_id": identity["bead_id"],
+                "bead_status": "closed",
+                "evidence": evidence,
+            }
+        )
+        evidence_path = store.root / "runs" / run_id / evidence
+        result_path = evidence_path / "result.json"
+        if (evidence_path / "manifest.json").is_file():
+            if not store.verify_evidence(run_id, evidence):
+                raise StartError("completion evidence could not be verified")
+            stored = _read_json_file(result_path, "completion evidence")
+            if stored != record:
+                raise StartError("completion evidence contradicts terminal facts")
+        else:
+            if evidence_path.exists():
+                entries = {path.name for path in evidence_path.iterdir()}
+                if entries not in (set(), {"result.json"}):
+                    raise StartError("unsealed completion evidence is ambiguous")
+            if result_path.is_file():
+                if _read_json_file(result_path, "completion evidence") != record:
+                    raise StartError("completion evidence contradicts terminal facts")
+            else:
+                store.write_evidence_value(run_id, f"{evidence}/result.json", record)
+            store.seal_evidence(run_id, evidence)
+
+        if projection["state"] != "completed":
+            projection = store.append_event(
+                run_id,
+                "run.completed",
+                state="completed",
+                data={
+                    "checkpoint": "completed",
+                    "attention": {},
+                    "completion": record,
+                },
+            )
+        elif projection.get("completion") != record:
+            raise StartError("completed Run contradicts terminal publication evidence")
+        return projection
+
+
+def _verified_terminal_pr(
+    identity: dict[str, Any], projection: dict[str, Any], pr: Any
+) -> str:
+    merge = pr.get("mergeCommit") if isinstance(pr, dict) else None
+    merge_commit = merge.get("oid") if isinstance(merge, dict) else None
+    if (
+        not isinstance(pr, dict)
+        or pr.get("number") != projection.get("pr_number")
+        or pr.get("url") != projection.get("pr_url")
+        or pr.get("state") != "MERGED"
+        or pr.get("isDraft") is not False
+        or pr.get("headRefOid") != projection.get("candidate_sha")
+        or pr.get("headRefName") != projection.get("branch")
+        or pr.get("baseRefName") != identity["base_branch"]
+        or not isinstance(merge_commit, str)
+        or not _is_full_git_sha(merge_commit)
+    ):
+        raise StartError("merged PR facts disagree with the reviewed Candidate")
+    return merge_commit
+
+
+def _validate_terminal_bead(
+    bead: dict[str, Any], bead_id: str, repository: str
+) -> None:
+    labels = bead.get("labels")
+    if (
+        bead.get("id") != bead_id
+        or bead.get("status") != "closed"
+        or not isinstance(labels, list)
+        or f"project:{repository.rsplit('/', 1)[-1]}" not in labels
+    ):
+        raise StartError("closed Bead facts disagree with the reviewed Run")
+
+
+def _required_projection_text(projection: dict[str, Any], key: str) -> str:
+    value = projection.get(key)
+    if not isinstance(value, str) or not value:
+        raise StartError(f"completion requires {key}")
+    return value
+
+
+def _read_json_file(path: Path, label: str) -> Any:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise StartError(f"{label} is missing or malformed") from exc
 
 
 def approve_bootstrap_validation(
