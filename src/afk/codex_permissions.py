@@ -2,11 +2,33 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+from pathlib import Path
 
 
 def codex_environment() -> dict[str, str]:
     allowed = ("HOME", "PATH", "USER", "LOGNAME", "LANG", "LC_ALL", "CODEX_HOME")
     return {name: os.environ[name] for name in allowed if name in os.environ}
+
+
+def codex_package_beneath_home() -> Path | None:
+    executable = shutil.which("codex")
+    if executable is None:
+        return None
+    resolved = Path(executable).resolve()
+    home = Path.home().resolve()
+    if not resolved.is_relative_to(home):
+        return None
+    if resolved.name != "codex.js" or resolved.parent.name != "bin":
+        return None
+    package = resolved.parent.parent
+    if (
+        package.name != "codex"
+        or package.parent.name != "@openai"
+        or package.parent.parent.name != "node_modules"
+    ):
+        return None
+    return package
 
 
 def codex_permission_args(
