@@ -418,20 +418,16 @@ class RunStore:
                 self.verify_evidence(run_id, relative_directory)
                 stored = _read_evidence_result(result_path)
                 if stored != expected:
-                    raise EvidenceError(
-                        "completion evidence contradicts terminal facts"
-                    )
+                    raise EvidenceError("evidence result contradicts expected value")
                 return stored
 
             if directory.exists():
                 entries = {path.name for path in directory.iterdir()}
                 if entries not in (set(), {"result.json"}):
-                    raise EvidenceError("unsealed completion evidence is ambiguous")
+                    raise EvidenceError("unsealed evidence result is ambiguous")
             if result_path.is_file():
                 if _read_evidence_result(result_path) != expected:
-                    raise EvidenceError(
-                        "completion evidence contradicts terminal facts"
-                    )
+                    raise EvidenceError("evidence result contradicts expected value")
             else:
                 self.write_evidence_value(
                     run_id, f"{relative_directory}/result.json", expected
@@ -679,7 +675,7 @@ def _read_evidence_result(path: Path) -> Any:
     try:
         return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise EvidenceError("completion evidence is missing or malformed") from exc
+        raise EvidenceError("evidence result is missing or malformed") from exc
 
 
 def _write_new_bytes(path: Path, value: bytes) -> None:
