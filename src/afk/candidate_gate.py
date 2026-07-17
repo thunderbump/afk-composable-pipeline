@@ -15,7 +15,11 @@ from afk.candidate_validation import (
     CandidateValidationError,
     run_supervised_command,
 )
-from afk.codex_permissions import codex_environment, codex_permission_args
+from afk.codex_permissions import (
+    codex_environment,
+    codex_package_beneath_home,
+    codex_permission_args,
+)
 from afk.jsonutil import canonical_json
 from afk.redaction import redact_artifact_value
 from afk.run_store import RunStore
@@ -777,6 +781,9 @@ def _review_permission_args(
         str(bundle_path.resolve()): "read",
         str(temporary.resolve()): "write",
     }
+    codex_package = codex_package_beneath_home()
+    if codex_package is not None:
+        filesystem[str(codex_package)] = "read"
     shell_environment = {
         "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
         "HOME": str(home),

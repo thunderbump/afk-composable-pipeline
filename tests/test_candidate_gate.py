@@ -179,6 +179,39 @@ class CandidateGateTest(unittest.TestCase):
             self.assertNotIn(f'"{bundle}" = "write"', config)
             self.assertIn("network = { enabled = false }", config)
 
+    def test_review_permission_profile_allows_installed_codex_package(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            home = root / "home"
+            package = home / ".local/lib/node_modules/@openai/codex"
+            wrapper = package / "bin/codex.js"
+            launcher = home / ".local/bin/codex"
+            wrapper.parent.mkdir(parents=True)
+            launcher.parent.mkdir(parents=True)
+            wrapper.touch()
+            launcher.symlink_to(wrapper)
+            worktree = root / "worktree"
+            bundle = root / "bundle"
+            output = root / "output"
+            worktree.mkdir()
+            bundle.mkdir()
+            output.mkdir()
+
+            with (
+                mock.patch("pathlib.Path.home", return_value=home),
+                mock.patch("shutil.which", return_value=str(launcher)),
+            ):
+                args = candidate_gate_module._review_permission_args(
+                    worktree, bundle, output
+                )
+
+            config = "\n".join(
+                args[index + 1] for index, value in enumerate(args) if value == "-c"
+            )
+            self.assertIn(f'"{package}" = "read"', config)
+            self.assertNotIn(f'"{home}" = "read"', config)
+            self.assertNotIn(f'"{home}" = "write"', config)
+
     def test_normalized_review_redacts_summary_title_and_body(self):
         result = normalize_review_result(
             "standards",

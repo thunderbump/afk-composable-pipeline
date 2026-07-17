@@ -14,7 +14,11 @@ from afk.candidate_validation import (
     CandidateValidationError,
     run_supervised_command,
 )
-from afk.codex_permissions import codex_environment, codex_permission_args
+from afk.codex_permissions import (
+    codex_environment,
+    codex_package_beneath_home,
+    codex_permission_args,
+)
 from afk.jsonutil import canonical_json
 from afk.redaction import redact_artifact_value
 from afk.run_store import RunStore, RunStoreError
@@ -583,7 +587,9 @@ def _codex_permission_args(worktree: Path, branch: str) -> list[str]:
         str(branch_ref_directory): "write",
         str(branch_log_directory): "write",
     }
-    codex_package = _codex_package_beneath_home()
+    if shutil.which("codex") is None:
+        raise CandidateError("Codex executable is unavailable")
+    codex_package = codex_package_beneath_home()
     if codex_package is not None:
         filesystem[str(codex_package)] = "read"
     shell_environment = {
@@ -598,26 +604,6 @@ def _codex_permission_args(worktree: Path, branch: str) -> list[str]:
         filesystem=filesystem,
         shell_environment=shell_environment,
     )
-
-
-def _codex_package_beneath_home() -> Path | None:
-    executable = shutil.which("codex")
-    if executable is None:
-        raise CandidateError("Codex executable is unavailable")
-    resolved = Path(executable).resolve()
-    home = Path.home().resolve()
-    if not resolved.is_relative_to(home):
-        return None
-    if resolved.name != "codex.js" or resolved.parent.name != "bin":
-        return None
-    package = resolved.parent.parent
-    if (
-        package.name != "codex"
-        or package.parent.name != "@openai"
-        or package.parent.parent.name != "node_modules"
-    ):
-        return None
-    return package
 
 
 def _resolved_git_path(worktree: Path, argument: str) -> Path:
