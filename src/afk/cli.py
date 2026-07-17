@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from afk.candidate_validation import (
+    BOOTSTRAP_ADAPTER,
     CandidateValidationError,
     tracked_regular_file_identity,
 )
@@ -689,46 +690,70 @@ def _run_report(projection: dict[str, Any]) -> dict[str, Any]:
         and isinstance(contract, dict)
         and contract.get("source") == "approved_bootstrap"
         and isinstance(candidate_sha, str)
-        and isinstance(contract.get("approval"), dict)
-        and contract["approval"].get("candidate_sha") != candidate_sha
-        and isinstance(contract["approval"].get("harness"), dict)
     ):
-        approval = contract["approval"]
-        harness = approval["harness"]
-        observed = tracked_regular_file_identity(
-            Path(projection["worktree_path"]), candidate_sha, harness["path"]
-        )
-        if observed is None:
-            raise CandidateValidationError(
-                "invalid", "current Candidate bootstrap harness identity is unavailable"
+        approval = contract.get("approval")
+        if (
+            set(contract) == {"source", "base_sha", "adapter_id"}
+            and contract.get("adapter_id") == BOOTSTRAP_ADAPTER
+        ):
+            report["authorization"] = {
+                "status": "required",
+                "candidate_sha": candidate_sha,
+                "reason": "bootstrap validation harness approval is unavailable",
+                "continuation": {
+                    "approve": [
+                        sys.executable,
+                        "-m",
+                        "afk.bootstrap_approval",
+                        "<tracked-executable-harness>",
+                        "--run-id",
+                        projection["run_id"],
+                    ],
+                    "resume": [sys.executable, "-m", "afk", "resume"],
+                    "resume_precondition": {"active_run_id": projection["run_id"]},
+                },
+            }
+        elif (
+            isinstance(approval, dict)
+            and approval.get("candidate_sha") != candidate_sha
+            and isinstance(approval.get("harness"), dict)
+        ):
+            harness = approval["harness"]
+            observed = tracked_regular_file_identity(
+                Path(projection["worktree_path"]), candidate_sha, harness["path"]
             )
-        report["authorization"] = {
-            "status": "required",
-            "candidate_sha": candidate_sha,
-            "artifact": {
-                "path": harness["path"],
-                "mode": observed[0],
-                "blob_sha": observed[1],
-            },
-            "reason": (
-                "bootstrap approval is Candidate-bound; prior approval targets "
-                f"{approval.get('candidate_sha')}"
-            ),
-            "continuation": {
-                "approve": [
-                    sys.executable,
-                    "-m",
-                    "afk.bootstrap_approval",
-                    harness.get("path"),
-                    "--run-id",
-                    projection["run_id"],
-                    "--timeout-seconds",
-                    str(approval.get("timeout_seconds")),
-                ],
-                "resume": [sys.executable, "-m", "afk", "resume"],
-                "resume_precondition": {"active_run_id": projection["run_id"]},
-            },
-        }
+            if observed is None:
+                raise CandidateValidationError(
+                    "invalid",
+                    "current Candidate bootstrap harness identity is unavailable",
+                )
+            report["authorization"] = {
+                "status": "required",
+                "candidate_sha": candidate_sha,
+                "artifact": {
+                    "path": harness["path"],
+                    "mode": observed[0],
+                    "blob_sha": observed[1],
+                },
+                "reason": (
+                    "bootstrap approval is Candidate-bound; prior approval targets "
+                    f"{approval.get('candidate_sha')}"
+                ),
+                "continuation": {
+                    "approve": [
+                        sys.executable,
+                        "-m",
+                        "afk.bootstrap_approval",
+                        harness.get("path"),
+                        "--run-id",
+                        projection["run_id"],
+                        "--timeout-seconds",
+                        str(approval.get("timeout_seconds")),
+                    ],
+                    "resume": [sys.executable, "-m", "afk", "resume"],
+                    "resume_precondition": {"active_run_id": projection["run_id"]},
+                },
+            }
     return redact_artifact_value(report)
 
 

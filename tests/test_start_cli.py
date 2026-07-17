@@ -1390,6 +1390,30 @@ class StartCliTest(unittest.TestCase):
         self.assertEqual(rejected.returncode, 2)
         self.assertIn("already contains afk.toml", rejected.stderr)
 
+    def test_initial_bootstrap_worker_pauses_before_starting_validation(self):
+        started = self.run_afk(
+            "start",
+            "central-bnkl.1.1",
+            "--bootstrap-contract",
+            AFK_FAKE_PINNED_CONTRACT="missing",
+        )
+        run_id = started.stdout.strip()
+
+        completed = self.run_afk("_worker", run_id, AFK_FAKE_PINNED_CONTRACT="missing")
+
+        self.assertEqual(completed.returncode, 2, completed.stderr)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(status["state"], "attention_required")
+        self.assertEqual(status["checkpoint"], "candidate_ready")
+        self.assertEqual(status["attention"]["scope"], "validation")
+        self.assertEqual(status["attention"]["kind"], "unavailable")
+        self.assertIn("operator approval", status["attention"]["summary"])
+        self.assertNotIn("validation_attempt", status)
+        report = json.loads(self.run_afk("report", run_id).stdout)
+        self.assertTrue(report["paused"])
+        self.assertEqual(report["authorization"]["status"], "required")
+        self.assertNotIn("artifact", report["authorization"])
+
     def test_normal_start_uses_pinned_contract_not_local_worktree_content(self):
         (self.project / "afk.toml").write_text("invalid local shim\n", encoding="utf-8")
 

@@ -823,6 +823,64 @@ class CandidateValidationCliTest(unittest.TestCase):
         self.assertEqual(status["validation"]["status"], "passed")
         self.assertTrue(marker.is_file())
 
+    def test_initial_bootstrap_candidate_pauses_before_validation_for_approval(self):
+        self.git("commit", "--allow-empty", "-m", "base without validation harness")
+        base_sha = self.git("rev-parse", "HEAD")
+        scripts = self.repository / "scripts"
+        scripts.mkdir()
+        harness = scripts / "validate.sh"
+        harness.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        harness.chmod(0o755)
+        self.git("add", ".")
+        self.git("commit", "-m", "propose bootstrap validation harness")
+        candidate_sha = self.git("rev-parse", "HEAD")
+        run_id = self.create_ready_run(
+            candidate_sha=candidate_sha,
+            base_sha=base_sha,
+            validation_contract={
+                "source": "approved_bootstrap",
+                "base_sha": base_sha,
+                "adapter_id": "afk.builtin.bootstrap-validation/v1",
+            },
+        )
+
+        paused = self.run_afk("resume")
+
+        self.assertEqual(paused.returncode, 2, paused.stderr)
+        status = self.status(run_id)
+        self.assertEqual(status["state"], "attention_required")
+        self.assertEqual(status["checkpoint"], "candidate_ready")
+        self.assertNotIn("validation_attempt", status)
+        report = json.loads(self.run_afk("report", run_id).stdout)
+        self.assertEqual(
+            report["authorization"],
+            {
+                "status": "required",
+                "candidate_sha": candidate_sha,
+                "reason": "bootstrap validation harness approval is unavailable",
+                "continuation": {
+                    "approve": [
+                        sys.executable,
+                        "-m",
+                        "afk.bootstrap_approval",
+                        "<tracked-executable-harness>",
+                        "--run-id",
+                        run_id,
+                    ],
+                    "resume": [sys.executable, "-m", "afk", "resume"],
+                    "resume_precondition": {"active_run_id": run_id},
+                },
+            },
+        )
+
+        approved = self.run_bootstrap_approval(
+            "scripts/validate.sh", "--run-id", run_id, "--timeout-seconds", "5"
+        )
+        self.assertEqual(approved.returncode, 0, approved.stderr)
+        completed = self.run_afk("resume")
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(self.status(run_id)["checkpoint"], "validated")
+
     def test_bootstrap_adapter_imports_as_a_package_module(self):
         environment = os.environ.copy()
         environment["PYTHONPATH"] = str(ROOT / "src")
@@ -917,7 +975,7 @@ class CandidateValidationCliTest(unittest.TestCase):
         self.assertNotIn("must-not-cross", stdout)
         self.assertTrue((gate / "manifest.json").is_file())
 
-    def test_bootstrap_fails_closed_without_a_preserved_harness(self):
+    def test_bootstrap_fails_closed_with_an_untrusted_adapter(self):
         self.git("commit", "--allow-empty", "-m", "base without validation harness")
         base_sha = self.git("rev-parse", "HEAD")
         marker = self.temp / "untrusted-bootstrap-policy-ran"
@@ -939,7 +997,7 @@ class CandidateValidationCliTest(unittest.TestCase):
             validation_contract={
                 "source": "approved_bootstrap",
                 "base_sha": base_sha,
-                "adapter_id": "afk.builtin.bootstrap-validation/v1",
+                "adapter_id": "untrusted-bootstrap-adapter",
             },
         )
 
@@ -950,6 +1008,8 @@ class CandidateValidationCliTest(unittest.TestCase):
         self.assertEqual(status["attention"]["kind"], "invalid")
         self.assertIn("policy", status["attention"]["summary"])
         self.assertFalse(marker.exists())
+        report = json.loads(self.run_afk("report", run_id).stdout)
+        self.assertNotIn("authorization", report)
 
     def test_bootstrap_approval_cannot_cross_candidate_shas(self):
         self.git("commit", "--allow-empty", "-m", "base without validation harness")
