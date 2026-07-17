@@ -701,6 +701,9 @@ class CandidateGateTest(unittest.TestCase):
                 mock.patch(
                     "afk.start._advance_completed_gate", return_value=0
                 ) as repair,
+                mock.patch(
+                    "afk.start.reconcile_interrupted_repair_worktree"
+                ) as reconcile,
                 mock.patch("afk.start._advance_gate") as gate,
             ):
                 resumed = resume_run()
@@ -713,6 +716,11 @@ class CandidateGateTest(unittest.TestCase):
                     "next_action": "repair",
                     "repair_brief": {**brief, "repair_attempt": 2},
                 },
+            )
+            reconcile.assert_called_once_with(
+                store,
+                run_id,
+                repair_brief={**brief, "repair_attempt": 2},
             )
             gate.assert_not_called()
             attempt = Path(temporary) / "state/runs/run-1/attempts/repair-1"
@@ -930,6 +938,9 @@ class CandidateGateTest(unittest.TestCase):
                     mock.patch(
                         "afk.start._advance_completed_gate", return_value=0
                     ) as repair,
+                    mock.patch(
+                        "afk.start.reconcile_interrupted_repair_worktree"
+                    ) as reconcile,
                     mock.patch("afk.start._advance_gate") as gate,
                 ):
                     resumed = resume_run()
@@ -939,6 +950,11 @@ class CandidateGateTest(unittest.TestCase):
                     store,
                     run_id,
                     outcome={"next_action": "repair", "repair_brief": next_brief},
+                )
+                reconcile.assert_called_once_with(
+                    store,
+                    run_id,
+                    repair_brief=next_brief,
                 )
                 gate.assert_not_called()
 

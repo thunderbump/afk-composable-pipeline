@@ -393,6 +393,34 @@ def seal_interrupted_repair_attempt(
     return interruption
 
 
+def reconcile_interrupted_repair_worktree(
+    store: RunStore,
+    run_id: str,
+    *,
+    repair_brief: dict[str, Any],
+) -> None:
+    """Restore the dedicated worktree to the published pre-repair Candidate."""
+    projection = store.status(run_id)
+    candidate_sha = repair_brief.get("candidate_sha")
+    worktree = Path(_field(projection, "worktree_path"))
+    branch = _field(projection, "branch")
+    if candidate_sha != projection.get("candidate_sha"):
+        raise CandidateError("interrupted repair Candidate binding is invalid")
+    observed_root = Path(_git(worktree, "rev-parse", "--show-toplevel")).resolve()
+    if observed_root != worktree.resolve():
+        raise CandidateError("interrupted repair worktree identity is invalid")
+    if _git(worktree, "branch", "--show-current") != branch:
+        raise CandidateError("interrupted repair changed the intended branch")
+    for command in (
+        ["git", "reset", "--hard", candidate_sha],
+        ["git", "clean", "-ffdx"],
+    ):
+        completed = _run(command, cwd=worktree)
+        if completed.returncode != 0:
+            raise CandidateError("interrupted repair worktree could not be restored")
+    verify_candidate_publication(store.identity(run_id), store.status(run_id))
+
+
 def _finish_repair_candidate(
     store: RunStore,
     run_id: str,

@@ -510,6 +510,107 @@ class CandidateTest(unittest.TestCase):
         self.assertTrue((second_attempt / "report.json").is_file())
         self.assertEqual(self.store.status("run-1")["repair_attempts_used"], 2)
 
+    def test_fresh_repair_discards_dirty_interrupted_slot_work(self):
+        self._assert_fresh_repair_discards_interrupted_work("dirty")
+
+    def test_fresh_repair_discards_committed_interrupted_slot_work(self):
+        self._assert_fresh_repair_discards_interrupted_work("committed")
+
+    def _assert_fresh_repair_discards_interrupted_work(self, mode):
+        first = self.produce()
+        candidate_sha = first["candidate_sha"]
+        brief = {
+            "schema_version": 1,
+            "candidate_sha": candidate_sha,
+            "repair_attempt": 1,
+            "blocking_findings": [
+                {
+                    "id": "validation-smoke",
+                    "source": "validation",
+                    "title": "Smoke test failed",
+                    "body": "Repair it.",
+                    "blocking": True,
+                }
+            ],
+        }
+        bead = {
+            "id": "central-test.1",
+            "title": "Implement the thing",
+            "description": "Change one file.",
+            "acceptance_criteria": "The file exists.",
+        }
+        self.store.append_event(
+            "run-1",
+            "gate.cycle_completed",
+            state="candidate_ready",
+            data={
+                "checkpoint": "candidate_ready",
+                "gate_cycles": [{"next_action": "repair", "repair_brief": brief}],
+            },
+        )
+        outside = self.temp / "outside-user-change.txt"
+        outside.write_text("preserve me\n", encoding="utf-8")
+
+        def crash_after_codex_mutation(command, *, cwd, input_text):
+            if mode == "dirty":
+                (cwd / "candidate.txt").write_text(
+                    "dirty interrupted repair\n", encoding="utf-8"
+                )
+                (cwd / "interrupted-untracked.txt").write_text(
+                    "untracked\n", encoding="utf-8"
+                )
+            else:
+                (cwd / "interrupted-commit.txt").write_text(
+                    "committed\n", encoding="utf-8"
+                )
+                subprocess.run(
+                    ["git", "add", "interrupted-commit.txt"], cwd=cwd, check=True
+                )
+                subprocess.run(
+                    ["git", "commit", "-m", "interrupted repair"],
+                    cwd=cwd,
+                    check=True,
+                    capture_output=True,
+                )
+            raise RuntimeError("crash after Codex mutation")
+
+        with (
+            mock.patch(
+                "afk.candidate._run_codex", side_effect=crash_after_codex_mutation
+            ),
+            self.assertRaisesRegex(RuntimeError, "after Codex mutation"),
+        ):
+            produce_repair_candidate(
+                self.store,
+                "run-1",
+                bead=bead,
+                repair_brief=brief,
+            )
+
+        with (
+            mock.patch.dict(os.environ, self._candidate_environment(), clear=True),
+            mock.patch("afk.start.RunStore", return_value=self.store),
+            mock.patch("afk.start._show_bead", return_value=bead),
+            mock.patch("afk.start._advance_validation", return_value=0),
+            mock.patch("afk.start._advance_gate", return_value=0),
+        ):
+            resumed = resume_run()
+
+        self.assertEqual(resumed, ("run-1", 0))
+        second_report = json.loads(
+            (self.state / "runs/run-1/attempts/repair-2/report.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(second_report["starting_sha"], candidate_sha)
+        self.assertFalse((self.checkout / "interrupted-untracked.txt").exists())
+        self.assertFalse((self.checkout / "interrupted-commit.txt").exists())
+        self.assertNotIn(
+            "dirty interrupted repair",
+            (self.checkout / "candidate.txt").read_text(encoding="utf-8"),
+        )
+        self.assertEqual(outside.read_text(encoding="utf-8"), "preserve me\n")
+
     def test_timed_out_repair_seals_evidence_and_leaves_no_descendant_mutation(self):
         first = self.produce()
         brief = {

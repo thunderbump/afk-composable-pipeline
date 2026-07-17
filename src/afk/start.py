@@ -17,6 +17,7 @@ from afk.candidate import (
     CandidateError,
     produce_candidate,
     produce_repair_candidate,
+    reconcile_interrupted_repair_worktree,
     seal_interrupted_repair_attempt,
 )
 from afk.candidate_gate import GateError, complete_gate_cycle
@@ -487,6 +488,23 @@ def _advance_interrupted_repair(
         )
         return 2
     brief = projection["repair_brief"]
+    try:
+        reconcile_interrupted_repair_worktree(
+            store,
+            run_id,
+            repair_brief=brief,
+        )
+    except (CandidateError, OSError, RunStoreError, ValueError) as exc:
+        _attention(
+            store,
+            run_id,
+            checkpoint=projection["checkpoint"],
+            scope="repair",
+            kind=exc.kind if isinstance(exc, CandidateError) else "unavailable",
+            summary=exc.summary if isinstance(exc, CandidateError) else str(exc),
+            interrupted_repair=projection["interrupted_repair"],
+        )
+        return 2
     return _advance_completed_gate(
         store,
         run_id,
