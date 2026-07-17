@@ -17,7 +17,7 @@ from afk.candidate_gate import (  # noqa: E402
     reconcile_gate_comment,
     run_candidate_reviews,
 )
-from afk.run_store import RunStore  # noqa: E402
+from afk.run_store import EvidenceTampered, RunStore  # noqa: E402
 from afk.start import _advance_completed_gate  # noqa: E402
 
 
@@ -306,7 +306,7 @@ class CandidateGateTest(unittest.TestCase):
                 store.effect(run_id, "gate-comment-1")["status"], "confirmed"
             )
 
-    def test_two_fresh_axes_consume_the_same_sealed_review_bundle(self):
+    def test_gate_review_recovery_reuses_only_manifest_valid_completed_work(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             checkout = root / "checkout"
@@ -382,6 +382,13 @@ class CandidateGateTest(unittest.TestCase):
                 },
             )
             calls = []
+            bundle = (
+                f"gates/gate-cycle-1-{candidate_sha[:12]}/review-bundle/bundle.json"
+            )
+            store.write_evidence_text(run_id, bundle, "{}\n")
+            store.seal_evidence(
+                run_id, f"gates/gate-cycle-1-{candidate_sha[:12]}/review-bundle"
+            )
 
             def reviewer(axis, bundle_path, attempt_path, worktree):
                 calls.append((axis, bundle_path, attempt_path))
@@ -397,13 +404,15 @@ class CandidateGateTest(unittest.TestCase):
                     "",
                 )
 
-            with mock.patch(
-                "afk.candidate_gate._execute_reviewer", side_effect=reviewer
+            with (
+                mock.patch(
+                    "afk.candidate_gate._execute_reviewer", side_effect=reviewer
+                ),
+                mock.patch("afk.candidate_gate.reconcile_gate_comment"),
             ):
-                reviews = run_candidate_reviews(
+                outcome = complete_gate_cycle(
                     store,
                     run_id,
-                    cycle=1,
                     bead={
                         "id": "central-test.1",
                         "title": "Test",
@@ -411,6 +420,7 @@ class CandidateGateTest(unittest.TestCase):
                         "acceptance_criteria": "Both axes pass.",
                     },
                 )
+            reviews = outcome["reviews"]
 
             self.assertEqual(
                 [review["axis"] for review in reviews], ["standards", "spec"]
@@ -419,6 +429,165 @@ class CandidateGateTest(unittest.TestCase):
             self.assertNotEqual(calls[0][2], calls[1][2])
             self.assertTrue((calls[0][2] / "manifest.json").is_file())
             self.assertTrue((calls[1][2] / "manifest.json").is_file())
+            self.assertEqual(outcome["next_action"], "complete")
+
+            second_bundle = f"gates/gate-cycle-2-{candidate_sha[:12]}/review-bundle"
+            store.write_evidence_text(run_id, f"{second_bundle}/bundle.json", "{}\n")
+            store.seal_evidence(run_id, second_bundle)
+            completed_standards = {
+                "axis": "standards",
+                "process_status": "succeeded",
+                "status": "passed",
+                "summary": "standards passed before crash",
+                "findings": [],
+            }
+            store.write_evidence_text(
+                run_id,
+                "attempts/review-cycle-2-standards/report.json",
+                (
+                    '{"axis":"standards","findings":[],"process_status":'
+                    '"succeeded","status":"passed","summary":'
+                    '"standards passed before crash"}'
+                ),
+            )
+            store.seal_evidence(run_id, "attempts/review-cycle-2-standards")
+            resumed_calls = []
+
+            def resumed_reviewer(axis, bundle_path, attempt_path, worktree):
+                resumed_calls.append(axis)
+                return (
+                    0,
+                    {"status": "passed", "summary": "spec passed", "findings": []},
+                    "",
+                    "",
+                )
+
+            with mock.patch(
+                "afk.candidate_gate._execute_reviewer",
+                side_effect=resumed_reviewer,
+            ):
+                resumed_reviews = run_candidate_reviews(
+                    store,
+                    run_id,
+                    cycle=2,
+                    bead={"id": "central-test.1"},
+                )
+
+            self.assertEqual(resumed_calls, ["spec"])
+            self.assertEqual(resumed_reviews[0], completed_standards)
+            self.assertEqual(resumed_reviews[1]["axis"], "spec")
+
+            store.append_event(
+                run_id,
+                "repair.started",
+                data={"checkpoint": "candidate_ready", "repair_attempts_used": 1},
+            )
+            gate = f"gates/gate-cycle-2-{candidate_sha[:12]}"
+            original_seal = store.seal_evidence
+
+            def crash_before_gate_seal(observed_run_id, relative_directory):
+                if relative_directory == gate:
+                    raise RuntimeError("crash before Gate seal")
+                return original_seal(observed_run_id, relative_directory)
+
+            with (
+                mock.patch.object(
+                    store, "seal_evidence", side_effect=crash_before_gate_seal
+                ),
+                mock.patch("afk.candidate_gate.reconcile_gate_comment"),
+                self.assertRaisesRegex(RuntimeError, "crash before Gate seal"),
+            ):
+                complete_gate_cycle(store, run_id, bead={"id": "central-test.1"})
+
+            with (
+                mock.patch("afk.candidate_gate._execute_reviewer") as rerun,
+                mock.patch(
+                    "afk.candidate_gate.reconcile_gate_comment",
+                    side_effect=RuntimeError("crash after Gate seal"),
+                ),
+                self.assertRaisesRegex(RuntimeError, "crash after Gate seal"),
+            ):
+                complete_gate_cycle(store, run_id, bead={"id": "central-test.1"})
+
+            rerun.assert_not_called()
+            with (
+                mock.patch("afk.candidate_gate._execute_reviewer") as sealed_rerun,
+                mock.patch("afk.candidate_gate.reconcile_gate_comment"),
+            ):
+                resumed_outcome = complete_gate_cycle(
+                    store, run_id, bead={"id": "central-test.1"}
+                )
+            sealed_rerun.assert_not_called()
+            self.assertEqual(resumed_outcome["next_action"], "complete")
+            self.assertTrue(
+                (root / "state" / "runs" / run_id / gate / "manifest.json").is_file()
+            )
+
+            store.append_event(
+                run_id,
+                "repair.started",
+                data={"checkpoint": "candidate_ready", "repair_attempts_used": 2},
+            )
+            third_bundle = f"gates/gate-cycle-3-{candidate_sha[:12]}/review-bundle"
+            store.write_evidence_text(run_id, f"{third_bundle}/bundle.json", "{}\n")
+            store.seal_evidence(run_id, third_bundle)
+            store.write_evidence_text(
+                run_id, "attempts/review-cycle-3-standards/prompt.md", "started\n"
+            )
+            with (
+                mock.patch("afk.candidate_gate._execute_reviewer") as ambiguous_rerun,
+                self.assertRaisesRegex(GateError, "incomplete") as raised,
+            ):
+                complete_gate_cycle(store, run_id, bead={"id": "central-test.1"})
+            ambiguous_rerun.assert_not_called()
+            self.assertEqual(raised.exception.kind, "inconclusive")
+
+            store.append_event(
+                run_id,
+                "repair.started",
+                data={"checkpoint": "candidate_ready", "repair_attempts_used": 3},
+            )
+            fourth_bundle = f"gates/gate-cycle-4-{candidate_sha[:12]}/review-bundle"
+            store.write_evidence_text(run_id, f"{fourth_bundle}/bundle.json", "{}\n")
+            store.seal_evidence(run_id, fourth_bundle)
+            tampered_attempt = (
+                root / "state" / "runs" / run_id / "attempts/review-cycle-4-standards"
+            )
+            store.write_evidence_text(
+                run_id,
+                "attempts/review-cycle-4-standards/report.json",
+                (
+                    '{"axis":"standards","findings":[],"process_status":'
+                    '"succeeded","status":"passed","summary":"passed"}'
+                ),
+            )
+            store.seal_evidence(run_id, "attempts/review-cycle-4-standards")
+            report = tampered_attempt / "report.json"
+            report.chmod(0o600)
+            report.write_text("{}", encoding="utf-8")
+            report.chmod(0o400)
+            with (
+                mock.patch("afk.candidate_gate._execute_reviewer") as tampered_rerun,
+                self.assertRaises(EvidenceTampered),
+            ):
+                complete_gate_cycle(store, run_id, bead={"id": "central-test.1"})
+            tampered_rerun.assert_not_called()
+
+            store.append_event(
+                run_id,
+                "repair.started",
+                data={"checkpoint": "candidate_ready", "repair_attempts_used": 4},
+            )
+            ambiguous_gate = f"gates/gate-cycle-5-{candidate_sha[:12]}"
+            store.write_evidence_text(
+                run_id, f"{ambiguous_gate}/unexpected.txt", "partial\n"
+            )
+            with (
+                mock.patch("afk.candidate_gate._execute_reviewer") as unsafe_retry,
+                self.assertRaisesRegex(GateError, "ambiguous"),
+            ):
+                complete_gate_cycle(store, run_id, bead={"id": "central-test.1"})
+            unsafe_retry.assert_not_called()
 
     def test_review_process_success_is_distinct_from_rejected_verdict(self):
         result = normalize_review_result(

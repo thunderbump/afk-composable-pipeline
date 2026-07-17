@@ -91,11 +91,21 @@ def complete_gate_cycle(
         if not store.verify_evidence(run_id, evidence):
             raise GateError("Gate Cycle evidence could not be verified")
         outcome = _read_json(evidence_path / "outcome.json")
-    elif evidence_path.exists():
-        raise GateError(
-            "Gate Cycle was interrupted before evidence was sealed", kind="inconclusive"
-        )
     else:
+        if evidence_path.exists():
+            entries = {path.name for path in evidence_path.iterdir()}
+            expected = (
+                (
+                    {"review-bundle"},
+                    {"review-bundle", "outcome.json"},
+                )
+                if validation["status"] == "passed"
+                else ({"outcome.json"},)
+            )
+            if entries not in expected:
+                raise GateError(
+                    "unsealed Gate Cycle evidence is ambiguous", kind="inconclusive"
+                )
         reviews = (
             run_candidate_reviews(store, run_id, cycle=cycle, bead=bead)
             if validation["status"] == "passed"
@@ -131,11 +141,18 @@ def complete_gate_cycle(
             and (validation["status"] == "rejected" or "rejected" in review_statuses)
         ):
             outcome["stop_reason"] = "repair budget exhausted after four attempts"
-        store.write_evidence_text(
-            run_id,
-            f"{evidence}/outcome.json",
-            canonical_json(outcome) + "\n",
-        )
+        outcome_path = evidence_path / "outcome.json"
+        if outcome_path.exists():
+            if _read_json(outcome_path) != outcome:
+                raise GateError(
+                    "unsealed Gate Cycle outcome is ambiguous", kind="inconclusive"
+                )
+        else:
+            store.write_evidence_text(
+                run_id,
+                f"{evidence}/outcome.json",
+                canonical_json(outcome) + "\n",
+            )
         store.seal_evidence(run_id, evidence)
 
     pr_number = projection.get("pr_number")
@@ -300,7 +317,21 @@ def run_candidate_reviews(
         attempt = f"attempts/review-cycle-{cycle}-{axis}"
         attempt_path = store.root / "runs" / run_id / attempt
         if attempt_path.exists():
-            raise GateError(f"{axis} review attempt was already started")
+            if not (attempt_path / "manifest.json").is_file():
+                raise GateError(
+                    f"{axis} review attempt is incomplete", kind="inconclusive"
+                )
+            if not store.verify_evidence(run_id, attempt):
+                raise GateError(f"{axis} review evidence could not be verified")
+            result_paths = [
+                path
+                for name in ("report.json", "outcome.json")
+                if (path := attempt_path / name).is_file()
+            ]
+            if len(result_paths) != 1:
+                raise GateError(f"{axis} review evidence is ambiguous")
+            reviews.append(_stored_review_result(axis, result_paths[0]))
+            continue
         prompt = _review_prompt(axis, bundle_path)
         store.write_evidence_text(run_id, f"{attempt}/prompt.md", prompt)
         store.write_evidence_text(
@@ -357,6 +388,60 @@ def run_candidate_reviews(
         store.seal_evidence(run_id, attempt)
         reviews.append(result)
     return reviews
+
+
+def _stored_review_result(axis: str, path: Path) -> dict[str, Any]:
+    result = _read_json(path)
+    if not isinstance(result, dict) or set(result) != {
+        "axis",
+        "process_status",
+        "status",
+        "summary",
+        "findings",
+    }:
+        raise GateError(f"{axis} stored review result is invalid")
+    if result["axis"] != axis:
+        raise GateError(f"{axis} stored review axis is invalid")
+    process_status = result["process_status"]
+    if process_status == "failed":
+        if (
+            result["status"] != "inconclusive"
+            or not isinstance(result["summary"], str)
+            or not result["summary"].strip()
+            or result["findings"] != []
+            or path.name != "outcome.json"
+        ):
+            raise GateError(f"{axis} stored failed review is invalid")
+        return result
+    if process_status != "succeeded":
+        raise GateError(f"{axis} stored review process status is invalid")
+    prefix = f"{axis}-"
+    findings = result["findings"]
+    if not isinstance(findings, list):
+        raise GateError(f"{axis} stored review findings are invalid")
+    payload_findings = []
+    for finding in findings:
+        if (
+            not isinstance(finding, dict)
+            or not isinstance(finding.get("id"), str)
+            or not finding["id"].startswith(prefix)
+        ):
+            raise GateError(f"{axis} stored review finding is invalid")
+        payload_findings.append({**finding, "id": finding["id"][len(prefix) :]})
+    normalized = normalize_review_result(
+        axis,
+        {
+            "status": result["status"],
+            "summary": result["summary"],
+            "findings": payload_findings,
+        },
+        process_exit_code=0,
+    )
+    if normalized != result:
+        raise GateError(f"{axis} stored review result is invalid")
+    if path.name == "outcome.json" and result["status"] != "inconclusive":
+        raise GateError(f"{axis} stored review outcome is invalid")
+    return result
 
 
 def normalize_review_result(
