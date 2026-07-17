@@ -1045,6 +1045,113 @@ class CandidateValidationCliTest(unittest.TestCase):
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertEqual(self.status(run_id)["checkpoint"], "validated")
 
+    def test_report_exposes_repaired_candidate_bootstrap_approval_pause(self):
+        self.git("commit", "--allow-empty", "-m", "base without validation harness")
+        base_sha = self.git("rev-parse", "HEAD")
+        scripts = self.repository / "scripts"
+        scripts.mkdir()
+        harness = scripts / "validate.sh"
+        harness.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        harness.chmod(0o755)
+        self.git("add", ".")
+        self.git("commit", "-m", "first Candidate")
+        first_candidate = self.git("rev-parse", "HEAD")
+        run_id = self.create_ready_run(
+            candidate_sha=first_candidate,
+            base_sha=base_sha,
+            validation_contract={
+                "source": "approved_bootstrap",
+                "base_sha": base_sha,
+                "adapter_id": "afk.builtin.bootstrap-validation/v1",
+            },
+        )
+        approved = self.run_bootstrap_approval(
+            "scripts/validate.sh", "--timeout-seconds", "5"
+        )
+        self.assertEqual(approved.returncode, 0, approved.stderr)
+        self.git("commit", "--allow-empty", "-m", "repaired Candidate")
+        repaired_candidate = self.git("rev-parse", "HEAD")
+        store = RunStore(self.state_home / "afk")
+        store.append_event(
+            run_id,
+            "candidate.repaired",
+            state="candidate_ready",
+            data={
+                "checkpoint": "candidate_ready",
+                "candidate_sha": repaired_candidate,
+                "pr_head_sha": repaired_candidate,
+            },
+        )
+        store.append_event(
+            run_id,
+            "run.attention_required",
+            state="attention_required",
+            data={
+                "checkpoint": "candidate_ready",
+                "attention": {
+                    "scope": "validation",
+                    "kind": "unavailable",
+                    "summary": (
+                        "repaired bootstrap Candidate requires explicit operator "
+                        "reapproval"
+                    ),
+                },
+            },
+        )
+
+        completed = self.run_afk("report", run_id)
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        report = json.loads(completed.stdout)
+        self.assertEqual(report["state"], "attention_required")
+        self.assertFalse(report["complete"])
+        self.assertTrue(report["paused"])
+        self.assertEqual(report["candidate_sha"], repaired_candidate)
+        self.assertEqual(
+            report["authorization"],
+            {
+                "status": "required",
+                "candidate_sha": repaired_candidate,
+                "artifact": {
+                    "path": "scripts/validate.sh",
+                    "mode": "100755",
+                    "blob_sha": self.git(
+                        "rev-parse", f"{first_candidate}:scripts/validate.sh"
+                    ),
+                },
+                "reason": (
+                    "bootstrap approval is Candidate-bound; prior approval targets "
+                    f"{first_candidate}"
+                ),
+                "continuation": {
+                    "approve": [
+                        sys.executable,
+                        "-m",
+                        "afk.bootstrap_approval",
+                        "scripts/validate.sh",
+                        "--timeout-seconds",
+                        "5",
+                    ],
+                    "resume": [sys.executable, "-m", "afk", "resume"],
+                },
+            },
+        )
+
+        store.append_event(
+            run_id,
+            "run.completed",
+            state="completed",
+            data={"checkpoint": "completed", "attention": {}},
+        )
+        completed = self.run_afk("report", run_id)
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        final_report = json.loads(completed.stdout)
+        self.assertEqual(final_report["state"], "completed")
+        self.assertTrue(final_report["complete"])
+        self.assertFalse(final_report["paused"])
+        self.assertNotIn("authorization", final_report)
+
     def test_bootstrap_approval_rejects_a_nonexecutable_harness(self):
         self.git("commit", "--allow-empty", "-m", "base without validation harness")
         base_sha = self.git("rev-parse", "HEAD")

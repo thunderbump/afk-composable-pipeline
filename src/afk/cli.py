@@ -111,6 +111,14 @@ def main(argv: list[str] | None = None) -> int:
             print(" ".join(fields))
         return 0
 
+    if args.command == "report":
+        try:
+            projection = RunStore().status(args.run_id)
+        except RunStoreError as exc:
+            parser.error(str(exc))
+        print(canonical_json(_run_report(projection)))
+        return 0
+
     if args.command == "run-step":
         try:
             input_data = json.loads(args.input)
@@ -465,6 +473,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--json", action="store_true", help="Print the Run projection as JSON"
     )
 
+    report_parser = subcommands.add_parser(
+        "report", help="Serialize an incremental or final Run report"
+    )
+    report_parser.add_argument(
+        "run_id", nargs="?", help="Run id; defaults to the Active Run"
+    )
+
     run_step_parser = subcommands.add_parser("run-step", help="Run one pipeline step")
     run_step_parser.add_argument("step")
     run_step_parser.add_argument("--input", required=True, help="JSON input payload")
@@ -620,6 +635,58 @@ def build_parser() -> argparse.ArgumentParser:
     add_retrospective_follow_up_flags(integrate_parser)
 
     return parser
+
+
+def _run_report(projection: dict[str, Any]) -> dict[str, Any]:
+    report = {
+        "schema_version": SCHEMA_VERSION,
+        "run_id": projection["run_id"],
+        "bead_id": projection["bead_id"],
+        "state": projection["state"],
+        "checkpoint": projection["checkpoint"],
+        "complete": projection["state"] == "completed",
+        "paused": projection["state"] == "attention_required",
+        "updated_at": projection["updated_at"],
+    }
+    for key in ("candidate_sha", "attention"):
+        if key in projection:
+            report[key] = projection[key]
+    contract = projection.get("validation_contract")
+    candidate_sha = projection.get("candidate_sha")
+    if (
+        projection["state"] == "attention_required"
+        and isinstance(projection.get("attention"), dict)
+        and projection["attention"].get("scope") == "validation"
+        and isinstance(contract, dict)
+        and contract.get("source") == "approved_bootstrap"
+        and isinstance(candidate_sha, str)
+        and isinstance(contract.get("approval"), dict)
+        and contract["approval"].get("candidate_sha") != candidate_sha
+        and isinstance(contract["approval"].get("harness"), dict)
+    ):
+        approval = contract["approval"]
+        harness = approval["harness"]
+        report["authorization"] = {
+            "status": "required",
+            "candidate_sha": candidate_sha,
+            "artifact": harness,
+            "reason": (
+                "bootstrap approval is Candidate-bound; prior approval targets "
+                f"{approval.get('candidate_sha')}"
+            ),
+            "continuation": {
+                "approve": [
+                    sys.executable,
+                    "-m",
+                    "afk.bootstrap_approval",
+                    harness.get("path"),
+                    "--timeout-seconds",
+                    str(approval.get("timeout_seconds")),
+                ],
+                "resume": [sys.executable, "-m", "afk", "resume"],
+            },
+        }
+    return redact_artifact_value(report)
 
 
 def resolve_ledger_dir(cli_value: str | None) -> Path:

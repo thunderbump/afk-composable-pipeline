@@ -48,6 +48,19 @@ same approval command again; AFK verifies the harness identity at the new SHA
 and replaces the prior Candidate-bound approval instead of carrying trust
 forward automatically.
 
+Inspect the same machine-readable report while a Run is active or after it
+completes:
+
+```sh
+PYTHONPATH=src python3 -m afk report [run-id]
+```
+
+The report preserves the existing Run State and exposes `complete` and
+`paused` booleans. A repaired bootstrap Candidate awaiting approval also
+includes its exact Candidate and harness identity, why the prior approval no
+longer applies, and the approval and resume commands. It does not introduce a
+new Run State.
+
 When `--ledger` is omitted, AFK resolves ledger output with this precedence:
 `--ledger` > `AFK_LEDGER_DIR` > `./ledgers`. Preview-only `run-next` does not
 create `./ledgers`; the directory is only created when execution actually writes
