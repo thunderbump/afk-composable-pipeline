@@ -40,6 +40,21 @@ class SupervisedCommandTest(unittest.TestCase):
         self.assertEqual(completed.stdout, "out:prompt\n")
         self.assertEqual(completed.stderr, "err:prompt\n")
 
+    def test_timeout_remains_live_while_child_does_not_read_large_stdin(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            started = time.monotonic()
+            with self.assertRaisesRegex(CandidateValidationError, "timed out"):
+                run_supervised_command(
+                    [sys.executable, "-c", "import time; time.sleep(1)"],
+                    cwd=Path(temporary),
+                    environment=os.environ.copy(),
+                    timeout_seconds=0.1,
+                    input_text="x" * (1024 * 1024),
+                    label="Codex",
+                )
+
+        self.assertLess(time.monotonic() - started, 0.8)
+
     def test_each_output_stream_is_independently_size_limited(self):
         for stream in ("stdout", "stderr"):
             with (

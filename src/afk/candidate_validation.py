@@ -762,6 +762,7 @@ def run_supervised_command(
     label: str,
 ) -> subprocess.CompletedProcess[str]:
     subject = label.strip() or "command"
+    deadline = time.monotonic() + timeout_seconds
     with _LinuxDescendantSupervisor() as descendants:
         process = subprocess.Popen(
             command,
@@ -774,6 +775,10 @@ def run_supervised_command(
         )
         descendants.track(process.pid)
         assert process.stdout is not None and process.stderr is not None
+        input_bytes = memoryview(input_text.encode("utf-8")) if input_text else None
+        input_offset = 0
+        if process.stdin is not None:
+            os.set_blocking(process.stdin.fileno(), False)
         captured = {"stdout": bytearray(), "stderr": bytearray()}
         overflow = threading.Event()
         readers = [
@@ -789,17 +794,10 @@ def run_supervised_command(
         ]
         for reader in readers:
             reader.start()
-        if process.stdin is not None:
-            try:
-                process.stdin.write(input_text.encode("utf-8"))
-            except BrokenPipeError:
-                pass
-            finally:
-                process.stdin.close()
-        deadline = time.monotonic() + timeout_seconds
         while process.poll() is None and not overflow.is_set():
             descendants.discover(process.pid)
             if time.monotonic() >= deadline:
+                _close_process_input(process)
                 descendants.terminate(process.pid)
                 process.poll()
                 _join_readers(readers)
@@ -810,7 +808,10 @@ def run_supervised_command(
                     stdout=stdout,
                     stderr=stderr,
                 )
+            if process.stdin is not None:
+                input_offset = _feed_process_input(process, input_bytes, input_offset)
             overflow.wait(0.01)
+        _close_process_input(process)
         descendants.terminate(process.pid)
         _join_readers(readers)
         if overflow.is_set():
@@ -847,6 +848,37 @@ def run_supervised_command(
         return subprocess.CompletedProcess(
             command, process.returncode, redact_text(stdout), redact_text(stderr)
         )
+
+
+def _feed_process_input(
+    process: subprocess.Popen[bytes],
+    input_bytes: memoryview | None,
+    input_offset: int,
+) -> int:
+    assert process.stdin is not None
+    if input_bytes is None or input_offset == len(input_bytes):
+        process.stdin.close()
+        process.stdin = None
+        return input_offset
+    try:
+        written = os.write(process.stdin.fileno(), input_bytes[input_offset:])
+    except BlockingIOError:
+        return input_offset
+    except BrokenPipeError:
+        process.stdin.close()
+        process.stdin = None
+        return input_offset
+    input_offset += written
+    if input_offset == len(input_bytes):
+        process.stdin.close()
+        process.stdin = None
+    return input_offset
+
+
+def _close_process_input(process: subprocess.Popen[bytes]) -> None:
+    if process.stdin is not None:
+        process.stdin.close()
+        process.stdin = None
 
 
 def _capture_output(
