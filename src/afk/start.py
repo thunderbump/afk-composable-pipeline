@@ -191,14 +191,14 @@ def resume_run(*, note: str | None = None) -> tuple[str, int]:
             if _gate_attention_resume_ready(store, run_id, projection):
                 return run_id, _advance_gate(store, run_id)
             return run_id, 2
+        if projection["last_event"] == "gate.cycle_completed":
+            return run_id, _advance_completed_gate(store, run_id)
         if projection["checkpoint"] == "reviewed":
             return run_id, 0
         if projection["checkpoint"] == "validated":
             return run_id, _advance_gate(store, run_id)
         if projection["last_event"] == "validation.rejected":
             return run_id, _advance_gate(store, run_id)
-        if projection["last_event"] == "gate.cycle_completed":
-            return run_id, _advance_completed_gate(store, run_id)
         if projection["last_event"] == "candidate.repaired":
             return run_id, _advance_repaired_candidate(store, run_id)
         if "worker_exit_code" in projection:
