@@ -205,6 +205,8 @@ def resume_run(*, note: str | None = None) -> tuple[str, int]:
         if "worker_exit_code" in projection:
             if _candidate_resume_ready(projection):
                 return run_id, _advance_candidate(store, run_id)
+            if _bootstrap_approval_missing(projection):
+                return run_id, 2
             if _validation_resume_ready(projection):
                 return run_id, _advance_validation(store, run_id)
             return run_id, projection["worker_exit_code"]
@@ -504,6 +506,16 @@ def _validation_resume_ready(projection: dict[str, Any]) -> bool:
         and isinstance(attention, dict)
         and attention.get("scope") == "validation"
         and attention.get("kind") in {"unavailable", "inconclusive", "interrupted"}
+    )
+
+
+def _bootstrap_approval_missing(projection: dict[str, Any]) -> bool:
+    contract = projection.get("validation_contract")
+    return (
+        isinstance(contract, dict)
+        and set(contract) == {"source", "base_sha", "adapter_id"}
+        and contract.get("source") == "approved_bootstrap"
+        and contract.get("adapter_id") == BOOTSTRAP_VALIDATION_ADAPTER
     )
 
 
@@ -1197,6 +1209,16 @@ def _advance_repaired_candidate(store: RunStore, run_id: str) -> int:
 
 
 def _advance_validation_then_gate(store: RunStore, run_id: str) -> int:
+    if _bootstrap_approval_missing(store.status(run_id)):
+        _attention(
+            store,
+            run_id,
+            checkpoint="candidate_ready",
+            scope="validation",
+            kind="unavailable",
+            summary="bootstrap validation requires explicit operator approval",
+        )
+        return 2
     exit_code = _advance_validation(store, run_id)
     if exit_code != 0:
         return exit_code

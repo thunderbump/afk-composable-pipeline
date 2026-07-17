@@ -48,6 +48,11 @@ same approval command again; AFK verifies the harness identity at the new SHA
 and replaces the prior Candidate-bound approval instead of carrying trust
 forward automatically.
 
+An initial bootstrap Candidate also pauses before creating a validation
+attempt. Its report identifies the exact Run and Candidate but leaves the
+artifact absent until the operator selects and approves a tracked executable
+harness.
+
 Inspect the same machine-readable report while a Run is active or after it
 completes:
 
@@ -56,10 +61,11 @@ PYTHONPATH=src python3 -m afk report [run-id]
 ```
 
 The report preserves the existing Run State and exposes `complete` and
-`paused` booleans. A repaired bootstrap Candidate awaiting approval also
-includes its exact Candidate and harness identity, why the prior approval no
-longer applies, and the approval and resume commands. It does not introduce a
-new Run State.
+`paused` booleans. An initial bootstrap authorization report supplies a safe
+tracked-executable placeholder instead of inventing an artifact identity. A
+repaired bootstrap Candidate awaiting approval includes its exact Candidate
+and harness identity, why the prior approval no longer applies, and the
+approval and resume commands. It does not introduce a new Run State.
 
 When `--ledger` is omitted, AFK resolves ledger output with this precedence:
 `--ledger` > `AFK_LEDGER_DIR` > `./ledgers`. Preview-only `run-next` does not
