@@ -288,6 +288,22 @@ class StartCliTest(unittest.TestCase):
                 },
             ),
             ("unmerged", {"AFK_FAKE_BEAD_STATUS": "closed"}),
+            (
+                "missing merge commit",
+                {
+                    "AFK_FAKE_PR_MERGED": "1",
+                    "AFK_FAKE_PR_MERGE_COMMIT": "missing",
+                    "AFK_FAKE_BEAD_STATUS": "closed",
+                },
+            ),
+            (
+                "malformed merge commit",
+                {
+                    "AFK_FAKE_PR_MERGED": "1",
+                    "AFK_FAKE_PR_MERGE_COMMIT": '{"oid":"not-a-sha"}',
+                    "AFK_FAKE_BEAD_STATUS": "closed",
+                },
+            ),
             ("bead", {"AFK_FAKE_PR_MERGED": "1"}),
         )
         for label, overrides in cases:
@@ -308,6 +324,13 @@ class StartCliTest(unittest.TestCase):
                 / ("gates/completion-" + "d" * 12)
             ).exists()
         )
+        events = [
+            json.loads(line)["event"]
+            for line in (self.state_home / "afk" / "runs" / run_id / "events.jsonl")
+            .read_text(encoding="utf-8")
+            .splitlines()
+        ]
+        self.assertNotIn("run.completed", events)
 
     def test_complete_recovers_matching_unsealed_terminal_evidence(self):
         started = self.run_afk("start", "central-bnkl.1.1")
@@ -1610,6 +1633,11 @@ class StartCliTest(unittest.TestCase):
                             })
                         if os.environ.get("AFK_FAKE_PR_HEAD"):
                             value["headRefOid"] = os.environ["AFK_FAKE_PR_HEAD"]
+                        merge_commit = os.environ.get("AFK_FAKE_PR_MERGE_COMMIT")
+                        if merge_commit == "missing":
+                            value.pop("mergeCommit", None)
+                        elif merge_commit:
+                            value["mergeCommit"] = json.loads(merge_commit)
                         print(json.dumps(value))
                     elif args[:2] == ["pr", "create"]:
                         value = {

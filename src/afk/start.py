@@ -384,25 +384,7 @@ def complete_run(run_id: str | None = None) -> dict[str, Any]:
                 "evidence": evidence,
             }
         )
-        evidence_path = store.root / "runs" / run_id / evidence
-        result_path = evidence_path / "result.json"
-        if (evidence_path / "manifest.json").is_file():
-            if not store.verify_evidence(run_id, evidence):
-                raise StartError("completion evidence could not be verified")
-            stored = _read_json_file(result_path, "completion evidence")
-            if stored != record:
-                raise StartError("completion evidence contradicts terminal facts")
-        else:
-            if evidence_path.exists():
-                entries = {path.name for path in evidence_path.iterdir()}
-                if entries not in (set(), {"result.json"}):
-                    raise StartError("unsealed completion evidence is ambiguous")
-            if result_path.is_file():
-                if _read_json_file(result_path, "completion evidence") != record:
-                    raise StartError("completion evidence contradicts terminal facts")
-            else:
-                store.write_evidence_value(run_id, f"{evidence}/result.json", record)
-            store.seal_evidence(run_id, evidence)
+        store.reconcile_evidence_result(run_id, evidence, record)
 
         if projection["state"] != "completed":
             projection = store.append_event(
@@ -459,13 +441,6 @@ def _required_projection_text(projection: dict[str, Any], key: str) -> str:
     if not isinstance(value, str) or not value:
         raise StartError(f"completion requires {key}")
     return value
-
-
-def _read_json_file(path: Path, label: str) -> Any:
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise StartError(f"{label} is missing or malformed") from exc
 
 
 def approve_bootstrap_validation(
