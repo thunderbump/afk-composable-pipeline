@@ -773,7 +773,11 @@ def run_supervised_command(
             stderr=subprocess.PIPE,
             start_new_session=True,
         )
-        descendants.track(process.pid)
+        try:
+            descendants.track(process.pid)
+        except CandidateValidationError:
+            _terminate_untracked_process_group(process)
+            raise
         assert process.stdout is not None and process.stderr is not None
         input_bytes = memoryview(input_text.encode("utf-8")) if input_text else None
         input_offset = 0
@@ -879,6 +883,32 @@ def _close_process_input(process: subprocess.Popen[bytes]) -> None:
     if process.stdin is not None:
         process.stdin.close()
         process.stdin = None
+
+
+def _terminate_untracked_process_group(process: subprocess.Popen[bytes]) -> None:
+    failure: OSError | subprocess.TimeoutExpired | None = None
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    except OSError as exc:
+        failure = exc
+        try:
+            process.kill()
+        except OSError:
+            pass
+    try:
+        process.wait(timeout=PROCESS_CLEANUP_SECONDS)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        failure = failure or exc
+    finally:
+        for stream in (process.stdin, process.stdout, process.stderr):
+            if stream is not None:
+                stream.close()
+    if failure is not None:
+        raise CandidateValidationError(
+            "interrupted", "untracked process group could not be terminated"
+        ) from failure
 
 
 def _capture_output(

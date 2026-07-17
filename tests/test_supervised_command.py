@@ -55,6 +55,36 @@ class SupervisedCommandTest(unittest.TestCase):
 
         self.assertLess(time.monotonic() - started, 0.8)
 
+    def test_initial_tracking_failure_terminates_child_before_mutation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            marker = root / "late-mutation"
+            command = (
+                "import time; time.sleep(0.2);"
+                f"open({str(marker)!r},'w').write('mutated')"
+            )
+
+            with (
+                mock.patch.object(
+                    candidate_validation.os,
+                    "pidfd_open",
+                    side_effect=OSError("unavailable"),
+                ),
+                self.assertRaisesRegex(
+                    CandidateValidationError, "supervision is unavailable"
+                ),
+            ):
+                run_supervised_command(
+                    [sys.executable, "-c", command],
+                    cwd=root,
+                    environment=os.environ.copy(),
+                    timeout_seconds=1,
+                    label="Codex",
+                )
+
+            time.sleep(0.3)
+            self.assertFalse(marker.exists())
+
     def test_each_output_stream_is_independently_size_limited(self):
         for stream in ("stdout", "stderr"):
             with (
