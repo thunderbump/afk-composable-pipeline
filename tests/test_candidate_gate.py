@@ -12,6 +12,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from afk import candidate_gate as candidate_gate_module  # noqa: E402
 from afk.bead_spec import persist_bead_spec  # noqa: E402
+from afk.candidate import CandidateError  # noqa: E402
 from afk.candidate_gate import (  # noqa: E402
     GateError,
     build_repair_brief,
@@ -852,6 +853,313 @@ class CandidateGateTest(unittest.TestCase):
             self.assertEqual(status["repair_attempts_used"], 4)
             self.assertEqual(status["attention"]["kind"], "exhausted")
             self.assertEqual(status["interrupted_repair"]["status"], "exhausted")
+
+    def test_resume_retries_gate_reconciliation_after_gate_attention(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store, run_id, _, candidate_sha, _ = self._published_validated_candidate(
+                root
+            )
+            validation_projection = store.status(run_id)
+            persist_bead_spec(store, run_id, {"id": "central-test.1"})
+            store.append_event(
+                run_id,
+                "validation.passed",
+                state="validated",
+                data={
+                    key: validation_projection[key]
+                    for key in (
+                        "checkpoint",
+                        "candidate_sha",
+                        "worktree_path",
+                        "branch",
+                        "pr_number",
+                        "validation",
+                    )
+                },
+            )
+            reviews = [
+                {
+                    "axis": "standards",
+                    "process_status": "succeeded",
+                    "status": "rejected",
+                    "summary": "fix it",
+                    "findings": [
+                        {
+                            "id": "standards-1",
+                            "priority": "high",
+                            "title": "fix it",
+                            "body": "fix it",
+                            "path": "app.txt",
+                            "line": 1,
+                            "blocking": True,
+                        }
+                    ],
+                },
+                {
+                    "axis": "spec",
+                    "process_status": "succeeded",
+                    "status": "passed",
+                    "summary": "passed",
+                    "findings": [],
+                },
+            ]
+            gh_calls = []
+
+            def gh(command, worktree, **kwargs):
+                gh_calls.append(command)
+                if "--method" not in command:
+                    if len(gh_calls) == 1:
+                        raise GateError(
+                            "GitHub comment command failed", kind="inconclusive"
+                        )
+                    return subprocess.CompletedProcess(command, 0, "[]\n", "")
+                body = json.loads(kwargs["input_text"])["body"]
+                return subprocess.CompletedProcess(
+                    command,
+                    0,
+                    json.dumps(
+                        {
+                            "body": body,
+                            "html_url": "https://example.test/comment/1",
+                        }
+                    ),
+                    "",
+                )
+
+            def stop_after_repair(*args, **kwargs):
+                raise CandidateError("repair started", kind="unavailable")
+
+            with (
+                mock.patch("afk.start.RunStore", return_value=store),
+                mock.patch(
+                    "afk.candidate_gate.run_candidate_reviews", return_value=reviews
+                ) as run_reviews,
+                mock.patch("afk.candidate_gate._run_gh", side_effect=gh),
+                mock.patch(
+                    "afk.start.produce_repair_candidate",
+                    side_effect=stop_after_repair,
+                ) as repair,
+                mock.patch("afk.start._advance_validation") as validation,
+            ):
+                first_resume = resume_run()
+
+                self.assertEqual(first_resume, (run_id, 2))
+                self.assertEqual(store.status(run_id)["attention"]["scope"], "gate")
+                gate_evidence = (
+                    root
+                    / "state/runs"
+                    / run_id
+                    / f"gates/gate-cycle-1-{candidate_sha[:12]}"
+                )
+                self.assertTrue(
+                    (gate_evidence / "manifest.json").is_file(), store.status(run_id)
+                )
+                self.assertEqual(run_reviews.call_count, 1)
+                repair.assert_not_called()
+
+                second_resume = resume_run()
+
+            self.assertEqual(second_resume, (run_id, 2))
+            self.assertEqual(run_reviews.call_count, 1)
+            validation.assert_not_called()
+            repair.assert_called_once()
+            self.assertEqual(len(store.status(run_id)["gate_cycles"]), 1)
+            self.assertEqual(
+                store.effect(run_id, "gate-comment-1")["status"], "confirmed"
+            )
+            self.assertEqual(sum("--method" in command for command in gh_calls), 1)
+
+    def test_resume_does_not_retry_gate_without_exact_sealed_outcome(self):
+        for case in ("pre-seal", "mismatched", "tampered"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                store = RunStore(root / "state")
+                run_id = store.create_run(
+                    bead_id="central-test.1",
+                    repository="owner/project",
+                    base_branch="main",
+                    base_sha="a" * 40,
+                    start_request={},
+                    run_id="run-1",
+                )["run_id"]
+                persist_bead_spec(store, run_id, {"id": "central-test.1"})
+                store.write_evidence_text(
+                    run_id, "gates/validation/result.json", "{}\n"
+                )
+                store.seal_evidence(run_id, "gates/validation")
+                candidate_sha = "b" * 40
+                store.append_event(
+                    run_id,
+                    "validation.rejected",
+                    state="candidate_ready",
+                    data={
+                        "checkpoint": "candidate_ready",
+                        "candidate_sha": candidate_sha,
+                        "worktree_path": str(root),
+                        "branch": "afk/central-test-1-run-1/candidate",
+                        "pr_number": 7,
+                        "validation": {
+                            "status": "rejected",
+                            "candidate_sha": candidate_sha,
+                            "summary": "failed",
+                            "evidence": "gates/validation",
+                            "checks": [],
+                        },
+                    },
+                )
+                gate_evidence = f"gates/gate-cycle-1-{candidate_sha[:12]}"
+                if case != "pre-seal":
+                    outcome_candidate = (
+                        "c" * 40 if case == "mismatched" else candidate_sha
+                    )
+                    store.write_evidence_value(
+                        run_id,
+                        f"{gate_evidence}/outcome.json",
+                        {
+                            "schema_version": 1,
+                            "cycle": 1,
+                            "candidate_sha": outcome_candidate,
+                            "validation": {
+                                "status": "rejected",
+                                "candidate_sha": outcome_candidate,
+                                "summary": "failed",
+                                "evidence": "gates/validation",
+                                "checks": [],
+                            },
+                            "reviews": [],
+                            "prior_dispositions": [],
+                            "next_action": "repair",
+                            "evidence": gate_evidence,
+                            "repair_brief": {
+                                "schema_version": 1,
+                                "candidate_sha": outcome_candidate,
+                                "repair_attempt": 1,
+                                "blocking_findings": [],
+                            },
+                        },
+                    )
+                    store.seal_evidence(run_id, gate_evidence)
+                    if case == "tampered":
+                        outcome_path = (
+                            root
+                            / "state/runs"
+                            / run_id
+                            / gate_evidence
+                            / "outcome.json"
+                        )
+                        outcome_path.chmod(0o600)
+                        outcome_path.write_text("{}\n", encoding="utf-8")
+                store.append_event(
+                    run_id,
+                    "run.attention_required",
+                    state="attention_required",
+                    data={
+                        "checkpoint": "candidate_ready",
+                        "attention": {
+                            "scope": "gate",
+                            "kind": "inconclusive",
+                            "summary": "GitHub comment command failed",
+                        },
+                    },
+                )
+                last_sequence = store.status(run_id)["last_sequence"]
+
+                with (
+                    mock.patch("afk.start.RunStore", return_value=store),
+                    mock.patch(
+                        "afk.candidate_gate._run_gh",
+                        side_effect=AssertionError("Gate retry must not start"),
+                    ),
+                ):
+                    resumed = resume_run()
+
+                self.assertEqual(resumed, (run_id, 2))
+                self.assertEqual(store.status(run_id)["last_sequence"], last_sequence)
+
+    def test_resume_keeps_completed_terminal_gate_attention_paused(self):
+        for label, used, stop_reason in (
+            ("inconclusive", 0, None),
+            ("exhausted", 4, "repair budget exhausted after four attempts"),
+        ):
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                store = RunStore(root / "state")
+                run_id = store.create_run(
+                    bead_id="central-test.1",
+                    repository="owner/project",
+                    base_branch="main",
+                    base_sha="a" * 40,
+                    start_request={},
+                    run_id="run-1",
+                )["run_id"]
+                candidate_sha = "b" * 40
+                validation = {
+                    "status": "passed",
+                    "candidate_sha": candidate_sha,
+                    "summary": "passed",
+                    "evidence": "gates/validation",
+                    "checks": [],
+                }
+                store.write_evidence_text(
+                    run_id, "gates/validation/result.json", "{}\n"
+                )
+                store.seal_evidence(run_id, "gates/validation")
+                cycle = used + 1
+                gate_evidence = f"gates/gate-cycle-{cycle}-{candidate_sha[:12]}"
+                outcome = {
+                    "schema_version": 1,
+                    "cycle": cycle,
+                    "candidate_sha": candidate_sha,
+                    "validation": validation,
+                    "reviews": [],
+                    "prior_dispositions": [],
+                    "next_action": "attention",
+                    "evidence": gate_evidence,
+                    **({"stop_reason": stop_reason} if stop_reason else {}),
+                }
+                store.write_evidence_value(
+                    run_id, f"{gate_evidence}/outcome.json", outcome
+                )
+                store.seal_evidence(run_id, gate_evidence)
+                store.append_event(
+                    run_id,
+                    "gate.cycle_completed",
+                    state="validated",
+                    data={
+                        "checkpoint": "validated",
+                        "candidate_sha": candidate_sha,
+                        "repair_attempts_used": used,
+                        "validation": validation,
+                        "gate_cycles": [outcome],
+                    },
+                )
+                attention = {
+                    "scope": "gate",
+                    "kind": "exhausted" if stop_reason else "inconclusive",
+                    "summary": stop_reason or "review was inconclusive",
+                }
+                store.append_event(
+                    run_id,
+                    "run.attention_required",
+                    state="attention_required",
+                    data={"checkpoint": "validated", "attention": attention},
+                )
+                last_sequence = store.status(run_id)["last_sequence"]
+
+                with (
+                    mock.patch("afk.start.RunStore", return_value=store),
+                    mock.patch(
+                        "afk.start._advance_gate",
+                        side_effect=AssertionError("Gate must not be retried"),
+                    ),
+                ):
+                    resumed = resume_run()
+
+                status = store.status(run_id)
+                self.assertEqual(resumed, (run_id, 2))
+                self.assertEqual(status["last_sequence"], last_sequence)
+                self.assertEqual(status["attention"], attention)
 
     def test_resume_keeps_interrupted_repair_continuation_after_attention(self):
         for checkpoint in ("validated", "candidate_ready"):

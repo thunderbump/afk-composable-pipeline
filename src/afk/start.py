@@ -170,6 +170,11 @@ def resume_run(*, note: str | None = None) -> tuple[str, int]:
             return run_id, _advance_interrupted_repair(store, run_id, projection)
         if _repair_resume_ready(projection):
             return run_id, _advance_completed_gate(store, run_id)
+        attention = projection.get("attention")
+        if isinstance(attention, dict) and attention.get("scope") == "gate":
+            if _gate_attention_resume_ready(store, run_id, projection):
+                return run_id, _advance_gate(store, run_id)
+            return run_id, 2
         if projection["checkpoint"] == "reviewed":
             return run_id, 0
         if projection["checkpoint"] == "validated":
@@ -357,6 +362,62 @@ def _validation_resume_ready(projection: dict[str, Any]) -> bool:
         and isinstance(attention, dict)
         and attention.get("scope") == "validation"
         and attention.get("kind") in {"unavailable", "inconclusive", "interrupted"}
+    )
+
+
+def _gate_attention_resume_ready(
+    store: RunStore, run_id: str, projection: dict[str, Any]
+) -> bool:
+    candidate_sha = projection.get("candidate_sha")
+    used = projection.get("repair_attempts_used", 0)
+    if (
+        not isinstance(candidate_sha, str)
+        or not _is_full_git_sha(candidate_sha)
+        or type(used) is not int
+        or not 0 <= used <= 4
+    ):
+        return False
+    cycle = used + 1
+    evidence = f"gates/gate-cycle-{cycle}-{candidate_sha[:12]}"
+    outcome_path = store.root / "runs" / run_id / evidence / "outcome.json"
+    try:
+        if not store.verify_evidence(run_id, evidence):
+            return False
+        outcome = json.loads(outcome_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, RunStoreError):
+        return False
+    validation = outcome.get("validation") if isinstance(outcome, dict) else None
+    current_validation = projection.get("validation")
+    cycles = projection.get("gate_cycles", [])
+    if (
+        not isinstance(outcome, dict)
+        or outcome.get("schema_version") != 1
+        or outcome.get("cycle") != cycle
+        or outcome.get("candidate_sha") != candidate_sha
+        or outcome.get("evidence") != evidence
+        or not isinstance(validation, dict)
+        or not isinstance(current_validation, dict)
+        or validation.get("candidate_sha") != candidate_sha
+        or validation.get("status") != current_validation.get("status")
+        or validation.get("evidence") != current_validation.get("evidence")
+        or not isinstance(outcome.get("reviews"), list)
+        or outcome.get("prior_dispositions")
+        != projection.get("repair_dispositions", [])
+        or outcome.get("next_action") not in {"complete", "attention", "repair"}
+        or not isinstance(cycles, list)
+        or any(
+            isinstance(item, dict)
+            and item.get("cycle") == cycle
+            and item.get("candidate_sha") == candidate_sha
+            for item in cycles
+        )
+    ):
+        return False
+    brief = outcome.get("repair_brief")
+    return outcome.get("next_action") != "repair" or (
+        isinstance(brief, dict)
+        and brief.get("candidate_sha") == candidate_sha
+        and brief.get("repair_attempt") == cycle
     )
 
 
