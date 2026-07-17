@@ -159,6 +159,8 @@ def resume_run(*, note: str | None = None) -> tuple[str, int]:
             return run_id, _advance_gate(store, run_id)
         if projection["last_event"] == "gate.cycle_completed":
             return run_id, _advance_completed_gate(store, run_id)
+        if projection["last_event"] == "candidate.repaired":
+            return run_id, _advance_repaired_candidate(store, run_id)
         if _repair_resume_ready(projection):
             return run_id, _advance_completed_gate(store, run_id)
         if "worker_exit_code" in projection:
@@ -745,6 +747,26 @@ def _advance_gate(store: RunStore, run_id: str) -> int:
     return _advance_completed_gate(store, run_id, outcome=outcome, bead=bead)
 
 
+def _advance_repaired_candidate(store: RunStore, run_id: str) -> int:
+    validation_contract = store.status(run_id).get("validation_contract", {})
+    if (
+        isinstance(validation_contract, dict)
+        and validation_contract.get("source") == "approved_bootstrap"
+    ):
+        _attention(
+            store,
+            run_id,
+            checkpoint="candidate_ready",
+            scope="validation",
+            kind="unavailable",
+            summary=(
+                "repaired bootstrap Candidate requires explicit operator reapproval"
+            ),
+        )
+        return 2
+    return _advance_validation(store, run_id)
+
+
 def _advance_completed_gate(
     store: RunStore,
     run_id: str,
@@ -827,23 +849,7 @@ def _advance_completed_gate(
             ),
         )
         return 2
-    validation_contract = store.status(run_id).get("validation_contract", {})
-    if (
-        isinstance(validation_contract, dict)
-        and validation_contract.get("source") == "approved_bootstrap"
-    ):
-        _attention(
-            store,
-            run_id,
-            checkpoint="candidate_ready",
-            scope="validation",
-            kind="unavailable",
-            summary=(
-                "repaired bootstrap Candidate requires explicit operator reapproval"
-            ),
-        )
-        return 2
-    return _advance_validation(store, run_id)
+    return _advance_repaired_candidate(store, run_id)
 
 
 def preflight(

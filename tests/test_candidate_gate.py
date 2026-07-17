@@ -20,7 +20,7 @@ from afk.candidate_gate import (  # noqa: E402
     run_candidate_reviews,
 )
 from afk.run_store import EvidenceTampered, RunStore  # noqa: E402
-from afk.start import _advance_completed_gate  # noqa: E402
+from afk.start import _advance_completed_gate, resume_run  # noqa: E402
 
 
 class CandidateGateTest(unittest.TestCase):
@@ -102,6 +102,71 @@ class CandidateGateTest(unittest.TestCase):
             self.assertEqual(status["attention"]["scope"], "validation")
             self.assertEqual(status["attention"]["kind"], "unavailable")
             self.assertIn("reapproval", status["attention"]["summary"])
+
+    def test_resume_continues_after_durable_candidate_repaired_event(self):
+        contracts = (
+            ("pinned_base", 0, True),
+            ("approved_bootstrap", 2, False),
+        )
+        for source, expected_exit, advances_validation in contracts:
+            with (
+                self.subTest(source=source),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                store = RunStore(Path(temporary) / "state")
+                run_id = store.create_run(
+                    bead_id="central-test.1",
+                    repository="owner/project",
+                    base_branch="main",
+                    base_sha="a" * 40,
+                    start_request={},
+                    run_id="run-1",
+                )["run_id"]
+                store.append_event(
+                    run_id,
+                    "gate.cycle_completed",
+                    state="candidate_ready",
+                    data={
+                        "checkpoint": "candidate_ready",
+                        "candidate_sha": "b" * 40,
+                        "worker_exit_code": 0,
+                        "validation_contract": {"source": source},
+                        "repair_brief": {
+                            "candidate_sha": "b" * 40,
+                            "repair_attempt": 1,
+                        },
+                    },
+                )
+                store.append_event(
+                    run_id,
+                    "candidate.repaired",
+                    state="candidate_ready",
+                    data={
+                        "checkpoint": "candidate_ready",
+                        "previous_candidate_sha": "b" * 40,
+                        "candidate_sha": "c" * 40,
+                        "repair_attempts_used": 1,
+                        "attention": {},
+                    },
+                )
+
+                with (
+                    mock.patch("afk.start.RunStore", return_value=store),
+                    mock.patch(
+                        "afk.start._advance_validation", return_value=0
+                    ) as validation,
+                ):
+                    resumed = resume_run()
+
+                self.assertEqual(resumed, (run_id, expected_exit))
+                if advances_validation:
+                    validation.assert_called_once_with(store, run_id)
+                else:
+                    validation.assert_not_called()
+                    attention = store.status(run_id)["attention"]
+                    self.assertEqual(attention["scope"], "validation")
+                    self.assertEqual(attention["kind"], "unavailable")
+                    self.assertIn("reapproval", attention["summary"])
 
     def test_passed_validation_and_both_reviews_reach_reviewed(self):
         with tempfile.TemporaryDirectory() as temporary:
