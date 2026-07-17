@@ -43,7 +43,10 @@ blob in the durable Run. The built-in adapter invokes that approved legacy
 exit into a structured passed, rejected, or inconclusive Validation Gate.
 Candidate `afk.toml` content is not consulted. Missing, untracked,
 non-executable, changed, or differently bound harnesses fail closed before
-execution.
+execution. A repaired Candidate therefore requires the operator to run the
+same approval command again; AFK verifies the harness identity at the new SHA
+and replaces the prior Candidate-bound approval instead of carrying trust
+forward automatically.
 
 When `--ledger` is omitted, AFK resolves ledger output with this precedence:
 `--ledger` > `AFK_LEDGER_DIR` > `./ledgers`. Preview-only `run-next` does not

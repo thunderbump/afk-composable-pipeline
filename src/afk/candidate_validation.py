@@ -439,6 +439,18 @@ def approve_bootstrap_contract(
     timeout_seconds: int,
 ) -> dict[str, Any]:
     if (
+        isinstance(identity, dict)
+        and set(identity) == {"source", "base_sha", "adapter_id", "approval"}
+        and identity.get("source") == "approved_bootstrap"
+        and identity.get("adapter_id") == BOOTSTRAP_ADAPTER
+    ):
+        _bootstrap_approval(identity)
+        identity = {
+            "source": identity["source"],
+            "base_sha": identity["base_sha"],
+            "adapter_id": identity["adapter_id"],
+        }
+    if (
         not isinstance(identity, dict)
         or set(identity) != {"source", "base_sha", "adapter_id"}
         or identity.get("source") != "approved_bootstrap"
