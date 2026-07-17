@@ -84,6 +84,10 @@ class CandidateGateTest(unittest.TestCase):
             capture_output=True,
         )
         (checkout / "app.txt").write_text("candidate\n", encoding="utf-8")
+        (checkout / "AGENTS.md").write_text(
+            "fixture password=instruction-secret\n", encoding="utf-8"
+        )
+        subprocess.run(["git", "add", "AGENTS.md"], cwd=checkout, check=True)
         subprocess.run(
             ["git", "commit", "-am", "candidate"],
             cwd=checkout,
@@ -168,6 +172,135 @@ class CandidateGateTest(unittest.TestCase):
             self.assertNotIn(f'"{worktree}" = "write"', config)
             self.assertNotIn(f'"{bundle}" = "write"', config)
             self.assertIn("network = { enabled = false }", config)
+
+    def test_normalized_review_redacts_summary_title_and_body(self):
+        result = normalize_review_result(
+            "standards",
+            {
+                "status": "rejected",
+                "summary": "password=summary-secret",
+                "findings": [
+                    {
+                        "id": "secret",
+                        "priority": "high",
+                        "title": "token=title-secret",
+                        "body": "api_key=body-secret",
+                        "path": "app.py",
+                        "line": 1,
+                        "blocking": True,
+                    }
+                ],
+            },
+            process_exit_code=0,
+        )
+
+        serialized = json.dumps(result)
+        self.assertNotIn("summary-secret", serialized)
+        self.assertNotIn("title-secret", serialized)
+        self.assertNotIn("body-secret", serialized)
+        self.assertIn("[REDACTED]", serialized)
+
+    def test_gate_redacts_comment_repair_brief_evidence_and_event(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store, run_id, _, _, _ = self._published_validated_candidate(root)
+            reviews = [
+                {
+                    "axis": "standards",
+                    "process_status": "succeeded",
+                    "status": "rejected",
+                    "summary": "password=summary-secret",
+                    "findings": [
+                        {
+                            "id": "standards-secret",
+                            "priority": "high",
+                            "title": "token=title-secret",
+                            "body": "api_key=body-secret",
+                            "path": "app.py",
+                            "line": 1,
+                            "blocking": True,
+                        }
+                    ],
+                },
+                {
+                    "axis": "spec",
+                    "process_status": "succeeded",
+                    "status": "passed",
+                    "summary": "passed",
+                    "findings": [],
+                },
+            ]
+
+            with (
+                mock.patch(
+                    "afk.candidate_gate.run_candidate_reviews", return_value=reviews
+                ) as run_reviews,
+                mock.patch("afk.candidate_gate.reconcile_gate_comment") as comment,
+            ):
+                outcome = complete_gate_cycle(
+                    store, run_id, bead={"id": "central-test.1"}
+                )
+                recovered = complete_gate_cycle(
+                    store, run_id, bead={"id": "central-test.1"}
+                )
+
+            self.assertEqual(recovered, outcome)
+            self.assertEqual(run_reviews.call_count, 1)
+            serialized = json.dumps(outcome)
+            for secret in ("summary-secret", "title-secret", "body-secret"):
+                self.assertNotIn(secret, serialized)
+            self.assertIn("[REDACTED]", serialized)
+            self.assertEqual(comment.call_args.kwargs["gate"], outcome)
+            comment_body = candidate_gate_module._gate_comment_body(outcome, "marker")
+            self.assertNotIn("summary-secret", comment_body)
+            self.assertNotIn("title-secret", comment_body)
+            gate_path = root / "state/runs" / run_id / outcome["evidence"]
+            evidence = (gate_path / "outcome.json").read_text(encoding="utf-8")
+            events = (root / "state/runs" / run_id / "events.jsonl").read_text(
+                encoding="utf-8"
+            )
+            for secret in ("summary-secret", "title-secret", "body-secret"):
+                self.assertNotIn(secret, evidence)
+                self.assertNotIn(secret, events)
+
+    def test_redacted_review_bundle_recovers_with_exact_bead_and_instructions(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store, run_id, _, candidate_sha, _ = self._published_validated_candidate(
+                root
+            )
+            bead = {
+                "id": "central-test.1",
+                "title": "password=bead-secret",
+                "description": "Review it.",
+                "acceptance_criteria": "Both axes pass.",
+            }
+
+            def reviewer(axis, bundle_path, attempt_path, worktree):
+                return (
+                    0,
+                    {"status": "passed", "summary": "passed", "findings": []},
+                    "",
+                    "",
+                )
+
+            with mock.patch(
+                "afk.candidate_gate._execute_reviewer", side_effect=reviewer
+            ) as execute:
+                first = run_candidate_reviews(store, run_id, cycle=1, bead=bead)
+                second = run_candidate_reviews(store, run_id, cycle=1, bead=bead)
+
+            self.assertEqual(first, second)
+            self.assertEqual(execute.call_count, 2)
+            bundle = (
+                root
+                / "state/runs"
+                / run_id
+                / f"gates/gate-cycle-1-{candidate_sha[:12]}/review-bundle/bundle.json"
+            ).read_text(encoding="utf-8")
+            self.assertNotIn("bead-secret", bundle)
+            self.assertNotIn("instruction-secret", bundle)
+            self.assertIn("[REDACTED]", bundle)
 
     def test_gate_rejects_dirty_candidate_before_review(self):
         with tempfile.TemporaryDirectory() as temporary:

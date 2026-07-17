@@ -16,6 +16,7 @@ from afk.candidate_validation import (
 )
 from afk.codex_permissions import codex_environment, codex_permission_args
 from afk.jsonutil import canonical_json
+from afk.redaction import redact_artifact_value
 from afk.run_store import RunStore
 
 
@@ -131,18 +132,15 @@ def complete_gate_cycle(
             _require_candidate_publication(store, run_id, projection)
         except GateError as exc:
             if reviews:
-                store.write_evidence_text(
+                store.write_evidence_value(
                     run_id,
                     f"{evidence}/publication-drift.json",
-                    canonical_json(
-                        {
-                            "schema_version": 1,
-                            "candidate_sha": candidate_sha,
-                            "kind": exc.kind,
-                            "summary": exc.summary,
-                        }
-                    )
-                    + "\n",
+                    {
+                        "schema_version": 1,
+                        "candidate_sha": candidate_sha,
+                        "kind": exc.kind,
+                        "summary": exc.summary,
+                    },
                 )
                 store.seal_evidence(run_id, evidence)
             raise
@@ -176,17 +174,19 @@ def complete_gate_cycle(
             and (validation["status"] == "rejected" or "rejected" in review_statuses)
         ):
             outcome["stop_reason"] = "repair budget exhausted after four attempts"
+        redacted_outcome = redact_artifact_value(outcome)
         outcome_path = evidence_path / "outcome.json"
         if outcome_path.exists():
-            if _read_json(outcome_path) != outcome:
+            if _read_json(outcome_path) != redacted_outcome:
                 raise GateError(
                     "unsealed Gate Cycle outcome is ambiguous", kind="inconclusive"
                 )
+            outcome = redacted_outcome
         else:
-            store.write_evidence_text(
+            outcome = store.write_evidence_value(
                 run_id,
                 f"{evidence}/outcome.json",
-                canonical_json(outcome) + "\n",
+                outcome,
             )
         store.seal_evidence(run_id, evidence)
 
@@ -315,7 +315,7 @@ def run_candidate_reviews(
     validation = _validation_snapshot(
         store, run_id, validation_record, candidate_sha=candidate_sha
     )
-    expected_bundle = {
+    bundle_value = {
         "schema_version": 1,
         "run_id": run_id,
         "base_sha": identity["base_sha"],
@@ -338,14 +338,15 @@ def run_candidate_reviews(
         "prior_dispositions": projection.get("repair_dispositions", []),
         "prior_gate_cycles": projection.get("gate_cycles", []),
     }
+    expected_bundle = redact_artifact_value(bundle_value)
 
     bundle = f"gates/gate-cycle-{cycle}-{candidate_sha[:12]}/review-bundle"
     bundle_path = store.root / "runs" / run_id / bundle
     if not bundle_path.exists():
-        store.write_evidence_text(
+        expected_bundle = store.write_evidence_value(
             run_id,
             f"{bundle}/bundle.json",
-            canonical_json(expected_bundle) + "\n",
+            bundle_value,
         )
         store.seal_evidence(run_id, bundle)
     else:
@@ -387,17 +388,19 @@ def run_candidate_reviews(
                 axis, bundle_path, attempt_path, worktree
             )
         except GateError as exc:
-            result = {
-                "axis": axis,
-                "process_status": "failed",
-                "status": "inconclusive",
-                "summary": exc.summary,
-                "findings": [],
-            }
+            result = redact_artifact_value(
+                {
+                    "axis": axis,
+                    "process_status": "failed",
+                    "status": "inconclusive",
+                    "summary": exc.summary,
+                    "findings": [],
+                }
+            )
             store.write_evidence_text(run_id, f"{attempt}/events.jsonl", exc.stdout)
             store.write_evidence_text(run_id, f"{attempt}/stderr.txt", exc.stderr)
-            store.write_evidence_text(
-                run_id, f"{attempt}/outcome.json", canonical_json(result) + "\n"
+            result = store.write_evidence_value(
+                run_id, f"{attempt}/outcome.json", result
             )
             store.seal_evidence(run_id, attempt)
             reviews.append(result)
@@ -407,29 +410,29 @@ def run_candidate_reviews(
         try:
             result = normalize_review_result(axis, payload, process_exit_code=exit_code)
         except GateError as exc:
-            result = {
-                "axis": axis,
-                "process_status": "failed" if exit_code != 0 else "succeeded",
-                "status": "inconclusive",
-                "summary": exc.summary,
-                "findings": [],
-            }
+            result = redact_artifact_value(
+                {
+                    "axis": axis,
+                    "process_status": "failed" if exit_code != 0 else "succeeded",
+                    "status": "inconclusive",
+                    "summary": exc.summary,
+                    "findings": [],
+                }
+            )
             store.write_evidence_text(
                 run_id,
                 f"{attempt}/raw-report.txt",
                 payload if isinstance(payload, str) else canonical_json(payload),
             )
-            store.write_evidence_text(
+            result = store.write_evidence_value(
                 run_id,
                 f"{attempt}/outcome.json",
-                canonical_json(result) + "\n",
+                result,
             )
             store.seal_evidence(run_id, attempt)
             reviews.append(result)
             continue
-        store.write_evidence_text(
-            run_id, f"{attempt}/report.json", canonical_json(result) + "\n"
-        )
+        result = store.write_evidence_value(run_id, f"{attempt}/report.json", result)
         store.seal_evidence(run_id, attempt)
         reviews.append(result)
     return reviews
@@ -526,13 +529,15 @@ def normalize_review_result(
         raise GateError(f"{axis} passed review contains blocking findings")
     if status == "rejected" and not blocking:
         raise GateError(f"{axis} rejected review has no blocking findings")
-    return {
-        "axis": axis,
-        "process_status": "succeeded",
-        "status": status,
-        "summary": summary.strip(),
-        "findings": normalized_findings,
-    }
+    return redact_artifact_value(
+        {
+            "axis": axis,
+            "process_status": "succeeded",
+            "status": status,
+            "summary": summary.strip(),
+            "findings": normalized_findings,
+        }
+    )
 
 
 def _normalize_finding(axis: str, value: Any, index: int) -> dict[str, Any]:

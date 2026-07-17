@@ -15,6 +15,7 @@ from afk.candidate_validation import (
 )
 from afk.codex_permissions import codex_environment, codex_permission_args
 from afk.jsonutil import canonical_json
+from afk.redaction import redact_artifact_value
 from afk.run_store import RunStore, RunStoreError
 
 
@@ -432,6 +433,8 @@ def _repair_prompt(
     worktree: Path,
     branch: str,
 ) -> str:
+    bead = redact_artifact_value(bead)
+    repair_brief = redact_artifact_value(repair_brief)
     return f"""# AFK repair attempt
 
 Run: {identity['run_id']}

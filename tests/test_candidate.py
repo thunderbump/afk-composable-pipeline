@@ -238,6 +238,33 @@ class CandidateTest(unittest.TestCase):
         )
         self.assertEqual(self.store.effect("run-1", "pr-create")["status"], "confirmed")
 
+    def test_repair_prompt_redacts_structured_bead_and_brief(self):
+        prompt = candidate_module._repair_prompt(
+            {"run_id": "run-1", "repository": "owner/project"},
+            {
+                "id": "central-test.1",
+                "title": "password=bead-secret",
+                "description": "Repair it.",
+                "acceptance_criteria": "No secret remains.",
+            },
+            {
+                "candidate_sha": "b" * 40,
+                "repair_attempt": 1,
+                "blocking_findings": [
+                    {
+                        "id": "standards-secret",
+                        "body": "token=brief-secret",
+                    }
+                ],
+            },
+            self.checkout,
+            self.branch,
+        )
+
+        self.assertNotIn("bead-secret", prompt)
+        self.assertNotIn("brief-secret", prompt)
+        self.assertIn("[REDACTED]", prompt)
+
     def test_repair_consumes_a_slot_and_advances_the_same_candidate_branch(self):
         first = self.produce()
         brief = {
