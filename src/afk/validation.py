@@ -794,11 +794,9 @@ def stopped_process_group(process_group: int) -> list[dict[str, Any]]:
 
 
 def stopped_worker_processes(root_pid: int, *, process_groups_available: bool) -> list[dict[str, Any]]:
-    stopped = {int(item["pid"]): item for item in stopped_process_tree(root_pid)}
     if process_groups_available:
-        for item in stopped_process_group(root_pid):
-            stopped[int(item["pid"])] = item
-    return [stopped[pid] for pid in sorted(stopped)]
+        return stopped_process_group(root_pid)
+    return stopped_process_tree(root_pid)
 
 
 def process_group_members(process_group: int) -> list[int]:
