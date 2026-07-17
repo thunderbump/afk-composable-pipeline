@@ -14,7 +14,11 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 import afk.candidate as candidate_module  # noqa: E402
-from afk.candidate import CandidateError, produce_candidate  # noqa: E402
+from afk.candidate import (  # noqa: E402
+    CandidateError,
+    produce_candidate,
+    produce_repair_candidate,
+)
 from afk.run_store import RunStore  # noqa: E402
 
 
@@ -228,6 +232,100 @@ class CandidateTest(unittest.TestCase):
         )
         self.assertEqual(self.store.effect("run-1", "pr-create")["status"], "confirmed")
 
+    def test_repair_consumes_a_slot_and_advances_the_same_candidate_branch(self):
+        first = self.produce()
+        brief = {
+            "schema_version": 1,
+            "candidate_sha": first["candidate_sha"],
+            "repair_attempt": 1,
+            "blocking_findings": [
+                {
+                    "id": "validation-smoke",
+                    "source": "validation",
+                    "title": "Smoke test failed",
+                    "body": "Repair the smoke startup.",
+                    "blocking": True,
+                }
+            ],
+        }
+
+        with mock.patch.dict(os.environ, self._candidate_environment(), clear=True):
+            result = produce_repair_candidate(
+                self.store,
+                "run-1",
+                bead={
+                    "id": "central-test.1",
+                    "title": "Implement the thing",
+                    "description": "Change one file.",
+                    "acceptance_criteria": "The file exists.",
+                },
+                repair_brief=brief,
+            )
+
+        self.assertNotEqual(result["candidate_sha"], first["candidate_sha"])
+        self.assertEqual(result["repair_attempts_used"], 1)
+        self.assertEqual(result["previous_candidate_sha"], first["candidate_sha"])
+        attempt = self.state / "runs" / "run-1" / "attempts" / "repair-1"
+        report = json.loads((attempt / "report.json").read_text(encoding="utf-8"))
+        self.assertEqual(
+            report["dispositions"],
+            [{"finding_id": "validation-smoke", "disposition": "addressed"}],
+        )
+        pr = json.loads(self.gh_state.read_text(encoding="utf-8"))
+        self.assertEqual(pr["number"], 7)
+        self.assertEqual(pr["headRefOid"], result["candidate_sha"])
+
+    def test_malformed_repair_output_is_sealed_and_consumes_its_slot(self):
+        first = self.produce()
+        brief = {
+            "schema_version": 1,
+            "candidate_sha": first["candidate_sha"],
+            "repair_attempt": 1,
+            "blocking_findings": [
+                {
+                    "id": "validation-smoke",
+                    "source": "validation",
+                    "title": "Smoke test failed",
+                    "body": "Repair it.",
+                    "blocking": True,
+                }
+            ],
+        }
+        (self.codex_home / "fake-outcome").write_text("malformed", encoding="utf-8")
+
+        with mock.patch.dict(os.environ, self._candidate_environment(), clear=True):
+            with self.assertRaisesRegex(CandidateError, "report"):
+                produce_repair_candidate(
+                    self.store,
+                    "run-1",
+                    bead={
+                        "id": "central-test.1",
+                        "title": "Implement the thing",
+                        "description": "Change one file.",
+                        "acceptance_criteria": "The file exists.",
+                    },
+                    repair_brief=brief,
+                )
+
+        attempt = self.state / "runs" / "run-1" / "attempts" / "repair-1"
+        self.assertTrue((attempt / "manifest.json").is_file())
+        self.assertEqual(
+            self.store.status("run-1")["repair_attempts_used"], 1
+        )
+
+    def _candidate_environment(self):
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "PATH": f"{self.bin}:{environment['PATH']}",
+                "HOME": str(self.home),
+                "CODEX_HOME": str(self.codex_home),
+                "GH_FAKE_STATE": str(self.gh_state),
+                "CODEX_ENV_CAPTURE": str(self.codex_env),
+            }
+        )
+        return environment
+
     def test_allows_only_codex_package_when_installed_beneath_home(self):
         package = self.home / ".local/lib/node_modules/@openai/codex"
         wrapper = package / "bin/codex.js"
@@ -356,16 +454,19 @@ class CandidateTest(unittest.TestCase):
                 import json, os, subprocess, sys
                 from pathlib import Path
                 args = sys.argv[1:]
+                prompt = sys.stdin.read()
                 cwd = Path(args[args.index("--cd") + 1])
                 report = Path(args[args.index("--output-last-message") + 1])
                 Path({str(self.codex_env)!r}).write_text(json.dumps(dict(os.environ)), encoding="utf-8")  # noqa: E501
                 Path({str(self.codex_args)!r}).write_text(json.dumps(args), encoding="utf-8")  # noqa: E501
                 outcome = (Path(os.environ["CODEX_HOME"]) / "fake-outcome").read_text()
                 start = subprocess.run(["git", "rev-parse", "HEAD"], cwd=cwd, text=True, capture_output=True, check=True).stdout.strip()  # noqa: E501
+                repair = "# AFK repair attempt" in prompt
+                changed = "repair.txt" if repair else "candidate.txt"
                 if outcome not in {"no_change", "nonzero", "malformed"}:
-                    (cwd / "candidate.txt").write_text("candidate\\n", encoding="utf-8")
-                    subprocess.run(["git", "add", "candidate.txt"], cwd=cwd, check=True)
-                    subprocess.run(["git", "commit", "-m", "candidate"], cwd=cwd, check=True, capture_output=True)  # noqa: E501
+                    (cwd / changed).write_text("candidate\\n", encoding="utf-8")
+                    subprocess.run(["git", "add", changed], cwd=cwd, check=True)
+                    subprocess.run(["git", "commit", "-m", "repair" if repair else "candidate"], cwd=cwd, check=True, capture_output=True)  # noqa: E501
                 if outcome == "merge":
                     subprocess.run(["git", "commit", "--allow-empty", "-m", "side"], cwd=cwd, check=True, capture_output=True)  # noqa: E501
                     side = subprocess.run(["git", "rev-parse", "HEAD"], cwd=cwd, text=True, capture_output=True, check=True).stdout.strip()  # noqa: E501
@@ -377,14 +478,17 @@ class CandidateTest(unittest.TestCase):
                 if outcome == "malformed":
                     report.write_text("not json", encoding="utf-8")
                 else:
-                    report.write_text(json.dumps({{
+                    value = {{
                         "status": "no_change" if outcome == "no_change" else "completed",  # noqa: E501
                         "starting_sha": start,
                         "ending_sha": end,
                         "summary": "implemented",
                         "checks": [],
-                        "changed_areas": ["candidate.txt"],
-                    }}), encoding="utf-8")
+                        "changed_areas": [changed],
+                    }}
+                    if repair:
+                        value["dispositions"] = [{{"finding_id": "validation-smoke", "disposition": "addressed"}}]
+                    report.write_text(json.dumps(value), encoding="utf-8")
                 print(json.dumps({{"type": "result"}}))
                 raise SystemExit(1 if outcome == "nonzero" else 0)
                 """
@@ -401,7 +505,13 @@ class CandidateTest(unittest.TestCase):
                 args = sys.argv[1:]
                 state = Path(os.environ["GH_FAKE_STATE"])
                 if args[:2] == ["pr", "list"]:
-                    print(json.dumps([json.loads(state.read_text())] if state.exists() else []))  # noqa: E501
+                    if state.exists():
+                        value = json.loads(state.read_text())
+                        value["headRefOid"] = subprocess.run(["git", "rev-parse", "HEAD"], text=True, capture_output=True, check=True).stdout.strip()  # noqa: E501
+                        state.write_text(json.dumps(value), encoding="utf-8")
+                        print(json.dumps([value]))
+                    else:
+                        print("[]")
                 elif args[:2] == ["pr", "create"]:
                     branch = args[args.index("--head") + 1]
                     base = args[args.index("--base") + 1]

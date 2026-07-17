@@ -46,6 +46,27 @@ REPORT_SCHEMA = {
         "changed_areas": {"type": "array", "items": {"type": "string"}},
     },
 }
+REPAIR_REPORT_SCHEMA = {
+    **REPORT_SCHEMA,
+    "required": [*REPORT_SCHEMA["required"], "dispositions"],
+    "properties": {
+        **REPORT_SCHEMA["properties"],
+        "dispositions": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["finding_id", "disposition"],
+                "properties": {
+                    "finding_id": {"type": "string", "minLength": 1},
+                    "disposition": {
+                        "enum": ["addressed", "not_addressed", "disputed"]
+                    },
+                },
+            },
+        },
+    },
+}
 
 
 class CandidateError(RuntimeError):
@@ -151,6 +172,142 @@ def produce_candidate(
     )
 
 
+def produce_repair_candidate(
+    store: RunStore,
+    run_id: str,
+    *,
+    bead: dict[str, Any],
+    repair_brief: dict[str, Any],
+) -> dict[str, Any]:
+    """Run one budgeted repair and advance the existing Candidate branch/PR."""
+    identity = store.identity(run_id)
+    projection = store.status(run_id)
+    worktree = Path(_field(projection, "worktree_path"))
+    branch = _field(projection, "branch")
+    previous_sha = _field(projection, "candidate_sha")
+    attempt_number = repair_brief.get("repair_attempt")
+    if type(attempt_number) is not int or not 1 <= attempt_number <= 4:
+        raise CandidateError(
+            "repair attempt is outside the four-slot budget", kind="invalid"
+        )
+    if repair_brief.get("candidate_sha") != previous_sha:
+        raise CandidateError(
+            "Repair Brief is not bound to the current Candidate", kind="invalid"
+        )
+    attempt = f"attempts/repair-{attempt_number}"
+    attempt_path = store.root / "runs" / run_id / attempt
+    if attempt_path.exists():
+        raise CandidateError("repair attempt was already started")
+
+    store.append_event(
+        run_id,
+        "repair.started",
+        data={
+            "checkpoint": "candidate_ready",
+            "repair_attempts_used": attempt_number,
+            "repair_brief": repair_brief,
+        },
+    )
+    prompt = _repair_prompt(identity, bead, repair_brief, worktree, branch)
+    store.write_evidence_text(run_id, f"{attempt}/prompt.md", prompt)
+    store.write_evidence_text(
+        run_id,
+        f"{attempt}/schema.json",
+        canonical_json(REPAIR_REPORT_SCHEMA) + "\n",
+    )
+    with tempfile.TemporaryDirectory(prefix="afk-repair-") as temporary:
+        report_path = Path(temporary) / "report.json"
+        report_error: CandidateError | None = None
+        command = [
+            "codex",
+            "exec",
+            "--ephemeral",
+            "--ignore-user-config",
+            *_codex_permission_args(worktree, branch),
+            "--cd",
+            str(worktree),
+            "--output-schema",
+            str(attempt_path / "schema.json"),
+            "--output-last-message",
+            str(report_path),
+            "--json",
+            "-",
+        ]
+        completed = _run(
+            command,
+            cwd=worktree,
+            env=_codex_environment(),
+            input_text=prompt,
+            timeout=COMMAND_TIMEOUT_SECONDS,
+        )
+        if completed.returncode == 0:
+            try:
+                report = _read_repair_report(report_path, repair_brief)
+            except CandidateError as exc:
+                report_error = exc
+                try:
+                    raw_report = report_path.read_text(encoding="utf-8")
+                except (OSError, UnicodeDecodeError):
+                    raw_report = ""
+    store.write_evidence_text(run_id, f"{attempt}/events.jsonl", completed.stdout)
+    store.write_evidence_text(run_id, f"{attempt}/stderr.txt", completed.stderr)
+    if completed.returncode != 0 or report_error is not None:
+        error = report_error or CandidateError(
+            f"repair agent exited with status {completed.returncode}"
+        )
+        if report_error is not None:
+            store.write_evidence_text(
+                run_id, f"{attempt}/raw-report.txt", raw_report
+            )
+        store.write_evidence_text(
+            run_id,
+            f"{attempt}/outcome.json",
+            canonical_json({"status": error.kind, "summary": error.summary}) + "\n",
+        )
+        store.seal_evidence(run_id, attempt)
+        raise error
+    store.write_evidence_text(
+        run_id, f"{attempt}/report.json", canonical_json(report) + "\n"
+    )
+    store.seal_evidence(run_id, attempt)
+
+    candidate_sha = _verify_candidate(
+        worktree,
+        branch=branch,
+        base_sha=previous_sha,
+        report=report,
+    )
+    _reconcile_push(
+        store,
+        run_id,
+        worktree,
+        branch,
+        candidate_sha,
+        expected_previous_sha=previous_sha,
+    )
+    prs = _list_prs(worktree, identity["repository"], branch)
+    if len(prs) != 1:
+        raise CandidateError("Candidate branch does not have exactly one stable PR")
+    pr = prs[0]
+    _verify_published(identity, worktree, branch, candidate_sha, pr)
+    return store.append_event(
+        run_id,
+        "candidate.repaired",
+        state="candidate_ready",
+        data={
+            "checkpoint": "candidate_ready",
+            "previous_candidate_sha": previous_sha,
+            "candidate_sha": candidate_sha,
+            "pr_number": pr["number"],
+            "pr_url": pr["url"],
+            "pr_head_sha": pr["headRefOid"],
+            "repair_attempts_used": attempt_number,
+            "repair_dispositions": report["dispositions"],
+            "attention": {},
+        },
+    )
+
+
 def _implementation_prompt(
     identity: dict[str, Any],
     bead: dict[str, Any],
@@ -191,6 +348,44 @@ rewrite the starting commit, push, or create a pull request.
 Finish with the schema-constrained report. `completed` means HEAD advanced with
 one or more ordinary commits and the worktree is clean. Use `no_change` when no
 commit is needed and `blocked` when safe completion is impossible.
+"""
+
+
+def _repair_prompt(
+    identity: dict[str, Any],
+    bead: dict[str, Any],
+    repair_brief: dict[str, Any],
+    worktree: Path,
+    branch: str,
+) -> str:
+    return f"""# AFK repair attempt
+
+Run: {identity['run_id']}
+Attempt: repair-{repair_brief['repair_attempt']}
+Repository: {identity['repository']}
+Worktree: {worktree}
+Branch: {branch}
+Starting Candidate: {repair_brief['candidate_sha']}
+
+## Exact Bead
+
+ID: {_field(bead, 'id')}
+Title: {_field(bead, 'title')}
+Description: {_field(bead, 'description')}
+Acceptance criteria: {_field(bead, 'acceptance_criteria')}
+
+## Candidate-bound Repair Brief
+
+{canonical_json(repair_brief)}
+
+## Contract
+
+Work only in the dedicated worktree and follow its AGENTS.md files. Address the
+blocking findings, run safe unprivileged checks, and commit the repair. Do not
+access Docker, systemd, the network, GitHub, Beads, AFK state, or credentials.
+Do not merge, rewrite the Starting Candidate, push, or create a pull request.
+Return one disposition for every blocking finding. Dispositions are claims for
+the audit trail; the next full validation and review cycle decides correctness.
 """
 
 
@@ -297,26 +492,59 @@ def _read_report(path: Path) -> dict[str, Any]:
         raise CandidateError("implementation report is missing or malformed") from exc
     if not isinstance(value, dict) or set(value) != set(REPORT_SCHEMA["required"]):
         raise CandidateError("implementation report is missing or malformed")
+    _validate_report(value, label="implementation")
+    return value
+
+
+def _read_repair_report(
+    path: Path, repair_brief: dict[str, Any]
+) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise CandidateError("repair report is missing or malformed") from exc
+    expected = set(REPAIR_REPORT_SCHEMA["required"])
+    if not isinstance(value, dict) or set(value) != expected:
+        raise CandidateError("repair report is missing or malformed")
+    base_report = {key: value[key] for key in REPORT_SCHEMA["required"]}
+    _validate_report(base_report, label="repair")
+    dispositions = value["dispositions"]
+    if not isinstance(dispositions, list) or not all(
+        isinstance(item, dict)
+        and set(item) == {"finding_id", "disposition"}
+        and isinstance(item["finding_id"], str)
+        and item["disposition"] in {"addressed", "not_addressed", "disputed"}
+        for item in dispositions
+    ):
+        raise CandidateError("repair report dispositions are malformed")
+    expected_ids = [
+        finding.get("id") for finding in repair_brief.get("blocking_findings", [])
+    ]
+    if [item["finding_id"] for item in dispositions] != expected_ids:
+        raise CandidateError("repair report dispositions do not match the Repair Brief")
+    return value
+
+
+def _validate_report(value: dict[str, Any], *, label: str) -> None:
     if value.get("status") not in {"completed", "no_change", "blocked"}:
-        raise CandidateError("implementation report is missing or malformed")
+        raise CandidateError(f"{label} report is missing or malformed")
     for key in ("starting_sha", "ending_sha", "summary"):
         if not isinstance(value.get(key), str) or not value[key]:
-            raise CandidateError("implementation report is missing or malformed")
+            raise CandidateError(f"{label} report is missing or malformed")
     for key in ("starting_sha", "ending_sha"):
         if re.fullmatch(r"[0-9a-f]{40}", value[key]) is None:
-            raise CandidateError("implementation report is missing or malformed")
+            raise CandidateError(f"{label} report is missing or malformed")
     if not isinstance(value.get("checks"), list) or not isinstance(
         value.get("changed_areas"), list
     ):
-        raise CandidateError("implementation report is missing or malformed")
+        raise CandidateError(f"{label} report is missing or malformed")
     if not all(
         isinstance(check, dict)
         and set(check) == {"command", "outcome"}
         and all(isinstance(check[field], str) for field in check)
         for check in value["checks"]
     ) or not all(isinstance(area, str) for area in value["changed_areas"]):
-        raise CandidateError("implementation report is missing or malformed")
-    return value
+        raise CandidateError(f"{label} report is missing or malformed")
 
 
 def _verify_candidate(
@@ -355,6 +583,8 @@ def _reconcile_push(
     worktree: Path,
     branch: str,
     candidate_sha: str,
+    *,
+    expected_previous_sha: str | None = None,
 ) -> None:
     effect_id = f"branch-push-{candidate_sha}"
     effect = store.prepare_effect(
@@ -364,9 +594,12 @@ def _reconcile_push(
         intended={"branch": branch, "candidate_sha": candidate_sha, "remote": "origin"},
     )
     remote_sha = _remote_sha(worktree, branch)
-    if remote_sha and remote_sha != candidate_sha:
+    allowed_remote = {candidate_sha}
+    if expected_previous_sha is not None:
+        allowed_remote.add(expected_previous_sha)
+    if remote_sha and remote_sha not in allowed_remote:
         raise CandidateError("remote Candidate branch has a contradictory head")
-    if not remote_sha:
+    if remote_sha != candidate_sha:
         pushed = _run(
             ["git", "push", "origin", f"{candidate_sha}:refs/heads/{branch}"],
             cwd=worktree,

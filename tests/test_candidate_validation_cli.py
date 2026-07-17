@@ -177,8 +177,11 @@ class CandidateValidationCliTest(unittest.TestCase):
 
         resumed = self.run_afk("resume")
 
-        self.assertEqual(resumed.returncode, 0, resumed.stderr)
-        self.assertEqual(self.status(run_id)["last_sequence"], status["last_sequence"])
+        self.assertEqual(resumed.returncode, 2, resumed.stderr)
+        resumed_status = self.status(run_id)
+        self.assertGreater(resumed_status["last_sequence"], status["last_sequence"])
+        self.assertEqual(resumed_status["attention"]["scope"], "gate")
+        self.assertEqual(resumed_status["attention"]["kind"], "unavailable")
 
     def test_rejected_validation_accepts_mixed_check_outcomes(self):
         self.write_contract_worker(
@@ -457,8 +460,11 @@ class CandidateValidationCliTest(unittest.TestCase):
 
         resumed = self.run_afk("resume")
 
-        self.assertEqual(resumed.returncode, 0, resumed.stderr)
-        self.assertEqual(self.status(run_id)["last_sequence"], sequence)
+        self.assertEqual(resumed.returncode, 2, resumed.stderr)
+        resumed_status = self.status(run_id)
+        self.assertGreater(resumed_status["last_sequence"], sequence)
+        self.assertEqual(resumed_status["attention"]["scope"], "gate")
+        self.assertEqual(resumed_status["attention"]["kind"], "unavailable")
         self.assertFalse(marker.exists())
 
     def test_boolean_contract_schema_version_is_invalid(self):

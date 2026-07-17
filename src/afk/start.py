@@ -12,7 +12,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from afk.candidate import CandidateError, produce_candidate
+from afk.candidate import CandidateError, produce_candidate, produce_repair_candidate
+from afk.candidate_gate import GateError, complete_gate_cycle
 from afk.candidate_validation import (
     CandidateValidationError,
     VALIDATION_ENVIRONMENT_ALLOWLIST,
@@ -150,10 +151,14 @@ def resume_run(*, note: str | None = None) -> tuple[str, int]:
         run_id = projection["run_id"]
         if _validation_attempt_open(projection):
             return run_id, _recover_validation_attempt(store, run_id, projection)
+        if projection["checkpoint"] == "reviewed":
+            return run_id, 0
         if projection["checkpoint"] == "validated":
-            return run_id, 0
+            return run_id, _advance_gate(store, run_id)
         if projection["last_event"] == "validation.rejected":
-            return run_id, 0
+            return run_id, _advance_gate(store, run_id)
+        if projection["last_event"] == "gate.cycle_completed":
+            return run_id, _advance_completed_gate(store, run_id)
         if "worker_exit_code" in projection:
             if _candidate_resume_ready(projection):
                 return run_id, _advance_candidate(store, run_id)
@@ -686,6 +691,119 @@ def _advance_candidate(store: RunStore, run_id: str) -> int:
             run_id,
             checkpoint=checkpoint,
             scope="candidate",
+            kind="unavailable",
+            summary=str(exc),
+            classification=(
+                _error_classification(exc) if isinstance(exc, StartError) else None
+            ),
+        )
+        return 2
+    return _advance_validation(store, run_id)
+
+
+def _advance_gate(store: RunStore, run_id: str) -> int:
+    identity = store.identity(run_id)
+    request = identity.get("start_request", {})
+    try:
+        bead = _show_bead(identity["bead_id"], Path(request["beads_workspace"]))
+        outcome = complete_gate_cycle(store, run_id, bead=bead)
+    except GateError as exc:
+        _attention(
+            store,
+            run_id,
+            checkpoint=store.status(run_id)["checkpoint"],
+            scope="gate",
+            kind=exc.kind,
+            summary=exc.summary,
+        )
+        return 2
+    except (KeyError, OSError, StartError, RunStoreError, ValueError) as exc:
+        _attention(
+            store,
+            run_id,
+            checkpoint=store.status(run_id)["checkpoint"],
+            scope="gate",
+            kind="unavailable",
+            summary=str(exc),
+            classification=(
+                _error_classification(exc) if isinstance(exc, StartError) else None
+            ),
+        )
+        return 2
+    return _advance_completed_gate(store, run_id, outcome=outcome, bead=bead)
+
+
+def _advance_completed_gate(
+    store: RunStore,
+    run_id: str,
+    *,
+    outcome: dict[str, Any] | None = None,
+    bead: dict[str, Any] | None = None,
+) -> int:
+    projection = store.status(run_id)
+    if outcome is None:
+        cycles = projection.get("gate_cycles", [])
+        if not isinstance(cycles, list) or not cycles or not isinstance(cycles[-1], dict):
+            _attention(
+                store,
+                run_id,
+                checkpoint=projection["checkpoint"],
+                scope="gate",
+                kind="invalid",
+                summary="completed Gate Cycle outcome is missing",
+            )
+            return 2
+        outcome = cycles[-1]
+    next_action = outcome.get("next_action")
+    if next_action == "complete":
+        return 0
+    if next_action == "attention":
+        _attention(
+            store,
+            run_id,
+            checkpoint=projection["checkpoint"],
+            scope="gate",
+            kind="exhausted" if outcome.get("stop_reason") else "inconclusive",
+            summary=str(outcome.get("stop_reason", "Gate Cycle was inconclusive")),
+        )
+        return 2
+    if next_action != "repair" or not isinstance(outcome.get("repair_brief"), dict):
+        _attention(
+            store,
+            run_id,
+            checkpoint=projection["checkpoint"],
+            scope="gate",
+            kind="invalid",
+            summary="Gate Cycle next action is invalid",
+        )
+        return 2
+    identity = store.identity(run_id)
+    request = identity.get("start_request", {})
+    try:
+        if bead is None:
+            bead = _show_bead(identity["bead_id"], Path(request["beads_workspace"]))
+        produce_repair_candidate(
+            store,
+            run_id,
+            bead=bead,
+            repair_brief=outcome["repair_brief"],
+        )
+    except CandidateError as exc:
+        _attention(
+            store,
+            run_id,
+            checkpoint=store.status(run_id)["checkpoint"],
+            scope="repair",
+            kind=exc.kind,
+            summary=exc.summary,
+        )
+        return 2
+    except (KeyError, OSError, StartError, RunStoreError, ValueError) as exc:
+        _attention(
+            store,
+            run_id,
+            checkpoint=store.status(run_id)["checkpoint"],
+            scope="repair",
             kind="unavailable",
             summary=str(exc),
             classification=(

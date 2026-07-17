@@ -891,10 +891,11 @@ class StartCliTest(unittest.TestCase):
 
         terminal_resume = self.run_afk("resume", HOME=home)
 
-        self.assertEqual(terminal_resume.returncode, 0, terminal_resume.stderr)
+        self.assertEqual(terminal_resume.returncode, 2, terminal_resume.stderr)
         terminal = json.loads(self.run_afk("status", run_id, "--json").stdout)
         self.assertEqual(terminal["checkpoint"], "validated")
         self.assertEqual(terminal["validation"]["status"], "passed")
+        self.assertEqual(terminal["attention"]["scope"], "gate")
 
     def test_resume_requires_attention_for_confirmed_collected_worker_without_terminal(
         self,
