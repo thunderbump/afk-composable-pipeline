@@ -120,8 +120,7 @@ def complete_gate_cycle(
     if type(used) is not int or not 0 <= used <= 4:
         raise GateError("repair budget state is invalid")
     cycle = used + 1
-    retry_segment = f"-retry-{retry}" if retry else ""
-    evidence = f"gates/gate-cycle-{cycle}{retry_segment}-{candidate_sha[:12]}"
+    evidence = _gate_evidence(cycle, retry, candidate_sha)
     evidence_path = store.root / "runs" / run_id / evidence
 
     if (evidence_path / "manifest.json").exists():
@@ -263,6 +262,11 @@ def _require_candidate_publication(
         raise GateError(exc.summary, kind=exc.kind) from exc
 
 
+def _gate_evidence(cycle: int, retry: int, candidate_sha: str) -> str:
+    retry_segment = f"-retry-{retry}" if retry else ""
+    return f"gates/gate-cycle-{cycle}{retry_segment}-{candidate_sha[:12]}"
+
+
 def reconcile_gate_comment(
     store: RunStore,
     run_id: str,
@@ -374,9 +378,7 @@ def run_candidate_reviews(
     expected_bundle = redact_artifact_value(bundle_value)
 
     retry_segment = f"-retry-{retry}" if retry else ""
-    bundle = (
-        f"gates/gate-cycle-{cycle}{retry_segment}-{candidate_sha[:12]}" "/review-bundle"
-    )
+    bundle = f"{_gate_evidence(cycle, retry, candidate_sha)}/review-bundle"
     bundle_path = store.root / "runs" / run_id / bundle
     if not bundle_path.exists():
         expected_bundle = store.write_evidence_value(

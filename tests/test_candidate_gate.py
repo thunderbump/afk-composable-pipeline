@@ -1639,6 +1639,17 @@ class CandidateGateTest(unittest.TestCase):
             self.assertEqual(outcome["retry"], 1)
             self.assertEqual(outcome["evidence"], retry_evidence)
             self.assertEqual(outcome["next_action"], "complete")
+            self.assertTrue(
+                (
+                    root
+                    / "state"
+                    / "runs"
+                    / run_id
+                    / retry_evidence
+                    / "review-bundle"
+                    / "manifest.json"
+                ).is_file()
+            )
             self.assertEqual(store.status(run_id)["checkpoint"], "reviewed")
             self.assertEqual(store.status(run_id)["gate_retry"], {})
             self.assertEqual(
