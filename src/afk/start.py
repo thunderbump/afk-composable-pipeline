@@ -372,8 +372,7 @@ def _gate_attention_resume_ready(
     used = projection.get("repair_attempts_used", 0)
     if (
         not isinstance(candidate_sha, str)
-        or len(candidate_sha) != 40
-        or any(character not in "0123456789abcdef" for character in candidate_sha)
+        or not _is_full_git_sha(candidate_sha)
         or type(used) is not int
         or not 0 <= used <= 4
     ):
