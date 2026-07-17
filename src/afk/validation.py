@@ -246,6 +246,7 @@ def normalize_checkout(checkout: Any) -> dict[str, Any]:
             "status": "invalid",
             "message": "checkout HEAD does not match checkout.start_commit",
         }
+    prepared["start_commit"] = head
     return normalized
 
 

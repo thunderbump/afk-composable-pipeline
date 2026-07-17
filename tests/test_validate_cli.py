@@ -335,7 +335,7 @@ class ValidateCliTest(unittest.TestCase):
                 (run_dir / "stdout.log").read_text(encoding="utf-8"),
             )
 
-    def test_validate_accepts_a_git_linked_worktree_and_binds_its_commit(self):
+    def test_validate_canonicalizes_a_linked_worktree_abbreviated_start_commit(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
             repository = temp_path / "repository"
@@ -370,7 +370,7 @@ class ValidateCliTest(unittest.TestCase):
                             "checkout_path": str(checkout),
                             "review_branch": "afk/linked",
                             "requested_ref": "main",
-                            "start_commit": candidate,
+                            "start_commit": candidate[:12],
                         },
                         "validation": {"dry_run": False, "timeout_seconds": 30},
                         "worker": {
@@ -471,9 +471,7 @@ class ValidateCliTest(unittest.TestCase):
                     fake_git_dir.mkdir()
                     marker = checkout / ".git"
                     marker.write_text("gitdir: ../fake-git-dir\n", encoding="utf-8")
-                    (fake_git_dir / "gitdir").write_text(
-                        str(marker), encoding="utf-8"
-                    )
+                    (fake_git_dir / "gitdir").write_text(str(marker), encoding="utf-8")
                 self.assert_invalid_checkout(checkout, temp_path / "ledger")
 
     def test_validate_rejects_gitdir_indirection_through_a_symlink_loop(self):
