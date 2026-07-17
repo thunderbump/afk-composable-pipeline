@@ -91,6 +91,7 @@ def start_run(
         run_id = projection["run_id"]
         try:
             bead = _show_bead(bead_id, context.beads_workspace)
+            bead["comments"] = _bead_comments(bead_id, context.beads_workspace)
         except StartError as exc:
             _attention(
                 store,
@@ -1496,6 +1497,22 @@ def _show_bead(bead_id: str, workspace: Path) -> dict[str, Any]:
     ):
         raise _malformed_beads_output()
     return result[0]
+
+
+def _bead_comments(bead_id: str, workspace: Path) -> list[dict[str, Any]]:
+    comments = _bd_json(["bd", "comments", bead_id, "--json"], cwd=workspace)
+    required = ("id", "issue_id", "author", "text", "created_at")
+    if not isinstance(comments, list) or not all(
+        isinstance(comment, dict)
+        and comment.get("issue_id") == bead_id
+        and all(
+            isinstance(comment.get(field), str) and bool(comment[field])
+            for field in required
+        )
+        for comment in comments
+    ):
+        raise _malformed_beads_output()
+    return comments
 
 
 def _validate_start_bead(bead: dict[str, Any], bead_id: str, repository: str) -> None:
