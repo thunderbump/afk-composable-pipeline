@@ -1077,6 +1077,90 @@ class CandidateGateTest(unittest.TestCase):
                 self.assertEqual(resumed, (run_id, 2))
                 self.assertEqual(store.status(run_id)["last_sequence"], last_sequence)
 
+    def test_resume_keeps_completed_terminal_gate_attention_paused(self):
+        for label, used, stop_reason in (
+            ("inconclusive", 0, None),
+            ("exhausted", 4, "repair budget exhausted after four attempts"),
+        ):
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                store = RunStore(root / "state")
+                run_id = store.create_run(
+                    bead_id="central-test.1",
+                    repository="owner/project",
+                    base_branch="main",
+                    base_sha="a" * 40,
+                    start_request={},
+                    run_id="run-1",
+                )["run_id"]
+                candidate_sha = "b" * 40
+                validation = {
+                    "status": "passed",
+                    "candidate_sha": candidate_sha,
+                    "summary": "passed",
+                    "evidence": "gates/validation",
+                    "checks": [],
+                }
+                store.write_evidence_text(
+                    run_id, "gates/validation/result.json", "{}\n"
+                )
+                store.seal_evidence(run_id, "gates/validation")
+                cycle = used + 1
+                gate_evidence = f"gates/gate-cycle-{cycle}-{candidate_sha[:12]}"
+                outcome = {
+                    "schema_version": 1,
+                    "cycle": cycle,
+                    "candidate_sha": candidate_sha,
+                    "validation": validation,
+                    "reviews": [],
+                    "prior_dispositions": [],
+                    "next_action": "attention",
+                    "evidence": gate_evidence,
+                    **({"stop_reason": stop_reason} if stop_reason else {}),
+                }
+                store.write_evidence_value(
+                    run_id, f"{gate_evidence}/outcome.json", outcome
+                )
+                store.seal_evidence(run_id, gate_evidence)
+                store.append_event(
+                    run_id,
+                    "gate.cycle_completed",
+                    state="validated",
+                    data={
+                        "checkpoint": "validated",
+                        "candidate_sha": candidate_sha,
+                        "repair_attempts_used": used,
+                        "validation": validation,
+                        "gate_cycles": [outcome],
+                    },
+                )
+                attention = {
+                    "scope": "gate",
+                    "kind": "exhausted" if stop_reason else "inconclusive",
+                    "summary": stop_reason or "review was inconclusive",
+                }
+                store.append_event(
+                    run_id,
+                    "run.attention_required",
+                    state="attention_required",
+                    data={"checkpoint": "validated", "attention": attention},
+                )
+                last_sequence = store.status(run_id)["last_sequence"]
+
+                with (
+                    mock.patch("afk.start.RunStore", return_value=store),
+                    mock.patch(
+                        "afk.start._advance_gate",
+                        side_effect=AssertionError("Gate must not be retried"),
+                    ),
+                ):
+                    resumed = resume_run()
+
+                status = store.status(run_id)
+                self.assertEqual(resumed, (run_id, 2))
+                self.assertEqual(status["last_sequence"], last_sequence)
+                self.assertEqual(status["attention"], attention)
+
     def test_resume_keeps_interrupted_repair_continuation_after_attention(self):
         for checkpoint in ("validated", "candidate_ready"):
             with (

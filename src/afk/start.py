@@ -389,6 +389,7 @@ def _gate_attention_resume_ready(
         return False
     validation = outcome.get("validation") if isinstance(outcome, dict) else None
     current_validation = projection.get("validation")
+    cycles = projection.get("gate_cycles", [])
     if (
         not isinstance(outcome, dict)
         or outcome.get("schema_version") != 1
@@ -404,6 +405,13 @@ def _gate_attention_resume_ready(
         or outcome.get("prior_dispositions")
         != projection.get("repair_dispositions", [])
         or outcome.get("next_action") not in {"complete", "attention", "repair"}
+        or not isinstance(cycles, list)
+        or any(
+            isinstance(item, dict)
+            and item.get("cycle") == cycle
+            and item.get("candidate_sha") == candidate_sha
+            for item in cycles
+        )
     ):
         return False
     brief = outcome.get("repair_brief")
