@@ -13,7 +13,12 @@ from pathlib import Path
 from typing import Any
 
 from afk.bead_spec import BEAD_SPEC_EVIDENCE, load_bead_spec, persist_bead_spec
-from afk.candidate import CandidateError, produce_candidate, produce_repair_candidate
+from afk.candidate import (
+    CandidateError,
+    produce_candidate,
+    produce_repair_candidate,
+    seal_interrupted_repair_attempt,
+)
 from afk.candidate_gate import GateError, complete_gate_cycle
 from afk.candidate_validation import (
     CandidateValidationError,
@@ -153,6 +158,10 @@ def resume_run(*, note: str | None = None) -> tuple[str, int]:
         run_id = projection["run_id"]
         if _validation_attempt_open(projection):
             return run_id, _recover_validation_attempt(store, run_id, projection)
+        if _repair_interruption_pending(store, run_id, projection):
+            return run_id, _recover_interrupted_repair(store, run_id, projection)
+        if projection["last_event"] == "repair.interrupted":
+            return run_id, _advance_interrupted_repair(store, run_id, projection)
         if _repair_resume_ready(projection):
             return run_id, _advance_completed_gate(store, run_id)
         if projection["checkpoint"] == "reviewed":
@@ -352,6 +361,99 @@ def _repair_resume_ready(projection: dict[str, Any]) -> bool:
         and isinstance(brief, dict)
         and brief.get("candidate_sha") == projection.get("candidate_sha")
         and brief.get("repair_attempt") == projection.get("repair_attempts_used")
+    )
+
+
+def _repair_interruption_pending(
+    store: RunStore, run_id: str, projection: dict[str, Any]
+) -> bool:
+    brief = projection.get("repair_brief")
+    used = projection.get("repair_attempts_used")
+    if (
+        not isinstance(brief, dict)
+        or type(used) is not int
+        or brief.get("repair_attempt") != used
+    ):
+        return False
+    attempt = store.root / "runs" / run_id / f"attempts/repair-{used}"
+    return attempt.is_dir() and (
+        not (attempt / "manifest.json").is_file()
+        or (attempt / "interruption.json").is_file()
+    )
+
+
+def _recover_interrupted_repair(
+    store: RunStore, run_id: str, projection: dict[str, Any]
+) -> int:
+    brief = projection["repair_brief"]
+    attempt_number = projection["repair_attempts_used"]
+    try:
+        interruption = seal_interrupted_repair_attempt(
+            store,
+            run_id,
+            repair_brief=brief,
+        )
+    except (CandidateError, OSError, RunStoreError, ValueError) as exc:
+        _attention(
+            store,
+            run_id,
+            checkpoint=projection["checkpoint"],
+            scope="repair",
+            kind=exc.kind if isinstance(exc, CandidateError) else "unavailable",
+            summary=exc.summary if isinstance(exc, CandidateError) else str(exc),
+        )
+        return 2
+    next_brief = (
+        {**brief, "repair_attempt": attempt_number + 1} if attempt_number < 4 else {}
+    )
+    projection = store.append_event(
+        run_id,
+        "repair.interrupted",
+        data={
+            "checkpoint": projection["checkpoint"],
+            "repair_attempts_used": attempt_number,
+            "repair_brief": next_brief,
+            "interrupted_repair": interruption,
+        },
+    )
+    return _advance_interrupted_repair(store, run_id, projection)
+
+
+def _advance_interrupted_repair(
+    store: RunStore, run_id: str, projection: dict[str, Any]
+) -> int:
+    used = projection.get("repair_attempts_used")
+    if used == 4:
+        _attention(
+            store,
+            run_id,
+            checkpoint=projection["checkpoint"],
+            scope="repair",
+            kind="exhausted",
+            summary="repair budget exhausted after interrupted fourth attempt",
+        )
+        return 2
+    brief = projection.get("repair_brief")
+    if (
+        type(used) is not int
+        or not 1 <= used < 4
+        or not isinstance(brief, dict)
+        or brief.get("repair_attempt") != used + 1
+        or brief.get("candidate_sha") != projection.get("candidate_sha")
+    ):
+        _attention(
+            store,
+            run_id,
+            checkpoint=projection["checkpoint"],
+            scope="repair",
+            kind="invalid",
+            summary="interrupted repair continuation is invalid",
+        )
+        return 2
+    return _advance_completed_gate(
+        store,
+        run_id,
+        outcome={"next_action": "repair", "repair_brief": brief},
     )
 
 

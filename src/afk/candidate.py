@@ -338,6 +338,60 @@ def produce_repair_candidate(
     )
 
 
+def seal_interrupted_repair_attempt(
+    store: RunStore,
+    run_id: str,
+    *,
+    repair_brief: dict[str, Any],
+) -> dict[str, Any]:
+    """Seal an uncompleted repair slot without treating it as resumable output."""
+    projection = store.status(run_id)
+    attempt_number = repair_brief.get("repair_attempt")
+    candidate_sha = repair_brief.get("candidate_sha")
+    if (
+        type(attempt_number) is not int
+        or not 1 <= attempt_number <= 4
+        or projection.get("repair_attempts_used") != attempt_number
+        or projection.get("candidate_sha") != candidate_sha
+    ):
+        raise CandidateError("interrupted repair is not bound to the consumed slot")
+    attempt = f"attempts/repair-{attempt_number}"
+    attempt_path = store.root / "runs" / run_id / attempt
+    if not attempt_path.is_dir():
+        raise CandidateError("interrupted repair evidence is missing")
+    interruption = {
+        "schema_version": 1,
+        "candidate_sha": candidate_sha,
+        "repair_attempt": attempt_number,
+        "status": "interrupted",
+        "summary": "repair execution ended before evidence was sealed",
+    }
+    interruption_path = attempt_path / "interruption.json"
+    if (attempt_path / "manifest.json").is_file():
+        if not store.verify_evidence(run_id, attempt):
+            raise CandidateError("interrupted repair evidence could not be verified")
+        if not interruption_path.is_file():
+            raise CandidateError("sealed repair attempt is not an interruption")
+    elif interruption_path.exists():
+        if not interruption_path.is_file():
+            raise CandidateError("interrupted repair classification is invalid")
+    else:
+        store.write_evidence_value(
+            run_id,
+            f"{attempt}/interruption.json",
+            interruption,
+        )
+    try:
+        observed = json.loads(interruption_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise CandidateError("interrupted repair classification is invalid") from exc
+    if observed != interruption:
+        raise CandidateError("interrupted repair classification is ambiguous")
+    if not (attempt_path / "manifest.json").is_file():
+        store.seal_evidence(run_id, attempt)
+    return interruption
+
+
 def _finish_repair_candidate(
     store: RunStore,
     run_id: str,

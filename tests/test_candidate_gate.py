@@ -709,6 +709,65 @@ class CandidateGateTest(unittest.TestCase):
             repair.assert_called_once_with(store, run_id)
             gate.assert_not_called()
 
+    def test_resume_of_crashed_fourth_repair_seals_it_and_exhausts_budget(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store = RunStore(root / "state")
+            run_id = store.create_run(
+                bead_id="central-test.1",
+                repository="owner/project",
+                base_branch="main",
+                base_sha="a" * 40,
+                start_request={},
+                run_id="run-1",
+            )["run_id"]
+            brief = {
+                "schema_version": 1,
+                "candidate_sha": "b" * 40,
+                "repair_attempt": 4,
+                "blocking_findings": [],
+            }
+            store.append_event(
+                run_id,
+                "gate.cycle_completed",
+                state="candidate_ready",
+                data={
+                    "checkpoint": "candidate_ready",
+                    "candidate_sha": "b" * 40,
+                    "gate_cycles": [{"next_action": "repair", "repair_brief": brief}],
+                },
+            )
+            store.append_event(
+                run_id,
+                "repair.started",
+                data={
+                    "checkpoint": "candidate_ready",
+                    "repair_attempts_used": 4,
+                    "repair_brief": brief,
+                },
+            )
+            store.write_evidence_text(
+                run_id, "attempts/repair-4/prompt.md", "started\n"
+            )
+
+            with (
+                mock.patch("afk.start.RunStore", return_value=store),
+                mock.patch("afk.start.produce_repair_candidate") as repair,
+            ):
+                resumed = resume_run()
+
+            self.assertEqual(resumed, (run_id, 2))
+            repair.assert_not_called()
+            attempt = root / "state/runs/run-1/attempts/repair-4"
+            self.assertTrue((attempt / "manifest.json").is_file())
+            interruption = json.loads(
+                (attempt / "interruption.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(interruption["repair_attempt"], 4)
+            status = store.status(run_id)
+            self.assertEqual(status["repair_attempts_used"], 4)
+            self.assertEqual(status["attention"]["kind"], "exhausted")
+
     def test_passed_validation_and_both_reviews_reach_reviewed(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
