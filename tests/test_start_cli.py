@@ -87,6 +87,8 @@ class StartCliTest(unittest.TestCase):
                 "AFK_FAKE_BEAD": "central-bnkl.1.1",
                 "AFK_FAKE_BEAD_STATUS": "open",
                 "AFK_FAKE_ASSIGNEE": "",
+                "AFK_FAKE_BEAD_DESCRIPTION": "Implement one candidate.",
+                "AFK_FAKE_BEAD_COMMENTS": "[]",
                 "AFK_FAKE_PINNED_CONTRACT": "present",
                 "AFK_FAKE_EXPECTED_PASSWORD": self.secret_value,
                 "USER": "bump",
@@ -116,7 +118,7 @@ class StartCliTest(unittest.TestCase):
         readable = self.run_afk("status", run_id)
         self.assertEqual(
             readable.stdout,
-            f"{run_id} created bead=central-bnkl.1.1 sequence=2 "
+            f"{run_id} created bead=central-bnkl.1.1 sequence=3 "
             f"checkpoint=created unit=afk-{run_id}-worker-1\n",
         )
         effect = json.loads(
@@ -225,6 +227,37 @@ class StartCliTest(unittest.TestCase):
             '"command":"bd","args":["update","central-bnkl.1.1","--claim"', commands
         )
         self.assertIn(BASE_SHA, commands)
+
+    def test_gate_uses_the_canonical_start_bead_after_live_tracker_mutation(self):
+        started = self.run_afk("start", "central-bnkl.1.1")
+        run_id = started.stdout.strip()
+
+        completed = self.run_afk(
+            "_worker",
+            run_id,
+            AFK_FAKE_BEAD_STATUS="in_progress",
+            AFK_FAKE_ASSIGNEE="bump",
+            AFK_FAKE_BEAD_DESCRIPTION="mutated live description",
+            AFK_FAKE_BEAD_COMMENTS='[{"text":"mutated live comment"}]',
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        projection = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(projection["checkpoint"], "reviewed")
+        bundle = json.loads(
+            (
+                self.state_home
+                / "afk"
+                / "runs"
+                / run_id
+                / projection["gate_cycles"][-1]["evidence"]
+                / "review-bundle"
+                / "bundle.json"
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual(bundle["bead"]["description"], "Implement one candidate.")
+        self.assertEqual(bundle["bead"]["status"], "open")
+        self.assertEqual(bundle["bead"].get("comments", []), [])
 
     def test_candidate_contract_changes_remain_proposals_for_later_validation(self):
         home = self.temp
@@ -1516,8 +1549,9 @@ class StartCliTest(unittest.TestCase):
                         print(json.dumps([{
                             "id": os.environ["AFK_FAKE_BEAD"],
                             "title": "Create the first slice",
-                            "description": "Implement one candidate.",
+                            "description": os.environ["AFK_FAKE_BEAD_DESCRIPTION"],
                             "acceptance_criteria": "Candidate is committed.",
+                            "comments": json.loads(os.environ["AFK_FAKE_BEAD_COMMENTS"]),
                             "status": status,
                             "assignee": assignee,
                             "labels": labels,

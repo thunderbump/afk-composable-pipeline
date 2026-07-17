@@ -16,6 +16,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 import afk.candidate as candidate_module  # noqa: E402
 import afk.candidate_validation as candidate_validation  # noqa: E402
+from afk.bead_spec import persist_bead_spec  # noqa: E402
 from afk.candidate import (  # noqa: E402
     CandidateError,
     produce_candidate,
@@ -266,6 +267,18 @@ class CandidateTest(unittest.TestCase):
         self.assertIn("[REDACTED]", prompt)
 
     def test_repair_consumes_a_slot_and_advances_the_same_candidate_branch(self):
+        persist_bead_spec(
+            self.store,
+            "run-1",
+            {
+                "id": "central-test.1",
+                "title": "Implement the thing",
+                "description": "Change one file.",
+                "acceptance_criteria": "The file exists.",
+                "status": "open",
+                "comments": [],
+            },
+        )
         first = self.produce()
         brief = {
             "schema_version": 1,
@@ -289,8 +302,10 @@ class CandidateTest(unittest.TestCase):
                 bead={
                     "id": "central-test.1",
                     "title": "Implement the thing",
-                    "description": "Change one file.",
+                    "description": "mutated live description",
                     "acceptance_criteria": "The file exists.",
+                    "status": "closed",
+                    "comments": [{"text": "mutated live comment"}],
                 },
                 repair_brief=brief,
             )
@@ -300,6 +315,9 @@ class CandidateTest(unittest.TestCase):
         self.assertEqual(result["previous_candidate_sha"], first["candidate_sha"])
         attempt = self.state / "runs" / "run-1" / "attempts" / "repair-1"
         report = json.loads((attempt / "report.json").read_text(encoding="utf-8"))
+        prompt = (attempt / "prompt.md").read_text(encoding="utf-8")
+        self.assertIn("Description: Change one file.", prompt)
+        self.assertNotIn("mutated live", prompt)
         self.assertEqual(
             report["dispositions"],
             [{"finding_id": "validation-smoke", "disposition": "addressed"}],

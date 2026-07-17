@@ -9,6 +9,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+from afk.bead_spec import load_bead_spec
 from afk.candidate import CandidateError, verify_candidate_publication
 from afk.candidate_validation import (
     CandidateValidationError,
@@ -80,6 +81,7 @@ def complete_gate_cycle(
     *,
     bead: dict[str, Any],
 ) -> dict[str, Any]:
+    bead = load_bead_spec(store, run_id, fallback=bead)
     projection = store.status(run_id)
     _require_candidate_publication(store, run_id, projection)
     candidate_sha = _required_text(projection, "candidate_sha")
@@ -297,6 +299,7 @@ def run_candidate_reviews(
     cycle: int,
     bead: dict[str, Any],
 ) -> list[dict[str, Any]]:
+    bead = load_bead_spec(store, run_id, fallback=bead)
     projection = store.status(run_id)
     identity = store.identity(run_id)
     candidate_sha = _required_text(projection, "candidate_sha")

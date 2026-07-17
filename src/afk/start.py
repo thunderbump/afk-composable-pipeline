@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from afk.bead_spec import BEAD_SPEC_EVIDENCE, load_bead_spec, persist_bead_spec
 from afk.candidate import CandidateError, produce_candidate, produce_repair_candidate
 from afk.candidate_gate import GateError, complete_gate_cycle
 from afk.candidate_validation import (
@@ -109,6 +110,7 @@ def start_run(
                 validation_contract=context.validation_contract,
             )
             return run_id, 2
+        persist_bead_spec(store, run_id, bead)
         unit = worker_unit(run_id)
         lingering = _lingering(context.claimant)
         store.prepare_effect(
@@ -682,10 +684,8 @@ def _run_worker_with_lock(store: RunStore, run_id: str) -> int:
 
 
 def _advance_candidate(store: RunStore, run_id: str) -> int:
-    identity = store.identity(run_id)
-    request = identity.get("start_request", {})
     try:
-        bead = _show_bead(identity["bead_id"], Path(request["beads_workspace"]))
+        bead = _bead_for_run(store, run_id)
         produce_candidate(store, run_id, bead=bead)
     except CandidateError as exc:
         checkpoint = store.status(run_id)["checkpoint"]
@@ -716,10 +716,8 @@ def _advance_candidate(store: RunStore, run_id: str) -> int:
 
 
 def _advance_gate(store: RunStore, run_id: str) -> int:
-    identity = store.identity(run_id)
-    request = identity.get("start_request", {})
     try:
-        bead = _show_bead(identity["bead_id"], Path(request["beads_workspace"]))
+        bead = _bead_for_run(store, run_id)
         outcome = complete_gate_cycle(store, run_id, bead=bead)
     except GateError as exc:
         _attention(
@@ -774,6 +772,15 @@ def _advance_validation_then_gate(store: RunStore, run_id: str) -> int:
     return _advance_gate(store, run_id)
 
 
+def _bead_for_run(store: RunStore, run_id: str) -> dict[str, Any]:
+    evidence = store.root / "runs" / run_id / BEAD_SPEC_EVIDENCE
+    if "bead_spec" in store.status(run_id) or evidence.exists():
+        return load_bead_spec(store, run_id)
+    identity = store.identity(run_id)
+    request = identity.get("start_request", {})
+    return _show_bead(identity["bead_id"], Path(request["beads_workspace"]))
+
+
 def _advance_completed_gate(
     store: RunStore,
     run_id: str,
@@ -822,11 +829,9 @@ def _advance_completed_gate(
             summary="Gate Cycle next action is invalid",
         )
         return 2
-    identity = store.identity(run_id)
-    request = identity.get("start_request", {})
     try:
         if bead is None:
-            bead = _show_bead(identity["bead_id"], Path(request["beads_workspace"]))
+            bead = _bead_for_run(store, run_id)
         produce_repair_candidate(
             store,
             run_id,

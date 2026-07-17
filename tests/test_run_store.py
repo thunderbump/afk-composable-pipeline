@@ -11,6 +11,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+from afk.bead_spec import (  # noqa: E402
+    BEAD_SPEC_ARTIFACT,
+    BEAD_SPEC_EVIDENCE,
+    load_bead_spec,
+)
 from afk.run_store import (  # noqa: E402
     ATTEMPT_BYTE_LIMIT,
     GATE_BYTE_LIMIT,
@@ -375,6 +380,30 @@ class RunStoreTest(unittest.TestCase):
                 "run-001", "attempts/attempt-1/stderr.txt", "late write\n"
             )
         self.assertEqual(stat.S_IMODE(directory.stat().st_mode), 0o500)
+
+    def test_sealed_bead_spec_recovers_after_projection_record_crash(self):
+        self.create_run()
+        bead = {
+            "id": "central-bnkl.1.1",
+            "description": "Start-time specification.",
+            "status": "open",
+            "comments": [],
+        }
+        self.store.write_evidence_value("run-001", BEAD_SPEC_ARTIFACT, bead)
+        self.store.seal_evidence("run-001", BEAD_SPEC_EVIDENCE)
+
+        recovered = load_bead_spec(
+            self.store,
+            "run-001",
+            fallback={
+                **bead,
+                "description": "mutated live description",
+                "status": "closed",
+                "comments": [{"text": "mutated live comment"}],
+            },
+        )
+
+        self.assertEqual(recovered, bead)
 
     def test_status_cli_reports_named_and_active_run(self):
         self.create_run()

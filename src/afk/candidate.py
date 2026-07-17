@@ -9,6 +9,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+from afk.bead_spec import load_bead_spec
 from afk.candidate_validation import (
     CandidateValidationError,
     run_supervised_command,
@@ -96,6 +97,7 @@ def produce_candidate(
     bead: dict[str, Any],
 ) -> dict[str, Any]:
     """Produce and reconcile the Run's one implementation Candidate."""
+    bead = load_bead_spec(store, run_id, fallback=bead)
     identity = store.identity(run_id)
     projection = store.status(run_id)
     worktree = Path(_field(projection, "worktree_path"))
@@ -193,6 +195,7 @@ def produce_repair_candidate(
     repair_brief: dict[str, Any],
 ) -> dict[str, Any]:
     """Run one budgeted repair and advance the existing Candidate branch/PR."""
+    bead = load_bead_spec(store, run_id, fallback=bead)
     identity = store.identity(run_id)
     projection = store.status(run_id)
     worktree = Path(_field(projection, "worktree_path"))

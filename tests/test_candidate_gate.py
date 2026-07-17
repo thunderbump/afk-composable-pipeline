@@ -11,6 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from afk import candidate_gate as candidate_gate_module  # noqa: E402
+from afk.bead_spec import persist_bead_spec  # noqa: E402
 from afk.candidate_gate import (  # noqa: E402
     GateError,
     build_repair_brief,
@@ -279,6 +280,7 @@ class CandidateGateTest(unittest.TestCase):
                 "description": "Review it.",
                 "acceptance_criteria": "Both axes pass.",
             }
+            persist_bead_spec(store, run_id, bead)
 
             def reviewer(axis, bundle_path, attempt_path, worktree):
                 return (
@@ -292,7 +294,17 @@ class CandidateGateTest(unittest.TestCase):
                 "afk.candidate_gate._execute_reviewer", side_effect=reviewer
             ) as execute:
                 first = run_candidate_reviews(store, run_id, cycle=1, bead=bead)
-                second = run_candidate_reviews(store, run_id, cycle=1, bead=bead)
+                second = run_candidate_reviews(
+                    store,
+                    run_id,
+                    cycle=1,
+                    bead={
+                        **bead,
+                        "description": "mutated live description",
+                        "status": "closed",
+                        "comments": [{"text": "mutated live comment"}],
+                    },
+                )
 
             self.assertEqual(first, second)
             self.assertEqual(execute.call_count, 2)
