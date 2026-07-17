@@ -358,8 +358,8 @@ def seal_interrupted_repair_attempt(
         raise CandidateError("interrupted repair is not bound to the consumed slot")
     attempt = f"attempts/repair-{attempt_number}"
     attempt_path = store.root / "runs" / run_id / attempt
-    if not attempt_path.is_dir():
-        raise CandidateError("interrupted repair evidence is missing")
+    if attempt_path.exists() and not attempt_path.is_dir():
+        raise CandidateError("interrupted repair evidence is invalid")
     interruption = {
         "schema_version": 1,
         "candidate_sha": candidate_sha,

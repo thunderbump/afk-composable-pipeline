@@ -659,7 +659,7 @@ class CandidateGateTest(unittest.TestCase):
                     self.assertEqual(attention["kind"], "unavailable")
                     self.assertIn("reapproval", attention["summary"])
 
-    def test_resume_continues_validated_repair_attempt(self):
+    def test_resume_consumes_validated_repair_started_before_evidence(self):
         with tempfile.TemporaryDirectory() as temporary:
             store = RunStore(Path(temporary) / "state")
             run_id = store.create_run(
@@ -706,8 +706,18 @@ class CandidateGateTest(unittest.TestCase):
                 resumed = resume_run()
 
             self.assertEqual(resumed, (run_id, 0))
-            repair.assert_called_once_with(store, run_id)
+            repair.assert_called_once_with(
+                store,
+                run_id,
+                outcome={
+                    "next_action": "repair",
+                    "repair_brief": {**brief, "repair_attempt": 2},
+                },
+            )
             gate.assert_not_called()
+            attempt = Path(temporary) / "state/runs/run-1/attempts/repair-1"
+            self.assertTrue((attempt / "interruption.json").is_file())
+            self.assertTrue((attempt / "manifest.json").is_file())
 
     def test_resume_of_crashed_fourth_repair_seals_it_and_exhausts_budget(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -779,6 +789,61 @@ class CandidateGateTest(unittest.TestCase):
             self.assertEqual(resumed_again, (run_id, 2))
             self.assertEqual(store.status(run_id)["last_sequence"], last_sequence)
             retried_repair.assert_not_called()
+
+    def test_resume_exhausts_started_fourth_repair_without_evidence_directory(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store = RunStore(root / "state")
+            run_id = store.create_run(
+                bead_id="central-test.1",
+                repository="owner/project",
+                base_branch="main",
+                base_sha="a" * 40,
+                start_request={},
+                run_id="run-1",
+            )["run_id"]
+            brief = {
+                "schema_version": 1,
+                "candidate_sha": "b" * 40,
+                "repair_attempt": 4,
+                "blocking_findings": [],
+            }
+            store.append_event(
+                run_id,
+                "gate.cycle_completed",
+                state="candidate_ready",
+                data={
+                    "checkpoint": "candidate_ready",
+                    "candidate_sha": "b" * 40,
+                    "gate_cycles": [{"next_action": "repair", "repair_brief": brief}],
+                },
+            )
+            store.append_event(
+                run_id,
+                "repair.started",
+                data={
+                    "checkpoint": "candidate_ready",
+                    "repair_attempts_used": 4,
+                    "repair_brief": brief,
+                },
+            )
+            attempt = root / "state/runs/run-1/attempts/repair-4"
+            self.assertFalse(attempt.exists())
+
+            with (
+                mock.patch("afk.start.RunStore", return_value=store),
+                mock.patch("afk.start.produce_repair_candidate") as repair,
+            ):
+                resumed = resume_run()
+
+            self.assertEqual(resumed, (run_id, 2))
+            repair.assert_not_called()
+            self.assertTrue((attempt / "interruption.json").is_file())
+            self.assertTrue((attempt / "manifest.json").is_file())
+            status = store.status(run_id)
+            self.assertEqual(status["repair_attempts_used"], 4)
+            self.assertEqual(status["attention"]["kind"], "exhausted")
+            self.assertEqual(status["interrupted_repair"]["status"], "exhausted")
 
     def test_resume_keeps_interrupted_repair_continuation_after_attention(self):
         for checkpoint in ("validated", "candidate_ready"):

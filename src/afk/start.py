@@ -378,10 +378,11 @@ def _repair_interruption_pending(
         not isinstance(brief, dict)
         or type(used) is not int
         or brief.get("repair_attempt") != used
+        or brief.get("candidate_sha") != projection.get("candidate_sha")
     ):
         return False
     attempt = store.root / "runs" / run_id / f"attempts/repair-{used}"
-    return attempt.is_dir() and (
+    return (
         not (attempt / "manifest.json").is_file()
         or (attempt / "interruption.json").is_file()
     )

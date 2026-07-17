@@ -447,6 +447,69 @@ class CandidateTest(unittest.TestCase):
         self.assertEqual(self.store.status("run-1")["repair_attempts_used"], 2)
         self.assertEqual(self.store.status("run-1")["interrupted_repair"], {})
 
+    def test_resume_consumes_started_repair_before_evidence_directory_exists(self):
+        first = self.produce()
+        brief = {
+            "schema_version": 1,
+            "candidate_sha": first["candidate_sha"],
+            "repair_attempt": 1,
+            "blocking_findings": [
+                {
+                    "id": "validation-smoke",
+                    "source": "validation",
+                    "title": "Smoke test failed",
+                    "body": "Repair it.",
+                    "blocking": True,
+                }
+            ],
+        }
+        bead = {
+            "id": "central-test.1",
+            "title": "Implement the thing",
+            "description": "Change one file.",
+            "acceptance_criteria": "The file exists.",
+        }
+        self.store.append_event(
+            "run-1",
+            "gate.cycle_completed",
+            state="candidate_ready",
+            data={
+                "checkpoint": "candidate_ready",
+                "gate_cycles": [{"next_action": "repair", "repair_brief": brief}],
+            },
+        )
+
+        with (
+            mock.patch(
+                "afk.candidate._repair_prompt", side_effect=RuntimeError("crash")
+            ),
+            self.assertRaisesRegex(RuntimeError, "crash"),
+        ):
+            produce_repair_candidate(
+                self.store,
+                "run-1",
+                bead=bead,
+                repair_brief=brief,
+            )
+
+        first_attempt = self.state / "runs/run-1/attempts/repair-1"
+        self.assertFalse(first_attempt.exists())
+        with (
+            mock.patch.dict(os.environ, self._candidate_environment(), clear=True),
+            mock.patch("afk.start.RunStore", return_value=self.store),
+            mock.patch("afk.start._show_bead", return_value=bead),
+            mock.patch("afk.start._advance_validation", return_value=0),
+            mock.patch("afk.start._advance_gate", return_value=0),
+        ):
+            resumed = resume_run()
+
+        self.assertEqual(resumed, ("run-1", 0))
+        self.assertTrue((first_attempt / "interruption.json").is_file())
+        self.assertTrue((first_attempt / "manifest.json").is_file())
+        second_attempt = self.state / "runs/run-1/attempts/repair-2"
+        self.assertTrue((second_attempt / "report.json").is_file())
+        self.assertEqual(self.store.status("run-1")["repair_attempts_used"], 2)
+
     def test_timed_out_repair_seals_evidence_and_leaves_no_descendant_mutation(self):
         first = self.produce()
         brief = {
