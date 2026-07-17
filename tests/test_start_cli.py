@@ -228,6 +228,146 @@ class StartCliTest(unittest.TestCase):
         )
         self.assertIn(BASE_SHA, commands)
 
+    def test_complete_reconciles_merged_candidate_and_closed_bead_idempotently(self):
+        started = self.run_afk("start", "central-bnkl.1.1")
+        run_id = started.stdout.strip()
+        worker = self.run_afk("_worker", run_id)
+        self.assertEqual(worker.returncode, 0, worker.stderr)
+
+        completed = self.run_afk(
+            "complete",
+            run_id,
+            AFK_FAKE_PR_MERGED="1",
+            AFK_FAKE_BEAD_STATUS="closed",
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        report = json.loads(completed.stdout)
+        self.assertTrue(report["complete"])
+        self.assertFalse(report["paused"])
+        self.assertEqual(report["state"], "completed")
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(status["checkpoint"], "completed")
+        self.assertEqual(status["completion"]["candidate_sha"], "d" * 40)
+        self.assertEqual(status["completion"]["merge_commit"], "f" * 40)
+        evidence = (
+            self.state_home / "afk" / "runs" / run_id / status["completion"]["evidence"]
+        )
+        self.assertTrue((evidence / "manifest.json").is_file())
+
+        repeated = self.run_afk(
+            "complete",
+            run_id,
+            AFK_FAKE_PR_MERGED="1",
+            AFK_FAKE_BEAD_STATUS="closed",
+        )
+
+        self.assertEqual(repeated.returncode, 0, repeated.stderr)
+        self.assertTrue(json.loads(repeated.stdout)["complete"])
+        events = [
+            json.loads(line)["event"]
+            for line in (self.state_home / "afk" / "runs" / run_id / "events.jsonl")
+            .read_text(encoding="utf-8")
+            .splitlines()
+        ]
+        self.assertEqual(events.count("run.completed"), 1)
+
+    def test_complete_fails_closed_on_terminal_fact_mismatch(self):
+        started = self.run_afk("start", "central-bnkl.1.1")
+        run_id = started.stdout.strip()
+        worker = self.run_afk("_worker", run_id)
+        self.assertEqual(worker.returncode, 0, worker.stderr)
+
+        cases = (
+            (
+                "head",
+                {
+                    "AFK_FAKE_PR_MERGED": "1",
+                    "AFK_FAKE_PR_HEAD": "e" * 40,
+                    "AFK_FAKE_BEAD_STATUS": "closed",
+                },
+            ),
+            ("unmerged", {"AFK_FAKE_BEAD_STATUS": "closed"}),
+            (
+                "missing merge commit",
+                {
+                    "AFK_FAKE_PR_MERGED": "1",
+                    "AFK_FAKE_PR_MERGE_COMMIT": "missing",
+                    "AFK_FAKE_BEAD_STATUS": "closed",
+                },
+            ),
+            (
+                "malformed merge commit",
+                {
+                    "AFK_FAKE_PR_MERGED": "1",
+                    "AFK_FAKE_PR_MERGE_COMMIT": '{"oid":"not-a-sha"}',
+                    "AFK_FAKE_BEAD_STATUS": "closed",
+                },
+            ),
+            ("bead", {"AFK_FAKE_PR_MERGED": "1"}),
+        )
+        for label, overrides in cases:
+            with self.subTest(label=label):
+                completed = self.run_afk("complete", run_id, **overrides)
+                self.assertEqual(completed.returncode, 2)
+                self.assertEqual(completed.stdout, "")
+
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(status["state"], "reviewed")
+        self.assertNotIn("completion", status)
+        self.assertFalse(
+            (
+                self.state_home
+                / "afk"
+                / "runs"
+                / run_id
+                / ("gates/completion-" + "d" * 12)
+            ).exists()
+        )
+        events = [
+            json.loads(line)["event"]
+            for line in (self.state_home / "afk" / "runs" / run_id / "events.jsonl")
+            .read_text(encoding="utf-8")
+            .splitlines()
+        ]
+        self.assertNotIn("run.completed", events)
+
+    def test_complete_recovers_matching_unsealed_terminal_evidence(self):
+        started = self.run_afk("start", "central-bnkl.1.1")
+        run_id = started.stdout.strip()
+        worker = self.run_afk("_worker", run_id)
+        self.assertEqual(worker.returncode, 0, worker.stderr)
+        store = RunStore(self.state_home / "afk")
+        status = store.status(run_id)
+        evidence = "gates/completion-" + "d" * 12
+        store.write_evidence_value(
+            run_id,
+            f"{evidence}/result.json",
+            {
+                "schema_version": 1,
+                "candidate_sha": "d" * 40,
+                "gate_evidence": status["gate_cycles"][-1]["evidence"],
+                "pr_number": 17,
+                "pr_url": "https://example.test/pr/17",
+                "merge_commit": "f" * 40,
+                "bead_id": "central-bnkl.1.1",
+                "bead_status": "closed",
+                "evidence": evidence,
+            },
+        )
+
+        completed = self.run_afk(
+            "complete",
+            run_id,
+            AFK_FAKE_PR_MERGED="1",
+            AFK_FAKE_BEAD_STATUS="closed",
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertTrue(json.loads(completed.stdout)["complete"])
+        completion = self.state_home / "afk" / "runs" / run_id / evidence
+        self.assertTrue((completion / "manifest.json").is_file())
+
     def test_gate_uses_the_canonical_start_bead_after_live_tracker_mutation(self):
         started = self.run_afk("start", "central-bnkl.1.1")
         run_id = started.stdout.strip()
@@ -1483,6 +1623,22 @@ class StartCliTest(unittest.TestCase):
                 elif command == "gh":
                     if args[:2] == ["pr", "list"]:
                         print(json.dumps([json.loads(pr_state.read_text())] if pr_state.exists() else []))  # noqa: E501
+                    elif args[:2] == ["pr", "view"]:
+                        value = json.loads(pr_state.read_text())
+                        if os.environ.get("AFK_FAKE_PR_MERGED"):
+                            value.update({
+                                "state": "MERGED",
+                                "isDraft": False,
+                                "mergeCommit": {"oid": "f" * 40},
+                            })
+                        if os.environ.get("AFK_FAKE_PR_HEAD"):
+                            value["headRefOid"] = os.environ["AFK_FAKE_PR_HEAD"]
+                        merge_commit = os.environ.get("AFK_FAKE_PR_MERGE_COMMIT")
+                        if merge_commit == "missing":
+                            value.pop("mergeCommit", None)
+                        elif merge_commit:
+                            value["mergeCommit"] = json.loads(merge_commit)
+                        print(json.dumps(value))
                     elif args[:2] == ["pr", "create"]:
                         value = {
                             "number": 17,

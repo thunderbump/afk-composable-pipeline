@@ -405,6 +405,36 @@ class RunStore:
                 raise EvidenceTampered("sealed evidence is writable")
         return True
 
+    def reconcile_evidence_result(
+        self, run_id: str, relative_directory: str, value: Any
+    ) -> Any:
+        """Recover or verify one evidence result, then seal its evidence unit."""
+        with self.lock():
+            directory = self._evidence_path(run_id, relative_directory)
+            manifest_path = directory / "manifest.json"
+            result_path = directory / "result.json"
+            expected = redact_artifact_value(value)
+            if manifest_path.is_file():
+                self.verify_evidence(run_id, relative_directory)
+                stored = _read_evidence_result(result_path)
+                if stored != expected:
+                    raise EvidenceError("evidence result contradicts expected value")
+                return stored
+
+            if directory.exists():
+                entries = {path.name for path in directory.iterdir()}
+                if entries not in (set(), {"result.json"}):
+                    raise EvidenceError("unsealed evidence result is ambiguous")
+            if result_path.is_file():
+                if _read_evidence_result(result_path) != expected:
+                    raise EvidenceError("evidence result contradicts expected value")
+            else:
+                self.write_evidence_value(
+                    run_id, f"{relative_directory}/result.json", expected
+                )
+            self.seal_evidence(run_id, relative_directory)
+            return expected
+
     def _append_event_unlocked(
         self,
         run_id: str,
@@ -617,6 +647,7 @@ def _project(identity: dict[str, Any], events: list[dict[str, Any]]) -> dict[str
         "repair_dispositions",
         "gate_cycles",
         "gate_retry",
+        "completion",
         "bead_spec",
         "interrupted_repair",
     ):
@@ -638,6 +669,13 @@ def _write_new_json(path: Path, value: Any) -> None:
     _write_new_bytes(
         path, f"{canonical_json(redact_artifact_value(value))}\n".encode("utf-8")
     )
+
+
+def _read_evidence_result(path: Path) -> Any:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise EvidenceError("evidence result is missing or malformed") from exc
 
 
 def _write_new_bytes(path: Path, value: bytes) -> None:

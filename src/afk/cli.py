@@ -48,7 +48,14 @@ from afk.registry import (
     default_step_registry,
 )
 from afk.run_store import RunStore, RunStoreError
-from afk.start import StartError, resume_run, run_worker, run_worker_unit, start_run
+from afk.start import (
+    StartError,
+    complete_run,
+    resume_run,
+    run_worker,
+    run_worker_unit,
+    start_run,
+)
 
 
 SCHEMA_VERSION = 1
@@ -121,6 +128,16 @@ def main(argv: list[str] | None = None) -> int:
             report = _run_report(projection)
         except (CandidateValidationError, RunStoreError) as exc:
             parser.error(str(exc))
+        print(canonical_json(report))
+        return 0
+
+    if args.command == "complete":
+        try:
+            projection = complete_run(args.run_id)
+            report = _run_report(projection)
+        except (StartError, RunStoreError) as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
         print(canonical_json(report))
         return 0
 
@@ -482,6 +499,13 @@ def build_parser() -> argparse.ArgumentParser:
         "report", help="Serialize an incremental or final Run report"
     )
     report_parser.add_argument(
+        "run_id", nargs="?", help="Run id; defaults to the Active Run"
+    )
+
+    complete_parser = subcommands.add_parser(
+        "complete", help="Reconcile terminal publication for a reviewed Run"
+    )
+    complete_parser.add_argument(
         "run_id", nargs="?", help="Run id; defaults to the Active Run"
     )
 
