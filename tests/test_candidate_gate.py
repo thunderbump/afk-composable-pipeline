@@ -1,3 +1,4 @@
+import json
 import sys
 import subprocess
 import tempfile
@@ -357,6 +358,82 @@ class CandidateGateTest(unittest.TestCase):
                             store, run_id, pr_number=7, worktree=root, gate=gate
                         )
                     replacement.assert_not_called()
+
+    def test_gate_comment_reconciliation_reads_all_paginated_comment_pages(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store = RunStore(root / "state")
+            run_id = store.create_run(
+                bead_id="central-test.1",
+                repository="owner/project",
+                base_branch="main",
+                base_sha="a" * 40,
+                start_request={},
+                run_id="run-1",
+            )["run_id"]
+            gate = {
+                "cycle": 1,
+                "candidate_sha": "b" * 40,
+                "validation": {"status": "rejected", "summary": "failed"},
+                "reviews": [],
+                "next_action": "repair",
+            }
+            posted = []
+
+            def post(repository, pr_number, body, worktree):
+                posted.append(body)
+                return "https://example.test/comment/1"
+
+            with (
+                mock.patch("afk.candidate_gate._github_comments", return_value=[]),
+                mock.patch("afk.candidate_gate._post_gate_comment", side_effect=post),
+            ):
+                reconcile_gate_comment(
+                    store, run_id, pr_number=7, worktree=root, gate=gate
+                )
+
+            pages = [
+                [{"url": "https://example.test/comment/other", "body": "unrelated"}],
+                [
+                    {
+                        "url": "https://example.test/comment/1",
+                        "body": posted[0],
+                    }
+                ],
+            ]
+
+            def paginated(command, worktree, **kwargs):
+                self.assertIn("--slurp", command)
+                return subprocess.CompletedProcess(
+                    command, 0, stdout=json.dumps(pages), stderr=""
+                )
+
+            with (
+                mock.patch("afk.candidate_gate._run_gh", side_effect=paginated),
+                mock.patch("afk.candidate_gate._post_gate_comment") as duplicate,
+            ):
+                reconcile_gate_comment(
+                    store, run_id, pr_number=7, worktree=root, gate=gate
+                )
+
+            duplicate.assert_not_called()
+
+            malformed = subprocess.CompletedProcess(
+                [],
+                0,
+                stdout=json.dumps([[{"body": posted[0]}], {"not": "a page"}]),
+                stderr="",
+            )
+            with (
+                mock.patch("afk.candidate_gate._run_gh", return_value=malformed),
+                mock.patch("afk.candidate_gate._post_gate_comment") as replacement,
+                self.assertRaisesRegex(GateError, "malformed"),
+            ):
+                reconcile_gate_comment(
+                    store, run_id, pr_number=7, worktree=root, gate=gate
+                )
+
+            replacement.assert_not_called()
 
     def test_gate_review_recovery_reuses_only_manifest_valid_completed_work(self):
         with tempfile.TemporaryDirectory() as temporary:

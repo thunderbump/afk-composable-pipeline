@@ -867,6 +867,7 @@ def _github_comments(
             "api",
             f"repos/{owner}/{name}/issues/{pr_number}/comments",
             "--paginate",
+            "--slurp",
         ],
         worktree,
     )
@@ -876,9 +877,12 @@ def _github_comments(
         raise GateError(
             "GitHub comment observation was malformed", kind="inconclusive"
         ) from exc
-    if not isinstance(value, list) or not all(isinstance(item, dict) for item in value):
+    if not isinstance(value, list) or not all(
+        isinstance(page, list) and all(isinstance(item, dict) for item in page)
+        for page in value
+    ):
         raise GateError("GitHub comment observation was malformed", kind="inconclusive")
-    return value
+    return [item for page in value for item in page]
 
 
 def _post_gate_comment(
