@@ -17,7 +17,9 @@ from afk.redaction import (  # noqa: E402
 class RedactionTest(unittest.TestCase):
     def test_redacts_url_userinfo_query_and_fragment(self):
         self.assertEqual(
-            redact_url("https://user:secret@example.invalid/repo.git?token=hidden#frag"),
+            redact_url(
+                "https://user:secret@example.invalid/repo.git?token=hidden#frag"
+            ),
             "https://example.invalid/repo.git",
         )
 
@@ -105,6 +107,11 @@ class RedactionTest(unittest.TestCase):
         self.assertIn('"api_key": "[REDACTED]"', redacted)
         self.assertIn('"password" : "[REDACTED]"', redacted)
 
+    def test_secret_assignment_redaction_is_idempotent_in_canonical_json(self):
+        text = '{"summary":"password=[REDACTED]"}\n'
+
+        self.assertEqual(redact_text(text), text)
+
     def test_redacts_camel_case_secret_key_values_in_artifacts_and_text(self):
         payload = {
             "accessToken": "access-token-secret",
@@ -174,12 +181,18 @@ class RedactionTest(unittest.TestCase):
         self.assertEqual(redact_text(text), text)
 
     def test_secret_value_detection_allows_safe_url_query_values(self):
-        self.assertFalse(is_secret_value("https://example.invalid/api?mode=test#section"))
+        self.assertFalse(
+            is_secret_value("https://example.invalid/api?mode=test#section")
+        )
 
     def test_secret_value_detection_rejects_credential_bearing_urls(self):
-        self.assertTrue(is_secret_value("https://user:secret@example.invalid/api?mode=test"))
+        self.assertTrue(
+            is_secret_value("https://user:secret@example.invalid/api?mode=test")
+        )
         self.assertTrue(is_secret_value("https://example.invalid/api?token=hidden"))
-        self.assertTrue(is_secret_value("https://example.invalid/api#access_token=hidden"))
+        self.assertTrue(
+            is_secret_value("https://example.invalid/api#access_token=hidden")
+        )
 
     def test_secret_value_detection_rejects_common_provider_token_shapes(self):
         fake_token_values = [
@@ -192,7 +205,10 @@ class RedactionTest(unittest.TestCase):
             with self.subTest(fake_token=fake_token[:7]):
                 self.assertTrue(is_secret_value(fake_token))
                 self.assertEqual(redact_text(f"token={fake_token}"), "token=[REDACTED]")
-                self.assertEqual(redact_text(f"prefix {fake_token} suffix"), "prefix [REDACTED] suffix")
+                self.assertEqual(
+                    redact_text(f"prefix {fake_token} suffix"),
+                    "prefix [REDACTED] suffix",
+                )
 
     def test_redacts_bearer_tokens_in_text(self):
         text = "Authentication failed: Bearer A1b2C3d4E5f6G7h8"
@@ -212,7 +228,9 @@ class RedactionTest(unittest.TestCase):
 
         self.assertEqual(redact_text(text), "Authentication failed: Bearer [REDACTED]")
 
-    def test_redacts_opaque_lowercase_bearer_tokens_with_url_safe_separators_in_text(self):
+    def test_redacts_opaque_lowercase_bearer_tokens_with_url_safe_separators_in_text(
+        self,
+    ):
         for token in ("abcdefgh_ijkl", "abcdefgh-ijkl"):
             with self.subTest(token=token):
                 self.assertEqual(
@@ -249,8 +267,14 @@ class RedactionTest(unittest.TestCase):
                     f"Authentication failed: Bearer {value}",
                 )
 
-    def test_preserves_allowlisted_backslash_escaped_quoted_bearer_auth_failure_text(self):
-        for value in (r"\"unauthorized\"", r"\'authorizationfailed\'", r"\"missingcredential\""):
+    def test_preserves_allowlisted_backslash_escaped_quoted_bearer_auth_failure_text(
+        self,
+    ):
+        for value in (
+            r"\"unauthorized\"",
+            r"\'authorizationfailed\'",
+            r"\"missingcredential\"",
+        ):
             with self.subTest(value=value):
                 self.assertEqual(
                     redact_text(f"Authentication failed: Bearer {value}"),
@@ -258,7 +282,10 @@ class RedactionTest(unittest.TestCase):
                 )
 
     def test_preserves_www_authenticate_bearer_parameters(self):
-        text = "WWW-Authenticate: Bearer authorization_uri=https://login.example/token, error=invalid_token"
+        text = (
+            "WWW-Authenticate: Bearer "
+            "authorization_uri=https://login.example/token, error=invalid_token"
+        )
 
         self.assertEqual(redact_text(text), text)
 
@@ -268,7 +295,9 @@ class RedactionTest(unittest.TestCase):
             "service=https://example.invalid/api",
         )
 
-    def test_runtime_redacts_exact_secret_values_from_strings_and_nested_artifacts(self):
+    def test_runtime_redacts_exact_secret_values_from_strings_and_nested_artifacts(
+        self,
+    ):
         payload = {
             "summary": "plain-secret-value",
             "notes": ["saw plain-secret-value in wrapper output"],
@@ -276,11 +305,15 @@ class RedactionTest(unittest.TestCase):
         }
         text = "stdout plain-secret-value stderr"
 
-        redacted_payload = redact_artifact_value(payload, exact_secrets={"plain-secret-value"})
+        redacted_payload = redact_artifact_value(
+            payload, exact_secrets={"plain-secret-value"}
+        )
         redacted_text = redact_text(text, exact_secrets={"plain-secret-value"})
 
         self.assertEqual(redacted_payload["summary"], "[REDACTED]")
-        self.assertEqual(redacted_payload["notes"], ["saw [REDACTED] in wrapper output"])
+        self.assertEqual(
+            redacted_payload["notes"], ["saw [REDACTED] in wrapper output"]
+        )
         self.assertEqual(redacted_payload["nested"]["text"], "prefix [REDACTED] suffix")
         self.assertEqual(redacted_text, "stdout [REDACTED] stderr")
 

@@ -9,7 +9,14 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+from afk.bead_spec import load_bead_spec
+from afk.candidate_validation import (
+    CandidateValidationError,
+    run_supervised_command,
+)
+from afk.codex_permissions import codex_environment, codex_permission_args
 from afk.jsonutil import canonical_json
+from afk.redaction import redact_artifact_value
 from afk.run_store import RunStore, RunStoreError
 
 
@@ -46,13 +53,41 @@ REPORT_SCHEMA = {
         "changed_areas": {"type": "array", "items": {"type": "string"}},
     },
 }
+REPAIR_REPORT_SCHEMA = {
+    **REPORT_SCHEMA,
+    "required": [*REPORT_SCHEMA["required"], "dispositions"],
+    "properties": {
+        **REPORT_SCHEMA["properties"],
+        "dispositions": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["finding_id", "disposition"],
+                "properties": {
+                    "finding_id": {"type": "string", "minLength": 1},
+                    "disposition": {"enum": ["addressed", "not_addressed", "disputed"]},
+                },
+            },
+        },
+    },
+}
 
 
 class CandidateError(RuntimeError):
-    def __init__(self, summary: str, *, kind: str = "inconclusive"):
+    def __init__(
+        self,
+        summary: str,
+        *,
+        kind: str = "inconclusive",
+        stdout: str = "",
+        stderr: str = "",
+    ):
         super().__init__(summary)
         self.summary = summary
         self.kind = kind
+        self.stdout = stdout
+        self.stderr = stderr
 
 
 def produce_candidate(
@@ -62,6 +97,7 @@ def produce_candidate(
     bead: dict[str, Any],
 ) -> dict[str, Any]:
     """Produce and reconcile the Run's one implementation Candidate."""
+    bead = load_bead_spec(store, run_id, fallback=bead)
     identity = store.identity(run_id)
     projection = store.status(run_id)
     worktree = Path(_field(projection, "worktree_path"))
@@ -105,7 +141,7 @@ def produce_candidate(
             completed = _run(
                 command,
                 cwd=worktree,
-                env=_codex_environment(),
+                env=codex_environment(),
                 input_text=prompt,
                 timeout=COMMAND_TIMEOUT_SECONDS,
             )
@@ -147,6 +183,291 @@ def produce_candidate(
             "pr_number": pr["number"],
             "pr_url": pr["url"],
             "pr_head_sha": pr["headRefOid"],
+        },
+    )
+
+
+def produce_repair_candidate(
+    store: RunStore,
+    run_id: str,
+    *,
+    bead: dict[str, Any],
+    repair_brief: dict[str, Any],
+) -> dict[str, Any]:
+    """Run one budgeted repair and advance the existing Candidate branch/PR."""
+    bead = load_bead_spec(store, run_id, fallback=bead)
+    identity = store.identity(run_id)
+    projection = store.status(run_id)
+    worktree = Path(_field(projection, "worktree_path"))
+    branch = _field(projection, "branch")
+    previous_sha = _field(projection, "candidate_sha")
+    attempt_number = repair_brief.get("repair_attempt")
+    if type(attempt_number) is not int or not 1 <= attempt_number <= 4:
+        raise CandidateError(
+            "repair attempt is outside the four-slot budget", kind="invalid"
+        )
+    if repair_brief.get("candidate_sha") != previous_sha:
+        raise CandidateError(
+            "Repair Brief is not bound to the current Candidate", kind="invalid"
+        )
+    attempt = f"attempts/repair-{attempt_number}"
+    attempt_path = store.root / "runs" / run_id / attempt
+    if attempt_path.exists():
+        if (
+            projection.get("repair_attempts_used") != attempt_number
+            or projection.get("repair_brief") != repair_brief
+        ):
+            raise CandidateError("repair attempt is not bound to the current brief")
+        if not (attempt_path / "manifest.json").is_file():
+            raise CandidateError("repair attempt is incomplete", kind="inconclusive")
+        if not store.verify_evidence(run_id, attempt):
+            raise CandidateError("repair attempt evidence could not be verified")
+        result_paths = [
+            path
+            for name in ("report.json", "outcome.json")
+            if (path := attempt_path / name).is_file()
+        ]
+        if len(result_paths) != 1 or result_paths[0].name != "report.json":
+            raise CandidateError("repair attempt did not produce a completed report")
+        report = _read_repair_report(result_paths[0], repair_brief)
+        return _finish_repair_candidate(
+            store,
+            run_id,
+            identity=identity,
+            worktree=worktree,
+            branch=branch,
+            previous_sha=previous_sha,
+            attempt_number=attempt_number,
+            report=report,
+        )
+
+    store.append_event(
+        run_id,
+        "repair.started",
+        data={
+            "checkpoint": projection["checkpoint"],
+            "repair_attempts_used": attempt_number,
+            "repair_brief": repair_brief,
+            "interrupted_repair": {},
+        },
+    )
+    prompt = _repair_prompt(identity, bead, repair_brief, worktree, branch)
+    store.write_evidence_text(run_id, f"{attempt}/prompt.md", prompt)
+    store.write_evidence_text(
+        run_id,
+        f"{attempt}/schema.json",
+        canonical_json(REPAIR_REPORT_SCHEMA) + "\n",
+    )
+    with tempfile.TemporaryDirectory(prefix="afk-repair-") as temporary:
+        report_path = Path(temporary) / "report.json"
+        report_error: CandidateError | None = None
+        execution_error: CandidateError | None = None
+        command = [
+            "codex",
+            "exec",
+            "--ephemeral",
+            "--ignore-user-config",
+            *_codex_permission_args(worktree, branch),
+            "--cd",
+            str(worktree),
+            "--output-schema",
+            str(attempt_path / "schema.json"),
+            "--output-last-message",
+            str(report_path),
+            "--json",
+            "-",
+        ]
+        try:
+            completed = _run_codex(command, cwd=worktree, input_text=prompt)
+        except CandidateError as exc:
+            execution_error = exc
+        if execution_error is None and completed.returncode == 0:
+            try:
+                report = _read_repair_report(report_path, repair_brief)
+            except CandidateError as exc:
+                report_error = exc
+                try:
+                    raw_report = report_path.read_text(encoding="utf-8")
+                except (OSError, UnicodeDecodeError):
+                    raw_report = ""
+    if execution_error is not None:
+        store.write_evidence_text(
+            run_id, f"{attempt}/events.jsonl", execution_error.stdout
+        )
+        store.write_evidence_text(
+            run_id, f"{attempt}/stderr.txt", execution_error.stderr
+        )
+        store.write_evidence_text(
+            run_id,
+            f"{attempt}/outcome.json",
+            canonical_json(
+                {"status": execution_error.kind, "summary": execution_error.summary}
+            )
+            + "\n",
+        )
+        store.seal_evidence(run_id, attempt)
+        raise execution_error
+    store.write_evidence_text(run_id, f"{attempt}/events.jsonl", completed.stdout)
+    store.write_evidence_text(run_id, f"{attempt}/stderr.txt", completed.stderr)
+    if completed.returncode != 0 or report_error is not None:
+        error = report_error or CandidateError(
+            f"repair agent exited with status {completed.returncode}"
+        )
+        if report_error is not None:
+            store.write_evidence_text(run_id, f"{attempt}/raw-report.txt", raw_report)
+        store.write_evidence_text(
+            run_id,
+            f"{attempt}/outcome.json",
+            canonical_json({"status": error.kind, "summary": error.summary}) + "\n",
+        )
+        store.seal_evidence(run_id, attempt)
+        raise error
+    store.write_evidence_text(
+        run_id, f"{attempt}/report.json", canonical_json(report) + "\n"
+    )
+    store.seal_evidence(run_id, attempt)
+
+    return _finish_repair_candidate(
+        store,
+        run_id,
+        identity=identity,
+        worktree=worktree,
+        branch=branch,
+        previous_sha=previous_sha,
+        attempt_number=attempt_number,
+        report=report,
+    )
+
+
+def seal_interrupted_repair_attempt(
+    store: RunStore,
+    run_id: str,
+    *,
+    repair_brief: dict[str, Any],
+) -> dict[str, Any]:
+    """Seal an uncompleted repair slot without treating it as resumable output."""
+    projection = store.status(run_id)
+    attempt_number = repair_brief.get("repair_attempt")
+    candidate_sha = repair_brief.get("candidate_sha")
+    if (
+        type(attempt_number) is not int
+        or not 1 <= attempt_number <= 4
+        or projection.get("repair_attempts_used") != attempt_number
+        or projection.get("candidate_sha") != candidate_sha
+    ):
+        raise CandidateError("interrupted repair is not bound to the consumed slot")
+    attempt = f"attempts/repair-{attempt_number}"
+    attempt_path = store.root / "runs" / run_id / attempt
+    if attempt_path.exists() and not attempt_path.is_dir():
+        raise CandidateError("interrupted repair evidence is invalid")
+    interruption = {
+        "schema_version": 1,
+        "candidate_sha": candidate_sha,
+        "repair_attempt": attempt_number,
+        "status": "interrupted",
+        "summary": "repair execution ended before evidence was sealed",
+    }
+    interruption_path = attempt_path / "interruption.json"
+    if (attempt_path / "manifest.json").is_file():
+        if not store.verify_evidence(run_id, attempt):
+            raise CandidateError("interrupted repair evidence could not be verified")
+        if not interruption_path.is_file():
+            raise CandidateError("sealed repair attempt is not an interruption")
+    elif interruption_path.exists():
+        if not interruption_path.is_file():
+            raise CandidateError("interrupted repair classification is invalid")
+    else:
+        store.write_evidence_value(
+            run_id,
+            f"{attempt}/interruption.json",
+            interruption,
+        )
+    try:
+        observed = json.loads(interruption_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise CandidateError("interrupted repair classification is invalid") from exc
+    if observed != interruption:
+        raise CandidateError("interrupted repair classification is ambiguous")
+    if not (attempt_path / "manifest.json").is_file():
+        store.seal_evidence(run_id, attempt)
+    return interruption
+
+
+def reconcile_interrupted_repair_worktree(
+    store: RunStore,
+    run_id: str,
+    *,
+    repair_brief: dict[str, Any],
+) -> None:
+    """Restore the dedicated worktree to the published pre-repair Candidate."""
+    projection = store.status(run_id)
+    candidate_sha = repair_brief.get("candidate_sha")
+    worktree = Path(_field(projection, "worktree_path"))
+    branch = _field(projection, "branch")
+    if candidate_sha != projection.get("candidate_sha"):
+        raise CandidateError("interrupted repair Candidate binding is invalid")
+    expected_worktree = store.root / "worktrees" / run_id
+    if worktree.resolve() != expected_worktree.resolve():
+        raise CandidateError("interrupted repair worktree identity is invalid")
+    observed_root = Path(_git(worktree, "rev-parse", "--show-toplevel")).resolve()
+    if observed_root != worktree.resolve():
+        raise CandidateError("interrupted repair worktree identity is invalid")
+    if _git(worktree, "branch", "--show-current") != branch:
+        raise CandidateError("interrupted repair changed the intended branch")
+    for command in (
+        ["git", "reset", "--hard", candidate_sha],
+        ["git", "clean", "-ffdx"],
+    ):
+        completed = _run(command, cwd=worktree)
+        if completed.returncode != 0:
+            raise CandidateError("interrupted repair worktree could not be restored")
+    verify_candidate_publication(store.identity(run_id), store.status(run_id))
+
+
+def _finish_repair_candidate(
+    store: RunStore,
+    run_id: str,
+    *,
+    identity: dict[str, Any],
+    worktree: Path,
+    branch: str,
+    previous_sha: str,
+    attempt_number: int,
+    report: dict[str, Any],
+) -> dict[str, Any]:
+    candidate_sha = _verify_candidate(
+        worktree,
+        branch=branch,
+        base_sha=previous_sha,
+        report=report,
+    )
+    _reconcile_push(
+        store,
+        run_id,
+        worktree,
+        branch,
+        candidate_sha,
+        expected_previous_sha=previous_sha,
+    )
+    prs = _list_prs(worktree, identity["repository"], branch)
+    if len(prs) != 1:
+        raise CandidateError("Candidate branch does not have exactly one stable PR")
+    pr = prs[0]
+    _verify_published(identity, worktree, branch, candidate_sha, pr)
+    return store.append_event(
+        run_id,
+        "candidate.repaired",
+        state="candidate_ready",
+        data={
+            "checkpoint": "candidate_ready",
+            "previous_candidate_sha": previous_sha,
+            "candidate_sha": candidate_sha,
+            "pr_number": pr["number"],
+            "pr_url": pr["url"],
+            "pr_head_sha": pr["headRefOid"],
+            "repair_attempts_used": attempt_number,
+            "repair_dispositions": report["dispositions"],
+            "attention": {},
         },
     )
 
@@ -194,9 +515,44 @@ commit is needed and `blocked` when safe completion is impossible.
 """
 
 
-def _codex_environment() -> dict[str, str]:
-    allowed = ("HOME", "PATH", "USER", "LOGNAME", "LANG", "LC_ALL", "CODEX_HOME")
-    return {name: os.environ[name] for name in allowed if name in os.environ}
+def _repair_prompt(
+    identity: dict[str, Any],
+    bead: dict[str, Any],
+    repair_brief: dict[str, Any],
+    worktree: Path,
+    branch: str,
+) -> str:
+    bead = redact_artifact_value(bead)
+    repair_brief = redact_artifact_value(repair_brief)
+    return f"""# AFK repair attempt
+
+Run: {identity['run_id']}
+Attempt: repair-{repair_brief['repair_attempt']}
+Repository: {identity['repository']}
+Worktree: {worktree}
+Branch: {branch}
+Starting Candidate: {repair_brief['candidate_sha']}
+
+## Exact Bead
+
+ID: {_field(bead, 'id')}
+Title: {_field(bead, 'title')}
+Description: {_field(bead, 'description')}
+Acceptance criteria: {_field(bead, 'acceptance_criteria')}
+
+## Candidate-bound Repair Brief
+
+{canonical_json(repair_brief)}
+
+## Contract
+
+Work only in the dedicated worktree and follow its AGENTS.md files. Address the
+blocking findings, run safe unprivileged checks, and commit the repair. Do not
+access Docker, systemd, the network, GitHub, Beads, AFK state, or credentials.
+Do not merge, rewrite the Starting Candidate, push, or create a pull request.
+Return one disposition for every blocking finding. Dispositions are claims for
+the audit trail; the next full validation and review cycle decides correctness.
+"""
 
 
 def _codex_permission_args(worktree: Path, branch: str) -> list[str]:
@@ -236,26 +592,12 @@ def _codex_permission_args(worktree: Path, branch: str) -> list[str]:
         "TMPDIR": str(temporary),
         "GIT_TERMINAL_PROMPT": "0",
     }
-    profile = (
-        '{ description = "AFK Candidate implementation", filesystem = '
-        f"{_toml_table(filesystem)}, network = {{ enabled = false }} }}"
+    return codex_permission_args(
+        profile_name="afk_candidate",
+        description="AFK Candidate implementation",
+        filesystem=filesystem,
+        shell_environment=shell_environment,
     )
-    shell_policy = (
-        '{ inherit = "none", ignore_default_excludes = false, set = '
-        f"{_toml_table(shell_environment)} }}"
-    )
-    return [
-        "-c",
-        'default_permissions="afk_candidate"',
-        "-c",
-        f"permissions.afk_candidate={profile}",
-        "-c",
-        'approval_policy="never"',
-        "-c",
-        'web_search="disabled"',
-        "-c",
-        f"shell_environment_policy={shell_policy}",
-    ]
 
 
 def _codex_package_beneath_home() -> Path | None:
@@ -283,13 +625,6 @@ def _resolved_git_path(worktree: Path, argument: str) -> Path:
     return path.resolve() if path.is_absolute() else (worktree / path).resolve()
 
 
-def _toml_table(values: dict[str, str]) -> str:
-    fields = ", ".join(
-        f"{json.dumps(key)} = {json.dumps(value)}" for key, value in values.items()
-    )
-    return f"{{ {fields} }}"
-
-
 def _read_report(path: Path) -> dict[str, Any]:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
@@ -297,26 +632,57 @@ def _read_report(path: Path) -> dict[str, Any]:
         raise CandidateError("implementation report is missing or malformed") from exc
     if not isinstance(value, dict) or set(value) != set(REPORT_SCHEMA["required"]):
         raise CandidateError("implementation report is missing or malformed")
+    _validate_report(value, label="implementation")
+    return value
+
+
+def _read_repair_report(path: Path, repair_brief: dict[str, Any]) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise CandidateError("repair report is missing or malformed") from exc
+    expected = set(REPAIR_REPORT_SCHEMA["required"])
+    if not isinstance(value, dict) or set(value) != expected:
+        raise CandidateError("repair report is missing or malformed")
+    base_report = {key: value[key] for key in REPORT_SCHEMA["required"]}
+    _validate_report(base_report, label="repair")
+    dispositions = value["dispositions"]
+    if not isinstance(dispositions, list) or not all(
+        isinstance(item, dict)
+        and set(item) == {"finding_id", "disposition"}
+        and isinstance(item["finding_id"], str)
+        and item["disposition"] in {"addressed", "not_addressed", "disputed"}
+        for item in dispositions
+    ):
+        raise CandidateError("repair report dispositions are malformed")
+    expected_ids = [
+        finding.get("id") for finding in repair_brief.get("blocking_findings", [])
+    ]
+    if [item["finding_id"] for item in dispositions] != expected_ids:
+        raise CandidateError("repair report dispositions do not match the Repair Brief")
+    return value
+
+
+def _validate_report(value: dict[str, Any], *, label: str) -> None:
     if value.get("status") not in {"completed", "no_change", "blocked"}:
-        raise CandidateError("implementation report is missing or malformed")
+        raise CandidateError(f"{label} report is missing or malformed")
     for key in ("starting_sha", "ending_sha", "summary"):
         if not isinstance(value.get(key), str) or not value[key]:
-            raise CandidateError("implementation report is missing or malformed")
+            raise CandidateError(f"{label} report is missing or malformed")
     for key in ("starting_sha", "ending_sha"):
         if re.fullmatch(r"[0-9a-f]{40}", value[key]) is None:
-            raise CandidateError("implementation report is missing or malformed")
+            raise CandidateError(f"{label} report is missing or malformed")
     if not isinstance(value.get("checks"), list) or not isinstance(
         value.get("changed_areas"), list
     ):
-        raise CandidateError("implementation report is missing or malformed")
+        raise CandidateError(f"{label} report is missing or malformed")
     if not all(
         isinstance(check, dict)
         and set(check) == {"command", "outcome"}
         and all(isinstance(check[field], str) for field in check)
         for check in value["checks"]
     ) or not all(isinstance(area, str) for area in value["changed_areas"]):
-        raise CandidateError("implementation report is missing or malformed")
-    return value
+        raise CandidateError(f"{label} report is missing or malformed")
 
 
 def _verify_candidate(
@@ -355,6 +721,8 @@ def _reconcile_push(
     worktree: Path,
     branch: str,
     candidate_sha: str,
+    *,
+    expected_previous_sha: str | None = None,
 ) -> None:
     effect_id = f"branch-push-{candidate_sha}"
     effect = store.prepare_effect(
@@ -364,9 +732,12 @@ def _reconcile_push(
         intended={"branch": branch, "candidate_sha": candidate_sha, "remote": "origin"},
     )
     remote_sha = _remote_sha(worktree, branch)
-    if remote_sha and remote_sha != candidate_sha:
+    allowed_remote = {candidate_sha}
+    if expected_previous_sha is not None:
+        allowed_remote.add(expected_previous_sha)
+    if remote_sha and remote_sha not in allowed_remote:
         raise CandidateError("remote Candidate branch has a contradictory head")
-    if not remote_sha:
+    if remote_sha != candidate_sha:
         pushed = _run(
             ["git", "push", "origin", f"{candidate_sha}:refs/heads/{branch}"],
             cwd=worktree,
@@ -484,16 +855,29 @@ def _verify_published(
     branch: str,
     candidate_sha: str,
     pr: dict[str, Any],
+    *,
+    expected_pr_number: int | None = None,
 ) -> None:
     local = _git(worktree, "rev-parse", "HEAD")
+    dirty = _git(worktree, "status", "--porcelain")
     remote = _remote_sha(worktree, branch)
     target = _remote_sha(worktree, identity["base_branch"])
     if target != identity["base_sha"]:
-        raise CandidateError("target branch no longer equals the pinned base")
+        raise CandidateError(
+            "target branch no longer equals the pinned base", kind="conflict"
+        )
     if (
         local != candidate_sha
+        or dirty
         or remote != candidate_sha
         or pr.get("headRefOid") != candidate_sha
+    ):
+        raise CandidateError(
+            "local, remote, and PR heads disagree with the Candidate",
+            kind="head_mismatch",
+        )
+    if (
+        (expected_pr_number is not None and pr.get("number") != expected_pr_number)
         or pr.get("headRefName") != branch
         or pr.get("baseRefName") != identity["base_branch"]
         or pr.get("state") != "OPEN"
@@ -501,7 +885,33 @@ def _verify_published(
         or type(pr.get("number")) is not int
         or not isinstance(pr.get("url"), str)
     ):
-        raise CandidateError("local, remote, and draft PR Candidate facts disagree")
+        raise CandidateError("draft PR Candidate facts disagree", kind="conflict")
+
+
+def verify_candidate_publication(
+    identity: dict[str, Any], projection: dict[str, Any]
+) -> dict[str, Any]:
+    """Read and reconcile the exact published Candidate without mutating it."""
+    worktree = Path(_field(projection, "worktree_path"))
+    branch = _field(projection, "branch")
+    candidate_sha = _field(projection, "candidate_sha")
+    pr_number = projection.get("pr_number")
+    if type(pr_number) is not int or pr_number <= 0:
+        raise CandidateError("stable Candidate PR number is invalid", kind="conflict")
+    prs = _list_prs(worktree, identity["repository"], branch)
+    if len(prs) != 1:
+        raise CandidateError(
+            "Candidate branch does not have exactly one stable PR", kind="conflict"
+        )
+    _verify_published(
+        identity,
+        worktree,
+        branch,
+        candidate_sha,
+        prs[0],
+        expected_pr_number=pr_number,
+    )
+    return prs[0]
 
 
 def _remote_sha(worktree: Path, branch: str) -> str:
@@ -523,6 +933,29 @@ def _git(worktree: Path, *args: str) -> str:
     if completed.returncode != 0:
         raise CandidateError(f"Git inspection failed: {' '.join(args)}")
     return completed.stdout.strip()
+
+
+def _run_codex(
+    command: list[str], *, cwd: Path, input_text: str
+) -> subprocess.CompletedProcess[str]:
+    try:
+        return run_supervised_command(
+            command,
+            cwd=cwd,
+            environment=codex_environment(),
+            input_text=input_text,
+            timeout_seconds=COMMAND_TIMEOUT_SECONDS,
+            label="repair agent",
+        )
+    except CandidateValidationError as exc:
+        raise CandidateError(
+            exc.summary,
+            kind=exc.kind,
+            stdout=exc.stdout or "",
+            stderr=exc.stderr or "",
+        ) from exc
+    except OSError as exc:
+        raise CandidateError("Codex command is unavailable") from exc
 
 
 def _run(

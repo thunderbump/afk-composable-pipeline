@@ -1,0 +1,2187 @@
+import json
+import sys
+import subprocess
+import tempfile
+import unittest
+from unittest import mock
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
+
+from afk import candidate_gate as candidate_gate_module  # noqa: E402
+from afk.bead_spec import persist_bead_spec  # noqa: E402
+from afk.candidate_gate import (  # noqa: E402
+    GateError,
+    build_repair_brief,
+    complete_gate_cycle,
+    normalize_review_result,
+    reconcile_gate_comment,
+    run_candidate_reviews,
+)
+from afk.run_store import EvidenceTampered, RunStore  # noqa: E402
+from afk.start import (  # noqa: E402
+    _advance_candidate,
+    _advance_completed_gate,
+    resume_run,
+)
+
+
+class CandidateGateTest(unittest.TestCase):
+    def setUp(self):
+        self.publication_check = mock.patch(
+            "afk.candidate_gate._require_candidate_publication"
+        )
+        self.publication_check.start()
+
+    def tearDown(self):
+        if self.publication_check is not None:
+            self.publication_check.stop()
+
+    def _use_real_publication_check(self):
+        self.publication_check.stop()
+        self.publication_check = None
+
+    def _published_validated_candidate(self, root):
+        remote = root / "remote.git"
+        checkout = root / "checkout"
+        subprocess.run(
+            ["git", "init", "--bare", remote], check=True, capture_output=True
+        )
+        subprocess.run(
+            ["git", "init", "-b", "main", checkout], check=True, capture_output=True
+        )
+        for key, value in (
+            ("user.name", "AFK Test"),
+            ("user.email", "afk@example.test"),
+        ):
+            subprocess.run(["git", "config", key, value], cwd=checkout, check=True)
+        (checkout / "app.txt").write_text("base\n", encoding="utf-8")
+        subprocess.run(["git", "add", "app.txt"], cwd=checkout, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "base"],
+            cwd=checkout,
+            check=True,
+            capture_output=True,
+        )
+        base_sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=checkout,
+            text=True,
+            capture_output=True,
+            check=True,
+        ).stdout.strip()
+        subprocess.run(
+            ["git", "remote", "add", "origin", remote], cwd=checkout, check=True
+        )
+        subprocess.run(
+            ["git", "push", "origin", "main"],
+            cwd=checkout,
+            check=True,
+            capture_output=True,
+        )
+        branch = "afk/central-test-1-run-1/candidate"
+        subprocess.run(
+            ["git", "switch", "-c", branch],
+            cwd=checkout,
+            check=True,
+            capture_output=True,
+        )
+        (checkout / "app.txt").write_text("candidate\n", encoding="utf-8")
+        (checkout / "AGENTS.md").write_text(
+            "fixture password=instruction-secret\n", encoding="utf-8"
+        )
+        subprocess.run(["git", "add", "AGENTS.md"], cwd=checkout, check=True)
+        subprocess.run(
+            ["git", "commit", "-am", "candidate"],
+            cwd=checkout,
+            check=True,
+            capture_output=True,
+        )
+        candidate_sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=checkout,
+            text=True,
+            capture_output=True,
+            check=True,
+        ).stdout.strip()
+        subprocess.run(
+            ["git", "push", "origin", branch],
+            cwd=checkout,
+            check=True,
+            capture_output=True,
+        )
+        store = RunStore(root / "state")
+        run_id = store.create_run(
+            bead_id="central-test.1",
+            repository="owner/project",
+            base_branch="main",
+            base_sha=base_sha,
+            start_request={},
+            run_id="run-1",
+        )["run_id"]
+        store.write_evidence_text(run_id, "gates/validation/result.json", "{}\n")
+        store.seal_evidence(run_id, "gates/validation")
+        store.append_event(
+            run_id,
+            "validation.passed",
+            state="validated",
+            data={
+                "checkpoint": "validated",
+                "candidate_sha": candidate_sha,
+                "worktree_path": str(checkout),
+                "branch": branch,
+                "pr_number": 7,
+                "validation": {
+                    "status": "passed",
+                    "candidate_sha": candidate_sha,
+                    "summary": "passed",
+                    "evidence": "gates/validation",
+                    "checks": [],
+                },
+            },
+        )
+        pr = {
+            "number": 7,
+            "url": "https://example.test/pr/7",
+            "state": "OPEN",
+            "isDraft": True,
+            "headRefOid": candidate_sha,
+            "headRefName": branch,
+            "baseRefName": "main",
+        }
+        return store, run_id, checkout, candidate_sha, pr
+
+    def test_review_permission_profile_keeps_inputs_read_only(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            worktree = root / "worktree"
+            bundle = root / "bundle"
+            output = root / "output"
+            worktree.mkdir()
+            bundle.mkdir()
+            output.mkdir()
+
+            args = candidate_gate_module._review_permission_args(
+                worktree, bundle, output
+            )
+
+            config = "\n".join(
+                args[index + 1] for index, value in enumerate(args) if value == "-c"
+            )
+            self.assertIn('default_permissions="afk_review"', config)
+            self.assertIn(f'"{worktree}" = "read"', config)
+            self.assertIn(f'"{bundle}" = "read"', config)
+            self.assertIn(f'"{output}" = "write"', config)
+            self.assertNotIn(f'"{worktree}" = "write"', config)
+            self.assertNotIn(f'"{bundle}" = "write"', config)
+            self.assertIn("network = { enabled = false }", config)
+
+    def test_normalized_review_redacts_summary_title_and_body(self):
+        result = normalize_review_result(
+            "standards",
+            {
+                "schema_version": 1,
+                "candidate_sha": "a" * 40,
+                "axis": "standards",
+                "status": "rejected",
+                "summary": "password=summary-secret",
+                "findings": [
+                    {
+                        "id": "secret",
+                        "priority": "high",
+                        "title": "token=title-secret",
+                        "body": "api_key=body-secret",
+                        "path": "app.py",
+                        "line": 1,
+                        "blocking": True,
+                    }
+                ],
+            },
+            candidate_sha="a" * 40,
+            process_exit_code=0,
+        )
+
+        serialized = json.dumps(result)
+        self.assertNotIn("summary-secret", serialized)
+        self.assertNotIn("title-secret", serialized)
+        self.assertNotIn("body-secret", serialized)
+        self.assertIn("[REDACTED]", serialized)
+
+    def test_gate_redacts_comment_repair_brief_evidence_and_event(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store, run_id, _, _, _ = self._published_validated_candidate(root)
+            reviews = [
+                {
+                    "axis": "standards",
+                    "process_status": "succeeded",
+                    "status": "rejected",
+                    "summary": "password=summary-secret",
+                    "findings": [
+                        {
+                            "id": "standards-secret",
+                            "priority": "high",
+                            "title": "token=title-secret",
+                            "body": "api_key=body-secret",
+                            "path": "app.py",
+                            "line": 1,
+                            "blocking": True,
+                        }
+                    ],
+                },
+                {
+                    "axis": "spec",
+                    "process_status": "succeeded",
+                    "status": "passed",
+                    "summary": "passed",
+                    "findings": [],
+                },
+            ]
+
+            with (
+                mock.patch(
+                    "afk.candidate_gate.run_candidate_reviews", return_value=reviews
+                ) as run_reviews,
+                mock.patch("afk.candidate_gate.reconcile_gate_comment") as comment,
+            ):
+                outcome = complete_gate_cycle(
+                    store, run_id, bead={"id": "central-test.1"}
+                )
+                recovered = complete_gate_cycle(
+                    store, run_id, bead={"id": "central-test.1"}
+                )
+
+            self.assertEqual(recovered, outcome)
+            self.assertEqual(run_reviews.call_count, 1)
+            serialized = json.dumps(outcome)
+            for secret in ("summary-secret", "title-secret", "body-secret"):
+                self.assertNotIn(secret, serialized)
+            self.assertIn("[REDACTED]", serialized)
+            self.assertEqual(comment.call_args.kwargs["gate"], outcome)
+            comment_body = candidate_gate_module._gate_comment_body(outcome, "marker")
+            self.assertNotIn("summary-secret", comment_body)
+            self.assertNotIn("title-secret", comment_body)
+            gate_path = root / "state/runs" / run_id / outcome["evidence"]
+            evidence = (gate_path / "outcome.json").read_text(encoding="utf-8")
+            events = (root / "state/runs" / run_id / "events.jsonl").read_text(
+                encoding="utf-8"
+            )
+            for secret in ("summary-secret", "title-secret", "body-secret"):
+                self.assertNotIn(secret, evidence)
+                self.assertNotIn(secret, events)
+
+    def test_redacted_review_bundle_recovers_with_exact_bead_and_instructions(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store, run_id, _, candidate_sha, _ = self._published_validated_candidate(
+                root
+            )
+            bead = {
+                "id": "central-test.1",
+                "title": "password=bead-secret",
+                "description": "Review it.",
+                "acceptance_criteria": "Both axes pass.",
+            }
+            persist_bead_spec(store, run_id, bead)
+
+            def reviewer(axis, bundle_path, attempt_path, worktree):
+                return (
+                    0,
+                    {
+                        "schema_version": 1,
+                        "candidate_sha": candidate_sha,
+                        "axis": axis,
+                        "status": "passed",
+                        "summary": "passed",
+                        "findings": [],
+                    },
+                    "",
+                    "",
+                )
+
+            with mock.patch(
+                "afk.candidate_gate._execute_reviewer", side_effect=reviewer
+            ) as execute:
+                first = run_candidate_reviews(store, run_id, cycle=1, bead=bead)
+                second = run_candidate_reviews(
+                    store,
+                    run_id,
+                    cycle=1,
+                    bead={
+                        **bead,
+                        "description": "mutated live description",
+                        "status": "closed",
+                        "comments": [{"text": "mutated live comment"}],
+                    },
+                )
+
+            self.assertEqual(first, second)
+            self.assertEqual(execute.call_count, 2)
+            bundle = (
+                root
+                / "state/runs"
+                / run_id
+                / f"gates/gate-cycle-1-{candidate_sha[:12]}/review-bundle/bundle.json"
+            ).read_text(encoding="utf-8")
+            self.assertNotIn("bead-secret", bundle)
+            self.assertNotIn("instruction-secret", bundle)
+            self.assertIn("[REDACTED]", bundle)
+
+    def test_gate_rejects_dirty_candidate_before_review(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            self._use_real_publication_check()
+            root = Path(temporary)
+            store, run_id, checkout, _, pr = self._published_validated_candidate(root)
+            (checkout / "dirty.txt").write_text("drift\n", encoding="utf-8")
+            reviews = mock.Mock(
+                return_value=[
+                    {
+                        "axis": axis,
+                        "process_status": "succeeded",
+                        "status": "passed",
+                        "summary": "passed",
+                        "findings": [],
+                    }
+                    for axis in ("standards", "spec")
+                ]
+            )
+
+            with (
+                mock.patch("afk.candidate._list_prs", return_value=[pr]),
+                mock.patch("afk.candidate_gate.run_candidate_reviews", reviews),
+                mock.patch("afk.candidate_gate.reconcile_gate_comment"),
+                self.assertRaises(GateError) as raised,
+            ):
+                complete_gate_cycle(store, run_id, bead={"id": "central-test.1"})
+
+            self.assertEqual(raised.exception.kind, "head_mismatch")
+            reviews.assert_not_called()
+
+    def test_gate_rejects_local_remote_base_and_pr_drift(self):
+        cases = (
+            "local-head",
+            "remote-head",
+            "base",
+            "number",
+            "missing-pr",
+            "duplicate-pr",
+            "pr-head",
+            "pr-base",
+            "closed",
+            "ready",
+        )
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
+                self._use_real_publication_check()
+                root = Path(temporary)
+                store, run_id, checkout, candidate_sha, pr = (
+                    self._published_validated_candidate(root)
+                )
+                if case == "local-head":
+                    subprocess.run(
+                        ["git", "commit", "--allow-empty", "-m", "drift"],
+                        cwd=checkout,
+                        check=True,
+                        capture_output=True,
+                    )
+                elif case == "remote-head":
+                    subprocess.run(
+                        ["git", "commit", "--allow-empty", "-m", "drift"],
+                        cwd=checkout,
+                        check=True,
+                        capture_output=True,
+                    )
+                    subprocess.run(
+                        ["git", "push", "origin", "HEAD"],
+                        cwd=checkout,
+                        check=True,
+                        capture_output=True,
+                    )
+                    subprocess.run(
+                        ["git", "reset", "--hard", candidate_sha],
+                        cwd=checkout,
+                        check=True,
+                        capture_output=True,
+                    )
+                elif case == "base":
+                    subprocess.run(
+                        ["git", "push", "origin", "HEAD:main"],
+                        cwd=checkout,
+                        check=True,
+                        capture_output=True,
+                    )
+                elif case == "number":
+                    pr["number"] = 8
+                elif case == "pr-head":
+                    pr["headRefOid"] = "c" * 40
+                elif case == "pr-base":
+                    pr["baseRefName"] = "other"
+                elif case == "closed":
+                    pr["state"] = "CLOSED"
+                else:
+                    pr["isDraft"] = False
+
+                observed_prs = (
+                    []
+                    if case == "missing-pr"
+                    else [pr, dict(pr)] if case == "duplicate-pr" else [pr]
+                )
+
+                with (
+                    mock.patch("afk.candidate._list_prs", return_value=observed_prs),
+                    mock.patch("afk.candidate_gate.run_candidate_reviews") as reviews,
+                    self.assertRaises(GateError) as raised,
+                ):
+                    complete_gate_cycle(store, run_id, bead={"id": "central-test.1"})
+
+                expected = (
+                    "head_mismatch"
+                    if case in {"local-head", "remote-head", "pr-head"}
+                    else "conflict"
+                )
+                self.assertEqual(raised.exception.kind, expected)
+                reviews.assert_not_called()
+                self.publication_check = mock.patch(
+                    "afk.candidate_gate._require_candidate_publication"
+                )
+                self.publication_check.start()
+
+    def test_publication_drift_during_review_blocks_attempt_reuse(self):
+        self._use_real_publication_check()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store, run_id, checkout, candidate_sha, pr = (
+                self._published_validated_candidate(root)
+            )
+            reviews = [
+                {
+                    "axis": axis,
+                    "process_status": "succeeded",
+                    "status": "passed",
+                    "summary": "passed",
+                    "findings": [],
+                }
+                for axis in ("standards", "spec")
+            ]
+
+            def drift(*args, **kwargs):
+                (checkout / "dirty.txt").write_text("drift\n", encoding="utf-8")
+                return reviews
+
+            with (
+                mock.patch("afk.candidate._list_prs", return_value=[pr]),
+                mock.patch(
+                    "afk.candidate_gate.run_candidate_reviews", side_effect=drift
+                ),
+                self.assertRaises(GateError) as raised,
+            ):
+                complete_gate_cycle(store, run_id, bead={"id": "central-test.1"})
+
+            self.assertEqual(raised.exception.kind, "head_mismatch")
+            gate = (
+                root
+                / "state/runs"
+                / run_id
+                / f"gates/gate-cycle-1-{candidate_sha[:12]}"
+            )
+            self.assertTrue((gate / "publication-drift.json").is_file())
+            self.assertTrue((gate / "manifest.json").is_file())
+            (checkout / "dirty.txt").unlink()
+            with (
+                mock.patch("afk.candidate._list_prs", return_value=[pr]),
+                mock.patch("afk.candidate_gate.run_candidate_reviews") as rerun,
+                self.assertRaises(GateError),
+            ):
+                complete_gate_cycle(store, run_id, bead={"id": "central-test.1"})
+            rerun.assert_not_called()
+
+    def test_repaired_bootstrap_candidate_pauses_for_explicit_reapproval(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store = RunStore(root / "state")
+            run_id = store.create_run(
+                bead_id="central-test.1",
+                repository="owner/project",
+                base_branch="main",
+                base_sha="a" * 40,
+                start_request={},
+                run_id="run-1",
+            )["run_id"]
+            store.append_event(
+                run_id,
+                "gate.cycle_completed",
+                state="candidate_ready",
+                data={
+                    "checkpoint": "candidate_ready",
+                    "candidate_sha": "b" * 40,
+                    "validation_contract": {
+                        "source": "approved_bootstrap",
+                        "base_sha": "a" * 40,
+                        "adapter_id": "afk.builtin.bootstrap-validation/v1",
+                        "approval": {},
+                    },
+                },
+            )
+            outcome = {
+                "next_action": "repair",
+                "repair_brief": {
+                    "candidate_sha": "b" * 40,
+                    "repair_attempt": 1,
+                    "blocking_findings": [],
+                },
+            }
+
+            with (
+                mock.patch("afk.start.produce_repair_candidate"),
+                mock.patch("afk.start._advance_validation") as validation,
+            ):
+                exit_code = _advance_completed_gate(
+                    store,
+                    run_id,
+                    outcome=outcome,
+                    bead={"id": "central-test.1"},
+                )
+
+            self.assertEqual(exit_code, 2)
+            validation.assert_not_called()
+            status = store.status(run_id)
+            self.assertEqual(status["attention"]["scope"], "validation")
+            self.assertEqual(status["attention"]["kind"], "unavailable")
+            self.assertIn("reapproval", status["attention"]["summary"])
+
+    def test_initial_candidate_passed_validation_continues_into_gate(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store = RunStore(Path(temporary) / "state")
+            run_id = store.create_run(
+                bead_id="central-test.1",
+                repository="owner/project",
+                base_branch="main",
+                base_sha="a" * 40,
+                start_request={"beads_workspace": temporary},
+                run_id="run-1",
+            )["run_id"]
+
+            def pass_validation(_store, _run_id):
+                store.append_event(
+                    run_id,
+                    "validation.passed",
+                    state="validated",
+                    data={"checkpoint": "validated"},
+                )
+                return 0
+
+            def enter_gate(_store, _run_id):
+                self.assertEqual(store.status(run_id)["checkpoint"], "validated")
+                return 0
+
+            with (
+                mock.patch(
+                    "afk.start._show_bead", return_value={"id": "central-test.1"}
+                ),
+                mock.patch("afk.start.produce_candidate"),
+                mock.patch(
+                    "afk.start._advance_validation", side_effect=pass_validation
+                ),
+                mock.patch("afk.start._advance_gate", side_effect=enter_gate) as gate,
+            ):
+                exit_code = _advance_candidate(store, run_id)
+
+            self.assertEqual(exit_code, 0)
+            gate.assert_called_once_with(store, run_id)
+
+    def test_resume_continues_after_durable_candidate_repaired_event(self):
+        contracts = (
+            ("pinned_base", 0, True),
+            ("approved_bootstrap", 2, False),
+        )
+        for source, expected_exit, advances_validation in contracts:
+            with (
+                self.subTest(source=source),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                store = RunStore(Path(temporary) / "state")
+                run_id = store.create_run(
+                    bead_id="central-test.1",
+                    repository="owner/project",
+                    base_branch="main",
+                    base_sha="a" * 40,
+                    start_request={},
+                    run_id="run-1",
+                )["run_id"]
+                store.append_event(
+                    run_id,
+                    "gate.cycle_completed",
+                    state="candidate_ready",
+                    data={
+                        "checkpoint": "candidate_ready",
+                        "candidate_sha": "b" * 40,
+                        "worker_exit_code": 0,
+                        "validation_contract": {"source": source},
+                        "repair_brief": {
+                            "candidate_sha": "b" * 40,
+                            "repair_attempt": 1,
+                        },
+                    },
+                )
+                store.append_event(
+                    run_id,
+                    "candidate.repaired",
+                    state="candidate_ready",
+                    data={
+                        "checkpoint": "candidate_ready",
+                        "previous_candidate_sha": "b" * 40,
+                        "candidate_sha": "c" * 40,
+                        "repair_attempts_used": 1,
+                        "attention": {},
+                    },
+                )
+
+                with (
+                    mock.patch("afk.start.RunStore", return_value=store),
+                    mock.patch(
+                        "afk.start._advance_validation", return_value=0
+                    ) as validation,
+                    mock.patch("afk.start._advance_gate", return_value=0) as gate,
+                ):
+                    resumed = resume_run()
+
+                self.assertEqual(resumed, (run_id, expected_exit))
+                if advances_validation:
+                    validation.assert_called_once_with(store, run_id)
+                    gate.assert_called_once_with(store, run_id)
+                else:
+                    validation.assert_not_called()
+                    gate.assert_not_called()
+                    attention = store.status(run_id)["attention"]
+                    self.assertEqual(attention["scope"], "validation")
+                    self.assertEqual(attention["kind"], "unavailable")
+                    self.assertIn("reapproval", attention["summary"])
+
+    def test_resume_consumes_validated_repair_started_before_evidence(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store = RunStore(Path(temporary) / "state")
+            run_id = store.create_run(
+                bead_id="central-test.1",
+                repository="owner/project",
+                base_branch="main",
+                base_sha="a" * 40,
+                start_request={},
+                run_id="run-1",
+            )["run_id"]
+            brief = {
+                "candidate_sha": "b" * 40,
+                "repair_attempt": 1,
+                "blocking_findings": [],
+            }
+            outcome = {"next_action": "repair", "repair_brief": brief}
+            store.append_event(
+                run_id,
+                "gate.cycle_completed",
+                state="validated",
+                data={
+                    "checkpoint": "validated",
+                    "candidate_sha": "b" * 40,
+                    "gate_cycles": [outcome],
+                },
+            )
+            store.append_event(
+                run_id,
+                "repair.started",
+                data={
+                    "checkpoint": "validated",
+                    "repair_attempts_used": 1,
+                    "repair_brief": brief,
+                },
+            )
+
+            with (
+                mock.patch("afk.start.RunStore", return_value=store),
+                mock.patch(
+                    "afk.start._advance_completed_gate", return_value=0
+                ) as repair,
+                mock.patch(
+                    "afk.start.reconcile_interrupted_repair_worktree"
+                ) as reconcile,
+                mock.patch("afk.start._advance_gate") as gate,
+            ):
+                resumed = resume_run()
+
+            self.assertEqual(resumed, (run_id, 0))
+            repair.assert_called_once_with(
+                store,
+                run_id,
+                outcome={
+                    "next_action": "repair",
+                    "repair_brief": {**brief, "repair_attempt": 2},
+                },
+            )
+            reconcile.assert_called_once_with(
+                store,
+                run_id,
+                repair_brief={**brief, "repair_attempt": 2},
+            )
+            gate.assert_not_called()
+            attempt = Path(temporary) / "state/runs/run-1/attempts/repair-1"
+            self.assertTrue((attempt / "interruption.json").is_file())
+            self.assertTrue((attempt / "manifest.json").is_file())
+
+    def test_resume_of_crashed_fourth_repair_seals_it_and_exhausts_budget(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store = RunStore(root / "state")
+            run_id = store.create_run(
+                bead_id="central-test.1",
+                repository="owner/project",
+                base_branch="main",
+                base_sha="a" * 40,
+                start_request={},
+                run_id="run-1",
+            )["run_id"]
+            brief = {
+                "schema_version": 1,
+                "candidate_sha": "b" * 40,
+                "repair_attempt": 4,
+                "blocking_findings": [],
+            }
+            store.append_event(
+                run_id,
+                "gate.cycle_completed",
+                state="candidate_ready",
+                data={
+                    "checkpoint": "candidate_ready",
+                    "candidate_sha": "b" * 40,
+                    "gate_cycles": [{"next_action": "repair", "repair_brief": brief}],
+                },
+            )
+            store.append_event(
+                run_id,
+                "repair.started",
+                data={
+                    "checkpoint": "candidate_ready",
+                    "repair_attempts_used": 4,
+                    "repair_brief": brief,
+                },
+            )
+            store.write_evidence_text(
+                run_id, "attempts/repair-4/prompt.md", "started\n"
+            )
+
+            with (
+                mock.patch("afk.start.RunStore", return_value=store),
+                mock.patch("afk.start.produce_repair_candidate") as repair,
+            ):
+                resumed = resume_run()
+
+            self.assertEqual(resumed, (run_id, 2))
+            repair.assert_not_called()
+            attempt = root / "state/runs/run-1/attempts/repair-4"
+            self.assertTrue((attempt / "manifest.json").is_file())
+            interruption = json.loads(
+                (attempt / "interruption.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(interruption["repair_attempt"], 4)
+            status = store.status(run_id)
+            self.assertEqual(status["repair_attempts_used"], 4)
+            self.assertEqual(status["attention"]["kind"], "exhausted")
+            self.assertEqual(status["interrupted_repair"]["status"], "exhausted")
+            last_sequence = status["last_sequence"]
+
+            with (
+                mock.patch("afk.start.RunStore", return_value=store),
+                mock.patch("afk.start.produce_repair_candidate") as retried_repair,
+            ):
+                resumed_again = resume_run()
+
+            self.assertEqual(resumed_again, (run_id, 2))
+            self.assertEqual(store.status(run_id)["last_sequence"], last_sequence)
+            retried_repair.assert_not_called()
+
+    def test_resume_exhausts_started_fourth_repair_without_evidence_directory(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store = RunStore(root / "state")
+            run_id = store.create_run(
+                bead_id="central-test.1",
+                repository="owner/project",
+                base_branch="main",
+                base_sha="a" * 40,
+                start_request={},
+                run_id="run-1",
+            )["run_id"]
+            brief = {
+                "schema_version": 1,
+                "candidate_sha": "b" * 40,
+                "repair_attempt": 4,
+                "blocking_findings": [],
+            }
+            store.append_event(
+                run_id,
+                "gate.cycle_completed",
+                state="candidate_ready",
+                data={
+                    "checkpoint": "candidate_ready",
+                    "candidate_sha": "b" * 40,
+                    "gate_cycles": [{"next_action": "repair", "repair_brief": brief}],
+                },
+            )
+            store.append_event(
+                run_id,
+                "repair.started",
+                data={
+                    "checkpoint": "candidate_ready",
+                    "repair_attempts_used": 4,
+                    "repair_brief": brief,
+                },
+            )
+            attempt = root / "state/runs/run-1/attempts/repair-4"
+            self.assertFalse(attempt.exists())
+
+            with (
+                mock.patch("afk.start.RunStore", return_value=store),
+                mock.patch("afk.start.produce_repair_candidate") as repair,
+            ):
+                resumed = resume_run()
+
+            self.assertEqual(resumed, (run_id, 2))
+            repair.assert_not_called()
+            self.assertTrue((attempt / "interruption.json").is_file())
+            self.assertTrue((attempt / "manifest.json").is_file())
+            status = store.status(run_id)
+            self.assertEqual(status["repair_attempts_used"], 4)
+            self.assertEqual(status["attention"]["kind"], "exhausted")
+            self.assertEqual(status["interrupted_repair"]["status"], "exhausted")
+
+    def test_resume_keeps_interrupted_repair_continuation_after_attention(self):
+        for checkpoint in ("validated", "candidate_ready"):
+            with (
+                self.subTest(checkpoint=checkpoint),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                root = Path(temporary)
+                store = RunStore(root / "state")
+                run_id = store.create_run(
+                    bead_id="central-test.1",
+                    repository="owner/project",
+                    base_branch="main",
+                    base_sha="a" * 40,
+                    start_request={},
+                    run_id="run-1",
+                )["run_id"]
+                first_brief = {
+                    "schema_version": 1,
+                    "candidate_sha": "b" * 40,
+                    "repair_attempt": 1,
+                    "blocking_findings": [],
+                }
+                next_brief = {**first_brief, "repair_attempt": 2}
+                interruption = {
+                    "schema_version": 1,
+                    "candidate_sha": "b" * 40,
+                    "repair_attempt": 1,
+                    "status": "interrupted",
+                    "summary": "repair execution ended before evidence was sealed",
+                }
+                store.append_event(
+                    run_id,
+                    "gate.cycle_completed",
+                    state=checkpoint,
+                    data={
+                        "checkpoint": checkpoint,
+                        "candidate_sha": "b" * 40,
+                        "worker_exit_code": 0,
+                        "gate_cycles": [
+                            {"next_action": "repair", "repair_brief": first_brief}
+                        ],
+                    },
+                )
+                store.append_event(
+                    run_id,
+                    "repair.started",
+                    data={
+                        "checkpoint": checkpoint,
+                        "repair_attempts_used": 1,
+                        "repair_brief": first_brief,
+                    },
+                )
+                store.write_evidence_value(
+                    run_id, "attempts/repair-1/interruption.json", interruption
+                )
+                store.seal_evidence(run_id, "attempts/repair-1")
+                store.append_event(
+                    run_id,
+                    "repair.interrupted",
+                    data={
+                        "checkpoint": checkpoint,
+                        "repair_attempts_used": 1,
+                        "repair_brief": next_brief,
+                        "interrupted_repair": interruption,
+                    },
+                )
+                store.append_event(
+                    run_id,
+                    "run.attention_required",
+                    state="attention_required",
+                    data={
+                        "checkpoint": checkpoint,
+                        "attention": {
+                            "scope": "repair",
+                            "kind": "unavailable",
+                            "summary": "transient failure",
+                        },
+                    },
+                )
+
+                with (
+                    mock.patch("afk.start.RunStore", return_value=store),
+                    mock.patch(
+                        "afk.start._advance_completed_gate", return_value=0
+                    ) as repair,
+                    mock.patch(
+                        "afk.start.reconcile_interrupted_repair_worktree"
+                    ) as reconcile,
+                    mock.patch("afk.start._advance_gate") as gate,
+                ):
+                    resumed = resume_run()
+
+                self.assertEqual(resumed, (run_id, 0))
+                repair.assert_called_once_with(
+                    store,
+                    run_id,
+                    outcome={"next_action": "repair", "repair_brief": next_brief},
+                )
+                reconcile.assert_called_once_with(
+                    store,
+                    run_id,
+                    repair_brief=next_brief,
+                )
+                gate.assert_not_called()
+
+    def test_passed_validation_and_both_reviews_reach_reviewed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout = root / "checkout"
+            checkout.mkdir()
+            store = RunStore(root / "state")
+            run_id = store.create_run(
+                bead_id="central-test.1",
+                repository="owner/project",
+                base_branch="main",
+                base_sha="a" * 40,
+                start_request={},
+                run_id="run-1",
+            )["run_id"]
+            store.write_evidence_text(run_id, "gates/validation-b/result.json", "{}\n")
+            store.seal_evidence(run_id, "gates/validation-b")
+            store.append_event(
+                run_id,
+                "validation.passed",
+                state="validated",
+                data={
+                    "checkpoint": "validated",
+                    "candidate_sha": "b" * 40,
+                    "worktree_path": str(checkout),
+                    "pr_number": 7,
+                    "validation": {
+                        "status": "passed",
+                        "candidate_sha": "b" * 40,
+                        "summary": "passed",
+                        "evidence": "gates/validation-b",
+                        "checks": [],
+                    },
+                },
+            )
+            reviews = [
+                {
+                    "axis": axis,
+                    "process_status": "succeeded",
+                    "status": "passed",
+                    "summary": "passed",
+                    "findings": [],
+                }
+                for axis in ("standards", "spec")
+            ]
+
+            with (
+                mock.patch(
+                    "afk.candidate_gate.run_candidate_reviews", return_value=reviews
+                ) as run_reviews,
+                mock.patch("afk.candidate_gate.reconcile_gate_comment"),
+            ):
+                outcome = complete_gate_cycle(
+                    store, run_id, bead={"id": "central-test.1"}
+                )
+
+            self.assertEqual(outcome["next_action"], "complete")
+            self.assertEqual(store.status(run_id)["checkpoint"], "reviewed")
+            run_reviews.assert_called_once()
+
+    def test_inconclusive_review_preserves_validated_checkpoint(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout = root / "checkout"
+            checkout.mkdir()
+            store = RunStore(root / "state")
+            run_id = store.create_run(
+                bead_id="central-test.1",
+                repository="owner/project",
+                base_branch="main",
+                base_sha="a" * 40,
+                start_request={},
+                run_id="run-1",
+            )["run_id"]
+            store.write_evidence_text(run_id, "gates/validation-b/result.json", "{}\n")
+            store.seal_evidence(run_id, "gates/validation-b")
+            store.append_event(
+                run_id,
+                "validation.passed",
+                state="validated",
+                data={
+                    "checkpoint": "validated",
+                    "candidate_sha": "b" * 40,
+                    "worktree_path": str(checkout),
+                    "pr_number": 7,
+                    "validation": {
+                        "status": "passed",
+                        "candidate_sha": "b" * 40,
+                        "summary": "passed",
+                        "evidence": "gates/validation-b",
+                        "checks": [],
+                    },
+                },
+            )
+            reviews = [
+                {
+                    "axis": "standards",
+                    "process_status": "failed",
+                    "status": "inconclusive",
+                    "summary": "reviewer timed out",
+                    "findings": [],
+                },
+                {
+                    "axis": "spec",
+                    "process_status": "succeeded",
+                    "status": "passed",
+                    "summary": "passed",
+                    "findings": [],
+                },
+            ]
+
+            with (
+                mock.patch(
+                    "afk.candidate_gate.run_candidate_reviews", return_value=reviews
+                ),
+                mock.patch("afk.candidate_gate.reconcile_gate_comment"),
+            ):
+                outcome = complete_gate_cycle(
+                    store, run_id, bead={"id": "central-test.1"}
+                )
+
+            self.assertEqual(outcome["next_action"], "attention")
+            self.assertEqual(store.status(run_id)["checkpoint"], "validated")
+
+    def test_four_rejected_repairs_exhaust_the_budget_without_a_fifth_brief(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout = root / "checkout"
+            checkout.mkdir()
+            store = RunStore(root / "state")
+            run_id = store.create_run(
+                bead_id="central-test.1",
+                repository="owner/project",
+                base_branch="main",
+                base_sha="a" * 40,
+                start_request={},
+                run_id="run-1",
+            )["run_id"]
+            store.write_evidence_text(run_id, "gates/validation-b/result.json", "{}\n")
+            store.seal_evidence(run_id, "gates/validation-b")
+            store.append_event(
+                run_id,
+                "validation.rejected",
+                state="candidate_ready",
+                data={
+                    "checkpoint": "candidate_ready",
+                    "candidate_sha": "b" * 40,
+                    "worktree_path": str(checkout),
+                    "pr_number": 7,
+                    "repair_attempts_used": 4,
+                    "validation": {
+                        "status": "rejected",
+                        "candidate_sha": "b" * 40,
+                        "summary": "still failing",
+                        "evidence": "gates/validation-b",
+                        "checks": [
+                            {
+                                "name": "smoke",
+                                "status": "rejected",
+                                "log_path": "smoke.log",
+                            }
+                        ],
+                    },
+                },
+            )
+
+            with mock.patch("afk.candidate_gate.reconcile_gate_comment"):
+                outcome = complete_gate_cycle(
+                    store, run_id, bead={"id": "central-test.1"}
+                )
+
+            self.assertEqual(outcome["next_action"], "attention")
+            self.assertIn("four", outcome["stop_reason"])
+            self.assertNotIn("repair_brief", outcome)
+            self.assertEqual(store.status(run_id)["checkpoint"], "candidate_ready")
+
+    def test_fourth_review_rejection_exhaustion_preserves_validated_checkpoint(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout = root / "checkout"
+            checkout.mkdir()
+            store = RunStore(root / "state")
+            run_id = store.create_run(
+                bead_id="central-test.1",
+                repository="owner/project",
+                base_branch="main",
+                base_sha="a" * 40,
+                start_request={},
+                run_id="run-1",
+            )["run_id"]
+            store.write_evidence_text(run_id, "gates/validation-b/result.json", "{}\n")
+            store.seal_evidence(run_id, "gates/validation-b")
+            store.append_event(
+                run_id,
+                "validation.passed",
+                state="validated",
+                data={
+                    "checkpoint": "validated",
+                    "candidate_sha": "b" * 40,
+                    "worktree_path": str(checkout),
+                    "pr_number": 7,
+                    "repair_attempts_used": 4,
+                    "validation": {
+                        "status": "passed",
+                        "candidate_sha": "b" * 40,
+                        "summary": "passed",
+                        "evidence": "gates/validation-b",
+                        "checks": [],
+                    },
+                },
+            )
+            reviews = [
+                {
+                    "axis": "standards",
+                    "process_status": "succeeded",
+                    "status": "rejected",
+                    "summary": "still rejected",
+                    "findings": [
+                        {
+                            "id": "standards-blocker",
+                            "priority": "high",
+                            "title": "Blocking issue",
+                            "body": "The issue remains.",
+                            "path": "app.py",
+                            "line": 1,
+                            "blocking": True,
+                        }
+                    ],
+                },
+                {
+                    "axis": "spec",
+                    "process_status": "succeeded",
+                    "status": "passed",
+                    "summary": "passed",
+                    "findings": [],
+                },
+            ]
+
+            with (
+                mock.patch(
+                    "afk.candidate_gate.run_candidate_reviews", return_value=reviews
+                ),
+                mock.patch("afk.candidate_gate.reconcile_gate_comment"),
+            ):
+                outcome = complete_gate_cycle(
+                    store, run_id, bead={"id": "central-test.1"}
+                )
+
+            self.assertEqual(outcome["next_action"], "attention")
+            self.assertIn("four", outcome["stop_reason"])
+            self.assertEqual(store.status(run_id)["checkpoint"], "validated")
+
+    def test_rejected_validation_completes_cycle_and_returns_one_repair_brief(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout = root / "checkout"
+            checkout.mkdir()
+            store = RunStore(root / "state")
+            run_id = store.create_run(
+                bead_id="central-test.1",
+                repository="owner/project",
+                base_branch="main",
+                base_sha="a" * 40,
+                start_request={},
+                run_id="run-1",
+            )["run_id"]
+            store.write_evidence_text(run_id, "gates/validation-b/result.json", "{}\n")
+            store.seal_evidence(run_id, "gates/validation-b")
+            store.append_event(
+                run_id,
+                "validation.rejected",
+                state="candidate_ready",
+                data={
+                    "checkpoint": "candidate_ready",
+                    "candidate_sha": "b" * 40,
+                    "worktree_path": str(checkout),
+                    "pr_number": 7,
+                    "validation": {
+                        "status": "rejected",
+                        "candidate_sha": "b" * 40,
+                        "summary": "smoke failed",
+                        "evidence": "gates/validation-b",
+                        "checks": [
+                            {
+                                "name": "smoke",
+                                "status": "rejected",
+                                "log_path": "smoke.log",
+                            }
+                        ],
+                    },
+                },
+            )
+
+            with mock.patch("afk.candidate_gate.reconcile_gate_comment") as comment:
+                outcome = complete_gate_cycle(
+                    store,
+                    run_id,
+                    bead={"id": "central-test.1"},
+                )
+
+            self.assertEqual(outcome["next_action"], "repair")
+            self.assertEqual(outcome["repair_brief"]["repair_attempt"], 1)
+            self.assertEqual(outcome["reviews"], [])
+            comment.assert_called_once()
+            status = store.status(run_id)
+            self.assertEqual(status["last_event"], "gate.cycle_completed")
+            self.assertEqual(status["gate_cycles"][0]["candidate_sha"], "b" * 40)
+            gate = root / "state" / "runs" / run_id / outcome["evidence"]
+            self.assertTrue((gate / "manifest.json").is_file())
+
+    def test_gate_comment_reconciles_a_post_confirmation_crash_without_duplication(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store = RunStore(root / "state")
+            run_id = store.create_run(
+                bead_id="central-test.1",
+                repository="owner/project",
+                base_branch="main",
+                base_sha="a" * 40,
+                start_request={},
+                run_id="run-1",
+            )["run_id"]
+            gate = {
+                "cycle": 1,
+                "candidate_sha": "b" * 40,
+                "validation": {"status": "rejected", "summary": "failed"},
+                "reviews": [],
+                "next_action": "repair",
+            }
+            posted = []
+            comments = []
+
+            def post(repository, pr_number, body, worktree):
+                posted.append(body)
+                comments.append({"url": "https://example.test/comment/1", "body": body})
+                return comments[0]["url"]
+
+            original_confirm = store.confirm_effect
+            with (
+                mock.patch(
+                    "afk.candidate_gate._github_comments",
+                    side_effect=lambda *args: list(comments),
+                ),
+                mock.patch("afk.candidate_gate._post_gate_comment", side_effect=post),
+                mock.patch.object(
+                    store, "confirm_effect", side_effect=RuntimeError("crash")
+                ),
+                self.assertRaisesRegex(RuntimeError, "crash"),
+            ):
+                reconcile_gate_comment(
+                    store, run_id, pr_number=7, worktree=root, gate=gate
+                )
+
+            with mock.patch(
+                "afk.candidate_gate._github_comments", return_value=comments
+            ):
+                with mock.patch("afk.candidate_gate._post_gate_comment") as duplicate:
+                    with mock.patch.object(
+                        store, "confirm_effect", side_effect=original_confirm
+                    ):
+                        reconcile_gate_comment(
+                            store, run_id, pr_number=7, worktree=root, gate=gate
+                        )
+
+            self.assertEqual(len(posted), 1)
+            duplicate.assert_not_called()
+            self.assertEqual(
+                store.effect(run_id, "gate-comment-1")["status"], "confirmed"
+            )
+
+            marker = posted[0].splitlines()[0]
+            mismatches = {
+                "edited": posted[0] + "edited\n",
+                "truncated": marker,
+                "marker collision": f"{marker}\nunrelated evidence\n",
+            }
+            for label, mismatched_body in mismatches.items():
+                with self.subTest(label=label):
+                    comments[0]["body"] = mismatched_body
+                    with (
+                        mock.patch(
+                            "afk.candidate_gate._github_comments",
+                            return_value=comments,
+                        ),
+                        mock.patch(
+                            "afk.candidate_gate._post_gate_comment"
+                        ) as replacement,
+                        self.assertRaisesRegex(GateError, "content"),
+                    ):
+                        reconcile_gate_comment(
+                            store, run_id, pr_number=7, worktree=root, gate=gate
+                        )
+                    replacement.assert_not_called()
+
+            duplicate_cases = {
+                "two exact": [posted[0], posted[0]],
+                "exact and marker collision": [posted[0], marker],
+            }
+            for label, bodies in duplicate_cases.items():
+                with self.subTest(label=label):
+                    duplicates = [
+                        {
+                            "url": f"https://example.test/comment/{index}",
+                            "body": duplicate_body,
+                        }
+                        for index, duplicate_body in enumerate(bodies, start=1)
+                    ]
+                    with (
+                        mock.patch(
+                            "afk.candidate_gate._github_comments",
+                            return_value=duplicates,
+                        ),
+                        mock.patch(
+                            "afk.candidate_gate._post_gate_comment"
+                        ) as replacement,
+                        self.assertRaisesRegex(GateError, "duplicate"),
+                    ):
+                        reconcile_gate_comment(
+                            store, run_id, pr_number=7, worktree=root, gate=gate
+                        )
+                    replacement.assert_not_called()
+
+    def test_gate_comment_reconciliation_reads_all_paginated_comment_pages(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store = RunStore(root / "state")
+            run_id = store.create_run(
+                bead_id="central-test.1",
+                repository="owner/project",
+                base_branch="main",
+                base_sha="a" * 40,
+                start_request={},
+                run_id="run-1",
+            )["run_id"]
+            gate = {
+                "cycle": 1,
+                "candidate_sha": "b" * 40,
+                "validation": {"status": "rejected", "summary": "failed"},
+                "reviews": [],
+                "next_action": "repair",
+            }
+            posted = []
+
+            def post(repository, pr_number, body, worktree):
+                posted.append(body)
+                return "https://example.test/comment/1"
+
+            with (
+                mock.patch("afk.candidate_gate._github_comments", return_value=[]),
+                mock.patch("afk.candidate_gate._post_gate_comment", side_effect=post),
+            ):
+                reconcile_gate_comment(
+                    store, run_id, pr_number=7, worktree=root, gate=gate
+                )
+
+            pages = [
+                [{"url": "https://example.test/comment/other", "body": "unrelated"}],
+                [
+                    {
+                        "url": "https://example.test/comment/1",
+                        "body": posted[0],
+                    }
+                ],
+            ]
+
+            def paginated(command, worktree, **kwargs):
+                self.assertIn("--slurp", command)
+                return subprocess.CompletedProcess(
+                    command, 0, stdout=json.dumps(pages), stderr=""
+                )
+
+            with (
+                mock.patch("afk.candidate_gate._run_gh", side_effect=paginated),
+                mock.patch("afk.candidate_gate._post_gate_comment") as duplicate,
+            ):
+                reconcile_gate_comment(
+                    store, run_id, pr_number=7, worktree=root, gate=gate
+                )
+
+            duplicate.assert_not_called()
+
+            malformed = subprocess.CompletedProcess(
+                [],
+                0,
+                stdout=json.dumps([[{"body": posted[0]}], {"not": "a page"}]),
+                stderr="",
+            )
+            with (
+                mock.patch("afk.candidate_gate._run_gh", return_value=malformed),
+                mock.patch("afk.candidate_gate._post_gate_comment") as replacement,
+                self.assertRaisesRegex(GateError, "malformed"),
+            ):
+                reconcile_gate_comment(
+                    store, run_id, pr_number=7, worktree=root, gate=gate
+                )
+
+            replacement.assert_not_called()
+
+    def test_gate_review_recovery_reuses_only_manifest_valid_completed_work(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout = root / "checkout"
+            checkout.mkdir()
+            subprocess.run(
+                ["git", "init", "-b", "main"],
+                cwd=checkout,
+                check=True,
+                capture_output=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.email", "afk@example.test"],
+                cwd=checkout,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.name", "AFK Test"], cwd=checkout, check=True
+            )
+            (checkout / "app.txt").write_text("base\n", encoding="utf-8")
+            subprocess.run(["git", "add", "app.txt"], cwd=checkout, check=True)
+            subprocess.run(
+                ["git", "commit", "-m", "base"],
+                cwd=checkout,
+                check=True,
+                capture_output=True,
+            )
+            base_sha = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=checkout,
+                text=True,
+                capture_output=True,
+                check=True,
+            ).stdout.strip()
+            (checkout / "app.txt").write_text("candidate\n", encoding="utf-8")
+            subprocess.run(
+                ["git", "commit", "-am", "candidate"],
+                cwd=checkout,
+                check=True,
+                capture_output=True,
+            )
+            candidate_sha = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=checkout,
+                text=True,
+                capture_output=True,
+                check=True,
+            ).stdout.strip()
+            store = RunStore(root / "state")
+            run_id = store.create_run(
+                bead_id="central-test.1",
+                repository="owner/project",
+                base_branch="main",
+                base_sha=base_sha,
+                start_request={"repository_root": str(checkout)},
+                run_id="run-1",
+            )["run_id"]
+            store.write_evidence_text(run_id, "gates/validation-b/result.json", "{}\n")
+            store.seal_evidence(run_id, "gates/validation-b")
+            store.append_event(
+                run_id,
+                "candidate.ready",
+                state="candidate_ready",
+                data={
+                    "checkpoint": "candidate_ready",
+                    "candidate_sha": candidate_sha,
+                    "worktree_path": str(checkout),
+                    "pr_number": 7,
+                    "validation": {
+                        "status": "passed",
+                        "candidate_sha": candidate_sha,
+                        "evidence": "gates/validation-b",
+                    },
+                },
+            )
+            calls = []
+            full_bead = {
+                "id": "central-test.1",
+                "title": "Test",
+                "description": "Test the gate.",
+                "acceptance_criteria": "Both axes pass.",
+            }
+
+            def seal_bundle_before_crash(cycle, bead):
+                bundle = f"gates/gate-cycle-{cycle}-{candidate_sha[:12]}/review-bundle"
+                original_seal = store.seal_evidence
+
+                def seal_then_crash(observed_run_id, relative_directory):
+                    manifest = original_seal(observed_run_id, relative_directory)
+                    if relative_directory == bundle:
+                        raise RuntimeError("crash after review bundle seal")
+                    return manifest
+
+                with (
+                    mock.patch.object(
+                        store, "seal_evidence", side_effect=seal_then_crash
+                    ),
+                    mock.patch("afk.candidate_gate._execute_reviewer") as reviewer,
+                    self.assertRaisesRegex(RuntimeError, "review bundle seal"),
+                ):
+                    run_candidate_reviews(
+                        store,
+                        run_id,
+                        cycle=cycle,
+                        bead=bead,
+                    )
+                reviewer.assert_not_called()
+
+            seal_bundle_before_crash(1, full_bead)
+
+            def reviewer(axis, bundle_path, attempt_path, worktree):
+                calls.append((axis, bundle_path, attempt_path))
+                self.assertTrue((bundle_path / "manifest.json").is_file())
+                return (
+                    0,
+                    {
+                        "schema_version": 1,
+                        "candidate_sha": candidate_sha,
+                        "axis": axis,
+                        "status": "passed",
+                        "summary": f"{axis} passed",
+                        "findings": [],
+                    },
+                    "",
+                    "",
+                )
+
+            with (
+                mock.patch(
+                    "afk.candidate_gate._execute_reviewer", side_effect=reviewer
+                ),
+                mock.patch("afk.candidate_gate.reconcile_gate_comment"),
+            ):
+                outcome = complete_gate_cycle(
+                    store,
+                    run_id,
+                    bead=full_bead,
+                )
+            reviews = outcome["reviews"]
+
+            self.assertEqual(
+                [review["axis"] for review in reviews], ["standards", "spec"]
+            )
+            self.assertEqual(calls[0][1], calls[1][1])
+            self.assertNotEqual(calls[0][2], calls[1][2])
+            self.assertTrue((calls[0][2] / "manifest.json").is_file())
+            self.assertTrue((calls[1][2] / "manifest.json").is_file())
+            self.assertEqual(outcome["next_action"], "complete")
+
+            seal_bundle_before_crash(2, {"id": "central-test.1"})
+            completed_standards = {
+                "schema_version": 1,
+                "candidate_sha": candidate_sha,
+                "axis": "standards",
+                "process_status": "succeeded",
+                "status": "passed",
+                "summary": "standards passed before crash",
+                "findings": [],
+            }
+            store.write_evidence_text(
+                run_id,
+                "attempts/review-cycle-2-standards/report.json",
+                json.dumps(completed_standards),
+            )
+            store.seal_evidence(run_id, "attempts/review-cycle-2-standards")
+            resumed_calls = []
+
+            def resumed_reviewer(axis, bundle_path, attempt_path, worktree):
+                resumed_calls.append(axis)
+                return (
+                    0,
+                    {
+                        "schema_version": 1,
+                        "candidate_sha": candidate_sha,
+                        "axis": axis,
+                        "status": "passed",
+                        "summary": "spec passed",
+                        "findings": [],
+                    },
+                    "",
+                    "",
+                )
+
+            with mock.patch(
+                "afk.candidate_gate._execute_reviewer",
+                side_effect=resumed_reviewer,
+            ):
+                resumed_reviews = run_candidate_reviews(
+                    store,
+                    run_id,
+                    cycle=2,
+                    bead={"id": "central-test.1"},
+                )
+
+            self.assertEqual(resumed_calls, ["spec"])
+            self.assertEqual(resumed_reviews[0], completed_standards)
+            self.assertEqual(resumed_reviews[1]["axis"], "spec")
+
+            store.append_event(
+                run_id,
+                "repair.started",
+                data={"checkpoint": "candidate_ready", "repair_attempts_used": 1},
+            )
+            gate = f"gates/gate-cycle-2-{candidate_sha[:12]}"
+            original_seal = store.seal_evidence
+
+            def crash_before_gate_seal(observed_run_id, relative_directory):
+                if relative_directory == gate:
+                    raise RuntimeError("crash before Gate seal")
+                return original_seal(observed_run_id, relative_directory)
+
+            with (
+                mock.patch.object(
+                    store, "seal_evidence", side_effect=crash_before_gate_seal
+                ),
+                mock.patch("afk.candidate_gate.reconcile_gate_comment"),
+                self.assertRaisesRegex(RuntimeError, "crash before Gate seal"),
+            ):
+                complete_gate_cycle(store, run_id, bead={"id": "central-test.1"})
+
+            with (
+                mock.patch("afk.candidate_gate._execute_reviewer") as rerun,
+                mock.patch(
+                    "afk.candidate_gate.reconcile_gate_comment",
+                    side_effect=RuntimeError("crash after Gate seal"),
+                ),
+                self.assertRaisesRegex(RuntimeError, "crash after Gate seal"),
+            ):
+                complete_gate_cycle(store, run_id, bead={"id": "central-test.1"})
+
+            rerun.assert_not_called()
+            with (
+                mock.patch("afk.candidate_gate._execute_reviewer") as sealed_rerun,
+                mock.patch("afk.candidate_gate.reconcile_gate_comment"),
+            ):
+                resumed_outcome = complete_gate_cycle(
+                    store, run_id, bead={"id": "central-test.1"}
+                )
+            sealed_rerun.assert_not_called()
+            self.assertEqual(resumed_outcome["next_action"], "complete")
+            self.assertTrue(
+                (root / "state" / "runs" / run_id / gate / "manifest.json").is_file()
+            )
+
+            store.append_event(
+                run_id,
+                "repair.started",
+                data={"checkpoint": "candidate_ready", "repair_attempts_used": 2},
+            )
+            seal_bundle_before_crash(3, {"id": "central-test.1"})
+            store.write_evidence_text(
+                run_id, "attempts/review-cycle-3-standards/prompt.md", "started\n"
+            )
+            with (
+                mock.patch("afk.candidate_gate._execute_reviewer") as ambiguous_rerun,
+                self.assertRaisesRegex(GateError, "incomplete") as raised,
+            ):
+                complete_gate_cycle(store, run_id, bead={"id": "central-test.1"})
+            ambiguous_rerun.assert_not_called()
+            self.assertEqual(raised.exception.kind, "inconclusive")
+
+            store.append_event(
+                run_id,
+                "repair.started",
+                data={"checkpoint": "candidate_ready", "repair_attempts_used": 3},
+            )
+            seal_bundle_before_crash(4, {"id": "central-test.1"})
+            tampered_attempt = (
+                root / "state" / "runs" / run_id / "attempts/review-cycle-4-standards"
+            )
+            store.write_evidence_text(
+                run_id,
+                "attempts/review-cycle-4-standards/report.json",
+                (
+                    '{"axis":"standards","findings":[],"process_status":'
+                    '"succeeded","status":"passed","summary":"passed"}'
+                ),
+            )
+            store.seal_evidence(run_id, "attempts/review-cycle-4-standards")
+            report = tampered_attempt / "report.json"
+            report.chmod(0o600)
+            report.write_text("{}", encoding="utf-8")
+            report.chmod(0o400)
+            with (
+                mock.patch("afk.candidate_gate._execute_reviewer") as tampered_rerun,
+                self.assertRaises(EvidenceTampered),
+            ):
+                complete_gate_cycle(store, run_id, bead={"id": "central-test.1"})
+            tampered_rerun.assert_not_called()
+
+            store.append_event(
+                run_id,
+                "repair.started",
+                data={"checkpoint": "candidate_ready", "repair_attempts_used": 4},
+            )
+            ambiguous_gate = f"gates/gate-cycle-5-{candidate_sha[:12]}"
+            store.write_evidence_text(
+                run_id, f"{ambiguous_gate}/unexpected.txt", "partial\n"
+            )
+            with (
+                mock.patch("afk.candidate_gate._execute_reviewer") as unsafe_retry,
+                self.assertRaisesRegex(GateError, "ambiguous"),
+            ):
+                complete_gate_cycle(store, run_id, bead={"id": "central-test.1"})
+            unsafe_retry.assert_not_called()
+
+            invalid_bundle = f"gates/gate-cycle-6-{candidate_sha[:12]}/review-bundle"
+            store.write_evidence_text(run_id, f"{invalid_bundle}/bundle.json", "{}\n")
+            store.seal_evidence(run_id, invalid_bundle)
+            with (
+                mock.patch("afk.candidate_gate._execute_reviewer") as unsafe_review,
+                self.assertRaisesRegex(GateError, "bundle"),
+            ):
+                run_candidate_reviews(
+                    store,
+                    run_id,
+                    cycle=6,
+                    bead={"id": "central-test.1"},
+                )
+            unsafe_review.assert_not_called()
+
+            exact_bead = {"id": "central-test.1"}
+            seal_bundle_before_crash(7, exact_bead)
+            valid_bundle_path = (
+                root
+                / "state"
+                / "runs"
+                / run_id
+                / f"gates/gate-cycle-7-{candidate_sha[:12]}/review-bundle/bundle.json"
+            )
+            valid_bundle = json.loads(valid_bundle_path.read_text(encoding="utf-8"))
+            contradictions = {
+                "extra field": lambda value: value.update(extra=True),
+                "run": lambda value: value.update(run_id="other-run"),
+                "repository": lambda value: value.update(repository="other/project"),
+                "base": lambda value: value.update(base_sha="f" * 40),
+                "candidate crossing": lambda value: value.update(
+                    candidate_sha="e" * 40
+                ),
+                "bead": lambda value: value.update(bead={"id": "central-other.1"}),
+                "validation": lambda value: value.update(validation={}),
+                "validation manifest": lambda value: value.update(
+                    validation_manifest={}
+                ),
+                "diff": lambda value: value.update(diff="different diff"),
+                "instructions": lambda value: value.update(
+                    repository_instructions=[
+                        {"path": "AGENTS.md", "content": "different"}
+                    ]
+                ),
+                "prior cycles": lambda value: value.update(prior_gate_cycles=[]),
+                "prior dispositions": lambda value: value.update(
+                    prior_dispositions=[
+                        {"finding_id": "other", "disposition": "addressed"}
+                    ]
+                ),
+            }
+            for cycle, (label, contradict) in enumerate(
+                contradictions.items(), start=8
+            ):
+                with self.subTest(label=label):
+                    contradicted = json.loads(json.dumps(valid_bundle))
+                    contradict(contradicted)
+                    contradicted_bundle = (
+                        f"gates/gate-cycle-{cycle}-{candidate_sha[:12]}"
+                        "/review-bundle"
+                    )
+                    store.write_evidence_text(
+                        run_id,
+                        f"{contradicted_bundle}/bundle.json",
+                        json.dumps(contradicted),
+                    )
+                    store.seal_evidence(run_id, contradicted_bundle)
+                    with (
+                        mock.patch(
+                            "afk.candidate_gate._execute_reviewer"
+                        ) as contradicted_review,
+                        self.assertRaisesRegex(GateError, "bundle"),
+                    ):
+                        run_candidate_reviews(
+                            store,
+                            run_id,
+                            cycle=cycle,
+                            bead=exact_bead,
+                        )
+                    contradicted_review.assert_not_called()
+
+    def test_review_process_success_is_distinct_from_rejected_verdict(self):
+        result = normalize_review_result(
+            "standards",
+            {
+                "schema_version": 1,
+                "candidate_sha": "a" * 40,
+                "axis": "standards",
+                "status": "rejected",
+                "summary": "One blocking issue.",
+                "findings": [
+                    {
+                        "id": "1",
+                        "priority": "high",
+                        "title": "Unsafe fallback",
+                        "body": "Remove the fallback.",
+                        "path": "src/app.py",
+                        "line": 12,
+                        "blocking": True,
+                    }
+                ],
+            },
+            candidate_sha="a" * 40,
+            process_exit_code=0,
+        )
+
+        self.assertEqual(result["process_status"], "succeeded")
+        self.assertEqual(result["status"], "rejected")
+        self.assertEqual(result["findings"][0]["id"], "standards-1")
+
+    def test_failed_review_process_or_protocol_does_not_prevent_the_other_axis(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout = root / "checkout"
+            checkout.mkdir()
+            subprocess.run(
+                ["git", "init", "-b", "main"],
+                cwd=checkout,
+                check=True,
+                capture_output=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.email", "afk@example.test"],
+                cwd=checkout,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.name", "AFK Test"],
+                cwd=checkout,
+                check=True,
+            )
+            (checkout / "app.txt").write_text("base\n", encoding="utf-8")
+            subprocess.run(["git", "add", "app.txt"], cwd=checkout, check=True)
+            subprocess.run(
+                ["git", "commit", "-m", "base"],
+                cwd=checkout,
+                check=True,
+                capture_output=True,
+            )
+            base_sha = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=checkout,
+                text=True,
+                capture_output=True,
+                check=True,
+            ).stdout.strip()
+            (checkout / "app.txt").write_text("candidate\n", encoding="utf-8")
+            subprocess.run(
+                ["git", "commit", "-am", "candidate"],
+                cwd=checkout,
+                check=True,
+                capture_output=True,
+            )
+            candidate_sha = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=checkout,
+                text=True,
+                capture_output=True,
+                check=True,
+            ).stdout.strip()
+            store = RunStore(root / "state")
+            run_id = store.create_run(
+                bead_id="central-test.1",
+                repository="owner/project",
+                base_branch="main",
+                base_sha=base_sha,
+                start_request={"repository_root": str(checkout)},
+                run_id="run-1",
+            )["run_id"]
+            store.write_evidence_text(run_id, "gates/validation-b/result.json", "{}\n")
+            store.seal_evidence(run_id, "gates/validation-b")
+            store.append_event(
+                run_id,
+                "candidate.ready",
+                state="candidate_ready",
+                data={
+                    "checkpoint": "candidate_ready",
+                    "candidate_sha": candidate_sha,
+                    "worktree_path": str(checkout),
+                    "pr_number": 7,
+                    "validation": {
+                        "status": "passed",
+                        "candidate_sha": candidate_sha,
+                        "evidence": "gates/validation-b",
+                    },
+                },
+            )
+
+            def reviewer(axis, bundle_path, attempt_path, worktree):
+                if axis == "standards":
+                    raise GateError("standards reviewer timed out", kind="inconclusive")
+                return (
+                    0,
+                    {
+                        "schema_version": 1,
+                        "candidate_sha": candidate_sha,
+                        "axis": axis,
+                        "status": "passed",
+                        "summary": "spec passed",
+                        "findings": [],
+                    },
+                    "spec events\n",
+                    "",
+                )
+
+            with mock.patch(
+                "afk.candidate_gate._execute_reviewer", side_effect=reviewer
+            ):
+                reviews = run_candidate_reviews(
+                    store,
+                    run_id,
+                    cycle=1,
+                    bead={"id": "central-test.1"},
+                )
+
+            self.assertEqual(
+                reviews,
+                [
+                    {
+                        "schema_version": 1,
+                        "candidate_sha": candidate_sha,
+                        "axis": "standards",
+                        "process_status": "failed",
+                        "status": "inconclusive",
+                        "summary": "standards reviewer timed out",
+                        "findings": [],
+                    },
+                    {
+                        "schema_version": 1,
+                        "candidate_sha": candidate_sha,
+                        "axis": "spec",
+                        "process_status": "succeeded",
+                        "status": "passed",
+                        "summary": "spec passed",
+                        "findings": [],
+                    },
+                ],
+            )
+            standards = (
+                root / "state" / "runs" / run_id / "attempts/review-cycle-1-standards"
+            )
+            self.assertTrue((standards / "manifest.json").is_file())
+            self.assertTrue((standards / "outcome.json").is_file())
+
+            valid_standards = {
+                "schema_version": 1,
+                "candidate_sha": candidate_sha,
+                "axis": "standards",
+                "status": "passed",
+                "summary": "standards passed",
+                "findings": [],
+            }
+            invalid_payloads = (
+                {"summary": "missing identity"},
+                {**valid_standards, "schema_version": 2},
+                {**valid_standards, "candidate_sha": "f" * 40},
+                {**valid_standards, "axis": "spec"},
+            )
+            for cycle, invalid_payload in enumerate(invalid_payloads, start=2):
+                with self.subTest(cycle=cycle):
+
+                    def malformed_reviewer(axis, bundle_path, attempt_path, worktree):
+                        payload = (
+                            invalid_payload
+                            if axis == "standards"
+                            else {
+                                "schema_version": 1,
+                                "candidate_sha": candidate_sha,
+                                "axis": axis,
+                                "status": "passed",
+                                "summary": "spec passed",
+                                "findings": [],
+                            }
+                        )
+                        return 0, payload, f"{axis} events\n", ""
+
+                    with mock.patch(
+                        "afk.candidate_gate._execute_reviewer",
+                        side_effect=malformed_reviewer,
+                    ):
+                        protocol_reviews = run_candidate_reviews(
+                            store,
+                            run_id,
+                            cycle=cycle,
+                            bead={"id": "central-test.1"},
+                        )
+
+                    self.assertEqual(
+                        [review["axis"] for review in protocol_reviews],
+                        ["standards", "spec"],
+                    )
+                    self.assertEqual(protocol_reviews[0]["process_status"], "succeeded")
+                    self.assertEqual(protocol_reviews[0]["status"], "inconclusive")
+                    self.assertEqual(protocol_reviews[1]["status"], "passed")
+                    protocol_attempt = (
+                        root
+                        / "state"
+                        / "runs"
+                        / run_id
+                        / f"attempts/review-cycle-{cycle}-standards"
+                    )
+                    self.assertTrue((protocol_attempt / "manifest.json").is_file())
+                    self.assertTrue((protocol_attempt / "raw-report.txt").is_file())
+
+            store.append_event(
+                run_id,
+                "repair.started",
+                data={"checkpoint": "candidate_ready", "repair_attempts_used": 2},
+            )
+            with (
+                mock.patch(
+                    "afk.candidate_gate.run_candidate_reviews",
+                    return_value=protocol_reviews,
+                ),
+                mock.patch("afk.candidate_gate.reconcile_gate_comment"),
+            ):
+                outcome = complete_gate_cycle(
+                    store, run_id, bead={"id": "central-test.1"}
+                )
+
+            self.assertEqual(outcome["next_action"], "attention")
+
+    def test_review_rejects_malformed_or_contradictory_output(self):
+        candidate_sha = "a" * 40
+        valid = {
+            "schema_version": 1,
+            "candidate_sha": candidate_sha,
+            "axis": "spec",
+            "status": "passed",
+            "summary": "looks good",
+            "findings": [],
+        }
+        for label, payload in (
+            ("missing identity", {"status": "passed", "summary": "ok", "findings": []}),
+            ("boolean version", {**valid, "schema_version": True}),
+            ("wrong version", {**valid, "schema_version": 2}),
+            ("wrong Candidate", {**valid, "candidate_sha": "b" * 40}),
+            ("wrong axis", {**valid, "axis": "standards"}),
+        ):
+            with self.subTest(label=label), self.assertRaises(GateError):
+                normalize_review_result(
+                    "spec",
+                    payload,
+                    candidate_sha=candidate_sha,
+                    process_exit_code=0,
+                )
+
+        with self.assertRaisesRegex(GateError, "findings"):
+            normalize_review_result(
+                "spec",
+                {**valid, "findings": [{}]},
+                candidate_sha=candidate_sha,
+                process_exit_code=0,
+            )
+
+        with self.assertRaisesRegex(GateError, "exited"):
+            normalize_review_result(
+                "spec",
+                {**valid, "status": "rejected", "summary": "bad"},
+                candidate_sha=candidate_sha,
+                process_exit_code=1,
+            )
+
+    def test_repair_brief_combines_blocking_validation_and_review_findings(self):
+        brief = build_repair_brief(
+            candidate_sha="a" * 40,
+            cycle=2,
+            validation={
+                "status": "rejected",
+                "summary": "tests failed",
+                "checks": [
+                    {"name": "unit", "status": "passed", "log_path": "unit.log"},
+                    {"name": "smoke", "status": "rejected", "log_path": "smoke.log"},
+                ],
+                "diagnostics": [
+                    {
+                        "path": "afk/stderr.log",
+                        "content": "Docker smoke failed: fetch failed",
+                    },
+                    {
+                        "path": "contract/smoke.log",
+                        "content": "health endpoint unavailable",
+                    },
+                ],
+            },
+            reviews=[
+                {
+                    "axis": "standards",
+                    "status": "rejected",
+                    "findings": [
+                        {
+                            "id": "standards-1",
+                            "priority": "high",
+                            "title": "Missing test",
+                            "body": "Cover the failure path.",
+                            "path": "tests/test_app.py",
+                            "line": 10,
+                            "blocking": True,
+                        }
+                    ],
+                },
+                {
+                    "axis": "spec",
+                    "status": "passed",
+                    "findings": [],
+                },
+            ],
+        )
+
+        self.assertEqual(brief["candidate_sha"], "a" * 40)
+        self.assertEqual(brief["repair_attempt"], 2)
+        self.assertEqual(
+            [finding["id"] for finding in brief["blocking_findings"]],
+            ["validation-smoke", "standards-1"],
+        )
+        self.assertNotIn("unit", str(brief["blocking_findings"]))
+        self.assertIn("fetch failed", brief["blocking_findings"][0]["body"])
+        self.assertIn("health endpoint", brief["blocking_findings"][0]["body"])
+
+
+if __name__ == "__main__":
+    unittest.main()

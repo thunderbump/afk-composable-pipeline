@@ -439,6 +439,18 @@ def approve_bootstrap_contract(
     timeout_seconds: int,
 ) -> dict[str, Any]:
     if (
+        isinstance(identity, dict)
+        and set(identity) == {"source", "base_sha", "adapter_id", "approval"}
+        and identity.get("source") == "approved_bootstrap"
+        and identity.get("adapter_id") == BOOTSTRAP_ADAPTER
+    ):
+        _bootstrap_approval(identity)
+        identity = {
+            "source": identity["source"],
+            "base_sha": identity["base_sha"],
+            "adapter_id": identity["adapter_id"],
+        }
+    if (
         not isinstance(identity, dict)
         or set(identity) != {"source", "base_sha", "adapter_id"}
         or identity.get("source") != "approved_bootstrap"
@@ -731,17 +743,46 @@ def _run_contract(
     environment: dict[str, str],
     timeout_seconds: int,
 ) -> subprocess.CompletedProcess[str]:
+    return run_supervised_command(
+        command,
+        cwd=cwd,
+        environment=environment,
+        timeout_seconds=timeout_seconds,
+        label="validation",
+    )
+
+
+def run_supervised_command(
+    command: list[str],
+    *,
+    cwd: Path,
+    environment: dict[str, str],
+    timeout_seconds: float,
+    input_text: str | None = None,
+    label: str,
+) -> subprocess.CompletedProcess[str]:
+    subject = label.strip() or "command"
+    deadline = time.monotonic() + timeout_seconds
     with _LinuxDescendantSupervisor() as descendants:
         process = subprocess.Popen(
             command,
             cwd=cwd,
             env=environment,
+            stdin=subprocess.PIPE if input_text is not None else None,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             start_new_session=True,
         )
-        descendants.track(process.pid)
+        try:
+            descendants.track(process.pid)
+        except CandidateValidationError:
+            descendants.terminate_untracked(process)
+            raise
         assert process.stdout is not None and process.stderr is not None
+        input_bytes = memoryview(input_text.encode("utf-8")) if input_text else None
+        input_offset = 0
+        if process.stdin is not None:
+            os.set_blocking(process.stdin.fileno(), False)
         captured = {"stdout": bytearray(), "stderr": bytearray()}
         overflow = threading.Event()
         readers = [
@@ -757,26 +798,30 @@ def _run_contract(
         ]
         for reader in readers:
             reader.start()
-        deadline = time.monotonic() + timeout_seconds
         while process.poll() is None and not overflow.is_set():
             descendants.discover(process.pid)
             if time.monotonic() >= deadline:
+                _close_process_input(process)
                 descendants.terminate(process.pid)
+                process.poll()
                 _join_readers(readers)
                 stdout, stderr = _diagnostic_output(captured)
                 raise CandidateValidationError(
                     "interrupted",
-                    "validation timed out and its process tree was terminated",
+                    f"{subject} timed out and its process tree was terminated",
                     stdout=stdout,
                     stderr=stderr,
                 )
+            if process.stdin is not None:
+                input_offset = _feed_process_input(process, input_bytes, input_offset)
             overflow.wait(0.01)
+        _close_process_input(process)
         descendants.terminate(process.pid)
         _join_readers(readers)
         if overflow.is_set():
             raise CandidateValidationError(
                 "invalid",
-                "validation output exceeds the size limit",
+                f"{subject} output exceeds the size limit",
                 stdout="",
                 stderr="",
             )
@@ -789,7 +834,7 @@ def _run_contract(
             stdout, stderr = _diagnostic_output(captured)
             raise CandidateValidationError(
                 "interrupted",
-                f"validation exited after signal {signal_name}",
+                f"{subject} exited after signal {signal_name}",
                 stdout=stdout,
                 stderr=stderr,
             )
@@ -800,13 +845,44 @@ def _run_contract(
             diagnostic_stdout, diagnostic_stderr = _diagnostic_output(captured)
             raise CandidateValidationError(
                 "invalid",
-                "validation output must be UTF-8 text",
+                f"{subject} output must be UTF-8 text",
                 stdout=diagnostic_stdout,
                 stderr=diagnostic_stderr,
             ) from exc
         return subprocess.CompletedProcess(
             command, process.returncode, redact_text(stdout), redact_text(stderr)
         )
+
+
+def _feed_process_input(
+    process: subprocess.Popen[bytes],
+    input_bytes: memoryview | None,
+    input_offset: int,
+) -> int:
+    assert process.stdin is not None
+    if input_bytes is None or input_offset == len(input_bytes):
+        process.stdin.close()
+        process.stdin = None
+        return input_offset
+    try:
+        written = os.write(process.stdin.fileno(), input_bytes[input_offset:])
+    except BlockingIOError:
+        return input_offset
+    except BrokenPipeError:
+        process.stdin.close()
+        process.stdin = None
+        return input_offset
+    input_offset += written
+    if input_offset == len(input_bytes):
+        process.stdin.close()
+        process.stdin = None
+    return input_offset
+
+
+def _close_process_input(process: subprocess.Popen[bytes]) -> None:
+    if process.stdin is not None:
+        process.stdin.close()
+        process.stdin = None
 
 
 def _capture_output(
@@ -905,6 +981,58 @@ class _LinuxDescendantSupervisor:
         raise CandidateValidationError(
             "interrupted", "validation process tree could not be terminated"
         )
+
+    def terminate_untracked(self, process: subprocess.Popen[bytes]) -> None:
+        failure: OSError | None = None
+        deadline = time.monotonic() + PROCESS_CLEANUP_SECONDS
+        try:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except OSError as exc:
+                failure = exc
+            while time.monotonic() < deadline:
+                process.poll()
+                children = [
+                    pid
+                    for pid in _proc_children(os.getpid())
+                    if pid not in self._baseline
+                ]
+                for pid in children:
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    except OSError as exc:
+                        failure = failure or exc
+                for pid in children:
+                    if pid == process.pid:
+                        continue
+                    try:
+                        os.waitpid(pid, os.WNOHANG)
+                    except ChildProcessError:
+                        pass
+                    except OSError as exc:
+                        failure = failure or exc
+                process.poll()
+                remaining = [
+                    pid
+                    for pid in _proc_children(os.getpid())
+                    if pid not in self._baseline
+                ]
+                if process.returncode is not None and not remaining:
+                    if failure is None:
+                        return
+                    break
+                time.sleep(0.01)
+        finally:
+            for stream in (process.stdin, process.stdout, process.stderr):
+                if stream is not None:
+                    stream.close()
+        raise CandidateValidationError(
+            "interrupted", "untracked process tree could not be terminated"
+        ) from failure
 
     def _wait_for_exit(self, root_pid: int, requested_signal: signal.Signals) -> bool:
         deadline = time.monotonic() + PROCESS_CLEANUP_SECONDS

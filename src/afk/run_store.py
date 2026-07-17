@@ -311,6 +311,21 @@ class RunStore:
             _write_new_bytes(path, encoded)
             return path
 
+    def write_evidence_value(self, run_id: str, relative_path: str, value: Any) -> Any:
+        """Redact and persist one canonical structured evidence value."""
+        with self.lock():
+            path = self._evidence_path(run_id, relative_path)
+            run_dir = self._run_dir(run_id)
+            if path == _evidence_unit_root(path, run_dir) / "manifest.json":
+                raise EvidenceError("manifest.json is reserved")
+            if _sealed_ancestor(path, run_dir):
+                raise EvidenceError("completed evidence is read-only")
+            redacted = redact_artifact_value(value)
+            encoded = (canonical_json(redacted) + "\n").encode("utf-8")
+            _secure_directory(path.parent)
+            _write_new_bytes(path, encoded)
+            return redacted
+
     def ingest_evidence_file(
         self, run_id: str, relative_path: str, source_path: Path
     ) -> Path:
@@ -596,6 +611,13 @@ def _project(identity: dict[str, Any], events: list[dict[str, Any]]) -> dict[str
         "pr_head_sha",
         "validation",
         "validation_attempt",
+        "previous_candidate_sha",
+        "repair_attempts_used",
+        "repair_brief",
+        "repair_dispositions",
+        "gate_cycles",
+        "bead_spec",
+        "interrupted_repair",
     ):
         if key in details:
             projection[key] = details[key]

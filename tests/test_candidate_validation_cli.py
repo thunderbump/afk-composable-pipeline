@@ -177,8 +177,11 @@ class CandidateValidationCliTest(unittest.TestCase):
 
         resumed = self.run_afk("resume")
 
-        self.assertEqual(resumed.returncode, 0, resumed.stderr)
-        self.assertEqual(self.status(run_id)["last_sequence"], status["last_sequence"])
+        self.assertEqual(resumed.returncode, 2, resumed.stderr)
+        resumed_status = self.status(run_id)
+        self.assertGreater(resumed_status["last_sequence"], status["last_sequence"])
+        self.assertEqual(resumed_status["attention"]["scope"], "gate")
+        self.assertEqual(resumed_status["attention"]["kind"], "unavailable")
 
     def test_rejected_validation_accepts_mixed_check_outcomes(self):
         self.write_contract_worker(
@@ -457,8 +460,11 @@ class CandidateValidationCliTest(unittest.TestCase):
 
         resumed = self.run_afk("resume")
 
-        self.assertEqual(resumed.returncode, 0, resumed.stderr)
-        self.assertEqual(self.status(run_id)["last_sequence"], sequence)
+        self.assertEqual(resumed.returncode, 2, resumed.stderr)
+        resumed_status = self.status(run_id)
+        self.assertGreater(resumed_status["last_sequence"], sequence)
+        self.assertEqual(resumed_status["attention"]["scope"], "gate")
+        self.assertEqual(resumed_status["attention"]["kind"], "unavailable")
         self.assertFalse(marker.exists())
 
     def test_boolean_contract_schema_version_is_invalid(self):
@@ -989,6 +995,55 @@ class CandidateValidationCliTest(unittest.TestCase):
         status = self.status(run_id)
         self.assertEqual(status["attention"]["kind"], "invalid")
         self.assertIn("another Candidate", status["attention"]["summary"])
+
+    def test_operator_can_reapprove_bootstrap_after_a_repair(self):
+        self.git("commit", "--allow-empty", "-m", "base without validation harness")
+        base_sha = self.git("rev-parse", "HEAD")
+        scripts = self.repository / "scripts"
+        scripts.mkdir()
+        harness = scripts / "validate.sh"
+        harness.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        harness.chmod(0o755)
+        self.git("add", ".")
+        self.git("commit", "-m", "first Candidate")
+        first_candidate = self.git("rev-parse", "HEAD")
+        run_id = self.create_ready_run(
+            candidate_sha=first_candidate,
+            base_sha=base_sha,
+            validation_contract={
+                "source": "approved_bootstrap",
+                "base_sha": base_sha,
+                "adapter_id": "afk.builtin.bootstrap-validation/v1",
+            },
+        )
+        first_approval = self.run_bootstrap_approval(
+            "scripts/validate.sh", "--timeout-seconds", "5"
+        )
+        self.assertEqual(first_approval.returncode, 0, first_approval.stderr)
+        self.git("commit", "--allow-empty", "-m", "repaired Candidate")
+        repaired_candidate = self.git("rev-parse", "HEAD")
+        store = RunStore(self.state_home / "afk")
+        store.append_event(
+            run_id,
+            "candidate.repaired",
+            state="candidate_ready",
+            data={
+                "checkpoint": "candidate_ready",
+                "candidate_sha": repaired_candidate,
+                "pr_head_sha": repaired_candidate,
+            },
+        )
+
+        reapproved = self.run_bootstrap_approval(
+            "scripts/validate.sh", "--timeout-seconds", "5"
+        )
+
+        self.assertEqual(reapproved.returncode, 0, reapproved.stderr)
+        contract = self.status(run_id)["validation_contract"]
+        self.assertEqual(contract["approval"]["candidate_sha"], repaired_candidate)
+        completed = self.run_afk("resume")
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(self.status(run_id)["checkpoint"], "validated")
 
     def test_bootstrap_approval_rejects_a_nonexecutable_harness(self):
         self.git("commit", "--allow-empty", "-m", "base without validation harness")

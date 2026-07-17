@@ -10,13 +10,28 @@ SECRET_KEY_PATTERN = re.compile(
     r"(^|[._-])(auth|credentials?|password|secret|token|api[._-]?key|env)($|[._-])",
     re.IGNORECASE,
 )
-SECRET_KEY_COMPONENTS = {"auth", "credential", "credentials", "password", "secret", "token", "env"}
+SECRET_KEY_COMPONENTS = {
+    "auth",
+    "credential",
+    "credentials",
+    "password",
+    "secret",
+    "token",
+    "env",
+}
 KEY_COMPONENT_PATTERN = re.compile(r"[A-Z]+(?=[A-Z][a-z]|[0-9]|$)|[A-Z]?[a-z]+|[0-9]+")
-SECRET_FLAG_COMPONENTS = {"auth", "credential", "credentials", "password", "secret", "token"}
+SECRET_FLAG_COMPONENTS = {
+    "auth",
+    "credential",
+    "credentials",
+    "password",
+    "secret",
+    "token",
+}
 SECRET_ASSIGNMENT_PATTERN = re.compile(
     r"(?P<key>[A-Za-z_][A-Za-z0-9_.-]*)"
     r"(?P<separator>\s*[:=]\s*)"
-    r"(?P<value>[^\s,;]+)",
+    r"(?P<value>\[REDACTED\]|[^\s,;]+)",
 )
 JSON_SECRET_STRING_PATTERN = re.compile(
     r"(?P<prefix>(?P<key_quote>[\"'])(?P<key>[A-Za-z_][A-Za-z0-9_.-]*)"
@@ -58,24 +73,33 @@ def redact_artifact_value_for_key(
         return "[REDACTED]"
     if isinstance(value, dict):
         return {
-            item_key: redact_artifact_value_for_key(str(item_key), item, exact_secrets=exact_secrets)
+            item_key: redact_artifact_value_for_key(
+                str(item_key), item, exact_secrets=exact_secrets
+            )
             for item_key, item in value.items()
         }
     if isinstance(value, list):
         if key == "command":
             return redact_command_list(value, exact_secrets=exact_secrets)
-        return [redact_artifact_value_for_key(key, item, exact_secrets=exact_secrets) for item in value]
+        return [
+            redact_artifact_value_for_key(key, item, exact_secrets=exact_secrets)
+            for item in value
+        ]
     if isinstance(value, str):
         return redact_text(value, exact_secrets=exact_secrets)
     return value
 
 
-def redact_command_list(value: list[Any], *, exact_secrets: set[str] | None = None) -> list[Any]:
+def redact_command_list(
+    value: list[Any], *, exact_secrets: set[str] | None = None
+) -> list[Any]:
     redacted: list[Any] = []
     redact_next = False
     for item in value:
         if not isinstance(item, str):
-            redacted.append(redact_artifact_value_for_key(None, item, exact_secrets=exact_secrets))
+            redacted.append(
+                redact_artifact_value_for_key(None, item, exact_secrets=exact_secrets)
+            )
             redact_next = False
             continue
         if redact_next:
@@ -104,7 +128,10 @@ def is_secret_command_flag(value: str) -> bool:
         return True
     if "apikey" in components:
         return True
-    return any(left == "api" and right == "key" for left, right in zip(components, components[1:]))
+    return any(
+        left == "api" and right == "key"
+        for left, right in zip(components, components[1:])
+    )
 
 
 def is_secret_key(value: str) -> bool:
@@ -115,23 +142,37 @@ def is_secret_key(value: str) -> bool:
         return True
     if "apikey" in components:
         return True
-    return any(left == "api" and right == "key" for left, right in zip(components, components[1:]))
+    return any(
+        left == "api" and right == "key"
+        for left, right in zip(components, components[1:])
+    )
 
 
 def is_secret_value(value: str) -> bool:
     if SECRET_TOKEN_VALUE_PATTERN.search(value):
         return True
-    if any(is_secret_key(match.group("key")) for match in JSON_SECRET_STRING_PATTERN.finditer(value)):
+    if any(
+        is_secret_key(match.group("key"))
+        for match in JSON_SECRET_STRING_PATTERN.finditer(value)
+    ):
         return True
-    if any(is_secret_key(match.group("key")) for match in SECRET_ASSIGNMENT_PATTERN.finditer(value)):
+    if any(
+        is_secret_key(match.group("key"))
+        for match in SECRET_ASSIGNMENT_PATTERN.finditer(value)
+    ):
         return True
-    return any(url_has_secret_value(match.group("url")) for match in URL_PATTERN.finditer(value))
+    return any(
+        url_has_secret_value(match.group("url"))
+        for match in URL_PATTERN.finditer(value)
+    )
 
 
 def key_components(value: str) -> list[str]:
     components = []
     for chunk in re.split(r"[._-]+", value):
-        components.extend(match.group(0).lower() for match in KEY_COMPONENT_PATTERN.finditer(chunk))
+        components.extend(
+            match.group(0).lower() for match in KEY_COMPONENT_PATTERN.finditer(chunk)
+        )
     return components
 
 
@@ -144,7 +185,9 @@ def redact_text(value: str, *, exact_secrets: set[str] | None = None) -> str:
     return redact_exact_secret_values(redacted, exact_secrets=exact_secrets)
 
 
-def redact_exact_secret_values(value: str, *, exact_secrets: set[str] | None = None) -> str:
+def redact_exact_secret_values(
+    value: str, *, exact_secrets: set[str] | None = None
+) -> str:
     if not exact_secrets:
         return value
     redacted = value
@@ -168,7 +211,10 @@ def normalize_exact_secrets(values: set[str] | None) -> set[str]:
 
 
 def bearer_secret_present(value: str) -> bool:
-    return any(is_bearer_secret_value(match.group("value")) for match in BEARER_SECRET_PATTERN.finditer(value))
+    return any(
+        is_bearer_secret_value(match.group("value"))
+        for match in BEARER_SECRET_PATTERN.finditer(value)
+    )
 
 
 def is_bearer_secret_value(value: str) -> bool:
@@ -180,16 +226,27 @@ def is_bearer_secret_value(value: str) -> bool:
         return False
     if unpadded.isalpha() and unpadded.islower() and unpadded in SAFE_BEARER_WORDS:
         return False
-    return any(char.isdigit() for char in unpadded) or any(char.isupper() for char in unpadded) or any(
-        char in "./+~_-" for char in unpadded
-    ) or unpadded.isalpha()
+    return (
+        any(char.isdigit() for char in unpadded)
+        or any(char.isupper() for char in unpadded)
+        or any(char in "./+~_-" for char in unpadded)
+        or unpadded.isalpha()
+    )
 
 
 def normalize_bearer_secret_value(value: str) -> str:
     normalized = value.strip()
-    if len(normalized) >= 4 and normalized[:2] == normalized[-2:] and normalized[:2] in {r"\"", r"\'"}:
+    if (
+        len(normalized) >= 4
+        and normalized[:2] == normalized[-2:]
+        and normalized[:2] in {r"\"", r"\'"}
+    ):
         return normalized[2:-2].strip()
-    if len(normalized) >= 2 and normalized[0] == normalized[-1] and normalized[0] in "\"'":
+    if (
+        len(normalized) >= 2
+        and normalized[0] == normalized[-1]
+        and normalized[0] in "\"'"
+    ):
         return normalized[1:-1].strip()
     return normalized
 
@@ -228,7 +285,9 @@ def url_has_secret_value(value: str) -> bool:
     if parsed.username or parsed.password:
         return True
     query_keys = [key for key, _ in parse_qsl(parsed.query, keep_blank_values=True)]
-    fragment_keys = [key for key, _ in parse_qsl(parsed.fragment, keep_blank_values=True)]
+    fragment_keys = [
+        key for key, _ in parse_qsl(parsed.fragment, keep_blank_values=True)
+    ]
     return any(is_secret_key(key) for key in [*query_keys, *fragment_keys])
 
 

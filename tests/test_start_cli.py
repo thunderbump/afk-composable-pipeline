@@ -87,6 +87,8 @@ class StartCliTest(unittest.TestCase):
                 "AFK_FAKE_BEAD": "central-bnkl.1.1",
                 "AFK_FAKE_BEAD_STATUS": "open",
                 "AFK_FAKE_ASSIGNEE": "",
+                "AFK_FAKE_BEAD_DESCRIPTION": "Implement one candidate.",
+                "AFK_FAKE_BEAD_COMMENTS": "[]",
                 "AFK_FAKE_PINNED_CONTRACT": "present",
                 "AFK_FAKE_EXPECTED_PASSWORD": self.secret_value,
                 "USER": "bump",
@@ -116,7 +118,7 @@ class StartCliTest(unittest.TestCase):
         readable = self.run_afk("status", run_id)
         self.assertEqual(
             readable.stdout,
-            f"{run_id} created bead=central-bnkl.1.1 sequence=2 "
+            f"{run_id} created bead=central-bnkl.1.1 sequence=3 "
             f"checkpoint=created unit=afk-{run_id}-worker-1\n",
         )
         effect = json.loads(
@@ -193,14 +195,14 @@ class StartCliTest(unittest.TestCase):
         while time.monotonic() < deadline:
             status = self.run_afk("status", run_id, "--json")
             projection = json.loads(status.stdout)
-            if projection["state"] in {"attention_required", "validated"}:
+            if projection["state"] in {"attention_required", "reviewed"}:
                 break
             time.sleep(0.05)
-        self.assertEqual(projection["checkpoint"], "validated")
+        self.assertEqual(projection["checkpoint"], "reviewed")
         effect = RunStore(self.state_home / "afk").effect(run_id, "worker-launch-1")
         self.assertEqual(effect["status"], "confirmed")
 
-    def test_worker_claims_publishes_and_validates_the_exact_candidate(self):
+    def test_worker_claims_publishes_validates_and_reviews_the_exact_candidate(self):
         started = self.run_afk("start", "central-bnkl.1.1")
         run_id = started.stdout.strip()
 
@@ -208,8 +210,8 @@ class StartCliTest(unittest.TestCase):
 
         self.assertEqual(completed.returncode, 0, completed.stderr)
         projection = json.loads(self.run_afk("status", run_id, "--json").stdout)
-        self.assertEqual(projection["state"], "validated")
-        self.assertEqual(projection["checkpoint"], "validated")
+        self.assertEqual(projection["state"], "reviewed")
+        self.assertEqual(projection["checkpoint"], "reviewed")
         self.assertEqual(projection["validation"]["status"], "passed")
         self.assertEqual(projection["candidate_sha"], "d" * 40)
         self.assertEqual(projection["pr_number"], 17)
@@ -225,6 +227,37 @@ class StartCliTest(unittest.TestCase):
             '"command":"bd","args":["update","central-bnkl.1.1","--claim"', commands
         )
         self.assertIn(BASE_SHA, commands)
+
+    def test_gate_uses_the_canonical_start_bead_after_live_tracker_mutation(self):
+        started = self.run_afk("start", "central-bnkl.1.1")
+        run_id = started.stdout.strip()
+
+        completed = self.run_afk(
+            "_worker",
+            run_id,
+            AFK_FAKE_BEAD_STATUS="in_progress",
+            AFK_FAKE_ASSIGNEE="bump",
+            AFK_FAKE_BEAD_DESCRIPTION="mutated live description",
+            AFK_FAKE_BEAD_COMMENTS='[{"text":"mutated live comment"}]',
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        projection = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(projection["checkpoint"], "reviewed")
+        bundle = json.loads(
+            (
+                self.state_home
+                / "afk"
+                / "runs"
+                / run_id
+                / projection["gate_cycles"][-1]["evidence"]
+                / "review-bundle"
+                / "bundle.json"
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual(bundle["bead"]["description"], "Implement one candidate.")
+        self.assertEqual(bundle["bead"]["status"], "open")
+        self.assertEqual(bundle["bead"].get("comments", []), [])
 
     def test_candidate_contract_changes_remain_proposals_for_later_validation(self):
         home = self.temp
@@ -856,7 +889,7 @@ class StartCliTest(unittest.TestCase):
 
         self.assertEqual(resumed.returncode, 0, resumed.stderr)
         after = json.loads(self.run_afk("status", run_id, "--json").stdout)
-        self.assertEqual(after["checkpoint"], "validated")
+        self.assertEqual(after["checkpoint"], "reviewed")
         self.assertEqual(after["validation"]["status"], "passed")
         push_effect = RunStore(self.state_home / "afk").effect(
             run_id, f'branch-push-{"d" * 40}'
@@ -883,7 +916,7 @@ class StartCliTest(unittest.TestCase):
 
         self.assertEqual(resumed.returncode, 0, resumed.stderr)
         after = json.loads(self.run_afk("status", run_id, "--json").stdout)
-        self.assertEqual(after["checkpoint"], "validated")
+        self.assertEqual(after["checkpoint"], "reviewed")
         self.assertEqual(after["validation"]["status"], "passed")
         self.assertEqual(store.effect(run_id, "pr-create")["status"], "confirmed")
         commands = self.command_log.read_text(encoding="utf-8")
@@ -893,7 +926,7 @@ class StartCliTest(unittest.TestCase):
 
         self.assertEqual(terminal_resume.returncode, 0, terminal_resume.stderr)
         terminal = json.loads(self.run_afk("status", run_id, "--json").stdout)
-        self.assertEqual(terminal["checkpoint"], "validated")
+        self.assertEqual(terminal["checkpoint"], "reviewed")
         self.assertEqual(terminal["validation"]["status"], "passed")
 
     def test_resume_requires_attention_for_confirmed_collected_worker_without_terminal(
@@ -1325,6 +1358,7 @@ class StartCliTest(unittest.TestCase):
                 candidate_marker = Path(os.environ["HOME"]) / ".fake-candidate"
                 pushed_marker = Path(os.environ["HOME"]) / ".fake-pushed"
                 pr_state = Path(os.environ["XDG_STATE_HOME"]) / "fake-pr.json"
+                comment_state = Path(os.environ["XDG_STATE_HOME"]) / "fake-comment.json"
                 target_drift = Path(os.environ["XDG_STATE_HOME"]) / "fake-target-drift"
                 if command == "git":
                     if args[:2] == ["rev-parse", "--show-toplevel"]:
@@ -1339,6 +1373,8 @@ class StartCliTest(unittest.TestCase):
                         elif pushed_marker.exists():
                             print(candidate_sha + "\\t" + requested)
                     elif args[:1] == ["fetch"]:
+                        pass
+                    elif args[:3] == ["ls-tree", "-r", "--name-only"]:
                         pass
                     elif args[:1] == ["ls-tree"]:
                         requested = args[-1]
@@ -1436,6 +1472,8 @@ class StartCliTest(unittest.TestCase):
                         pass
                     elif args[:1] == ["rev-list"]:
                         pass
+                    elif args[:1] == ["diff"]:
+                        pass
                     elif args[:1] == ["push"]:
                         pushed_marker.write_text(candidate_sha, encoding="utf-8")
                         if os.environ.get("AFK_FAKE_PUSH_INTERRUPTED"):
@@ -1461,6 +1499,22 @@ class StartCliTest(unittest.TestCase):
                             target_drift.write_text("drifted", encoding="utf-8")
                         if os.environ.get("AFK_FAKE_PR_INTERRUPTED"):
                             raise SystemExit(1)
+                    elif args[:1] == ["api"]:
+                        if "--method" in args:
+                            body = json.loads(sys.stdin.read())["body"]
+                            value = {
+                                "body": body,
+                                "html_url": "https://example.test/comment/1",
+                            }
+                            comment_state.write_text(json.dumps(value), encoding="utf-8")
+                            print(json.dumps(value))
+                        else:
+                            comments = (
+                                [json.loads(comment_state.read_text())]
+                                if comment_state.exists()
+                                else []
+                            )
+                            print(json.dumps([comments]))
                     elif os.environ.get("AFK_FAKE_GH_NON_OBJECT"):
                         print("[]")
                     else:
@@ -1495,8 +1549,9 @@ class StartCliTest(unittest.TestCase):
                         print(json.dumps([{
                             "id": os.environ["AFK_FAKE_BEAD"],
                             "title": "Create the first slice",
-                            "description": "Implement one candidate.",
+                            "description": os.environ["AFK_FAKE_BEAD_DESCRIPTION"],
                             "acceptance_criteria": "Candidate is committed.",
+                            "comments": json.loads(os.environ["AFK_FAKE_BEAD_COMMENTS"]),
                             "status": status,
                             "assignee": assignee,
                             "labels": labels,
@@ -1600,10 +1655,27 @@ class StartCliTest(unittest.TestCase):
                 from pathlib import Path
 
                 args = sys.argv[1:]
+                prompt = sys.stdin.read()
                 base_sha = "a" * 40
                 candidate_sha = "d" * 40
                 worktree = Path(args[args.index("--cd") + 1])
                 report = Path(args[args.index("--output-last-message") + 1])
+                if "# AFK standards review" in prompt or "# AFK spec review" in prompt:
+                    axis = (
+                        "standards"
+                        if "# AFK standards review" in prompt
+                        else "spec"
+                    )
+                    report.write_text(json.dumps({
+                        "schema_version": 1,
+                        "candidate_sha": candidate_sha,
+                        "axis": axis,
+                        "status": "passed",
+                        "summary": "review passed",
+                        "findings": [],
+                    }), encoding="utf-8")
+                    print(json.dumps({"type": "result"}))
+                    raise SystemExit(0)
                 (Path(os.environ["HOME"]) / ".fake-candidate").write_text(
                     candidate_sha, encoding="utf-8"
                 )
