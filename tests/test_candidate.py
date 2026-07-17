@@ -455,6 +455,7 @@ class CandidateTest(unittest.TestCase):
             mock.patch("afk.start.RunStore", return_value=self.store),
             mock.patch("afk.start._show_bead", return_value=bead),
             mock.patch("afk.start._advance_validation", return_value=0),
+            mock.patch("afk.start._advance_gate", return_value=0),
         ):
             resumed_run_id, resumed_exit = resume_run()
         self.assertEqual((resumed_run_id, resumed_exit), ("run-1", 0))

@@ -20,7 +20,11 @@ from afk.candidate_gate import (  # noqa: E402
     run_candidate_reviews,
 )
 from afk.run_store import EvidenceTampered, RunStore  # noqa: E402
-from afk.start import _advance_completed_gate, resume_run  # noqa: E402
+from afk.start import (  # noqa: E402
+    _advance_candidate,
+    _advance_completed_gate,
+    resume_run,
+)
 
 
 class CandidateGateTest(unittest.TestCase):
@@ -524,6 +528,46 @@ class CandidateGateTest(unittest.TestCase):
             self.assertEqual(status["attention"]["kind"], "unavailable")
             self.assertIn("reapproval", status["attention"]["summary"])
 
+    def test_initial_candidate_passed_validation_continues_into_gate(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store = RunStore(Path(temporary) / "state")
+            run_id = store.create_run(
+                bead_id="central-test.1",
+                repository="owner/project",
+                base_branch="main",
+                base_sha="a" * 40,
+                start_request={"beads_workspace": temporary},
+                run_id="run-1",
+            )["run_id"]
+
+            def pass_validation(_store, _run_id):
+                store.append_event(
+                    run_id,
+                    "validation.passed",
+                    state="validated",
+                    data={"checkpoint": "validated"},
+                )
+                return 0
+
+            def enter_gate(_store, _run_id):
+                self.assertEqual(store.status(run_id)["checkpoint"], "validated")
+                return 0
+
+            with (
+                mock.patch(
+                    "afk.start._show_bead", return_value={"id": "central-test.1"}
+                ),
+                mock.patch("afk.start.produce_candidate"),
+                mock.patch(
+                    "afk.start._advance_validation", side_effect=pass_validation
+                ),
+                mock.patch("afk.start._advance_gate", side_effect=enter_gate) as gate,
+            ):
+                exit_code = _advance_candidate(store, run_id)
+
+            self.assertEqual(exit_code, 0)
+            gate.assert_called_once_with(store, run_id)
+
     def test_resume_continues_after_durable_candidate_repaired_event(self):
         contracts = (
             ("pinned_base", 0, True),
@@ -576,14 +620,17 @@ class CandidateGateTest(unittest.TestCase):
                     mock.patch(
                         "afk.start._advance_validation", return_value=0
                     ) as validation,
+                    mock.patch("afk.start._advance_gate", return_value=0) as gate,
                 ):
                     resumed = resume_run()
 
                 self.assertEqual(resumed, (run_id, expected_exit))
                 if advances_validation:
                     validation.assert_called_once_with(store, run_id)
+                    gate.assert_called_once_with(store, run_id)
                 else:
                     validation.assert_not_called()
+                    gate.assert_not_called()
                     attention = store.status(run_id)["attention"]
                     self.assertEqual(attention["scope"], "validation")
                     self.assertEqual(attention["kind"], "unavailable")

@@ -712,7 +712,7 @@ def _advance_candidate(store: RunStore, run_id: str) -> int:
             ),
         )
         return 2
-    return _advance_validation(store, run_id)
+    return _advance_validation_then_gate(store, run_id)
 
 
 def _advance_gate(store: RunStore, run_id: str) -> int:
@@ -764,7 +764,14 @@ def _advance_repaired_candidate(store: RunStore, run_id: str) -> int:
             ),
         )
         return 2
-    return _advance_validation(store, run_id)
+    return _advance_validation_then_gate(store, run_id)
+
+
+def _advance_validation_then_gate(store: RunStore, run_id: str) -> int:
+    exit_code = _advance_validation(store, run_id)
+    if exit_code != 0:
+        return exit_code
+    return _advance_gate(store, run_id)
 
 
 def _advance_completed_gate(
