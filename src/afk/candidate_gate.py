@@ -9,6 +9,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+from afk.candidate import CandidateError, verify_candidate_publication
 from afk.candidate_validation import (
     CandidateValidationError,
     run_supervised_command,
@@ -79,6 +80,7 @@ def complete_gate_cycle(
     bead: dict[str, Any],
 ) -> dict[str, Any]:
     projection = store.status(run_id)
+    _require_candidate_publication(store, run_id, projection)
     candidate_sha = _required_text(projection, "candidate_sha")
     validation_record = projection.get("validation")
     if (
@@ -125,6 +127,25 @@ def complete_gate_cycle(
             if validation["status"] == "passed"
             else []
         )
+        try:
+            _require_candidate_publication(store, run_id, projection)
+        except GateError as exc:
+            if reviews:
+                store.write_evidence_text(
+                    run_id,
+                    f"{evidence}/publication-drift.json",
+                    canonical_json(
+                        {
+                            "schema_version": 1,
+                            "candidate_sha": candidate_sha,
+                            "kind": exc.kind,
+                            "summary": exc.summary,
+                        }
+                    )
+                    + "\n",
+                )
+                store.seal_evidence(run_id, evidence)
+            raise
         review_statuses = {review["status"] for review in reviews}
         if "inconclusive" in review_statuses:
             next_action = "attention"
@@ -169,6 +190,7 @@ def complete_gate_cycle(
             )
         store.seal_evidence(run_id, evidence)
 
+    _require_candidate_publication(store, run_id, projection)
     pr_number = projection.get("pr_number")
     if type(pr_number) is not int or pr_number <= 0:
         raise GateError(
@@ -206,6 +228,15 @@ def complete_gate_cycle(
             },
         )
     return outcome
+
+
+def _require_candidate_publication(
+    store: RunStore, run_id: str, projection: dict[str, Any]
+) -> None:
+    try:
+        verify_candidate_publication(store.identity(run_id), projection)
+    except CandidateError as exc:
+        raise GateError(exc.summary, kind=exc.kind) from exc
 
 
 def reconcile_gate_comment(

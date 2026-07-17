@@ -24,6 +24,126 @@ from afk.start import _advance_completed_gate, resume_run  # noqa: E402
 
 
 class CandidateGateTest(unittest.TestCase):
+    def setUp(self):
+        self.publication_check = mock.patch(
+            "afk.candidate_gate._require_candidate_publication"
+        )
+        self.publication_check.start()
+
+    def tearDown(self):
+        if self.publication_check is not None:
+            self.publication_check.stop()
+
+    def _use_real_publication_check(self):
+        self.publication_check.stop()
+        self.publication_check = None
+
+    def _published_validated_candidate(self, root):
+        remote = root / "remote.git"
+        checkout = root / "checkout"
+        subprocess.run(
+            ["git", "init", "--bare", remote], check=True, capture_output=True
+        )
+        subprocess.run(
+            ["git", "init", "-b", "main", checkout], check=True, capture_output=True
+        )
+        for key, value in (
+            ("user.name", "AFK Test"),
+            ("user.email", "afk@example.test"),
+        ):
+            subprocess.run(["git", "config", key, value], cwd=checkout, check=True)
+        (checkout / "app.txt").write_text("base\n", encoding="utf-8")
+        subprocess.run(["git", "add", "app.txt"], cwd=checkout, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "base"],
+            cwd=checkout,
+            check=True,
+            capture_output=True,
+        )
+        base_sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=checkout,
+            text=True,
+            capture_output=True,
+            check=True,
+        ).stdout.strip()
+        subprocess.run(
+            ["git", "remote", "add", "origin", remote], cwd=checkout, check=True
+        )
+        subprocess.run(
+            ["git", "push", "origin", "main"],
+            cwd=checkout,
+            check=True,
+            capture_output=True,
+        )
+        branch = "afk/central-test-1-run-1/candidate"
+        subprocess.run(
+            ["git", "switch", "-c", branch],
+            cwd=checkout,
+            check=True,
+            capture_output=True,
+        )
+        (checkout / "app.txt").write_text("candidate\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "commit", "-am", "candidate"],
+            cwd=checkout,
+            check=True,
+            capture_output=True,
+        )
+        candidate_sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=checkout,
+            text=True,
+            capture_output=True,
+            check=True,
+        ).stdout.strip()
+        subprocess.run(
+            ["git", "push", "origin", branch],
+            cwd=checkout,
+            check=True,
+            capture_output=True,
+        )
+        store = RunStore(root / "state")
+        run_id = store.create_run(
+            bead_id="central-test.1",
+            repository="owner/project",
+            base_branch="main",
+            base_sha=base_sha,
+            start_request={},
+            run_id="run-1",
+        )["run_id"]
+        store.write_evidence_text(run_id, "gates/validation/result.json", "{}\n")
+        store.seal_evidence(run_id, "gates/validation")
+        store.append_event(
+            run_id,
+            "validation.passed",
+            state="validated",
+            data={
+                "checkpoint": "validated",
+                "candidate_sha": candidate_sha,
+                "worktree_path": str(checkout),
+                "branch": branch,
+                "pr_number": 7,
+                "validation": {
+                    "status": "passed",
+                    "candidate_sha": candidate_sha,
+                    "summary": "passed",
+                    "evidence": "gates/validation",
+                    "checks": [],
+                },
+            },
+        )
+        pr = {
+            "number": 7,
+            "url": "https://example.test/pr/7",
+            "state": "OPEN",
+            "isDraft": True,
+            "headRefOid": candidate_sha,
+            "headRefName": branch,
+            "baseRefName": "main",
+        }
+        return store, run_id, checkout, candidate_sha, pr
+
     def test_review_permission_profile_keeps_inputs_read_only(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -48,6 +168,174 @@ class CandidateGateTest(unittest.TestCase):
             self.assertNotIn(f'"{worktree}" = "write"', config)
             self.assertNotIn(f'"{bundle}" = "write"', config)
             self.assertIn("network = { enabled = false }", config)
+
+    def test_gate_rejects_dirty_candidate_before_review(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            self._use_real_publication_check()
+            root = Path(temporary)
+            store, run_id, checkout, _, pr = self._published_validated_candidate(root)
+            (checkout / "dirty.txt").write_text("drift\n", encoding="utf-8")
+            reviews = mock.Mock(
+                return_value=[
+                    {
+                        "axis": axis,
+                        "process_status": "succeeded",
+                        "status": "passed",
+                        "summary": "passed",
+                        "findings": [],
+                    }
+                    for axis in ("standards", "spec")
+                ]
+            )
+
+            with (
+                mock.patch("afk.candidate._list_prs", return_value=[pr]),
+                mock.patch("afk.candidate_gate.run_candidate_reviews", reviews),
+                mock.patch("afk.candidate_gate.reconcile_gate_comment"),
+                self.assertRaises(GateError) as raised,
+            ):
+                complete_gate_cycle(store, run_id, bead={"id": "central-test.1"})
+
+            self.assertEqual(raised.exception.kind, "head_mismatch")
+            reviews.assert_not_called()
+
+    def test_gate_rejects_local_remote_base_and_pr_drift(self):
+        cases = (
+            "local-head",
+            "remote-head",
+            "base",
+            "number",
+            "missing-pr",
+            "duplicate-pr",
+            "pr-head",
+            "pr-base",
+            "closed",
+            "ready",
+        )
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
+                self._use_real_publication_check()
+                root = Path(temporary)
+                store, run_id, checkout, candidate_sha, pr = (
+                    self._published_validated_candidate(root)
+                )
+                if case == "local-head":
+                    subprocess.run(
+                        ["git", "commit", "--allow-empty", "-m", "drift"],
+                        cwd=checkout,
+                        check=True,
+                        capture_output=True,
+                    )
+                elif case == "remote-head":
+                    subprocess.run(
+                        ["git", "commit", "--allow-empty", "-m", "drift"],
+                        cwd=checkout,
+                        check=True,
+                        capture_output=True,
+                    )
+                    subprocess.run(
+                        ["git", "push", "origin", "HEAD"],
+                        cwd=checkout,
+                        check=True,
+                        capture_output=True,
+                    )
+                    subprocess.run(
+                        ["git", "reset", "--hard", candidate_sha],
+                        cwd=checkout,
+                        check=True,
+                        capture_output=True,
+                    )
+                elif case == "base":
+                    subprocess.run(
+                        ["git", "push", "origin", "HEAD:main"],
+                        cwd=checkout,
+                        check=True,
+                        capture_output=True,
+                    )
+                elif case == "number":
+                    pr["number"] = 8
+                elif case == "pr-head":
+                    pr["headRefOid"] = "c" * 40
+                elif case == "pr-base":
+                    pr["baseRefName"] = "other"
+                elif case == "closed":
+                    pr["state"] = "CLOSED"
+                else:
+                    pr["isDraft"] = False
+
+                observed_prs = (
+                    []
+                    if case == "missing-pr"
+                    else [pr, dict(pr)] if case == "duplicate-pr" else [pr]
+                )
+
+                with (
+                    mock.patch("afk.candidate._list_prs", return_value=observed_prs),
+                    mock.patch("afk.candidate_gate.run_candidate_reviews") as reviews,
+                    self.assertRaises(GateError) as raised,
+                ):
+                    complete_gate_cycle(store, run_id, bead={"id": "central-test.1"})
+
+                expected = (
+                    "head_mismatch"
+                    if case in {"local-head", "remote-head", "pr-head"}
+                    else "conflict"
+                )
+                self.assertEqual(raised.exception.kind, expected)
+                reviews.assert_not_called()
+                self.publication_check = mock.patch(
+                    "afk.candidate_gate._require_candidate_publication"
+                )
+                self.publication_check.start()
+
+    def test_publication_drift_during_review_blocks_attempt_reuse(self):
+        self._use_real_publication_check()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store, run_id, checkout, candidate_sha, pr = (
+                self._published_validated_candidate(root)
+            )
+            reviews = [
+                {
+                    "axis": axis,
+                    "process_status": "succeeded",
+                    "status": "passed",
+                    "summary": "passed",
+                    "findings": [],
+                }
+                for axis in ("standards", "spec")
+            ]
+
+            def drift(*args, **kwargs):
+                (checkout / "dirty.txt").write_text("drift\n", encoding="utf-8")
+                return reviews
+
+            with (
+                mock.patch("afk.candidate._list_prs", return_value=[pr]),
+                mock.patch(
+                    "afk.candidate_gate.run_candidate_reviews", side_effect=drift
+                ),
+                self.assertRaises(GateError) as raised,
+            ):
+                complete_gate_cycle(store, run_id, bead={"id": "central-test.1"})
+
+            self.assertEqual(raised.exception.kind, "head_mismatch")
+            gate = (
+                root
+                / "state/runs"
+                / run_id
+                / f"gates/gate-cycle-1-{candidate_sha[:12]}"
+            )
+            self.assertTrue((gate / "publication-drift.json").is_file())
+            self.assertTrue((gate / "manifest.json").is_file())
+            (checkout / "dirty.txt").unlink()
+            with (
+                mock.patch("afk.candidate._list_prs", return_value=[pr]),
+                mock.patch("afk.candidate_gate.run_candidate_reviews") as rerun,
+                self.assertRaises(GateError),
+            ):
+                complete_gate_cycle(store, run_id, bead={"id": "central-test.1"})
+            rerun.assert_not_called()
 
     def test_repaired_bootstrap_candidate_pauses_for_explicit_reapproval(self):
         with tempfile.TemporaryDirectory() as temporary:

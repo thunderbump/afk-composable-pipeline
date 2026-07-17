@@ -763,16 +763,29 @@ def _verify_published(
     branch: str,
     candidate_sha: str,
     pr: dict[str, Any],
+    *,
+    expected_pr_number: int | None = None,
 ) -> None:
     local = _git(worktree, "rev-parse", "HEAD")
+    dirty = _git(worktree, "status", "--porcelain")
     remote = _remote_sha(worktree, branch)
     target = _remote_sha(worktree, identity["base_branch"])
     if target != identity["base_sha"]:
-        raise CandidateError("target branch no longer equals the pinned base")
+        raise CandidateError(
+            "target branch no longer equals the pinned base", kind="conflict"
+        )
     if (
         local != candidate_sha
+        or dirty
         or remote != candidate_sha
         or pr.get("headRefOid") != candidate_sha
+    ):
+        raise CandidateError(
+            "local, remote, and PR heads disagree with the Candidate",
+            kind="head_mismatch",
+        )
+    if (
+        (expected_pr_number is not None and pr.get("number") != expected_pr_number)
         or pr.get("headRefName") != branch
         or pr.get("baseRefName") != identity["base_branch"]
         or pr.get("state") != "OPEN"
@@ -780,7 +793,33 @@ def _verify_published(
         or type(pr.get("number")) is not int
         or not isinstance(pr.get("url"), str)
     ):
-        raise CandidateError("local, remote, and draft PR Candidate facts disagree")
+        raise CandidateError("draft PR Candidate facts disagree", kind="conflict")
+
+
+def verify_candidate_publication(
+    identity: dict[str, Any], projection: dict[str, Any]
+) -> dict[str, Any]:
+    """Read and reconcile the exact published Candidate without mutating it."""
+    worktree = Path(_field(projection, "worktree_path"))
+    branch = _field(projection, "branch")
+    candidate_sha = _field(projection, "candidate_sha")
+    pr_number = projection.get("pr_number")
+    if type(pr_number) is not int or pr_number <= 0:
+        raise CandidateError("stable Candidate PR number is invalid", kind="conflict")
+    prs = _list_prs(worktree, identity["repository"], branch)
+    if len(prs) != 1:
+        raise CandidateError(
+            "Candidate branch does not have exactly one stable PR", kind="conflict"
+        )
+    _verify_published(
+        identity,
+        worktree,
+        branch,
+        candidate_sha,
+        prs[0],
+        expected_pr_number=pr_number,
+    )
+    return prs[0]
 
 
 def _remote_sha(worktree: Path, branch: str) -> str:
