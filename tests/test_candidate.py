@@ -5,6 +5,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -14,6 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 import afk.candidate as candidate_module  # noqa: E402
+import afk.candidate_validation as candidate_validation  # noqa: E402
 from afk.candidate import (  # noqa: E402
     CandidateError,
     produce_candidate,
@@ -314,6 +316,49 @@ class CandidateTest(unittest.TestCase):
         attempt = self.state / "runs" / "run-1" / "attempts" / "repair-1"
         self.assertTrue((attempt / "manifest.json").is_file())
         self.assertEqual(self.store.status("run-1")["repair_attempts_used"], 1)
+
+    def test_timed_out_repair_seals_evidence_and_leaves_no_descendant_mutation(self):
+        first = self.produce()
+        brief = {
+            "schema_version": 1,
+            "candidate_sha": first["candidate_sha"],
+            "repair_attempt": 1,
+            "blocking_findings": [
+                {
+                    "id": "validation-smoke",
+                    "source": "validation",
+                    "title": "Smoke test failed",
+                    "body": "Repair it.",
+                    "blocking": True,
+                }
+            ],
+        }
+        (self.codex_home / "fake-outcome").write_text("timeout", encoding="utf-8")
+
+        with (
+            mock.patch.dict(os.environ, self._candidate_environment(), clear=True),
+            mock.patch.object(candidate_module, "COMMAND_TIMEOUT_SECONDS", 0.1),
+            mock.patch.object(candidate_validation, "PROCESS_CLEANUP_SECONDS", 0.1),
+            self.assertRaisesRegex(CandidateError, "timed out"),
+        ):
+            produce_repair_candidate(
+                self.store,
+                "run-1",
+                bead={
+                    "id": "central-test.1",
+                    "title": "Implement the thing",
+                    "description": "Change one file.",
+                    "acceptance_criteria": "The file exists.",
+                },
+                repair_brief=brief,
+            )
+
+        time.sleep(0.7)
+        self.assertFalse((self.checkout / "late-repair-mutation").exists())
+        attempt = self.state / "runs/run-1/attempts/repair-1"
+        self.assertTrue((attempt / "manifest.json").is_file())
+        outcome = json.loads((attempt / "outcome.json").read_text(encoding="utf-8"))
+        self.assertEqual(outcome["status"], "interrupted")
 
     def test_repair_resume_reconciles_crash_windows_without_rerunning_codex(self):
         first = self.produce()
@@ -714,7 +759,7 @@ class CandidateTest(unittest.TestCase):
             textwrap.dedent(
                 f"""
                 #!/usr/bin/env python3
-                import json, os, subprocess, sys
+                import json, os, signal, subprocess, sys, time
                 from pathlib import Path
                 args = sys.argv[1:]
                 prompt = sys.stdin.read()
@@ -727,6 +772,11 @@ class CandidateTest(unittest.TestCase):
                 repair = "# AFK repair attempt" in prompt
                 repair_attempt = prompt.split("Attempt: repair-")[1].splitlines()[0] if repair else ""  # noqa: E501
                 changed = f"repair-{{repair_attempt}}.txt" if repair else "candidate.txt"
+                if outcome == "timeout":
+                    child = "import os,signal,time;os.setsid();signal.signal(signal.SIGTERM,signal.SIG_IGN);time.sleep(0.5);open('late-repair-mutation','w').write('mutated')"  # noqa: E501
+                    subprocess.Popen([sys.executable, "-c", child], cwd=cwd)
+                    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+                    time.sleep(30)
                 if outcome not in {"no_change", "nonzero", "malformed"}:
                     (cwd / changed).write_text("candidate\\n", encoding="utf-8")
                     subprocess.run(["git", "add", changed], cwd=cwd, check=True)

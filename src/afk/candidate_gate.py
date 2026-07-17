@@ -9,6 +9,10 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+from afk.candidate_validation import (
+    CandidateValidationError,
+    run_supervised_command,
+)
 from afk.codex_permissions import codex_environment, codex_permission_args
 from afk.jsonutil import canonical_json
 from afk.run_store import RunStore
@@ -53,10 +57,19 @@ REVIEW_REPORT_SCHEMA = {
 
 
 class GateError(RuntimeError):
-    def __init__(self, summary: str, *, kind: str = "invalid"):
+    def __init__(
+        self,
+        summary: str,
+        *,
+        kind: str = "invalid",
+        stdout: str = "",
+        stderr: str = "",
+    ):
         super().__init__(summary)
         self.summary = summary
         self.kind = kind
+        self.stdout = stdout
+        self.stderr = stderr
 
 
 def complete_gate_cycle(
@@ -353,6 +366,8 @@ def run_candidate_reviews(
                 "summary": exc.summary,
                 "findings": [],
             }
+            store.write_evidence_text(run_id, f"{attempt}/events.jsonl", exc.stdout)
+            store.write_evidence_text(run_id, f"{attempt}/stderr.txt", exc.stderr)
             store.write_evidence_text(
                 run_id, f"{attempt}/outcome.json", canonical_json(result) + "\n"
             )
@@ -618,18 +633,21 @@ def _execute_reviewer(
             "-",
         ]
         try:
-            completed = subprocess.run(
+            completed = run_supervised_command(
                 command,
                 cwd=worktree,
-                env=codex_environment(),
-                input=prompt,
-                text=True,
-                capture_output=True,
-                check=False,
-                timeout=3600,
+                environment=codex_environment(),
+                input_text=prompt,
+                timeout_seconds=3600,
+                label=f"{axis} reviewer",
             )
-        except subprocess.TimeoutExpired as exc:
-            raise GateError(f"{axis} reviewer timed out", kind="inconclusive") from exc
+        except CandidateValidationError as exc:
+            raise GateError(
+                exc.summary,
+                kind=exc.kind,
+                stdout=exc.stdout or "",
+                stderr=exc.stderr or "",
+            ) from exc
         except OSError as exc:
             raise GateError(
                 f"{axis} reviewer is unavailable", kind="inconclusive"

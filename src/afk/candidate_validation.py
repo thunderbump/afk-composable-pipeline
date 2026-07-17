@@ -743,11 +743,31 @@ def _run_contract(
     environment: dict[str, str],
     timeout_seconds: int,
 ) -> subprocess.CompletedProcess[str]:
+    return run_supervised_command(
+        command,
+        cwd=cwd,
+        environment=environment,
+        timeout_seconds=timeout_seconds,
+        label="validation",
+    )
+
+
+def run_supervised_command(
+    command: list[str],
+    *,
+    cwd: Path,
+    environment: dict[str, str],
+    timeout_seconds: float,
+    input_text: str | None = None,
+    label: str,
+) -> subprocess.CompletedProcess[str]:
+    subject = label.strip() or "command"
     with _LinuxDescendantSupervisor() as descendants:
         process = subprocess.Popen(
             command,
             cwd=cwd,
             env=environment,
+            stdin=subprocess.PIPE if input_text is not None else None,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             start_new_session=True,
@@ -769,16 +789,24 @@ def _run_contract(
         ]
         for reader in readers:
             reader.start()
+        if process.stdin is not None:
+            try:
+                process.stdin.write(input_text.encode("utf-8"))
+            except BrokenPipeError:
+                pass
+            finally:
+                process.stdin.close()
         deadline = time.monotonic() + timeout_seconds
         while process.poll() is None and not overflow.is_set():
             descendants.discover(process.pid)
             if time.monotonic() >= deadline:
                 descendants.terminate(process.pid)
+                process.poll()
                 _join_readers(readers)
                 stdout, stderr = _diagnostic_output(captured)
                 raise CandidateValidationError(
                     "interrupted",
-                    "validation timed out and its process tree was terminated",
+                    f"{subject} timed out and its process tree was terminated",
                     stdout=stdout,
                     stderr=stderr,
                 )
@@ -788,7 +816,7 @@ def _run_contract(
         if overflow.is_set():
             raise CandidateValidationError(
                 "invalid",
-                "validation output exceeds the size limit",
+                f"{subject} output exceeds the size limit",
                 stdout="",
                 stderr="",
             )
@@ -801,7 +829,7 @@ def _run_contract(
             stdout, stderr = _diagnostic_output(captured)
             raise CandidateValidationError(
                 "interrupted",
-                f"validation exited after signal {signal_name}",
+                f"{subject} exited after signal {signal_name}",
                 stdout=stdout,
                 stderr=stderr,
             )
@@ -812,7 +840,7 @@ def _run_contract(
             diagnostic_stdout, diagnostic_stderr = _diagnostic_output(captured)
             raise CandidateValidationError(
                 "invalid",
-                "validation output must be UTF-8 text",
+                f"{subject} output must be UTF-8 text",
                 stdout=diagnostic_stdout,
                 stderr=diagnostic_stderr,
             ) from exc

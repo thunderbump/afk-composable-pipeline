@@ -9,6 +9,10 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+from afk.candidate_validation import (
+    CandidateValidationError,
+    run_supervised_command,
+)
 from afk.codex_permissions import codex_environment, codex_permission_args
 from afk.jsonutil import canonical_json
 from afk.run_store import RunStore, RunStoreError
@@ -69,10 +73,19 @@ REPAIR_REPORT_SCHEMA = {
 
 
 class CandidateError(RuntimeError):
-    def __init__(self, summary: str, *, kind: str = "inconclusive"):
+    def __init__(
+        self,
+        summary: str,
+        *,
+        kind: str = "inconclusive",
+        stdout: str = "",
+        stderr: str = "",
+    ):
         super().__init__(summary)
         self.summary = summary
         self.kind = kind
+        self.stdout = stdout
+        self.stderr = stderr
 
 
 def produce_candidate(
@@ -243,6 +256,7 @@ def produce_repair_candidate(
     with tempfile.TemporaryDirectory(prefix="afk-repair-") as temporary:
         report_path = Path(temporary) / "report.json"
         report_error: CandidateError | None = None
+        execution_error: CandidateError | None = None
         command = [
             "codex",
             "exec",
@@ -258,14 +272,11 @@ def produce_repair_candidate(
             "--json",
             "-",
         ]
-        completed = _run(
-            command,
-            cwd=worktree,
-            env=codex_environment(),
-            input_text=prompt,
-            timeout=COMMAND_TIMEOUT_SECONDS,
-        )
-        if completed.returncode == 0:
+        try:
+            completed = _run_codex(command, cwd=worktree, input_text=prompt)
+        except CandidateError as exc:
+            execution_error = exc
+        if execution_error is None and completed.returncode == 0:
             try:
                 report = _read_repair_report(report_path, repair_brief)
             except CandidateError as exc:
@@ -274,6 +285,23 @@ def produce_repair_candidate(
                     raw_report = report_path.read_text(encoding="utf-8")
                 except (OSError, UnicodeDecodeError):
                     raw_report = ""
+    if execution_error is not None:
+        store.write_evidence_text(
+            run_id, f"{attempt}/events.jsonl", execution_error.stdout
+        )
+        store.write_evidence_text(
+            run_id, f"{attempt}/stderr.txt", execution_error.stderr
+        )
+        store.write_evidence_text(
+            run_id,
+            f"{attempt}/outcome.json",
+            canonical_json(
+                {"status": execution_error.kind, "summary": execution_error.summary}
+            )
+            + "\n",
+        )
+        store.seal_evidence(run_id, attempt)
+        raise execution_error
     store.write_evidence_text(run_id, f"{attempt}/events.jsonl", completed.stdout)
     store.write_evidence_text(run_id, f"{attempt}/stderr.txt", completed.stderr)
     if completed.returncode != 0 or report_error is not None:
@@ -774,6 +802,29 @@ def _git(worktree: Path, *args: str) -> str:
     if completed.returncode != 0:
         raise CandidateError(f"Git inspection failed: {' '.join(args)}")
     return completed.stdout.strip()
+
+
+def _run_codex(
+    command: list[str], *, cwd: Path, input_text: str
+) -> subprocess.CompletedProcess[str]:
+    try:
+        return run_supervised_command(
+            command,
+            cwd=cwd,
+            environment=codex_environment(),
+            input_text=input_text,
+            timeout_seconds=COMMAND_TIMEOUT_SECONDS,
+            label="repair agent",
+        )
+    except CandidateValidationError as exc:
+        raise CandidateError(
+            exc.summary,
+            kind=exc.kind,
+            stdout=exc.stdout or "",
+            stderr=exc.stderr or "",
+        ) from exc
+    except OSError as exc:
+        raise CandidateError("Codex command is unavailable") from exc
 
 
 def _run(
