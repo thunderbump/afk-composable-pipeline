@@ -335,6 +335,10 @@ class CandidateGateTest(unittest.TestCase):
                     {"name": "unit", "status": "passed", "log_path": "unit.log"},
                     {"name": "smoke", "status": "rejected", "log_path": "smoke.log"},
                 ],
+                "diagnostics": [
+                    {"path": "afk/stderr.log", "content": "Docker smoke failed: fetch failed"},
+                    {"path": "contract/smoke.log", "content": "health endpoint unavailable"},
+                ],
             },
             reviews=[
                 {
@@ -367,6 +371,8 @@ class CandidateGateTest(unittest.TestCase):
             ["validation-smoke", "standards-1"],
         )
         self.assertNotIn("unit", str(brief["blocking_findings"]))
+        self.assertIn("fetch failed", brief["blocking_findings"][0]["body"])
+        self.assertIn("health endpoint", brief["blocking_findings"][0]["body"])
 
 
 if __name__ == "__main__":

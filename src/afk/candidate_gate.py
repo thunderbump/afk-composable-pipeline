@@ -387,6 +387,11 @@ def build_repair_brief(
 ) -> dict[str, Any]:
     """Normalize every blocking Gate Cycle item into one Candidate-bound brief."""
     findings: list[dict[str, Any]] = []
+    diagnostic_text = "\n\n".join(
+        f"[{item.get('path', 'validation log')}]\n{item.get('content', '')}"
+        for item in validation.get("diagnostics", [])
+        if isinstance(item, dict)
+    )
     for check in validation.get("checks", []):
         if not isinstance(check, dict) or check.get("status") != "rejected":
             continue
@@ -397,18 +402,20 @@ def build_repair_brief(
                 "source": "validation",
                 "priority": "high",
                 "title": f"Validation check rejected: {name}",
-                "body": str(validation.get("summary", "Validation rejected.")),
+                "body": "\n\n".join(
+                    part
+                    for part in (
+                        str(validation.get("summary", "Validation rejected.")),
+                        diagnostic_text,
+                    )
+                    if part
+                ),
                 "path": str(check.get("log_path", "")),
                 "line": None,
                 "blocking": True,
             }
         )
     if validation.get("status") == "rejected" and not findings:
-        diagnostic_text = "\n\n".join(
-            f"[{item.get('path', 'validation log')}]\n{item.get('content', '')}"
-            for item in validation.get("diagnostics", [])
-            if isinstance(item, dict)
-        )
         findings.append(
             {
                 "id": "validation-contract",
