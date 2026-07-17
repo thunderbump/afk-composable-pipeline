@@ -406,6 +406,9 @@ def reconcile_interrupted_repair_worktree(
     branch = _field(projection, "branch")
     if candidate_sha != projection.get("candidate_sha"):
         raise CandidateError("interrupted repair Candidate binding is invalid")
+    expected_worktree = store.root / "worktrees" / run_id
+    if worktree.resolve() != expected_worktree.resolve():
+        raise CandidateError("interrupted repair worktree identity is invalid")
     observed_root = Path(_git(worktree, "rev-parse", "--show-toplevel")).resolve()
     if observed_root != worktree.resolve():
         raise CandidateError("interrupted repair worktree identity is invalid")

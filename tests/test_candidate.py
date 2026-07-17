@@ -21,6 +21,7 @@ from afk.candidate import (  # noqa: E402
     CandidateError,
     produce_candidate,
     produce_repair_candidate,
+    reconcile_interrupted_repair_worktree,
 )
 from afk.run_store import EvidenceTampered, RunStore  # noqa: E402
 from afk.start import resume_run  # noqa: E402
@@ -38,7 +39,9 @@ class CandidateTest(unittest.TestCase):
         self.codex_home.mkdir()
         self.remote = self.temp / "remote.git"
         self.primary_checkout = self.temp / "primary"
-        self.checkout = self.temp / "checkout"
+        self.state = self.temp / "state"
+        self.checkout = self.state / "worktrees" / "run-1"
+        self.checkout.parent.mkdir(parents=True)
         subprocess.run(
             ["git", "init", "--bare", str(self.remote)], check=True, capture_output=True
         )
@@ -92,7 +95,6 @@ class CandidateTest(unittest.TestCase):
             check=True,
             capture_output=True,
         )
-        self.state = self.temp / "state"
         self.store = RunStore(self.state)
         self.store.create_run(
             bead_id="central-test.1",
@@ -515,6 +517,62 @@ class CandidateTest(unittest.TestCase):
 
     def test_fresh_repair_discards_committed_interrupted_slot_work(self):
         self._assert_fresh_repair_discards_interrupted_work("committed")
+
+    def test_interrupted_repair_rejects_a_misbound_user_worktree(self):
+        first = self.produce()
+        candidate_sha = first["candidate_sha"]
+        subprocess.run(
+            ["git", "switch", "--detach"],
+            cwd=self.checkout,
+            check=True,
+            capture_output=True,
+        )
+        user_checkout = self.temp / "user-checkout"
+        subprocess.run(
+            ["git", "worktree", "add", str(user_checkout), self.branch],
+            cwd=self.primary_checkout,
+            check=True,
+            capture_output=True,
+        )
+        self.store.append_event(
+            "run-1",
+            "test.projection_corrupted",
+            state="candidate_ready",
+            data={
+                "checkpoint": "candidate_ready",
+                "worktree_path": str(user_checkout),
+                "branch": self.branch,
+            },
+        )
+        tracked = user_checkout / "README.md"
+        tracked.write_text("user dirty change\n", encoding="utf-8")
+        untracked = user_checkout / "user-untracked.txt"
+        untracked.write_text("preserve me\n", encoding="utf-8")
+        head_before = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=user_checkout,
+            text=True,
+            capture_output=True,
+            check=True,
+        ).stdout.strip()
+
+        with self.assertRaisesRegex(CandidateError, "worktree identity"):
+            reconcile_interrupted_repair_worktree(
+                self.store,
+                "run-1",
+                repair_brief={"candidate_sha": candidate_sha},
+            )
+
+        head_after = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=user_checkout,
+            text=True,
+            capture_output=True,
+            check=True,
+        ).stdout.strip()
+        self.assertEqual(head_after, head_before)
+        self.assertEqual(tracked.read_text(encoding="utf-8"), "user dirty change\n")
+        self.assertEqual(untracked.read_text(encoding="utf-8"), "preserve me\n")
 
     def _assert_fresh_repair_discards_interrupted_work(self, mode):
         first = self.produce()
