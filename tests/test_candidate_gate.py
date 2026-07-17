@@ -182,6 +182,9 @@ class CandidateGateTest(unittest.TestCase):
         result = normalize_review_result(
             "standards",
             {
+                "schema_version": 1,
+                "candidate_sha": "a" * 40,
+                "axis": "standards",
                 "status": "rejected",
                 "summary": "password=summary-secret",
                 "findings": [
@@ -196,6 +199,7 @@ class CandidateGateTest(unittest.TestCase):
                     }
                 ],
             },
+            candidate_sha="a" * 40,
             process_exit_code=0,
         )
 
@@ -285,7 +289,14 @@ class CandidateGateTest(unittest.TestCase):
             def reviewer(axis, bundle_path, attempt_path, worktree):
                 return (
                     0,
-                    {"status": "passed", "summary": "passed", "findings": []},
+                    {
+                        "schema_version": 1,
+                        "candidate_sha": candidate_sha,
+                        "axis": axis,
+                        "status": "passed",
+                        "summary": "passed",
+                        "findings": [],
+                    },
                     "",
                     "",
                 )
@@ -1313,6 +1324,9 @@ class CandidateGateTest(unittest.TestCase):
                 return (
                     0,
                     {
+                        "schema_version": 1,
+                        "candidate_sha": candidate_sha,
+                        "axis": axis,
                         "status": "passed",
                         "summary": f"{axis} passed",
                         "findings": [],
@@ -1345,6 +1359,8 @@ class CandidateGateTest(unittest.TestCase):
 
             seal_bundle_before_crash(2, {"id": "central-test.1"})
             completed_standards = {
+                "schema_version": 1,
+                "candidate_sha": candidate_sha,
                 "axis": "standards",
                 "process_status": "succeeded",
                 "status": "passed",
@@ -1354,11 +1370,7 @@ class CandidateGateTest(unittest.TestCase):
             store.write_evidence_text(
                 run_id,
                 "attempts/review-cycle-2-standards/report.json",
-                (
-                    '{"axis":"standards","findings":[],"process_status":'
-                    '"succeeded","status":"passed","summary":'
-                    '"standards passed before crash"}'
-                ),
+                json.dumps(completed_standards),
             )
             store.seal_evidence(run_id, "attempts/review-cycle-2-standards")
             resumed_calls = []
@@ -1367,7 +1379,14 @@ class CandidateGateTest(unittest.TestCase):
                 resumed_calls.append(axis)
                 return (
                     0,
-                    {"status": "passed", "summary": "spec passed", "findings": []},
+                    {
+                        "schema_version": 1,
+                        "candidate_sha": candidate_sha,
+                        "axis": axis,
+                        "status": "passed",
+                        "summary": "spec passed",
+                        "findings": [],
+                    },
                     "",
                     "",
                 )
@@ -1580,6 +1599,9 @@ class CandidateGateTest(unittest.TestCase):
         result = normalize_review_result(
             "standards",
             {
+                "schema_version": 1,
+                "candidate_sha": "a" * 40,
+                "axis": "standards",
                 "status": "rejected",
                 "summary": "One blocking issue.",
                 "findings": [
@@ -1594,6 +1616,7 @@ class CandidateGateTest(unittest.TestCase):
                     }
                 ],
             },
+            candidate_sha="a" * 40,
             process_exit_code=0,
         )
 
@@ -1684,7 +1707,14 @@ class CandidateGateTest(unittest.TestCase):
                     raise GateError("standards reviewer timed out", kind="inconclusive")
                 return (
                     0,
-                    {"status": "passed", "summary": "spec passed", "findings": []},
+                    {
+                        "schema_version": 1,
+                        "candidate_sha": candidate_sha,
+                        "axis": axis,
+                        "status": "passed",
+                        "summary": "spec passed",
+                        "findings": [],
+                    },
                     "spec events\n",
                     "",
                 )
@@ -1703,6 +1733,8 @@ class CandidateGateTest(unittest.TestCase):
                 reviews,
                 [
                     {
+                        "schema_version": 1,
+                        "candidate_sha": candidate_sha,
                         "axis": "standards",
                         "process_status": "failed",
                         "status": "inconclusive",
@@ -1710,6 +1742,8 @@ class CandidateGateTest(unittest.TestCase):
                         "findings": [],
                     },
                     {
+                        "schema_version": 1,
+                        "candidate_sha": candidate_sha,
                         "axis": "spec",
                         "process_status": "succeeded",
                         "status": "passed",
@@ -1724,39 +1758,65 @@ class CandidateGateTest(unittest.TestCase):
             self.assertTrue((standards / "manifest.json").is_file())
             self.assertTrue((standards / "outcome.json").is_file())
 
-            def malformed_reviewer(axis, bundle_path, attempt_path, worktree):
-                if axis == "standards":
-                    return 0, {"summary": "missing fields"}, "bad report\n", ""
-                return (
-                    0,
-                    {"status": "passed", "summary": "spec passed", "findings": []},
-                    "spec events\n",
-                    "",
-                )
-
-            with mock.patch(
-                "afk.candidate_gate._execute_reviewer",
-                side_effect=malformed_reviewer,
-            ):
-                protocol_reviews = run_candidate_reviews(
-                    store,
-                    run_id,
-                    cycle=2,
-                    bead={"id": "central-test.1"},
-                )
-
-            self.assertEqual(
-                [review["axis"] for review in protocol_reviews],
-                ["standards", "spec"],
+            valid_standards = {
+                "schema_version": 1,
+                "candidate_sha": candidate_sha,
+                "axis": "standards",
+                "status": "passed",
+                "summary": "standards passed",
+                "findings": [],
+            }
+            invalid_payloads = (
+                {"summary": "missing identity"},
+                {**valid_standards, "schema_version": 2},
+                {**valid_standards, "candidate_sha": "f" * 40},
+                {**valid_standards, "axis": "spec"},
             )
-            self.assertEqual(protocol_reviews[0]["process_status"], "succeeded")
-            self.assertEqual(protocol_reviews[0]["status"], "inconclusive")
-            self.assertEqual(protocol_reviews[1]["status"], "passed")
-            protocol_attempt = (
-                root / "state" / "runs" / run_id / "attempts/review-cycle-2-standards"
-            )
-            self.assertTrue((protocol_attempt / "manifest.json").is_file())
-            self.assertTrue((protocol_attempt / "raw-report.txt").is_file())
+            for cycle, invalid_payload in enumerate(invalid_payloads, start=2):
+                with self.subTest(cycle=cycle):
+
+                    def malformed_reviewer(axis, bundle_path, attempt_path, worktree):
+                        payload = (
+                            invalid_payload
+                            if axis == "standards"
+                            else {
+                                "schema_version": 1,
+                                "candidate_sha": candidate_sha,
+                                "axis": axis,
+                                "status": "passed",
+                                "summary": "spec passed",
+                                "findings": [],
+                            }
+                        )
+                        return 0, payload, f"{axis} events\n", ""
+
+                    with mock.patch(
+                        "afk.candidate_gate._execute_reviewer",
+                        side_effect=malformed_reviewer,
+                    ):
+                        protocol_reviews = run_candidate_reviews(
+                            store,
+                            run_id,
+                            cycle=cycle,
+                            bead={"id": "central-test.1"},
+                        )
+
+                    self.assertEqual(
+                        [review["axis"] for review in protocol_reviews],
+                        ["standards", "spec"],
+                    )
+                    self.assertEqual(protocol_reviews[0]["process_status"], "succeeded")
+                    self.assertEqual(protocol_reviews[0]["status"], "inconclusive")
+                    self.assertEqual(protocol_reviews[1]["status"], "passed")
+                    protocol_attempt = (
+                        root
+                        / "state"
+                        / "runs"
+                        / run_id
+                        / f"attempts/review-cycle-{cycle}-standards"
+                    )
+                    self.assertTrue((protocol_attempt / "manifest.json").is_file())
+                    self.assertTrue((protocol_attempt / "raw-report.txt").is_file())
 
             store.append_event(
                 run_id,
@@ -1777,17 +1837,43 @@ class CandidateGateTest(unittest.TestCase):
             self.assertEqual(outcome["next_action"], "attention")
 
     def test_review_rejects_malformed_or_contradictory_output(self):
+        candidate_sha = "a" * 40
+        valid = {
+            "schema_version": 1,
+            "candidate_sha": candidate_sha,
+            "axis": "spec",
+            "status": "passed",
+            "summary": "looks good",
+            "findings": [],
+        }
+        for label, payload in (
+            ("missing identity", {"status": "passed", "summary": "ok", "findings": []}),
+            ("boolean version", {**valid, "schema_version": True}),
+            ("wrong version", {**valid, "schema_version": 2}),
+            ("wrong Candidate", {**valid, "candidate_sha": "b" * 40}),
+            ("wrong axis", {**valid, "axis": "standards"}),
+        ):
+            with self.subTest(label=label), self.assertRaises(GateError):
+                normalize_review_result(
+                    "spec",
+                    payload,
+                    candidate_sha=candidate_sha,
+                    process_exit_code=0,
+                )
+
         with self.assertRaisesRegex(GateError, "findings"):
             normalize_review_result(
                 "spec",
-                {"status": "passed", "summary": "looks good", "findings": [{}]},
+                {**valid, "findings": [{}]},
+                candidate_sha=candidate_sha,
                 process_exit_code=0,
             )
 
         with self.assertRaisesRegex(GateError, "exited"):
             normalize_review_result(
                 "spec",
-                {"status": "rejected", "summary": "bad", "findings": []},
+                {**valid, "status": "rejected", "summary": "bad"},
+                candidate_sha=candidate_sha,
                 process_exit_code=1,
             )
 

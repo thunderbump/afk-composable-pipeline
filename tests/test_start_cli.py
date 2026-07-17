@@ -1661,7 +1661,15 @@ class StartCliTest(unittest.TestCase):
                 worktree = Path(args[args.index("--cd") + 1])
                 report = Path(args[args.index("--output-last-message") + 1])
                 if "# AFK standards review" in prompt or "# AFK spec review" in prompt:
+                    axis = (
+                        "standards"
+                        if "# AFK standards review" in prompt
+                        else "spec"
+                    )
                     report.write_text(json.dumps({
+                        "schema_version": 1,
+                        "candidate_sha": candidate_sha,
+                        "axis": axis,
                         "status": "passed",
                         "summary": "review passed",
                         "findings": [],

@@ -26,8 +26,18 @@ REVIEW_REPORT_SCHEMA = {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "type": "object",
     "additionalProperties": False,
-    "required": ["status", "summary", "findings"],
+    "required": [
+        "schema_version",
+        "candidate_sha",
+        "axis",
+        "status",
+        "summary",
+        "findings",
+    ],
     "properties": {
+        "schema_version": {"type": "integer", "const": 1},
+        "candidate_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "axis": {"enum": ["standards", "spec"]},
         "status": {"enum": ["passed", "rejected", "inconclusive"]},
         "summary": {"type": "string", "minLength": 1},
         "findings": {
@@ -377,9 +387,9 @@ def run_candidate_reviews(
             ]
             if len(result_paths) != 1:
                 raise GateError(f"{axis} review evidence is ambiguous")
-            reviews.append(_stored_review_result(axis, result_paths[0]))
+            reviews.append(_stored_review_result(axis, candidate_sha, result_paths[0]))
             continue
-        prompt = _review_prompt(axis, bundle_path)
+        prompt = _review_prompt(axis, bundle_path, candidate_sha)
         store.write_evidence_text(run_id, f"{attempt}/prompt.md", prompt)
         store.write_evidence_text(
             run_id,
@@ -393,6 +403,8 @@ def run_candidate_reviews(
         except GateError as exc:
             result = redact_artifact_value(
                 {
+                    "schema_version": 1,
+                    "candidate_sha": candidate_sha,
                     "axis": axis,
                     "process_status": "failed",
                     "status": "inconclusive",
@@ -411,10 +423,17 @@ def run_candidate_reviews(
         store.write_evidence_text(run_id, f"{attempt}/events.jsonl", stdout)
         store.write_evidence_text(run_id, f"{attempt}/stderr.txt", stderr)
         try:
-            result = normalize_review_result(axis, payload, process_exit_code=exit_code)
+            result = normalize_review_result(
+                axis,
+                payload,
+                candidate_sha=candidate_sha,
+                process_exit_code=exit_code,
+            )
         except GateError as exc:
             result = redact_artifact_value(
                 {
+                    "schema_version": 1,
+                    "candidate_sha": candidate_sha,
                     "axis": axis,
                     "process_status": "failed" if exit_code != 0 else "succeeded",
                     "status": "inconclusive",
@@ -441,9 +460,11 @@ def run_candidate_reviews(
     return reviews
 
 
-def _stored_review_result(axis: str, path: Path) -> dict[str, Any]:
+def _stored_review_result(axis: str, candidate_sha: str, path: Path) -> dict[str, Any]:
     result = _read_json(path)
     if not isinstance(result, dict) or set(result) != {
+        "schema_version",
+        "candidate_sha",
         "axis",
         "process_status",
         "status",
@@ -451,8 +472,13 @@ def _stored_review_result(axis: str, path: Path) -> dict[str, Any]:
         "findings",
     }:
         raise GateError(f"{axis} stored review result is invalid")
-    if result["axis"] != axis:
-        raise GateError(f"{axis} stored review axis is invalid")
+    if (
+        type(result["schema_version"]) is not int
+        or result["schema_version"] != 1
+        or result["candidate_sha"] != candidate_sha
+        or result["axis"] != axis
+    ):
+        raise GateError(f"{axis} stored review identity is invalid")
     process_status = result["process_status"]
     if process_status == "failed":
         if (
@@ -482,10 +508,14 @@ def _stored_review_result(axis: str, path: Path) -> dict[str, Any]:
     normalized = normalize_review_result(
         axis,
         {
+            "schema_version": result["schema_version"],
+            "candidate_sha": result["candidate_sha"],
+            "axis": result["axis"],
             "status": result["status"],
             "summary": result["summary"],
             "findings": payload_findings,
         },
+        candidate_sha=candidate_sha,
         process_exit_code=0,
     )
     if normalized != result:
@@ -496,7 +526,11 @@ def _stored_review_result(axis: str, path: Path) -> dict[str, Any]:
 
 
 def normalize_review_result(
-    axis: str, payload: Any, *, process_exit_code: int
+    axis: str,
+    payload: Any,
+    *,
+    candidate_sha: str,
+    process_exit_code: int,
 ) -> dict[str, Any]:
     if process_exit_code != 0:
         raise GateError(
@@ -504,13 +538,23 @@ def normalize_review_result(
             kind="inconclusive",
         )
     if not isinstance(payload, dict) or set(payload) != {
+        "schema_version",
+        "candidate_sha",
+        "axis",
         "status",
         "summary",
         "findings",
     }:
         raise GateError(
-            f"{axis} review output must contain status, summary, and findings"
+            f"{axis} review output must contain exact identity, status, "
+            "summary, and findings"
         )
+    if type(payload["schema_version"]) is not int or payload["schema_version"] != 1:
+        raise GateError(f"{axis} review schema version is invalid")
+    if payload["candidate_sha"] != candidate_sha:
+        raise GateError(f"{axis} review Candidate SHA is invalid")
+    if payload["axis"] != axis:
+        raise GateError(f"{axis} review axis is invalid")
     status = payload["status"]
     summary = payload["summary"]
     findings = payload["findings"]
@@ -534,6 +578,8 @@ def normalize_review_result(
         raise GateError(f"{axis} rejected review has no blocking findings")
     return redact_artifact_value(
         {
+            "schema_version": 1,
+            "candidate_sha": candidate_sha,
             "axis": axis,
             "process_status": "succeeded",
             "status": status,
@@ -649,7 +695,10 @@ def _execute_reviewer(
     attempt_path: Path,
     worktree: Path,
 ) -> tuple[int, Any, str, str]:
-    prompt = _review_prompt(axis, bundle_path)
+    bundle = _read_json(bundle_path / "bundle.json")
+    if not isinstance(bundle, dict):
+        raise GateError("review bundle is malformed")
+    prompt = _review_prompt(axis, bundle_path, _required_text(bundle, "candidate_sha"))
     with tempfile.TemporaryDirectory(prefix=f"afk-review-{axis}-") as temporary:
         temporary_path = Path(temporary)
         report_path = temporary_path / "report.json"
@@ -698,7 +747,7 @@ def _execute_reviewer(
         return completed.returncode, payload, completed.stdout, completed.stderr
 
 
-def _review_prompt(axis: str, bundle_path: Path) -> str:
+def _review_prompt(axis: str, bundle_path: Path, candidate_sha: str) -> str:
     focus = {
         "standards": (
             "repository instructions, correctness, safety, maintainability, and tests"
@@ -707,11 +756,13 @@ def _review_prompt(axis: str, bundle_path: Path) -> str:
     }[axis]
     return f"""# AFK {axis} review
 
-Independently review the immutable bundle at {bundle_path} with focus on {focus}.
+Independently review Candidate {candidate_sha} on axis {axis} using the immutable
+bundle at {bundle_path}, with focus on {focus}.
 This is a read-only review. Do not edit files, run network commands, or rely on
 another review session. Report `rejected` only with at least one blocking
 finding; advisory findings must set blocking=false. Use stable axis-local IDs.
-Return only the schema-constrained result.
+Return only the schema-constrained result with schema_version=1 and the exact
+Candidate SHA and axis above.
 """
 
 
