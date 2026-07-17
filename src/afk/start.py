@@ -1499,8 +1499,14 @@ def _show_bead(bead_id: str, workspace: Path) -> dict[str, Any]:
     return result[0]
 
 
-def _bead_comments(bead_id: str, workspace: Path) -> list[dict[str, Any]]:
-    comments = _bd_json(["bd", "comments", bead_id, "--json"], cwd=workspace)
+def _bead_comments(bead_id: str, workspace: Path) -> Any:
+    return _bd_json(["bd", "comments", bead_id, "--json"], cwd=workspace)
+
+
+def _validate_start_bead(bead: dict[str, Any], bead_id: str, repository: str) -> None:
+    if bead.get("id") != bead_id or bead.get("status") != "open":
+        raise StartError(f"Bead is not open and exact: {bead_id}")
+    comments = bead.get("comments")
     required = ("id", "issue_id", "author", "text", "created_at")
     if not isinstance(comments, list) or not all(
         isinstance(comment, dict)
@@ -1512,12 +1518,6 @@ def _bead_comments(bead_id: str, workspace: Path) -> list[dict[str, Any]]:
         for comment in comments
     ):
         raise _malformed_beads_output()
-    return comments
-
-
-def _validate_start_bead(bead: dict[str, Any], bead_id: str, repository: str) -> None:
-    if bead.get("id") != bead_id or bead.get("status") != "open":
-        raise StartError(f"Bead is not open and exact: {bead_id}")
     project_label = f"project:{repository.rsplit('/', 1)[-1]}"
     labels = bead.get("labels")
     if not isinstance(labels, list) or not all(

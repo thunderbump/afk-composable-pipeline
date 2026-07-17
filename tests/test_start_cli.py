@@ -490,6 +490,7 @@ class StartCliTest(unittest.TestCase):
         status = json.loads(self.run_afk("status", run_id, "--json").stdout)
         self.assertEqual(status["checkpoint"], "created")
         self.assertEqual(status["attention"]["scope"], "bead_preflight")
+        self.assertEqual(status["attention"]["kind"], "invalid")
         self.assertEqual(status["attention"]["classification"], "malformed_output")
         self.assertFalse(
             (
