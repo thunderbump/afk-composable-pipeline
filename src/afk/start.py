@@ -170,8 +170,24 @@ def resume_run(*, note: str | None = None) -> tuple[str, int]:
             return run_id, _advance_interrupted_repair(store, run_id, projection)
         if _repair_resume_ready(projection):
             return run_id, _advance_completed_gate(store, run_id)
+        gate_retry = _pending_gate_retry(projection)
+        if gate_retry is not None:
+            return run_id, _advance_gate(store, run_id, retry=gate_retry["retry"])
         attention = projection.get("attention")
         if isinstance(attention, dict) and attention.get("scope") == "gate":
+            gate_retry = _gate_retry_authorization(projection, note)
+            if gate_retry is not None:
+                store.append_event(
+                    run_id,
+                    "gate.retry_authorized",
+                    state="validated",
+                    data={
+                        "checkpoint": "validated",
+                        "attention": {},
+                        "gate_retry": gate_retry,
+                    },
+                )
+                return run_id, _advance_gate(store, run_id, retry=gate_retry["retry"])
             if _gate_attention_resume_ready(store, run_id, projection):
                 return run_id, _advance_gate(store, run_id)
             return run_id, 2
@@ -419,6 +435,77 @@ def _gate_attention_resume_ready(
         and brief.get("candidate_sha") == candidate_sha
         and brief.get("repair_attempt") == cycle
     )
+
+
+def _gate_retry_authorization(
+    projection: dict[str, Any], note: str | None
+) -> dict[str, Any] | None:
+    attention = projection.get("attention")
+    cycles = projection.get("gate_cycles")
+    if (
+        not isinstance(note, str)
+        or not note.strip()
+        or not isinstance(attention, dict)
+        or attention.get("scope") != "gate"
+        or attention.get("kind") != "inconclusive"
+        or not isinstance(cycles, list)
+        or not cycles
+        or not isinstance(cycles[-1], dict)
+    ):
+        return None
+    latest = cycles[-1]
+    reviews = latest.get("reviews")
+    candidate_sha = projection.get("candidate_sha")
+    validation = projection.get("validation")
+    cycle = latest.get("cycle")
+    if (
+        latest.get("next_action") != "attention"
+        or latest.get("stop_reason")
+        or latest.get("candidate_sha") != candidate_sha
+        or not isinstance(validation, dict)
+        or validation.get("candidate_sha") != candidate_sha
+        or validation.get("status") != "passed"
+        or type(cycle) is not int
+        or cycle <= 0
+        or not isinstance(reviews, list)
+        or not any(
+            isinstance(review, dict) and review.get("status") == "inconclusive"
+            for review in reviews
+        )
+    ):
+        return None
+    prior_retries = [
+        item.get("retry", 0)
+        for item in cycles
+        if isinstance(item, dict)
+        and item.get("cycle") == cycle
+        and item.get("candidate_sha") == candidate_sha
+        and type(item.get("retry", 0)) is int
+    ]
+    return {
+        "schema_version": 1,
+        "candidate_sha": candidate_sha,
+        "cycle": cycle,
+        "retry": max(prior_retries, default=0) + 1,
+        "note": note.strip(),
+    }
+
+
+def _pending_gate_retry(projection: dict[str, Any]) -> dict[str, Any] | None:
+    retry = projection.get("gate_retry")
+    if (
+        isinstance(retry, dict)
+        and retry.get("schema_version") == 1
+        and retry.get("candidate_sha") == projection.get("candidate_sha")
+        and type(retry.get("cycle")) is int
+        and type(retry.get("retry")) is int
+        and retry["cycle"] > 0
+        and retry["retry"] > 0
+        and isinstance(retry.get("note"), str)
+        and retry["note"]
+    ):
+        return retry
+    return None
 
 
 def _repair_resume_ready(projection: dict[str, Any]) -> bool:
@@ -933,10 +1020,10 @@ def _advance_candidate(store: RunStore, run_id: str) -> int:
     return _advance_validation_then_gate(store, run_id)
 
 
-def _advance_gate(store: RunStore, run_id: str) -> int:
+def _advance_gate(store: RunStore, run_id: str, *, retry: int = 0) -> int:
     try:
         bead = _bead_for_run(store, run_id)
-        outcome = complete_gate_cycle(store, run_id, bead=bead)
+        outcome = complete_gate_cycle(store, run_id, bead=bead, retry=retry)
     except GateError as exc:
         _attention(
             store,

@@ -1145,7 +1145,16 @@ class CandidateGateTest(unittest.TestCase):
                     "cycle": cycle,
                     "candidate_sha": candidate_sha,
                     "validation": validation,
-                    "reviews": [],
+                    "reviews": (
+                        [
+                            {
+                                "axis": "standards",
+                                "status": "inconclusive",
+                            }
+                        ]
+                        if label == "inconclusive"
+                        else []
+                    ),
                     "prior_dispositions": [],
                     "next_action": "attention",
                     "evidence": gate_evidence,
@@ -1193,6 +1202,34 @@ class CandidateGateTest(unittest.TestCase):
                 self.assertEqual(resumed, (run_id, 2))
                 self.assertEqual(status["last_sequence"], last_sequence)
                 self.assertEqual(status["attention"], attention)
+
+                with (
+                    mock.patch("afk.start.RunStore", return_value=store),
+                    mock.patch("afk.start._advance_gate", return_value=0) as advance,
+                ):
+                    authorized = resume_run(note="review runtime fixed")
+
+                if label == "inconclusive":
+                    self.assertEqual(authorized, (run_id, 0))
+                    advance.assert_called_once_with(store, run_id, retry=1)
+                    retry = store.status(run_id)["gate_retry"]
+                    self.assertEqual(retry["cycle"], cycle)
+                    self.assertEqual(retry["retry"], 1)
+                    self.assertEqual(retry["note"], "review runtime fixed")
+
+                    with (
+                        mock.patch("afk.start.RunStore", return_value=store),
+                        mock.patch(
+                            "afk.start._advance_gate", return_value=0
+                        ) as continued_gate,
+                    ):
+                        continued = resume_run()
+
+                    self.assertEqual(continued, (run_id, 0))
+                    continued_gate.assert_called_once_with(store, run_id, retry=1)
+                else:
+                    self.assertEqual(authorized, (run_id, 2))
+                    advance.assert_not_called()
 
     def test_resume_keeps_interrupted_repair_continuation_after_attention(self):
         for checkpoint in ("validated", "candidate_ready"):
@@ -1421,6 +1458,96 @@ class CandidateGateTest(unittest.TestCase):
 
             self.assertEqual(outcome["next_action"], "attention")
             self.assertEqual(store.status(run_id)["checkpoint"], "validated")
+
+    def test_explicit_gate_retry_writes_fresh_evidence(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store, run_id, _, candidate_sha, _ = self._published_validated_candidate(
+                root
+            )
+            persist_bead_spec(store, run_id, {"id": "central-test.1"})
+            original_evidence = f"gates/gate-cycle-1-{candidate_sha[:12]}"
+            original = {
+                "schema_version": 1,
+                "cycle": 1,
+                "candidate_sha": candidate_sha,
+                "reviews": [{"axis": "standards", "status": "inconclusive"}],
+                "next_action": "attention",
+                "evidence": original_evidence,
+            }
+            store.write_evidence_value(
+                run_id, f"{original_evidence}/outcome.json", original
+            )
+            store.seal_evidence(run_id, original_evidence)
+            store.append_event(
+                run_id,
+                "gate.cycle_completed",
+                state="validated",
+                data={
+                    "checkpoint": "validated",
+                    "gate_cycles": [original],
+                    "attention": {},
+                },
+            )
+            original_manifest = (
+                root / "state" / "runs" / run_id / original_evidence / "manifest.json"
+            ).read_bytes()
+
+            def reviewer(axis, bundle_path, attempt_path, worktree):
+                return (
+                    0,
+                    {
+                        "schema_version": 1,
+                        "candidate_sha": candidate_sha,
+                        "axis": axis,
+                        "status": "passed",
+                        "summary": f"{axis} passed",
+                        "findings": [],
+                    },
+                    "events\n",
+                    "",
+                )
+
+            with (
+                mock.patch(
+                    "afk.candidate_gate._execute_reviewer", side_effect=reviewer
+                ),
+                mock.patch("afk.candidate_gate.reconcile_gate_comment"),
+            ):
+                outcome = complete_gate_cycle(
+                    store,
+                    run_id,
+                    bead={"id": "central-test.1"},
+                    retry=1,
+                )
+
+            retry_evidence = f"gates/gate-cycle-1-retry-1-{candidate_sha[:12]}"
+            self.assertEqual(outcome["retry"], 1)
+            self.assertEqual(outcome["evidence"], retry_evidence)
+            self.assertEqual(outcome["next_action"], "complete")
+            self.assertEqual(store.status(run_id)["checkpoint"], "reviewed")
+            self.assertEqual(store.status(run_id)["gate_retry"], {})
+            self.assertEqual(
+                (
+                    root
+                    / "state"
+                    / "runs"
+                    / run_id
+                    / original_evidence
+                    / "manifest.json"
+                ).read_bytes(),
+                original_manifest,
+            )
+            for axis in ("standards", "spec"):
+                self.assertTrue(
+                    (
+                        root
+                        / "state"
+                        / "runs"
+                        / run_id
+                        / f"attempts/review-cycle-1-retry-1-{axis}/manifest.json"
+                    ).is_file()
+                )
 
     def test_four_rejected_repairs_exhaust_the_budget_without_a_fifth_brief(self):
         with tempfile.TemporaryDirectory() as temporary:

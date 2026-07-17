@@ -94,7 +94,10 @@ def complete_gate_cycle(
     run_id: str,
     *,
     bead: dict[str, Any],
+    retry: int = 0,
 ) -> dict[str, Any]:
+    if type(retry) is not int or retry < 0:
+        raise GateError("Gate retry number is invalid")
     bead = load_bead_spec(store, run_id, fallback=bead)
     projection = store.status(run_id)
     _require_candidate_publication(store, run_id, projection)
@@ -117,7 +120,8 @@ def complete_gate_cycle(
     if type(used) is not int or not 0 <= used <= 4:
         raise GateError("repair budget state is invalid")
     cycle = used + 1
-    evidence = f"gates/gate-cycle-{cycle}-{candidate_sha[:12]}"
+    retry_segment = f"-retry-{retry}" if retry else ""
+    evidence = f"gates/gate-cycle-{cycle}{retry_segment}-{candidate_sha[:12]}"
     evidence_path = store.root / "runs" / run_id / evidence
 
     if (evidence_path / "manifest.json").exists():
@@ -140,7 +144,7 @@ def complete_gate_cycle(
                     "unsealed Gate Cycle evidence is ambiguous", kind="inconclusive"
                 )
         reviews = (
-            run_candidate_reviews(store, run_id, cycle=cycle, bead=bead)
+            run_candidate_reviews(store, run_id, cycle=cycle, retry=retry, bead=bead)
             if validation["status"] == "passed"
             else []
         )
@@ -177,6 +181,8 @@ def complete_gate_cycle(
             "next_action": next_action,
             "evidence": evidence,
         }
+        if retry:
+            outcome["retry"] = retry
         if next_action == "repair":
             outcome["repair_brief"] = build_repair_brief(
                 candidate_sha=candidate_sha,
@@ -226,6 +232,7 @@ def complete_gate_cycle(
         isinstance(item, dict)
         and item.get("cycle") == cycle
         and item.get("candidate_sha") == candidate_sha
+        and item.get("retry", 0) == retry
         for item in cycles
     ):
         checkpoint = (
@@ -240,6 +247,7 @@ def complete_gate_cycle(
             data={
                 "checkpoint": checkpoint,
                 "gate_cycles": [*cycles, outcome],
+                "gate_retry": {},
                 "attention": {},
             },
         )
@@ -267,9 +275,13 @@ def reconcile_gate_comment(
     cycle = gate.get("cycle")
     if type(cycle) is not int or cycle <= 0:
         raise GateError("Gate Cycle number is invalid")
-    marker = f"<!-- afk-gate:{run_id}:{cycle} -->"
+    retry = gate.get("retry", 0)
+    if type(retry) is not int or retry < 0:
+        raise GateError("Gate retry number is invalid")
+    retry_segment = f":retry-{retry}" if retry else ""
+    marker = f"<!-- afk-gate:{run_id}:{cycle}{retry_segment} -->"
     body = _gate_comment_body(gate, marker)
-    effect_id = f"gate-comment-{cycle}"
+    effect_id = f"gate-comment-{cycle}{f'-retry-{retry}' if retry else ''}"
     effect = store.prepare_effect(
         run_id,
         effect_id,
@@ -278,6 +290,7 @@ def reconcile_gate_comment(
             "repository": identity["repository"],
             "pr_number": pr_number,
             "cycle": cycle,
+            "retry": retry,
             "candidate_sha": gate.get("candidate_sha"),
             "body_sha256": hashlib.sha256(body.encode("utf-8")).hexdigest(),
         },
@@ -311,8 +324,11 @@ def run_candidate_reviews(
     run_id: str,
     *,
     cycle: int,
+    retry: int = 0,
     bead: dict[str, Any],
 ) -> list[dict[str, Any]]:
+    if type(retry) is not int or retry < 0:
+        raise GateError("Gate retry number is invalid")
     bead = load_bead_spec(store, run_id, fallback=bead)
     projection = store.status(run_id)
     identity = store.identity(run_id)
@@ -357,7 +373,10 @@ def run_candidate_reviews(
     }
     expected_bundle = redact_artifact_value(bundle_value)
 
-    bundle = f"gates/gate-cycle-{cycle}-{candidate_sha[:12]}/review-bundle"
+    retry_segment = f"-retry-{retry}" if retry else ""
+    bundle = (
+        f"gates/gate-cycle-{cycle}{retry_segment}-{candidate_sha[:12]}" "/review-bundle"
+    )
     bundle_path = store.root / "runs" / run_id / bundle
     if not bundle_path.exists():
         expected_bundle = store.write_evidence_value(
@@ -375,7 +394,7 @@ def run_candidate_reviews(
 
     reviews = []
     for axis in REVIEW_AXES:
-        attempt = f"attempts/review-cycle-{cycle}-{axis}"
+        attempt = f"attempts/review-cycle-{cycle}{retry_segment}-{axis}"
         attempt_path = store.root / "runs" / run_id / attempt
         if attempt_path.exists():
             if not (attempt_path / "manifest.json").is_file():
@@ -902,9 +921,11 @@ def _required_text(value: dict[str, Any], key: str) -> str:
 def _gate_comment_body(gate: dict[str, Any], marker: str) -> str:
     validation = gate.get("validation", {})
     reviews = gate.get("reviews", [])
+    retry = gate.get("retry", 0)
+    retry_label = f" (retry {retry})" if retry else ""
     lines = [
         marker,
-        f"## AFK Gate Cycle {gate['cycle']}",
+        f"## AFK Gate Cycle {gate['cycle']}{retry_label}",
         "",
         f"Candidate: `{gate.get('candidate_sha', '')}`",
         (
