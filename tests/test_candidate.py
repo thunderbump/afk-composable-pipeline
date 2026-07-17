@@ -19,7 +19,8 @@ from afk.candidate import (  # noqa: E402
     produce_candidate,
     produce_repair_candidate,
 )
-from afk.run_store import RunStore  # noqa: E402
+from afk.run_store import EvidenceTampered, RunStore  # noqa: E402
+from afk.start import resume_run  # noqa: E402
 
 
 class CandidateTest(unittest.TestCase):
@@ -95,7 +96,10 @@ class CandidateTest(unittest.TestCase):
             repository="owner/project",
             base_branch="main",
             base_sha=self.base_sha,
-            start_request={"repository_root": str(self.checkout)},
+            start_request={
+                "repository_root": str(self.checkout),
+                "beads_workspace": str(self.temp),
+            },
             run_id="run-1",
         )
         self.store.append_event(
@@ -311,6 +315,171 @@ class CandidateTest(unittest.TestCase):
         self.assertTrue((attempt / "manifest.json").is_file())
         self.assertEqual(self.store.status("run-1")["repair_attempts_used"], 1)
 
+    def test_repair_resume_reconciles_crash_windows_without_rerunning_codex(self):
+        first = self.produce()
+        brief = {
+            "schema_version": 1,
+            "candidate_sha": first["candidate_sha"],
+            "repair_attempt": 1,
+            "blocking_findings": [
+                {
+                    "id": "validation-smoke",
+                    "source": "validation",
+                    "title": "Smoke test failed",
+                    "body": "Repair it.",
+                    "blocking": True,
+                }
+            ],
+        }
+        bead = {
+            "id": "central-test.1",
+            "title": "Implement the thing",
+            "description": "Change one file.",
+            "acceptance_criteria": "The file exists.",
+        }
+        gate_outcome = {"next_action": "repair", "repair_brief": brief}
+        self.store.append_event(
+            "run-1",
+            "gate.cycle_completed",
+            state="candidate_ready",
+            data={
+                "checkpoint": "candidate_ready",
+                "gate_cycles": [gate_outcome],
+            },
+        )
+
+        with (
+            mock.patch.dict(os.environ, self._candidate_environment(), clear=True),
+            mock.patch(
+                "afk.candidate._verify_candidate",
+                side_effect=RuntimeError("crash after sealed report"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "crash after sealed report"),
+        ):
+            produce_repair_candidate(
+                self.store,
+                "run-1",
+                bead=bead,
+                repair_brief=brief,
+            )
+
+        attempt = self.state / "runs" / "run-1" / "attempts" / "repair-1"
+        self.assertTrue((attempt / "manifest.json").is_file())
+        codex = self.bin / "codex"
+        disabled_codex = self.bin / "codex.disabled"
+        codex.rename(disabled_codex)
+        with (
+            mock.patch.dict(os.environ, self._candidate_environment(), clear=True),
+            mock.patch("afk.start.RunStore", return_value=self.store),
+            mock.patch("afk.start._show_bead", return_value=bead),
+            mock.patch("afk.start._advance_validation", return_value=0),
+        ):
+            resumed_run_id, resumed_exit = resume_run()
+        self.assertEqual((resumed_run_id, resumed_exit), ("run-1", 0))
+        resumed = self.store.status("run-1")
+
+        self.assertEqual(resumed["repair_attempts_used"], 1)
+        self.assertEqual(resumed["previous_candidate_sha"], first["candidate_sha"])
+        disabled_codex.rename(codex)
+
+        second_brief = {
+            **brief,
+            "candidate_sha": resumed["candidate_sha"],
+            "repair_attempt": 2,
+        }
+        original_confirm = self.store.confirm_effect
+
+        def crash_before_push_confirmation(run_id, effect_id, *, observed):
+            if effect_id.startswith("branch-push-"):
+                raise RuntimeError("crash after push before confirmation")
+            return original_confirm(run_id, effect_id, observed=observed)
+
+        with (
+            mock.patch.dict(os.environ, self._candidate_environment(), clear=True),
+            mock.patch.object(
+                self.store,
+                "confirm_effect",
+                side_effect=crash_before_push_confirmation,
+            ),
+            self.assertRaisesRegex(RuntimeError, "after push before confirmation"),
+        ):
+            produce_repair_candidate(
+                self.store,
+                "run-1",
+                bead=bead,
+                repair_brief=second_brief,
+            )
+
+        second_sha = self.git("rev-parse", "HEAD")
+        self.assertEqual(
+            self.store.effect("run-1", f"branch-push-{second_sha}")["status"],
+            "prepared",
+        )
+        codex.rename(disabled_codex)
+        with mock.patch.dict(os.environ, self._candidate_environment(), clear=True):
+            second = produce_repair_candidate(
+                self.store,
+                "run-1",
+                bead=bead,
+                repair_brief=second_brief,
+            )
+        self.assertEqual(second["repair_attempts_used"], 2)
+        self.assertEqual(
+            self.store.effect("run-1", f"branch-push-{second_sha}")["status"],
+            "confirmed",
+        )
+        disabled_codex.rename(codex)
+
+        third_brief = {
+            **brief,
+            "candidate_sha": second["candidate_sha"],
+            "repair_attempt": 3,
+        }
+        original_append = self.store.append_event
+
+        def crash_before_candidate_event(run_id, event, **kwargs):
+            if event == "candidate.repaired":
+                raise RuntimeError("crash before candidate repaired event")
+            return original_append(run_id, event, **kwargs)
+
+        with (
+            mock.patch.dict(os.environ, self._candidate_environment(), clear=True),
+            mock.patch.object(
+                self.store, "append_event", side_effect=crash_before_candidate_event
+            ),
+            self.assertRaisesRegex(RuntimeError, "before candidate repaired event"),
+        ):
+            produce_repair_candidate(
+                self.store,
+                "run-1",
+                bead=bead,
+                repair_brief=third_brief,
+            )
+
+        third_sha = self.git("rev-parse", "HEAD")
+        self.assertEqual(
+            self.store.effect("run-1", f"branch-push-{third_sha}")["status"],
+            "confirmed",
+        )
+        codex.rename(disabled_codex)
+        with mock.patch.dict(os.environ, self._candidate_environment(), clear=True):
+            third = produce_repair_candidate(
+                self.store,
+                "run-1",
+                bead=bead,
+                repair_brief=third_brief,
+            )
+        self.assertEqual(third["repair_attempts_used"], 3)
+        events = [
+            json.loads(line)
+            for line in (self.state / "runs" / "run-1" / "events.jsonl")
+            .read_text(encoding="utf-8")
+            .splitlines()
+        ]
+        self.assertEqual(
+            [event["event"] for event in events].count("candidate.repaired"), 3
+        )
+
     def _candidate_environment(self):
         environment = os.environ.copy()
         environment.update(
@@ -323,6 +492,102 @@ class CandidateTest(unittest.TestCase):
             }
         )
         return environment
+
+    def test_repair_resume_rejects_unsealed_tampered_or_invalid_evidence(self):
+        first = self.produce()
+        candidate_sha = first["candidate_sha"]
+        codex = self.bin / "codex"
+        codex.unlink()
+
+        def brief(attempt):
+            return {
+                "schema_version": 1,
+                "candidate_sha": candidate_sha,
+                "repair_attempt": attempt,
+                "blocking_findings": [
+                    {
+                        "id": "validation-smoke",
+                        "source": "validation",
+                        "title": "Smoke failed",
+                        "body": "Repair it.",
+                        "blocking": True,
+                    }
+                ],
+            }
+
+        def start_attempt(attempt, repair_brief):
+            self.store.append_event(
+                "run-1",
+                "repair.started",
+                data={
+                    "checkpoint": "candidate_ready",
+                    "repair_attempts_used": attempt,
+                    "repair_brief": repair_brief,
+                },
+            )
+
+        bead = {
+            "id": "central-test.1",
+            "title": "Implement the thing",
+            "description": "Change one file.",
+            "acceptance_criteria": "The file exists.",
+        }
+        first_brief = brief(1)
+        start_attempt(1, first_brief)
+        self.store.write_evidence_text(
+            "run-1", "attempts/repair-1/prompt.md", "started\n"
+        )
+        with self.assertRaisesRegex(CandidateError, "incomplete"):
+            produce_repair_candidate(
+                self.store, "run-1", bead=bead, repair_brief=first_brief
+            )
+
+        valid_report = {
+            "status": "completed",
+            "starting_sha": candidate_sha,
+            "ending_sha": candidate_sha,
+            "summary": "repaired",
+            "checks": [],
+            "changed_areas": ["app"],
+            "dispositions": [
+                {"finding_id": "validation-smoke", "disposition": "addressed"}
+            ],
+        }
+        second_brief = brief(2)
+        start_attempt(2, second_brief)
+        self.store.write_evidence_text(
+            "run-1",
+            "attempts/repair-2/report.json",
+            json.dumps(valid_report),
+        )
+        self.store.seal_evidence("run-1", "attempts/repair-2")
+        tampered = self.state / "runs/run-1/attempts/repair-2/report.json"
+        tampered.chmod(0o600)
+        tampered.write_text("{}", encoding="utf-8")
+        tampered.chmod(0o400)
+        with self.assertRaises(EvidenceTampered):
+            produce_repair_candidate(
+                self.store, "run-1", bead=bead, repair_brief=second_brief
+            )
+
+        third_brief = brief(3)
+        start_attempt(3, third_brief)
+        invalid_report = {
+            **valid_report,
+            "dispositions": [
+                {"finding_id": "wrong-finding", "disposition": "addressed"}
+            ],
+        }
+        self.store.write_evidence_text(
+            "run-1",
+            "attempts/repair-3/report.json",
+            json.dumps(invalid_report),
+        )
+        self.store.seal_evidence("run-1", "attempts/repair-3")
+        with self.assertRaisesRegex(CandidateError, "dispositions"):
+            produce_repair_candidate(
+                self.store, "run-1", bead=bead, repair_brief=third_brief
+            )
 
     def test_allows_only_codex_package_when_installed_beneath_home(self):
         package = self.home / ".local/lib/node_modules/@openai/codex"
@@ -460,7 +725,8 @@ class CandidateTest(unittest.TestCase):
                 outcome = (Path(os.environ["CODEX_HOME"]) / "fake-outcome").read_text()
                 start = subprocess.run(["git", "rev-parse", "HEAD"], cwd=cwd, text=True, capture_output=True, check=True).stdout.strip()  # noqa: E501
                 repair = "# AFK repair attempt" in prompt
-                changed = "repair.txt" if repair else "candidate.txt"
+                repair_attempt = prompt.split("Attempt: repair-")[1].splitlines()[0] if repair else ""  # noqa: E501
+                changed = f"repair-{{repair_attempt}}.txt" if repair else "candidate.txt"
                 if outcome not in {"no_change", "nonzero", "malformed"}:
                     (cwd / changed).write_text("candidate\\n", encoding="utf-8")
                     subprocess.run(["git", "add", changed], cwd=cwd, check=True)

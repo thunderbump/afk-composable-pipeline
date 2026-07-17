@@ -159,6 +159,8 @@ def resume_run(*, note: str | None = None) -> tuple[str, int]:
             return run_id, _advance_gate(store, run_id)
         if projection["last_event"] == "gate.cycle_completed":
             return run_id, _advance_completed_gate(store, run_id)
+        if _repair_resume_ready(projection):
+            return run_id, _advance_completed_gate(store, run_id)
         if "worker_exit_code" in projection:
             if _candidate_resume_ready(projection):
                 return run_id, _advance_candidate(store, run_id)
@@ -336,6 +338,16 @@ def _validation_resume_ready(projection: dict[str, Any]) -> bool:
         and isinstance(attention, dict)
         and attention.get("scope") == "validation"
         and attention.get("kind") in {"unavailable", "inconclusive", "interrupted"}
+    )
+
+
+def _repair_resume_ready(projection: dict[str, Any]) -> bool:
+    brief = projection.get("repair_brief")
+    return (
+        projection["checkpoint"] == "candidate_ready"
+        and isinstance(brief, dict)
+        and brief.get("candidate_sha") == projection.get("candidate_sha")
+        and brief.get("repair_attempt") == projection.get("repair_attempts_used")
     )
 
 

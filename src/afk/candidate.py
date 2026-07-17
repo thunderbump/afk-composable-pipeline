@@ -196,7 +196,33 @@ def produce_repair_candidate(
     attempt = f"attempts/repair-{attempt_number}"
     attempt_path = store.root / "runs" / run_id / attempt
     if attempt_path.exists():
-        raise CandidateError("repair attempt was already started")
+        if (
+            projection.get("repair_attempts_used") != attempt_number
+            or projection.get("repair_brief") != repair_brief
+        ):
+            raise CandidateError("repair attempt is not bound to the current brief")
+        if not (attempt_path / "manifest.json").is_file():
+            raise CandidateError("repair attempt is incomplete", kind="inconclusive")
+        if not store.verify_evidence(run_id, attempt):
+            raise CandidateError("repair attempt evidence could not be verified")
+        result_paths = [
+            path
+            for name in ("report.json", "outcome.json")
+            if (path := attempt_path / name).is_file()
+        ]
+        if len(result_paths) != 1 or result_paths[0].name != "report.json":
+            raise CandidateError("repair attempt did not produce a completed report")
+        report = _read_repair_report(result_paths[0], repair_brief)
+        return _finish_repair_candidate(
+            store,
+            run_id,
+            identity=identity,
+            worktree=worktree,
+            branch=branch,
+            previous_sha=previous_sha,
+            attempt_number=attempt_number,
+            report=report,
+        )
 
     store.append_event(
         run_id,
@@ -268,6 +294,29 @@ def produce_repair_candidate(
     )
     store.seal_evidence(run_id, attempt)
 
+    return _finish_repair_candidate(
+        store,
+        run_id,
+        identity=identity,
+        worktree=worktree,
+        branch=branch,
+        previous_sha=previous_sha,
+        attempt_number=attempt_number,
+        report=report,
+    )
+
+
+def _finish_repair_candidate(
+    store: RunStore,
+    run_id: str,
+    *,
+    identity: dict[str, Any],
+    worktree: Path,
+    branch: str,
+    previous_sha: str,
+    attempt_number: int,
+    report: dict[str, Any],
+) -> dict[str, Any]:
     candidate_sha = _verify_candidate(
         worktree,
         branch=branch,
