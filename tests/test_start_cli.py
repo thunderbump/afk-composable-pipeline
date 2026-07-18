@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 import afk.run_store as run_store_module  # noqa: E402
-from afk.run_store import RunStore, RunStoreBusy  # noqa: E402
+from afk.run_store import RunStore, RunStoreBusy, RunStoreError  # noqa: E402
 from afk.start import (  # noqa: E402
     StartError,
     _beads_password,
@@ -103,6 +103,13 @@ class StartCliTest(unittest.TestCase):
             capture_output=True,
             check=False,
         )
+
+    def start_reviewed_run(self):
+        started = self.run_afk("start", "central-bnkl.1.1")
+        run_id = started.stdout.strip()
+        worker = self.run_afk("_worker", run_id)
+        self.assertEqual(worker.returncode, 0, worker.stderr)
+        return run_id
 
     def test_start_launches_numbered_transient_worker_and_reports_checkpoint(self):
         completed = self.run_afk("start", "central-bnkl.1.1")
@@ -227,6 +234,247 @@ class StartCliTest(unittest.TestCase):
             '"command":"bd","args":["update","central-bnkl.1.1","--claim"', commands
         )
         self.assertIn(BASE_SHA, commands)
+
+    def test_resume_marks_the_exact_reviewed_candidate_pr_ready_idempotently(self):
+        run_id = self.start_reviewed_run()
+
+        resumed = self.run_afk("resume")
+
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        self.assertEqual(resumed.stdout.strip(), run_id)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(status["state"], "reviewed")
+        self.assertEqual(
+            status["pr_ready"],
+            {
+                "number": 17,
+                "url": "https://example.test/pr/17",
+                "candidate_sha": "d" * 40,
+                "head": f"afk/central-bnkl-1-1-{run_id}/candidate",
+                "base": "main",
+                "draft": False,
+            },
+        )
+        effect = RunStore(self.state_home / "afk").effect(run_id, "pr-mark-ready")
+        self.assertEqual(effect["status"], "confirmed")
+        self.assertEqual(effect["observed"], status["pr_ready"])
+
+        repeated = self.run_afk("resume")
+
+        self.assertEqual(repeated.returncode, 0, repeated.stderr)
+        commands = [
+            json.loads(line)
+            for line in self.command_log.read_text(encoding="utf-8").splitlines()
+        ]
+        ready_commands = [
+            record
+            for record in commands
+            if record["command"] == "gh" and record["args"][:2] == ["pr", "ready"]
+        ]
+        self.assertEqual(len(ready_commands), 1)
+
+    def test_resume_clears_transient_attention_after_ready_pr_is_observed_again(self):
+        run_id = self.start_reviewed_run()
+        ready = self.run_afk("resume")
+        self.assertEqual(ready.returncode, 0, ready.stderr)
+
+        unavailable = self.run_afk("resume", AFK_FAKE_READY_PR_UNAVAILABLE="1")
+        self.assertEqual(unavailable.returncode, 2, unavailable.stderr)
+
+        resumed = self.run_afk("resume")
+
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(status["state"], "reviewed")
+        self.assertEqual(status["attention"], {})
+        commands = [
+            json.loads(line)
+            for line in self.command_log.read_text(encoding="utf-8").splitlines()
+        ]
+        ready_commands = [
+            record
+            for record in commands
+            if record["command"] == "gh" and record["args"][:2] == ["pr", "ready"]
+        ]
+        self.assertEqual(len(ready_commands), 1)
+
+    def test_resume_pauses_when_pr_was_readied_without_an_existing_effect(self):
+        run_id = self.start_reviewed_run()
+        pr_state = self.state_home / "fake-pr.json"
+        pr = json.loads(pr_state.read_text(encoding="utf-8"))
+        pr["isDraft"] = False
+        pr_state.write_text(json.dumps(pr), encoding="utf-8")
+
+        resumed = self.run_afk("resume")
+
+        self.assertEqual(resumed.returncode, 2, resumed.stderr)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(status["state"], "attention_required")
+        self.assertEqual(status["attention"]["scope"], "publication")
+        self.assertEqual(status["attention"]["kind"], "conflict")
+        with self.assertRaises(RunStoreError):
+            RunStore(self.state_home / "afk").effect(run_id, "pr-mark-ready")
+        commands = self.command_log.read_text(encoding="utf-8")
+        self.assertNotIn('"args":["pr","ready"', commands)
+
+    def test_resume_reconciles_interruption_after_marking_pr_ready(self):
+        run_id = self.start_reviewed_run()
+
+        interrupted = self.run_afk("resume", AFK_FAKE_PR_READY_INTERRUPTED="1")
+
+        self.assertEqual(interrupted.returncode, 2, interrupted.stderr)
+        store = RunStore(self.state_home / "afk")
+        self.assertEqual(store.effect(run_id, "pr-mark-ready")["status"], "prepared")
+
+        resumed = self.run_afk("resume")
+
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertFalse(status["pr_ready"]["draft"])
+        self.assertEqual(store.effect(run_id, "pr-mark-ready")["status"], "confirmed")
+        commands = [
+            json.loads(line)
+            for line in self.command_log.read_text(encoding="utf-8").splitlines()
+        ]
+        ready_commands = [
+            record
+            for record in commands
+            if record["command"] == "gh" and record["args"][:2] == ["pr", "ready"]
+        ]
+        self.assertEqual(len(ready_commands), 1)
+
+    def test_resume_retries_interruption_before_marking_pr_ready(self):
+        run_id = self.start_reviewed_run()
+
+        interrupted = self.run_afk("resume", AFK_FAKE_PR_READY_UNAVAILABLE="1")
+
+        self.assertEqual(interrupted.returncode, 2, interrupted.stderr)
+        store = RunStore(self.state_home / "afk")
+        self.assertEqual(store.effect(run_id, "pr-mark-ready")["status"], "prepared")
+
+        resumed = self.run_afk("resume")
+
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        self.assertEqual(store.effect(run_id, "pr-mark-ready")["status"], "confirmed")
+        effects = list(
+            (self.state_home / "afk" / "runs" / run_id / "effects").glob(
+                "pr-mark-ready.json"
+            )
+        )
+        self.assertEqual(len(effects), 1)
+
+    def test_resume_pauses_before_mutation_when_ready_pr_state_is_malformed(self):
+        run_id = self.start_reviewed_run()
+
+        resumed = self.run_afk("resume", AFK_FAKE_READY_PR_MALFORMED="1")
+
+        self.assertEqual(resumed.returncode, 2, resumed.stderr)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(status["state"], "attention_required")
+        self.assertEqual(status["attention"]["scope"], "publication")
+        with self.assertRaises(RunStoreError):
+            RunStore(self.state_home / "afk").effect(run_id, "pr-mark-ready")
+        commands = self.command_log.read_text(encoding="utf-8")
+        self.assertNotIn('"args":["pr","ready"', commands)
+
+    def test_resume_pauses_before_mutation_when_ready_pr_url_drifts(self):
+        run_id = self.start_reviewed_run()
+
+        resumed = self.run_afk(
+            "resume", AFK_FAKE_READY_PR_URL="https://example.test/pr/99"
+        )
+
+        self.assertEqual(resumed.returncode, 2, resumed.stderr)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(status["attention"]["kind"], "conflict")
+        with self.assertRaises(RunStoreError):
+            RunStore(self.state_home / "afk").effect(run_id, "pr-mark-ready")
+        commands = self.command_log.read_text(encoding="utf-8")
+        self.assertNotIn('"args":["pr","ready"', commands)
+
+    def test_resume_pauses_before_mutation_when_ready_pr_is_ambiguous(self):
+        run_id = self.start_reviewed_run()
+
+        resumed = self.run_afk("resume", AFK_FAKE_READY_PR_AMBIGUOUS="1")
+
+        self.assertEqual(resumed.returncode, 2, resumed.stderr)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(status["attention"]["kind"], "conflict")
+        with self.assertRaises(RunStoreError):
+            RunStore(self.state_home / "afk").effect(run_id, "pr-mark-ready")
+        commands = self.command_log.read_text(encoding="utf-8")
+        self.assertNotIn('"args":["pr","ready"', commands)
+
+    def test_resume_pauses_before_mutation_when_ready_pr_is_unavailable(self):
+        run_id = self.start_reviewed_run()
+
+        resumed = self.run_afk("resume", AFK_FAKE_READY_PR_UNAVAILABLE="1")
+
+        self.assertEqual(resumed.returncode, 2, resumed.stderr)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(status["attention"]["scope"], "publication")
+        with self.assertRaises(RunStoreError):
+            RunStore(self.state_home / "afk").effect(run_id, "pr-mark-ready")
+        commands = self.command_log.read_text(encoding="utf-8")
+        self.assertNotIn('"args":["pr","ready"', commands)
+
+    def test_resume_pauses_before_mutation_when_pinned_target_drifts(self):
+        run_id = self.start_reviewed_run()
+        (self.state_home / "fake-target-drift").write_text("drifted", encoding="utf-8")
+
+        resumed = self.run_afk("resume")
+
+        self.assertEqual(resumed.returncode, 2, resumed.stderr)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(status["attention"]["kind"], "conflict")
+        with self.assertRaises(RunStoreError):
+            RunStore(self.state_home / "afk").effect(run_id, "pr-mark-ready")
+        commands = self.command_log.read_text(encoding="utf-8")
+        self.assertNotIn('"args":["pr","ready"', commands)
+
+    def test_resume_pauses_before_mutation_when_passed_gate_evidence_is_invalid(self):
+        run_id = self.start_reviewed_run()
+        store = RunStore(self.state_home / "afk")
+        status = store.status(run_id)
+        evidence = status["gate_cycles"][-1]["evidence"]
+        manifest = (
+            self.state_home / "afk" / "runs" / run_id / evidence / "manifest.json"
+        )
+        manifest.chmod(0o600)
+        manifest.write_text("{}\n", encoding="utf-8")
+
+        resumed = self.run_afk("resume")
+
+        self.assertEqual(resumed.returncode, 2, resumed.stderr)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(status["attention"]["kind"], "invalid")
+        with self.assertRaises(RunStoreError):
+            store.effect(run_id, "pr-mark-ready")
+        commands = self.command_log.read_text(encoding="utf-8")
+        self.assertNotIn('"args":["pr","ready"', commands)
+
+    def test_resume_pauses_when_projected_gate_contradicts_sealed_outcome(self):
+        run_id = self.start_reviewed_run()
+        store = RunStore(self.state_home / "afk")
+        status = store.status(run_id)
+        contradictory = json.loads(json.dumps(status["gate_cycles"][-1]))
+        contradictory["validation"]["status"] = "rejected"
+        store.append_event(
+            run_id,
+            "gate.projection_corrupted",
+            state="reviewed",
+            data={"gate_cycles": [contradictory]},
+        )
+
+        resumed = self.run_afk("resume")
+
+        self.assertEqual(resumed.returncode, 2, resumed.stderr)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(status["attention"]["kind"], "invalid")
+        with self.assertRaises(RunStoreError):
+            store.effect(run_id, "pr-mark-ready")
+        commands = self.command_log.read_text(encoding="utf-8")
+        self.assertNotIn('"args":["pr","ready"', commands)
 
     def test_complete_reconciles_merged_candidate_and_closed_bead_idempotently(self):
         started = self.run_afk("start", "central-bnkl.1.1")
@@ -1749,7 +1997,17 @@ class StartCliTest(unittest.TestCase):
                         raise SystemExit(f"unexpected git args: {args}")
                 elif command == "gh":
                     if args[:2] == ["pr", "list"]:
-                        print(json.dumps([json.loads(pr_state.read_text())] if pr_state.exists() else []))  # noqa: E501
+                        if os.environ.get("AFK_FAKE_READY_PR_UNAVAILABLE"):
+                            raise SystemExit(1)
+                        elif os.environ.get("AFK_FAKE_READY_PR_MALFORMED"):
+                            print("{")
+                        else:
+                            values = [json.loads(pr_state.read_text())] if pr_state.exists() else []  # noqa: E501
+                            if values and os.environ.get("AFK_FAKE_READY_PR_URL"):
+                                values[0]["url"] = os.environ["AFK_FAKE_READY_PR_URL"]
+                            if values and os.environ.get("AFK_FAKE_READY_PR_AMBIGUOUS"):
+                                values.append(dict(values[0]))
+                            print(json.dumps(values))
                     elif args[:2] == ["pr", "view"]:
                         value = json.loads(pr_state.read_text())
                         if os.environ.get("AFK_FAKE_PR_MERGED"):
@@ -1782,6 +2040,15 @@ class StartCliTest(unittest.TestCase):
                             target_drift.write_text("drifted", encoding="utf-8")
                         if os.environ.get("AFK_FAKE_PR_INTERRUPTED"):
                             raise SystemExit(1)
+                    elif args[:2] == ["pr", "ready"]:
+                        if os.environ.get("AFK_FAKE_PR_READY_UNAVAILABLE"):
+                            raise SystemExit(1)
+                        value = json.loads(pr_state.read_text())
+                        value["isDraft"] = False
+                        pr_state.write_text(json.dumps(value), encoding="utf-8")
+                        if os.environ.get("AFK_FAKE_PR_READY_INTERRUPTED"):
+                            raise SystemExit(1)
+                        print(value["url"])
                     elif args[:1] == ["api"]:
                         if "--method" in args:
                             body = json.loads(sys.stdin.read())["body"]
