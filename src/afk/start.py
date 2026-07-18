@@ -19,6 +19,7 @@ from afk.candidate import (
     merge_candidate_pr,
     produce_candidate,
     produce_repair_candidate,
+    reconcile_candidate_branch_deletion,
     reconcile_interrupted_repair_worktree,
     seal_interrupted_repair_attempt,
 )
@@ -1347,19 +1348,12 @@ def _advance_pr_ready(store: RunStore, run_id: str) -> int:
 
 def _advance_merge(store: RunStore, run_id: str) -> int:
     try:
-        observed, branch_deleted = merge_candidate_pr(store, run_id)
+        observed = merge_candidate_pr(store, run_id)
     except CandidateError as exc:
-        checkpoint = "reviewed"
-        if exc.merged_observation is not None:
-            try:
-                _record_merged(store, run_id, exc.merged_observation, False)
-                checkpoint = "merged"
-            except RunStoreError as conflict:
-                exc = CandidateError(str(conflict), kind="conflict")
         _attention(
             store,
             run_id,
-            checkpoint=checkpoint,
+            checkpoint="reviewed",
             scope="merge",
             kind=exc.kind,
             summary=exc.summary,
@@ -1376,7 +1370,7 @@ def _advance_merge(store: RunStore, run_id: str) -> int:
         )
         return 2
     try:
-        _record_merged(store, run_id, observed, branch_deleted)
+        _record_merged(store, run_id, observed, False)
     except RunStoreError as exc:
         _attention(
             store,
@@ -1387,6 +1381,29 @@ def _advance_merge(store: RunStore, run_id: str) -> int:
             summary=str(exc),
         )
         return 2
+    try:
+        branch_deleted = reconcile_candidate_branch_deletion(store, run_id)
+    except CandidateError as exc:
+        _attention(
+            store,
+            run_id,
+            checkpoint="merged",
+            scope="merge",
+            kind=exc.kind,
+            summary=exc.summary,
+        )
+        return 2
+    except RunStoreError as exc:
+        _attention(
+            store,
+            run_id,
+            checkpoint="merged",
+            scope="merge",
+            kind="conflict",
+            summary=str(exc),
+        )
+        return 2
+    _record_merged(store, run_id, observed, branch_deleted, reconcile=True)
     return 0
 
 
@@ -1395,6 +1412,8 @@ def _record_merged(
     run_id: str,
     observed: dict[str, Any],
     branch_deleted: bool,
+    *,
+    reconcile: bool = False,
 ) -> None:
     projection = store.status(run_id)
     if projection.get("merge") is None:
@@ -1411,6 +1430,21 @@ def _record_merged(
         )
     elif projection.get("merge") != observed:
         raise RunStoreError("merged PR fact contradicts the Run")
+    elif reconcile and (
+        projection["state"] != "merged"
+        or bool(projection.get("attention"))
+        or projection.get("remote_branch_deleted") != branch_deleted
+    ):
+        store.append_event(
+            run_id,
+            "pr.merge_reconciled",
+            state="merged",
+            data={
+                "checkpoint": "merged",
+                "attention": {},
+                "remote_branch_deleted": branch_deleted,
+            },
+        )
 
 
 def _advance_completed_gate(

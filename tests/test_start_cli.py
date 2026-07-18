@@ -407,6 +407,82 @@ class StartCliTest(unittest.TestCase):
             1,
         )
 
+    def test_resume_reconciles_merged_cleanup_after_remote_branch_remediation(self):
+        run_id = self.start_reviewed_run()
+        ready = self.run_afk("resume")
+        self.assertEqual(ready.returncode, 0, ready.stderr)
+        conflicted = self.run_afk("resume", AFK_FAKE_REPLACED_REMOTE_BRANCH="1")
+        self.assertEqual(conflicted.returncode, 2, conflicted.stderr)
+        before = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(before["checkpoint"], "merged")
+        self.assertEqual(before["remote_branch_deleted"], False)
+        (self.state_home / "fake-remote-replaced").unlink()
+
+        resumed = self.run_afk("resume")
+
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(status["state"], "merged")
+        self.assertEqual(status["checkpoint"], "merged")
+        self.assertEqual(status["attention"], {})
+        self.assertEqual(status["remote_branch_deleted"], True)
+        self.assertEqual(status["last_event"], "pr.merge_reconciled")
+        self.assertEqual(status["last_sequence"], before["last_sequence"] + 1)
+        store = RunStore(self.state_home / "afk")
+        self.assertEqual(
+            store.effect(run_id, "remote-branch-delete")["status"], "confirmed"
+        )
+
+        repeated = self.run_afk("resume")
+
+        self.assertEqual(repeated.returncode, 0, repeated.stderr)
+        repeated_status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(repeated_status["last_sequence"], status["last_sequence"])
+        commands = [
+            json.loads(line)
+            for line in self.command_log.read_text(encoding="utf-8").splitlines()
+        ]
+        merge_commands = [
+            record
+            for record in commands
+            if record["command"] == "gh" and record["args"][:2] == ["pr", "merge"]
+        ]
+        self.assertEqual(len(merge_commands), 1)
+
+    def test_resume_records_merge_before_remote_branch_observation_fails(self):
+        run_id = self.start_reviewed_run()
+        ready = self.run_afk("resume")
+        self.assertEqual(ready.returncode, 0, ready.stderr)
+
+        interrupted = self.run_afk("resume", AFK_FAKE_POST_MERGE_REMOTE_UNAVAILABLE="1")
+
+        self.assertEqual(interrupted.returncode, 2, interrupted.stderr)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(status["state"], "attention_required")
+        self.assertEqual(status["checkpoint"], "merged")
+        self.assertEqual(status["merge"]["candidate_sha"], "d" * 40)
+        self.assertEqual(status["merge"]["merge_commit"], "f" * 40)
+        self.assertEqual(status["attention"]["scope"], "merge")
+        store = RunStore(self.state_home / "afk")
+        self.assertEqual(store.effect(run_id, "pr-squash-merge")["status"], "confirmed")
+        self.assertEqual(
+            store.effect(run_id, "remote-branch-delete")["status"], "prepared"
+        )
+
+        resumed = self.run_afk("resume", AFK_FAKE_POST_MERGE_REMOTE_UNAVAILABLE="1")
+
+        self.assertEqual(resumed.returncode, 2, resumed.stderr)
+        commands = [
+            json.loads(line)
+            for line in self.command_log.read_text(encoding="utf-8").splitlines()
+        ]
+        merge_commands = [
+            record
+            for record in commands
+            if record["command"] == "gh" and record["args"][:2] == ["pr", "merge"]
+        ]
+        self.assertEqual(len(merge_commands), 1)
+
     def test_resume_pauses_when_merged_pr_effect_identity_does_not_match(self):
         run_id = self.start_reviewed_run()
         ready = self.run_afk("resume")
@@ -2195,6 +2271,11 @@ class StartCliTest(unittest.TestCase):
                                 value = json.loads(pr_state.read_text())
                                 value["baseRefName"] = "release"
                                 pr_state.write_text(json.dumps(value), encoding="utf-8")
+                        elif (
+                            os.environ.get("AFK_FAKE_POST_MERGE_REMOTE_UNAVAILABLE")
+                            and remote_deleted.exists()
+                        ):
+                            raise SystemExit(1)
                         elif remote_replaced.exists():
                             print("a" * 40 + "\\t" + requested)
                         elif pushed_marker.exists() and not remote_deleted.exists():

@@ -88,14 +88,12 @@ class CandidateError(RuntimeError):
         kind: str = "inconclusive",
         stdout: str = "",
         stderr: str = "",
-        merged_observation: dict[str, Any] | None = None,
     ):
         super().__init__(summary)
         self.summary = summary
         self.kind = kind
         self.stdout = stdout
         self.stderr = stderr
-        self.merged_observation = merged_observation
 
 
 def produce_candidate(
@@ -1047,7 +1045,7 @@ def _ready_pr_observation(pr: dict[str, Any], candidate_sha: str) -> dict[str, A
     }
 
 
-def merge_candidate_pr(store: RunStore, run_id: str) -> tuple[dict[str, Any], bool]:
+def merge_candidate_pr(store: RunStore, run_id: str) -> dict[str, Any]:
     identity = store.identity(run_id)
     projection = store.status(run_id)
     worktree = Path(_field(projection, "worktree_path"))
@@ -1076,9 +1074,7 @@ def merge_candidate_pr(store: RunStore, run_id: str) -> tuple[dict[str, Any], bo
             identity,
             projection,
             pr,
-            worktree,
             merge_effect,
-            delete_effect,
         )
     _require_open_effect(merge_effect, "pr-squash-merge", merge_intended)
     _require_open_effect(delete_effect, "remote-branch-delete", delete_intended)
@@ -1150,10 +1146,53 @@ def merge_candidate_pr(store: RunStore, run_id: str) -> tuple[dict[str, Any], bo
         identity,
         projection,
         pr,
-        worktree,
         store.effect(run_id, "pr-squash-merge"),
-        store.effect(run_id, "remote-branch-delete"),
     )
+
+
+def reconcile_candidate_branch_deletion(store: RunStore, run_id: str) -> bool:
+    identity = store.identity(run_id)
+    projection = store.status(run_id)
+    worktree = Path(_field(projection, "worktree_path"))
+    branch = _field(projection, "branch")
+    candidate_sha = _field(projection, "candidate_sha")
+    pr_number = projection.get("pr_number")
+    pr_url = _field(projection, "pr_url")
+    if type(pr_number) is not int or pr_number <= 0:
+        raise CandidateError("stable Candidate PR number is invalid", kind="conflict")
+    _, delete_intended = _candidate_merge_intended(
+        identity,
+        pr_number,
+        pr_url,
+        branch,
+        candidate_sha,
+    )
+    delete_effect = store.effect_if_present(run_id, "remote-branch-delete")
+    _require_effect_identity(delete_effect, "remote-branch-delete", delete_intended)
+    remote_sha = _remote_sha(worktree, branch)
+    if remote_sha not in {"", candidate_sha}:
+        raise CandidateError(
+            "remote Candidate branch was replaced after merge", kind="conflict"
+        )
+    deleted = remote_sha == ""
+    delete_observed = {
+        "repository": identity["repository"],
+        "branch": branch,
+        "deleted": True,
+    }
+    if delete_effect["status"] == "confirmed":
+        _require_effect_observation(delete_effect, delete_observed)
+        if not deleted:
+            raise CandidateError(
+                "confirmed branch deletion contradicts the remote", kind="conflict"
+            )
+    if deleted:
+        store.confirm_effect(
+            run_id,
+            "remote-branch-delete",
+            observed=delete_observed,
+        )
+    return deleted
 
 
 def _candidate_merge_intended(
@@ -1219,10 +1258,8 @@ def _reconcile_candidate_merge(
     identity: dict[str, Any],
     projection: dict[str, Any],
     pr: dict[str, Any],
-    worktree: Path,
     merge_effect: dict[str, Any],
-    delete_effect: dict[str, Any],
-) -> tuple[dict[str, Any], bool]:
+) -> dict[str, Any]:
     merge = pr.get("mergeCommit")
     merge_commit = merge.get("oid") if isinstance(merge, dict) else None
     if (
@@ -1250,32 +1287,7 @@ def _reconcile_candidate_merge(
     }
     _require_effect_observation(merge_effect, observed)
     store.confirm_effect(run_id, "pr-squash-merge", observed=observed)
-    remote_sha = _remote_sha(worktree, projection["branch"])
-    if remote_sha not in {"", projection["candidate_sha"]}:
-        raise CandidateError(
-            "remote Candidate branch was replaced after merge",
-            kind="conflict",
-            merged_observation=observed,
-        )
-    deleted = remote_sha == ""
-    delete_observed = {
-        "repository": identity["repository"],
-        "branch": projection["branch"],
-        "deleted": True,
-    }
-    if delete_effect.get("status") == "confirmed":
-        _require_effect_observation(delete_effect, delete_observed)
-        if not deleted:
-            raise CandidateError(
-                "confirmed branch deletion contradicts the remote", kind="conflict"
-            )
-    if deleted:
-        store.confirm_effect(
-            run_id,
-            "remote-branch-delete",
-            observed=delete_observed,
-        )
-    return observed, deleted
+    return observed
 
 
 def _require_effect_observation(
