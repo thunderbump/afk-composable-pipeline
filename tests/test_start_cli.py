@@ -383,7 +383,7 @@ class StartCliTest(unittest.TestCase):
         ]
         self.assertEqual(len(merge_commands), 1)
 
-    def test_resume_pauses_when_merged_candidate_branch_was_replaced(self):
+    def test_resume_closes_bead_after_merged_candidate_branch_was_replaced(self):
         run_id = self.start_reviewed_run()
         ready = self.run_afk("resume")
         self.assertEqual(ready.returncode, 0, ready.stderr)
@@ -406,10 +406,10 @@ class StartCliTest(unittest.TestCase):
 
         resumed = self.run_afk("resume")
 
-        self.assertEqual(resumed.returncode, 2, resumed.stderr)
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
         status = json.loads(self.run_afk("status", run_id, "--json").stdout)
-        self.assertEqual(status["state"], "attention_required")
-        self.assertEqual(status["checkpoint"], "merged")
+        self.assertEqual(status["state"], "bead_closed")
+        self.assertEqual(status["checkpoint"], "bead_closed")
         self.assertEqual(status["merge"]["merge_commit"], "f" * 40)
         self.assertEqual(store.effect(run_id, "pr-squash-merge")["status"], "confirmed")
         self.assertEqual(
@@ -431,7 +431,7 @@ class StartCliTest(unittest.TestCase):
             1,
         )
 
-    def test_resume_reconciles_merged_cleanup_after_remote_branch_remediation(self):
+    def test_resume_defers_remote_cleanup_after_bead_close(self):
         run_id = self.start_reviewed_run()
         ready = self.run_afk("resume")
         self.assertEqual(ready.returncode, 0, ready.stderr)
@@ -446,15 +446,15 @@ class StartCliTest(unittest.TestCase):
 
         self.assertEqual(resumed.returncode, 0, resumed.stderr)
         status = json.loads(self.run_afk("status", run_id, "--json").stdout)
-        self.assertEqual(status["state"], "merged")
-        self.assertEqual(status["checkpoint"], "merged")
+        self.assertEqual(status["state"], "bead_closed")
+        self.assertEqual(status["checkpoint"], "bead_closed")
         self.assertEqual(status["attention"], {})
-        self.assertEqual(status["remote_branch_deleted"], True)
-        self.assertEqual(status["last_event"], "pr.merge_reconciled")
+        self.assertEqual(status["remote_branch_deleted"], False)
+        self.assertEqual(status["last_event"], "bead.closed")
         self.assertEqual(status["last_sequence"], before["last_sequence"] + 1)
         store = RunStore(self.state_home / "afk")
         self.assertEqual(
-            store.effect(run_id, "remote-branch-delete")["status"], "confirmed"
+            store.effect(run_id, "remote-branch-delete")["status"], "prepared"
         )
 
         repeated = self.run_afk("resume")
@@ -473,7 +473,245 @@ class StartCliTest(unittest.TestCase):
         ]
         self.assertEqual(len(merge_commands), 1)
 
-    def test_resume_keeps_merged_checkpoint_when_pr_observation_is_unavailable(self):
+    def test_resume_closes_exact_bead_after_confirmed_merge(self):
+        run_id = self.start_reviewed_run()
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+
+        closed = self.run_afk("resume")
+
+        self.assertEqual(closed.returncode, 0, closed.stderr)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(status["state"], "bead_closed")
+        self.assertEqual(status["checkpoint"], "bead_closed")
+        self.assertEqual(
+            status["bead_closure"],
+            {
+                "bead_id": "central-bnkl.1.1",
+                "repository": "thunderbump/beads-webui",
+                "pr_number": 17,
+                "pr_url": "https://example.test/pr/17",
+                "candidate_sha": "d" * 40,
+                "merge_commit": "f" * 40,
+                "status": "closed",
+            },
+        )
+        store = RunStore(self.state_home / "afk")
+        effect = store.effect(run_id, "bead-close")
+        self.assertEqual(effect["status"], "confirmed")
+        self.assertEqual(
+            effect["intended"],
+            {
+                "bead_id": "central-bnkl.1.1",
+                "repository": "thunderbump/beads-webui",
+                "pr_number": 17,
+                "pr_url": "https://example.test/pr/17",
+                "candidate_sha": "d" * 40,
+                "merge_commit": "f" * 40,
+                "reason": "merged via " + "f" * 40,
+            },
+        )
+        self.assertEqual(effect["observed"], status["bead_closure"])
+
+        repeated = self.run_afk("resume")
+
+        self.assertEqual(repeated.returncode, 0, repeated.stderr)
+        repeated_status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(repeated_status["last_sequence"], status["last_sequence"])
+        commands = [
+            json.loads(line)
+            for line in self.command_log.read_text(encoding="utf-8").splitlines()
+        ]
+        self.assertIn(
+            [
+                "close",
+                "central-bnkl.1.1",
+                "--reason",
+                "merged via " + "f" * 40,
+                "--json",
+            ],
+            [record["args"] for record in commands if record["command"] == "bd"],
+        )
+        merge_commands = [
+            record
+            for record in commands
+            if record["command"] == "gh" and record["args"][:2] == ["pr", "merge"]
+        ]
+        self.assertEqual(len(merge_commands), 1)
+        close_commands = [
+            record
+            for record in commands
+            if record["command"] == "bd" and record["args"][:1] == ["close"]
+        ]
+        self.assertEqual(len(close_commands), 1)
+
+    def test_resume_reconciles_interruption_after_bead_close_without_second_close(self):
+        run_id = self.start_reviewed_run()
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+
+        interrupted = self.run_afk("resume", AFK_FAKE_BEAD_CLOSE_INTERRUPTED="1")
+
+        self.assertEqual(interrupted.returncode, 2, interrupted.stderr)
+        before = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(before["checkpoint"], "merged")
+        self.assertEqual(before["merge"]["merge_commit"], "f" * 40)
+        store = RunStore(self.state_home / "afk")
+        self.assertEqual(store.effect(run_id, "bead-close")["status"], "prepared")
+
+        resumed = self.run_afk("resume")
+
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(status["checkpoint"], "bead_closed")
+        self.assertEqual(store.effect(run_id, "bead-close")["status"], "confirmed")
+        commands = [
+            json.loads(line)
+            for line in self.command_log.read_text(encoding="utf-8").splitlines()
+        ]
+        close_commands = [
+            record
+            for record in commands
+            if record["command"] == "bd" and record["args"][:1] == ["close"]
+        ]
+        merge_commands = [
+            record
+            for record in commands
+            if record["command"] == "gh" and record["args"][:2] == ["pr", "merge"]
+        ]
+        self.assertEqual(len(close_commands), 1)
+        self.assertEqual(len(merge_commands), 1)
+
+    def test_resume_retries_only_bead_close_after_close_failure(self):
+        run_id = self.start_reviewed_run()
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+
+        failed = self.run_afk("resume", AFK_FAKE_BEAD_CLOSE_FAILURE="1")
+
+        self.assertEqual(failed.returncode, 2, failed.stderr)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(status["checkpoint"], "merged")
+        self.assertEqual(status["attention"]["scope"], "bead_close")
+        self.assertEqual(status["merge"]["merge_commit"], "f" * 40)
+
+        retried = self.run_afk("resume")
+
+        self.assertEqual(retried.returncode, 0, retried.stderr)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(status["checkpoint"], "bead_closed")
+        commands = [
+            json.loads(line)
+            for line in self.command_log.read_text(encoding="utf-8").splitlines()
+        ]
+        merge_commands = [
+            record
+            for record in commands
+            if record["command"] == "gh" and record["args"][:2] == ["pr", "merge"]
+        ]
+        self.assertEqual(len(merge_commands), 1)
+
+    def test_resume_refuses_bead_closed_without_close_effect(self):
+        run_id = self.start_reviewed_run()
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+
+        resumed = self.run_afk("resume", AFK_FAKE_BEAD_STATUS="closed")
+
+        self.assertEqual(resumed.returncode, 2, resumed.stderr)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(status["checkpoint"], "merged")
+        self.assertIn("without AFK authorization", status["attention"]["summary"])
+        store = RunStore(self.state_home / "afk")
+        with self.assertRaises(RunStoreError):
+            store.effect(run_id, "bead-close")
+        commands = self.command_log.read_text(encoding="utf-8")
+        self.assertNotIn('"args":["close"', commands)
+
+    def test_resume_refuses_cross_project_bead_before_close_effect(self):
+        run_id = self.start_reviewed_run()
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+
+        resumed = self.run_afk(
+            "resume", AFK_FAKE_PROJECT_LABEL="project:another-repository"
+        )
+
+        self.assertEqual(resumed.returncode, 2, resumed.stderr)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(status["checkpoint"], "merged")
+        self.assertIn("facts disagree", status["attention"]["summary"])
+        store = RunStore(self.state_home / "afk")
+        with self.assertRaises(RunStoreError):
+            store.effect(run_id, "bead-close")
+        commands = self.command_log.read_text(encoding="utf-8")
+        self.assertNotIn('"args":["close"', commands)
+
+    def test_resume_refuses_bead_project_change_after_effect_preparation(self):
+        run_id = self.start_reviewed_run()
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+
+        resumed = self.run_afk(
+            "resume", AFK_FAKE_BEAD_PROJECT_CHANGE_AFTER_FIRST_SHOW="1"
+        )
+
+        self.assertEqual(resumed.returncode, 2, resumed.stderr)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(status["checkpoint"], "merged")
+        self.assertIn("facts disagree", status["attention"]["summary"])
+        store = RunStore(self.state_home / "afk")
+        self.assertEqual(store.effect(run_id, "bead-close")["status"], "prepared")
+        commands = self.command_log.read_text(encoding="utf-8")
+        self.assertNotIn('"args":["close"', commands)
+
+    def test_resume_refuses_malformed_bead_close_observation(self):
+        run_id = self.start_reviewed_run()
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+
+        resumed = self.run_afk("resume", AFK_FAKE_BEAD_SHOW_MALFORMED="1")
+
+        self.assertEqual(resumed.returncode, 2, resumed.stderr)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(status["checkpoint"], "merged")
+        self.assertEqual(status["attention"]["classification"], "malformed_output")
+        store = RunStore(self.state_home / "afk")
+        with self.assertRaises(RunStoreError):
+            store.effect(run_id, "bead-close")
+        commands = self.command_log.read_text(encoding="utf-8")
+        self.assertNotIn('"args":["close"', commands)
+
+    def test_resume_refuses_confirmed_close_effect_when_bead_is_open(self):
+        run_id = self.start_reviewed_run()
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+        store = RunStore(self.state_home / "afk")
+        merge = store.status(run_id)["merge"]
+        intended = {
+            "bead_id": "central-bnkl.1.1",
+            "repository": "thunderbump/beads-webui",
+            "pr_number": 17,
+            "pr_url": "https://example.test/pr/17",
+            "candidate_sha": "d" * 40,
+            "merge_commit": merge["merge_commit"],
+            "reason": "merged via " + merge["merge_commit"],
+        }
+        observed = {key: value for key, value in intended.items() if key != "reason"}
+        observed["status"] = "closed"
+        store.prepare_effect(run_id, "bead-close", kind="bead-close", intended=intended)
+        store.confirm_effect(run_id, "bead-close", observed=observed)
+
+        resumed = self.run_afk("resume")
+
+        self.assertEqual(resumed.returncode, 2, resumed.stderr)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(status["checkpoint"], "merged")
+        self.assertIn("contradicts live", status["attention"]["summary"])
+        commands = self.command_log.read_text(encoding="utf-8")
+        self.assertNotIn('"args":["close"', commands)
+
+    def test_resume_closes_bead_without_reobserving_merged_pr(self):
         run_id = self.start_reviewed_run()
         ready = self.run_afk("resume")
         self.assertEqual(ready.returncode, 0, ready.stderr)
@@ -484,10 +722,10 @@ class StartCliTest(unittest.TestCase):
 
         unavailable = self.run_afk("resume", AFK_FAKE_MERGE_PR_UNAVAILABLE="1")
 
-        self.assertEqual(unavailable.returncode, 2, unavailable.stderr)
+        self.assertEqual(unavailable.returncode, 0, unavailable.stderr)
         status = json.loads(self.run_afk("status", run_id, "--json").stdout)
-        self.assertEqual(status["state"], "attention_required")
-        self.assertEqual(status["checkpoint"], "merged")
+        self.assertEqual(status["state"], "bead_closed")
+        self.assertEqual(status["checkpoint"], "bead_closed")
         self.assertEqual(
             status["merge"],
             {
@@ -534,7 +772,12 @@ class StartCliTest(unittest.TestCase):
 
         resumed = self.run_afk("resume", AFK_FAKE_POST_MERGE_REMOTE_UNAVAILABLE="1")
 
-        self.assertEqual(resumed.returncode, 2, resumed.stderr)
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(status["checkpoint"], "bead_closed")
+        self.assertEqual(
+            store.effect(run_id, "remote-branch-delete")["status"], "prepared"
+        )
         commands = [
             json.loads(line)
             for line in self.command_log.read_text(encoding="utf-8").splitlines()
@@ -546,7 +789,7 @@ class StartCliTest(unittest.TestCase):
         ]
         self.assertEqual(len(merge_commands), 1)
 
-    def test_resume_does_not_confirm_branch_deletion_for_mismatched_origin(self):
+    def test_resume_closes_bead_without_reobserving_cleanup_origin(self):
         run_id = self.start_reviewed_run()
         ready = self.run_afk("resume")
         self.assertEqual(ready.returncode, 0, ready.stderr)
@@ -557,11 +800,11 @@ class StartCliTest(unittest.TestCase):
             "resume", AFK_FAKE_ORIGIN_REPOSITORY="thunderbump/another-repo"
         )
 
-        self.assertEqual(resumed.returncode, 2, resumed.stderr)
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
         status = json.loads(self.run_afk("status", run_id, "--json").stdout)
-        self.assertEqual(status["checkpoint"], "merged")
+        self.assertEqual(status["checkpoint"], "bead_closed")
         self.assertEqual(status["remote_branch_deleted"], False)
-        self.assertIn("origin", status["attention"]["summary"])
+        self.assertEqual(status["attention"], {})
         store = RunStore(self.state_home / "afk")
         self.assertEqual(
             store.effect(run_id, "remote-branch-delete")["status"], "prepared"
@@ -2608,6 +2851,8 @@ class StartCliTest(unittest.TestCase):
                 )
                 remote_deleted = Path(os.environ["XDG_STATE_HOME"]) / "fake-remote-deleted"
                 remote_replaced = Path(os.environ["XDG_STATE_HOME"]) / "fake-remote-replaced"
+                bead_closed = Path(os.environ["XDG_STATE_HOME"]) / "fake-bead-closed"
+                bead_show_count = Path(os.environ["XDG_STATE_HOME"]) / "fake-bead-show-count"
                 if command == "git":
                     if args[:2] == ["rev-parse", "--show-toplevel"]:
                         print(project)
@@ -2963,7 +3208,11 @@ class StartCliTest(unittest.TestCase):
                             "password": os.environ["BEADS_DOLT_PASSWORD"],
                         }), file=sys.stderr)
                         raise SystemExit(1)
-                    status = os.environ["AFK_FAKE_BEAD_STATUS"]
+                    status = (
+                        "closed"
+                        if bead_closed.exists()
+                        else os.environ["AFK_FAKE_BEAD_STATUS"]
+                    )
                     assignee = os.environ["AFK_FAKE_ASSIGNEE"]
                     labels = (
                         None
@@ -2975,6 +3224,22 @@ class StartCliTest(unittest.TestCase):
                         ]
                     )
                     if args[:1] == ["show"]:
+                        if os.environ.get("AFK_FAKE_BEAD_SHOW_MALFORMED"):
+                            print("{}")
+                            raise SystemExit(0)
+                        if os.environ.get(
+                            "AFK_FAKE_BEAD_PROJECT_CHANGE_AFTER_FIRST_SHOW"
+                        ):
+                            show_count = (
+                                int(bead_show_count.read_text())
+                                if bead_show_count.exists()
+                                else 0
+                            )
+                            bead_show_count.write_text(
+                                str(show_count + 1), encoding="utf-8"
+                            )
+                            if show_count:
+                                labels = ["project:another-repository"]
                         print(json.dumps([{
                             "id": os.environ["AFK_FAKE_BEAD"],
                             "title": "Create the first slice",
@@ -3022,6 +3287,17 @@ class StartCliTest(unittest.TestCase):
                             ),
                             "status": "in_progress",
                             "assignee": os.environ["USER"],
+                        }))
+                    elif args[:1] == ["close"]:
+                        if os.environ.get("AFK_FAKE_BEAD_CLOSE_FAILURE"):
+                            print("close failed", file=sys.stderr)
+                            raise SystemExit(1)
+                        bead_closed.write_text("closed", encoding="utf-8")
+                        if os.environ.get("AFK_FAKE_BEAD_CLOSE_INTERRUPTED"):
+                            raise SystemExit(1)
+                        print(json.dumps({
+                            "id": os.environ["AFK_FAKE_BEAD"],
+                            "status": "closed",
                         }))
                     else:
                         raise SystemExit(f"unexpected bd args: {args}")

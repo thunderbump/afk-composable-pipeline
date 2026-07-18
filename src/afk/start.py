@@ -205,7 +205,9 @@ def resume_run(*, note: str | None = None) -> tuple[str, int]:
                 return run_id, _advance_merge(store, run_id)
             return run_id, _advance_pr_ready(store, run_id)
         if projection["checkpoint"] == "merged":
-            return run_id, _advance_merge(store, run_id)
+            return run_id, _advance_bead_close(store, run_id)
+        if projection["checkpoint"] == "bead_closed":
+            return run_id, 0
         if projection["checkpoint"] == "validated":
             return run_id, _advance_gate(store, run_id)
         if projection["last_event"] == "validation.rejected":
@@ -1446,6 +1448,149 @@ def _record_merged(
                 "remote_branch_deleted": branch_deleted,
             },
         )
+
+
+def _advance_bead_close(store: RunStore, run_id: str) -> int:
+    try:
+        observed = _close_merged_bead(store, run_id)
+        _record_bead_closed(store, run_id, observed)
+    except StartError as exc:
+        _attention(
+            store,
+            run_id,
+            checkpoint="merged",
+            scope="bead_close",
+            kind=(
+                "unavailable" if isinstance(exc, ExternalCommandError) else "invalid"
+            ),
+            summary=str(exc),
+            classification=_error_classification(exc),
+        )
+        return 2
+    except RunStoreError as exc:
+        _attention(
+            store,
+            run_id,
+            checkpoint="merged",
+            scope="bead_close",
+            kind="invalid",
+            summary=str(exc),
+        )
+        return 2
+    return 0
+
+
+def _close_merged_bead(store: RunStore, run_id: str) -> dict[str, Any]:
+    identity = store.identity(run_id)
+    projection = store.status(run_id)
+    merge = projection.get("merge")
+    if (
+        not isinstance(merge, dict)
+        or merge.get("number") != projection.get("pr_number")
+        or merge.get("url") != projection.get("pr_url")
+        or merge.get("candidate_sha") != projection.get("candidate_sha")
+        or not isinstance(merge.get("merge_commit"), str)
+        or not _is_full_git_sha(merge["merge_commit"])
+    ):
+        raise StartError("Bead closure requires the exact durable merge")
+    request = identity.get("start_request")
+    workspace_value = (
+        request.get("beads_workspace") if isinstance(request, dict) else None
+    )
+    if not isinstance(workspace_value, str) or not workspace_value:
+        raise StartError("Bead closure requires the pinned Beads workspace")
+    workspace = Path(workspace_value)
+    reason = f"merged via {merge['merge_commit']}"
+    intended = {
+        "bead_id": identity["bead_id"],
+        "repository": identity["repository"],
+        "pr_number": merge["number"],
+        "pr_url": merge["url"],
+        "candidate_sha": merge["candidate_sha"],
+        "merge_commit": merge["merge_commit"],
+        "reason": reason,
+    }
+    effect = store.effect_if_present(run_id, "bead-close")
+    bead = _show_bead(identity["bead_id"], workspace)
+    _validate_closable_bead(bead, identity["bead_id"], identity["repository"])
+    if effect is None:
+        if bead["status"] == "closed":
+            raise StartError("source Bead was closed without AFK authorization")
+        effect = store.prepare_effect(
+            run_id,
+            "bead-close",
+            kind="bead-close",
+            intended=intended,
+        )
+    elif effect.get("kind") != "bead-close" or effect.get("intended") != intended:
+        raise StartError("Bead close Effect disagrees with the durable merge")
+
+    observed = {
+        "bead_id": identity["bead_id"],
+        "repository": identity["repository"],
+        "pr_number": merge["number"],
+        "pr_url": merge["url"],
+        "candidate_sha": merge["candidate_sha"],
+        "merge_commit": merge["merge_commit"],
+        "status": "closed",
+    }
+    if effect.get("status") == "confirmed":
+        if effect.get("observed") != observed or bead["status"] != "closed":
+            raise StartError("confirmed Bead close contradicts live Beads state")
+        return observed
+    if effect.get("status") != "prepared" or "observed" in effect:
+        raise StartError("Bead close Effect status is invalid")
+    bead = _show_bead(identity["bead_id"], workspace)
+    _validate_closable_bead(bead, identity["bead_id"], identity["repository"])
+    if bead["status"] != "closed":
+        _bd_json(
+            [
+                "bd",
+                "close",
+                identity["bead_id"],
+                "--reason",
+                reason,
+                "--json",
+            ],
+            cwd=workspace,
+        )
+        bead = _show_bead(identity["bead_id"], workspace)
+        _validate_closable_bead(bead, identity["bead_id"], identity["repository"])
+    if bead["status"] != "closed":
+        raise StartError("Beads did not confirm the exact source Bead closed")
+    store.confirm_effect(run_id, "bead-close", observed=observed)
+    return observed
+
+
+def _validate_closable_bead(
+    bead: dict[str, Any], bead_id: str, repository: str
+) -> None:
+    labels = bead.get("labels")
+    if (
+        bead.get("id") != bead_id
+        or bead.get("status") not in {"open", "in_progress", "closed"}
+        or not isinstance(labels, list)
+        or not all(isinstance(label, str) for label in labels)
+        or f"project:{repository.rsplit('/', 1)[-1]}" not in labels
+    ):
+        raise StartError("source Bead facts disagree with the merged Run")
+
+
+def _record_bead_closed(store: RunStore, run_id: str, observed: dict[str, Any]) -> None:
+    projection = store.status(run_id)
+    if projection.get("bead_closure") is None:
+        store.append_event(
+            run_id,
+            "bead.closed",
+            state="bead_closed",
+            data={
+                "checkpoint": "bead_closed",
+                "attention": {},
+                "bead_closure": observed,
+            },
+        )
+    elif projection.get("bead_closure") != observed:
+        raise RunStoreError("closed Bead fact contradicts the Run")
 
 
 def _advance_completed_gate(
