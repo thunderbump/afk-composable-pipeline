@@ -1200,10 +1200,6 @@ def reconcile_candidate_branch_deletion(store: RunStore, run_id: str) -> bool:
     }
     if delete_effect["status"] == "confirmed":
         _require_effect_observation(delete_effect, delete_observed)
-        if not deleted:
-            raise CandidateError(
-                "confirmed branch deletion contradicts the remote", kind="conflict"
-            )
     if deleted:
         store.confirm_effect(
             run_id,
