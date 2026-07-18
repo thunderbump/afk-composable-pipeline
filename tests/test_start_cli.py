@@ -1,5 +1,6 @@
 import json
 import os
+import shutil
 import stat
 import subprocess
 import sys
@@ -598,6 +599,73 @@ class StartCliTest(unittest.TestCase):
         self.assertEqual(len(deletes), 1)
         self.assertIn(
             "afk/central-bnkl-1-1-" + run_id + "/candidate",
+            deletes[0]["args"],
+        )
+
+    def test_terminal_cleanup_reconciles_confirmed_remote_after_worktree_is_gone(
+        self,
+    ):
+        run_id = self.start_reviewed_run()
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+        store = RunStore(self.state_home / "afk")
+        self.assertEqual(
+            store.effect(run_id, "remote-branch-delete")["status"], "confirmed"
+        )
+        worktree = self.state_home / "afk" / "worktrees" / run_id
+        (self.state_home / "fake-worktree-removed").write_text(
+            "removed", encoding="utf-8"
+        )
+        shutil.rmtree(worktree)
+
+        completed = self.run_afk("resume")
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(status["state"], "completed")
+        self.assertTrue(status["completion"]["remote_branch_deleted"])
+        self.assertEqual(status["completion"]["cleanup_warnings"], [])
+
+    def test_terminal_cleanup_retries_lingering_remote_after_worktree_is_gone(self):
+        run_id = self.start_reviewed_run()
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+        self.assertEqual(
+            self.run_afk("resume", AFK_FAKE_REMOTE_BRANCH_LINGERS="1").returncode,
+            0,
+        )
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+        store = RunStore(self.state_home / "afk")
+        self.assertEqual(
+            store.effect(run_id, "remote-branch-delete")["status"], "prepared"
+        )
+        worktree = self.state_home / "afk" / "worktrees" / run_id
+        (self.state_home / "fake-worktree-removed").write_text(
+            "removed", encoding="utf-8"
+        )
+        shutil.rmtree(worktree)
+
+        completed = self.run_afk("resume")
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(status["state"], "completed")
+        self.assertTrue(status["completion"]["remote_branch_deleted"])
+        self.assertEqual(status["completion"]["cleanup_warnings"], [])
+        deletes = [
+            record
+            for record in map(
+                json.loads,
+                self.command_log.read_text(encoding="utf-8").splitlines(),
+            )
+            if record["command"] == "git" and "--delete" in record["args"]
+        ]
+        self.assertEqual(len(deletes), 1)
+        self.assertIn(
+            "--force-with-lease=refs/heads/afk/central-bnkl-1-1-"
+            + run_id
+            + "/candidate:"
+            + "d" * 40,
             deletes[0]["args"],
         )
 

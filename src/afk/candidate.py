@@ -1170,7 +1170,7 @@ def merge_candidate_pr(store: RunStore, run_id: str) -> dict[str, Any]:
 def reconcile_candidate_branch_deletion(store: RunStore, run_id: str) -> bool:
     identity = store.identity(run_id)
     projection = store.status(run_id)
-    worktree = Path(_field(projection, "worktree_path"))
+    checkout = _pinned_repository_checkout(identity)
     branch = _field(projection, "branch")
     candidate_sha = _field(projection, "candidate_sha")
     pr_number = projection.get("pr_number")
@@ -1186,8 +1186,8 @@ def reconcile_candidate_branch_deletion(store: RunStore, run_id: str) -> bool:
     )
     delete_effect = store.effect_if_present(run_id, "remote-branch-delete")
     _require_effect_identity(delete_effect, "remote-branch-delete", delete_intended)
-    origin = _pinned_origin(identity, worktree)
-    remote_sha = _remote_sha(worktree, branch, origin)
+    origin = _pinned_origin(identity, checkout)
+    remote_sha = _remote_sha(checkout, branch, origin)
     if remote_sha not in {"", candidate_sha}:
         raise CandidateError(
             "remote Candidate branch was replaced after merge", kind="conflict"
@@ -1219,11 +1219,11 @@ def delete_candidate_branch(store: RunStore, run_id: str) -> bool:
         return True
     identity = store.identity(run_id)
     projection = store.status(run_id)
-    worktree = Path(_field(projection, "worktree_path"))
+    checkout = _pinned_repository_checkout(identity)
     branch = _field(projection, "branch")
     candidate_sha = _field(projection, "candidate_sha")
-    origin = _pinned_origin(identity, worktree)
-    if _remote_sha(worktree, branch, origin) != candidate_sha:
+    origin = _pinned_origin(identity, checkout)
+    if _remote_sha(checkout, branch, origin) != candidate_sha:
         raise CandidateError(
             "remote Candidate branch is not the exact merged Candidate",
             kind="conflict",
@@ -1237,7 +1237,7 @@ def delete_candidate_branch(store: RunStore, run_id: str) -> bool:
             origin,
             branch,
         ],
-        cwd=worktree,
+        cwd=checkout,
     )
     if completed.returncode != 0:
         raise CandidateError("remote Candidate branch deletion failed")
@@ -1270,6 +1270,14 @@ def _candidate_merge_intended(
             "candidate_sha": candidate_sha,
         },
     )
+
+
+def _pinned_repository_checkout(identity: dict[str, Any]) -> Path:
+    request = identity.get("start_request")
+    root = request.get("repository_root") if isinstance(request, dict) else None
+    if not isinstance(root, str) or not root or not Path(root).is_dir():
+        raise CandidateError("pinned repository checkout is unavailable")
+    return Path(root)
 
 
 def _require_effect_identity(
