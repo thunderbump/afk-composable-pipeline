@@ -706,14 +706,19 @@ class RetrospectiveModuleTest(unittest.TestCase):
             ],
         )
 
-    def test_build_pipeline_retrospective_replays_historical_dogfood_failure(self):
+    def test_build_pipeline_retrospective_replays_historical_dogfood_failure(
+        self,
+    ):
         excerpt = (
             "Zone |   Error    | Connect Connection [default] Failed to connect "
             "to database Error [#2002: Can't connect to server on 'mariadb' (115)]"
         )
         state = persisted_workstream_result_state(
             excerpt=excerpt,
-            log_path="/tmp/ledger/runs/validate/validation-evidence/logs/validation.log",
+            log_path=(
+                "/tmp/ledger/runs/validate/validation-evidence/logs/"
+                "validation.log"
+            ),
         )
         state["publication"] = {
             "status": "blocked",
