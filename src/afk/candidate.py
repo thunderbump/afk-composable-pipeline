@@ -958,6 +958,14 @@ def mark_candidate_pr_ready(store: RunStore, run_id: str) -> dict[str, Any]:
         expected_pr_url=pr_url,
         expected_draft=None,
     )
+    if not pr["isDraft"]:
+        try:
+            store.effect(run_id, "pr-mark-ready")
+        except RunStoreError as exc:
+            raise CandidateError(
+                "Candidate PR was marked ready without AFK authorization",
+                kind="conflict",
+            ) from exc
     observed = _ready_pr_observation(pr, candidate_sha)
     effect = store.prepare_effect(
         run_id,

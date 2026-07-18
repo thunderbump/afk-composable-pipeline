@@ -1242,19 +1242,26 @@ def _advance_pr_ready(store: RunStore, run_id: str) -> int:
     projection = store.status(run_id)
     cycles = projection.get("gate_cycles")
     latest = cycles[-1] if isinstance(cycles, list) and cycles else None
+    sealed_outcome = None
     try:
         evidence_valid = (
             isinstance(latest, dict)
             and isinstance(latest.get("evidence"), str)
             and store.verify_evidence(run_id, latest["evidence"])
         )
-    except RunStoreError:
+        if evidence_valid:
+            outcome_path = (
+                store.root / "runs" / run_id / latest["evidence"] / "outcome.json"
+            )
+            sealed_outcome = json.loads(outcome_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, RunStoreError):
         evidence_valid = False
     if (
         not isinstance(latest, dict)
         or latest.get("next_action") != "complete"
         or latest.get("candidate_sha") != projection.get("candidate_sha")
         or not evidence_valid
+        or sealed_outcome != latest
     ):
         _attention(
             store,
@@ -1330,6 +1337,13 @@ def _advance_pr_ready(store: RunStore, run_id: str) -> int:
             summary="ready PR fact contradicts the reviewed Run",
         )
         return 2
+    elif projection["state"] != "reviewed" or projection.get("attention"):
+        store.append_event(
+            run_id,
+            "pr.ready_reconciled",
+            state="reviewed",
+            data={"checkpoint": "reviewed", "attention": {}},
+        )
     return 0
 
 

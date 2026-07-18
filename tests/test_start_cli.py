@@ -104,6 +104,13 @@ class StartCliTest(unittest.TestCase):
             check=False,
         )
 
+    def start_reviewed_run(self):
+        started = self.run_afk("start", "central-bnkl.1.1")
+        run_id = started.stdout.strip()
+        worker = self.run_afk("_worker", run_id)
+        self.assertEqual(worker.returncode, 0, worker.stderr)
+        return run_id
+
     def test_start_launches_numbered_transient_worker_and_reports_checkpoint(self):
         completed = self.run_afk("start", "central-bnkl.1.1")
 
@@ -229,10 +236,7 @@ class StartCliTest(unittest.TestCase):
         self.assertIn(BASE_SHA, commands)
 
     def test_resume_marks_the_exact_reviewed_candidate_pr_ready_idempotently(self):
-        started = self.run_afk("start", "central-bnkl.1.1")
-        run_id = started.stdout.strip()
-        worker = self.run_afk("_worker", run_id)
-        self.assertEqual(worker.returncode, 0, worker.stderr)
+        run_id = self.start_reviewed_run()
 
         resumed = self.run_afk("resume")
 
@@ -269,11 +273,52 @@ class StartCliTest(unittest.TestCase):
         ]
         self.assertEqual(len(ready_commands), 1)
 
+    def test_resume_clears_transient_attention_after_ready_pr_is_observed_again(self):
+        run_id = self.start_reviewed_run()
+        ready = self.run_afk("resume")
+        self.assertEqual(ready.returncode, 0, ready.stderr)
+
+        unavailable = self.run_afk("resume", AFK_FAKE_READY_PR_UNAVAILABLE="1")
+        self.assertEqual(unavailable.returncode, 2, unavailable.stderr)
+
+        resumed = self.run_afk("resume")
+
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(status["state"], "reviewed")
+        self.assertEqual(status["attention"], {})
+        commands = [
+            json.loads(line)
+            for line in self.command_log.read_text(encoding="utf-8").splitlines()
+        ]
+        ready_commands = [
+            record
+            for record in commands
+            if record["command"] == "gh" and record["args"][:2] == ["pr", "ready"]
+        ]
+        self.assertEqual(len(ready_commands), 1)
+
+    def test_resume_pauses_when_pr_was_readied_without_an_existing_effect(self):
+        run_id = self.start_reviewed_run()
+        pr_state = self.state_home / "fake-pr.json"
+        pr = json.loads(pr_state.read_text(encoding="utf-8"))
+        pr["isDraft"] = False
+        pr_state.write_text(json.dumps(pr), encoding="utf-8")
+
+        resumed = self.run_afk("resume")
+
+        self.assertEqual(resumed.returncode, 2, resumed.stderr)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(status["state"], "attention_required")
+        self.assertEqual(status["attention"]["scope"], "publication")
+        self.assertEqual(status["attention"]["kind"], "conflict")
+        with self.assertRaises(RunStoreError):
+            RunStore(self.state_home / "afk").effect(run_id, "pr-mark-ready")
+        commands = self.command_log.read_text(encoding="utf-8")
+        self.assertNotIn('"args":["pr","ready"', commands)
+
     def test_resume_reconciles_interruption_after_marking_pr_ready(self):
-        started = self.run_afk("start", "central-bnkl.1.1")
-        run_id = started.stdout.strip()
-        worker = self.run_afk("_worker", run_id)
-        self.assertEqual(worker.returncode, 0, worker.stderr)
+        run_id = self.start_reviewed_run()
 
         interrupted = self.run_afk("resume", AFK_FAKE_PR_READY_INTERRUPTED="1")
 
@@ -299,10 +344,7 @@ class StartCliTest(unittest.TestCase):
         self.assertEqual(len(ready_commands), 1)
 
     def test_resume_retries_interruption_before_marking_pr_ready(self):
-        started = self.run_afk("start", "central-bnkl.1.1")
-        run_id = started.stdout.strip()
-        worker = self.run_afk("_worker", run_id)
-        self.assertEqual(worker.returncode, 0, worker.stderr)
+        run_id = self.start_reviewed_run()
 
         interrupted = self.run_afk("resume", AFK_FAKE_PR_READY_UNAVAILABLE="1")
 
@@ -322,10 +364,7 @@ class StartCliTest(unittest.TestCase):
         self.assertEqual(len(effects), 1)
 
     def test_resume_pauses_before_mutation_when_ready_pr_state_is_malformed(self):
-        started = self.run_afk("start", "central-bnkl.1.1")
-        run_id = started.stdout.strip()
-        worker = self.run_afk("_worker", run_id)
-        self.assertEqual(worker.returncode, 0, worker.stderr)
+        run_id = self.start_reviewed_run()
 
         resumed = self.run_afk("resume", AFK_FAKE_READY_PR_MALFORMED="1")
 
@@ -339,10 +378,7 @@ class StartCliTest(unittest.TestCase):
         self.assertNotIn('"args":["pr","ready"', commands)
 
     def test_resume_pauses_before_mutation_when_ready_pr_url_drifts(self):
-        started = self.run_afk("start", "central-bnkl.1.1")
-        run_id = started.stdout.strip()
-        worker = self.run_afk("_worker", run_id)
-        self.assertEqual(worker.returncode, 0, worker.stderr)
+        run_id = self.start_reviewed_run()
 
         resumed = self.run_afk(
             "resume", AFK_FAKE_READY_PR_URL="https://example.test/pr/99"
@@ -357,10 +393,7 @@ class StartCliTest(unittest.TestCase):
         self.assertNotIn('"args":["pr","ready"', commands)
 
     def test_resume_pauses_before_mutation_when_ready_pr_is_ambiguous(self):
-        started = self.run_afk("start", "central-bnkl.1.1")
-        run_id = started.stdout.strip()
-        worker = self.run_afk("_worker", run_id)
-        self.assertEqual(worker.returncode, 0, worker.stderr)
+        run_id = self.start_reviewed_run()
 
         resumed = self.run_afk("resume", AFK_FAKE_READY_PR_AMBIGUOUS="1")
 
@@ -373,10 +406,7 @@ class StartCliTest(unittest.TestCase):
         self.assertNotIn('"args":["pr","ready"', commands)
 
     def test_resume_pauses_before_mutation_when_ready_pr_is_unavailable(self):
-        started = self.run_afk("start", "central-bnkl.1.1")
-        run_id = started.stdout.strip()
-        worker = self.run_afk("_worker", run_id)
-        self.assertEqual(worker.returncode, 0, worker.stderr)
+        run_id = self.start_reviewed_run()
 
         resumed = self.run_afk("resume", AFK_FAKE_READY_PR_UNAVAILABLE="1")
 
@@ -389,10 +419,7 @@ class StartCliTest(unittest.TestCase):
         self.assertNotIn('"args":["pr","ready"', commands)
 
     def test_resume_pauses_before_mutation_when_pinned_target_drifts(self):
-        started = self.run_afk("start", "central-bnkl.1.1")
-        run_id = started.stdout.strip()
-        worker = self.run_afk("_worker", run_id)
-        self.assertEqual(worker.returncode, 0, worker.stderr)
+        run_id = self.start_reviewed_run()
         (self.state_home / "fake-target-drift").write_text("drifted", encoding="utf-8")
 
         resumed = self.run_afk("resume")
@@ -406,10 +433,7 @@ class StartCliTest(unittest.TestCase):
         self.assertNotIn('"args":["pr","ready"', commands)
 
     def test_resume_pauses_before_mutation_when_passed_gate_evidence_is_invalid(self):
-        started = self.run_afk("start", "central-bnkl.1.1")
-        run_id = started.stdout.strip()
-        worker = self.run_afk("_worker", run_id)
-        self.assertEqual(worker.returncode, 0, worker.stderr)
+        run_id = self.start_reviewed_run()
         store = RunStore(self.state_home / "afk")
         status = store.status(run_id)
         evidence = status["gate_cycles"][-1]["evidence"]
@@ -418,6 +442,29 @@ class StartCliTest(unittest.TestCase):
         )
         manifest.chmod(0o600)
         manifest.write_text("{}\n", encoding="utf-8")
+
+        resumed = self.run_afk("resume")
+
+        self.assertEqual(resumed.returncode, 2, resumed.stderr)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(status["attention"]["kind"], "invalid")
+        with self.assertRaises(RunStoreError):
+            store.effect(run_id, "pr-mark-ready")
+        commands = self.command_log.read_text(encoding="utf-8")
+        self.assertNotIn('"args":["pr","ready"', commands)
+
+    def test_resume_pauses_when_projected_gate_contradicts_sealed_outcome(self):
+        run_id = self.start_reviewed_run()
+        store = RunStore(self.state_home / "afk")
+        status = store.status(run_id)
+        contradictory = json.loads(json.dumps(status["gate_cycles"][-1]))
+        contradictory["validation"]["status"] = "rejected"
+        store.append_event(
+            run_id,
+            "gate.projection_corrupted",
+            state="reviewed",
+            data={"gate_cycles": [contradictory]},
+        )
 
         resumed = self.run_afk("resume")
 
