@@ -494,6 +494,7 @@ class StartCliTest(unittest.TestCase):
                 "candidate_sha": "d" * 40,
                 "merge_commit": "f" * 40,
                 "status": "closed",
+                "close_reason": "merged via " + "f" * 40,
             },
         )
         store = RunStore(self.state_home / "afk")
@@ -699,6 +700,7 @@ class StartCliTest(unittest.TestCase):
         }
         observed = {key: value for key, value in intended.items() if key != "reason"}
         observed["status"] = "closed"
+        observed["close_reason"] = intended["reason"]
         store.prepare_effect(run_id, "bead-close", kind="bead-close", intended=intended)
         store.confirm_effect(run_id, "bead-close", observed=observed)
 
@@ -708,6 +710,38 @@ class StartCliTest(unittest.TestCase):
         status = json.loads(self.run_afk("status", run_id, "--json").stdout)
         self.assertEqual(status["checkpoint"], "merged")
         self.assertIn("contradicts live", status["attention"]["summary"])
+        commands = self.command_log.read_text(encoding="utf-8")
+        self.assertNotIn('"args":["close"', commands)
+
+    def test_resume_refuses_prepared_close_effect_when_bead_has_wrong_reason(self):
+        run_id = self.start_reviewed_run()
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+        store = RunStore(self.state_home / "afk")
+        merge = store.status(run_id)["merge"]
+        intended = {
+            "bead_id": "central-bnkl.1.1",
+            "repository": "thunderbump/beads-webui",
+            "pr_number": 17,
+            "pr_url": "https://example.test/pr/17",
+            "candidate_sha": "d" * 40,
+            "merge_commit": merge["merge_commit"],
+            "reason": "merged via " + merge["merge_commit"],
+        }
+        store.prepare_effect(run_id, "bead-close", kind="bead-close", intended=intended)
+
+        for _ in range(2):
+            resumed = self.run_afk(
+                "resume",
+                AFK_FAKE_BEAD_STATUS="closed",
+                AFK_FAKE_BEAD_CLOSE_REASON="closed by an operator",
+            )
+
+            self.assertEqual(resumed.returncode, 2, resumed.stderr)
+            status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+            self.assertEqual(status["checkpoint"], "merged")
+            self.assertEqual(status["attention"]["scope"], "bead_close")
+            self.assertEqual(store.effect(run_id, "bead-close")["status"], "prepared")
         commands = self.command_log.read_text(encoding="utf-8")
         self.assertNotIn('"args":["close"', commands)
 
@@ -3246,6 +3280,11 @@ class StartCliTest(unittest.TestCase):
                             "description": os.environ["AFK_FAKE_BEAD_DESCRIPTION"],
                             "acceptance_criteria": "Candidate is committed.",
                             "status": status,
+                            "close_reason": (
+                                bead_closed.read_text(encoding="utf-8")
+                                if bead_closed.exists()
+                                else os.environ.get("AFK_FAKE_BEAD_CLOSE_REASON", "")
+                            ),
                             "assignee": assignee,
                             "labels": labels,
                         }]))
@@ -3292,7 +3331,7 @@ class StartCliTest(unittest.TestCase):
                         if os.environ.get("AFK_FAKE_BEAD_CLOSE_FAILURE"):
                             print("close failed", file=sys.stderr)
                             raise SystemExit(1)
-                        bead_closed.write_text("closed", encoding="utf-8")
+                        bead_closed.write_text(args[args.index("--reason") + 1], encoding="utf-8")
                         if os.environ.get("AFK_FAKE_BEAD_CLOSE_INTERRUPTED"):
                             raise SystemExit(1)
                         print(json.dumps({

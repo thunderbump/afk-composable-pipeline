@@ -1533,15 +1533,22 @@ def _close_merged_bead(store: RunStore, run_id: str) -> dict[str, Any]:
         "candidate_sha": merge["candidate_sha"],
         "merge_commit": merge["merge_commit"],
         "status": "closed",
+        "close_reason": reason,
     }
     if effect.get("status") == "confirmed":
-        if effect.get("observed") != observed or bead["status"] != "closed":
+        if (
+            effect.get("observed") != observed
+            or bead["status"] != "closed"
+            or bead.get("close_reason") != reason
+        ):
             raise StartError("confirmed Bead close contradicts live Beads state")
         return observed
     if effect.get("status") != "prepared" or "observed" in effect:
         raise StartError("Bead close Effect status is invalid")
     bead = _show_bead(identity["bead_id"], workspace)
     _validate_closable_bead(bead, identity["bead_id"], identity["repository"])
+    if bead["status"] == "closed" and bead.get("close_reason") != reason:
+        raise StartError("closed source Bead reason disagrees with the durable merge")
     if bead["status"] != "closed":
         _bd_json(
             [
@@ -1556,7 +1563,7 @@ def _close_merged_bead(store: RunStore, run_id: str) -> dict[str, Any]:
         )
         bead = _show_bead(identity["bead_id"], workspace)
         _validate_closable_bead(bead, identity["bead_id"], identity["repository"])
-    if bead["status"] != "closed":
+    if bead["status"] != "closed" or bead.get("close_reason") != reason:
         raise StartError("Beads did not confirm the exact source Bead closed")
     store.confirm_effect(run_id, "bead-close", observed=observed)
     return observed
