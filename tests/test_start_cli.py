@@ -874,6 +874,22 @@ class StartCliTest(unittest.TestCase):
         commands = self.command_log.read_text(encoding="utf-8")
         self.assertNotIn('"args":["pr","merge"', commands)
 
+    def test_resume_pauses_when_target_drifts_after_third_pr_observation(self):
+        run_id = self.start_reviewed_run()
+        ready = self.run_afk("resume")
+        self.assertEqual(ready.returncode, 0, ready.stderr)
+
+        merged = self.run_afk("resume", AFK_FAKE_TARGET_DRIFT_AFTER_THIRD_PR_VIEW="1")
+
+        self.assertEqual(merged.returncode, 2, merged.stderr)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(status["state"], "attention_required")
+        self.assertEqual(status["checkpoint"], "reviewed")
+        self.assertEqual(status["attention"]["scope"], "merge")
+        self.assertIn("target branch", status["attention"]["summary"])
+        commands = self.command_log.read_text(encoding="utf-8")
+        self.assertNotIn('"args":["pr","merge"', commands)
+
     def test_resume_recovers_transient_attention_before_merge(self):
         run_id = self.start_reviewed_run()
         ready = self.run_afk("resume")
@@ -2708,6 +2724,13 @@ class StartCliTest(unittest.TestCase):
                             view_count == 2
                             and os.environ.get(
                                 "AFK_FAKE_TARGET_DRIFT_AFTER_SECOND_PR_VIEW"
+                            )
+                        ):
+                            target_drift.write_text("drifted", encoding="utf-8")
+                        if (
+                            view_count == 3
+                            and os.environ.get(
+                                "AFK_FAKE_TARGET_DRIFT_AFTER_THIRD_PR_VIEW"
                             )
                         ):
                             target_drift.write_text("drifted", encoding="utf-8")

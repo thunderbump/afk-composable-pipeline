@@ -1128,6 +1128,10 @@ def merge_candidate_pr(store: RunStore, run_id: str) -> dict[str, Any]:
         raise CandidateError(
             "ready PR changed during final merge checks", kind="conflict"
         )
+    if _remote_sha(worktree, identity["base_branch"], origin) != identity["base_sha"]:
+        raise CandidateError(
+            "target branch no longer equals the pinned base", kind="conflict"
+        )
     completed = _run(
         [
             "gh",
