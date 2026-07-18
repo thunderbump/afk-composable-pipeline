@@ -15,6 +15,7 @@ from typing import Any
 from afk.bead_spec import BEAD_SPEC_EVIDENCE, load_bead_spec, persist_bead_spec
 from afk.candidate import (
     CandidateError,
+    delete_candidate_branch,
     mark_candidate_pr_ready,
     merge_candidate_pr,
     produce_candidate,
@@ -207,7 +208,7 @@ def resume_run(*, note: str | None = None) -> tuple[str, int]:
         if projection["checkpoint"] == "merged":
             return run_id, _advance_bead_close(store, run_id)
         if projection["checkpoint"] == "bead_closed":
-            return run_id, 0
+            return run_id, _advance_terminal_cleanup(store, run_id)
         if projection["checkpoint"] == "validated":
             return run_id, _advance_gate(store, run_id)
         if projection["last_event"] == "validation.rejected":
@@ -1598,6 +1599,217 @@ def _record_bead_closed(store: RunStore, run_id: str, observed: dict[str, Any]) 
         )
     elif projection.get("bead_closure") != observed:
         raise RunStoreError("closed Bead fact contradicts the Run")
+
+
+def _advance_terminal_cleanup(store: RunStore, run_id: str) -> int:
+    projection = store.status(run_id)
+    try:
+        identity, merge, closure = _terminal_facts(store, run_id, projection)
+    except (StartError, RunStoreError) as exc:
+        _attention(
+            store,
+            run_id,
+            checkpoint="bead_closed",
+            scope="terminal_cleanup",
+            kind="invalid",
+            summary=str(exc),
+        )
+        return 2
+
+    warnings: list[str] = []
+    remote_deleted = False
+    try:
+        remote_deleted = delete_candidate_branch(store, run_id)
+    except (CandidateError, RunStoreError):
+        warnings.append("remote Candidate branch cleanup could not be confirmed")
+
+    worktree_removed, local_branch_deleted, local_warnings = _cleanup_run_checkout(
+        store, identity, projection
+    )
+    warnings.extend(local_warnings)
+    candidate_sha = projection["candidate_sha"]
+    evidence = f"gates/completion-{candidate_sha[:12]}"
+    record = redact_artifact_value(
+        {
+            "schema_version": 1,
+            "repository": identity["repository"],
+            "bead_id": identity["bead_id"],
+            "candidate_sha": candidate_sha,
+            "pr_number": merge["number"],
+            "pr_url": merge["url"],
+            "merge_commit": merge["merge_commit"],
+            "bead_closure": closure,
+            "remote_branch_deleted": remote_deleted,
+            "worktree_removed": worktree_removed,
+            "local_branch_deleted": local_branch_deleted,
+            "cleanup_warnings": warnings[:3],
+            "evidence": evidence,
+        }
+    )
+    try:
+        store.reconcile_evidence_result(run_id, evidence, record)
+        store.append_event(
+            run_id,
+            "run.completed",
+            state="completed",
+            data={
+                "checkpoint": "completed",
+                "attention": {},
+                "completion": record,
+            },
+        )
+    except RunStoreError as exc:
+        _attention(
+            store,
+            run_id,
+            checkpoint="bead_closed",
+            scope="terminal_cleanup",
+            kind="invalid",
+            summary=str(exc),
+        )
+        return 2
+    return 0
+
+
+def _terminal_facts(
+    store: RunStore, run_id: str, projection: dict[str, Any]
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    identity = store.identity(run_id)
+    merge = projection.get("merge")
+    closure = projection.get("bead_closure")
+    close_effect = store.effect_if_present(run_id, "bead-close")
+    if (
+        projection.get("checkpoint") != "bead_closed"
+        or not isinstance(merge, dict)
+        or not isinstance(closure, dict)
+        or close_effect is None
+        or close_effect.get("status") != "confirmed"
+        or close_effect.get("observed") != closure
+        or merge.get("number") != projection.get("pr_number")
+        or merge.get("url") != projection.get("pr_url")
+        or merge.get("candidate_sha") != projection.get("candidate_sha")
+        or closure.get("bead_id") != identity["bead_id"]
+        or closure.get("repository") != identity["repository"]
+        or closure.get("pr_number") != merge.get("number")
+        or closure.get("pr_url") != merge.get("url")
+        or closure.get("candidate_sha") != merge.get("candidate_sha")
+        or closure.get("merge_commit") != merge.get("merge_commit")
+        or closure.get("status") != "closed"
+    ):
+        raise StartError("terminal cleanup requires the exact merge and Bead closure")
+    return identity, merge, closure
+
+
+def _cleanup_run_checkout(
+    store: RunStore, identity: dict[str, Any], projection: dict[str, Any]
+) -> tuple[bool, bool, list[str]]:
+    run_id = identity["run_id"]
+    expected_worktree = store.root / "worktrees" / run_id
+    expected_branch = f"afk/{identity['bead_id'].replace('.', '-')}-{run_id}/candidate"
+    worktree_value = projection.get("worktree_path")
+    branch_value = projection.get("branch")
+    if worktree_value != str(expected_worktree) or branch_value != expected_branch:
+        return False, False, ["Run worktree identity is not AFK-owned; cleanup skipped"]
+    request = identity.get("start_request")
+    root_value = request.get("repository_root") if isinstance(request, dict) else None
+    if not isinstance(root_value, str) or not root_value:
+        return False, False, ["Run repository identity is invalid; cleanup skipped"]
+    root = Path(root_value)
+    candidate_sha = projection["candidate_sha"]
+    warnings: list[str] = []
+
+    listing_available, registered = _registered_worktree(root, expected_worktree)
+    worktree_removed = (
+        listing_available and not expected_worktree.exists() and registered is None
+    )
+    if not listing_available:
+        warnings.append("Run worktree registration could not be inspected")
+    elif not worktree_removed:
+        if (
+            registered is None
+            or registered.get("HEAD") != candidate_sha
+            or registered.get("branch") != f"refs/heads/{expected_branch}"
+        ):
+            warnings.append(
+                "Run worktree ownership could not be verified; cleanup skipped"
+            )
+        else:
+            dirty = _command(
+                ["git", "status", "--porcelain"],
+                cwd=expected_worktree,
+                check=False,
+            )
+            removed = (
+                _command(
+                    ["git", "worktree", "remove", str(expected_worktree)],
+                    cwd=root,
+                    check=False,
+                )
+                if dirty.returncode == 0 and not dirty.stdout
+                else None
+            )
+            after_available, after_registered = _registered_worktree(
+                root, expected_worktree
+            )
+            worktree_removed = (
+                removed is not None
+                and removed.returncode == 0
+                and not expected_worktree.exists()
+                and after_available
+                and after_registered is None
+            )
+            if not worktree_removed:
+                warnings.append("Run worktree cleanup failed")
+
+    branch_sha = _command(
+        [
+            "git",
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            f"refs/heads/{expected_branch}",
+        ],
+        cwd=root,
+        check=False,
+    )
+    local_branch_deleted = branch_sha.returncode == 1
+    if branch_sha.returncode not in {0, 1}:
+        warnings.append("Run branch could not be inspected; cleanup skipped")
+    elif not local_branch_deleted:
+        if branch_sha.stdout.strip() != candidate_sha or not worktree_removed:
+            warnings.append(
+                "Run branch ownership could not be verified; cleanup skipped"
+            )
+        else:
+            deleted = _command(
+                ["git", "branch", "-D", expected_branch], cwd=root, check=False
+            )
+            local_branch_deleted = deleted.returncode == 0
+            if not local_branch_deleted:
+                warnings.append("Run branch cleanup failed")
+    return worktree_removed, local_branch_deleted, warnings[:2]
+
+
+def _registered_worktree(
+    root: Path, expected: Path
+) -> tuple[bool, dict[str, str] | None]:
+    listing = _command(
+        ["git", "worktree", "list", "--porcelain"], cwd=root, check=False
+    )
+    if listing.returncode != 0:
+        return False, None
+    record: dict[str, str] = {}
+    for line in [*listing.stdout.splitlines(), ""]:
+        if line:
+            key, _, value = line.partition(" ")
+            record[key] = value
+            continue
+        if record:
+            value = record.get("worktree")
+            if value and Path(value).resolve() == expected.resolve():
+                return True, record
+            record = {}
+    return True, None
 
 
 def _advance_completed_gate(

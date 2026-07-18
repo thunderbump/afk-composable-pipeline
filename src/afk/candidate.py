@@ -1213,6 +1213,32 @@ def reconcile_candidate_branch_deletion(store: RunStore, run_id: str) -> bool:
     return deleted
 
 
+def delete_candidate_branch(store: RunStore, run_id: str) -> bool:
+    """Delete only the still-exact remote Candidate branch and prove its absence."""
+    if reconcile_candidate_branch_deletion(store, run_id):
+        return True
+    identity = store.identity(run_id)
+    projection = store.status(run_id)
+    worktree = Path(_field(projection, "worktree_path"))
+    branch = _field(projection, "branch")
+    candidate_sha = _field(projection, "candidate_sha")
+    origin = _pinned_origin(identity, worktree)
+    if _remote_sha(worktree, branch, origin) != candidate_sha:
+        raise CandidateError(
+            "remote Candidate branch is not the exact merged Candidate",
+            kind="conflict",
+        )
+    completed = _run(
+        ["git", "push", origin, "--delete", branch],
+        cwd=worktree,
+    )
+    if completed.returncode != 0:
+        raise CandidateError("remote Candidate branch deletion failed")
+    if not reconcile_candidate_branch_deletion(store, run_id):
+        raise CandidateError("remote Candidate branch deletion was not confirmed")
+    return True
+
+
 def _candidate_merge_intended(
     identity: dict[str, Any],
     pr_number: int,
