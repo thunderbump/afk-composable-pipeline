@@ -8,7 +8,6 @@ import subprocess
 import sys
 import time
 import tomllib
-from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -1689,87 +1688,79 @@ def _cleanup_run_checkout(
         return False, False, ["Run repository identity is invalid; cleanup skipped"]
     root = Path(root_value)
     candidate_sha = projection["candidate_sha"]
+    quarantine = store.root / "worktree-quarantine" / run_id
     warnings: list[str] = []
 
     listing_available, registered = _registered_worktree(root, expected_worktree)
+    quarantine_available, quarantined = _registered_worktree(root, quarantine)
     worktree_removed = (
-        listing_available and not expected_worktree.exists() and registered is None
+        listing_available
+        and quarantine_available
+        and registered is None
+        and quarantined is None
+        and not quarantine.exists()
     )
-    if not listing_available:
+    if not listing_available or not quarantine_available:
         warnings.append("Run worktree registration could not be inspected")
     elif not worktree_removed:
-        if (
-            registered is None
-            or registered.get("HEAD") != candidate_sha
-            or registered.get("branch") != f"refs/heads/{expected_branch}"
+        checkout = quarantine if quarantined is not None else expected_worktree
+        registration = quarantined if quarantined is not None else registered
+        if not _owned_worktree_registration(
+            registration, candidate_sha, expected_branch
         ):
             warnings.append(
                 "Run worktree ownership could not be verified; cleanup skipped"
             )
         else:
-            with _worktree_ownership_lock(
-                root, expected_worktree, expected_branch
-            ) as ownership_locked:
-                locked_available, locked_registration = _registered_worktree(
-                    root, expected_worktree
-                )
-                locked_head = _command(
-                    ["git", "rev-parse", "HEAD"],
-                    cwd=expected_worktree,
-                    check=False,
-                )
-                locked_branch = _command(
-                    ["git", "branch", "--show-current"],
-                    cwd=expected_worktree,
-                    check=False,
-                )
-                locked_ref = _command(
+            if checkout == expected_worktree and _owned_worktree_checkout(
+                root, checkout, candidate_sha, expected_branch
+            ):
+                quarantine.parent.mkdir(parents=True, exist_ok=True)
+                moved = _command(
                     [
                         "git",
-                        "rev-parse",
-                        "--verify",
-                        "--quiet",
-                        f"refs/heads/{expected_branch}",
+                        "worktree",
+                        "move",
+                        str(expected_worktree),
+                        str(quarantine),
                     ],
                     cwd=root,
                     check=False,
                 )
-                dirty = _command(
-                    ["git", "status", "--porcelain"],
-                    cwd=expected_worktree,
-                    check=False,
-                )
-                # Git honors both lock files, so this last observation remains
-                # true through the no-force removal mutation.
-                owned_at_removal = (
-                    ownership_locked
-                    and locked_available
-                    and locked_registration == registered
-                    and locked_head.returncode == 0
-                    and locked_head.stdout.strip() == candidate_sha
-                    and locked_branch.returncode == 0
-                    and locked_branch.stdout.strip() == expected_branch
-                    and locked_ref.returncode == 0
-                    and locked_ref.stdout.strip() == candidate_sha
-                    and dirty.returncode == 0
-                    and not dirty.stdout
-                )
-                removed = (
-                    _command(
-                        ["git", "worktree", "remove", str(expected_worktree)],
-                        cwd=root,
-                        check=False,
-                    )
-                    if owned_at_removal
-                    else None
-                )
-            after_available, after_registered = _registered_worktree(
+                if moved.returncode == 0:
+                    checkout = quarantine
+            expected_available, after_expected = _registered_worktree(
                 root, expected_worktree
             )
+            quarantined_available, after_quarantined = _registered_worktree(
+                root, quarantine
+            )
+            owned_at_removal = (
+                checkout == quarantine
+                and expected_available
+                and after_expected is None
+                and quarantined_available
+                and _owned_worktree_registration(
+                    after_quarantined, candidate_sha, expected_branch
+                )
+                and _owned_worktree_checkout(
+                    root, quarantine, candidate_sha, expected_branch
+                )
+            )
+            removed = (
+                _command(
+                    ["git", "worktree", "remove", str(quarantine)],
+                    cwd=root,
+                    check=False,
+                )
+                if owned_at_removal
+                else None
+            )
+            after_available, after_registered = _registered_worktree(root, quarantine)
             worktree_removed = (
                 removed is not None
                 and removed.returncode == 0
-                and not expected_worktree.exists()
+                and not quarantine.exists()
                 and after_available
                 and after_registered is None
             )
@@ -1824,45 +1815,39 @@ def _cleanup_run_checkout(
     return worktree_removed, local_branch_deleted, warnings[:2]
 
 
-@contextmanager
-def _worktree_ownership_lock(root: Path, worktree: Path, branch: str):
-    git_dir = _command(["git", "rev-parse", "--git-dir"], cwd=worktree, check=False)
-    common_dir = _command(
-        ["git", "rev-parse", "--git-common-dir"], cwd=worktree, check=False
+def _owned_worktree_registration(
+    registration: dict[str, str] | None, candidate_sha: str, branch: str
+) -> bool:
+    return (
+        registration is not None
+        and registration.get("HEAD") == candidate_sha
+        and registration.get("branch") == f"refs/heads/{branch}"
     )
-    if git_dir.returncode != 0 or common_dir.returncode != 0:
-        yield False
-        return
-    lock_paths = [
-        _git_path(worktree, git_dir.stdout) / "HEAD.lock",
-        _git_path(worktree, common_dir.stdout) / "refs" / "heads" / f"{branch}.lock",
-    ]
-    descriptors: list[int] = []
-    try:
-        for path in lock_paths:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            descriptors.append(
-                os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-            )
-    except OSError:
-        for descriptor in descriptors:
-            os.close(descriptor)
-        for path in lock_paths[: len(descriptors)]:
-            path.unlink(missing_ok=True)
-        yield False
-        return
-    try:
-        yield True
-    finally:
-        for descriptor in descriptors:
-            os.close(descriptor)
-        for path in lock_paths:
-            path.unlink(missing_ok=True)
 
 
-def _git_path(cwd: Path, output: str) -> Path:
-    path = Path(output.strip())
-    return path if path.is_absolute() else (cwd / path).resolve()
+def _owned_worktree_checkout(
+    root: Path, checkout: Path, candidate_sha: str, branch: str
+) -> bool:
+    head = _command(["git", "rev-parse", "HEAD"], cwd=checkout, check=False)
+    current_branch = _command(
+        ["git", "branch", "--show-current"], cwd=checkout, check=False
+    )
+    branch_ref = _command(
+        ["git", "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"],
+        cwd=root,
+        check=False,
+    )
+    dirty = _command(["git", "status", "--porcelain"], cwd=checkout, check=False)
+    return (
+        head.returncode == 0
+        and head.stdout.strip() == candidate_sha
+        and current_branch.returncode == 0
+        and current_branch.stdout.strip() == branch
+        and branch_ref.returncode == 0
+        and branch_ref.stdout.strip() == candidate_sha
+        and dirty.returncode == 0
+        and not dirty.stdout
+    )
 
 
 def _registered_worktree(
