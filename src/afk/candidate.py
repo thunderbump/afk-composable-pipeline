@@ -1284,6 +1284,13 @@ def _reconcile_candidate_merge(
         raise CandidateError(
             "merged PR facts disagree with the reviewed Candidate", kind="conflict"
         )
+    _verify_squash_commit(
+        worktree=Path(_field(projection, "worktree_path")),
+        repository=identity["repository"],
+        merge_commit=merge_commit,
+        base_sha=identity["base_sha"],
+        candidate_sha=_field(projection, "candidate_sha"),
+    )
     observed = {
         "number": pr["number"],
         "url": pr["url"],
@@ -1295,6 +1302,69 @@ def _reconcile_candidate_merge(
     _require_effect_observation(merge_effect, observed)
     store.confirm_effect(run_id, "pr-squash-merge", observed=observed)
     return observed
+
+
+def _verify_squash_commit(
+    *,
+    worktree: Path,
+    repository: str,
+    merge_commit: str,
+    base_sha: str,
+    candidate_sha: str,
+) -> None:
+    candidate = _github_git_commit(worktree, repository, candidate_sha)
+    merged = _github_git_commit(worktree, repository, merge_commit)
+    candidate_tree = candidate.get("tree")
+    merged_tree = merged.get("tree")
+    parents = merged.get("parents")
+    if (
+        candidate.get("sha") != candidate_sha
+        or not isinstance(candidate_tree, dict)
+        or not _full_git_sha(candidate_tree.get("sha"))
+        or merged.get("sha") != merge_commit
+        or not isinstance(merged_tree, dict)
+        or merged_tree.get("sha") != candidate_tree["sha"]
+        or not isinstance(parents, list)
+        or len(parents) != 1
+        or not isinstance(parents[0], dict)
+        or parents[0].get("sha") != base_sha
+    ):
+        raise CandidateError(
+            "GitHub squash commit disagrees with the reviewed Candidate",
+            kind="conflict",
+        )
+
+
+def _github_git_commit(
+    worktree: Path, repository: str, commit_sha: str
+) -> dict[str, Any]:
+    completed = _run(
+        [
+            "gh",
+            "api",
+            f"repos/{repository}/git/commits/{commit_sha}",
+            "--method",
+            "GET",
+        ],
+        cwd=worktree,
+    )
+    if completed.returncode != 0:
+        raise CandidateError("GitHub commit observation failed")
+    try:
+        value = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise CandidateError("GitHub commit observation was malformed") from exc
+    if not isinstance(value, dict):
+        raise CandidateError("GitHub commit observation was malformed")
+    return value
+
+
+def _full_git_sha(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 40
+        and all(character in "0123456789abcdef" for character in value)
+    )
 
 
 def _require_effect_observation(

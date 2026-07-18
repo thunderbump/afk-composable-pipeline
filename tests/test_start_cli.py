@@ -324,6 +324,30 @@ class StartCliTest(unittest.TestCase):
                 ]
             ],
         )
+        api_commands = [
+            record["args"]
+            for record in commands
+            if record["command"] == "gh"
+            and record["args"][:1] == ["api"]
+            and "/git/commits/" in record["args"][1]
+        ]
+        self.assertEqual(
+            api_commands,
+            [
+                [
+                    "api",
+                    "repos/thunderbump/beads-webui/git/commits/" + "d" * 40,
+                    "--method",
+                    "GET",
+                ],
+                [
+                    "api",
+                    "repos/thunderbump/beads-webui/git/commits/" + "f" * 40,
+                    "--method",
+                    "GET",
+                ],
+            ],
+        )
 
     def test_resume_reconciles_interruption_after_squash_merge(self):
         run_id = self.start_reviewed_run()
@@ -675,6 +699,89 @@ class StartCliTest(unittest.TestCase):
             if record["command"] == "gh" and record["args"][:2] == ["pr", "merge"]
         ]
         self.assertEqual(len(merge_commands), 1)
+
+    def test_resume_pauses_when_squash_commit_has_two_parents(self):
+        run_id = self.start_reviewed_run()
+        ready = self.run_afk("resume")
+        self.assertEqual(ready.returncode, 0, ready.stderr)
+
+        merged = self.run_afk("resume", AFK_FAKE_MERGE_PARENTS="two")
+
+        self.assertEqual(merged.returncode, 2, merged.stderr)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(status["state"], "attention_required")
+        self.assertEqual(status["checkpoint"], "reviewed")
+        self.assertEqual(status["attention"]["scope"], "merge")
+        store = RunStore(self.state_home / "afk")
+        self.assertEqual(store.effect(run_id, "pr-squash-merge")["status"], "prepared")
+
+    def test_resume_pauses_when_squash_commit_parent_is_not_pinned_base(self):
+        run_id = self.start_reviewed_run()
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+
+        merged = self.run_afk("resume", AFK_FAKE_MERGE_PARENT="e" * 40)
+
+        self.assertEqual(merged.returncode, 2, merged.stderr)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(status["checkpoint"], "reviewed")
+        self.assertEqual(status["attention"]["kind"], "conflict")
+        self.assertEqual(
+            RunStore(self.state_home / "afk").effect(run_id, "pr-squash-merge")[
+                "status"
+            ],
+            "prepared",
+        )
+
+    def test_resume_pauses_when_squash_commit_tree_is_not_candidate_tree(self):
+        run_id = self.start_reviewed_run()
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+
+        merged = self.run_afk("resume", AFK_FAKE_MERGE_TREE="e" * 40)
+
+        self.assertEqual(merged.returncode, 2, merged.stderr)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(status["checkpoint"], "reviewed")
+        self.assertEqual(status["attention"]["kind"], "conflict")
+        self.assertEqual(
+            RunStore(self.state_home / "afk").effect(run_id, "pr-squash-merge")[
+                "status"
+            ],
+            "prepared",
+        )
+
+    def test_resume_pauses_when_squash_commit_observation_is_unavailable(self):
+        run_id = self.start_reviewed_run()
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+
+        merged = self.run_afk("resume", AFK_FAKE_MERGE_COMMIT_UNAVAILABLE="1")
+
+        self.assertEqual(merged.returncode, 2, merged.stderr)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(status["checkpoint"], "reviewed")
+        self.assertEqual(status["attention"]["kind"], "inconclusive")
+        self.assertEqual(
+            RunStore(self.state_home / "afk").effect(run_id, "pr-squash-merge")[
+                "status"
+            ],
+            "prepared",
+        )
+
+    def test_resume_pauses_when_squash_commit_observation_is_malformed(self):
+        run_id = self.start_reviewed_run()
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+
+        merged = self.run_afk("resume", AFK_FAKE_MERGE_COMMIT_MALFORMED="1")
+
+        self.assertEqual(merged.returncode, 2, merged.stderr)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(status["checkpoint"], "reviewed")
+        self.assertEqual(status["attention"]["kind"], "inconclusive")
+        self.assertEqual(
+            RunStore(self.state_home / "afk").effect(run_id, "pr-squash-merge")[
+                "status"
+            ],
+            "prepared",
+        )
 
     def test_resume_pauses_before_merge_when_pinned_target_drifts(self):
         run_id = self.start_reviewed_run()
@@ -2541,7 +2648,27 @@ class StartCliTest(unittest.TestCase):
                     else:
                         raise SystemExit(f"unexpected git args: {args}")
                 elif command == "gh":
-                    if args[:2] == ["pr", "list"]:
+                    if args[:1] == ["api"] and "/git/commits/" in args[1]:
+                        requested = args[1].rsplit("/", 1)[-1]
+                        if os.environ.get("AFK_FAKE_MERGE_COMMIT_UNAVAILABLE"):
+                            raise SystemExit(1)
+                        if os.environ.get("AFK_FAKE_MERGE_COMMIT_MALFORMED"):
+                            print("{")
+                        else:
+                            tree = "c" * 40
+                            parents = [{"sha": sha}]
+                            if requested == "f" * 40:
+                                if os.environ.get("AFK_FAKE_MERGE_PARENTS") == "two":
+                                    parents.append({"sha": candidate_sha})
+                                if os.environ.get("AFK_FAKE_MERGE_PARENT"):
+                                    parents = [{"sha": os.environ["AFK_FAKE_MERGE_PARENT"]}]
+                                tree = os.environ.get("AFK_FAKE_MERGE_TREE", tree)
+                            print(json.dumps({
+                                "sha": requested,
+                                "tree": {"sha": tree},
+                                "parents": parents,
+                            }))
+                    elif args[:2] == ["pr", "list"]:
                         if os.environ.get("AFK_FAKE_READY_PR_UNAVAILABLE"):
                             raise SystemExit(1)
                         elif os.environ.get("AFK_FAKE_READY_PR_MALFORMED"):
