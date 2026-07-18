@@ -870,11 +870,12 @@ def _verify_published(
     expected_pr_number: int | None = None,
     expected_pr_url: str | None = None,
     expected_draft: bool | None = True,
+    remote: str = "origin",
 ) -> None:
     local = _git(worktree, "rev-parse", "HEAD")
     dirty = _git(worktree, "status", "--porcelain")
-    remote = _remote_sha(worktree, branch)
-    target = _remote_sha(worktree, identity["base_branch"])
+    remote_sha = _remote_sha(worktree, branch, remote)
+    target = _remote_sha(worktree, identity["base_branch"], remote)
     if target != identity["base_sha"]:
         raise CandidateError(
             "target branch no longer equals the pinned base", kind="conflict"
@@ -882,7 +883,7 @@ def _verify_published(
     if (
         local != candidate_sha
         or dirty
-        or remote != candidate_sha
+        or remote_sha != candidate_sha
         or pr.get("headRefOid") != candidate_sha
     ):
         raise CandidateError(
@@ -1079,6 +1080,7 @@ def merge_candidate_pr(store: RunStore, run_id: str) -> dict[str, Any]:
         )
     _require_open_effect(merge_effect, "pr-squash-merge", merge_intended)
     _require_open_effect(delete_effect, "remote-branch-delete", delete_intended)
+    origin = _pinned_origin(identity, worktree)
     _verify_published(
         identity,
         worktree,
@@ -1088,6 +1090,7 @@ def merge_candidate_pr(store: RunStore, run_id: str) -> dict[str, Any]:
         expected_pr_number=pr_number,
         expected_pr_url=pr_url,
         expected_draft=False,
+        remote=origin,
     )
     if projection.get("pr_ready") != _ready_pr_observation(pr, candidate_sha):
         raise CandidateError(
@@ -1106,6 +1109,7 @@ def merge_candidate_pr(store: RunStore, run_id: str) -> dict[str, Any]:
         intended=delete_intended,
     )
     pr = _view_pr(worktree, identity["repository"], pr_number)
+    origin = _pinned_origin(identity, worktree)
     _verify_published(
         identity,
         worktree,
@@ -1115,6 +1119,7 @@ def merge_candidate_pr(store: RunStore, run_id: str) -> dict[str, Any]:
         expected_pr_number=pr_number,
         expected_pr_url=pr_url,
         expected_draft=False,
+        remote=origin,
     )
     if (
         projection.get("pr_ready") != _ready_pr_observation(pr, candidate_sha)
@@ -1170,17 +1175,8 @@ def reconcile_candidate_branch_deletion(store: RunStore, run_id: str) -> bool:
     )
     delete_effect = store.effect_if_present(run_id, "remote-branch-delete")
     _require_effect_identity(delete_effect, "remote-branch-delete", delete_intended)
-    origin_repository = github_repo_from_repo_url(
-        _git(worktree, "remote", "get-url", "origin")
-    )
-    if (
-        origin_repository is None
-        or origin_repository.casefold() != identity["repository"].casefold()
-    ):
-        raise CandidateError(
-            "origin does not match the pinned repository", kind="conflict"
-        )
-    remote_sha = _remote_sha(worktree, branch)
+    origin = _pinned_origin(identity, worktree)
+    remote_sha = _remote_sha(worktree, branch, origin)
     if remote_sha not in {"", candidate_sha}:
         raise CandidateError(
             "remote Candidate branch was replaced after merge", kind="conflict"
@@ -1339,10 +1335,18 @@ def _view_pr(worktree: Path, repository: str, pr_number: int) -> dict[str, Any]:
     return value
 
 
-def _remote_sha(worktree: Path, branch: str) -> str:
-    completed = _run(
-        ["git", "ls-remote", "origin", f"refs/heads/{branch}"], cwd=worktree
-    )
+def _pinned_origin(identity: dict[str, Any], worktree: Path) -> str:
+    origin = _git(worktree, "remote", "get-url", "origin")
+    repository = github_repo_from_repo_url(origin)
+    if repository is None or repository.casefold() != identity["repository"].casefold():
+        raise CandidateError(
+            "origin does not match the pinned repository", kind="conflict"
+        )
+    return origin
+
+
+def _remote_sha(worktree: Path, branch: str, remote: str = "origin") -> str:
+    completed = _run(["git", "ls-remote", remote, f"refs/heads/{branch}"], cwd=worktree)
     if completed.returncode != 0:
         raise CandidateError("remote Candidate head observation failed")
     fields = completed.stdout.strip().split()

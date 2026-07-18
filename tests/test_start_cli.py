@@ -526,12 +526,14 @@ class StartCliTest(unittest.TestCase):
         run_id = self.start_reviewed_run()
         ready = self.run_afk("resume")
         self.assertEqual(ready.returncode, 0, ready.stderr)
+        interrupted = self.run_afk("resume", AFK_FAKE_POST_MERGE_REMOTE_UNAVAILABLE="1")
+        self.assertEqual(interrupted.returncode, 2, interrupted.stderr)
 
-        merged = self.run_afk(
+        resumed = self.run_afk(
             "resume", AFK_FAKE_ORIGIN_REPOSITORY="thunderbump/another-repo"
         )
 
-        self.assertEqual(merged.returncode, 2, merged.stderr)
+        self.assertEqual(resumed.returncode, 2, resumed.stderr)
         status = json.loads(self.run_afk("status", run_id, "--json").stdout)
         self.assertEqual(status["checkpoint"], "merged")
         self.assertEqual(status["remote_branch_deleted"], False)
@@ -539,6 +541,36 @@ class StartCliTest(unittest.TestCase):
         store = RunStore(self.state_home / "afk")
         self.assertEqual(
             store.effect(run_id, "remote-branch-delete")["status"], "prepared"
+        )
+
+    def test_resume_observes_branch_deletion_through_captured_origin_url(self):
+        run_id = self.start_reviewed_run()
+        ready = self.run_afk("resume")
+        self.assertEqual(ready.returncode, 0, ready.stderr)
+
+        merged = self.run_afk(
+            "resume", AFK_FAKE_CLEANUP_ORIGIN_CHANGE_AFTER_GET_URL="1"
+        )
+
+        self.assertEqual(merged.returncode, 0, merged.stderr)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(status["checkpoint"], "merged")
+        self.assertEqual(status["remote_branch_deleted"], False)
+        store = RunStore(self.state_home / "afk")
+        self.assertEqual(
+            store.effect(run_id, "remote-branch-delete")["status"], "prepared"
+        )
+        commands = [
+            json.loads(line)
+            for line in self.command_log.read_text(encoding="utf-8").splitlines()
+        ]
+        self.assertIn(
+            [
+                "ls-remote",
+                "git@github.com:thunderbump/beads-webui.git",
+                f"refs/heads/afk/central-bnkl-1-1-{run_id}/candidate",
+            ],
+            [record["args"] for record in commands if record["command"] == "git"],
         )
 
     def test_resume_pauses_when_merged_pr_effect_identity_does_not_match(self):
@@ -658,6 +690,40 @@ class StartCliTest(unittest.TestCase):
         self.assertEqual(status["attention"]["scope"], "merge")
         with self.assertRaises(RunStoreError):
             RunStore(self.state_home / "afk").effect(run_id, "pr-squash-merge")
+        commands = self.command_log.read_text(encoding="utf-8")
+        self.assertNotIn('"args":["pr","merge"', commands)
+
+    def test_resume_pauses_before_merge_when_origin_does_not_match_repository(self):
+        run_id = self.start_reviewed_run()
+        ready = self.run_afk("resume")
+        self.assertEqual(ready.returncode, 0, ready.stderr)
+
+        merged = self.run_afk(
+            "resume", AFK_FAKE_ORIGIN_REPOSITORY="thunderbump/another-repo"
+        )
+
+        self.assertEqual(merged.returncode, 2, merged.stderr)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(status["state"], "attention_required")
+        self.assertEqual(status["checkpoint"], "reviewed")
+        self.assertEqual(status["attention"]["scope"], "merge")
+        self.assertIn("origin", status["attention"]["summary"])
+        commands = self.command_log.read_text(encoding="utf-8")
+        self.assertNotIn('"args":["pr","merge"', commands)
+
+    def test_resume_pauses_when_origin_changes_during_final_merge_checks(self):
+        run_id = self.start_reviewed_run()
+        ready = self.run_afk("resume")
+        self.assertEqual(ready.returncode, 0, ready.stderr)
+
+        merged = self.run_afk("resume", AFK_FAKE_ORIGIN_CHANGE_AFTER_FIRST_CHECK="1")
+
+        self.assertEqual(merged.returncode, 2, merged.stderr)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(status["state"], "attention_required")
+        self.assertEqual(status["checkpoint"], "reviewed")
+        self.assertEqual(status["attention"]["scope"], "merge")
+        self.assertIn("origin", status["attention"]["summary"])
         commands = self.command_log.read_text(encoding="utf-8")
         self.assertNotIn('"args":["pr","merge"', commands)
 
@@ -2310,6 +2376,10 @@ class StartCliTest(unittest.TestCase):
                 pr_view_count = Path(os.environ["XDG_STATE_HOME"]) / "fake-pr-view-count"
                 comment_state = Path(os.environ["XDG_STATE_HOME"]) / "fake-comment.json"
                 target_drift = Path(os.environ["XDG_STATE_HOME"]) / "fake-target-drift"
+                origin_checks = Path(os.environ["XDG_STATE_HOME"]) / "fake-origin-checks"
+                cleanup_origin_changed = (
+                    Path(os.environ["XDG_STATE_HOME"]) / "fake-cleanup-origin-changed"
+                )
                 remote_deleted = Path(os.environ["XDG_STATE_HOME"]) / "fake-remote-deleted"
                 remote_replaced = Path(os.environ["XDG_STATE_HOME"]) / "fake-remote-replaced"
                 if command == "git":
@@ -2320,6 +2390,18 @@ class StartCliTest(unittest.TestCase):
                             "AFK_FAKE_ORIGIN_REPOSITORY",
                             "thunderbump/beads-webui",
                         )
+                        if os.environ.get("AFK_FAKE_ORIGIN_CHANGE_AFTER_FIRST_CHECK"):
+                            checks = int(origin_checks.read_text()) if origin_checks.exists() else 0
+                            origin_checks.write_text(str(checks + 1), encoding="utf-8")
+                            if checks:
+                                repository = "thunderbump/another-repo"
+                        if (
+                            os.environ.get(
+                                "AFK_FAKE_CLEANUP_ORIGIN_CHANGE_AFTER_GET_URL"
+                            )
+                            and remote_deleted.exists()
+                        ):
+                            cleanup_origin_changed.write_text("changed", encoding="utf-8")
                         print("git@github.com:" + repository + ".git")
                     elif args[:1] == ["ls-remote"]:
                         requested = args[-1]
@@ -2333,6 +2415,14 @@ class StartCliTest(unittest.TestCase):
                                 value = json.loads(pr_state.read_text())
                                 value["baseRefName"] = "release"
                                 pr_state.write_text(json.dumps(value), encoding="utf-8")
+                        elif (
+                            os.environ.get(
+                                "AFK_FAKE_CLEANUP_ORIGIN_CHANGE_AFTER_GET_URL"
+                            )
+                            and cleanup_origin_changed.exists()
+                            and args[1] != "origin"
+                        ):
+                            print(candidate_sha + "\\t" + requested)
                         elif (
                             os.environ.get("AFK_FAKE_POST_MERGE_REMOTE_UNAVAILABLE")
                             and remote_deleted.exists()
