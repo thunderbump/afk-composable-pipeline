@@ -669,6 +669,39 @@ class StartCliTest(unittest.TestCase):
         self.assertNotIn('"args":["worktree","remove"', commands)
         self.assertNotIn('"args":["branch","-D"', commands)
 
+    def test_terminal_cleanup_does_not_delete_local_branch_replaced_at_mutation(self):
+        run_id = self.start_reviewed_run()
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+
+        completed = self.run_afk(
+            "resume", AFK_FAKE_LOCAL_BRANCH_MOVES_DURING_DELETE="1"
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertFalse(status["completion"]["local_branch_deleted"])
+        self.assertIn(
+            "Run branch cleanup failed",
+            status["completion"]["cleanup_warnings"],
+        )
+        self.assertTrue((self.state_home / "fake-local-branch-replaced").exists())
+        self.assertFalse((self.state_home / "fake-local-branch-removed").exists())
+        commands = [
+            json.loads(line)
+            for line in self.command_log.read_text(encoding="utf-8").splitlines()
+        ]
+        branch_ref = "refs/heads/afk/central-bnkl-1-1-" + run_id + "/candidate"
+        self.assertIn(
+            ["update-ref", "-d", branch_ref, "d" * 40],
+            [record["args"] for record in commands if record["command"] == "git"],
+        )
+        self.assertNotIn(
+            ["branch", "-D", branch_ref.removeprefix("refs/heads/")],
+            [record["args"] for record in commands if record["command"] == "git"],
+        )
+
     def test_terminal_cleanup_failures_are_durable_warnings(self):
         run_id = self.start_reviewed_run()
         self.assertEqual(self.run_afk("resume").returncode, 0)
@@ -3094,6 +3127,7 @@ class StartCliTest(unittest.TestCase):
                 remote_replaced = Path(os.environ["XDG_STATE_HOME"]) / "fake-remote-replaced"
                 worktree_removed = Path(os.environ["XDG_STATE_HOME"]) / "fake-worktree-removed"
                 local_branch_removed = Path(os.environ["XDG_STATE_HOME"]) / "fake-local-branch-removed"
+                local_branch_replaced = Path(os.environ["XDG_STATE_HOME"]) / "fake-local-branch-replaced"
                 bead_closed = Path(os.environ["XDG_STATE_HOME"]) / "fake-bead-closed"
                 bead_show_count = Path(os.environ["XDG_STATE_HOME"]) / "fake-bead-show-count"
                 if command == "git":
@@ -3185,7 +3219,9 @@ class StartCliTest(unittest.TestCase):
                         print(common_dir)
                     elif args[:1] == ["rev-parse"]:
                         if args[-1].startswith("refs/heads/"):
-                            if not local_branch_removed.exists():
+                            if local_branch_replaced.exists():
+                                print("a" * 40)
+                            elif not local_branch_removed.exists():
                                 print(candidate_sha)
                             else:
                                 raise SystemExit(1)
@@ -3263,6 +3299,25 @@ class StartCliTest(unittest.TestCase):
                             shutil.rmtree(checkout)
                     elif args[:2] == ["branch", "-D"]:
                         if os.environ.get("AFK_FAKE_BRANCH_DELETE_FAILURE"):
+                            raise SystemExit(1)
+                        if os.environ.get(
+                            "AFK_FAKE_LOCAL_BRANCH_MOVES_DURING_DELETE"
+                        ):
+                            local_branch_replaced.write_text(
+                                "replaced", encoding="utf-8"
+                            )
+                        local_branch_removed.write_text("removed", encoding="utf-8")
+                    elif args[:2] == ["update-ref", "-d"]:
+                        if os.environ.get("AFK_FAKE_BRANCH_DELETE_FAILURE"):
+                            raise SystemExit(1)
+                        if os.environ.get(
+                            "AFK_FAKE_LOCAL_BRANCH_MOVES_DURING_DELETE"
+                        ):
+                            local_branch_replaced.write_text(
+                                "replaced", encoding="utf-8"
+                            )
+                        current = "a" * 40 if local_branch_replaced.exists() else candidate_sha
+                        if len(args) != 4 or args[3] != current:
                             raise SystemExit(1)
                         local_branch_removed.write_text("removed", encoding="utf-8")
                     elif args[:2] == ["branch", "--show-current"]:

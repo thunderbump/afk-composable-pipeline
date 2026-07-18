@@ -1861,10 +1861,29 @@ def _cleanup_run_checkout(
                 "Run branch ownership could not be verified; cleanup skipped"
             )
         else:
-            deleted = _command(
-                ["git", "branch", "-D", expected_branch], cwd=root, check=False
+            _command(
+                [
+                    "git",
+                    "update-ref",
+                    "-d",
+                    f"refs/heads/{expected_branch}",
+                    candidate_sha,
+                ],
+                cwd=root,
+                check=False,
             )
-            local_branch_deleted = deleted.returncode == 0
+            after_delete = _command(
+                [
+                    "git",
+                    "rev-parse",
+                    "--verify",
+                    "--quiet",
+                    f"refs/heads/{expected_branch}",
+                ],
+                cwd=root,
+                check=False,
+            )
+            local_branch_deleted = after_delete.returncode == 1
             if not local_branch_deleted:
                 warnings.append("Run branch cleanup failed")
     return worktree_removed, local_branch_deleted, warnings[:2]
