@@ -442,6 +442,17 @@ class RunStore:
             self.seal_evidence(run_id, relative_directory)
             return expected
 
+    def sealed_evidence_result(
+        self, run_id: str, relative_directory: str
+    ) -> Any | None:
+        """Return a verified sealed result, or None when it has not been sealed."""
+        with self.lock():
+            directory = self._evidence_path(run_id, relative_directory)
+            if not (directory / "manifest.json").is_file():
+                return None
+            self.verify_evidence(run_id, relative_directory)
+            return _read_evidence_result(directory / "result.json")
+
     def _append_event_unlocked(
         self,
         run_id: str,

@@ -1616,6 +1616,41 @@ def _advance_terminal_cleanup(store: RunStore, run_id: str) -> int:
         )
         return 2
 
+    candidate_sha = projection["candidate_sha"]
+    evidence = f"gates/completion-{candidate_sha[:12]}"
+    try:
+        sealed_completion = store.sealed_evidence_result(run_id, evidence)
+        if sealed_completion is not None:
+            _validate_sealed_completion(
+                sealed_completion,
+                identity=identity,
+                merge=merge,
+                closure=closure,
+                candidate_sha=candidate_sha,
+                evidence=evidence,
+            )
+            store.append_event(
+                run_id,
+                "run.completed",
+                state="completed",
+                data={
+                    "checkpoint": "completed",
+                    "attention": {},
+                    "completion": sealed_completion,
+                },
+            )
+            return 0
+    except (StartError, RunStoreError) as exc:
+        _attention(
+            store,
+            run_id,
+            checkpoint="bead_closed",
+            scope="terminal_cleanup",
+            kind="invalid",
+            summary=str(exc),
+        )
+        return 2
+
     warnings: list[str] = []
     remote_deleted = False
     try:
@@ -1633,8 +1668,6 @@ def _advance_terminal_cleanup(store: RunStore, run_id: str) -> int:
             "Run worktree cleanup could not be inspected; cleanup skipped"
         ]
     warnings.extend(local_warnings)
-    candidate_sha = projection["candidate_sha"]
-    evidence = f"gates/completion-{candidate_sha[:12]}"
     record = redact_artifact_value(
         {
             "schema_version": 1,
@@ -1675,6 +1708,47 @@ def _advance_terminal_cleanup(store: RunStore, run_id: str) -> int:
         )
         return 2
     return 0
+
+
+def _validate_sealed_completion(
+    record: Any,
+    *,
+    identity: dict[str, Any],
+    merge: dict[str, Any],
+    closure: dict[str, Any],
+    candidate_sha: str,
+    evidence: str,
+) -> None:
+    expected = {
+        "schema_version": 1,
+        "repository": identity["repository"],
+        "bead_id": identity["bead_id"],
+        "candidate_sha": candidate_sha,
+        "pr_number": merge["number"],
+        "pr_url": merge["url"],
+        "merge_commit": merge["merge_commit"],
+        "bead_closure": closure,
+        "evidence": evidence,
+    }
+    cleanup_keys = {
+        "remote_branch_deleted",
+        "worktree_removed",
+        "local_branch_deleted",
+        "cleanup_warnings",
+    }
+    if (
+        not isinstance(record, dict)
+        or set(record) != set(expected) | cleanup_keys
+        or any(record.get(key) != value for key, value in expected.items())
+        or any(
+            type(record.get(key)) is not bool
+            for key in cleanup_keys - {"cleanup_warnings"}
+        )
+        or not isinstance(record.get("cleanup_warnings"), list)
+        or len(record["cleanup_warnings"]) > 3
+        or not all(isinstance(warning, str) for warning in record["cleanup_warnings"])
+    ):
+        raise StartError("sealed completion evidence contradicts the terminal Run")
 
 
 def _terminal_facts(

@@ -680,6 +680,43 @@ class StartCliTest(unittest.TestCase):
         self.assertEqual(status["merge"]["merge_commit"], "f" * 40)
         self.assertEqual(status["bead_closure"]["status"], "closed")
 
+    def test_terminal_cleanup_recovers_sealed_completion_before_rechecking_cleanup(
+        self,
+    ):
+        run_id = self.start_reviewed_run()
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+        before = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        evidence = f"gates/completion-{before['candidate_sha'][:12]}"
+        sealed_completion = {
+            "schema_version": 1,
+            "repository": "thunderbump/beads-webui",
+            "bead_id": "central-bnkl.1.1",
+            "candidate_sha": before["candidate_sha"],
+            "pr_number": before["merge"]["number"],
+            "pr_url": before["merge"]["url"],
+            "merge_commit": before["merge"]["merge_commit"],
+            "bead_closure": before["bead_closure"],
+            "remote_branch_deleted": False,
+            "worktree_removed": False,
+            "local_branch_deleted": False,
+            "cleanup_warnings": ["cleanup was interrupted"],
+            "evidence": evidence,
+        }
+        store = RunStore(self.state_home / "afk")
+        store.reconcile_evidence_result(run_id, evidence, sealed_completion)
+        commands_before = self.command_log.read_text(encoding="utf-8")
+
+        resumed = self.run_afk("resume")
+
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(status["state"], "completed")
+        self.assertEqual(status["completion"], sealed_completion)
+        self.assertTrue((self.state_home / "afk" / "worktrees" / run_id).exists())
+        self.assertEqual(self.command_log.read_text(encoding="utf-8"), commands_before)
+
     def test_resume_reconciles_interruption_after_bead_close_without_second_close(self):
         run_id = self.start_reviewed_run()
         self.assertEqual(self.run_afk("resume").returncode, 0)
