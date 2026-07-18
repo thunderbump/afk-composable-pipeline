@@ -861,6 +861,24 @@ class StartCliTest(unittest.TestCase):
         self.assertEqual(status["merge"]["merge_commit"], "f" * 40)
         self.assertEqual(status["bead_closure"]["status"], "closed")
 
+    def test_terminal_cleanup_filesystem_exception_is_a_durable_warning(self):
+        run_id = self.start_reviewed_run()
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+
+        completed = self.run_afk("resume", AFK_FAKE_LOCK_UNLINK_FAILURE="1")
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(status["state"], "completed")
+        self.assertEqual(
+            status["completion"]["cleanup_warnings"],
+            ["Run worktree cleanup could not be inspected; cleanup skipped"],
+        )
+        self.assertEqual(status["merge"]["merge_commit"], "f" * 40)
+        self.assertEqual(status["bead_closure"]["status"], "closed")
+
     def test_terminal_cleanup_recovers_sealed_completion_before_rechecking_cleanup(
         self,
     ):
@@ -3465,6 +3483,16 @@ class StartCliTest(unittest.TestCase):
                         if checkout.exists():
                             import shutil
                             shutil.rmtree(checkout)
+                        if os.environ.get("AFK_FAKE_LOCK_UNLINK_FAILURE"):
+                            head_lock = (
+                                Path(os.environ["XDG_STATE_HOME"])
+                                / "fake-git"
+                                / "worktrees"
+                                / checkout.name
+                                / "HEAD.lock"
+                            )
+                            head_lock.unlink()
+                            head_lock.mkdir()
                     elif args[:2] == ["branch", "-D"]:
                         if os.environ.get("AFK_FAKE_BRANCH_DELETE_FAILURE"):
                             raise SystemExit(1)

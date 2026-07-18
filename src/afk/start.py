@@ -1555,7 +1555,7 @@ def _advance_terminal_cleanup(store: RunStore, run_id: str) -> int:
         worktree_removed, local_branch_deleted, local_warnings = _cleanup_run_checkout(
             store, identity, projection
         )
-    except ExternalCommandError:
+    except (ExternalCommandError, OSError, RuntimeError):
         worktree_removed, local_branch_deleted = False, False
         local_warnings = [
             "Run worktree cleanup could not be inspected; cleanup skipped"
