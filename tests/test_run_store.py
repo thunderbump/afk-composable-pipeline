@@ -6,6 +6,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -29,6 +30,7 @@ from afk.run_store import (  # noqa: E402
     RunStoreBusy,
     RunStoreError,
 )
+from afk.start import resume_run  # noqa: E402
 
 
 BASE_SHA = "a" * 40
@@ -153,6 +155,47 @@ class RunStoreTest(unittest.TestCase):
 
         next_run = self.create_run("run-002")
         self.assertEqual(next_run["run_id"], "run-002")
+
+    def test_resume_recovers_completion_after_active_pointer_unlink_fails(self):
+        self.create_run()
+        active_path = self.root / "active.json"
+        real_unlink = Path.unlink
+
+        def fail_active_unlink(path, *args, **kwargs):
+            if path == active_path:
+                raise OSError("injected active pointer unlink failure")
+            return real_unlink(path, *args, **kwargs)
+
+        with patch.object(
+            Path, "unlink", autospec=True, side_effect=fail_active_unlink
+        ):
+            with self.assertRaises(OSError):
+                self.store.append_event("run-001", "run.completed", state="completed")
+
+        with patch.dict(os.environ, {"XDG_STATE_HOME": str(self.state_home)}):
+            run_id, exit_code = resume_run()
+
+        self.assertEqual((run_id, exit_code), ("run-001", 0))
+        self.assertFalse(active_path.exists())
+        events = (self.root / "runs" / "run-001" / "events.jsonl").read_text(
+            encoding="utf-8"
+        )
+        self.assertEqual(events.count('"event":"run.completed"'), 1)
+
+    def test_completing_one_run_does_not_clear_another_runs_pointer(self):
+        self.create_run()
+        self.store.append_event("run-001", "run.completed", state="completed")
+        self.create_run("run-002")
+        self.store.append_event("run-002", "run.completed", state="completed")
+        active_path = self.root / "active.json"
+        active_path.write_text('{"run_id":"run-002"}\n', encoding="utf-8")
+
+        self.store.append_event("run-001", "run.observed", state="completed")
+
+        self.assertEqual(
+            json.loads(active_path.read_text(encoding="utf-8")),
+            {"run_id": "run-002"},
+        )
 
     def test_attention_required_run_remains_active(self):
         self.create_run()

@@ -192,20 +192,22 @@ class RunStore:
                 data=data,
                 recorded_at=recorded_at,
             )
-            active_path = self.root / "active.json"
             if projection["state"] == "completed" and self._active_run_id() is None:
-                active_path.unlink(missing_ok=True)
-                _fsync_directory(self.root)
+                self._clear_active_pointer(run_id)
             return projection
 
     def status(self, run_id: str | None = None) -> dict[str, Any]:
-        selected = run_id or self._active_run_id()
-        if selected is None:
-            raise RunNotFound("no Active Run")
-        _validate_run_id(selected)
-        identity = self._identity(selected)
-        events, _ = self._read_events(selected)
-        return _project(identity, events)
+        with self.lock():
+            selected = run_id or self._active_run_id()
+            if selected is None:
+                recovered = self._reconcile_completed_active_pointer()
+                if recovered is not None:
+                    return recovered
+                raise RunNotFound("no Active Run")
+            _validate_run_id(selected)
+            identity = self._identity(selected)
+            events, _ = self._read_events(selected)
+            return _project(identity, events)
 
     def identity(self, run_id: str) -> dict[str, Any]:
         return self._identity(run_id)
@@ -582,6 +584,41 @@ class RunStore:
         if len(active) > 1:
             raise EventHistoryCorrupt("multiple Active Runs exist")
         return active[0] if active else None
+
+    def _reconcile_completed_active_pointer(self) -> dict[str, Any] | None:
+        run_id = self._active_pointer_run_id()
+        if run_id is None:
+            return None
+        identity = self._identity(run_id)
+        events, _ = self._read_events(run_id)
+        projection = _project(identity, events)
+        if projection["state"] != "completed":
+            return None
+        self._clear_active_pointer(run_id)
+        return projection
+
+    def _clear_active_pointer(self, run_id: str) -> None:
+        if self._active_pointer_run_id() != run_id:
+            return
+        (self.root / "active.json").unlink(missing_ok=True)
+        _fsync_directory(self.root)
+
+    def _active_pointer_run_id(self) -> str | None:
+        try:
+            active = json.loads((self.root / "active.json").read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            return None
+        if (
+            not isinstance(active, dict)
+            or set(active) != {"run_id"}
+            or not isinstance(active["run_id"], str)
+        ):
+            return None
+        try:
+            _validate_run_id(active["run_id"])
+        except RunStoreError:
+            return None
+        return active["run_id"]
 
     def _run_dir(self, run_id: str) -> Path:
         _validate_run_id(run_id)
