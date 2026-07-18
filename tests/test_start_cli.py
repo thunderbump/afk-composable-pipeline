@@ -359,6 +359,84 @@ class StartCliTest(unittest.TestCase):
         ]
         self.assertEqual(len(merge_commands), 1)
 
+    def test_resume_pauses_when_merged_pr_effect_identity_does_not_match(self):
+        run_id = self.start_reviewed_run()
+        ready = self.run_afk("resume")
+        self.assertEqual(ready.returncode, 0, ready.stderr)
+        store = RunStore(self.state_home / "afk")
+        status = store.status(run_id)
+        store.prepare_effect(
+            run_id,
+            "pr-squash-merge",
+            kind="pr-squash-merge",
+            intended={"repository": "someone/else"},
+        )
+        store.prepare_effect(
+            run_id,
+            "remote-branch-delete",
+            kind="remote-branch-delete",
+            intended={
+                "repository": "thunderbump/beads-webui",
+                "branch": status["branch"],
+                "candidate_sha": "d" * 40,
+            },
+        )
+
+        resumed = self.run_afk("resume", AFK_FAKE_PR_MERGED="1")
+
+        self.assertEqual(resumed.returncode, 2, resumed.stderr)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(status["state"], "attention_required")
+        self.assertEqual(status["checkpoint"], "reviewed")
+        self.assertEqual(status["attention"]["scope"], "merge")
+        commands = self.command_log.read_text(encoding="utf-8")
+        self.assertNotIn('"args":["pr","merge"', commands)
+
+    def test_resume_pauses_when_open_pr_merge_effect_is_already_confirmed(self):
+        run_id = self.start_reviewed_run()
+        ready = self.run_afk("resume")
+        self.assertEqual(ready.returncode, 0, ready.stderr)
+        store = RunStore(self.state_home / "afk")
+        identity = store.identity(run_id)
+        status = store.status(run_id)
+        store.prepare_effect(
+            run_id,
+            "pr-squash-merge",
+            kind="pr-squash-merge",
+            intended={
+                "repository": identity["repository"],
+                "number": 17,
+                "url": "https://example.test/pr/17",
+                "candidate_sha": "d" * 40,
+                "head": status["branch"],
+                "base": identity["base_branch"],
+                "base_sha": identity["base_sha"],
+                "strategy": "squash",
+            },
+        )
+        store.confirm_effect(
+            run_id,
+            "pr-squash-merge",
+            observed={
+                "number": 17,
+                "url": "https://example.test/pr/17",
+                "candidate_sha": "d" * 40,
+                "head": status["branch"],
+                "base": identity["base_branch"],
+                "merge_commit": "f" * 40,
+            },
+        )
+
+        resumed = self.run_afk("resume")
+
+        self.assertEqual(resumed.returncode, 2, resumed.stderr)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(status["state"], "attention_required")
+        self.assertEqual(status["checkpoint"], "reviewed")
+        self.assertEqual(status["attention"]["scope"], "merge")
+        commands = self.command_log.read_text(encoding="utf-8")
+        self.assertNotIn('"args":["pr","merge"', commands)
+
     def test_resume_pauses_when_merged_pr_has_no_full_squash_commit(self):
         run_id = self.start_reviewed_run()
         ready = self.run_afk("resume")
@@ -398,6 +476,26 @@ class StartCliTest(unittest.TestCase):
         self.assertEqual(status["attention"]["scope"], "merge")
         with self.assertRaises(RunStoreError):
             RunStore(self.state_home / "afk").effect(run_id, "pr-squash-merge")
+        commands = self.command_log.read_text(encoding="utf-8")
+        self.assertNotIn('"args":["pr","merge"', commands)
+
+    def test_resume_pauses_when_pr_is_retargeted_during_merge_checks(self):
+        run_id = self.start_reviewed_run()
+        ready = self.run_afk("resume")
+        self.assertEqual(ready.returncode, 0, ready.stderr)
+
+        merged = self.run_afk("resume", AFK_FAKE_PR_RACE_DURING_GIT="retarget")
+
+        self.assertEqual(merged.returncode, 2, merged.stderr)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(status["state"], "attention_required")
+        self.assertEqual(status["checkpoint"], "reviewed")
+        self.assertEqual(status["attention"]["scope"], "merge")
+        store = RunStore(self.state_home / "afk")
+        with self.assertRaises(RunStoreError):
+            store.effect(run_id, "pr-squash-merge")
+        with self.assertRaises(RunStoreError):
+            store.effect(run_id, "remote-branch-delete")
         commands = self.command_log.read_text(encoding="utf-8")
         self.assertNotIn('"args":["pr","merge"', commands)
 
@@ -2020,6 +2118,13 @@ class StartCliTest(unittest.TestCase):
                         if requested == "refs/heads/main":
                             target_sha = "e" * 40 if target_drift.exists() else sha
                             print(target_sha + "\\trefs/heads/main")
+                            if (
+                                os.environ.get("AFK_FAKE_PR_RACE_DURING_GIT")
+                                == "retarget"
+                            ):
+                                value = json.loads(pr_state.read_text())
+                                value["baseRefName"] = "release"
+                                pr_state.write_text(json.dumps(value), encoding="utf-8")
                         elif pushed_marker.exists() and not remote_deleted.exists():
                             print(candidate_sha + "\\t" + requested)
                     elif args[:1] == ["fetch"]:
