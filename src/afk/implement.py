@@ -1211,11 +1211,11 @@ def fallback_git_metadata(start_commit: str) -> dict[str, Any]:
 def safe_git_metadata(checkout_path: Path, before_commit: str) -> dict[str, Any]:
     try:
         return git_metadata(checkout_path, before_commit)
-    except AgentRuntimeError as exc:
+    except (AgentRuntimeError, OSError) as exc:
         return {
             **fallback_git_metadata(before_commit),
             "metadata_status": "failed",
-            "metadata_error": redact_text(exc.message),
+            "metadata_error": redact_text(getattr(exc, "message", str(exc))),
         }
 
 
