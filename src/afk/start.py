@@ -1623,9 +1623,15 @@ def _advance_terminal_cleanup(store: RunStore, run_id: str) -> int:
     except (CandidateError, RunStoreError):
         warnings.append("remote Candidate branch cleanup could not be confirmed")
 
-    worktree_removed, local_branch_deleted, local_warnings = _cleanup_run_checkout(
-        store, identity, projection
-    )
+    try:
+        worktree_removed, local_branch_deleted, local_warnings = _cleanup_run_checkout(
+            store, identity, projection
+        )
+    except ExternalCommandError:
+        worktree_removed, local_branch_deleted = False, False
+        local_warnings = [
+            "Run worktree cleanup could not be inspected; cleanup skipped"
+        ]
     warnings.extend(local_warnings)
     candidate_sha = projection["candidate_sha"]
     evidence = f"gates/completion-{candidate_sha[:12]}"

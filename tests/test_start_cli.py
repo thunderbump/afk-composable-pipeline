@@ -659,6 +659,27 @@ class StartCliTest(unittest.TestCase):
         self.assertEqual(status["merge"]["merge_commit"], "f" * 40)
         self.assertEqual(status["bead_closure"]["status"], "closed")
 
+    def test_terminal_cleanup_command_exception_is_a_durable_warning(self):
+        run_id = self.start_reviewed_run()
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+
+        completed = self.run_afk(
+            "resume", AFK_FAKE_REPOSITORY_DISAPPEARS_DURING_CLEANUP="1"
+        )
+        self.project.mkdir()
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(status["state"], "completed")
+        self.assertEqual(
+            status["completion"]["cleanup_warnings"],
+            ["Run worktree cleanup could not be inspected; cleanup skipped"],
+        )
+        self.assertEqual(status["merge"]["merge_commit"], "f" * 40)
+        self.assertEqual(status["bead_closure"]["status"], "closed")
+
     def test_resume_reconciles_interruption_after_bead_close_without_second_close(self):
         run_id = self.start_reviewed_run()
         self.assertEqual(self.run_afk("resume").returncode, 0)
@@ -3123,6 +3144,11 @@ class StartCliTest(unittest.TestCase):
                         )
                         validation_worker.chmod(0o700)
                     elif args[:3] == ["worktree", "list", "--porcelain"]:
+                        if os.environ.get(
+                            "AFK_FAKE_REPOSITORY_DISAPPEARS_DURING_CLEANUP"
+                        ):
+                            import shutil
+                            shutil.rmtree(project)
                         if (
                             not os.environ.get("AFK_FAKE_UNREGISTERED_WORKTREE")
                             and not worktree_removed.exists()
