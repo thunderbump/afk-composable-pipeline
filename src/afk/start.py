@@ -1507,8 +1507,10 @@ def _advance_terminal_cleanup(store: RunStore, run_id: str) -> int:
     evidence = f"gates/completion-{candidate_sha[:12]}"
     try:
         sealed_completion = store.sealed_evidence_result(run_id, evidence)
+        if sealed_completion is None:
+            sealed_completion = store.unsealed_evidence_result(run_id, evidence)
         if sealed_completion is not None:
-            _validate_sealed_completion(
+            _validate_completion_record(
                 sealed_completion,
                 identity=identity,
                 merge=merge,
@@ -1516,6 +1518,7 @@ def _advance_terminal_cleanup(store: RunStore, run_id: str) -> int:
                 candidate_sha=candidate_sha,
                 evidence=evidence,
             )
+            store.reconcile_evidence_result(run_id, evidence, sealed_completion)
             store.append_event(
                 run_id,
                 "run.completed",
@@ -1597,7 +1600,7 @@ def _advance_terminal_cleanup(store: RunStore, run_id: str) -> int:
     return 0
 
 
-def _validate_sealed_completion(
+def _validate_completion_record(
     record: Any,
     *,
     identity: dict[str, Any],
@@ -1635,7 +1638,7 @@ def _validate_sealed_completion(
         or len(record["cleanup_warnings"]) > 3
         or not all(isinstance(warning, str) for warning in record["cleanup_warnings"])
     ):
-        raise StartError("sealed completion evidence contradicts the terminal Run")
+        raise StartError("completion evidence contradicts the terminal Run")
 
 
 def _terminal_facts(

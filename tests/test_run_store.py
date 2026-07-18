@@ -381,6 +381,42 @@ class RunStoreTest(unittest.TestCase):
             )
         self.assertEqual(stat.S_IMODE(directory.stat().st_mode), 0o500)
 
+    def test_unsealed_evidence_result_rejects_partial_evidence(self):
+        self.create_run()
+        directory = self.root / "runs" / "run-001" / "gates" / "completion"
+        directory.mkdir()
+
+        with self.assertRaises(EvidenceError):
+            self.store.unsealed_evidence_result("run-001", "gates/completion")
+
+    def test_unsealed_evidence_result_rejects_ambiguous_evidence(self):
+        self.create_run()
+        self.store.write_evidence_value(
+            "run-001", "gates/completion/result.json", {"status": "complete"}
+        )
+        self.store.write_evidence_text(
+            "run-001", "gates/completion/extra.txt", "unexpected\n"
+        )
+
+        with self.assertRaises(EvidenceError):
+            self.store.unsealed_evidence_result("run-001", "gates/completion")
+
+    def test_unsealed_evidence_result_rejects_malformed_evidence(self):
+        self.create_run()
+        self.store.write_evidence_text("run-001", "gates/completion/result.json", "{\n")
+
+        with self.assertRaises(EvidenceError):
+            self.store.unsealed_evidence_result("run-001", "gates/completion")
+
+    def test_unsealed_evidence_result_rejects_unverified_manifest(self):
+        self.create_run()
+        directory = self.root / "runs" / "run-001" / "gates" / "completion"
+        directory.mkdir()
+        (directory / "manifest.json").symlink_to("missing-manifest.json")
+
+        with self.assertRaises(EvidenceError):
+            self.store.unsealed_evidence_result("run-001", "gates/completion")
+
     def test_sealed_bead_spec_recovers_after_projection_record_crash(self):
         self.create_run()
         bead = {

@@ -448,10 +448,39 @@ class RunStore:
         """Return a verified sealed result, or None when it has not been sealed."""
         with self.lock():
             directory = self._evidence_path(run_id, relative_directory)
-            if not (directory / "manifest.json").is_file():
+            manifest_path = directory / "manifest.json"
+            if manifest_path.is_symlink() or (
+                manifest_path.exists() and not manifest_path.is_file()
+            ):
+                raise EvidenceTampered("evidence manifest is invalid")
+            if not manifest_path.is_file():
                 return None
             self.verify_evidence(run_id, relative_directory)
             return _read_evidence_result(directory / "result.json")
+
+    def unsealed_evidence_result(
+        self, run_id: str, relative_directory: str
+    ) -> Any | None:
+        """Return one complete unsealed result, rejecting partial evidence."""
+        with self.lock():
+            directory = self._evidence_path(run_id, relative_directory)
+            manifest_path = directory / "manifest.json"
+            if manifest_path.exists() or manifest_path.is_symlink():
+                raise EvidenceError("unsealed evidence contains an invalid manifest")
+            if not directory.exists():
+                return None
+            if not directory.is_dir():
+                raise EvidenceError("unsealed evidence result is invalid")
+            entries = list(directory.iterdir())
+            result_path = directory / "result.json"
+            if (
+                len(entries) != 1
+                or entries[0].name != "result.json"
+                or result_path.is_symlink()
+                or not result_path.is_file()
+            ):
+                raise EvidenceError("unsealed evidence result is partial or ambiguous")
+            return _read_evidence_result(result_path)
 
     def _append_event_unlocked(
         self,
