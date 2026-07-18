@@ -1229,7 +1229,14 @@ def delete_candidate_branch(store: RunStore, run_id: str) -> bool:
             kind="conflict",
         )
     completed = _run(
-        ["git", "push", origin, "--delete", branch],
+        [
+            "git",
+            "push",
+            f"--force-with-lease=refs/heads/{branch}:{candidate_sha}",
+            "--delete",
+            origin,
+            branch,
+        ],
         cwd=worktree,
     )
     if completed.returncode != 0:

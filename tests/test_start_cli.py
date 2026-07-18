@@ -601,6 +601,42 @@ class StartCliTest(unittest.TestCase):
             deletes[0]["args"],
         )
 
+    def test_terminal_cleanup_does_not_delete_branch_replaced_during_delete(self):
+        run_id = self.start_reviewed_run()
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+        self.assertEqual(
+            self.run_afk("resume", AFK_FAKE_REMOTE_BRANCH_LINGERS="1").returncode,
+            0,
+        )
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+
+        completed = self.run_afk("resume", AFK_FAKE_REMOTE_MOVES_DURING_DELETE="1")
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertFalse(status["completion"]["remote_branch_deleted"])
+        self.assertIn(
+            "remote Candidate branch cleanup could not be confirmed",
+            status["completion"]["cleanup_warnings"],
+        )
+        self.assertFalse((self.state_home / "fake-remote-deleted").exists())
+        deletes = [
+            record
+            for record in map(
+                json.loads,
+                self.command_log.read_text(encoding="utf-8").splitlines(),
+            )
+            if record["command"] == "git" and "--delete" in record["args"]
+        ]
+        self.assertEqual(len(deletes), 1)
+        self.assertIn(
+            "--force-with-lease=refs/heads/afk/central-bnkl-1-1-"
+            + run_id
+            + "/candidate:"
+            + "d" * 40,
+            deletes[0]["args"],
+        )
+
     def test_terminal_cleanup_warns_and_completes_without_unsafe_removal(self):
         run_id = self.start_reviewed_run()
         self.assertEqual(self.run_afk("resume").returncode, 0)
@@ -3242,6 +3278,17 @@ class StartCliTest(unittest.TestCase):
                         if "--delete" in args:
                             if os.environ.get("AFK_FAKE_REMOTE_DELETE_FAILURE"):
                                 raise SystemExit(1)
+                            if os.environ.get("AFK_FAKE_REMOTE_MOVES_DURING_DELETE"):
+                                remote_replaced.write_text("replaced", encoding="utf-8")
+                                branch = args[-1]
+                                expected_lease = (
+                                    "--force-with-lease=refs/heads/"
+                                    + branch
+                                    + ":"
+                                    + candidate_sha
+                                )
+                                if expected_lease in args:
+                                    raise SystemExit(1)
                             remote_deleted.write_text("deleted", encoding="utf-8")
                         else:
                             pushed_marker.write_text(candidate_sha, encoding="utf-8")
