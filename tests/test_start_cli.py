@@ -830,6 +830,32 @@ class StartCliTest(unittest.TestCase):
         self.assertIn(["worktree", "remove", str(quarantine)], git_commands)
         self.assertNotIn(["worktree", "remove", str(replacement)], git_commands)
 
+    def test_terminal_cleanup_recovers_quarantine_without_git_lockfiles(self):
+        run_id = self.start_reviewed_run()
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+
+        interrupted = self.run_afk(
+            "resume", AFK_FAKE_TERMINAL_CLEANUP_INTERRUPTS_AFTER_MOVE="1"
+        )
+
+        self.assertLess(interrupted.returncode, 0)
+        quarantine = self.state_home / "afk" / "worktree-quarantine" / run_id
+        self.assertTrue(quarantine.is_dir())
+        git_state = self.state_home / "fake-git"
+        self.assertEqual(list(git_state.rglob("*.lock")), [])
+
+        resumed = self.run_afk("resume")
+
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(status["state"], "completed")
+        self.assertTrue(status["completion"]["worktree_removed"])
+        self.assertTrue(status["completion"]["local_branch_deleted"])
+        self.assertFalse(quarantine.exists())
+        self.assertEqual(list(git_state.rglob("*.lock")), [])
+
     def test_terminal_cleanup_failures_are_durable_warnings(self):
         run_id = self.start_reviewed_run()
         self.assertEqual(self.run_afk("resume").returncode, 0)
@@ -3485,6 +3511,11 @@ class StartCliTest(unittest.TestCase):
                         worktree_quarantined.write_text(
                             str(destination), encoding="utf-8"
                         )
+                        if os.environ.get(
+                            "AFK_FAKE_TERMINAL_CLEANUP_INTERRUPTS_AFTER_MOVE"
+                        ):
+                            import signal
+                            os.kill(os.getppid(), signal.SIGKILL)
                         if os.environ.get("AFK_FAKE_WORKTREE_MOVES_DURING_REMOVE"):
                             source.mkdir()
                             (source / "not-afk-owned").write_text(
