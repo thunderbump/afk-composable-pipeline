@@ -706,17 +706,20 @@ class RetrospectiveModuleTest(unittest.TestCase):
             ],
         )
 
-    def test_build_pipeline_retrospective_replays_checked_in_dogfood_artifact(self):
-        artifact_path = (
-            ROOT
-            / "ledgers"
-            / "dogfood"
-            / "bump-eqemu-2026-07-07-1"
-            / "workstreams"
-            / "20260707T051607132664Z-5f118c15"
-            / "workstream-result.json"
+    def test_build_pipeline_retrospective_replays_historical_dogfood_failure(self):
+        excerpt = (
+            "Zone |   Error    | Connect Connection [default] Failed to connect "
+            "to database Error [#2002: Can't connect to server on 'mariadb' (115)]"
         )
-        state = json.loads(artifact_path.read_text(encoding="utf-8"))
+        state = persisted_workstream_result_state(
+            excerpt=excerpt,
+            log_path="/tmp/ledger/runs/validate/validation-evidence/logs/validation.log",
+        )
+        state["publication"] = {
+            "status": "blocked",
+            "reason": "repair budget exhausted: 5 attempts reached hard_cap=5",
+        }
+        state["tracker"] = retrospective_tracker("implemented")
 
         record = build_pipeline_retrospective(
             RetrospectiveContext(
