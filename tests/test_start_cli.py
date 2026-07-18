@@ -369,13 +369,42 @@ class StartCliTest(unittest.TestCase):
         self.assertEqual(merged.returncode, 2, merged.stderr)
         status = json.loads(self.run_afk("status", run_id, "--json").stdout)
         self.assertEqual(status["state"], "attention_required")
-        self.assertEqual(status["checkpoint"], "reviewed")
+        self.assertEqual(status["checkpoint"], "merged")
+        self.assertEqual(status["merge"]["candidate_sha"], "d" * 40)
+        self.assertEqual(status["merge"]["merge_commit"], "f" * 40)
         self.assertEqual(status["attention"]["scope"], "merge")
         self.assertEqual(status["attention"]["kind"], "conflict")
         store = RunStore(self.state_home / "afk")
-        self.assertEqual(store.effect(run_id, "pr-squash-merge")["status"], "prepared")
+        self.assertEqual(store.effect(run_id, "pr-squash-merge")["status"], "confirmed")
+        deletion = store.effect(run_id, "remote-branch-delete")
+        self.assertEqual(deletion["status"], "prepared")
+        self.assertNotIn("observed", deletion)
+
+        resumed = self.run_afk("resume")
+
+        self.assertEqual(resumed.returncode, 2, resumed.stderr)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(status["state"], "attention_required")
+        self.assertEqual(status["checkpoint"], "merged")
+        self.assertEqual(status["merge"]["merge_commit"], "f" * 40)
+        self.assertEqual(store.effect(run_id, "pr-squash-merge")["status"], "confirmed")
         self.assertEqual(
             store.effect(run_id, "remote-branch-delete")["status"], "prepared"
+        )
+        commands = [
+            json.loads(line)
+            for line in self.command_log.read_text(encoding="utf-8").splitlines()
+        ]
+        self.assertEqual(
+            len(
+                [
+                    record
+                    for record in commands
+                    if record["command"] == "gh"
+                    and record["args"][:2] == ["pr", "merge"]
+                ]
+            ),
+            1,
         )
 
     def test_resume_pauses_when_merged_pr_effect_identity_does_not_match(self):

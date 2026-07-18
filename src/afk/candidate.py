@@ -88,12 +88,14 @@ class CandidateError(RuntimeError):
         kind: str = "inconclusive",
         stdout: str = "",
         stderr: str = "",
+        merged_observation: dict[str, Any] | None = None,
     ):
         super().__init__(summary)
         self.summary = summary
         self.kind = kind
         self.stdout = stdout
         self.stderr = stderr
+        self.merged_observation = merged_observation
 
 
 def produce_candidate(
@@ -1247,10 +1249,13 @@ def _reconcile_candidate_merge(
         "merge_commit": merge_commit,
     }
     _require_effect_observation(merge_effect, observed)
+    store.confirm_effect(run_id, "pr-squash-merge", observed=observed)
     remote_sha = _remote_sha(worktree, projection["branch"])
     if remote_sha not in {"", projection["candidate_sha"]}:
         raise CandidateError(
-            "remote Candidate branch was replaced after merge", kind="conflict"
+            "remote Candidate branch was replaced after merge",
+            kind="conflict",
+            merged_observation=observed,
         )
     deleted = remote_sha == ""
     delete_observed = {
@@ -1264,7 +1269,6 @@ def _reconcile_candidate_merge(
             raise CandidateError(
                 "confirmed branch deletion contradicts the remote", kind="conflict"
             )
-    store.confirm_effect(run_id, "pr-squash-merge", observed=observed)
     if deleted:
         store.confirm_effect(
             run_id,

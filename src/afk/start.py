@@ -203,6 +203,8 @@ def resume_run(*, note: str | None = None) -> tuple[str, int]:
             if projection.get("pr_ready") is not None:
                 return run_id, _advance_merge(store, run_id)
             return run_id, _advance_pr_ready(store, run_id)
+        if projection["checkpoint"] == "merged":
+            return run_id, _advance_merge(store, run_id)
         if projection["checkpoint"] == "validated":
             return run_id, _advance_gate(store, run_id)
         if projection["last_event"] == "validation.rejected":
@@ -1347,10 +1349,17 @@ def _advance_merge(store: RunStore, run_id: str) -> int:
     try:
         observed, branch_deleted = merge_candidate_pr(store, run_id)
     except CandidateError as exc:
+        checkpoint = "reviewed"
+        if exc.merged_observation is not None:
+            try:
+                _record_merged(store, run_id, exc.merged_observation, False)
+                checkpoint = "merged"
+            except RunStoreError as conflict:
+                exc = CandidateError(str(conflict), kind="conflict")
         _attention(
             store,
             run_id,
-            checkpoint="reviewed",
+            checkpoint=checkpoint,
             scope="merge",
             kind=exc.kind,
             summary=exc.summary,
@@ -1366,6 +1375,27 @@ def _advance_merge(store: RunStore, run_id: str) -> int:
             summary=str(exc),
         )
         return 2
+    try:
+        _record_merged(store, run_id, observed, branch_deleted)
+    except RunStoreError as exc:
+        _attention(
+            store,
+            run_id,
+            checkpoint="merged",
+            scope="merge",
+            kind="conflict",
+            summary=str(exc),
+        )
+        return 2
+    return 0
+
+
+def _record_merged(
+    store: RunStore,
+    run_id: str,
+    observed: dict[str, Any],
+    branch_deleted: bool,
+) -> None:
     projection = store.status(run_id)
     if projection.get("merge") is None:
         store.append_event(
@@ -1380,16 +1410,7 @@ def _advance_merge(store: RunStore, run_id: str) -> int:
             },
         )
     elif projection.get("merge") != observed:
-        _attention(
-            store,
-            run_id,
-            checkpoint="merged",
-            scope="merge",
-            kind="conflict",
-            summary="merged PR fact contradicts the Run",
-        )
-        return 2
-    return 0
+        raise RunStoreError("merged PR fact contradicts the Run")
 
 
 def _advance_completed_gate(
