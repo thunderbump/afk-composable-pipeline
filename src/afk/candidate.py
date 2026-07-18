@@ -1383,23 +1383,29 @@ def _require_direct_merge_topology(
             f"repos/{repository}/rules/branches/{quote(base_branch, safe='')}",
             "--method",
             "GET",
+            "--paginate",
+            "--slurp",
         ],
         cwd=worktree,
     )
     if rules.returncode != 0:
         raise CandidateError("base branch merge rules observation failed")
     try:
-        rule_values = json.loads(rules.stdout)
+        rule_pages = json.loads(rules.stdout)
     except json.JSONDecodeError as exc:
         raise CandidateError(
             "base branch merge rules observation was malformed"
         ) from exc
-    if not isinstance(rule_values, list) or not all(
-        isinstance(rule, dict) and isinstance(rule.get("type"), str)
-        for rule in rule_values
+    if not isinstance(rule_pages, list) or not all(
+        isinstance(page, list)
+        and all(
+            isinstance(rule, dict) and isinstance(rule.get("type"), str)
+            for rule in page
+        )
+        for page in rule_pages
     ):
         raise CandidateError("base branch merge rules observation was malformed")
-    if any(rule["type"] == "merge_queue" for rule in rule_values):
+    if any(rule["type"] == "merge_queue" for page in rule_pages for rule in page):
         raise CandidateError("base branch requires a merge queue", kind="conflict")
 
     owner, name = repository.split("/", 1)

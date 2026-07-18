@@ -915,9 +915,37 @@ class StartCliTest(unittest.TestCase):
                 "repos/thunderbump/beads-webui/rules/branches/main",
                 "--method",
                 "GET",
+                "--paginate",
+                "--slurp",
             ],
             [record["args"] for record in commands if record["command"] == "gh"],
         )
+        self.assertFalse(
+            any(
+                record["command"] == "gh" and record["args"][:2] == ["pr", "merge"]
+                for record in commands
+            )
+        )
+
+    def test_resume_refuses_merge_queue_rule_on_later_rules_page(self):
+        run_id = self.start_reviewed_run()
+        ready = self.run_afk("resume")
+        self.assertEqual(ready.returncode, 0, ready.stderr)
+
+        merged = self.run_afk(
+            "resume",
+            AFK_FAKE_BASE_RULES_SECOND_PAGE_MERGE_QUEUE="1",
+        )
+
+        self.assertEqual(merged.returncode, 2, merged.stderr)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(status["checkpoint"], "reviewed")
+        self.assertEqual(status["attention"]["kind"], "conflict")
+        self.assertIn("merge queue", status["attention"]["summary"])
+        commands = [
+            json.loads(line)
+            for line in self.command_log.read_text(encoding="utf-8").splitlines()
+        ]
         self.assertFalse(
             any(
                 record["command"] == "gh" and record["args"][:2] == ["pr", "merge"]
@@ -2764,9 +2792,13 @@ class StartCliTest(unittest.TestCase):
                         and args[1]
                         == "repos/thunderbump/beads-webui/rules/branches/main"
                     ):
-                        rules = []
+                        rules = [[]]
                         if os.environ.get("AFK_FAKE_BASE_REQUIRES_MERGE_QUEUE"):
-                            rules.append({"type": "merge_queue"})
+                            rules[0].append({"type": "merge_queue"})
+                        if os.environ.get(
+                            "AFK_FAKE_BASE_RULES_SECOND_PAGE_MERGE_QUEUE"
+                        ):
+                            rules = [[{"type": "required_status_checks"}], [{"type": "merge_queue"}]]  # noqa: E501
                         print(json.dumps(rules))
                     elif args[:2] == ["pr", "list"]:
                         if os.environ.get("AFK_FAKE_READY_PR_UNAVAILABLE"):
