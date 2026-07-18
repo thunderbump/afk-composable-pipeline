@@ -543,6 +543,9 @@ class StartCliTest(unittest.TestCase):
             / repeated_status["completion"]["evidence"]
         )
         self.assertTrue((evidence / "manifest.json").is_file())
+        reported = self.run_afk("complete", run_id)
+        self.assertEqual(reported.returncode, 0, reported.stderr)
+        self.assertTrue(json.loads(reported.stdout)["complete"])
         commands = [
             json.loads(line)
             for line in self.command_log.read_text(encoding="utf-8").splitlines()
@@ -1789,7 +1792,7 @@ class StartCliTest(unittest.TestCase):
         commands = self.command_log.read_text(encoding="utf-8")
         self.assertNotIn('"args":["pr","ready"', commands)
 
-    def test_complete_reconciles_merged_candidate_and_closed_bead_idempotently(self):
+    def test_complete_cannot_bypass_the_durable_terminal_lifecycle(self):
         started = self.run_afk("start", "central-bnkl.1.1")
         run_id = started.stdout.strip()
         worker = self.run_afk("_worker", run_id)
@@ -1802,36 +1805,20 @@ class StartCliTest(unittest.TestCase):
             AFK_FAKE_BEAD_STATUS="closed",
         )
 
-        self.assertEqual(completed.returncode, 0, completed.stderr)
-        report = json.loads(completed.stdout)
-        self.assertTrue(report["complete"])
-        self.assertFalse(report["paused"])
-        self.assertEqual(report["state"], "completed")
+        self.assertEqual(completed.returncode, 2)
+        self.assertEqual(completed.stdout, "")
+        self.assertIn("afk resume", completed.stderr)
         status = json.loads(self.run_afk("status", run_id, "--json").stdout)
-        self.assertEqual(status["checkpoint"], "completed")
-        self.assertEqual(status["completion"]["candidate_sha"], "d" * 40)
-        self.assertEqual(status["completion"]["merge_commit"], "f" * 40)
-        evidence = (
-            self.state_home / "afk" / "runs" / run_id / status["completion"]["evidence"]
-        )
-        self.assertTrue((evidence / "manifest.json").is_file())
-
-        repeated = self.run_afk(
-            "complete",
-            run_id,
-            AFK_FAKE_PR_MERGED="1",
-            AFK_FAKE_BEAD_STATUS="closed",
-        )
-
-        self.assertEqual(repeated.returncode, 0, repeated.stderr)
-        self.assertTrue(json.loads(repeated.stdout)["complete"])
+        self.assertEqual(status["state"], "reviewed")
+        self.assertEqual(status["checkpoint"], "reviewed")
+        self.assertNotIn("completion", status)
         events = [
             json.loads(line)["event"]
             for line in (self.state_home / "afk" / "runs" / run_id / "events.jsonl")
             .read_text(encoding="utf-8")
             .splitlines()
         ]
-        self.assertEqual(events.count("run.completed"), 1)
+        self.assertNotIn("run.completed", events)
 
     def test_complete_fails_closed_on_terminal_fact_mismatch(self):
         started = self.run_afk("start", "central-bnkl.1.1")
@@ -1893,7 +1880,7 @@ class StartCliTest(unittest.TestCase):
         ]
         self.assertNotIn("run.completed", events)
 
-    def test_complete_recovers_matching_unsealed_terminal_evidence(self):
+    def test_complete_does_not_seal_legacy_terminal_evidence(self):
         started = self.run_afk("start", "central-bnkl.1.1")
         run_id = started.stdout.strip()
         worker = self.run_afk("_worker", run_id)
@@ -1924,10 +1911,14 @@ class StartCliTest(unittest.TestCase):
             AFK_FAKE_BEAD_STATUS="closed",
         )
 
-        self.assertEqual(completed.returncode, 0, completed.stderr)
-        self.assertTrue(json.loads(completed.stdout)["complete"])
+        self.assertEqual(completed.returncode, 2)
+        self.assertEqual(completed.stdout, "")
+        self.assertIn("afk resume", completed.stderr)
         completion = self.state_home / "afk" / "runs" / run_id / evidence
-        self.assertTrue((completion / "manifest.json").is_file())
+        self.assertFalse((completion / "manifest.json").exists())
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(status["state"], "reviewed")
+        self.assertNotIn("completion", status)
 
     def test_gate_uses_the_canonical_start_bead_after_live_tracker_mutation(self):
         started = self.run_afk("start", "central-bnkl.1.1")
