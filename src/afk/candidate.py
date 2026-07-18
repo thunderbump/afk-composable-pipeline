@@ -1239,11 +1239,12 @@ def delete_candidate_branch(store: RunStore, run_id: str) -> bool:
         ],
         cwd=checkout,
     )
+    deleted = reconcile_candidate_branch_deletion(store, run_id)
+    if deleted:
+        return True
     if completed.returncode != 0:
         raise CandidateError("remote Candidate branch deletion failed")
-    if not reconcile_candidate_branch_deletion(store, run_id):
-        raise CandidateError("remote Candidate branch deletion was not confirmed")
-    return True
+    raise CandidateError("remote Candidate branch deletion was not confirmed")
 
 
 def _candidate_merge_intended(

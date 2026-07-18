@@ -710,6 +710,28 @@ class StartCliTest(unittest.TestCase):
             deletes[0]["args"],
         )
 
+    def test_terminal_cleanup_accepts_branch_disappearing_during_delete(self):
+        run_id = self.start_reviewed_run()
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+        self.assertEqual(
+            self.run_afk("resume", AFK_FAKE_REMOTE_BRANCH_LINGERS="1").returncode,
+            0,
+        )
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+
+        completed = self.run_afk("resume", AFK_FAKE_REMOTE_DISAPPEARS_DURING_DELETE="1")
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertTrue(status["completion"]["remote_branch_deleted"])
+        self.assertEqual(status["completion"]["cleanup_warnings"], [])
+        self.assertEqual(
+            RunStore(self.state_home / "afk").effect(run_id, "remote-branch-delete")[
+                "status"
+            ],
+            "confirmed",
+        )
+
     def test_terminal_cleanup_warns_and_completes_without_unsafe_removal(self):
         run_id = self.start_reviewed_run()
         self.assertEqual(self.run_afk("resume").returncode, 0)
@@ -3393,6 +3415,11 @@ class StartCliTest(unittest.TestCase):
                     elif args[:1] == ["push"]:
                         if "--delete" in args:
                             if os.environ.get("AFK_FAKE_REMOTE_DELETE_FAILURE"):
+                                raise SystemExit(1)
+                            if os.environ.get(
+                                "AFK_FAKE_REMOTE_DISAPPEARS_DURING_DELETE"
+                            ):
+                                remote_deleted.write_text("deleted", encoding="utf-8")
                                 raise SystemExit(1)
                             if os.environ.get("AFK_FAKE_REMOTE_MOVES_DURING_DELETE"):
                                 remote_replaced.write_text("replaced", encoding="utf-8")
