@@ -274,6 +274,13 @@ class RunStore:
             raise RunStoreError(f"Effect is invalid: {effect_id}")
         return record
 
+    def effect_if_present(self, run_id: str, effect_id: str) -> dict[str, Any] | None:
+        _validate_run_id(effect_id)
+        path = self._run_dir(run_id) / "effects" / f"{effect_id}.json"
+        if not path.exists():
+            return None
+        return self.effect(run_id, effect_id)
+
     def confirm_effect(
         self, run_id: str, effect_id: str, *, observed: dict[str, Any]
     ) -> dict[str, Any]:
@@ -640,6 +647,8 @@ def _project(identity: dict[str, Any], events: list[dict[str, Any]]) -> dict[str
         "pr_url",
         "pr_head_sha",
         "pr_ready",
+        "merge",
+        "remote_branch_deleted",
         "validation",
         "validation_attempt",
         "previous_candidate_sha",

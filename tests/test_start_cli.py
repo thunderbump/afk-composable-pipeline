@@ -273,19 +273,147 @@ class StartCliTest(unittest.TestCase):
         ]
         self.assertEqual(len(ready_commands), 1)
 
-    def test_resume_clears_transient_attention_after_ready_pr_is_observed_again(self):
+    def test_resume_squash_merges_the_exact_ready_candidate(self):
         run_id = self.start_reviewed_run()
         ready = self.run_afk("resume")
         self.assertEqual(ready.returncode, 0, ready.stderr)
 
-        unavailable = self.run_afk("resume", AFK_FAKE_READY_PR_UNAVAILABLE="1")
+        merged = self.run_afk("resume")
+
+        self.assertEqual(merged.returncode, 0, merged.stderr)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(status["state"], "merged")
+        self.assertEqual(
+            status["merge"],
+            {
+                "number": 17,
+                "url": "https://example.test/pr/17",
+                "candidate_sha": "d" * 40,
+                "head": f"afk/central-bnkl-1-1-{run_id}/candidate",
+                "base": "main",
+                "merge_commit": "f" * 40,
+            },
+        )
+        store = RunStore(self.state_home / "afk")
+        self.assertEqual(store.effect(run_id, "pr-squash-merge")["status"], "confirmed")
+        self.assertEqual(
+            store.effect(run_id, "remote-branch-delete")["status"], "confirmed"
+        )
+        commands = [
+            json.loads(line)
+            for line in self.command_log.read_text(encoding="utf-8").splitlines()
+        ]
+        merge_commands = [
+            record["args"]
+            for record in commands
+            if record["command"] == "gh" and record["args"][:2] == ["pr", "merge"]
+        ]
+        self.assertEqual(
+            merge_commands,
+            [
+                [
+                    "pr",
+                    "merge",
+                    "17",
+                    "--repo",
+                    "thunderbump/beads-webui",
+                    "--squash",
+                    "--delete-branch",
+                    "--match-head-commit",
+                    "d" * 40,
+                ]
+            ],
+        )
+
+    def test_resume_reconciles_interruption_after_squash_merge(self):
+        run_id = self.start_reviewed_run()
+        ready = self.run_afk("resume")
+        self.assertEqual(ready.returncode, 0, ready.stderr)
+
+        interrupted = self.run_afk("resume", AFK_FAKE_PR_MERGE_INTERRUPTED="1")
+
+        self.assertEqual(interrupted.returncode, 2, interrupted.stderr)
+        store = RunStore(self.state_home / "afk")
+        self.assertEqual(store.effect(run_id, "pr-squash-merge")["status"], "prepared")
+        self.assertEqual(
+            store.effect(run_id, "remote-branch-delete")["status"], "prepared"
+        )
+
+        resumed = self.run_afk("resume")
+
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(status["state"], "merged")
+        self.assertEqual(store.effect(run_id, "pr-squash-merge")["status"], "confirmed")
+        self.assertEqual(
+            store.effect(run_id, "remote-branch-delete")["status"], "confirmed"
+        )
+        commands = [
+            json.loads(line)
+            for line in self.command_log.read_text(encoding="utf-8").splitlines()
+        ]
+        merge_commands = [
+            record
+            for record in commands
+            if record["command"] == "gh" and record["args"][:2] == ["pr", "merge"]
+        ]
+        self.assertEqual(len(merge_commands), 1)
+
+    def test_resume_pauses_when_merged_pr_has_no_full_squash_commit(self):
+        run_id = self.start_reviewed_run()
+        ready = self.run_afk("resume")
+        self.assertEqual(ready.returncode, 0, ready.stderr)
+
+        merged = self.run_afk("resume", AFK_FAKE_PR_MERGE_COMMIT="missing")
+
+        self.assertEqual(merged.returncode, 2, merged.stderr)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(status["state"], "attention_required")
+        self.assertEqual(status["checkpoint"], "reviewed")
+        self.assertEqual(status["attention"]["scope"], "merge")
+        store = RunStore(self.state_home / "afk")
+        self.assertEqual(store.effect(run_id, "pr-squash-merge")["status"], "prepared")
+        commands = [
+            json.loads(line)
+            for line in self.command_log.read_text(encoding="utf-8").splitlines()
+        ]
+        merge_commands = [
+            record
+            for record in commands
+            if record["command"] == "gh" and record["args"][:2] == ["pr", "merge"]
+        ]
+        self.assertEqual(len(merge_commands), 1)
+
+    def test_resume_pauses_before_merge_when_pinned_target_drifts(self):
+        run_id = self.start_reviewed_run()
+        ready = self.run_afk("resume")
+        self.assertEqual(ready.returncode, 0, ready.stderr)
+        (self.state_home / "fake-target-drift").write_text("drifted", encoding="utf-8")
+
+        merged = self.run_afk("resume")
+
+        self.assertEqual(merged.returncode, 2, merged.stderr)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(status["checkpoint"], "reviewed")
+        self.assertEqual(status["attention"]["scope"], "merge")
+        with self.assertRaises(RunStoreError):
+            RunStore(self.state_home / "afk").effect(run_id, "pr-squash-merge")
+        commands = self.command_log.read_text(encoding="utf-8")
+        self.assertNotIn('"args":["pr","merge"', commands)
+
+    def test_resume_recovers_transient_attention_before_merge(self):
+        run_id = self.start_reviewed_run()
+        ready = self.run_afk("resume")
+        self.assertEqual(ready.returncode, 0, ready.stderr)
+
+        unavailable = self.run_afk("resume", AFK_FAKE_MERGE_PR_UNAVAILABLE="1")
         self.assertEqual(unavailable.returncode, 2, unavailable.stderr)
 
         resumed = self.run_afk("resume")
 
         self.assertEqual(resumed.returncode, 0, resumed.stderr)
         status = json.loads(self.run_afk("status", run_id, "--json").stdout)
-        self.assertEqual(status["state"], "reviewed")
+        self.assertEqual(status["state"], "merged")
         self.assertEqual(status["attention"], {})
         commands = [
             json.loads(line)
@@ -297,6 +425,12 @@ class StartCliTest(unittest.TestCase):
             if record["command"] == "gh" and record["args"][:2] == ["pr", "ready"]
         ]
         self.assertEqual(len(ready_commands), 1)
+        merge_commands = [
+            record
+            for record in commands
+            if record["command"] == "gh" and record["args"][:2] == ["pr", "merge"]
+        ]
+        self.assertEqual(len(merge_commands), 1)
 
     def test_resume_pauses_when_pr_was_readied_without_an_existing_effect(self):
         run_id = self.start_reviewed_run()
@@ -1875,6 +2009,7 @@ class StartCliTest(unittest.TestCase):
                 pr_state = Path(os.environ["XDG_STATE_HOME"]) / "fake-pr.json"
                 comment_state = Path(os.environ["XDG_STATE_HOME"]) / "fake-comment.json"
                 target_drift = Path(os.environ["XDG_STATE_HOME"]) / "fake-target-drift"
+                remote_deleted = Path(os.environ["XDG_STATE_HOME"]) / "fake-remote-deleted"
                 if command == "git":
                     if args[:2] == ["rev-parse", "--show-toplevel"]:
                         print(project)
@@ -1885,7 +2020,7 @@ class StartCliTest(unittest.TestCase):
                         if requested == "refs/heads/main":
                             target_sha = "e" * 40 if target_drift.exists() else sha
                             print(target_sha + "\\trefs/heads/main")
-                        elif pushed_marker.exists():
+                        elif pushed_marker.exists() and not remote_deleted.exists():
                             print(candidate_sha + "\\t" + requested)
                     elif args[:1] == ["fetch"]:
                         pass
@@ -2009,6 +2144,8 @@ class StartCliTest(unittest.TestCase):
                                 values.append(dict(values[0]))
                             print(json.dumps(values))
                     elif args[:2] == ["pr", "view"]:
+                        if os.environ.get("AFK_FAKE_MERGE_PR_UNAVAILABLE"):
+                            raise SystemExit(1)
                         value = json.loads(pr_state.read_text())
                         if os.environ.get("AFK_FAKE_PR_MERGED"):
                             value.update({
@@ -2049,6 +2186,19 @@ class StartCliTest(unittest.TestCase):
                         if os.environ.get("AFK_FAKE_PR_READY_INTERRUPTED"):
                             raise SystemExit(1)
                         print(value["url"])
+                    elif args[:2] == ["pr", "merge"]:
+                        value = json.loads(pr_state.read_text())
+                        value.update(
+                            {
+                                "state": "MERGED",
+                                "isDraft": False,
+                                "mergeCommit": {"oid": "f" * 40},
+                            }
+                        )
+                        pr_state.write_text(json.dumps(value), encoding="utf-8")
+                        remote_deleted.write_text("deleted", encoding="utf-8")
+                        if os.environ.get("AFK_FAKE_PR_MERGE_INTERRUPTED"):
+                            raise SystemExit(1)
                     elif args[:1] == ["api"]:
                         if "--method" in args:
                             body = json.loads(sys.stdin.read())["body"]
