@@ -77,6 +77,7 @@ class StartCliTest(unittest.TestCase):
         self.temporary_directory.cleanup()
 
     def run_afk(self, *args, **overrides):
+        short_cleanup_timeout = overrides.pop("AFK_TEST_SHORT_CLEANUP_TIMEOUT", None)
         env = os.environ.copy()
         env.update(
             {
@@ -100,8 +101,22 @@ class StartCliTest(unittest.TestCase):
             }
         )
         env.update(overrides)
+        command = [sys.executable, "-m", "afk", *args]
+        if short_cleanup_timeout:
+            command = [
+                sys.executable,
+                "-c",
+                (
+                    "import sys; import afk.candidate as candidate; "
+                    "import afk.start as start; "
+                    "candidate._run.__kwdefaults__['timeout'] = 0.05; "
+                    "start.COMMAND_TIMEOUT_SECONDS = 0.05; "
+                    "from afk.cli import main; raise SystemExit(main(sys.argv[1:]))"
+                ),
+                *args,
+            ]
         return subprocess.run(
-            [sys.executable, "-m", "afk", *args],
+            command,
             cwd=self.project,
             env=env,
             text=True,
@@ -732,6 +747,29 @@ class StartCliTest(unittest.TestCase):
             "confirmed",
         )
 
+    def test_terminal_cleanup_reconciles_remote_delete_timeout_after_mutation(self):
+        run_id = self.start_reviewed_run()
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+        self.assertEqual(
+            self.run_afk("resume", AFK_FAKE_REMOTE_BRANCH_LINGERS="1").returncode,
+            0,
+        )
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+
+        completed = self.run_afk(
+            "resume",
+            AFK_FAKE_REMOTE_DELETE_TIMES_OUT_AFTER_MUTATION="1",
+            AFK_TEST_SHORT_CLEANUP_TIMEOUT="1",
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertTrue(status["completion"]["remote_branch_deleted"])
+        self.assertNotIn(
+            "remote Candidate branch cleanup could not be confirmed",
+            status["completion"]["cleanup_warnings"],
+        )
+
     def test_terminal_cleanup_warns_and_completes_without_unsafe_removal(self):
         run_id = self.start_reviewed_run()
         self.assertEqual(self.run_afk("resume").returncode, 0)
@@ -855,6 +893,44 @@ class StartCliTest(unittest.TestCase):
         self.assertTrue(status["completion"]["local_branch_deleted"])
         self.assertFalse(quarantine.exists())
         self.assertEqual(list(git_state.rglob("*.lock")), [])
+
+    def test_terminal_cleanup_reconciles_worktree_move_timeout_after_mutation(self):
+        run_id = self.start_reviewed_run()
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+
+        completed = self.run_afk(
+            "resume",
+            AFK_FAKE_WORKTREE_MOVE_TIMES_OUT_AFTER_MUTATION="1",
+            AFK_TEST_SHORT_CLEANUP_TIMEOUT="1",
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertTrue(status["completion"]["worktree_removed"])
+        self.assertNotIn(
+            "Run worktree cleanup failed", status["completion"]["cleanup_warnings"]
+        )
+
+    def test_terminal_cleanup_reconciles_worktree_remove_timeout_after_mutation(self):
+        run_id = self.start_reviewed_run()
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+
+        completed = self.run_afk(
+            "resume",
+            AFK_FAKE_WORKTREE_REMOVE_TIMES_OUT_AFTER_MUTATION="1",
+            AFK_TEST_SHORT_CLEANUP_TIMEOUT="1",
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertTrue(status["completion"]["worktree_removed"])
+        self.assertNotIn(
+            "Run worktree cleanup failed", status["completion"]["cleanup_warnings"]
+        )
 
     def test_terminal_cleanup_failures_are_durable_warnings(self):
         run_id = self.start_reviewed_run()
@@ -3512,6 +3588,11 @@ class StartCliTest(unittest.TestCase):
                             str(destination), encoding="utf-8"
                         )
                         if os.environ.get(
+                            "AFK_FAKE_WORKTREE_MOVE_TIMES_OUT_AFTER_MUTATION"
+                        ):
+                            import time
+                            time.sleep(1)
+                        if os.environ.get(
                             "AFK_FAKE_TERMINAL_CLEANUP_INTERRUPTS_AFTER_MOVE"
                         ):
                             import signal
@@ -3531,6 +3612,11 @@ class StartCliTest(unittest.TestCase):
                             import shutil
                             shutil.rmtree(checkout)
                         worktree_quarantined.unlink(missing_ok=True)
+                        if os.environ.get(
+                            "AFK_FAKE_WORKTREE_REMOVE_TIMES_OUT_AFTER_MUTATION"
+                        ):
+                            import time
+                            time.sleep(1)
                     elif args[:2] == ["branch", "-D"]:
                         if os.environ.get("AFK_FAKE_BRANCH_DELETE_FAILURE"):
                             raise SystemExit(1)
@@ -3584,6 +3670,11 @@ class StartCliTest(unittest.TestCase):
                                 if expected_lease in args:
                                     raise SystemExit(1)
                             remote_deleted.write_text("deleted", encoding="utf-8")
+                            if os.environ.get(
+                                "AFK_FAKE_REMOTE_DELETE_TIMES_OUT_AFTER_MUTATION"
+                            ):
+                                import time
+                                time.sleep(1)
                         else:
                             pushed_marker.write_text(candidate_sha, encoding="utf-8")
                         if os.environ.get("AFK_FAKE_PUSH_INTERRUPTED"):

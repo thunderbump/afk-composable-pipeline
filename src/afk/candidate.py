@@ -1228,17 +1228,22 @@ def delete_candidate_branch(store: RunStore, run_id: str) -> bool:
             "remote Candidate branch is not the exact merged Candidate",
             kind="conflict",
         )
-    completed = _run(
-        [
-            "git",
-            "push",
-            f"--force-with-lease=refs/heads/{branch}:{candidate_sha}",
-            "--delete",
-            origin,
-            branch,
-        ],
-        cwd=checkout,
-    )
+    try:
+        completed = _run(
+            [
+                "git",
+                "push",
+                f"--force-with-lease=refs/heads/{branch}:{candidate_sha}",
+                "--delete",
+                origin,
+                branch,
+            ],
+            cwd=checkout,
+        )
+    except CandidateError as command_error:
+        if reconcile_candidate_branch_deletion(store, run_id):
+            return True
+        raise command_error
     deleted = reconcile_candidate_branch_deletion(store, run_id)
     if deleted:
         return True

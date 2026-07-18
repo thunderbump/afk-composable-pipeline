@@ -1716,25 +1716,35 @@ def _cleanup_run_checkout(
                 root, checkout, candidate_sha, expected_branch
             ):
                 quarantine.parent.mkdir(parents=True, exist_ok=True)
-                moved = _command(
-                    [
-                        "git",
-                        "worktree",
-                        "move",
-                        str(expected_worktree),
-                        str(quarantine),
-                    ],
-                    cwd=root,
-                    check=False,
-                )
-                if moved.returncode == 0:
-                    checkout = quarantine
+                try:
+                    _command(
+                        [
+                            "git",
+                            "worktree",
+                            "move",
+                            str(expected_worktree),
+                            str(quarantine),
+                        ],
+                        cwd=root,
+                        check=False,
+                    )
+                except ExternalCommandError:
+                    pass
             expected_available, after_expected = _registered_worktree(
                 root, expected_worktree
             )
             quarantined_available, after_quarantined = _registered_worktree(
                 root, quarantine
             )
+            if (
+                expected_available
+                and after_expected is None
+                and quarantined_available
+                and _owned_worktree_registration(
+                    after_quarantined, candidate_sha, expected_branch
+                )
+            ):
+                checkout = quarantine
             owned_at_removal = (
                 checkout == quarantine
                 and expected_available
@@ -1747,19 +1757,18 @@ def _cleanup_run_checkout(
                     root, quarantine, candidate_sha, expected_branch
                 )
             )
-            removed = (
-                _command(
-                    ["git", "worktree", "remove", str(quarantine)],
-                    cwd=root,
-                    check=False,
-                )
-                if owned_at_removal
-                else None
-            )
+            if owned_at_removal:
+                try:
+                    _command(
+                        ["git", "worktree", "remove", str(quarantine)],
+                        cwd=root,
+                        check=False,
+                    )
+                except ExternalCommandError:
+                    pass
             after_available, after_registered = _registered_worktree(root, quarantine)
             worktree_removed = (
-                removed is not None
-                and removed.returncode == 0
+                owned_at_removal
                 and not quarantine.exists()
                 and after_available
                 and after_registered is None
