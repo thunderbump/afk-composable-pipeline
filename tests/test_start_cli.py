@@ -359,6 +359,25 @@ class StartCliTest(unittest.TestCase):
         ]
         self.assertEqual(len(merge_commands), 1)
 
+    def test_resume_pauses_when_merged_candidate_branch_was_replaced(self):
+        run_id = self.start_reviewed_run()
+        ready = self.run_afk("resume")
+        self.assertEqual(ready.returncode, 0, ready.stderr)
+
+        merged = self.run_afk("resume", AFK_FAKE_REPLACED_REMOTE_BRANCH="1")
+
+        self.assertEqual(merged.returncode, 2, merged.stderr)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(status["state"], "attention_required")
+        self.assertEqual(status["checkpoint"], "reviewed")
+        self.assertEqual(status["attention"]["scope"], "merge")
+        self.assertEqual(status["attention"]["kind"], "conflict")
+        store = RunStore(self.state_home / "afk")
+        self.assertEqual(store.effect(run_id, "pr-squash-merge")["status"], "prepared")
+        self.assertEqual(
+            store.effect(run_id, "remote-branch-delete")["status"], "prepared"
+        )
+
     def test_resume_pauses_when_merged_pr_effect_identity_does_not_match(self):
         run_id = self.start_reviewed_run()
         ready = self.run_afk("resume")
@@ -492,10 +511,30 @@ class StartCliTest(unittest.TestCase):
         self.assertEqual(status["checkpoint"], "reviewed")
         self.assertEqual(status["attention"]["scope"], "merge")
         store = RunStore(self.state_home / "afk")
-        with self.assertRaises(RunStoreError):
-            store.effect(run_id, "pr-squash-merge")
-        with self.assertRaises(RunStoreError):
-            store.effect(run_id, "remote-branch-delete")
+        self.assertEqual(store.effect(run_id, "pr-squash-merge")["status"], "prepared")
+        self.assertEqual(
+            store.effect(run_id, "remote-branch-delete")["status"], "prepared"
+        )
+        commands = self.command_log.read_text(encoding="utf-8")
+        self.assertNotIn('"args":["pr","merge"', commands)
+
+    def test_resume_pauses_when_target_drifts_after_final_pr_observation(self):
+        run_id = self.start_reviewed_run()
+        ready = self.run_afk("resume")
+        self.assertEqual(ready.returncode, 0, ready.stderr)
+
+        merged = self.run_afk("resume", AFK_FAKE_TARGET_DRIFT_AFTER_SECOND_PR_VIEW="1")
+
+        self.assertEqual(merged.returncode, 2, merged.stderr)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(status["state"], "attention_required")
+        self.assertEqual(status["checkpoint"], "reviewed")
+        self.assertEqual(status["attention"]["scope"], "merge")
+        store = RunStore(self.state_home / "afk")
+        self.assertEqual(store.effect(run_id, "pr-squash-merge")["status"], "prepared")
+        self.assertEqual(
+            store.effect(run_id, "remote-branch-delete")["status"], "prepared"
+        )
         commands = self.command_log.read_text(encoding="utf-8")
         self.assertNotIn('"args":["pr","merge"', commands)
 
@@ -2105,9 +2144,11 @@ class StartCliTest(unittest.TestCase):
                 candidate_marker = Path(os.environ["HOME"]) / ".fake-candidate"
                 pushed_marker = Path(os.environ["HOME"]) / ".fake-pushed"
                 pr_state = Path(os.environ["XDG_STATE_HOME"]) / "fake-pr.json"
+                pr_view_count = Path(os.environ["XDG_STATE_HOME"]) / "fake-pr-view-count"
                 comment_state = Path(os.environ["XDG_STATE_HOME"]) / "fake-comment.json"
                 target_drift = Path(os.environ["XDG_STATE_HOME"]) / "fake-target-drift"
                 remote_deleted = Path(os.environ["XDG_STATE_HOME"]) / "fake-remote-deleted"
+                remote_replaced = Path(os.environ["XDG_STATE_HOME"]) / "fake-remote-replaced"
                 if command == "git":
                     if args[:2] == ["rev-parse", "--show-toplevel"]:
                         print(project)
@@ -2125,6 +2166,8 @@ class StartCliTest(unittest.TestCase):
                                 value = json.loads(pr_state.read_text())
                                 value["baseRefName"] = "release"
                                 pr_state.write_text(json.dumps(value), encoding="utf-8")
+                        elif remote_replaced.exists():
+                            print("a" * 40 + "\\t" + requested)
                         elif pushed_marker.exists() and not remote_deleted.exists():
                             print(candidate_sha + "\\t" + requested)
                     elif args[:1] == ["fetch"]:
@@ -2251,6 +2294,12 @@ class StartCliTest(unittest.TestCase):
                     elif args[:2] == ["pr", "view"]:
                         if os.environ.get("AFK_FAKE_MERGE_PR_UNAVAILABLE"):
                             raise SystemExit(1)
+                        view_count = (
+                            int(pr_view_count.read_text(encoding="utf-8")) + 1
+                            if pr_view_count.exists()
+                            else 1
+                        )
+                        pr_view_count.write_text(str(view_count), encoding="utf-8")
                         value = json.loads(pr_state.read_text())
                         if os.environ.get("AFK_FAKE_PR_MERGED"):
                             value.update({
@@ -2266,6 +2315,13 @@ class StartCliTest(unittest.TestCase):
                         elif merge_commit:
                             value["mergeCommit"] = json.loads(merge_commit)
                         print(json.dumps(value))
+                        if (
+                            view_count == 2
+                            and os.environ.get(
+                                "AFK_FAKE_TARGET_DRIFT_AFTER_SECOND_PR_VIEW"
+                            )
+                        ):
+                            target_drift.write_text("drifted", encoding="utf-8")
                     elif args[:2] == ["pr", "create"]:
                         value = {
                             "number": 17,
@@ -2302,6 +2358,8 @@ class StartCliTest(unittest.TestCase):
                         )
                         pr_state.write_text(json.dumps(value), encoding="utf-8")
                         remote_deleted.write_text("deleted", encoding="utf-8")
+                        if os.environ.get("AFK_FAKE_REPLACED_REMOTE_BRANCH"):
+                            remote_replaced.write_text("replaced", encoding="utf-8")
                         if os.environ.get("AFK_FAKE_PR_MERGE_INTERRUPTED"):
                             raise SystemExit(1)
                     elif args[:1] == ["api"]:

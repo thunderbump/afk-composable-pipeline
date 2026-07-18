@@ -1094,10 +1094,6 @@ def merge_candidate_pr(store: RunStore, run_id: str) -> tuple[dict[str, Any], bo
         raise CandidateError(
             "ready PR facts contradict the reviewed Run", kind="conflict"
         )
-    if _view_pr(worktree, identity["repository"], pr_number) != pr:
-        raise CandidateError(
-            "ready PR changed during final merge checks", kind="conflict"
-        )
     store.prepare_effect(
         run_id,
         "pr-squash-merge",
@@ -1110,6 +1106,24 @@ def merge_candidate_pr(store: RunStore, run_id: str) -> tuple[dict[str, Any], bo
         kind="remote-branch-delete",
         intended=delete_intended,
     )
+    pr = _view_pr(worktree, identity["repository"], pr_number)
+    _verify_published(
+        identity,
+        worktree,
+        branch,
+        candidate_sha,
+        pr,
+        expected_pr_number=pr_number,
+        expected_pr_url=pr_url,
+        expected_draft=False,
+    )
+    if (
+        projection.get("pr_ready") != _ready_pr_observation(pr, candidate_sha)
+        or _view_pr(worktree, identity["repository"], pr_number) != pr
+    ):
+        raise CandidateError(
+            "ready PR changed during final merge checks", kind="conflict"
+        )
     completed = _run(
         [
             "gh",
@@ -1233,7 +1247,12 @@ def _reconcile_candidate_merge(
         "merge_commit": merge_commit,
     }
     _require_effect_observation(merge_effect, observed)
-    deleted = _remote_sha(worktree, projection["branch"]) == ""
+    remote_sha = _remote_sha(worktree, projection["branch"])
+    if remote_sha not in {"", projection["candidate_sha"]}:
+        raise CandidateError(
+            "remote Candidate branch was replaced after merge", kind="conflict"
+        )
+    deleted = remote_sha == ""
     delete_observed = {
         "repository": identity["repository"],
         "branch": projection["branch"],
