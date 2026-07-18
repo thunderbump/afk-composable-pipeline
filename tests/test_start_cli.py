@@ -890,6 +890,64 @@ class StartCliTest(unittest.TestCase):
         commands = self.command_log.read_text(encoding="utf-8")
         self.assertNotIn('"args":["pr","merge"', commands)
 
+    def test_resume_refuses_base_branch_that_requires_merge_queue(self):
+        run_id = self.start_reviewed_run()
+        ready = self.run_afk("resume")
+        self.assertEqual(ready.returncode, 0, ready.stderr)
+
+        merged = self.run_afk(
+            "resume",
+            AFK_FAKE_BASE_REQUIRES_MERGE_QUEUE="1",
+        )
+
+        self.assertEqual(merged.returncode, 2, merged.stderr)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(status["checkpoint"], "reviewed")
+        self.assertEqual(status["attention"]["kind"], "conflict")
+        self.assertIn("merge queue", status["attention"]["summary"])
+        commands = [
+            json.loads(line)
+            for line in self.command_log.read_text(encoding="utf-8").splitlines()
+        ]
+        self.assertIn(
+            [
+                "api",
+                "repos/thunderbump/beads-webui/rules/branches/main",
+                "--method",
+                "GET",
+            ],
+            [record["args"] for record in commands if record["command"] == "gh"],
+        )
+        self.assertFalse(
+            any(
+                record["command"] == "gh" and record["args"][:2] == ["pr", "merge"]
+                for record in commands
+            )
+        )
+
+    def test_resume_refuses_existing_auto_merge_request_on_exact_pr(self):
+        run_id = self.start_reviewed_run()
+        ready = self.run_afk("resume")
+        self.assertEqual(ready.returncode, 0, ready.stderr)
+
+        merged = self.run_afk("resume", AFK_FAKE_PR_AUTO_MERGE="1")
+
+        self.assertEqual(merged.returncode, 2, merged.stderr)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(status["checkpoint"], "reviewed")
+        self.assertEqual(status["attention"]["kind"], "conflict")
+        self.assertIn("auto-merge or merge queue", status["attention"]["summary"])
+        commands = [
+            json.loads(line)
+            for line in self.command_log.read_text(encoding="utf-8").splitlines()
+        ]
+        self.assertFalse(
+            any(
+                record["command"] == "gh" and record["args"][:2] == ["pr", "merge"]
+                for record in commands
+            )
+        )
+
     def test_resume_recovers_transient_attention_before_merge(self):
         run_id = self.start_reviewed_run()
         ready = self.run_afk("resume")
@@ -2684,6 +2742,32 @@ class StartCliTest(unittest.TestCase):
                                 "tree": {"sha": tree},
                                 "parents": parents,
                             }))
+                    elif args[:2] == ["api", "graphql"]:
+                        value = json.loads(pr_state.read_text())
+                        value["autoMergeRequest"] = (
+                            {"enabledAt": "2026-07-18T00:00:00Z"}
+                            if os.environ.get("AFK_FAKE_PR_AUTO_MERGE")
+                            else None
+                        )
+                        value["mergeQueueEntry"] = (
+                            {"id": "MQE_test", "state": "AWAITING_CHECKS"}
+                            if os.environ.get("AFK_FAKE_PR_QUEUED")
+                            else None
+                        )
+                        print(json.dumps({
+                            "data": {
+                                "repository": {"pullRequest": value},
+                            },
+                        }))
+                    elif (
+                        args[:1] == ["api"]
+                        and args[1]
+                        == "repos/thunderbump/beads-webui/rules/branches/main"
+                    ):
+                        rules = []
+                        if os.environ.get("AFK_FAKE_BASE_REQUIRES_MERGE_QUEUE"):
+                            rules.append({"type": "merge_queue"})
+                        print(json.dumps(rules))
                     elif args[:2] == ["pr", "list"]:
                         if os.environ.get("AFK_FAKE_READY_PR_UNAVAILABLE"):
                             raise SystemExit(1)
@@ -2714,6 +2798,12 @@ class StartCliTest(unittest.TestCase):
                             })
                         if os.environ.get("AFK_FAKE_PR_HEAD"):
                             value["headRefOid"] = os.environ["AFK_FAKE_PR_HEAD"]
+                        value["autoMergeRequest"] = (
+                            {"enabledAt": "2026-07-18T00:00:00Z"}
+                            if os.environ.get("AFK_FAKE_PR_AUTO_MERGE")
+                            else None
+                        )
+                        value.setdefault("mergeQueueEntry", None)
                         merge_commit = os.environ.get("AFK_FAKE_PR_MERGE_COMMIT")
                         if merge_commit == "missing":
                             value.pop("mergeCommit", None)
@@ -2761,6 +2851,10 @@ class StartCliTest(unittest.TestCase):
                         print(value["url"])
                     elif args[:2] == ["pr", "merge"]:
                         value = json.loads(pr_state.read_text())
+                        if os.environ.get("AFK_FAKE_BASE_REQUIRES_MERGE_QUEUE"):
+                            value["mergeQueueEntry"] = {"state": "AWAITING_CHECKS"}
+                            pr_state.write_text(json.dumps(value), encoding="utf-8")
+                            raise SystemExit(0)
                         value.update(
                             {
                                 "state": "MERGED",

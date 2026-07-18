@@ -8,6 +8,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 from afk.bead_spec import load_bead_spec
 from afk.candidate_validation import (
@@ -1128,6 +1129,12 @@ def merge_candidate_pr(store: RunStore, run_id: str) -> dict[str, Any]:
         raise CandidateError(
             "ready PR changed during final merge checks", kind="conflict"
         )
+    _require_direct_merge_topology(
+        worktree,
+        identity["repository"],
+        identity["base_branch"],
+        pr,
+    )
     if _remote_sha(worktree, identity["base_branch"], origin) != identity["base_sha"]:
         raise CandidateError(
             "target branch no longer equals the pinned base", kind="conflict"
@@ -1361,6 +1368,102 @@ def _github_git_commit(
     if not isinstance(value, dict):
         raise CandidateError("GitHub commit observation was malformed")
     return value
+
+
+def _require_direct_merge_topology(
+    worktree: Path,
+    repository: str,
+    base_branch: str,
+    expected_pr: dict[str, Any],
+) -> None:
+    rules = _run(
+        [
+            "gh",
+            "api",
+            f"repos/{repository}/rules/branches/{quote(base_branch, safe='')}",
+            "--method",
+            "GET",
+        ],
+        cwd=worktree,
+    )
+    if rules.returncode != 0:
+        raise CandidateError("base branch merge rules observation failed")
+    try:
+        rule_values = json.loads(rules.stdout)
+    except json.JSONDecodeError as exc:
+        raise CandidateError(
+            "base branch merge rules observation was malformed"
+        ) from exc
+    if not isinstance(rule_values, list) or not all(
+        isinstance(rule, dict) and isinstance(rule.get("type"), str)
+        for rule in rule_values
+    ):
+        raise CandidateError("base branch merge rules observation was malformed")
+    if any(rule["type"] == "merge_queue" for rule in rule_values):
+        raise CandidateError("base branch requires a merge queue", kind="conflict")
+
+    owner, name = repository.split("/", 1)
+    query = (
+        "query($owner:String!,$name:String!,$number:Int!){"
+        "repository(owner:$owner,name:$name){pullRequest(number:$number){"
+        "number url state isDraft headRefOid headRefName baseRefName "
+        "autoMergeRequest{enabledAt} mergeQueueEntry{id state}}}}"
+    )
+    automation = _run(
+        [
+            "gh",
+            "api",
+            "graphql",
+            "--method",
+            "POST",
+            "-f",
+            f"query={query}",
+            "-F",
+            f"owner={owner}",
+            "-F",
+            f"name={name}",
+            "-F",
+            f"number={expected_pr['number']}",
+        ],
+        cwd=worktree,
+    )
+    if automation.returncode != 0:
+        raise CandidateError("Candidate PR automation observation failed")
+    try:
+        value = json.loads(automation.stdout)
+        pr = value["data"]["repository"]["pullRequest"]
+    except (json.JSONDecodeError, KeyError, TypeError) as exc:
+        raise CandidateError(
+            "Candidate PR automation observation was malformed"
+        ) from exc
+    if (
+        not isinstance(value, dict)
+        or value.get("errors")
+        or not isinstance(pr, dict)
+        or "autoMergeRequest" not in pr
+        or "mergeQueueEntry" not in pr
+        or not isinstance(pr.get("autoMergeRequest"), (dict, type(None)))
+        or not isinstance(pr.get("mergeQueueEntry"), (dict, type(None)))
+    ):
+        raise CandidateError("Candidate PR automation observation was malformed")
+    for field in (
+        "number",
+        "url",
+        "state",
+        "isDraft",
+        "headRefOid",
+        "headRefName",
+        "baseRefName",
+    ):
+        if pr.get(field) != expected_pr.get(field):
+            raise CandidateError(
+                "Candidate PR changed during automation checks", kind="conflict"
+            )
+    if pr.get("autoMergeRequest") is not None or pr.get("mergeQueueEntry") is not None:
+        raise CandidateError(
+            "Candidate PR has an auto-merge or merge queue request",
+            kind="conflict",
+        )
 
 
 def _full_git_sha(value: Any) -> bool:
