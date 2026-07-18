@@ -15,6 +15,7 @@ from typing import Any
 from afk.bead_spec import BEAD_SPEC_EVIDENCE, load_bead_spec, persist_bead_spec
 from afk.candidate import (
     CandidateError,
+    mark_candidate_pr_ready,
     produce_candidate,
     produce_repair_candidate,
     reconcile_interrupted_repair_worktree,
@@ -194,9 +195,11 @@ def resume_run(*, note: str | None = None) -> tuple[str, int]:
                 return run_id, _advance_gate(store, run_id)
             return run_id, 2
         if projection["last_event"] == "gate.cycle_completed":
+            if projection["checkpoint"] == "reviewed":
+                return run_id, _advance_pr_ready(store, run_id)
             return run_id, _advance_completed_gate(store, run_id)
         if projection["checkpoint"] == "reviewed":
-            return run_id, 0
+            return run_id, _advance_pr_ready(store, run_id)
         if projection["checkpoint"] == "validated":
             return run_id, _advance_gate(store, run_id)
         if projection["last_event"] == "validation.rejected":
@@ -1233,6 +1236,101 @@ def _bead_for_run(store: RunStore, run_id: str) -> dict[str, Any]:
     identity = store.identity(run_id)
     request = identity.get("start_request", {})
     return _show_bead(identity["bead_id"], Path(request["beads_workspace"]))
+
+
+def _advance_pr_ready(store: RunStore, run_id: str) -> int:
+    projection = store.status(run_id)
+    cycles = projection.get("gate_cycles")
+    latest = cycles[-1] if isinstance(cycles, list) and cycles else None
+    try:
+        evidence_valid = (
+            isinstance(latest, dict)
+            and isinstance(latest.get("evidence"), str)
+            and store.verify_evidence(run_id, latest["evidence"])
+        )
+    except RunStoreError:
+        evidence_valid = False
+    if (
+        not isinstance(latest, dict)
+        or latest.get("next_action") != "complete"
+        or latest.get("candidate_sha") != projection.get("candidate_sha")
+        or not evidence_valid
+    ):
+        _attention(
+            store,
+            run_id,
+            checkpoint="reviewed",
+            scope="publication",
+            kind="invalid",
+            summary="PR readiness requires exact passed Gate evidence",
+        )
+        return 2
+    cycle = latest.get("cycle")
+    retry = latest.get("retry", 0)
+    if type(cycle) is not int or cycle <= 0 or type(retry) is not int or retry < 0:
+        _attention(
+            store,
+            run_id,
+            checkpoint="reviewed",
+            scope="publication",
+            kind="invalid",
+            summary="PR readiness Gate identity is invalid",
+        )
+        return 2
+    comment_effect_id = f"gate-comment-{cycle}{f'-retry-{retry}' if retry else ''}"
+    try:
+        comment_effect = store.effect(run_id, comment_effect_id)
+        intended = comment_effect.get("intended")
+        if (
+            comment_effect["status"] != "confirmed"
+            or not isinstance(intended, dict)
+            or intended.get("repository") != projection.get("repository")
+            or intended.get("pr_number") != projection.get("pr_number")
+            or intended.get("candidate_sha") != projection.get("candidate_sha")
+            or intended.get("cycle") != cycle
+            or intended.get("retry") != retry
+        ):
+            raise RunStoreError("final Gate comment is not confirmed")
+        observed = mark_candidate_pr_ready(store, run_id)
+    except CandidateError as exc:
+        _attention(
+            store,
+            run_id,
+            checkpoint="reviewed",
+            scope="publication",
+            kind=exc.kind,
+            summary=exc.summary,
+        )
+        return 2
+    except RunStoreError as exc:
+        _attention(
+            store,
+            run_id,
+            checkpoint="reviewed",
+            scope="publication",
+            kind="conflict",
+            summary=str(exc),
+        )
+        return 2
+    projection = store.status(run_id)
+    if projection.get("pr_ready") is None:
+        store.append_event(
+            run_id,
+            "pr.marked_ready",
+            state="reviewed",
+            data={"checkpoint": "reviewed", "attention": {}, "pr_ready": observed},
+        )
+    elif projection.get("pr_ready") != observed:
+        _attention(
+            store,
+            run_id,
+            checkpoint="reviewed",
+            scope="publication",
+            kind="conflict",
+            summary="ready PR fact contradicts the reviewed Run",
+        )
+        return 2
+    return 0
 
 
 def _advance_completed_gate(

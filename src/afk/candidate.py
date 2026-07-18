@@ -867,6 +867,8 @@ def _verify_published(
     pr: dict[str, Any],
     *,
     expected_pr_number: int | None = None,
+    expected_pr_url: str | None = None,
+    expected_draft: bool | None = True,
 ) -> None:
     local = _git(worktree, "rev-parse", "HEAD")
     dirty = _git(worktree, "status", "--porcelain")
@@ -888,14 +890,16 @@ def _verify_published(
         )
     if (
         (expected_pr_number is not None and pr.get("number") != expected_pr_number)
+        or (expected_pr_url is not None and pr.get("url") != expected_pr_url)
         or pr.get("headRefName") != branch
         or pr.get("baseRefName") != identity["base_branch"]
         or pr.get("state") != "OPEN"
-        or pr.get("isDraft") is not True
+        or type(pr.get("isDraft")) is not bool
+        or (expected_draft is not None and pr.get("isDraft") is not expected_draft)
         or type(pr.get("number")) is not int
         or not isinstance(pr.get("url"), str)
     ):
-        raise CandidateError("draft PR Candidate facts disagree", kind="conflict")
+        raise CandidateError("PR Candidate facts disagree", kind="conflict")
 
 
 def verify_candidate_publication(
@@ -906,6 +910,9 @@ def verify_candidate_publication(
     branch = _field(projection, "branch")
     candidate_sha = _field(projection, "candidate_sha")
     pr_number = projection.get("pr_number")
+    pr_url = projection.get("pr_url")
+    if pr_url is not None and (not isinstance(pr_url, str) or not pr_url):
+        raise CandidateError("stable Candidate PR URL is invalid", kind="conflict")
     if type(pr_number) is not int or pr_number <= 0:
         raise CandidateError("stable Candidate PR number is invalid", kind="conflict")
     prs = _list_prs(worktree, identity["repository"], branch)
@@ -920,8 +927,114 @@ def verify_candidate_publication(
         candidate_sha,
         prs[0],
         expected_pr_number=pr_number,
+        expected_pr_url=pr_url,
     )
     return prs[0]
+
+
+def mark_candidate_pr_ready(store: RunStore, run_id: str) -> dict[str, Any]:
+    identity = store.identity(run_id)
+    projection = store.status(run_id)
+    worktree = Path(_field(projection, "worktree_path"))
+    branch = _field(projection, "branch")
+    candidate_sha = _field(projection, "candidate_sha")
+    pr_number = projection.get("pr_number")
+    pr_url = _field(projection, "pr_url")
+    if type(pr_number) is not int or pr_number <= 0:
+        raise CandidateError("stable Candidate PR number is invalid", kind="conflict")
+    prs = _list_prs(worktree, identity["repository"], branch)
+    if len(prs) != 1:
+        raise CandidateError(
+            "Candidate branch does not have exactly one stable PR", kind="conflict"
+        )
+    pr = prs[0]
+    _verify_published(
+        identity,
+        worktree,
+        branch,
+        candidate_sha,
+        pr,
+        expected_pr_number=pr_number,
+        expected_pr_url=pr_url,
+        expected_draft=None,
+    )
+    observed = _ready_pr_observation(pr, candidate_sha)
+    effect = store.prepare_effect(
+        run_id,
+        "pr-mark-ready",
+        kind="pr-mark-ready",
+        intended={
+            "repository": identity["repository"],
+            "number": pr_number,
+            "url": pr.get("url"),
+            "candidate_sha": candidate_sha,
+            "head": branch,
+            "base": identity["base_branch"],
+            "base_sha": identity["base_sha"],
+            "draft": False,
+        },
+    )
+    if effect["status"] == "confirmed":
+        _verify_published(
+            identity,
+            worktree,
+            branch,
+            candidate_sha,
+            pr,
+            expected_pr_number=pr_number,
+            expected_pr_url=pr_url,
+            expected_draft=False,
+        )
+        if effect.get("observed") != observed:
+            raise CandidateError(
+                "confirmed ready PR contradicts GitHub", kind="conflict"
+            )
+        return observed
+    if pr["isDraft"]:
+        completed = _run(
+            [
+                "gh",
+                "pr",
+                "ready",
+                str(pr_number),
+                "--repo",
+                identity["repository"],
+            ],
+            cwd=worktree,
+        )
+        if completed.returncode != 0:
+            raise CandidateError("Candidate PR could not be marked ready")
+        prs = _list_prs(worktree, identity["repository"], branch)
+        if len(prs) != 1:
+            raise CandidateError(
+                "Candidate branch does not have exactly one stable PR",
+                kind="conflict",
+            )
+        pr = prs[0]
+        observed = _ready_pr_observation(pr, candidate_sha)
+    _verify_published(
+        identity,
+        worktree,
+        branch,
+        candidate_sha,
+        pr,
+        expected_pr_number=pr_number,
+        expected_pr_url=pr_url,
+        expected_draft=False,
+    )
+    store.confirm_effect(run_id, "pr-mark-ready", observed=observed)
+    return observed
+
+
+def _ready_pr_observation(pr: dict[str, Any], candidate_sha: str) -> dict[str, Any]:
+    return {
+        "number": pr.get("number"),
+        "url": pr.get("url"),
+        "candidate_sha": candidate_sha,
+        "head": pr.get("headRefName"),
+        "base": pr.get("baseRefName"),
+        "draft": pr.get("isDraft"),
+    }
 
 
 def _remote_sha(worktree: Path, branch: str) -> str:

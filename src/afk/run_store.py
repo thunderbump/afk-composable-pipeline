@@ -639,6 +639,7 @@ def _project(identity: dict[str, Any], events: list[dict[str, Any]]) -> dict[str
         "pr_number",
         "pr_url",
         "pr_head_sha",
+        "pr_ready",
         "validation",
         "validation_attempt",
         "previous_candidate_sha",
