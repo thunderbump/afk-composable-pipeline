@@ -31,7 +31,6 @@ BASE_SHA = "a" * 40
 
 class StartCliTest(unittest.TestCase):
     def setUp(self):
-        (Path.home() / ".fake-candidate").unlink(missing_ok=True)
         self.temporary_directory = tempfile.TemporaryDirectory()
         self.temp = Path(self.temporary_directory.name)
         self.project = self.temp / "beads-webui"
@@ -49,6 +48,9 @@ class StartCliTest(unittest.TestCase):
             encoding="utf-8",
         )
         self.state_home = self.temp / "state"
+        self.state_home.mkdir()
+        self.home = self.temp / "home"
+        self.home.mkdir()
         self.secret_value = "dogfood-password-value"
         self.secret_path = self.temp / "secrets" / "beads-password.txt"
         self.secret_path.parent.mkdir(mode=0o700)
@@ -72,7 +74,6 @@ class StartCliTest(unittest.TestCase):
         self._write_fake_commands()
 
     def tearDown(self):
-        (Path.home() / ".fake-candidate").unlink(missing_ok=True)
         self.temporary_directory.cleanup()
 
     def run_afk(self, *args, **overrides):
@@ -94,6 +95,7 @@ class StartCliTest(unittest.TestCase):
                 "AFK_FAKE_BEAD_COMMENTS": "[]",
                 "AFK_FAKE_PINNED_CONTRACT": "present",
                 "AFK_FAKE_EXPECTED_PASSWORD": self.secret_value,
+                "HOME": str(self.home),
                 "USER": "bump",
             }
         )
@@ -2062,12 +2064,11 @@ class StartCliTest(unittest.TestCase):
         )
 
     def test_candidate_contract_changes_remain_proposals_for_later_validation(self):
-        home = self.temp
-        (home / ".fake-contract-proposal").write_text("enabled", encoding="utf-8")
-        started = self.run_afk("start", "central-bnkl.1.1", HOME=str(home))
+        (self.home / ".fake-contract-proposal").write_text("enabled", encoding="utf-8")
+        started = self.run_afk("start", "central-bnkl.1.1")
         run_id = started.stdout.strip()
 
-        completed = self.run_afk("_worker", run_id, HOME=str(home))
+        completed = self.run_afk("_worker", run_id)
 
         self.assertEqual(completed.returncode, 2, completed.stderr)
         projection = json.loads(self.run_afk("status", run_id, "--json").stdout)
@@ -3183,6 +3184,7 @@ class StartCliTest(unittest.TestCase):
                 candidate_sha = "d" * 40
                 candidate_marker = Path(os.environ["HOME"]) / ".fake-candidate"
                 pushed_marker = Path(os.environ["HOME"]) / ".fake-pushed"
+                contract_proposal = Path(os.environ["HOME"]) / ".fake-contract-proposal"
                 pr_state = Path(os.environ["XDG_STATE_HOME"]) / "fake-pr.json"
                 pr_view_count = Path(os.environ["XDG_STATE_HOME"]) / "fake-pr-view-count"
                 comment_state = Path(os.environ["XDG_STATE_HOME"]) / "fake-comment.json"
@@ -3257,7 +3259,7 @@ class StartCliTest(unittest.TestCase):
                         if "-z" in args and requested == "scripts/validation-worker.sh":
                             changed = (
                                 args[2] == candidate_sha
-                                and (Path(os.environ["HOME"]) / ".fake-contract-proposal").exists()
+                                and contract_proposal.exists()
                             )
                             blob = "f" * 40 if changed else "b" * 40
                             sys.stdout.buffer.write(
