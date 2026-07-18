@@ -916,10 +916,12 @@ class StartCliTest(unittest.TestCase):
                 "--method",
                 "GET",
                 "--paginate",
-                "--slurp",
+                "--jq",
+                ".[] | {type: .type}",
             ],
             [record["args"] for record in commands if record["command"] == "gh"],
         )
+        self.assertNotIn("--slurp", json.dumps(commands))
         self.assertFalse(
             any(
                 record["command"] == "gh" and record["args"][:2] == ["pr", "merge"]
@@ -952,6 +954,21 @@ class StartCliTest(unittest.TestCase):
                 for record in commands
             )
         )
+
+    def test_resume_pauses_when_paginated_branch_rules_output_is_malformed(self):
+        run_id = self.start_reviewed_run()
+        ready = self.run_afk("resume")
+        self.assertEqual(ready.returncode, 0, ready.stderr)
+
+        merged = self.run_afk("resume", AFK_FAKE_BASE_RULES_MALFORMED="1")
+
+        self.assertEqual(merged.returncode, 2, merged.stderr)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(status["checkpoint"], "reviewed")
+        self.assertEqual(status["attention"]["kind"], "inconclusive")
+        self.assertIn("malformed", status["attention"]["summary"])
+        commands = self.command_log.read_text(encoding="utf-8")
+        self.assertNotIn('"args":["pr","merge"', commands)
 
     def test_resume_refuses_existing_auto_merge_request_on_exact_pr(self):
         run_id = self.start_reviewed_run()
@@ -2792,14 +2809,25 @@ class StartCliTest(unittest.TestCase):
                         and args[1]
                         == "repos/thunderbump/beads-webui/rules/branches/main"
                     ):
-                        rules = [[]]
+                        if "--slurp" in args:
+                            raise SystemExit("installed gh does not support --slurp")
+                        if args[args.index("--jq") + 1] != ".[] | {type: .type}":
+                            raise SystemExit("unexpected branch rules jq filter")
+                        if os.environ.get("AFK_FAKE_BASE_RULES_MALFORMED"):
+                            print("{")
+                            raise SystemExit(0)
+                        rules = []
                         if os.environ.get("AFK_FAKE_BASE_REQUIRES_MERGE_QUEUE"):
-                            rules[0].append({"type": "merge_queue"})
+                            rules.append({"type": "merge_queue"})
                         if os.environ.get(
                             "AFK_FAKE_BASE_RULES_SECOND_PAGE_MERGE_QUEUE"
                         ):
-                            rules = [[{"type": "required_status_checks"}], [{"type": "merge_queue"}]]  # noqa: E501
-                        print(json.dumps(rules))
+                            rules = [
+                                {"type": "required_status_checks"},
+                                {"type": "merge_queue"},
+                            ]
+                        for rule in rules:
+                            print(json.dumps(rule, separators=(",", ":")))
                     elif args[:2] == ["pr", "list"]:
                         if os.environ.get("AFK_FAKE_READY_PR_UNAVAILABLE"):
                             raise SystemExit(1)
