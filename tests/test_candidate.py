@@ -1133,8 +1133,8 @@ class CandidateTest(unittest.TestCase):
         original_remote_sha = candidate_module._remote_sha
         observed = {}
 
-        def move_head_after_candidate_verification(worktree, branch):
-            remote_sha = original_remote_sha(worktree, branch)
+        def move_head_after_candidate_verification(worktree, branch, remote="origin"):
+            remote_sha = original_remote_sha(worktree, branch, remote)
             if "candidate_sha" not in observed and not remote_sha:
                 observed["candidate_sha"] = self.git("rev-parse", "HEAD")
                 (self.checkout / "later.txt").write_text("later\n", encoding="utf-8")

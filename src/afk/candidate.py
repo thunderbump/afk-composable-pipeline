@@ -8,6 +8,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 from afk.bead_spec import load_bead_spec
 from afk.candidate_validation import (
@@ -21,6 +22,7 @@ from afk.codex_permissions import (
 )
 from afk.jsonutil import canonical_json
 from afk.redaction import redact_artifact_value
+from afk.run_next import github_repo_from_repo_url
 from afk.run_store import RunStore, RunStoreError
 
 
@@ -869,11 +871,12 @@ def _verify_published(
     expected_pr_number: int | None = None,
     expected_pr_url: str | None = None,
     expected_draft: bool | None = True,
+    remote: str = "origin",
 ) -> None:
     local = _git(worktree, "rev-parse", "HEAD")
     dirty = _git(worktree, "status", "--porcelain")
-    remote = _remote_sha(worktree, branch)
-    target = _remote_sha(worktree, identity["base_branch"])
+    remote_sha = _remote_sha(worktree, branch, remote)
+    target = _remote_sha(worktree, identity["base_branch"], remote)
     if target != identity["base_sha"]:
         raise CandidateError(
             "target branch no longer equals the pinned base", kind="conflict"
@@ -881,7 +884,7 @@ def _verify_published(
     if (
         local != candidate_sha
         or dirty
-        or remote != candidate_sha
+        or remote_sha != candidate_sha
         or pr.get("headRefOid") != candidate_sha
     ):
         raise CandidateError(
@@ -1045,10 +1048,485 @@ def _ready_pr_observation(pr: dict[str, Any], candidate_sha: str) -> dict[str, A
     }
 
 
-def _remote_sha(worktree: Path, branch: str) -> str:
-    completed = _run(
-        ["git", "ls-remote", "origin", f"refs/heads/{branch}"], cwd=worktree
+def merge_candidate_pr(store: RunStore, run_id: str) -> dict[str, Any]:
+    identity = store.identity(run_id)
+    projection = store.status(run_id)
+    worktree = Path(_field(projection, "worktree_path"))
+    branch = _field(projection, "branch")
+    candidate_sha = _field(projection, "candidate_sha")
+    pr_number = projection.get("pr_number")
+    pr_url = _field(projection, "pr_url")
+    if type(pr_number) is not int or pr_number <= 0:
+        raise CandidateError("stable Candidate PR number is invalid", kind="conflict")
+    merge_intended, delete_intended = _candidate_merge_intended(
+        identity,
+        pr_number,
+        pr_url,
+        branch,
+        candidate_sha,
     )
+    pr = _view_pr(worktree, identity["repository"], pr_number)
+    merge_effect = store.effect_if_present(run_id, "pr-squash-merge")
+    delete_effect = store.effect_if_present(run_id, "remote-branch-delete")
+    if pr.get("state") == "MERGED":
+        _require_effect_identity(merge_effect, "pr-squash-merge", merge_intended)
+        _require_effect_identity(delete_effect, "remote-branch-delete", delete_intended)
+        return _reconcile_candidate_merge(
+            store,
+            run_id,
+            identity,
+            projection,
+            pr,
+            merge_effect,
+        )
+    _require_open_effect(merge_effect, "pr-squash-merge", merge_intended)
+    _require_open_effect(delete_effect, "remote-branch-delete", delete_intended)
+    origin = _pinned_origin(identity, worktree)
+    _verify_published(
+        identity,
+        worktree,
+        branch,
+        candidate_sha,
+        pr,
+        expected_pr_number=pr_number,
+        expected_pr_url=pr_url,
+        expected_draft=False,
+        remote=origin,
+    )
+    if projection.get("pr_ready") != _ready_pr_observation(pr, candidate_sha):
+        raise CandidateError(
+            "ready PR facts contradict the reviewed Run", kind="conflict"
+        )
+    store.prepare_effect(
+        run_id,
+        "pr-squash-merge",
+        kind="pr-squash-merge",
+        intended=merge_intended,
+    )
+    store.prepare_effect(
+        run_id,
+        "remote-branch-delete",
+        kind="remote-branch-delete",
+        intended=delete_intended,
+    )
+    pr = _view_pr(worktree, identity["repository"], pr_number)
+    origin = _pinned_origin(identity, worktree)
+    _verify_published(
+        identity,
+        worktree,
+        branch,
+        candidate_sha,
+        pr,
+        expected_pr_number=pr_number,
+        expected_pr_url=pr_url,
+        expected_draft=False,
+        remote=origin,
+    )
+    if (
+        projection.get("pr_ready") != _ready_pr_observation(pr, candidate_sha)
+        or _view_pr(worktree, identity["repository"], pr_number) != pr
+    ):
+        raise CandidateError(
+            "ready PR changed during final merge checks", kind="conflict"
+        )
+    _require_direct_merge_topology(
+        worktree,
+        identity["repository"],
+        identity["base_branch"],
+        pr,
+    )
+    if _remote_sha(worktree, identity["base_branch"], origin) != identity["base_sha"]:
+        raise CandidateError(
+            "target branch no longer equals the pinned base", kind="conflict"
+        )
+    completed = _run(
+        [
+            "gh",
+            "pr",
+            "merge",
+            str(pr_number),
+            "--repo",
+            identity["repository"],
+            "--squash",
+            "--delete-branch",
+            "--match-head-commit",
+            candidate_sha,
+        ],
+        cwd=worktree,
+    )
+    if completed.returncode != 0:
+        raise CandidateError("Candidate PR squash merge failed")
+    pr = _view_pr(worktree, identity["repository"], pr_number)
+    return _reconcile_candidate_merge(
+        store,
+        run_id,
+        identity,
+        projection,
+        pr,
+        store.effect(run_id, "pr-squash-merge"),
+    )
+
+
+def reconcile_candidate_branch_deletion(store: RunStore, run_id: str) -> bool:
+    identity = store.identity(run_id)
+    projection = store.status(run_id)
+    worktree = Path(_field(projection, "worktree_path"))
+    branch = _field(projection, "branch")
+    candidate_sha = _field(projection, "candidate_sha")
+    pr_number = projection.get("pr_number")
+    pr_url = _field(projection, "pr_url")
+    if type(pr_number) is not int or pr_number <= 0:
+        raise CandidateError("stable Candidate PR number is invalid", kind="conflict")
+    _, delete_intended = _candidate_merge_intended(
+        identity,
+        pr_number,
+        pr_url,
+        branch,
+        candidate_sha,
+    )
+    delete_effect = store.effect_if_present(run_id, "remote-branch-delete")
+    _require_effect_identity(delete_effect, "remote-branch-delete", delete_intended)
+    origin = _pinned_origin(identity, worktree)
+    remote_sha = _remote_sha(worktree, branch, origin)
+    if remote_sha not in {"", candidate_sha}:
+        raise CandidateError(
+            "remote Candidate branch was replaced after merge", kind="conflict"
+        )
+    deleted = remote_sha == ""
+    delete_observed = {
+        "repository": identity["repository"],
+        "branch": branch,
+        "deleted": True,
+    }
+    if delete_effect["status"] == "confirmed":
+        _require_effect_observation(delete_effect, delete_observed)
+        if not deleted:
+            raise CandidateError(
+                "confirmed branch deletion contradicts the remote", kind="conflict"
+            )
+    if deleted:
+        store.confirm_effect(
+            run_id,
+            "remote-branch-delete",
+            observed=delete_observed,
+        )
+    return deleted
+
+
+def _candidate_merge_intended(
+    identity: dict[str, Any],
+    pr_number: int,
+    pr_url: str,
+    branch: str,
+    candidate_sha: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    return (
+        {
+            "repository": identity["repository"],
+            "number": pr_number,
+            "url": pr_url,
+            "candidate_sha": candidate_sha,
+            "head": branch,
+            "base": identity["base_branch"],
+            "base_sha": identity["base_sha"],
+            "strategy": "squash",
+        },
+        {
+            "repository": identity["repository"],
+            "branch": branch,
+            "candidate_sha": candidate_sha,
+        },
+    )
+
+
+def _require_effect_identity(
+    effect: dict[str, Any] | None,
+    kind: str,
+    intended: dict[str, Any],
+) -> None:
+    if (
+        effect is None
+        or effect.get("kind") != kind
+        or effect.get("intended") != intended
+    ):
+        raise CandidateError(
+            "Candidate PR merge Effect authorization disagrees with the Run",
+            kind="conflict",
+        )
+
+
+def _require_open_effect(
+    effect: dict[str, Any] | None,
+    kind: str,
+    intended: dict[str, Any],
+) -> None:
+    if effect is None:
+        return
+    _require_effect_identity(effect, kind, intended)
+    if effect.get("status") != "prepared" or "observed" in effect:
+        raise CandidateError(
+            "OPEN Candidate PR contradicts its merge Effect authorization",
+            kind="conflict",
+        )
+
+
+def _reconcile_candidate_merge(
+    store: RunStore,
+    run_id: str,
+    identity: dict[str, Any],
+    projection: dict[str, Any],
+    pr: dict[str, Any],
+    merge_effect: dict[str, Any],
+) -> dict[str, Any]:
+    merge = pr.get("mergeCommit")
+    merge_commit = merge.get("oid") if isinstance(merge, dict) else None
+    if (
+        pr.get("number") != projection.get("pr_number")
+        or pr.get("url") != projection.get("pr_url")
+        or pr.get("state") != "MERGED"
+        or pr.get("isDraft") is not False
+        or pr.get("headRefOid") != projection.get("candidate_sha")
+        or pr.get("headRefName") != projection.get("branch")
+        or pr.get("baseRefName") != identity["base_branch"]
+        or not isinstance(merge_commit, str)
+        or len(merge_commit) != 40
+        or any(character not in "0123456789abcdef" for character in merge_commit)
+    ):
+        raise CandidateError(
+            "merged PR facts disagree with the reviewed Candidate", kind="conflict"
+        )
+    _verify_squash_commit(
+        worktree=Path(_field(projection, "worktree_path")),
+        repository=identity["repository"],
+        merge_commit=merge_commit,
+        base_sha=identity["base_sha"],
+        candidate_sha=_field(projection, "candidate_sha"),
+    )
+    observed = {
+        "number": pr["number"],
+        "url": pr["url"],
+        "candidate_sha": pr["headRefOid"],
+        "head": pr["headRefName"],
+        "base": pr["baseRefName"],
+        "merge_commit": merge_commit,
+    }
+    _require_effect_observation(merge_effect, observed)
+    store.confirm_effect(run_id, "pr-squash-merge", observed=observed)
+    return observed
+
+
+def _verify_squash_commit(
+    *,
+    worktree: Path,
+    repository: str,
+    merge_commit: str,
+    base_sha: str,
+    candidate_sha: str,
+) -> None:
+    candidate = _github_git_commit(worktree, repository, candidate_sha)
+    merged = _github_git_commit(worktree, repository, merge_commit)
+    candidate_tree = candidate.get("tree")
+    merged_tree = merged.get("tree")
+    parents = merged.get("parents")
+    if (
+        candidate.get("sha") != candidate_sha
+        or not isinstance(candidate_tree, dict)
+        or not _full_git_sha(candidate_tree.get("sha"))
+        or merged.get("sha") != merge_commit
+        or not isinstance(merged_tree, dict)
+        or merged_tree.get("sha") != candidate_tree["sha"]
+        or not isinstance(parents, list)
+        or len(parents) != 1
+        or not isinstance(parents[0], dict)
+        or parents[0].get("sha") != base_sha
+    ):
+        raise CandidateError(
+            "GitHub squash commit disagrees with the reviewed Candidate",
+            kind="conflict",
+        )
+
+
+def _github_git_commit(
+    worktree: Path, repository: str, commit_sha: str
+) -> dict[str, Any]:
+    completed = _run(
+        [
+            "gh",
+            "api",
+            f"repos/{repository}/git/commits/{commit_sha}",
+            "--method",
+            "GET",
+        ],
+        cwd=worktree,
+    )
+    if completed.returncode != 0:
+        raise CandidateError("GitHub commit observation failed")
+    try:
+        value = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise CandidateError("GitHub commit observation was malformed") from exc
+    if not isinstance(value, dict):
+        raise CandidateError("GitHub commit observation was malformed")
+    return value
+
+
+def _require_direct_merge_topology(
+    worktree: Path,
+    repository: str,
+    base_branch: str,
+    expected_pr: dict[str, Any],
+) -> None:
+    rules = _run(
+        [
+            "gh",
+            "api",
+            f"repos/{repository}/rules/branches/{quote(base_branch, safe='')}",
+            "--method",
+            "GET",
+            "--paginate",
+            "--jq",
+            ".[] | {type: .type}",
+        ],
+        cwd=worktree,
+    )
+    if rules.returncode != 0:
+        raise CandidateError("base branch merge rules observation failed")
+    try:
+        branch_rules = [json.loads(line) for line in rules.stdout.splitlines()]
+    except json.JSONDecodeError as exc:
+        raise CandidateError(
+            "base branch merge rules observation was malformed"
+        ) from exc
+    if not all(
+        isinstance(rule, dict) and isinstance(rule.get("type"), str)
+        for rule in branch_rules
+    ):
+        raise CandidateError("base branch merge rules observation was malformed")
+    if any(rule["type"] == "merge_queue" for rule in branch_rules):
+        raise CandidateError("base branch requires a merge queue", kind="conflict")
+
+    owner, name = repository.split("/", 1)
+    query = (
+        "query($owner:String!,$name:String!,$number:Int!){"
+        "repository(owner:$owner,name:$name){pullRequest(number:$number){"
+        "number url state isDraft headRefOid headRefName baseRefName "
+        "autoMergeRequest{enabledAt} mergeQueueEntry{id state}}}}"
+    )
+    automation = _run(
+        [
+            "gh",
+            "api",
+            "graphql",
+            "--method",
+            "POST",
+            "-f",
+            f"query={query}",
+            "-F",
+            f"owner={owner}",
+            "-F",
+            f"name={name}",
+            "-F",
+            f"number={expected_pr['number']}",
+        ],
+        cwd=worktree,
+    )
+    if automation.returncode != 0:
+        raise CandidateError("Candidate PR automation observation failed")
+    try:
+        value = json.loads(automation.stdout)
+        pr = value["data"]["repository"]["pullRequest"]
+    except (json.JSONDecodeError, KeyError, TypeError) as exc:
+        raise CandidateError(
+            "Candidate PR automation observation was malformed"
+        ) from exc
+    if (
+        not isinstance(value, dict)
+        or value.get("errors")
+        or not isinstance(pr, dict)
+        or "autoMergeRequest" not in pr
+        or "mergeQueueEntry" not in pr
+        or not isinstance(pr.get("autoMergeRequest"), (dict, type(None)))
+        or not isinstance(pr.get("mergeQueueEntry"), (dict, type(None)))
+    ):
+        raise CandidateError("Candidate PR automation observation was malformed")
+    for field in (
+        "number",
+        "url",
+        "state",
+        "isDraft",
+        "headRefOid",
+        "headRefName",
+        "baseRefName",
+    ):
+        if pr.get(field) != expected_pr.get(field):
+            raise CandidateError(
+                "Candidate PR changed during automation checks", kind="conflict"
+            )
+    if pr.get("autoMergeRequest") is not None or pr.get("mergeQueueEntry") is not None:
+        raise CandidateError(
+            "Candidate PR has an auto-merge or merge queue request",
+            kind="conflict",
+        )
+
+
+def _full_git_sha(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 40
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _require_effect_observation(
+    effect: dict[str, Any], observed: dict[str, Any]
+) -> None:
+    if effect.get("status") == "confirmed" and effect.get("observed") != observed:
+        raise CandidateError(
+            "confirmed merge Effect observation disagrees with GitHub",
+            kind="conflict",
+        )
+
+
+def _view_pr(worktree: Path, repository: str, pr_number: int) -> dict[str, Any]:
+    completed = _run(
+        [
+            "gh",
+            "pr",
+            "view",
+            str(pr_number),
+            "--repo",
+            repository,
+            "--json",
+            (
+                "number,url,state,isDraft,headRefOid,headRefName,"
+                "baseRefName,mergeCommit"
+            ),
+        ],
+        cwd=worktree,
+    )
+    if completed.returncode != 0:
+        raise CandidateError("Candidate PR observation failed")
+    try:
+        value = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise CandidateError("Candidate PR observation was malformed") from exc
+    if not isinstance(value, dict):
+        raise CandidateError("Candidate PR observation was malformed")
+    return value
+
+
+def _pinned_origin(identity: dict[str, Any], worktree: Path) -> str:
+    origin = _git(worktree, "remote", "get-url", "origin")
+    repository = github_repo_from_repo_url(origin)
+    if repository is None or repository.casefold() != identity["repository"].casefold():
+        raise CandidateError(
+            "origin does not match the pinned repository", kind="conflict"
+        )
+    return origin
+
+
+def _remote_sha(worktree: Path, branch: str, remote: str = "origin") -> str:
+    completed = _run(["git", "ls-remote", remote, f"refs/heads/{branch}"], cwd=worktree)
     if completed.returncode != 0:
         raise CandidateError("remote Candidate head observation failed")
     fields = completed.stdout.strip().split()

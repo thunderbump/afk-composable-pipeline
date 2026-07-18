@@ -16,8 +16,10 @@ from afk.bead_spec import BEAD_SPEC_EVIDENCE, load_bead_spec, persist_bead_spec
 from afk.candidate import (
     CandidateError,
     mark_candidate_pr_ready,
+    merge_candidate_pr,
     produce_candidate,
     produce_repair_candidate,
+    reconcile_candidate_branch_deletion,
     reconcile_interrupted_repair_worktree,
     seal_interrupted_repair_attempt,
 )
@@ -199,7 +201,11 @@ def resume_run(*, note: str | None = None) -> tuple[str, int]:
                 return run_id, _advance_pr_ready(store, run_id)
             return run_id, _advance_completed_gate(store, run_id)
         if projection["checkpoint"] == "reviewed":
+            if projection.get("pr_ready") is not None:
+                return run_id, _advance_merge(store, run_id)
             return run_id, _advance_pr_ready(store, run_id)
+        if projection["checkpoint"] == "merged":
+            return run_id, _advance_merge(store, run_id)
         if projection["checkpoint"] == "validated":
             return run_id, _advance_gate(store, run_id)
         if projection["last_event"] == "validation.rejected":
@@ -1337,14 +1343,109 @@ def _advance_pr_ready(store: RunStore, run_id: str) -> int:
             summary="ready PR fact contradicts the reviewed Run",
         )
         return 2
-    elif projection["state"] != "reviewed" or projection.get("attention"):
+    return 0
+
+
+def _advance_merge(store: RunStore, run_id: str) -> int:
+    checkpoint = store.status(run_id)["checkpoint"]
+    try:
+        observed = merge_candidate_pr(store, run_id)
+    except CandidateError as exc:
+        _attention(
+            store,
+            run_id,
+            checkpoint=checkpoint,
+            scope="merge",
+            kind=exc.kind,
+            summary=exc.summary,
+        )
+        return 2
+    except RunStoreError as exc:
+        _attention(
+            store,
+            run_id,
+            checkpoint=checkpoint,
+            scope="merge",
+            kind="conflict",
+            summary=str(exc),
+        )
+        return 2
+    try:
+        _record_merged(store, run_id, observed, False)
+    except RunStoreError as exc:
+        _attention(
+            store,
+            run_id,
+            checkpoint="merged",
+            scope="merge",
+            kind="conflict",
+            summary=str(exc),
+        )
+        return 2
+    try:
+        branch_deleted = reconcile_candidate_branch_deletion(store, run_id)
+    except CandidateError as exc:
+        _attention(
+            store,
+            run_id,
+            checkpoint="merged",
+            scope="merge",
+            kind=exc.kind,
+            summary=exc.summary,
+        )
+        return 2
+    except RunStoreError as exc:
+        _attention(
+            store,
+            run_id,
+            checkpoint="merged",
+            scope="merge",
+            kind="conflict",
+            summary=str(exc),
+        )
+        return 2
+    _record_merged(store, run_id, observed, branch_deleted, reconcile=True)
+    return 0
+
+
+def _record_merged(
+    store: RunStore,
+    run_id: str,
+    observed: dict[str, Any],
+    branch_deleted: bool,
+    *,
+    reconcile: bool = False,
+) -> None:
+    projection = store.status(run_id)
+    if projection.get("merge") is None:
         store.append_event(
             run_id,
-            "pr.ready_reconciled",
-            state="reviewed",
-            data={"checkpoint": "reviewed", "attention": {}},
+            "pr.squash_merged",
+            state="merged",
+            data={
+                "checkpoint": "merged",
+                "attention": {},
+                "merge": observed,
+                "remote_branch_deleted": branch_deleted,
+            },
         )
-    return 0
+    elif projection.get("merge") != observed:
+        raise RunStoreError("merged PR fact contradicts the Run")
+    elif reconcile and (
+        projection["state"] != "merged"
+        or bool(projection.get("attention"))
+        or projection.get("remote_branch_deleted") != branch_deleted
+    ):
+        store.append_event(
+            run_id,
+            "pr.merge_reconciled",
+            state="merged",
+            data={
+                "checkpoint": "merged",
+                "attention": {},
+                "remote_branch_deleted": branch_deleted,
+            },
+        )
 
 
 def _advance_completed_gate(
