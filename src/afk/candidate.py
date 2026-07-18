@@ -21,6 +21,7 @@ from afk.codex_permissions import (
 )
 from afk.jsonutil import canonical_json
 from afk.redaction import redact_artifact_value
+from afk.run_next import github_repo_from_repo_url
 from afk.run_store import RunStore, RunStoreError
 
 
@@ -1169,6 +1170,16 @@ def reconcile_candidate_branch_deletion(store: RunStore, run_id: str) -> bool:
     )
     delete_effect = store.effect_if_present(run_id, "remote-branch-delete")
     _require_effect_identity(delete_effect, "remote-branch-delete", delete_intended)
+    origin_repository = github_repo_from_repo_url(
+        _git(worktree, "remote", "get-url", "origin")
+    )
+    if (
+        origin_repository is None
+        or origin_repository.casefold() != identity["repository"].casefold()
+    ):
+        raise CandidateError(
+            "origin does not match the pinned repository", kind="conflict"
+        )
     remote_sha = _remote_sha(worktree, branch)
     if remote_sha not in {"", candidate_sha}:
         raise CandidateError(

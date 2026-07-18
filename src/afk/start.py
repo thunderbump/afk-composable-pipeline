@@ -1347,13 +1347,14 @@ def _advance_pr_ready(store: RunStore, run_id: str) -> int:
 
 
 def _advance_merge(store: RunStore, run_id: str) -> int:
+    checkpoint = store.status(run_id)["checkpoint"]
     try:
         observed = merge_candidate_pr(store, run_id)
     except CandidateError as exc:
         _attention(
             store,
             run_id,
-            checkpoint="reviewed",
+            checkpoint=checkpoint,
             scope="merge",
             kind=exc.kind,
             summary=exc.summary,
@@ -1363,7 +1364,7 @@ def _advance_merge(store: RunStore, run_id: str) -> int:
         _attention(
             store,
             run_id,
-            checkpoint="reviewed",
+            checkpoint=checkpoint,
             scope="merge",
             kind="conflict",
             summary=str(exc),
