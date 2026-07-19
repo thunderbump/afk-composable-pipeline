@@ -85,7 +85,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "resume":
         try:
-            run_id, exit_code = resume_run(note=args.note)
+            run_id, exit_code = resume_run(args.run_id, note=args.note)
         except (StartError, RunStoreError) as exc:
             print(str(exc), file=sys.stderr)
             return 2
@@ -480,6 +480,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     resume_parser = subcommands.add_parser("resume", help="Reconcile the Active Run")
+    resume_parser.add_argument("run_id", nargs="?")
     resume_parser.add_argument("--note")
 
     worker_parser = subcommands.add_parser("_worker", help=argparse.SUPPRESS)

@@ -210,6 +210,13 @@ class RunStore:
         events, _ = self._read_events(selected)
         return _project(identity, events)
 
+    def reconcile_completed_active_pointer(self, run_id: str) -> dict[str, Any]:
+        with self.lock():
+            projection = self.status(run_id)
+            if projection["state"] == "completed":
+                self._clear_active_pointer(run_id)
+            return projection
+
     def identity(self, run_id: str) -> dict[str, Any]:
         return self._identity(run_id)
 
