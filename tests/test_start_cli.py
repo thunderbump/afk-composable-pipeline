@@ -3447,6 +3447,15 @@ class StartCliTest(unittest.TestCase):
 
         self.assert_resume_preflight_rejected("Event History record 1 is invalid")
 
+    def test_resume_rejects_torn_event_tail_before_external_commands(self):
+        _, run_dir = self.create_resume_preflight_run()
+        with (run_dir / "events.jsonl").open("ab") as stream:
+            stream.write(b'{"schema_version":1')
+
+        self.assert_resume_preflight_rejected(
+            "Event History has an incomplete trailing record"
+        )
+
     def test_resume_rejects_invalid_run_identity_before_external_commands(self):
         _, run_dir = self.create_resume_preflight_run()
         identity_path = run_dir / "run.json"

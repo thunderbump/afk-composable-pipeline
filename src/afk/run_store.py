@@ -218,6 +218,7 @@ class RunStore:
                 _require_mode(active_path, 0o600, "Active Run pointer")
             active_run_id = self._active_pointer_run_id(invalid_is_error=True)
             projection = self.status()
+            self._read_events(projection["run_id"], require_complete=True)
             if active_run_id is not None and active_run_id != projection["run_id"]:
                 raise EventHistoryCorrupt(
                     "Active Run pointer does not match Event History"
@@ -576,13 +577,17 @@ class RunStore:
         _atomic_json(self._run_dir(run_id) / "state.json", projection)
         return projection
 
-    def _read_events(self, run_id: str) -> tuple[list[dict[str, Any]], int]:
+    def _read_events(
+        self, run_id: str, *, require_complete: bool = False
+    ) -> tuple[list[dict[str, Any]], int]:
         path = self._run_dir(run_id) / "events.jsonl"
         try:
             payload = path.read_bytes()
         except FileNotFoundError as exc:
             raise RunNotFound(f"Run not found: {run_id}") from exc
         complete_bytes = payload.rfind(b"\n") + 1
+        if require_complete and complete_bytes != len(payload):
+            raise EventHistoryCorrupt("Event History has an incomplete trailing record")
         complete = payload[:complete_bytes]
         events = []
         offset = 0
