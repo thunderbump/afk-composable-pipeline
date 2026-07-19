@@ -3547,6 +3547,24 @@ class StartCliTest(unittest.TestCase):
 
         self.assert_resume_preflight_rejected("evidence does not match its manifest")
 
+    def test_resume_rejects_external_symlinked_evidence_manifest_before_commands(self):
+        store, _ = self.create_resume_preflight_run()
+        store.write_evidence_text(
+            "crashed-run", "attempts/attempt-1/result.txt", "complete\n"
+        )
+        store.seal_evidence("crashed-run", "attempts/attempt-1")
+        evidence = self.state_home / "afk/runs/crashed-run/attempts/attempt-1"
+        manifest = evidence / "manifest.json"
+        external_manifest = self.temp / "external-manifest.json"
+        external_manifest.write_bytes(manifest.read_bytes())
+        external_manifest.chmod(0o400)
+        evidence.chmod(0o700)
+        manifest.unlink()
+        manifest.symlink_to(external_manifest)
+        evidence.chmod(0o500)
+
+        self.assert_resume_preflight_rejected("evidence manifest is invalid")
+
     def test_resume_rejects_insecure_run_store_permissions_before_commands(self):
         self.create_resume_preflight_run()
         (self.state_home / "afk" / "active.json").chmod(0o644)

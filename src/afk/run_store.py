@@ -425,7 +425,11 @@ class RunStore:
         directory = self._evidence_path(run_id, relative_directory)
         manifest_path = directory / "manifest.json"
         try:
+            if not stat.S_ISREG(manifest_path.lstat().st_mode):
+                raise EvidenceTampered("evidence manifest is invalid")
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except EvidenceTampered:
+            raise
         except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise EvidenceTampered("evidence manifest is missing or invalid") from exc
         expected = _validate_manifest(manifest)
