@@ -127,6 +127,15 @@ class RunStoreTest(unittest.TestCase):
         )
         self.assertEqual(projection["state"], "claimed")
 
+    def test_status_remains_available_while_a_mutator_holds_the_global_lock(self):
+        other_store = RunStore(self.root)
+
+        with self.store.lock():
+            created = self.create_run()
+            observed = other_store.status()
+
+        self.assertEqual(observed, created)
+
     def test_one_active_run_prevents_another_run_from_being_created(self):
         self.create_run()
 
