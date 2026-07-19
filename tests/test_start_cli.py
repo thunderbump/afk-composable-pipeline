@@ -78,6 +78,8 @@ class StartCliTest(unittest.TestCase):
 
     def run_afk(self, *args, **overrides):
         short_cleanup_timeout = overrides.pop("AFK_TEST_SHORT_CLEANUP_TIMEOUT", None)
+        kill_before_event = overrides.pop("AFK_TEST_KILL_BEFORE_EVENT", None)
+        kill_after_event = overrides.pop("AFK_TEST_KILL_AFTER_EVENT", None)
         env = os.environ.copy()
         env.update(
             {
@@ -102,7 +104,32 @@ class StartCliTest(unittest.TestCase):
         )
         env.update(overrides)
         command = [sys.executable, "-m", "afk", *args]
-        if short_cleanup_timeout:
+        if kill_before_event or kill_after_event:
+            if kill_before_event:
+                env["AFK_TEST_KILL_BEFORE_EVENT"] = kill_before_event
+            if kill_after_event:
+                env["AFK_TEST_KILL_AFTER_EVENT"] = kill_after_event
+            command = [
+                sys.executable,
+                "-c",
+                (
+                    "import os, signal, sys\n"
+                    "from afk.run_store import RunStore\n"
+                    "original = RunStore.append_event\n"
+                    "before = os.environ.get('AFK_TEST_KILL_BEFORE_EVENT')\n"
+                    "after = os.environ.get('AFK_TEST_KILL_AFTER_EVENT')\n"
+                    "def injected(store, run_id, event, **kwargs):\n"
+                    " if event == before: os.kill(os.getpid(), signal.SIGKILL)\n"
+                    " result = original(store, run_id, event, **kwargs)\n"
+                    " if event == after: os.kill(os.getpid(), signal.SIGKILL)\n"
+                    " return result\n"
+                    "RunStore.append_event = injected\n"
+                    "from afk.cli import main\n"
+                    "raise SystemExit(main(sys.argv[1:]))\n"
+                ),
+                *args,
+            ]
+        elif short_cleanup_timeout:
             command = [
                 sys.executable,
                 "-c",
@@ -292,6 +319,71 @@ class StartCliTest(unittest.TestCase):
             if record["command"] == "gh" and record["args"][:2] == ["pr", "ready"]
         ]
         self.assertEqual(len(ready_commands), 1)
+
+    def test_resume_recovers_crash_before_ready_state_append(self):
+        run_id = self.start_reviewed_run()
+
+        interrupted = self.run_afk(
+            "resume", AFK_TEST_KILL_BEFORE_EVENT="pr.marked_ready"
+        )
+
+        self.assertLess(interrupted.returncode, 0)
+        before = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(before["checkpoint"], "reviewed")
+        self.assertNotIn("pr_ready", before)
+        store = RunStore(self.state_home / "afk")
+        self.assertEqual(store.effect(run_id, "pr-mark-ready")["status"], "confirmed")
+
+        resumed = self.run_afk("resume")
+
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        after = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(after["checkpoint"], "reviewed")
+        self.assertEqual(after["pr_ready"]["candidate_sha"], "d" * 40)
+        commands = [
+            json.loads(line)
+            for line in self.command_log.read_text(encoding="utf-8").splitlines()
+        ]
+        ready_commands = [
+            record
+            for record in commands
+            if record["command"] == "gh" and record["args"][:2] == ["pr", "ready"]
+        ]
+        self.assertEqual(len(ready_commands), 1)
+
+    def test_resume_recovers_crash_after_ready_state_append(self):
+        run_id = self.start_reviewed_run()
+
+        interrupted = self.run_afk(
+            "resume", AFK_TEST_KILL_AFTER_EVENT="pr.marked_ready"
+        )
+
+        self.assertLess(interrupted.returncode, 0)
+        before = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(before["checkpoint"], "reviewed")
+        self.assertEqual(before["pr_ready"]["candidate_sha"], "d" * 40)
+
+        resumed = self.run_afk("resume")
+
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        after = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(after["checkpoint"], "merged")
+        commands = [
+            json.loads(line)
+            for line in self.command_log.read_text(encoding="utf-8").splitlines()
+        ]
+        ready_commands = [
+            record
+            for record in commands
+            if record["command"] == "gh" and record["args"][:2] == ["pr", "ready"]
+        ]
+        merge_commands = [
+            record
+            for record in commands
+            if record["command"] == "gh" and record["args"][:2] == ["pr", "merge"]
+        ]
+        self.assertEqual(len(ready_commands), 1)
+        self.assertEqual(len(merge_commands), 1)
 
     def test_resume_squash_merges_the_exact_ready_candidate(self):
         run_id = self.start_reviewed_run()
