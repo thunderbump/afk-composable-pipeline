@@ -3688,6 +3688,84 @@ class StartCliTest(unittest.TestCase):
             "open validation attempt is invalid", status["attention"]["summary"]
         )
 
+    def assert_repeated_validation_lifecycle_rejected(self, store, run_dir):
+        first = self.run_afk("resume")
+        second = self.run_afk("resume")
+
+        self.assertEqual(first.returncode, 2)
+        self.assertEqual(second.returncode, 2)
+        self.assertFalse(self.command_log.exists())
+        for root in ("attempts", "gates", "retrospective"):
+            self.assertEqual(list((run_dir / root).iterdir()), [])
+        status = store.status("crashed-run")
+        self.assertEqual(status["attention"]["kind"], "invalid")
+        self.assertIn(
+            "validation attempt lifecycle is invalid",
+            status["attention"]["summary"],
+        )
+
+    def test_resume_rejects_started_projection_after_attempt_finished(self):
+        store, run_dir = self.create_resume_preflight_run()
+        started = {
+            "attempt_id": "validation-bbbbbbbbbbbb",
+            "candidate_sha": "b" * 40,
+            "status": "started",
+            "evidence": "attempts/validation-bbbbbbbbbbbb",
+        }
+        store.append_event(
+            "crashed-run",
+            "validation.attempt_started",
+            state="candidate_ready",
+            data={
+                "checkpoint": "candidate_ready",
+                "candidate_sha": "b" * 40,
+                "validation_attempt": started,
+            },
+        )
+        store.append_event(
+            "crashed-run",
+            "validation.attempt_finished",
+            data={
+                "checkpoint": "candidate_ready",
+                "validation_attempt": {**started, "status": "interrupted"},
+            },
+        )
+        store.append_event(
+            "crashed-run",
+            "run.attention_required",
+            state="attention_required",
+            data={
+                "checkpoint": "candidate_ready",
+                "worker_exit_code": 0,
+                "attention": {"scope": "validation", "kind": "unavailable"},
+                "validation_attempt": started,
+            },
+        )
+
+        self.assert_repeated_validation_lifecycle_rejected(store, run_dir)
+
+    def test_resume_rejects_validation_attempt_started_while_one_is_open(self):
+        store, run_dir = self.create_resume_preflight_run()
+        for suffix in ("a", "b"):
+            attempt_id = f"validation-{suffix * 12}"
+            store.append_event(
+                "crashed-run",
+                "validation.attempt_started",
+                state="candidate_ready",
+                data={
+                    "checkpoint": "candidate_ready",
+                    "candidate_sha": "b" * 40,
+                    "validation_attempt": {
+                        "attempt_id": attempt_id,
+                        "candidate_sha": "b" * 40,
+                        "status": "started",
+                        "evidence": f"attempts/{attempt_id}",
+                    },
+                },
+            )
+
+        self.assert_repeated_validation_lifecycle_rejected(store, run_dir)
+
     def test_resume_repeatedly_rejects_misbound_outstanding_repair_attempt(self):
         store, _ = self.create_resume_preflight_run()
         brief = {

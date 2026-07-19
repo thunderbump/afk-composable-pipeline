@@ -12,8 +12,16 @@ SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 def validate_open_attempts(
     projection: dict[str, Any], events: list[dict[str, Any]]
 ) -> str | None:
-    validation_is_open, started_validation = _open_validation_attempt(events)
+    lifecycle_invalid, validation_is_open, started_validation = (
+        _open_validation_attempt(events)
+    )
     validation = projection.get("validation_attempt")
+    if lifecycle_invalid or (
+        not validation_is_open
+        and isinstance(validation, dict)
+        and validation.get("status") == "started"
+    ):
+        return "validation attempt lifecycle is invalid"
     if validation_is_open:
         attempt_id = (
             validation.get("attempt_id") if isinstance(validation, dict) else None
@@ -69,24 +77,35 @@ def validate_open_attempts(
     return None
 
 
-def _open_validation_attempt(events: list[dict[str, Any]]) -> tuple[bool, Any]:
+def _open_validation_attempt(
+    events: list[dict[str, Any]],
+) -> tuple[bool, bool, Any]:
     is_open = False
     attempt: Any = None
     for event in events:
         if event["event"] == "validation.attempt_started":
+            if is_open:
+                return True, is_open, attempt
             is_open = True
             attempt = event["data"].get("validation_attempt")
-        elif event["event"] == "validation.attempt_finished" and is_open:
+        elif event["event"] == "validation.attempt_finished":
             finished = event["data"].get("validation_attempt")
-            if (
-                isinstance(attempt, dict)
+            if not (
+                is_open
+                and isinstance(attempt, dict)
                 and isinstance(finished, dict)
-                and isinstance(attempt.get("attempt_id"), str)
-                and finished.get("attempt_id") == attempt["attempt_id"]
+                and set(finished)
+                == {"attempt_id", "candidate_sha", "status", "evidence"}
+                and finished.get("attempt_id") == attempt.get("attempt_id")
+                and finished.get("candidate_sha") == attempt.get("candidate_sha")
+                and finished.get("evidence") == attempt.get("evidence")
+                and isinstance(finished.get("status"), str)
+                and finished["status"] != "started"
             ):
-                is_open = False
-                attempt = None
-    return is_open, attempt
+                return True, is_open, attempt
+            is_open = False
+            attempt = None
+    return False, is_open, attempt
 
 
 def _open_repair_attempt(events: list[dict[str, Any]]) -> tuple[bool, Any, Any]:
