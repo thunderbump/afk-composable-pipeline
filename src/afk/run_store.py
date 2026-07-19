@@ -60,6 +60,10 @@ class EvidenceTampered(EvidenceError):
     pass
 
 
+class ProjectedEvidenceTampered(EvidenceTampered):
+    pass
+
+
 def default_state_root() -> Path:
     state_home = os.environ.get("XDG_STATE_HOME")
     if state_home:
@@ -760,18 +764,33 @@ class RunStore:
 
     def _verify_sealed_evidence(self, run_id: str, projection: dict[str, Any]) -> None:
         run_dir = self._run_dir(run_id)
-        action_evidence = _projected_evidence_units(projection)
+        projected_units = _projected_evidence_units(projection)
+        projected_digests = _projected_manifest_digests(projection)
         for root_name in sorted(EVIDENCE_ROOTS):
             root = run_dir / root_name
             for unit in root.iterdir():
                 if unit.is_symlink() or not unit.is_dir():
                     raise EvidenceTampered("evidence unit is invalid")
                 relative = f"{root_name}/{unit.name}"
-                if relative in action_evidence:
-                    continue
                 manifest = unit / "manifest.json"
                 if manifest.exists() or manifest.is_symlink():
-                    self.verify_evidence(run_id, relative)
+                    try:
+                        self.verify_evidence(run_id, relative)
+                    except EvidenceTampered as exc:
+                        if relative in projected_units:
+                            raise ProjectedEvidenceTampered(str(exc)) from exc
+                        raise
+                    expected = projected_digests.get(relative)
+                    if expected is not None:
+                        observed = hashlib.sha256(
+                            canonical_json(
+                                json.loads(manifest.read_text(encoding="utf-8"))
+                            ).encode("utf-8")
+                        ).hexdigest()
+                        if expected != {observed}:
+                            raise ProjectedEvidenceTampered(
+                                "projected evidence manifest digest does not match"
+                            )
 
     def _validate_resume_permissions(self, run_id: str) -> None:
         run_dir = self._run_dir(run_id)
@@ -835,6 +854,25 @@ def _projected_evidence_units(value: Any) -> set[str]:
         for nested in value:
             units.update(_projected_evidence_units(nested))
     return units
+
+
+def _projected_manifest_digests(value: Any) -> dict[str, set[str]]:
+    digests: dict[str, set[str]] = {}
+    if isinstance(value, dict):
+        evidence = value.get("evidence")
+        digest = value.get("manifest_sha256")
+        if isinstance(evidence, str) and isinstance(digest, str):
+            parts = Path(evidence).parts
+            if len(parts) == 2 and parts[0] in EVIDENCE_ROOTS:
+                digests.setdefault(evidence, set()).add(digest)
+        for nested in value.values():
+            for evidence, nested_digests in _projected_manifest_digests(nested).items():
+                digests.setdefault(evidence, set()).update(nested_digests)
+    elif isinstance(value, list):
+        for nested in value:
+            for evidence, nested_digests in _projected_manifest_digests(nested).items():
+                digests.setdefault(evidence, set()).update(nested_digests)
+    return digests
 
 
 def _validate_manifest(manifest: Any) -> list[dict[str, Any]]:

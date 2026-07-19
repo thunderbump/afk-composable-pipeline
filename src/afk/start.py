@@ -34,7 +34,12 @@ from afk.candidate_validation import (
 )
 from afk.jsonutil import canonical_json
 from afk.redaction import redact_artifact_value
-from afk.run_store import RunStore, RunStoreBusy, RunStoreError
+from afk.run_store import (
+    ProjectedEvidenceTampered,
+    RunStore,
+    RunStoreBusy,
+    RunStoreError,
+)
 from afk.validation_contract import ValidationContractError, parse_validation_contract
 
 
@@ -168,7 +173,28 @@ def resume_run(
             return run_id, 0
         raise StartError("named resume is only available for a completed Run")
     with store.lock():
-        projection = store.resume_status()
+        try:
+            projection = store.resume_status()
+        except ProjectedEvidenceTampered as exc:
+            projection = store.status()
+            selected_run_id = projection["run_id"]
+            checkpoint = projection["checkpoint"]
+            _attention(
+                store,
+                selected_run_id,
+                checkpoint=checkpoint,
+                scope={
+                    "worktree_ready": "candidate",
+                    "candidate_ready": "validation",
+                    "validated": "gate",
+                    "reviewed": "publication",
+                    "merged": "bead_close",
+                    "bead_closed": "terminal_cleanup",
+                }.get(checkpoint, "worker"),
+                kind="invalid",
+                summary=str(exc),
+            )
+            return selected_run_id, 2
         selected_run_id = projection["run_id"]
         if projection["state"] == "completed":
             return selected_run_id, 0

@@ -2822,6 +2822,68 @@ class StartCliTest(unittest.TestCase):
 
         self.assertEqual(resumed.returncode, 2, resumed.stderr)
         status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(status["attention"]["scope"], "publication")
+        self.assertEqual(status["attention"]["kind"], "invalid")
+        with self.assertRaises(RunStoreError):
+            store.effect(run_id, "pr-mark-ready")
+        commands = self.command_log.read_text(encoding="utf-8")
+        self.assertNotIn('"args":["pr","ready"', commands)
+
+    def test_resume_pauses_before_mutation_when_projected_validation_is_tampered(self):
+        run_id = self.start_reviewed_run()
+        store = RunStore(self.state_home / "afk")
+        evidence = store.status(run_id)["validation"]["evidence"]
+        manifest = (
+            self.state_home / "afk" / "runs" / run_id / evidence / "manifest.json"
+        )
+        evidence_dir = manifest.parent
+        outcome = evidence_dir / "afk" / "outcome.json"
+        evidence_dir.chmod(0o700)
+        manifest.chmod(0o600)
+        manifest.unlink()
+        outcome.chmod(0o600)
+        outcome.write_text("{}\n", encoding="utf-8")
+        store.seal_evidence(run_id, evidence)
+        self.assertTrue(store.verify_evidence(run_id, evidence))
+
+        resumed = self.run_afk("resume")
+
+        self.assertEqual(resumed.returncode, 2, resumed.stderr)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(status["attention"]["scope"], "publication")
+        self.assertEqual(status["attention"]["kind"], "invalid")
+        with self.assertRaises(RunStoreError):
+            store.effect(run_id, "pr-mark-ready")
+        commands = self.command_log.read_text(encoding="utf-8")
+        self.assertNotIn('"args":["pr","ready"', commands)
+
+    def test_resume_pauses_before_mutation_when_projected_completion_is_tampered(self):
+        run_id = self.start_reviewed_run()
+        store = RunStore(self.state_home / "afk")
+        evidence = "gates/completion-projected"
+        store.write_evidence_value(
+            run_id, f"{evidence}/result.json", {"evidence": evidence}
+        )
+        store.seal_evidence(run_id, evidence)
+        store.append_event(
+            run_id,
+            "completion.projected",
+            state="reviewed",
+            data={
+                "checkpoint": "reviewed",
+                "completion": {"evidence": evidence},
+            },
+        )
+        manifest = (
+            self.state_home / "afk" / "runs" / run_id / evidence / "manifest.json"
+        )
+        manifest.chmod(0o600)
+        manifest.write_text("{}\n", encoding="utf-8")
+
+        resumed = self.run_afk("resume")
+
+        self.assertEqual(resumed.returncode, 2, resumed.stderr)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
         self.assertEqual(status["attention"]["kind"], "invalid")
         with self.assertRaises(RunStoreError):
             store.effect(run_id, "pr-mark-ready")
