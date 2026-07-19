@@ -414,6 +414,8 @@ class StartCliTest(unittest.TestCase):
         run_id = before["run_id"]
         self.assertEqual(before["last_event"], "bead.spec_recorded")
         store = RunStore(self.state_home / "afk")
+        lingering = store.identity(run_id)["start_request"]["lingering"]
+        self.assertEqual(lingering, "enabled")
         with self.assertRaisesRegex(RunStoreError, "Effect is missing"):
             store.effect(run_id, "worker-launch-1")
 
@@ -430,6 +432,9 @@ class StartCliTest(unittest.TestCase):
         ]
         self.assertEqual(events.count("worker.launch_prepared"), 1)
         self.assertEqual(events.count("worker.launch_retried"), 1)
+        prepared = self.launch_events(run_id, "worker.launch_prepared")[0]
+        self.assertEqual(prepared["data"]["lingering"], lingering)
+        self.assertEqual(store.status(run_id)["lingering"], lingering)
         self.assertEqual(self.mutation_count("worker-launch"), 1)
 
     def test_resume_recovers_process_crash_after_worker_launch_effect(self):
@@ -443,6 +448,8 @@ class StartCliTest(unittest.TestCase):
         run_id = before["run_id"]
         self.assertEqual(before["last_event"], "bead.spec_recorded")
         store = RunStore(self.state_home / "afk")
+        lingering = store.identity(run_id)["start_request"]["lingering"]
+        self.assertEqual(lingering, "enabled")
         self.assertEqual(store.effect(run_id, "worker-launch-1")["status"], "prepared")
 
         resumed = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="absent")
@@ -457,6 +464,9 @@ class StartCliTest(unittest.TestCase):
         ]
         self.assertEqual(events.count("worker.launch_prepared"), 1)
         self.assertEqual(events.count("worker.launch_retried"), 1)
+        prepared = self.launch_events(run_id, "worker.launch_prepared")[0]
+        self.assertEqual(prepared["data"]["lingering"], lingering)
+        self.assertEqual(store.status(run_id)["lingering"], lingering)
         self.assertEqual(self.mutation_count("worker-launch"), 1)
 
         observed = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="active")

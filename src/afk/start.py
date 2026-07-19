@@ -86,6 +86,7 @@ def start_run(
     )
     store = RunStore()
     with store.lock():
+        lingering = _lingering(context.claimant)
         projection = store.create_run(
             bead_id=bead_id,
             repository=context.repository,
@@ -95,6 +96,7 @@ def start_run(
                 "repository_root": str(context.root),
                 "beads_workspace": str(context.beads_workspace),
                 "claimant": context.claimant,
+                "lingering": lingering,
                 "validation_contract": context.validation_contract,
             },
         )
@@ -130,7 +132,6 @@ def start_run(
             return run_id, 2
         persist_bead_spec(store, run_id, bead)
         unit = worker_unit(run_id)
-        lingering = _lingering(context.claimant)
         store.prepare_effect(
             run_id,
             "worker-launch-1",
@@ -392,10 +393,16 @@ def _resume_worker_launch_effect(
     if effect["kind"] != "worker-launch" or effect["intended"] != {"unit": unit}:
         raise StartError("worker launch Effect does not match this Run")
     if projection["last_event"] == "bead.spec_recorded":
-        data: dict[str, Any] = {"unit": unit, "checkpoint": "created"}
-        validation_contract = store.identity(run_id)["start_request"].get(
-            "validation_contract"
-        )
+        start_request = store.identity(run_id)["start_request"]
+        lingering = start_request.get("lingering")
+        if lingering not in {"enabled", "disabled", "unknown"}:
+            raise RunStoreError("Run lacks a valid lingering observation")
+        data: dict[str, Any] = {
+            "unit": unit,
+            "checkpoint": "created",
+            "lingering": lingering,
+        }
+        validation_contract = start_request.get("validation_contract")
         if isinstance(validation_contract, dict):
             data["validation_contract"] = validation_contract
         store.append_event(run_id, "worker.launch_prepared", data=data)
