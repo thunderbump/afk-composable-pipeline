@@ -1650,6 +1650,45 @@ class StartCliTest(unittest.TestCase):
         )
         self.assertEqual(events.count('"event":"run.completed"'), 1)
 
+    def test_named_resume_of_retained_completed_run_is_idempotent(self):
+        run_id = self.start_reviewed_run()
+        for _ in range(4):
+            self.assertEqual(self.run_afk("resume").returncode, 0)
+        active = self.state_home / "afk" / "active.json"
+        self.assertFalse(active.exists())
+        events_path = self.state_home / "afk" / "runs" / run_id / "events.jsonl"
+        events_before = events_path.read_text(encoding="utf-8")
+        self.assertEqual(events_before.count('"event":"run.completed"'), 1)
+
+        first = self.run_afk("resume", run_id)
+        second = self.run_afk("resume", run_id)
+
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertEqual(first.stdout.strip(), run_id)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertEqual(second.stdout.strip(), run_id)
+        self.assertFalse(active.exists())
+        self.assertEqual(events_path.read_text(encoding="utf-8"), events_before)
+        unnamed = self.run_afk("resume")
+        self.assertEqual(unnamed.returncode, 2)
+        self.assertIn("no Active Run", unnamed.stderr)
+
+    def test_named_resume_does_not_advance_noncompleted_active_run(self):
+        run_id = self.start_reviewed_run()
+
+        named = self.run_afk("resume", run_id)
+
+        self.assertEqual(named.returncode, 2)
+        self.assertIn("only available for a completed Run", named.stderr)
+        before = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(before["checkpoint"], "reviewed")
+
+        unnamed = self.run_afk("resume")
+
+        self.assertEqual(unnamed.returncode, 0, unnamed.stderr)
+        after = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(after["pr_ready"]["candidate_sha"], "d" * 40)
+
     def test_resume_recovers_process_crash_before_bead_close_mutation(self):
         run_id = self.start_reviewed_run()
         self.assertEqual(self.run_afk("resume").returncode, 0)
