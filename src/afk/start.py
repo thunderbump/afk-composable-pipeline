@@ -15,6 +15,7 @@ from typing import Any
 from afk.bead_spec import BEAD_SPEC_EVIDENCE, load_bead_spec, persist_bead_spec
 from afk.candidate import (
     CandidateError,
+    delete_candidate_branch,
     mark_candidate_pr_ready,
     merge_candidate_pr,
     produce_candidate,
@@ -162,6 +163,8 @@ def resume_run(*, note: str | None = None) -> tuple[str, int]:
     with store.lock():
         projection = store.status()
         run_id = projection["run_id"]
+        if projection["state"] == "completed":
+            return run_id, 0
         if _validation_attempt_open(projection):
             return run_id, _recover_validation_attempt(store, run_id, projection)
         if _repair_interruption_pending(store, run_id, projection):
@@ -207,7 +210,7 @@ def resume_run(*, note: str | None = None) -> tuple[str, int]:
         if projection["checkpoint"] == "merged":
             return run_id, _advance_bead_close(store, run_id)
         if projection["checkpoint"] == "bead_closed":
-            return run_id, 0
+            return run_id, _advance_terminal_cleanup(store, run_id)
         if projection["checkpoint"] == "validated":
             return run_id, _advance_gate(store, run_id)
         if projection["last_event"] == "validation.rejected":
@@ -336,125 +339,12 @@ def complete_run(run_id: str | None = None) -> dict[str, Any]:
     store = RunStore()
     with store.lock():
         projection = store.status(run_id)
-        run_id = projection["run_id"]
-        identity = store.identity(run_id)
-        if projection["state"] not in {"reviewed", "completed"}:
-            raise StartError("completion requires a reviewed Run")
-        candidate_sha = projection.get("candidate_sha")
-        cycles = projection.get("gate_cycles")
-        if (
-            not isinstance(candidate_sha, str)
-            or not _is_full_git_sha(candidate_sha)
-            or not isinstance(cycles, list)
-            or not cycles
-            or not isinstance(cycles[-1], dict)
-            or cycles[-1].get("candidate_sha") != candidate_sha
-            or cycles[-1].get("next_action") != "complete"
-            or not isinstance(cycles[-1].get("evidence"), str)
-            or not store.verify_evidence(run_id, cycles[-1]["evidence"])
-        ):
-            raise StartError("completion requires exact passed Gate evidence")
-        worktree = Path(_required_projection_text(projection, "worktree_path"))
-        pr_number = projection.get("pr_number")
-        if type(pr_number) is not int or pr_number <= 0:
-            raise StartError("completion requires a stable Candidate PR")
-        pr = _json_command(
-            [
-                "gh",
-                "pr",
-                "view",
-                str(pr_number),
-                "--repo",
-                identity["repository"],
-                "--json",
-                (
-                    "number,url,state,isDraft,headRefOid,headRefName,"
-                    "baseRefName,mergeCommit"
-                ),
-            ],
-            cwd=worktree,
-        )
-        merge_commit = _verified_terminal_pr(identity, projection, pr)
-        request = identity.get("start_request")
-        workspace_value = (
-            request.get("beads_workspace") if isinstance(request, dict) else None
-        )
-        if not isinstance(workspace_value, str) or not workspace_value:
-            raise StartError("completion requires the pinned Beads workspace")
-        bead = _show_bead(identity["bead_id"], Path(workspace_value))
-        _validate_terminal_bead(bead, identity["bead_id"], identity["repository"])
-
-        evidence = f"gates/completion-{candidate_sha[:12]}"
-        record = redact_artifact_value(
-            {
-                "schema_version": 1,
-                "candidate_sha": candidate_sha,
-                "gate_evidence": cycles[-1]["evidence"],
-                "pr_number": pr_number,
-                "pr_url": pr["url"],
-                "merge_commit": merge_commit,
-                "bead_id": identity["bead_id"],
-                "bead_status": "closed",
-                "evidence": evidence,
-            }
-        )
-        store.reconcile_evidence_result(run_id, evidence, record)
-
         if projection["state"] != "completed":
-            projection = store.append_event(
-                run_id,
-                "run.completed",
-                state="completed",
-                data={
-                    "checkpoint": "completed",
-                    "attention": {},
-                    "completion": record,
-                },
+            raise StartError(
+                "afk complete cannot advance a Run; use afk resume to execute the "
+                "durable terminal lifecycle"
             )
-        elif projection.get("completion") != record:
-            raise StartError("completed Run contradicts terminal publication evidence")
         return projection
-
-
-def _verified_terminal_pr(
-    identity: dict[str, Any], projection: dict[str, Any], pr: Any
-) -> str:
-    merge = pr.get("mergeCommit") if isinstance(pr, dict) else None
-    merge_commit = merge.get("oid") if isinstance(merge, dict) else None
-    if (
-        not isinstance(pr, dict)
-        or pr.get("number") != projection.get("pr_number")
-        or pr.get("url") != projection.get("pr_url")
-        or pr.get("state") != "MERGED"
-        or pr.get("isDraft") is not False
-        or pr.get("headRefOid") != projection.get("candidate_sha")
-        or pr.get("headRefName") != projection.get("branch")
-        or pr.get("baseRefName") != identity["base_branch"]
-        or not isinstance(merge_commit, str)
-        or not _is_full_git_sha(merge_commit)
-    ):
-        raise StartError("merged PR facts disagree with the reviewed Candidate")
-    return merge_commit
-
-
-def _validate_terminal_bead(
-    bead: dict[str, Any], bead_id: str, repository: str
-) -> None:
-    labels = bead.get("labels")
-    if (
-        bead.get("id") != bead_id
-        or bead.get("status") != "closed"
-        or not isinstance(labels, list)
-        or f"project:{repository.rsplit('/', 1)[-1]}" not in labels
-    ):
-        raise StartError("closed Bead facts disagree with the reviewed Run")
-
-
-def _required_projection_text(projection: dict[str, Any], key: str) -> str:
-    value = projection.get(key)
-    if not isinstance(value, str) or not value:
-        raise StartError(f"completion requires {key}")
-    return value
 
 
 def approve_bootstrap_validation(
@@ -1598,6 +1488,405 @@ def _record_bead_closed(store: RunStore, run_id: str, observed: dict[str, Any]) 
         )
     elif projection.get("bead_closure") != observed:
         raise RunStoreError("closed Bead fact contradicts the Run")
+
+
+def _advance_terminal_cleanup(store: RunStore, run_id: str) -> int:
+    projection = store.status(run_id)
+    try:
+        identity, merge, closure = _terminal_facts(store, run_id, projection)
+    except (StartError, RunStoreError) as exc:
+        _attention(
+            store,
+            run_id,
+            checkpoint="bead_closed",
+            scope="terminal_cleanup",
+            kind="invalid",
+            summary=str(exc),
+        )
+        return 2
+
+    candidate_sha = projection["candidate_sha"]
+    evidence = f"gates/completion-{candidate_sha[:12]}"
+    try:
+        sealed_completion = store.sealed_evidence_result(run_id, evidence)
+        if sealed_completion is None:
+            sealed_completion = store.unsealed_evidence_result(run_id, evidence)
+        if sealed_completion is not None:
+            _validate_completion_record(
+                sealed_completion,
+                identity=identity,
+                merge=merge,
+                closure=closure,
+                candidate_sha=candidate_sha,
+                evidence=evidence,
+            )
+            store.reconcile_evidence_result(run_id, evidence, sealed_completion)
+            store.append_event(
+                run_id,
+                "run.completed",
+                state="completed",
+                data={
+                    "checkpoint": "completed",
+                    "attention": {},
+                    "completion": sealed_completion,
+                },
+            )
+            return 0
+    except (StartError, RunStoreError) as exc:
+        _attention(
+            store,
+            run_id,
+            checkpoint="bead_closed",
+            scope="terminal_cleanup",
+            kind="invalid",
+            summary=str(exc),
+        )
+        return 2
+
+    warnings: list[str] = []
+    remote_deleted = False
+    try:
+        remote_deleted = delete_candidate_branch(store, run_id)
+    except (CandidateError, RunStoreError):
+        warnings.append("remote Candidate branch cleanup could not be confirmed")
+
+    try:
+        worktree_removed, local_branch_deleted, local_warnings = _cleanup_run_checkout(
+            store, identity, projection
+        )
+    except (ExternalCommandError, OSError, RuntimeError):
+        worktree_removed, local_branch_deleted = False, False
+        local_warnings = [
+            "Run worktree cleanup could not be inspected; cleanup skipped"
+        ]
+    warnings.extend(local_warnings)
+    record = redact_artifact_value(
+        {
+            "schema_version": 1,
+            "repository": identity["repository"],
+            "bead_id": identity["bead_id"],
+            "candidate_sha": candidate_sha,
+            "pr_number": merge["number"],
+            "pr_url": merge["url"],
+            "merge_commit": merge["merge_commit"],
+            "bead_closure": closure,
+            "remote_branch_deleted": remote_deleted,
+            "worktree_removed": worktree_removed,
+            "local_branch_deleted": local_branch_deleted,
+            "cleanup_warnings": warnings[:3],
+            "evidence": evidence,
+        }
+    )
+    try:
+        store.reconcile_evidence_result(run_id, evidence, record)
+        store.append_event(
+            run_id,
+            "run.completed",
+            state="completed",
+            data={
+                "checkpoint": "completed",
+                "attention": {},
+                "completion": record,
+            },
+        )
+    except RunStoreError as exc:
+        _attention(
+            store,
+            run_id,
+            checkpoint="bead_closed",
+            scope="terminal_cleanup",
+            kind="invalid",
+            summary=str(exc),
+        )
+        return 2
+    return 0
+
+
+def _validate_completion_record(
+    record: Any,
+    *,
+    identity: dict[str, Any],
+    merge: dict[str, Any],
+    closure: dict[str, Any],
+    candidate_sha: str,
+    evidence: str,
+) -> None:
+    expected = {
+        "schema_version": 1,
+        "repository": identity["repository"],
+        "bead_id": identity["bead_id"],
+        "candidate_sha": candidate_sha,
+        "pr_number": merge["number"],
+        "pr_url": merge["url"],
+        "merge_commit": merge["merge_commit"],
+        "bead_closure": closure,
+        "evidence": evidence,
+    }
+    cleanup_keys = {
+        "remote_branch_deleted",
+        "worktree_removed",
+        "local_branch_deleted",
+        "cleanup_warnings",
+    }
+    if (
+        not isinstance(record, dict)
+        or set(record) != set(expected) | cleanup_keys
+        or any(record.get(key) != value for key, value in expected.items())
+        or any(
+            type(record.get(key)) is not bool
+            for key in cleanup_keys - {"cleanup_warnings"}
+        )
+        or not isinstance(record.get("cleanup_warnings"), list)
+        or len(record["cleanup_warnings"]) > 3
+        or not all(isinstance(warning, str) for warning in record["cleanup_warnings"])
+    ):
+        raise StartError("completion evidence contradicts the terminal Run")
+
+
+def _terminal_facts(
+    store: RunStore, run_id: str, projection: dict[str, Any]
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    identity = store.identity(run_id)
+    merge = projection.get("merge")
+    closure = projection.get("bead_closure")
+    close_effect = store.effect_if_present(run_id, "bead-close")
+    if (
+        projection.get("checkpoint") != "bead_closed"
+        or not isinstance(merge, dict)
+        or not isinstance(closure, dict)
+        or close_effect is None
+        or close_effect.get("status") != "confirmed"
+        or close_effect.get("observed") != closure
+        or merge.get("number") != projection.get("pr_number")
+        or merge.get("url") != projection.get("pr_url")
+        or merge.get("candidate_sha") != projection.get("candidate_sha")
+        or closure.get("bead_id") != identity["bead_id"]
+        or closure.get("repository") != identity["repository"]
+        or closure.get("pr_number") != merge.get("number")
+        or closure.get("pr_url") != merge.get("url")
+        or closure.get("candidate_sha") != merge.get("candidate_sha")
+        or closure.get("merge_commit") != merge.get("merge_commit")
+        or closure.get("status") != "closed"
+    ):
+        raise StartError("terminal cleanup requires the exact merge and Bead closure")
+    return identity, merge, closure
+
+
+def _cleanup_run_checkout(
+    store: RunStore, identity: dict[str, Any], projection: dict[str, Any]
+) -> tuple[bool, bool, list[str]]:
+    run_id = identity["run_id"]
+    expected_worktree = store.root / "worktrees" / run_id
+    expected_branch = f"afk/{identity['bead_id'].replace('.', '-')}-{run_id}/candidate"
+    worktree_value = projection.get("worktree_path")
+    branch_value = projection.get("branch")
+    if worktree_value != str(expected_worktree) or branch_value != expected_branch:
+        return False, False, ["Run worktree identity is not AFK-owned; cleanup skipped"]
+    request = identity.get("start_request")
+    root_value = request.get("repository_root") if isinstance(request, dict) else None
+    if not isinstance(root_value, str) or not root_value:
+        return False, False, ["Run repository identity is invalid; cleanup skipped"]
+    root = Path(root_value)
+    candidate_sha = projection["candidate_sha"]
+    quarantine = store.root / "worktree-quarantine" / run_id
+    warnings: list[str] = []
+
+    listing_available, registered = _registered_worktree(root, expected_worktree)
+    quarantine_available, quarantined = _registered_worktree(root, quarantine)
+    worktree_removed = (
+        listing_available
+        and quarantine_available
+        and registered is None
+        and quarantined is None
+        and not expected_worktree.exists()
+        and not quarantine.exists()
+    )
+    if not listing_available or not quarantine_available:
+        warnings.append("Run worktree registration could not be inspected")
+    elif not worktree_removed:
+        checkout = quarantine if quarantined is not None else expected_worktree
+        registration = quarantined if quarantined is not None else registered
+        if not _owned_worktree_registration(
+            registration, candidate_sha, expected_branch
+        ):
+            warnings.append(
+                "Run worktree ownership could not be verified; cleanup skipped"
+            )
+        else:
+            if checkout == expected_worktree and _owned_worktree_checkout(
+                root, checkout, candidate_sha, expected_branch
+            ):
+                quarantine.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    _command(
+                        [
+                            "git",
+                            "worktree",
+                            "move",
+                            str(expected_worktree),
+                            str(quarantine),
+                        ],
+                        cwd=root,
+                        check=False,
+                    )
+                except ExternalCommandError:
+                    pass
+            expected_available, after_expected = _registered_worktree(
+                root, expected_worktree
+            )
+            quarantined_available, after_quarantined = _registered_worktree(
+                root, quarantine
+            )
+            if (
+                expected_available
+                and after_expected is None
+                and quarantined_available
+                and _owned_worktree_registration(
+                    after_quarantined, candidate_sha, expected_branch
+                )
+            ):
+                checkout = quarantine
+            owned_at_removal = (
+                checkout == quarantine
+                and expected_available
+                and after_expected is None
+                and quarantined_available
+                and _owned_worktree_registration(
+                    after_quarantined, candidate_sha, expected_branch
+                )
+                and _owned_worktree_checkout(
+                    root, quarantine, candidate_sha, expected_branch
+                )
+            )
+            if owned_at_removal:
+                try:
+                    _command(
+                        ["git", "worktree", "remove", str(quarantine)],
+                        cwd=root,
+                        check=False,
+                    )
+                except ExternalCommandError:
+                    pass
+            after_available, after_registered = _registered_worktree(root, quarantine)
+            worktree_removed = (
+                owned_at_removal
+                and not quarantine.exists()
+                and after_available
+                and after_registered is None
+            )
+            if not worktree_removed:
+                warnings.append("Run worktree cleanup failed")
+
+    branch_sha = _command(
+        [
+            "git",
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            f"refs/heads/{expected_branch}",
+        ],
+        cwd=root,
+        check=False,
+    )
+    local_branch_deleted = branch_sha.returncode == 1
+    if branch_sha.returncode not in {0, 1}:
+        warnings.append("Run branch could not be inspected; cleanup skipped")
+    elif not local_branch_deleted:
+        if branch_sha.stdout.strip() != candidate_sha or not worktree_removed:
+            warnings.append(
+                "Run branch ownership could not be verified; cleanup skipped"
+            )
+        else:
+            try:
+                _command(
+                    [
+                        "git",
+                        "update-ref",
+                        "-d",
+                        f"refs/heads/{expected_branch}",
+                        candidate_sha,
+                    ],
+                    cwd=root,
+                    check=False,
+                )
+            except ExternalCommandError:
+                pass
+            try:
+                after_delete = _command(
+                    [
+                        "git",
+                        "rev-parse",
+                        "--verify",
+                        "--quiet",
+                        f"refs/heads/{expected_branch}",
+                    ],
+                    cwd=root,
+                    check=False,
+                )
+            except ExternalCommandError:
+                warnings.append("Run branch cleanup could not be confirmed")
+            else:
+                local_branch_deleted = after_delete.returncode == 1
+                if not local_branch_deleted:
+                    warnings.append("Run branch cleanup failed")
+    return worktree_removed, local_branch_deleted, warnings[:2]
+
+
+def _owned_worktree_registration(
+    registration: dict[str, str] | None, candidate_sha: str, branch: str
+) -> bool:
+    return (
+        registration is not None
+        and registration.get("HEAD") == candidate_sha
+        and registration.get("branch") == f"refs/heads/{branch}"
+    )
+
+
+def _owned_worktree_checkout(
+    root: Path, checkout: Path, candidate_sha: str, branch: str
+) -> bool:
+    head = _command(["git", "rev-parse", "HEAD"], cwd=checkout, check=False)
+    current_branch = _command(
+        ["git", "branch", "--show-current"], cwd=checkout, check=False
+    )
+    branch_ref = _command(
+        ["git", "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"],
+        cwd=root,
+        check=False,
+    )
+    dirty = _command(["git", "status", "--porcelain"], cwd=checkout, check=False)
+    return (
+        head.returncode == 0
+        and head.stdout.strip() == candidate_sha
+        and current_branch.returncode == 0
+        and current_branch.stdout.strip() == branch
+        and branch_ref.returncode == 0
+        and branch_ref.stdout.strip() == candidate_sha
+        and dirty.returncode == 0
+        and not dirty.stdout
+    )
+
+
+def _registered_worktree(
+    root: Path, expected: Path
+) -> tuple[bool, dict[str, str] | None]:
+    listing = _command(
+        ["git", "worktree", "list", "--porcelain"], cwd=root, check=False
+    )
+    if listing.returncode != 0:
+        return False, None
+    record: dict[str, str] = {}
+    for line in [*listing.stdout.splitlines(), ""]:
+        if line:
+            key, _, value = line.partition(" ")
+            record[key] = value
+            continue
+        if record:
+            value = record.get("worktree")
+            if value and Path(value).resolve() == expected.resolve():
+                return True, record
+            record = {}
+    return True, None
 
 
 def _advance_completed_gate(

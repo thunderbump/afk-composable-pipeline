@@ -162,9 +162,9 @@ class RunStore:
                     "start_request": start_request or {},
                 }
             )
-            _write_new_json(run_dir / "run.json", identity)
+            _write_new_json(run_dir / "run.json", identity, self.root)
             events_path = run_dir / "events.jsonl"
-            _write_new_bytes(events_path, b"")
+            _write_new_bytes(events_path, b"", self.root)
             projection = self._append_event_unlocked(
                 run_id,
                 "run.created",
@@ -192,16 +192,19 @@ class RunStore:
                 data=data,
                 recorded_at=recorded_at,
             )
-            active_path = self.root / "active.json"
             if projection["state"] == "completed" and self._active_run_id() is None:
-                active_path.unlink(missing_ok=True)
-                _fsync_directory(self.root)
+                self._clear_active_pointer(run_id)
             return projection
 
     def status(self, run_id: str | None = None) -> dict[str, Any]:
         selected = run_id or self._active_run_id()
         if selected is None:
-            raise RunNotFound("no Active Run")
+            recovered = self._reconcile_completed_active_pointer()
+            if recovered is not None:
+                return recovered
+            selected = self._active_run_id()
+            if selected is None:
+                raise RunNotFound("no Active Run")
         _validate_run_id(selected)
         identity = self._identity(selected)
         events, _ = self._read_events(selected)
@@ -238,7 +241,7 @@ class RunStore:
                 ):
                     raise RunStoreError(f"Effect identity conflict: {effect_id}")
                 return existing
-            _write_new_json(path, record)
+            _write_new_json(path, record, self.root)
             return record
 
     def effect(self, run_id: str, effect_id: str) -> dict[str, Any]:
@@ -315,7 +318,7 @@ class RunStore:
                     f"evidence stream exceeds {STREAM_BYTE_LIMIT} bytes"
                 )
             _secure_directory(path.parent)
-            _write_new_bytes(path, encoded)
+            _write_new_bytes(path, encoded, self.root)
             return path
 
     def write_evidence_value(self, run_id: str, relative_path: str, value: Any) -> Any:
@@ -330,7 +333,7 @@ class RunStore:
             redacted = redact_artifact_value(value)
             encoded = (canonical_json(redacted) + "\n").encode("utf-8")
             _secure_directory(path.parent)
-            _write_new_bytes(path, encoded)
+            _write_new_bytes(path, encoded, self.root)
             return redacted
 
     def ingest_evidence_file(
@@ -371,8 +374,7 @@ class RunStore:
                 "files": entries,
                 "total_bytes": sum(entry["bytes"] for entry in entries),
             }
-            _write_new_json(manifest_path, manifest)
-            for path in [*files, manifest_path]:
+            for path in files:
                 path.chmod(0o400)
             for path in sorted(
                 [entry for entry in directory.rglob("*") if entry.is_dir()],
@@ -380,7 +382,10 @@ class RunStore:
                 reverse=True,
             ):
                 path.chmod(0o500)
+            _write_new_json(manifest_path, manifest, self.root, mode=0o400)
             directory.chmod(0o500)
+            _fsync_directory(directory)
+            _fsync_directory(directory.parent)
             return manifest
 
     def verify_evidence(self, run_id: str, relative_directory: str) -> bool:
@@ -422,7 +427,7 @@ class RunStore:
             result_path = directory / "result.json"
             expected = redact_artifact_value(value)
             if manifest_path.is_file():
-                self.verify_evidence(run_id, relative_directory)
+                self._verify_or_finish_seal(run_id, relative_directory)
                 stored = _read_evidence_result(result_path)
                 if stored != expected:
                     raise EvidenceError("evidence result contradicts expected value")
@@ -441,6 +446,68 @@ class RunStore:
                 )
             self.seal_evidence(run_id, relative_directory)
             return expected
+
+    def sealed_evidence_result(
+        self, run_id: str, relative_directory: str
+    ) -> Any | None:
+        """Return a verified sealed result, or None when it has not been sealed."""
+        with self.lock():
+            directory = self._evidence_path(run_id, relative_directory)
+            manifest_path = directory / "manifest.json"
+            if manifest_path.is_symlink() or (
+                manifest_path.exists() and not manifest_path.is_file()
+            ):
+                raise EvidenceTampered("evidence manifest is invalid")
+            if not manifest_path.is_file():
+                return None
+            self._verify_or_finish_seal(run_id, relative_directory)
+            return _read_evidence_result(directory / "result.json")
+
+    def _verify_or_finish_seal(self, run_id: str, relative_directory: str) -> None:
+        try:
+            self.verify_evidence(run_id, relative_directory)
+            return
+        except EvidenceTampered as exc:
+            if str(exc) != "sealed evidence is writable":
+                raise
+
+        directory = self._evidence_path(run_id, relative_directory)
+        manifest_path = directory / "manifest.json"
+        files = _evidence_files(directory)
+        nested_directories = [path for path in directory.rglob("*") if path.is_dir()]
+        for path in [*files, manifest_path, *nested_directories]:
+            if stat.S_IMODE(path.stat().st_mode) & 0o222:
+                raise EvidenceTampered("sealed evidence is writable")
+        directory.chmod(0o500)
+        _fsync_directory(directory)
+        _fsync_directory(directory.parent)
+        self.verify_evidence(run_id, relative_directory)
+
+    def unsealed_evidence_result(
+        self, run_id: str, relative_directory: str
+    ) -> Any | None:
+        """Return one complete unsealed result, rejecting partial evidence."""
+        with self.lock():
+            directory = self._evidence_path(run_id, relative_directory)
+            manifest_path = directory / "manifest.json"
+            if manifest_path.exists() or manifest_path.is_symlink():
+                raise EvidenceError("unsealed evidence contains an invalid manifest")
+            if not directory.exists():
+                return None
+            if not directory.is_dir():
+                raise EvidenceError("unsealed evidence result is invalid")
+            entries = list(directory.iterdir())
+            if not entries:
+                return None
+            result_path = directory / "result.json"
+            if (
+                len(entries) != 1
+                or entries[0].name != "result.json"
+                or result_path.is_symlink()
+                or not result_path.is_file()
+            ):
+                raise EvidenceError("unsealed evidence result is partial or ambiguous")
+            return _read_evidence_result(result_path)
 
     def _append_event_unlocked(
         self,
@@ -542,6 +609,52 @@ class RunStore:
         if len(active) > 1:
             raise EventHistoryCorrupt("multiple Active Runs exist")
         return active[0] if active else None
+
+    def _reconcile_completed_active_pointer(self) -> dict[str, Any] | None:
+        run_id = self._active_pointer_run_id()
+        if run_id is None:
+            return None
+        identity = self._identity(run_id)
+        events, _ = self._read_events(run_id)
+        projection = _project(identity, events)
+        if projection["state"] != "completed":
+            return None
+        try:
+            with self.lock():
+                if self._active_pointer_run_id() != run_id:
+                    return None
+                identity = self._identity(run_id)
+                events, _ = self._read_events(run_id)
+                projection = _project(identity, events)
+                if projection["state"] != "completed":
+                    return None
+                self._clear_active_pointer(run_id)
+        except RunStoreBusy:
+            pass
+        return projection
+
+    def _clear_active_pointer(self, run_id: str) -> None:
+        if self._active_pointer_run_id() != run_id:
+            return
+        (self.root / "active.json").unlink(missing_ok=True)
+        _fsync_directory(self.root)
+
+    def _active_pointer_run_id(self) -> str | None:
+        try:
+            active = json.loads((self.root / "active.json").read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            return None
+        if (
+            not isinstance(active, dict)
+            or set(active) != {"run_id"}
+            or not isinstance(active["run_id"], str)
+        ):
+            return None
+        try:
+            _validate_run_id(active["run_id"])
+        except RunStoreError:
+            return None
+        return active["run_id"]
 
     def _run_dir(self, run_id: str) -> Path:
         _validate_run_id(run_id)
@@ -676,9 +789,14 @@ def _secure_directory(path: Path) -> None:
         _fsync_directory(path.parent)
 
 
-def _write_new_json(path: Path, value: Any) -> None:
+def _write_new_json(
+    path: Path, value: Any, staging_directory: Path, *, mode: int = 0o600
+) -> None:
     _write_new_bytes(
-        path, f"{canonical_json(redact_artifact_value(value))}\n".encode("utf-8")
+        path,
+        f"{canonical_json(redact_artifact_value(value))}\n".encode("utf-8"),
+        staging_directory,
+        mode=mode,
     )
 
 
@@ -689,17 +807,30 @@ def _read_evidence_result(path: Path) -> Any:
         raise EvidenceError("evidence result is missing or malformed") from exc
 
 
-def _write_new_bytes(path: Path, value: bytes) -> None:
-    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+def _write_new_bytes(
+    path: Path, value: bytes, staging_root: Path, *, mode: int = 0o600
+) -> None:
+    staging_directory = staging_root / ".unpublished"
+    _secure_directory(staging_directory)
+    target_id = hashlib.sha256(str(path).encode("utf-8")).hexdigest()
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f"{target_id}.", suffix=".tmp", dir=staging_directory
+    )
+    temporary = Path(temporary_name)
     try:
-        os.fchmod(descriptor, 0o600)
+        os.fchmod(descriptor, mode)
         written = os.write(descriptor, value)
         if written != len(value):
             raise RunStoreError(f"write was incomplete: {path.name}")
         os.fsync(descriptor)
-    finally:
         os.close(descriptor)
-    _fsync_directory(path.parent)
+        descriptor = -1
+        os.link(temporary, path)
+        _fsync_directory(path.parent)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        temporary.unlink(missing_ok=True)
 
 
 def _atomic_json(path: Path, value: Any) -> None:

@@ -1,5 +1,6 @@
 import json
 import os
+import shutil
 import stat
 import subprocess
 import sys
@@ -47,6 +48,9 @@ class StartCliTest(unittest.TestCase):
             encoding="utf-8",
         )
         self.state_home = self.temp / "state"
+        self.state_home.mkdir()
+        self.home = self.temp / "home"
+        self.home.mkdir()
         self.secret_value = "dogfood-password-value"
         self.secret_path = self.temp / "secrets" / "beads-password.txt"
         self.secret_path.parent.mkdir(mode=0o700)
@@ -73,6 +77,7 @@ class StartCliTest(unittest.TestCase):
         self.temporary_directory.cleanup()
 
     def run_afk(self, *args, **overrides):
+        short_cleanup_timeout = overrides.pop("AFK_TEST_SHORT_CLEANUP_TIMEOUT", None)
         env = os.environ.copy()
         env.update(
             {
@@ -91,12 +96,27 @@ class StartCliTest(unittest.TestCase):
                 "AFK_FAKE_BEAD_COMMENTS": "[]",
                 "AFK_FAKE_PINNED_CONTRACT": "present",
                 "AFK_FAKE_EXPECTED_PASSWORD": self.secret_value,
+                "HOME": str(self.home),
                 "USER": "bump",
             }
         )
         env.update(overrides)
+        command = [sys.executable, "-m", "afk", *args]
+        if short_cleanup_timeout:
+            command = [
+                sys.executable,
+                "-c",
+                (
+                    "import sys; import afk.candidate as candidate; "
+                    "import afk.start as start; "
+                    "candidate._run.__kwdefaults__['timeout'] = 0.05; "
+                    "start.COMMAND_TIMEOUT_SECONDS = 0.05; "
+                    "from afk.cli import main; raise SystemExit(main(sys.argv[1:]))"
+                ),
+                *args,
+            ]
         return subprocess.run(
-            [sys.executable, "-m", "afk", *args],
+            command,
             cwd=self.project,
             env=env,
             text=True,
@@ -461,7 +481,9 @@ class StartCliTest(unittest.TestCase):
 
         self.assertEqual(repeated.returncode, 0, repeated.stderr)
         repeated_status = json.loads(self.run_afk("status", run_id, "--json").stdout)
-        self.assertEqual(repeated_status["last_sequence"], status["last_sequence"])
+        self.assertEqual(repeated_status["state"], "completed")
+        self.assertEqual(repeated_status["last_sequence"], status["last_sequence"] + 1)
+        self.assertTrue(repeated_status["completion"]["remote_branch_deleted"])
         commands = [
             json.loads(line)
             for line in self.command_log.read_text(encoding="utf-8").splitlines()
@@ -514,11 +536,31 @@ class StartCliTest(unittest.TestCase):
         )
         self.assertEqual(effect["observed"], status["bead_closure"])
 
-        repeated = self.run_afk("resume")
+        completed = self.run_afk("resume")
 
-        self.assertEqual(repeated.returncode, 0, repeated.stderr)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
         repeated_status = json.loads(self.run_afk("status", run_id, "--json").stdout)
-        self.assertEqual(repeated_status["last_sequence"], status["last_sequence"])
+        self.assertEqual(repeated_status["state"], "completed")
+        self.assertEqual(repeated_status["checkpoint"], "completed")
+        self.assertEqual(repeated_status["completion"]["candidate_sha"], "d" * 40)
+        self.assertEqual(repeated_status["completion"]["merge_commit"], "f" * 40)
+        self.assertEqual(
+            repeated_status["completion"]["bead_closure"], status["bead_closure"]
+        )
+        self.assertEqual(repeated_status["completion"]["cleanup_warnings"], [])
+        self.assertFalse((self.state_home / "afk" / "worktrees" / run_id).exists())
+        self.assertFalse((self.state_home / "afk" / "active.json").exists())
+        evidence = (
+            self.state_home
+            / "afk"
+            / "runs"
+            / run_id
+            / repeated_status["completion"]["evidence"]
+        )
+        self.assertTrue((evidence / "manifest.json").is_file())
+        reported = self.run_afk("complete", run_id)
+        self.assertEqual(reported.returncode, 0, reported.stderr)
+        self.assertTrue(json.loads(reported.stdout)["complete"])
         commands = [
             json.loads(line)
             for line in self.command_log.read_text(encoding="utf-8").splitlines()
@@ -545,6 +587,573 @@ class StartCliTest(unittest.TestCase):
             if record["command"] == "bd" and record["args"][:1] == ["close"]
         ]
         self.assertEqual(len(close_commands), 1)
+
+    def test_terminal_cleanup_retries_exact_lingering_remote_branch(self):
+        run_id = self.start_reviewed_run()
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+        self.assertEqual(
+            self.run_afk("resume", AFK_FAKE_REMOTE_BRANCH_LINGERS="1").returncode,
+            0,
+        )
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+
+        completed = self.run_afk("resume")
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(status["state"], "completed")
+        self.assertTrue(status["completion"]["remote_branch_deleted"])
+        store = RunStore(self.state_home / "afk")
+        self.assertEqual(
+            store.effect(run_id, "remote-branch-delete")["status"], "confirmed"
+        )
+        commands = [
+            json.loads(line)
+            for line in self.command_log.read_text(encoding="utf-8").splitlines()
+        ]
+        deletes = [
+            record
+            for record in commands
+            if record["command"] == "git" and "--delete" in record["args"]
+        ]
+        self.assertEqual(len(deletes), 1)
+        self.assertIn(
+            "afk/central-bnkl-1-1-" + run_id + "/candidate",
+            deletes[0]["args"],
+        )
+
+    def test_terminal_cleanup_retries_exact_branch_recreated_after_confirmation(self):
+        run_id = self.start_reviewed_run()
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+        store = RunStore(self.state_home / "afk")
+        self.assertEqual(
+            store.effect(run_id, "remote-branch-delete")["status"], "confirmed"
+        )
+        (self.state_home / "fake-remote-deleted").unlink()
+
+        completed = self.run_afk("resume")
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertTrue(status["completion"]["remote_branch_deleted"])
+        self.assertEqual(status["completion"]["cleanup_warnings"], [])
+        deletes = [
+            record
+            for record in map(
+                json.loads,
+                self.command_log.read_text(encoding="utf-8").splitlines(),
+            )
+            if record["command"] == "git" and "--delete" in record["args"]
+        ]
+        self.assertEqual(len(deletes), 1)
+        self.assertIn(
+            "--force-with-lease=refs/heads/afk/central-bnkl-1-1-"
+            + run_id
+            + "/candidate:"
+            + "d" * 40,
+            deletes[0]["args"],
+        )
+
+    def test_terminal_cleanup_reconciles_confirmed_remote_after_worktree_is_gone(
+        self,
+    ):
+        run_id = self.start_reviewed_run()
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+        store = RunStore(self.state_home / "afk")
+        self.assertEqual(
+            store.effect(run_id, "remote-branch-delete")["status"], "confirmed"
+        )
+        worktree = self.state_home / "afk" / "worktrees" / run_id
+        (self.state_home / "fake-worktree-removed").write_text(
+            "removed", encoding="utf-8"
+        )
+        shutil.rmtree(worktree)
+
+        completed = self.run_afk("resume")
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(status["state"], "completed")
+        self.assertTrue(status["completion"]["remote_branch_deleted"])
+        self.assertEqual(status["completion"]["cleanup_warnings"], [])
+
+    def test_terminal_cleanup_retries_lingering_remote_after_worktree_is_gone(self):
+        run_id = self.start_reviewed_run()
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+        self.assertEqual(
+            self.run_afk("resume", AFK_FAKE_REMOTE_BRANCH_LINGERS="1").returncode,
+            0,
+        )
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+        store = RunStore(self.state_home / "afk")
+        self.assertEqual(
+            store.effect(run_id, "remote-branch-delete")["status"], "prepared"
+        )
+        worktree = self.state_home / "afk" / "worktrees" / run_id
+        (self.state_home / "fake-worktree-removed").write_text(
+            "removed", encoding="utf-8"
+        )
+        shutil.rmtree(worktree)
+
+        completed = self.run_afk("resume")
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(status["state"], "completed")
+        self.assertTrue(status["completion"]["remote_branch_deleted"])
+        self.assertEqual(status["completion"]["cleanup_warnings"], [])
+        deletes = [
+            record
+            for record in map(
+                json.loads,
+                self.command_log.read_text(encoding="utf-8").splitlines(),
+            )
+            if record["command"] == "git" and "--delete" in record["args"]
+        ]
+        self.assertEqual(len(deletes), 1)
+        self.assertIn(
+            "--force-with-lease=refs/heads/afk/central-bnkl-1-1-"
+            + run_id
+            + "/candidate:"
+            + "d" * 40,
+            deletes[0]["args"],
+        )
+
+    def test_terminal_cleanup_does_not_delete_branch_replaced_during_delete(self):
+        run_id = self.start_reviewed_run()
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+        self.assertEqual(
+            self.run_afk("resume", AFK_FAKE_REMOTE_BRANCH_LINGERS="1").returncode,
+            0,
+        )
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+
+        completed = self.run_afk("resume", AFK_FAKE_REMOTE_MOVES_DURING_DELETE="1")
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertFalse(status["completion"]["remote_branch_deleted"])
+        self.assertIn(
+            "remote Candidate branch cleanup could not be confirmed",
+            status["completion"]["cleanup_warnings"],
+        )
+        self.assertFalse((self.state_home / "fake-remote-deleted").exists())
+        deletes = [
+            record
+            for record in map(
+                json.loads,
+                self.command_log.read_text(encoding="utf-8").splitlines(),
+            )
+            if record["command"] == "git" and "--delete" in record["args"]
+        ]
+        self.assertEqual(len(deletes), 1)
+        self.assertIn(
+            "--force-with-lease=refs/heads/afk/central-bnkl-1-1-"
+            + run_id
+            + "/candidate:"
+            + "d" * 40,
+            deletes[0]["args"],
+        )
+
+    def test_terminal_cleanup_accepts_branch_disappearing_during_delete(self):
+        run_id = self.start_reviewed_run()
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+        self.assertEqual(
+            self.run_afk("resume", AFK_FAKE_REMOTE_BRANCH_LINGERS="1").returncode,
+            0,
+        )
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+
+        completed = self.run_afk("resume", AFK_FAKE_REMOTE_DISAPPEARS_DURING_DELETE="1")
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertTrue(status["completion"]["remote_branch_deleted"])
+        self.assertEqual(status["completion"]["cleanup_warnings"], [])
+        self.assertEqual(
+            RunStore(self.state_home / "afk").effect(run_id, "remote-branch-delete")[
+                "status"
+            ],
+            "confirmed",
+        )
+
+    def test_terminal_cleanup_reconciles_remote_delete_timeout_after_mutation(self):
+        run_id = self.start_reviewed_run()
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+        self.assertEqual(
+            self.run_afk("resume", AFK_FAKE_REMOTE_BRANCH_LINGERS="1").returncode,
+            0,
+        )
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+
+        completed = self.run_afk(
+            "resume",
+            AFK_FAKE_REMOTE_DELETE_TIMES_OUT_AFTER_MUTATION="1",
+            AFK_TEST_SHORT_CLEANUP_TIMEOUT="1",
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertTrue(status["completion"]["remote_branch_deleted"])
+        self.assertNotIn(
+            "remote Candidate branch cleanup could not be confirmed",
+            status["completion"]["cleanup_warnings"],
+        )
+
+    def test_terminal_cleanup_warns_and_completes_without_unsafe_removal(self):
+        run_id = self.start_reviewed_run()
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+        store = RunStore(self.state_home / "afk")
+        store.append_event(
+            run_id,
+            "test.worktree_identity_changed",
+            data={"worktree_path": str(self.temp / "not-afk-owned")},
+        )
+
+        completed = self.run_afk("resume")
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(status["state"], "completed")
+        self.assertEqual(status["merge"]["merge_commit"], "f" * 40)
+        self.assertEqual(status["bead_closure"]["status"], "closed")
+        self.assertTrue(status["completion"]["cleanup_warnings"])
+        self.assertTrue(
+            any(
+                "worktree identity" in warning
+                for warning in status["completion"]["cleanup_warnings"]
+            ),
+            status["completion"]["cleanup_warnings"],
+        )
+        self.assertTrue((self.state_home / "afk" / "worktrees" / run_id).exists())
+        commands = self.command_log.read_text(encoding="utf-8")
+        self.assertNotIn('"args":["worktree","remove"', commands)
+        self.assertNotIn('"args":["branch","-D"', commands)
+
+    def test_terminal_cleanup_does_not_delete_local_branch_replaced_at_mutation(self):
+        run_id = self.start_reviewed_run()
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+
+        completed = self.run_afk(
+            "resume", AFK_FAKE_LOCAL_BRANCH_MOVES_DURING_DELETE="1"
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertFalse(status["completion"]["local_branch_deleted"])
+        self.assertIn(
+            "Run branch cleanup failed",
+            status["completion"]["cleanup_warnings"],
+        )
+        self.assertTrue((self.state_home / "fake-local-branch-replaced").exists())
+        self.assertFalse((self.state_home / "fake-local-branch-removed").exists())
+        commands = [
+            json.loads(line)
+            for line in self.command_log.read_text(encoding="utf-8").splitlines()
+        ]
+        branch_ref = "refs/heads/afk/central-bnkl-1-1-" + run_id + "/candidate"
+        self.assertIn(
+            ["update-ref", "-d", branch_ref, "d" * 40],
+            [record["args"] for record in commands if record["command"] == "git"],
+        )
+        self.assertNotIn(
+            ["branch", "-D", branch_ref.removeprefix("refs/heads/")],
+            [record["args"] for record in commands if record["command"] == "git"],
+        )
+
+    def test_terminal_cleanup_reconciles_local_branch_timeout_after_mutation(self):
+        run_id = self.start_reviewed_run()
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+
+        completed = self.run_afk(
+            "resume",
+            AFK_FAKE_LOCAL_BRANCH_DELETE_TIMES_OUT_AFTER_MUTATION="1",
+            AFK_TEST_SHORT_CLEANUP_TIMEOUT="1",
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertTrue(status["completion"]["worktree_removed"])
+        self.assertTrue(status["completion"]["local_branch_deleted"])
+        self.assertEqual(status["completion"]["cleanup_warnings"], [])
+        self.assertTrue((self.state_home / "fake-local-branch-removed").exists())
+
+    def test_terminal_cleanup_preserves_replacement_at_manifest_path(self):
+        run_id = self.start_reviewed_run()
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+
+        completed = self.run_afk("resume", AFK_FAKE_WORKTREE_MOVES_DURING_REMOVE="1")
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertTrue(status["completion"]["worktree_removed"])
+        self.assertNotIn(
+            "Run worktree cleanup failed",
+            status["completion"]["cleanup_warnings"],
+        )
+        self.assertTrue((self.state_home / "fake-worktree-replaced").exists())
+        replacement = self.state_home / "afk" / "worktrees" / run_id
+        self.assertEqual(
+            (replacement / "not-afk-owned").read_text(encoding="utf-8"),
+            "replacement",
+        )
+        git_commands = [
+            json.loads(line)["args"]
+            for line in self.command_log.read_text(encoding="utf-8").splitlines()
+            if json.loads(line)["command"] == "git"
+        ]
+        quarantine = self.state_home / "afk" / "worktree-quarantine" / run_id
+        self.assertIn(
+            ["worktree", "move", str(replacement), str(quarantine)], git_commands
+        )
+        self.assertIn(["worktree", "remove", str(quarantine)], git_commands)
+        self.assertNotIn(["worktree", "remove", str(replacement)], git_commands)
+
+    def test_terminal_cleanup_recovers_quarantine_without_git_lockfiles(self):
+        run_id = self.start_reviewed_run()
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+
+        interrupted = self.run_afk(
+            "resume", AFK_FAKE_TERMINAL_CLEANUP_INTERRUPTS_AFTER_MOVE="1"
+        )
+
+        self.assertLess(interrupted.returncode, 0)
+        quarantine = self.state_home / "afk" / "worktree-quarantine" / run_id
+        self.assertTrue(quarantine.is_dir())
+        git_state = self.state_home / "fake-git"
+        self.assertEqual(list(git_state.rglob("*.lock")), [])
+
+        resumed = self.run_afk("resume")
+
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(status["state"], "completed")
+        self.assertTrue(status["completion"]["worktree_removed"])
+        self.assertTrue(status["completion"]["local_branch_deleted"])
+        self.assertFalse(quarantine.exists())
+        self.assertEqual(list(git_state.rglob("*.lock")), [])
+
+    def test_terminal_cleanup_preserves_unregistered_worktree_and_local_branch(self):
+        run_id = self.start_reviewed_run()
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+        worktree = self.state_home / "afk" / "worktrees" / run_id
+
+        completed = self.run_afk("resume", AFK_FAKE_UNREGISTERED_WORKTREE="1")
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertFalse(status["completion"]["worktree_removed"])
+        self.assertFalse(status["completion"]["local_branch_deleted"])
+        self.assertIn(
+            "Run worktree ownership could not be verified; cleanup skipped",
+            status["completion"]["cleanup_warnings"],
+        )
+        self.assertTrue(worktree.is_dir())
+        self.assertFalse((self.state_home / "fake-local-branch-removed").exists())
+
+    def test_terminal_cleanup_reconciles_worktree_move_timeout_after_mutation(self):
+        run_id = self.start_reviewed_run()
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+
+        completed = self.run_afk(
+            "resume",
+            AFK_FAKE_WORKTREE_MOVE_TIMES_OUT_AFTER_MUTATION="1",
+            AFK_TEST_SHORT_CLEANUP_TIMEOUT="1",
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertTrue(status["completion"]["worktree_removed"])
+        self.assertNotIn(
+            "Run worktree cleanup failed", status["completion"]["cleanup_warnings"]
+        )
+
+    def test_terminal_cleanup_reconciles_worktree_remove_timeout_after_mutation(self):
+        run_id = self.start_reviewed_run()
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+
+        completed = self.run_afk(
+            "resume",
+            AFK_FAKE_WORKTREE_REMOVE_TIMES_OUT_AFTER_MUTATION="1",
+            AFK_TEST_SHORT_CLEANUP_TIMEOUT="1",
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertTrue(status["completion"]["worktree_removed"])
+        self.assertNotIn(
+            "Run worktree cleanup failed", status["completion"]["cleanup_warnings"]
+        )
+
+    def test_terminal_cleanup_failures_are_durable_warnings(self):
+        run_id = self.start_reviewed_run()
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+        self.assertEqual(
+            self.run_afk("resume", AFK_FAKE_REMOTE_BRANCH_LINGERS="1").returncode,
+            0,
+        )
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+
+        completed = self.run_afk(
+            "resume",
+            AFK_FAKE_REMOTE_DELETE_FAILURE="1",
+            AFK_FAKE_WORKTREE_REMOVE_FAILURE="1",
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(status["state"], "completed")
+        completion = status["completion"]
+        self.assertFalse(completion["remote_branch_deleted"])
+        self.assertFalse(completion["worktree_removed"])
+        self.assertFalse(completion["local_branch_deleted"])
+        self.assertEqual(len(completion["cleanup_warnings"]), 3)
+        self.assertEqual(status["merge"]["merge_commit"], "f" * 40)
+        self.assertEqual(status["bead_closure"]["status"], "closed")
+
+    def test_terminal_cleanup_command_exception_is_a_durable_warning(self):
+        run_id = self.start_reviewed_run()
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+
+        completed = self.run_afk(
+            "resume", AFK_FAKE_REPOSITORY_DISAPPEARS_DURING_CLEANUP="1"
+        )
+        self.project.mkdir()
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(status["state"], "completed")
+        self.assertEqual(
+            status["completion"]["cleanup_warnings"],
+            ["Run worktree cleanup could not be inspected; cleanup skipped"],
+        )
+        self.assertEqual(status["merge"]["merge_commit"], "f" * 40)
+        self.assertEqual(status["bead_closure"]["status"], "closed")
+
+    def test_terminal_cleanup_filesystem_exception_is_a_durable_warning(self):
+        run_id = self.start_reviewed_run()
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+
+        (self.state_home / "afk" / "worktree-quarantine").write_text(
+            "not a directory", encoding="utf-8"
+        )
+
+        completed = self.run_afk("resume")
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(status["state"], "completed")
+        self.assertEqual(
+            status["completion"]["cleanup_warnings"],
+            ["Run worktree cleanup could not be inspected; cleanup skipped"],
+        )
+        self.assertEqual(status["merge"]["merge_commit"], "f" * 40)
+        self.assertEqual(status["bead_closure"]["status"], "closed")
+
+    def test_terminal_cleanup_recovers_sealed_completion_before_rechecking_cleanup(
+        self,
+    ):
+        run_id = self.start_reviewed_run()
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+        before = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        evidence = f"gates/completion-{before['candidate_sha'][:12]}"
+        sealed_completion = {
+            "schema_version": 1,
+            "repository": "thunderbump/beads-webui",
+            "bead_id": "central-bnkl.1.1",
+            "candidate_sha": before["candidate_sha"],
+            "pr_number": before["merge"]["number"],
+            "pr_url": before["merge"]["url"],
+            "merge_commit": before["merge"]["merge_commit"],
+            "bead_closure": before["bead_closure"],
+            "remote_branch_deleted": False,
+            "worktree_removed": False,
+            "local_branch_deleted": False,
+            "cleanup_warnings": ["cleanup was interrupted"],
+            "evidence": evidence,
+        }
+        store = RunStore(self.state_home / "afk")
+        store.reconcile_evidence_result(run_id, evidence, sealed_completion)
+        commands_before = self.command_log.read_text(encoding="utf-8")
+
+        resumed = self.run_afk("resume")
+
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(status["state"], "completed")
+        self.assertEqual(status["completion"], sealed_completion)
+        self.assertTrue((self.state_home / "afk" / "worktrees" / run_id).exists())
+        self.assertEqual(self.command_log.read_text(encoding="utf-8"), commands_before)
+
+    def test_terminal_cleanup_recovers_unsealed_completion_before_rechecking_cleanup(
+        self,
+    ):
+        run_id = self.start_reviewed_run()
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+        before = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        evidence = f"gates/completion-{before['candidate_sha'][:12]}"
+        interrupted_completion = {
+            "schema_version": 1,
+            "repository": "thunderbump/beads-webui",
+            "bead_id": "central-bnkl.1.1",
+            "candidate_sha": before["candidate_sha"],
+            "pr_number": before["merge"]["number"],
+            "pr_url": before["merge"]["url"],
+            "merge_commit": before["merge"]["merge_commit"],
+            "bead_closure": before["bead_closure"],
+            "remote_branch_deleted": False,
+            "worktree_removed": False,
+            "local_branch_deleted": False,
+            "cleanup_warnings": ["cleanup was interrupted"],
+            "evidence": evidence,
+        }
+        store = RunStore(self.state_home / "afk")
+        store.write_evidence_value(
+            run_id, f"{evidence}/result.json", interrupted_completion
+        )
+        commands_before = self.command_log.read_text(encoding="utf-8")
+
+        resumed = self.run_afk("resume")
+
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(status["state"], "completed")
+        self.assertEqual(status["completion"], interrupted_completion)
+        self.assertTrue(
+            (
+                self.state_home / "afk" / "runs" / run_id / evidence / "manifest.json"
+            ).is_file()
+        )
+        self.assertTrue((self.state_home / "afk" / "worktrees" / run_id).exists())
+        self.assertEqual(self.command_log.read_text(encoding="utf-8"), commands_before)
 
     def test_resume_reconciles_interruption_after_bead_close_without_second_close(self):
         run_id = self.start_reviewed_run()
@@ -1479,7 +2088,7 @@ class StartCliTest(unittest.TestCase):
         commands = self.command_log.read_text(encoding="utf-8")
         self.assertNotIn('"args":["pr","ready"', commands)
 
-    def test_complete_reconciles_merged_candidate_and_closed_bead_idempotently(self):
+    def test_complete_cannot_bypass_the_durable_terminal_lifecycle(self):
         started = self.run_afk("start", "central-bnkl.1.1")
         run_id = started.stdout.strip()
         worker = self.run_afk("_worker", run_id)
@@ -1492,36 +2101,20 @@ class StartCliTest(unittest.TestCase):
             AFK_FAKE_BEAD_STATUS="closed",
         )
 
-        self.assertEqual(completed.returncode, 0, completed.stderr)
-        report = json.loads(completed.stdout)
-        self.assertTrue(report["complete"])
-        self.assertFalse(report["paused"])
-        self.assertEqual(report["state"], "completed")
+        self.assertEqual(completed.returncode, 2)
+        self.assertEqual(completed.stdout, "")
+        self.assertIn("afk resume", completed.stderr)
         status = json.loads(self.run_afk("status", run_id, "--json").stdout)
-        self.assertEqual(status["checkpoint"], "completed")
-        self.assertEqual(status["completion"]["candidate_sha"], "d" * 40)
-        self.assertEqual(status["completion"]["merge_commit"], "f" * 40)
-        evidence = (
-            self.state_home / "afk" / "runs" / run_id / status["completion"]["evidence"]
-        )
-        self.assertTrue((evidence / "manifest.json").is_file())
-
-        repeated = self.run_afk(
-            "complete",
-            run_id,
-            AFK_FAKE_PR_MERGED="1",
-            AFK_FAKE_BEAD_STATUS="closed",
-        )
-
-        self.assertEqual(repeated.returncode, 0, repeated.stderr)
-        self.assertTrue(json.loads(repeated.stdout)["complete"])
+        self.assertEqual(status["state"], "reviewed")
+        self.assertEqual(status["checkpoint"], "reviewed")
+        self.assertNotIn("completion", status)
         events = [
             json.loads(line)["event"]
             for line in (self.state_home / "afk" / "runs" / run_id / "events.jsonl")
             .read_text(encoding="utf-8")
             .splitlines()
         ]
-        self.assertEqual(events.count("run.completed"), 1)
+        self.assertNotIn("run.completed", events)
 
     def test_complete_fails_closed_on_terminal_fact_mismatch(self):
         started = self.run_afk("start", "central-bnkl.1.1")
@@ -1583,7 +2176,7 @@ class StartCliTest(unittest.TestCase):
         ]
         self.assertNotIn("run.completed", events)
 
-    def test_complete_recovers_matching_unsealed_terminal_evidence(self):
+    def test_complete_does_not_seal_legacy_terminal_evidence(self):
         started = self.run_afk("start", "central-bnkl.1.1")
         run_id = started.stdout.strip()
         worker = self.run_afk("_worker", run_id)
@@ -1614,10 +2207,14 @@ class StartCliTest(unittest.TestCase):
             AFK_FAKE_BEAD_STATUS="closed",
         )
 
-        self.assertEqual(completed.returncode, 0, completed.stderr)
-        self.assertTrue(json.loads(completed.stdout)["complete"])
+        self.assertEqual(completed.returncode, 2)
+        self.assertEqual(completed.stdout, "")
+        self.assertIn("afk resume", completed.stderr)
         completion = self.state_home / "afk" / "runs" / run_id / evidence
-        self.assertTrue((completion / "manifest.json").is_file())
+        self.assertFalse((completion / "manifest.json").exists())
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(status["state"], "reviewed")
+        self.assertNotIn("completion", status)
 
     def test_gate_uses_the_canonical_start_bead_after_live_tracker_mutation(self):
         started = self.run_afk("start", "central-bnkl.1.1")
@@ -1754,12 +2351,11 @@ class StartCliTest(unittest.TestCase):
         )
 
     def test_candidate_contract_changes_remain_proposals_for_later_validation(self):
-        home = self.temp
-        (home / ".fake-contract-proposal").write_text("enabled", encoding="utf-8")
-        started = self.run_afk("start", "central-bnkl.1.1", HOME=str(home))
+        (self.home / ".fake-contract-proposal").write_text("enabled", encoding="utf-8")
+        started = self.run_afk("start", "central-bnkl.1.1")
         run_id = started.stdout.strip()
 
-        completed = self.run_afk("_worker", run_id, HOME=str(home))
+        completed = self.run_afk("_worker", run_id)
 
         self.assertEqual(completed.returncode, 2, completed.stderr)
         projection = json.loads(self.run_afk("status", run_id, "--json").stdout)
@@ -2875,6 +3471,7 @@ class StartCliTest(unittest.TestCase):
                 candidate_sha = "d" * 40
                 candidate_marker = Path(os.environ["HOME"]) / ".fake-candidate"
                 pushed_marker = Path(os.environ["HOME"]) / ".fake-pushed"
+                contract_proposal = Path(os.environ["HOME"]) / ".fake-contract-proposal"
                 pr_state = Path(os.environ["XDG_STATE_HOME"]) / "fake-pr.json"
                 pr_view_count = Path(os.environ["XDG_STATE_HOME"]) / "fake-pr-view-count"
                 comment_state = Path(os.environ["XDG_STATE_HOME"]) / "fake-comment.json"
@@ -2885,6 +3482,11 @@ class StartCliTest(unittest.TestCase):
                 )
                 remote_deleted = Path(os.environ["XDG_STATE_HOME"]) / "fake-remote-deleted"
                 remote_replaced = Path(os.environ["XDG_STATE_HOME"]) / "fake-remote-replaced"
+                worktree_removed = Path(os.environ["XDG_STATE_HOME"]) / "fake-worktree-removed"
+                worktree_replaced = Path(os.environ["XDG_STATE_HOME"]) / "fake-worktree-replaced"
+                worktree_quarantined = Path(os.environ["XDG_STATE_HOME"]) / "fake-worktree-quarantined"
+                local_branch_removed = Path(os.environ["XDG_STATE_HOME"]) / "fake-local-branch-removed"
+                local_branch_replaced = Path(os.environ["XDG_STATE_HOME"]) / "fake-local-branch-replaced"
                 bead_closed = Path(os.environ["XDG_STATE_HOME"]) / "fake-bead-closed"
                 bead_show_count = Path(os.environ["XDG_STATE_HOME"]) / "fake-bead-show-count"
                 if command == "git":
@@ -2946,7 +3548,7 @@ class StartCliTest(unittest.TestCase):
                         if "-z" in args and requested == "scripts/validation-worker.sh":
                             changed = (
                                 args[2] == candidate_sha
-                                and (Path(os.environ["HOME"]) / ".fake-contract-proposal").exists()
+                                and contract_proposal.exists()
                             )
                             blob = "f" * 40 if changed else "b" * 40
                             sys.stdout.buffer.write(
@@ -2975,7 +3577,15 @@ class StartCliTest(unittest.TestCase):
                         common_dir.mkdir(parents=True, exist_ok=True)
                         print(common_dir)
                     elif args[:1] == ["rev-parse"]:
-                        print(candidate_sha if candidate_marker.exists() and Path.cwd() != Path(project) else sha)  # noqa: E501
+                        if args[-1].startswith("refs/heads/"):
+                            if local_branch_replaced.exists():
+                                print("a" * 40)
+                            elif not local_branch_removed.exists():
+                                print(candidate_sha)
+                            else:
+                                raise SystemExit(1)
+                        else:
+                            print(candidate_sha if candidate_marker.exists() and Path.cwd() != Path(project) else sha)  # noqa: E501
                     elif args[:2] == ["worktree", "add"]:
                         if os.environ.get("AFK_FAKE_WORKTREE_FAILURE"):
                             print("worktree failed", file=sys.stderr)
@@ -3002,18 +3612,30 @@ class StartCliTest(unittest.TestCase):
                         )
                         validation_worker.chmod(0o700)
                     elif args[:3] == ["worktree", "list", "--porcelain"]:
-                        if not os.environ.get("AFK_FAKE_UNREGISTERED_WORKTREE"):
-                            worktrees = (
-                                Path(os.environ["XDG_STATE_HOME"])
-                                / "afk"
-                                / "worktrees"
-                            )
-                            for checkout in worktrees.iterdir():
+                        if os.environ.get(
+                            "AFK_FAKE_REPOSITORY_DISAPPEARS_DURING_CLEANUP"
+                        ):
+                            import shutil
+                            shutil.rmtree(project)
+                        if (
+                            not os.environ.get("AFK_FAKE_UNREGISTERED_WORKTREE")
+                            and not worktree_removed.exists()
+                        ):
+                            if worktree_quarantined.exists():
+                                checkouts = [Path(worktree_quarantined.read_text())]
+                            else:
+                                worktrees = (
+                                    Path(os.environ["XDG_STATE_HOME"])
+                                    / "afk"
+                                    / "worktrees"
+                                )
+                                checkouts = list(worktrees.iterdir())
+                            for checkout in checkouts:
                                 run_id = checkout.name
                                 head = (
                                     "b" * 40
                                     if os.environ.get("AFK_FAKE_WRONG_WORKTREE_HEAD")
-                                    else sha
+                                    else candidate_sha if candidate_marker.exists() else sha
                                 )
                                 branch = (
                                     "afk/wrong-branch"
@@ -3030,6 +3652,72 @@ class StartCliTest(unittest.TestCase):
                                 print()
                     elif args[:2] == ["status", "--porcelain"]:
                         pass
+                    elif args[:2] == ["worktree", "move"]:
+                        source = Path(args[-2])
+                        destination = Path(args[-1])
+                        destination.parent.mkdir(parents=True, exist_ok=True)
+                        source.rename(destination)
+                        worktree_quarantined.write_text(
+                            str(destination), encoding="utf-8"
+                        )
+                        if os.environ.get(
+                            "AFK_FAKE_WORKTREE_MOVE_TIMES_OUT_AFTER_MUTATION"
+                        ):
+                            import time
+                            time.sleep(1)
+                        if os.environ.get(
+                            "AFK_FAKE_TERMINAL_CLEANUP_INTERRUPTS_AFTER_MOVE"
+                        ):
+                            import signal
+                            os.kill(os.getppid(), signal.SIGKILL)
+                        if os.environ.get("AFK_FAKE_WORKTREE_MOVES_DURING_REMOVE"):
+                            source.mkdir()
+                            (source / "not-afk-owned").write_text(
+                                "replacement", encoding="utf-8"
+                            )
+                            worktree_replaced.write_text("replaced", encoding="utf-8")
+                    elif args[:2] == ["worktree", "remove"]:
+                        if os.environ.get("AFK_FAKE_WORKTREE_REMOVE_FAILURE"):
+                            raise SystemExit(1)
+                        worktree_removed.write_text("removed", encoding="utf-8")
+                        checkout = Path(args[-1])
+                        if checkout.exists():
+                            import shutil
+                            shutil.rmtree(checkout)
+                        worktree_quarantined.unlink(missing_ok=True)
+                        if os.environ.get(
+                            "AFK_FAKE_WORKTREE_REMOVE_TIMES_OUT_AFTER_MUTATION"
+                        ):
+                            import time
+                            time.sleep(1)
+                    elif args[:2] == ["branch", "-D"]:
+                        if os.environ.get("AFK_FAKE_BRANCH_DELETE_FAILURE"):
+                            raise SystemExit(1)
+                        if os.environ.get(
+                            "AFK_FAKE_LOCAL_BRANCH_MOVES_DURING_DELETE"
+                        ):
+                            local_branch_replaced.write_text(
+                                "replaced", encoding="utf-8"
+                            )
+                        local_branch_removed.write_text("removed", encoding="utf-8")
+                    elif args[:2] == ["update-ref", "-d"]:
+                        if os.environ.get("AFK_FAKE_BRANCH_DELETE_FAILURE"):
+                            raise SystemExit(1)
+                        if os.environ.get(
+                            "AFK_FAKE_LOCAL_BRANCH_MOVES_DURING_DELETE"
+                        ):
+                            local_branch_replaced.write_text(
+                                "replaced", encoding="utf-8"
+                            )
+                        current = "a" * 40 if local_branch_replaced.exists() else candidate_sha
+                        if len(args) != 4 or args[3] != current:
+                            raise SystemExit(1)
+                        local_branch_removed.write_text("removed", encoding="utf-8")
+                        if os.environ.get(
+                            "AFK_FAKE_LOCAL_BRANCH_DELETE_TIMES_OUT_AFTER_MUTATION"
+                        ):
+                            import time
+                            time.sleep(1)
                     elif args[:2] == ["branch", "--show-current"]:
                         run_id = Path.cwd().name
                         print("afk/" + os.environ["AFK_FAKE_BEAD"].replace(".", "-") + "-" + run_id + "/candidate")  # noqa: E501
@@ -3040,7 +3728,33 @@ class StartCliTest(unittest.TestCase):
                     elif args[:1] == ["diff"]:
                         pass
                     elif args[:1] == ["push"]:
-                        pushed_marker.write_text(candidate_sha, encoding="utf-8")
+                        if "--delete" in args:
+                            if os.environ.get("AFK_FAKE_REMOTE_DELETE_FAILURE"):
+                                raise SystemExit(1)
+                            if os.environ.get(
+                                "AFK_FAKE_REMOTE_DISAPPEARS_DURING_DELETE"
+                            ):
+                                remote_deleted.write_text("deleted", encoding="utf-8")
+                                raise SystemExit(1)
+                            if os.environ.get("AFK_FAKE_REMOTE_MOVES_DURING_DELETE"):
+                                remote_replaced.write_text("replaced", encoding="utf-8")
+                                branch = args[-1]
+                                expected_lease = (
+                                    "--force-with-lease=refs/heads/"
+                                    + branch
+                                    + ":"
+                                    + candidate_sha
+                                )
+                                if expected_lease in args:
+                                    raise SystemExit(1)
+                            remote_deleted.write_text("deleted", encoding="utf-8")
+                            if os.environ.get(
+                                "AFK_FAKE_REMOTE_DELETE_TIMES_OUT_AFTER_MUTATION"
+                            ):
+                                import time
+                                time.sleep(1)
+                        else:
+                            pushed_marker.write_text(candidate_sha, encoding="utf-8")
                         if os.environ.get("AFK_FAKE_PUSH_INTERRUPTED"):
                             raise SystemExit(1)
                     else:
@@ -3202,7 +3916,8 @@ class StartCliTest(unittest.TestCase):
                             }
                         )
                         pr_state.write_text(json.dumps(value), encoding="utf-8")
-                        remote_deleted.write_text("deleted", encoding="utf-8")
+                        if not os.environ.get("AFK_FAKE_REMOTE_BRANCH_LINGERS"):
+                            remote_deleted.write_text("deleted", encoding="utf-8")
                         if os.environ.get("AFK_FAKE_REPLACED_REMOTE_BRANCH"):
                             remote_replaced.write_text("replaced", encoding="utf-8")
                         if os.environ.get("AFK_FAKE_PR_MERGE_INTERRUPTED"):
