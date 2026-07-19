@@ -380,16 +380,10 @@ def _resume_worker_launch_effect(
     store: RunStore, run_id: str, projection: dict[str, Any]
 ) -> tuple[dict[str, Any], str]:
     unit = worker_unit(run_id)
-    try:
-        effect = store.effect(run_id, "worker-launch-1")
-    except RunStoreError:
-        effect_path = store.root / "runs" / run_id / "effects" / "worker-launch-1.json"
-        if (
-            projection["last_event"] != "bead.spec_recorded"
-            or effect_path.exists()
-            or effect_path.is_symlink()
-        ):
-            raise
+    effect = store.effect_if_present(run_id, "worker-launch-1")
+    if effect is None:
+        if projection["last_event"] != "bead.spec_recorded":
+            raise RunStoreError("Effect is missing or invalid: worker-launch-1")
         load_bead_spec(store, run_id)
         effect = store.prepare_effect(
             run_id,
