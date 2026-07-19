@@ -437,9 +437,21 @@ class RunStoreTest(unittest.TestCase):
         self.create_run()
         directory = self.root / "runs" / "run-001" / "gates" / "completion"
         directory.mkdir()
+        (directory / "partial.tmp").write_text("incomplete\n", encoding="utf-8")
 
         with self.assertRaises(EvidenceError):
             self.store.unsealed_evidence_result("run-001", "gates/completion")
+
+    def test_unsealed_evidence_result_treats_an_empty_directory_as_prepublication(
+        self,
+    ):
+        self.create_run()
+        directory = self.root / "runs" / "run-001" / "gates" / "completion"
+        directory.mkdir()
+
+        self.assertIsNone(
+            self.store.unsealed_evidence_result("run-001", "gates/completion")
+        )
 
     def test_unsealed_evidence_result_rejects_ambiguous_evidence(self):
         self.create_run()
@@ -468,6 +480,106 @@ class RunStoreTest(unittest.TestCase):
 
         with self.assertRaises(EvidenceError):
             self.store.unsealed_evidence_result("run-001", "gates/completion")
+
+    def test_reconcile_evidence_result_recovers_an_empty_prepublication_directory(
+        self,
+    ):
+        self.create_run()
+        directory = self.root / "runs" / "run-001" / "gates" / "completion"
+        directory.mkdir()
+
+        result = self.store.reconcile_evidence_result(
+            "run-001", "gates/completion", {"status": "complete"}
+        )
+
+        self.assertEqual(result, {"status": "complete"})
+        self.assertTrue(self.store.verify_evidence("run-001", "gates/completion"))
+
+    def test_reconcile_evidence_result_recovers_after_an_interrupted_result_write(
+        self,
+    ):
+        self.create_run()
+        expected = {"status": "complete"}
+
+        with patch("afk.run_store.os.write", return_value=0):
+            with self.assertRaises(RunStoreError):
+                self.store.reconcile_evidence_result(
+                    "run-001", "gates/completion", expected
+                )
+
+        directory = self.root / "runs" / "run-001" / "gates" / "completion"
+        self.assertEqual(list(directory.iterdir()), [])
+        self.assertEqual(
+            self.store.reconcile_evidence_result(
+                "run-001", "gates/completion", expected
+            ),
+            expected,
+        )
+        self.assertTrue(self.store.verify_evidence("run-001", "gates/completion"))
+
+    def test_reconcile_evidence_result_recovers_after_an_interrupted_manifest_write(
+        self,
+    ):
+        self.create_run()
+        expected = {"status": "complete"}
+        self.store.write_evidence_value(
+            "run-001", "gates/completion/result.json", expected
+        )
+
+        with patch("afk.run_store.os.write", return_value=0):
+            with self.assertRaises(RunStoreError):
+                self.store.seal_evidence("run-001", "gates/completion")
+
+        directory = self.root / "runs" / "run-001" / "gates" / "completion"
+        self.assertEqual([path.name for path in directory.iterdir()], ["result.json"])
+        self.assertEqual(
+            self.store.reconcile_evidence_result(
+                "run-001", "gates/completion", expected
+            ),
+            expected,
+        )
+        self.assertTrue(self.store.verify_evidence("run-001", "gates/completion"))
+
+    def test_sealed_evidence_result_finishes_interrupted_seal_permissions(self):
+        self.create_run()
+        expected = {"status": "complete"}
+        self.store.write_evidence_value(
+            "run-001", "gates/completion/result.json", expected
+        )
+        directory = self.root / "runs" / "run-001" / "gates" / "completion"
+        chmod = Path.chmod
+
+        def interrupt_root_seal(path, mode):
+            if path == directory and mode == 0o500:
+                raise OSError("simulated interruption")
+            return chmod(path, mode)
+
+        with patch(
+            "afk.run_store.Path.chmod", autospec=True, side_effect=interrupt_root_seal
+        ):
+            with self.assertRaises(OSError):
+                self.store.seal_evidence("run-001", "gates/completion")
+
+        self.assertTrue((directory / "manifest.json").is_file())
+        self.assertEqual(
+            self.store.sealed_evidence_result("run-001", "gates/completion"),
+            expected,
+        )
+        self.assertTrue(self.store.verify_evidence("run-001", "gates/completion"))
+
+    def test_sealed_evidence_result_does_not_repair_changed_published_evidence(self):
+        self.create_run()
+        expected = {"status": "complete"}
+        self.store.write_evidence_value(
+            "run-001", "gates/completion/result.json", expected
+        )
+        self.store.seal_evidence("run-001", "gates/completion")
+        result = self.root / "runs" / "run-001" / "gates" / "completion" / "result.json"
+        result.chmod(0o600)
+        result.write_text('{"status":"changed"}\n', encoding="utf-8")
+
+        with self.assertRaises(EvidenceTampered):
+            self.store.sealed_evidence_result("run-001", "gates/completion")
 
     def test_sealed_bead_spec_recovers_after_projection_record_crash(self):
         self.create_run()
