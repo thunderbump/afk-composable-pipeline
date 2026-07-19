@@ -3641,7 +3641,7 @@ class StartCliTest(unittest.TestCase):
         status = store.status("crashed-run")
         self.assertEqual(status["attention"]["kind"], "invalid")
         self.assertIn(
-            "open validation attempt is invalid", status["attention"]["summary"]
+            "validation attempt lifecycle is invalid", status["attention"]["summary"]
         )
 
     def test_resume_repeatedly_rejects_malformed_outstanding_validation_attempt(self):
