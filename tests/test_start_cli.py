@@ -286,8 +286,7 @@ class StartCliTest(unittest.TestCase):
                 / "worker-launch-1.json"
             ).read_text(encoding="utf-8")
         )
-        self.assertEqual(effect["status"], "confirmed")
-        self.assertEqual(effect["observed"], {"unit": f"afk-{run_id}-worker-1"})
+        self.assertEqual(effect["status"], "prepared")
         commands = self.command_log.read_text(encoding="utf-8")
         self.assertIn('"command":"systemd-run"', commands)
         self.assertIn('"--property=Restart=no"', commands)
@@ -336,7 +335,7 @@ class StartCliTest(unittest.TestCase):
         self.assertEqual(completed.returncode, 0, completed.stderr)
         run_id = completed.stdout.strip()
         effect = RunStore(self.state_home / "afk").effect(run_id, "worker-launch-1")
-        self.assertEqual(effect["status"], "confirmed")
+        self.assertEqual(effect["status"], "prepared")
         commands = self.command_log.read_text(encoding="utf-8")
         self.assertIn('"command":"resume-probe","returncode":2', commands)
 
@@ -355,7 +354,7 @@ class StartCliTest(unittest.TestCase):
         resumed = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="absent")
 
         self.assertEqual(resumed.returncode, 0, resumed.stderr)
-        self.assertEqual(store.effect(run_id, "worker-launch-1")["status"], "confirmed")
+        self.assertEqual(store.effect(run_id, "worker-launch-1")["status"], "prepared")
         self.assertEqual(self.mutation_count("worker-launch"), 1)
 
     def test_resume_recovers_process_crash_before_worker_launch_effect(self):
@@ -376,8 +375,7 @@ class StartCliTest(unittest.TestCase):
 
         self.assertEqual(resumed.returncode, 0, resumed.stderr)
         effect = store.effect(run_id, "worker-launch-1")
-        self.assertEqual(effect["status"], "confirmed")
-        self.assertEqual(effect["observed"], {"unit": f"afk-{run_id}-worker-1"})
+        self.assertEqual(effect["status"], "prepared")
         events = [
             json.loads(line)["event"]
             for line in (self.state_home / "afk" / "runs" / run_id / "events.jsonl")
@@ -404,7 +402,7 @@ class StartCliTest(unittest.TestCase):
         resumed = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="absent")
 
         self.assertEqual(resumed.returncode, 0, resumed.stderr)
-        self.assertEqual(store.effect(run_id, "worker-launch-1")["status"], "confirmed")
+        self.assertEqual(store.effect(run_id, "worker-launch-1")["status"], "prepared")
         events = [
             json.loads(line)["event"]
             for line in (self.state_home / "afk" / "runs" / run_id / "events.jsonl")
@@ -415,8 +413,9 @@ class StartCliTest(unittest.TestCase):
         self.assertEqual(events.count("worker.launch_retried"), 1)
         self.assertEqual(self.mutation_count("worker-launch"), 1)
 
-        repeated = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="absent")
-        self.assertEqual(repeated.returncode, 2, repeated.stderr)
+        observed = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="active")
+        self.assertEqual(observed.returncode, 0, observed.stderr)
+        self.assertEqual(store.effect(run_id, "worker-launch-1")["status"], "confirmed")
         self.assertEqual(self.mutation_count("worker-launch"), 1)
 
     def test_resume_reconciles_process_crash_after_worker_launch_mutation(self):
@@ -4795,10 +4794,13 @@ class StartCliTest(unittest.TestCase):
 
         self.assertEqual(resumed.returncode, 0, resumed.stderr)
         self.assertEqual(
+            store.effect("crashed-run", "worker-launch-1")["status"], "prepared"
+        )
+        observed = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="active")
+        self.assertEqual(observed.returncode, 0, observed.stderr)
+        self.assertEqual(
             store.effect("crashed-run", "worker-launch-1")["status"], "confirmed"
         )
-        repeated = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="absent")
-        self.assertEqual(repeated.returncode, 2, repeated.stderr)
         commands = self.command_log.read_text(encoding="utf-8")
         self.assertEqual(commands.count('"command":"systemd-run"'), 1)
 

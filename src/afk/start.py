@@ -149,7 +149,6 @@ def start_run(
         )
         try:
             _launch_worker(run_id, unit)
-            store.confirm_effect(run_id, "worker-launch-1", observed={"unit": unit})
         except StartError as exc:
             _attention(
                 store,
@@ -341,7 +340,6 @@ def resume_run(
                 return run_id, 2
             try:
                 _launch_worker(run_id, unit)
-                store.confirm_effect(run_id, "worker-launch-1", observed={"unit": unit})
             except StartError as exc:
                 _attention(
                     store,
