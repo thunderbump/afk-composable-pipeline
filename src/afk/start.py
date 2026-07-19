@@ -1698,6 +1698,7 @@ def _cleanup_run_checkout(
         and quarantine_available
         and registered is None
         and quarantined is None
+        and not expected_worktree.exists()
         and not quarantine.exists()
     )
     if not listing_available or not quarantine_available:

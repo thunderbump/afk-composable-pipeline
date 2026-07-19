@@ -947,6 +947,26 @@ class StartCliTest(unittest.TestCase):
         self.assertFalse(quarantine.exists())
         self.assertEqual(list(git_state.rglob("*.lock")), [])
 
+    def test_terminal_cleanup_preserves_unregistered_worktree_and_local_branch(self):
+        run_id = self.start_reviewed_run()
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+        worktree = self.state_home / "afk" / "worktrees" / run_id
+
+        completed = self.run_afk("resume", AFK_FAKE_UNREGISTERED_WORKTREE="1")
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertFalse(status["completion"]["worktree_removed"])
+        self.assertFalse(status["completion"]["local_branch_deleted"])
+        self.assertIn(
+            "Run worktree ownership could not be verified; cleanup skipped",
+            status["completion"]["cleanup_warnings"],
+        )
+        self.assertTrue(worktree.is_dir())
+        self.assertFalse((self.state_home / "fake-local-branch-removed").exists())
+
     def test_terminal_cleanup_reconciles_worktree_move_timeout_after_mutation(self):
         run_id = self.start_reviewed_run()
         self.assertEqual(self.run_afk("resume").returncode, 0)
