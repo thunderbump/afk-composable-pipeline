@@ -21,6 +21,7 @@ from afk.candidate_gate import (  # noqa: E402
     reconcile_gate_comment,
     run_candidate_reviews,
 )
+from afk.jsonutil import sha256_json  # noqa: E402
 from afk.run_store import EvidenceTampered, RunStore  # noqa: E402
 from afk.start import (  # noqa: E402
     _advance_candidate,
@@ -123,7 +124,9 @@ class CandidateGateTest(unittest.TestCase):
             run_id="run-1",
         )["run_id"]
         store.write_evidence_text(run_id, "gates/validation/result.json", "{}\n")
-        store.seal_evidence(run_id, "gates/validation")
+        validation_manifest_sha256 = sha256_json(
+            store.seal_evidence(run_id, "gates/validation")
+        )
         store.append_event(
             run_id,
             "validation.passed",
@@ -139,6 +142,7 @@ class CandidateGateTest(unittest.TestCase):
                     "candidate_sha": candidate_sha,
                     "summary": "passed",
                     "evidence": "gates/validation",
+                    "manifest_sha256": validation_manifest_sha256,
                     "checks": [],
                 },
             },
@@ -1041,7 +1045,9 @@ class CandidateGateTest(unittest.TestCase):
                 store.write_evidence_text(
                     run_id, "gates/validation/result.json", "{}\n"
                 )
-                store.seal_evidence(run_id, "gates/validation")
+                validation_manifest_sha256 = sha256_json(
+                    store.seal_evidence(run_id, "gates/validation")
+                )
                 candidate_sha = "b" * 40
                 store.append_event(
                     run_id,
@@ -1058,6 +1064,7 @@ class CandidateGateTest(unittest.TestCase):
                             "candidate_sha": candidate_sha,
                             "summary": "failed",
                             "evidence": "gates/validation",
+                            "manifest_sha256": validation_manifest_sha256,
                             "checks": [],
                         },
                     },
@@ -1126,9 +1133,14 @@ class CandidateGateTest(unittest.TestCase):
                         side_effect=AssertionError("Gate retry must not start"),
                     ),
                 ):
-                    resumed = resume_run()
+                    if case == "tampered":
+                        with self.assertRaises(EvidenceTampered):
+                            resume_run()
+                    else:
+                        resumed = resume_run()
 
-                self.assertEqual(resumed, (run_id, 2))
+                if case != "tampered":
+                    self.assertEqual(resumed, (run_id, 2))
                 self.assertEqual(store.status(run_id)["last_sequence"], last_sequence)
 
     def test_resume_keeps_completed_terminal_gate_attention_paused(self):
@@ -1158,7 +1170,9 @@ class CandidateGateTest(unittest.TestCase):
                 store.write_evidence_text(
                     run_id, "gates/validation/result.json", "{}\n"
                 )
-                store.seal_evidence(run_id, "gates/validation")
+                validation["manifest_sha256"] = sha256_json(
+                    store.seal_evidence(run_id, "gates/validation")
+                )
                 cycle = used + 1
                 gate_evidence = f"gates/gate-cycle-{cycle}-{candidate_sha[:12]}"
                 outcome = {
@@ -1270,6 +1284,10 @@ class CandidateGateTest(unittest.TestCase):
                 "candidate_sha": candidate_sha,
                 "evidence": "gates/validation",
             }
+            store.write_evidence_text(run_id, "gates/validation/result.json", "{}\n")
+            validation["manifest_sha256"] = sha256_json(
+                store.seal_evidence(run_id, "gates/validation")
+            )
             initial = {
                 "cycle": 1,
                 "candidate_sha": candidate_sha,
