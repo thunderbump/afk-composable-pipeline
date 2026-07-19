@@ -168,6 +168,54 @@ class StartCliTest(unittest.TestCase):
         self.assertEqual(worker.returncode, 0, worker.stderr)
         return run_id
 
+    def mutation_count(self, name):
+        path = self.state_home / "fake-mutations.jsonl"
+        if not path.exists():
+            return 0
+        return sum(
+            json.loads(line)["mutation"] == name
+            for line in path.read_text(encoding="utf-8").splitlines()
+        )
+
+    def command_count(self, command, prefix):
+        return sum(
+            record["command"] == command and record["args"][: len(prefix)] == prefix
+            for record in map(
+                json.loads,
+                self.command_log.read_text(encoding="utf-8").splitlines(),
+            )
+        )
+
+    def start_bead_closed_run_with_lingering_remote(self):
+        run_id = self.start_reviewed_run()
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+        self.assertEqual(
+            self.run_afk("resume", AFK_FAKE_REMOTE_BRANCH_LINGERS="1").returncode,
+            0,
+        )
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+        return run_id
+
+    def assert_exact_terminal_completion(self, run_id):
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        completion = status["completion"]
+        self.assertEqual(status["checkpoint"], "completed")
+        self.assertEqual(completion["repository"], "thunderbump/beads-webui")
+        self.assertEqual(completion["bead_id"], "central-bnkl.1.1")
+        self.assertEqual(completion["candidate_sha"], "d" * 40)
+        self.assertEqual(completion["pr_number"], 17)
+        self.assertEqual(completion["pr_url"], "https://example.test/pr/17")
+        self.assertEqual(completion["merge_commit"], "f" * 40)
+        self.assertEqual(completion["bead_closure"], status["bead_closure"])
+        self.assertTrue(completion["remote_branch_deleted"])
+        self.assertTrue(completion["worktree_removed"])
+        self.assertTrue(completion["local_branch_deleted"])
+        self.assertEqual(completion["cleanup_warnings"], [])
+        store = RunStore(self.state_home / "afk")
+        self.assertEqual(
+            store.sealed_evidence_result(run_id, completion["evidence"]), completion
+        )
+
     def test_start_launches_numbered_transient_worker_and_reports_checkpoint(self):
         completed = self.run_afk("start", "central-bnkl.1.1")
 
@@ -360,6 +408,54 @@ class StartCliTest(unittest.TestCase):
             if record["command"] == "gh" and record["args"][:2] == ["pr", "ready"]
         ]
         self.assertEqual(len(ready_commands), 1)
+
+    def test_resume_recovers_process_crash_before_pr_ready_mutation(self):
+        run_id = self.start_reviewed_run()
+
+        interrupted = self.run_afk("resume", AFK_TEST_KILL_BEFORE_MUTATION="pr-ready")
+
+        self.assertLess(interrupted.returncode, 0)
+        self.assertEqual(self.mutation_count("pr-ready"), 0)
+
+        resumed = self.run_afk("resume")
+
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        effect = RunStore(self.state_home / "afk").effect(run_id, "pr-mark-ready")
+        self.assertEqual(effect["status"], "confirmed")
+        self.assertEqual(effect["observed"], status["pr_ready"])
+        self.assertEqual(self.mutation_count("pr-ready"), 1)
+
+    def test_resume_reconciles_process_crash_after_pr_ready_mutation(self):
+        run_id = self.start_reviewed_run()
+
+        interrupted = self.run_afk("resume", AFK_TEST_KILL_AFTER_MUTATION="pr-ready")
+
+        self.assertLess(interrupted.returncode, 0)
+        self.assertEqual(self.mutation_count("pr-ready"), 1)
+
+        resumed = self.run_afk("resume")
+
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        effect = RunStore(self.state_home / "afk").effect(run_id, "pr-mark-ready")
+        self.assertEqual(effect["status"], "confirmed")
+        self.assertEqual(effect["observed"], status["pr_ready"])
+        self.assertEqual(self.mutation_count("pr-ready"), 1)
+
+    def test_resume_requires_attention_when_crashed_pr_ready_is_ambiguous(self):
+        run_id = self.start_reviewed_run()
+        interrupted = self.run_afk("resume", AFK_TEST_KILL_AFTER_MUTATION="pr-ready")
+        self.assertLess(interrupted.returncode, 0)
+
+        ambiguous = self.run_afk("resume", AFK_FAKE_READY_PR_UNAVAILABLE="1")
+
+        self.assertEqual(ambiguous.returncode, 2, ambiguous.stderr)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(status["checkpoint"], "reviewed")
+        self.assertEqual(status["attention"]["scope"], "publication")
+        self.assertEqual(status["attention"]["kind"], "inconclusive")
+        self.assertEqual(self.mutation_count("pr-ready"), 1)
 
     def test_resume_recovers_crash_after_ready_state_append(self):
         run_id = self.start_reviewed_run()
@@ -574,6 +670,43 @@ class StartCliTest(unittest.TestCase):
         ]
         self.assertEqual(len(merge_commands), 1)
         self.assertEqual(len(close_commands), 1)
+
+    def test_resume_recovers_process_crash_before_pr_merge_mutation(self):
+        run_id = self.start_reviewed_run()
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+
+        interrupted = self.run_afk("resume", AFK_TEST_KILL_BEFORE_MUTATION="pr-merge")
+
+        self.assertLess(interrupted.returncode, 0)
+        self.assertEqual(self.mutation_count("pr-merge"), 0)
+
+        resumed = self.run_afk("resume")
+
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        effect = RunStore(self.state_home / "afk").effect(run_id, "pr-squash-merge")
+        self.assertEqual(effect["status"], "confirmed")
+        self.assertEqual(effect["observed"], status["merge"])
+        self.assertEqual(self.mutation_count("pr-merge"), 1)
+
+    def test_resume_reconciles_process_crash_after_pr_merge_mutation(self):
+        run_id = self.start_reviewed_run()
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+
+        interrupted = self.run_afk("resume", AFK_TEST_KILL_AFTER_MUTATION="pr-merge")
+
+        self.assertLess(interrupted.returncode, 0)
+        self.assertEqual(self.mutation_count("pr-merge"), 1)
+
+        resumed = self.run_afk("resume")
+
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        effect = RunStore(self.state_home / "afk").effect(run_id, "pr-squash-merge")
+        self.assertEqual(effect["status"], "confirmed")
+        self.assertEqual(effect["observed"], status["merge"])
+        self.assertEqual(self.mutation_count("pr-merge"), 1)
+        self.assertEqual(self.command_count("gh", ["pr", "merge"]), 1)
 
     def test_resume_closes_bead_after_merged_candidate_branch_was_replaced(self):
         run_id = self.start_reviewed_run()
@@ -827,6 +960,147 @@ class StartCliTest(unittest.TestCase):
             + "d" * 40,
             deletes[0]["args"],
         )
+
+    def test_terminal_cleanup_recovers_process_crash_before_remote_delete(self):
+        run_id = self.start_bead_closed_run_with_lingering_remote()
+
+        interrupted = self.run_afk(
+            "resume", AFK_TEST_KILL_BEFORE_MUTATION="remote-branch-delete"
+        )
+
+        self.assertLess(interrupted.returncode, 0)
+        self.assertEqual(self.mutation_count("remote-branch-delete"), 0)
+
+        resumed = self.run_afk("resume")
+
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        self.assert_exact_terminal_completion(run_id)
+        self.assertEqual(self.mutation_count("remote-branch-delete"), 1)
+
+    def test_terminal_cleanup_reconciles_process_crash_after_remote_delete(self):
+        run_id = self.start_bead_closed_run_with_lingering_remote()
+
+        interrupted = self.run_afk(
+            "resume", AFK_TEST_KILL_AFTER_MUTATION="remote-branch-delete"
+        )
+
+        self.assertLess(interrupted.returncode, 0)
+        self.assertEqual(self.mutation_count("remote-branch-delete"), 1)
+
+        resumed = self.run_afk("resume")
+
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        self.assert_exact_terminal_completion(run_id)
+        self.assertEqual(self.mutation_count("remote-branch-delete"), 1)
+        self.assertEqual(self.command_count("git", ["push"]), 2)
+
+    def test_terminal_cleanup_recovers_process_crash_before_worktree_move(self):
+        run_id = self.start_bead_closed_run_with_lingering_remote()
+
+        interrupted = self.run_afk(
+            "resume", AFK_TEST_KILL_BEFORE_MUTATION="worktree-move"
+        )
+
+        self.assertLess(interrupted.returncode, 0)
+        self.assertEqual(self.mutation_count("worktree-move"), 0)
+
+        resumed = self.run_afk("resume")
+
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        self.assert_exact_terminal_completion(run_id)
+        self.assertEqual(self.mutation_count("remote-branch-delete"), 1)
+        self.assertEqual(self.mutation_count("worktree-move"), 1)
+
+    def test_terminal_cleanup_reconciles_process_crash_after_worktree_move(self):
+        run_id = self.start_bead_closed_run_with_lingering_remote()
+
+        interrupted = self.run_afk(
+            "resume", AFK_TEST_KILL_AFTER_MUTATION="worktree-move"
+        )
+
+        self.assertLess(interrupted.returncode, 0)
+        self.assertEqual(self.mutation_count("worktree-move"), 1)
+
+        resumed = self.run_afk("resume")
+
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        self.assert_exact_terminal_completion(run_id)
+        self.assertEqual(self.mutation_count("worktree-move"), 1)
+        self.assertEqual(self.command_count("git", ["worktree", "move"]), 1)
+
+    def test_terminal_cleanup_recovers_process_crash_before_worktree_remove(self):
+        run_id = self.start_bead_closed_run_with_lingering_remote()
+
+        interrupted = self.run_afk(
+            "resume", AFK_TEST_KILL_BEFORE_MUTATION="worktree-remove"
+        )
+
+        self.assertLess(interrupted.returncode, 0)
+        self.assertEqual(self.mutation_count("worktree-move"), 1)
+        self.assertEqual(self.mutation_count("worktree-remove"), 0)
+
+        resumed = self.run_afk("resume")
+
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        self.assert_exact_terminal_completion(run_id)
+        self.assertEqual(self.mutation_count("worktree-move"), 1)
+        self.assertEqual(self.mutation_count("worktree-remove"), 1)
+
+    def test_terminal_cleanup_reconciles_process_crash_after_worktree_remove(self):
+        run_id = self.start_bead_closed_run_with_lingering_remote()
+
+        interrupted = self.run_afk(
+            "resume", AFK_TEST_KILL_AFTER_MUTATION="worktree-remove"
+        )
+
+        self.assertLess(interrupted.returncode, 0)
+        self.assertEqual(self.mutation_count("worktree-remove"), 1)
+
+        resumed = self.run_afk("resume")
+
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        self.assert_exact_terminal_completion(run_id)
+        self.assertEqual(self.mutation_count("worktree-move"), 1)
+        self.assertEqual(self.mutation_count("worktree-remove"), 1)
+        self.assertEqual(self.command_count("git", ["worktree", "remove"]), 1)
+
+    def test_terminal_cleanup_recovers_process_crash_before_local_branch_delete(self):
+        run_id = self.start_bead_closed_run_with_lingering_remote()
+
+        interrupted = self.run_afk(
+            "resume", AFK_TEST_KILL_BEFORE_MUTATION="local-branch-delete"
+        )
+
+        self.assertLess(interrupted.returncode, 0)
+        self.assertEqual(self.mutation_count("worktree-remove"), 1)
+        self.assertEqual(self.mutation_count("local-branch-delete"), 0)
+
+        resumed = self.run_afk("resume")
+
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        self.assert_exact_terminal_completion(run_id)
+        self.assertEqual(self.mutation_count("worktree-move"), 1)
+        self.assertEqual(self.mutation_count("worktree-remove"), 1)
+        self.assertEqual(self.mutation_count("local-branch-delete"), 1)
+
+    def test_terminal_cleanup_reconciles_process_crash_after_local_branch_delete(self):
+        run_id = self.start_bead_closed_run_with_lingering_remote()
+
+        interrupted = self.run_afk(
+            "resume", AFK_TEST_KILL_AFTER_MUTATION="local-branch-delete"
+        )
+
+        self.assertLess(interrupted.returncode, 0)
+        self.assertEqual(self.mutation_count("local-branch-delete"), 1)
+
+        resumed = self.run_afk("resume")
+
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        self.assert_exact_terminal_completion(run_id)
+        self.assertEqual(self.mutation_count("worktree-move"), 1)
+        self.assertEqual(self.mutation_count("worktree-remove"), 1)
+        self.assertEqual(self.mutation_count("local-branch-delete"), 1)
+        self.assertEqual(self.command_count("git", ["update-ref", "-d"]), 1)
 
     def test_terminal_cleanup_reconciles_confirmed_remote_after_worktree_is_gone(
         self,
@@ -1375,6 +1649,45 @@ class StartCliTest(unittest.TestCase):
             encoding="utf-8"
         )
         self.assertEqual(events.count('"event":"run.completed"'), 1)
+
+    def test_resume_recovers_process_crash_before_bead_close_mutation(self):
+        run_id = self.start_reviewed_run()
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+
+        interrupted = self.run_afk("resume", AFK_TEST_KILL_BEFORE_MUTATION="bead-close")
+
+        self.assertLess(interrupted.returncode, 0)
+        self.assertEqual(self.mutation_count("bead-close"), 0)
+
+        resumed = self.run_afk("resume")
+
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        effect = RunStore(self.state_home / "afk").effect(run_id, "bead-close")
+        self.assertEqual(effect["status"], "confirmed")
+        self.assertEqual(effect["observed"], status["bead_closure"])
+        self.assertEqual(self.mutation_count("bead-close"), 1)
+
+    def test_resume_reconciles_process_crash_after_bead_close_mutation(self):
+        run_id = self.start_reviewed_run()
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+
+        interrupted = self.run_afk("resume", AFK_TEST_KILL_AFTER_MUTATION="bead-close")
+
+        self.assertLess(interrupted.returncode, 0)
+        self.assertEqual(self.mutation_count("bead-close"), 1)
+
+        resumed = self.run_afk("resume")
+
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        effect = RunStore(self.state_home / "afk").effect(run_id, "bead-close")
+        self.assertEqual(effect["status"], "confirmed")
+        self.assertEqual(effect["observed"], status["bead_closure"])
+        self.assertEqual(self.mutation_count("bead-close"), 1)
+        self.assertEqual(self.command_count("bd", ["close"]), 1)
 
     def test_resume_reconciles_interruption_after_bead_close_without_second_close(self):
         run_id = self.start_reviewed_run()
@@ -3841,6 +4154,22 @@ class StartCliTest(unittest.TestCase):
                 local_branch_replaced = Path(os.environ["XDG_STATE_HOME"]) / "fake-local-branch-replaced"
                 bead_closed = Path(os.environ["XDG_STATE_HOME"]) / "fake-bead-closed"
                 bead_show_count = Path(os.environ["XDG_STATE_HOME"]) / "fake-bead-show-count"
+                mutation_log = Path(os.environ["XDG_STATE_HOME"]) / "fake-mutations.jsonl"
+
+                def before_mutation(name):
+                    if os.environ.get("AFK_TEST_KILL_BEFORE_MUTATION") == name:
+                        import signal
+                        os.kill(os.getppid(), signal.SIGKILL)
+                        raise SystemExit(137)
+
+                def after_mutation(name):
+                    with mutation_log.open("a", encoding="utf-8") as stream:
+                        stream.write(json.dumps({"mutation": name}) + "\\n")
+                    if os.environ.get("AFK_TEST_KILL_AFTER_MUTATION") == name:
+                        import signal
+                        os.kill(os.getppid(), signal.SIGKILL)
+                        raise SystemExit(137)
+
                 if command == "git":
                     if args[:2] == ["rev-parse", "--show-toplevel"]:
                         print(project)
@@ -4007,11 +4336,13 @@ class StartCliTest(unittest.TestCase):
                     elif args[:2] == ["worktree", "move"]:
                         source = Path(args[-2])
                         destination = Path(args[-1])
+                        before_mutation("worktree-move")
                         destination.parent.mkdir(parents=True, exist_ok=True)
                         source.rename(destination)
                         worktree_quarantined.write_text(
                             str(destination), encoding="utf-8"
                         )
+                        after_mutation("worktree-move")
                         if os.environ.get(
                             "AFK_FAKE_WORKTREE_MOVE_TIMES_OUT_AFTER_MUTATION"
                         ):
@@ -4031,12 +4362,14 @@ class StartCliTest(unittest.TestCase):
                     elif args[:2] == ["worktree", "remove"]:
                         if os.environ.get("AFK_FAKE_WORKTREE_REMOVE_FAILURE"):
                             raise SystemExit(1)
+                        before_mutation("worktree-remove")
                         worktree_removed.write_text("removed", encoding="utf-8")
                         checkout = Path(args[-1])
                         if checkout.exists():
                             import shutil
                             shutil.rmtree(checkout)
                         worktree_quarantined.unlink(missing_ok=True)
+                        after_mutation("worktree-remove")
                         if os.environ.get(
                             "AFK_FAKE_WORKTREE_REMOVE_TIMES_OUT_AFTER_MUTATION"
                         ):
@@ -4064,7 +4397,9 @@ class StartCliTest(unittest.TestCase):
                         current = "a" * 40 if local_branch_replaced.exists() else candidate_sha
                         if len(args) != 4 or args[3] != current:
                             raise SystemExit(1)
+                        before_mutation("local-branch-delete")
                         local_branch_removed.write_text("removed", encoding="utf-8")
+                        after_mutation("local-branch-delete")
                         if os.environ.get(
                             "AFK_FAKE_LOCAL_BRANCH_DELETE_TIMES_OUT_AFTER_MUTATION"
                         ):
@@ -4099,7 +4434,9 @@ class StartCliTest(unittest.TestCase):
                                 )
                                 if expected_lease in args:
                                     raise SystemExit(1)
+                            before_mutation("remote-branch-delete")
                             remote_deleted.write_text("deleted", encoding="utf-8")
+                            after_mutation("remote-branch-delete")
                             if os.environ.get(
                                 "AFK_FAKE_REMOTE_DELETE_TIMES_OUT_AFTER_MUTATION"
                             ):
@@ -4248,9 +4585,11 @@ class StartCliTest(unittest.TestCase):
                     elif args[:2] == ["pr", "ready"]:
                         if os.environ.get("AFK_FAKE_PR_READY_UNAVAILABLE"):
                             raise SystemExit(1)
+                        before_mutation("pr-ready")
                         value = json.loads(pr_state.read_text())
                         value["isDraft"] = False
                         pr_state.write_text(json.dumps(value), encoding="utf-8")
+                        after_mutation("pr-ready")
                         if os.environ.get("AFK_FAKE_PR_READY_INTERRUPTED"):
                             raise SystemExit(1)
                         print(value["url"])
@@ -4260,6 +4599,7 @@ class StartCliTest(unittest.TestCase):
                             value["mergeQueueEntry"] = {"state": "AWAITING_CHECKS"}
                             pr_state.write_text(json.dumps(value), encoding="utf-8")
                             raise SystemExit(0)
+                        before_mutation("pr-merge")
                         value.update(
                             {
                                 "state": "MERGED",
@@ -4272,6 +4612,7 @@ class StartCliTest(unittest.TestCase):
                             remote_deleted.write_text("deleted", encoding="utf-8")
                         if os.environ.get("AFK_FAKE_REPLACED_REMOTE_BRANCH"):
                             remote_replaced.write_text("replaced", encoding="utf-8")
+                        after_mutation("pr-merge")
                         if os.environ.get("AFK_FAKE_PR_MERGE_INTERRUPTED"):
                             raise SystemExit(1)
                     elif args[:1] == ["api"]:
@@ -4398,7 +4739,9 @@ class StartCliTest(unittest.TestCase):
                         if os.environ.get("AFK_FAKE_BEAD_CLOSE_FAILURE"):
                             print("close failed", file=sys.stderr)
                             raise SystemExit(1)
+                        before_mutation("bead-close")
                         bead_closed.write_text(args[args.index("--reason") + 1], encoding="utf-8")
+                        after_mutation("bead-close")
                         if os.environ.get("AFK_FAKE_BEAD_CLOSE_INTERRUPTED"):
                             raise SystemExit(1)
                         print(json.dumps({
