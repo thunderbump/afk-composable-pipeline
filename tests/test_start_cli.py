@@ -27,6 +27,15 @@ from afk.start import (  # noqa: E402
 
 
 BASE_SHA = "a" * 40
+CRASH_INJECTION_OVERRIDES = (
+    "AFK_TEST_KILL_BEFORE_EVENT",
+    "AFK_TEST_KILL_AFTER_EVENT",
+    "AFK_TEST_KILL_AFTER_EVENT_WRITE",
+    "AFK_TEST_KILL_BEFORE_EFFECT",
+    "AFK_TEST_KILL_AFTER_EFFECT",
+    "AFK_TEST_KILL_BEFORE_CONFIRM",
+    "AFK_TEST_KILL_AFTER_CONFIRM",
+)
 
 
 class StartCliTest(unittest.TestCase):
@@ -78,13 +87,11 @@ class StartCliTest(unittest.TestCase):
 
     def run_afk(self, *args, **overrides):
         short_cleanup_timeout = overrides.pop("AFK_TEST_SHORT_CLEANUP_TIMEOUT", None)
-        kill_before_event = overrides.pop("AFK_TEST_KILL_BEFORE_EVENT", None)
-        kill_after_event = overrides.pop("AFK_TEST_KILL_AFTER_EVENT", None)
-        kill_after_event_write = overrides.pop("AFK_TEST_KILL_AFTER_EVENT_WRITE", None)
-        kill_before_effect = overrides.pop("AFK_TEST_KILL_BEFORE_EFFECT", None)
-        kill_after_effect = overrides.pop("AFK_TEST_KILL_AFTER_EFFECT", None)
-        kill_before_confirm = overrides.pop("AFK_TEST_KILL_BEFORE_CONFIRM", None)
-        kill_after_confirm = overrides.pop("AFK_TEST_KILL_AFTER_CONFIRM", None)
+        crash_injections = {
+            key: target
+            for key in CRASH_INJECTION_OVERRIDES
+            if (target := overrides.pop(key, None))
+        }
         env = os.environ.copy()
         env.update(
             {
@@ -109,67 +116,45 @@ class StartCliTest(unittest.TestCase):
         )
         env.update(overrides)
         command = [sys.executable, "-m", "afk", *args]
-        if (
-            kill_before_event
-            or kill_after_event
-            or kill_after_event_write
-            or kill_before_effect
-            or kill_after_effect
-            or kill_before_confirm
-            or kill_after_confirm
-        ):
-            if kill_before_event:
-                env["AFK_TEST_KILL_BEFORE_EVENT"] = kill_before_event
-            if kill_after_event:
-                env["AFK_TEST_KILL_AFTER_EVENT"] = kill_after_event
-            if kill_after_event_write:
-                env["AFK_TEST_KILL_AFTER_EVENT_WRITE"] = kill_after_event_write
-            if kill_before_effect:
-                env["AFK_TEST_KILL_BEFORE_EFFECT"] = kill_before_effect
-            if kill_after_effect:
-                env["AFK_TEST_KILL_AFTER_EFFECT"] = kill_after_effect
-            if kill_before_confirm:
-                env["AFK_TEST_KILL_BEFORE_CONFIRM"] = kill_before_confirm
-            if kill_after_confirm:
-                env["AFK_TEST_KILL_AFTER_CONFIRM"] = kill_after_confirm
+        if crash_injections:
+            env["AFK_TEST_CRASH_INJECTIONS"] = json.dumps(
+                crash_injections, sort_keys=True
+            )
             command = [
                 sys.executable,
                 "-c",
                 (
-                    "import os, signal, sys\n"
+                    "import json, os, signal, sys\n"
                     "from afk.run_store import RunStore\n"
                     "original = RunStore.append_event\n"
                     "original_write = RunStore._append_event_unlocked\n"
                     "original_effect = RunStore.prepare_effect\n"
                     "original_confirm = RunStore.confirm_effect\n"
-                    "before = os.environ.get('AFK_TEST_KILL_BEFORE_EVENT')\n"
-                    "after = os.environ.get('AFK_TEST_KILL_AFTER_EVENT')\n"
-                    "after_write = os.environ.get('AFK_TEST_KILL_AFTER_EVENT_WRITE')\n"
-                    "before_effect = os.environ.get('AFK_TEST_KILL_BEFORE_EFFECT')\n"
-                    "after_effect = os.environ.get('AFK_TEST_KILL_AFTER_EFFECT')\n"
-                    "before_confirm = os.environ.get('AFK_TEST_KILL_BEFORE_CONFIRM')\n"
-                    "after_confirm = os.environ.get('AFK_TEST_KILL_AFTER_CONFIRM')\n"
+                    "injections = json.loads(os.environ['AFK_TEST_CRASH_INJECTIONS'])\n"
                     "def injected(store, run_id, event, **kwargs):\n"
-                    " if event == before: os.kill(os.getpid(), signal.SIGKILL)\n"
+                    " if event == injections.get('AFK_TEST_KILL_BEFORE_EVENT'):\n"
+                    "  os.kill(os.getpid(), signal.SIGKILL)\n"
                     " result = original(store, run_id, event, **kwargs)\n"
-                    " if event == after: os.kill(os.getpid(), signal.SIGKILL)\n"
+                    " if event == injections.get('AFK_TEST_KILL_AFTER_EVENT'):\n"
+                    "  os.kill(os.getpid(), signal.SIGKILL)\n"
                     " return result\n"
                     "def injected_write(store, run_id, event, **kwargs):\n"
                     " result = original_write(store, run_id, event, **kwargs)\n"
-                    " if event == after_write: os.kill(os.getpid(), signal.SIGKILL)\n"
+                    " if event == injections.get('AFK_TEST_KILL_AFTER_EVENT_WRITE'):\n"
+                    "  os.kill(os.getpid(), signal.SIGKILL)\n"
                     " return result\n"
                     "def injected_effect(store, run_id, effect_id, **kwargs):\n"
-                    " if effect_id == before_effect:\n"
+                    " if effect_id == injections.get('AFK_TEST_KILL_BEFORE_EFFECT'):\n"
                     "  os.kill(os.getpid(), signal.SIGKILL)\n"
                     " result = original_effect(store, run_id, effect_id, **kwargs)\n"
-                    " if effect_id == after_effect:\n"
+                    " if effect_id == injections.get('AFK_TEST_KILL_AFTER_EFFECT'):\n"
                     "  os.kill(os.getpid(), signal.SIGKILL)\n"
                     " return result\n"
                     "def injected_confirm(store, run_id, effect_id, **kwargs):\n"
-                    " if effect_id == before_confirm:\n"
+                    " if effect_id == injections.get('AFK_TEST_KILL_BEFORE_CONFIRM'):\n"
                     "  os.kill(os.getpid(), signal.SIGKILL)\n"
                     " result = original_confirm(store, run_id, effect_id, **kwargs)\n"
-                    " if effect_id == after_confirm:\n"
+                    " if effect_id == injections.get('AFK_TEST_KILL_AFTER_CONFIRM'):\n"
                     "  os.kill(os.getpid(), signal.SIGKILL)\n"
                     " return result\n"
                     "RunStore.append_event = injected\n"
