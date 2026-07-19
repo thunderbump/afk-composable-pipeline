@@ -168,7 +168,7 @@ def resume_run(
             return run_id, 0
         raise StartError("named resume is only available for a completed Run")
     with store.lock():
-        projection = store.status()
+        projection = store.resume_status()
         selected_run_id = projection["run_id"]
         if projection["state"] == "completed":
             return selected_run_id, 0

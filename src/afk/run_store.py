@@ -210,6 +210,27 @@ class RunStore:
         events, _ = self._read_events(selected)
         return _project(identity, events)
 
+    def resume_status(self) -> dict[str, Any]:
+        with self.lock():
+            _require_mode(self.root, 0o700, "Run Store directory")
+            active_path = self.root / "active.json"
+            if active_path.exists() or active_path.is_symlink():
+                _require_mode(active_path, 0o600, "Active Run pointer")
+            active_run_id = self._active_pointer_run_id(invalid_is_error=True)
+            projection = self.status()
+            if active_run_id is not None and active_run_id != projection["run_id"]:
+                raise EventHistoryCorrupt(
+                    "Active Run pointer does not match Event History"
+                )
+            self._validate_resume_permissions(projection["run_id"])
+            self._verify_sealed_evidence(projection["run_id"], projection)
+            _atomic_json(self._run_dir(projection["run_id"]) / "state.json", projection)
+            if active_run_id is None:
+                _atomic_json(
+                    self.root / "active.json", {"run_id": projection["run_id"]}
+                )
+            return projection
+
     def reconcile_completed_active_pointer(self, run_id: str) -> dict[str, Any]:
         with self.lock():
             projection = self.status(run_id)
@@ -576,10 +597,40 @@ class RunStore:
             expected_sequence = len(events) + 1
             if (
                 not isinstance(record, dict)
+                or type(record.get("sequence")) is not int
                 or record.get("sequence") != expected_sequence
             ):
                 raise EventHistoryCorrupt(
                     f"Event History sequence must be {expected_sequence}"
+                )
+            expected_keys = {
+                "schema_version",
+                "sequence",
+                "recorded_at",
+                "event",
+                "data",
+            }
+            if "state" in record:
+                expected_keys.add("state")
+            if (
+                set(record) != expected_keys
+                or type(record.get("schema_version")) is not int
+                or record["schema_version"] != SCHEMA_VERSION
+                or not isinstance(record.get("recorded_at"), str)
+                or not record["recorded_at"].strip()
+                or not isinstance(record.get("event"), str)
+                or not record["event"].strip()
+                or not isinstance(record.get("data"), dict)
+                or (
+                    "state" in record
+                    and (
+                        not isinstance(record["state"], str)
+                        or not record["state"].strip()
+                    )
+                )
+            ):
+                raise EventHistoryCorrupt(
+                    f"Event History record {expected_sequence} is invalid"
                 )
             events.append(record)
         return events, complete_bytes
@@ -593,10 +644,36 @@ class RunStore:
             raise RunNotFound(f"Run not found: {run_id}") from exc
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise EventHistoryCorrupt(f"Run identity is invalid: {run_id}") from exc
-        if not isinstance(identity, dict) or identity.get("run_id") != run_id:
-            raise EventHistoryCorrupt(
-                f"Run identity does not match directory: {run_id}"
+        if (
+            not isinstance(identity, dict)
+            or set(identity)
+            != {
+                "schema_version",
+                "run_id",
+                "bead_id",
+                "repository",
+                "base_branch",
+                "base_sha",
+                "created_at",
+                "start_request",
+            }
+            or type(identity.get("schema_version")) is not int
+            or identity["schema_version"] != SCHEMA_VERSION
+            or identity.get("run_id") != run_id
+            or any(
+                not isinstance(identity.get(field), str) or not identity[field].strip()
+                for field in (
+                    "bead_id",
+                    "repository",
+                    "base_branch",
+                    "created_at",
+                )
             )
+            or not isinstance(identity.get("base_sha"), str)
+            or not SHA_PATTERN.fullmatch(identity["base_sha"])
+            or not isinstance(identity.get("start_request"), dict)
+        ):
+            raise EventHistoryCorrupt(f"Run identity is invalid: {run_id}")
         return identity
 
     def _active_run_id(self) -> str | None:
@@ -646,26 +723,62 @@ class RunStore:
         (self.root / "active.json").unlink(missing_ok=True)
         _fsync_directory(self.root)
 
-    def _active_pointer_run_id(self) -> str | None:
+    def _active_pointer_run_id(self, *, invalid_is_error: bool = False) -> str | None:
+        path = self.root / "active.json"
         try:
-            active = json.loads((self.root / "active.json").read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            active = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return None
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            if invalid_is_error:
+                raise EventHistoryCorrupt("Active Run pointer is invalid") from exc
             return None
         if (
             not isinstance(active, dict)
             or set(active) != {"run_id"}
             or not isinstance(active["run_id"], str)
         ):
+            if invalid_is_error:
+                raise EventHistoryCorrupt("Active Run pointer is invalid")
             return None
         try:
             _validate_run_id(active["run_id"])
-        except RunStoreError:
+        except RunStoreError as exc:
+            if invalid_is_error:
+                raise EventHistoryCorrupt("Active Run pointer is invalid") from exc
             return None
         return active["run_id"]
 
     def _run_dir(self, run_id: str) -> Path:
         _validate_run_id(run_id)
         return self.root / "runs" / run_id
+
+    def _verify_sealed_evidence(self, run_id: str, projection: dict[str, Any]) -> None:
+        run_dir = self._run_dir(run_id)
+        action_evidence = _projected_evidence_units(projection)
+        for root_name in sorted(EVIDENCE_ROOTS):
+            root = run_dir / root_name
+            for unit in root.iterdir():
+                if unit.is_symlink() or not unit.is_dir():
+                    raise EvidenceTampered("evidence unit is invalid")
+                relative = f"{root_name}/{unit.name}"
+                if relative in action_evidence:
+                    continue
+                manifest = unit / "manifest.json"
+                if manifest.exists() or manifest.is_symlink():
+                    self.verify_evidence(run_id, relative)
+
+    def _validate_resume_permissions(self, run_id: str) -> None:
+        run_dir = self._run_dir(run_id)
+        _require_mode(run_dir, 0o700, "Run directory")
+        for name in ("run.json", "events.jsonl"):
+            _require_mode(run_dir / name, 0o600, f"Run {name}")
+        effects = run_dir / "effects"
+        _require_mode(effects, 0o700, "Effect directory")
+        for effect in effects.iterdir():
+            _require_mode(effect, 0o600, "Effect record")
+        for root_name in EVIDENCE_ROOTS:
+            _require_mode(run_dir / root_name, 0o700, "evidence root")
 
     def _evidence_path(self, run_id: str, relative: str) -> Path:
         parts = Path(relative).parts
@@ -693,6 +806,30 @@ class RunStore:
 def _validate_run_id(run_id: str) -> None:
     if not RUN_ID_PATTERN.fullmatch(run_id):
         raise RunStoreError("run_id contains unsupported characters")
+
+
+def _require_mode(path: Path, mode: int, label: str) -> None:
+    try:
+        metadata = path.lstat()
+    except OSError as exc:
+        raise EventHistoryCorrupt(f"{label} is invalid") from exc
+    if stat.S_ISLNK(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) != mode:
+        raise EventHistoryCorrupt(f"{label} permissions are invalid")
+
+
+def _projected_evidence_units(value: Any) -> set[str]:
+    units: set[str] = set()
+    if isinstance(value, dict):
+        for key, nested in value.items():
+            if key == "evidence" and isinstance(nested, str):
+                parts = Path(nested).parts
+                if len(parts) >= 2 and parts[0] in EVIDENCE_ROOTS:
+                    units.add(f"{parts[0]}/{parts[1]}")
+            units.update(_projected_evidence_units(nested))
+    elif isinstance(value, list):
+        for nested in value:
+            units.update(_projected_evidence_units(nested))
+    return units
 
 
 def _validate_manifest(manifest: Any) -> list[dict[str, Any]]:

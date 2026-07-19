@@ -3397,6 +3397,117 @@ class StartCliTest(unittest.TestCase):
         status = json.loads(self.run_afk("status", "--json").stdout)
         self.assertEqual(status["unit"], "afk-crashed-run-worker-1")
 
+    def create_resume_preflight_run(self):
+        store = RunStore(self.state_home / "afk")
+        store.create_run(
+            bead_id="central-bnkl.1.1",
+            repository="thunderbump/beads-webui",
+            base_branch="main",
+            base_sha=BASE_SHA,
+            start_request={"repository_root": str(self.project)},
+            run_id="crashed-run",
+        )
+        store.prepare_effect(
+            "crashed-run",
+            "worker-launch-1",
+            kind="worker-launch",
+            intended={"unit": "afk-crashed-run-worker-1"},
+        )
+        return store, self.state_home / "afk" / "runs" / "crashed-run"
+
+    def assert_resume_preflight_rejected(self, message):
+        resumed = self.run_afk("resume")
+        self.assertEqual(resumed.returncode, 2)
+        self.assertIn(message, resumed.stderr)
+        self.assertFalse(self.command_log.exists())
+
+    def test_resume_rejects_a_malformed_active_pointer_before_external_commands(self):
+        self.create_resume_preflight_run()
+        (self.state_home / "afk" / "active.json").write_text(
+            '{"run_id":', encoding="utf-8"
+        )
+
+        self.assert_resume_preflight_rejected("Active Run pointer is invalid")
+
+    def test_resume_rejects_invalid_event_schema_before_external_commands(self):
+        _, run_dir = self.create_resume_preflight_run()
+        events_path = run_dir / "events.jsonl"
+        event = json.loads(events_path.read_text(encoding="utf-8"))
+        event["data"] = []
+        events_path.write_text(json.dumps(event) + "\n", encoding="utf-8")
+
+        self.assert_resume_preflight_rejected("Event History record 1 is invalid")
+
+    def test_resume_rejects_wrong_event_version_before_external_commands(self):
+        _, run_dir = self.create_resume_preflight_run()
+        events_path = run_dir / "events.jsonl"
+        event = json.loads(events_path.read_text(encoding="utf-8"))
+        event["schema_version"] = 2
+        events_path.write_text(json.dumps(event) + "\n", encoding="utf-8")
+
+        self.assert_resume_preflight_rejected("Event History record 1 is invalid")
+
+    def test_resume_rejects_invalid_run_identity_before_external_commands(self):
+        _, run_dir = self.create_resume_preflight_run()
+        identity_path = run_dir / "run.json"
+        identity = json.loads(identity_path.read_text(encoding="utf-8"))
+        identity["schema_version"] = 2
+        identity_path.write_text(json.dumps(identity) + "\n", encoding="utf-8")
+
+        self.assert_resume_preflight_rejected("Run identity is invalid: crashed-run")
+
+    def test_resume_rejects_malformed_run_identity_before_external_commands(self):
+        _, run_dir = self.create_resume_preflight_run()
+        identity_path = run_dir / "run.json"
+        identity = json.loads(identity_path.read_text(encoding="utf-8"))
+        identity["start_request"] = []
+        identity_path.write_text(json.dumps(identity) + "\n", encoding="utf-8")
+
+        self.assert_resume_preflight_rejected("Run identity is invalid: crashed-run")
+
+    def test_resume_rejects_tampered_sealed_evidence_before_external_commands(self):
+        store, _ = self.create_resume_preflight_run()
+        result_path = store.write_evidence_text(
+            "crashed-run", "attempts/attempt-1/result.txt", "complete\n"
+        )
+        store.seal_evidence("crashed-run", "attempts/attempt-1")
+        result_path.chmod(0o600)
+        result_path.write_text("tampered\n", encoding="utf-8")
+
+        self.assert_resume_preflight_rejected("evidence does not match its manifest")
+
+    def test_resume_rejects_insecure_run_store_permissions_before_commands(self):
+        self.create_resume_preflight_run()
+        (self.state_home / "afk" / "active.json").chmod(0o644)
+
+        self.assert_resume_preflight_rejected(
+            "Active Run pointer permissions are invalid"
+        )
+
+    def test_resume_regenerates_safe_active_pointer_and_projection(self):
+        store, run_dir = self.create_resume_preflight_run()
+        store.confirm_effect(
+            "crashed-run",
+            "worker-launch-1",
+            observed={"unit": "afk-crashed-run-worker-1"},
+        )
+        (self.state_home / "afk" / "active.json").unlink()
+        (run_dir / "state.json").write_text("{stale", encoding="utf-8")
+
+        resumed = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="active")
+
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        self.assertEqual(
+            json.loads(
+                (self.state_home / "afk" / "active.json").read_text(encoding="utf-8")
+            ),
+            {"run_id": "crashed-run"},
+        )
+        self.assertEqual(
+            json.loads((run_dir / "state.json").read_text(encoding="utf-8")),
+            store.status("crashed-run"),
+        )
+
     def test_worker_unit_persists_normalized_terminal_results(self):
         for exit_code, result in (
             (0, "completed"),
