@@ -268,7 +268,7 @@ class RunStore:
                 _require_mode(active_path, 0o600, "Active Run pointer")
             active_run_id = self._active_pointer_run_id(invalid_is_error=True)
             projection = self.status()
-            self._read_events(projection["run_id"], require_complete=True)
+            events, _ = self._read_events(projection["run_id"], require_complete=True)
             if active_run_id is not None and active_run_id != projection["run_id"]:
                 raise EventHistoryCorrupt(
                     "Active Run pointer does not match Event History"
@@ -276,7 +276,10 @@ class RunStore:
             self._validate_resume_permissions(projection["run_id"])
             self._validate_resume_effects(projection["run_id"])
             self._verify_sealed_evidence(projection["run_id"], projection)
-            _validate_open_attempts(projection)
+            _validate_open_attempts(
+                projection,
+                open_validation_attempt=_open_validation_attempt(events),
+            )
             _atomic_json(self._run_dir(projection["run_id"]) / "state.json", projection)
             if active_run_id is None:
                 _atomic_json(
@@ -1044,18 +1047,46 @@ def _project(identity: dict[str, Any], events: list[dict[str, Any]]) -> dict[str
     return projection
 
 
-def _validate_open_attempts(projection: dict[str, Any]) -> None:
+def _open_validation_attempt(events: list[dict[str, Any]]) -> tuple[bool, Any]:
+    is_open = False
+    attempt: Any = None
+    for event in events:
+        if event["event"] == "validation.attempt_started":
+            is_open = True
+            attempt = event["data"].get("validation_attempt")
+        elif event["event"] == "validation.attempt_finished" and is_open:
+            finished = event["data"].get("validation_attempt")
+            if (
+                isinstance(attempt, dict)
+                and isinstance(finished, dict)
+                and isinstance(attempt.get("attempt_id"), str)
+                and finished.get("attempt_id") == attempt["attempt_id"]
+            ):
+                is_open = False
+                attempt = None
+    return is_open, attempt
+
+
+def _validate_open_attempts(
+    projection: dict[str, Any], *, open_validation_attempt: tuple[bool, Any]
+) -> None:
     validation = projection.get("validation_attempt")
-    if isinstance(validation, dict) and validation.get("status") == "started":
-        attempt_id = validation.get("attempt_id")
+    validation_is_open, started_validation = open_validation_attempt
+    if validation_is_open:
+        attempt_id = (
+            validation.get("attempt_id") if isinstance(validation, dict) else None
+        )
         if (
-            set(validation) != {"attempt_id", "candidate_sha", "status", "evidence"}
+            not isinstance(validation, dict)
+            or set(validation) != {"attempt_id", "candidate_sha", "status", "evidence"}
+            or validation.get("status") != "started"
             or not isinstance(attempt_id, str)
             or not RUN_ID_PATTERN.fullmatch(attempt_id)
             or not isinstance(validation.get("candidate_sha"), str)
             or not SHA_PATTERN.fullmatch(validation["candidate_sha"])
             or validation.get("candidate_sha") != projection.get("candidate_sha")
             or validation.get("evidence") != f"attempts/{attempt_id}"
+            or validation != started_validation
         ):
             raise ResumePreflightInvalid("open validation attempt is invalid")
 

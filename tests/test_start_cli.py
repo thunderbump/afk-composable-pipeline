@@ -3591,6 +3591,50 @@ class StartCliTest(unittest.TestCase):
             "open validation attempt is invalid", status["attention"]["summary"]
         )
 
+    def test_resume_repeatedly_rejects_malformed_outstanding_validation_attempt(self):
+        store, _ = self.create_resume_preflight_run()
+        attempt = {
+            "attempt_id": "validation-bbbbbbbbbbbb",
+            "candidate_sha": "b" * 40,
+            "status": "started",
+            "evidence": "attempts/validation-bbbbbbbbbbbb",
+        }
+        store.append_event(
+            "crashed-run",
+            "validation.attempt_started",
+            state="candidate_ready",
+            data={
+                "checkpoint": "candidate_ready",
+                "candidate_sha": "b" * 40,
+                "validation_attempt": attempt,
+            },
+        )
+        store.append_event(
+            "crashed-run",
+            "run.attention_required",
+            state="attention_required",
+            data={
+                "checkpoint": "candidate_ready",
+                "worker_exit_code": 0,
+                "attention": {"scope": "validation", "kind": "unavailable"},
+                "validation_attempt": {
+                    key: value for key, value in attempt.items() if key != "status"
+                },
+            },
+        )
+
+        first = self.run_afk("resume")
+        second = self.run_afk("resume")
+
+        self.assertEqual(first.returncode, 2)
+        self.assertEqual(second.returncode, 2)
+        self.assertFalse(self.command_log.exists())
+        status = store.status("crashed-run")
+        self.assertEqual(status["attention"]["kind"], "invalid")
+        self.assertIn(
+            "open validation attempt is invalid", status["attention"]["summary"]
+        )
+
     def test_resume_rejects_unrelated_malformed_effect_before_commands(self):
         store, run_dir = self.create_resume_preflight_run()
         malformed = run_dir / "effects" / "unrelated.json"
