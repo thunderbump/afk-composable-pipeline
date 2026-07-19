@@ -279,6 +279,7 @@ class RunStore:
             _validate_open_attempts(
                 projection,
                 open_validation_attempt=_open_validation_attempt(events),
+                open_repair_attempt=_open_repair_attempt(events),
             )
             _atomic_json(self._run_dir(projection["run_id"]) / "state.json", projection)
             if active_run_id is None:
@@ -1067,8 +1068,29 @@ def _open_validation_attempt(events: list[dict[str, Any]]) -> tuple[bool, Any]:
     return is_open, attempt
 
 
+def _open_repair_attempt(events: list[dict[str, Any]]) -> tuple[bool, Any, Any]:
+    is_open = False
+    brief: Any = None
+    consumed_slot: Any = None
+    for event in events:
+        if event["event"] == "repair.started":
+            is_open = True
+            brief = event["data"].get("repair_brief")
+            consumed_slot = event["data"].get("repair_attempts_used")
+        elif event["event"] in {"candidate.repaired", "repair.interrupted"} and (
+            is_open and event["data"].get("repair_attempts_used") == consumed_slot
+        ):
+            is_open = False
+            brief = None
+            consumed_slot = None
+    return is_open, brief, consumed_slot
+
+
 def _validate_open_attempts(
-    projection: dict[str, Any], *, open_validation_attempt: tuple[bool, Any]
+    projection: dict[str, Any],
+    *,
+    open_validation_attempt: tuple[bool, Any],
+    open_repair_attempt: tuple[bool, Any, Any],
 ) -> None:
     validation = projection.get("validation_attempt")
     validation_is_open, started_validation = open_validation_attempt
@@ -1090,16 +1112,9 @@ def _validate_open_attempts(
         ):
             raise ResumePreflightInvalid("open validation attempt is invalid")
 
+    repair_is_open, started_repair, consumed_slot = open_repair_attempt
     repair = projection.get("repair_brief")
     repair_attempt = repair.get("repair_attempt") if isinstance(repair, dict) else None
-    attention = projection.get("attention")
-    repair_is_open = projection.get("last_event") == "repair.started" or (
-        isinstance(attention, dict)
-        and attention.get("scope") == "repair"
-        and repair_attempt == projection.get("repair_attempts_used")
-        and isinstance(repair, dict)
-        and repair.get("candidate_sha") == projection.get("candidate_sha")
-    )
     if repair_is_open and (
         not isinstance(repair, dict)
         or not repair
@@ -1125,7 +1140,10 @@ def _validate_open_attempts(
         or repair.get("candidate_sha") != projection.get("candidate_sha")
         or type(repair_attempt) is not int
         or not 1 <= repair_attempt <= 4
+        or repair_attempt != consumed_slot
+        or projection.get("repair_attempts_used") != consumed_slot
         or not isinstance(repair.get("blocking_findings"), list)
+        or repair != started_repair
     ):
         raise ResumePreflightInvalid("open repair attempt is invalid")
 

@@ -3635,6 +3635,59 @@ class StartCliTest(unittest.TestCase):
             "open validation attempt is invalid", status["attention"]["summary"]
         )
 
+    def test_resume_repeatedly_rejects_misbound_outstanding_repair_attempt(self):
+        store, _ = self.create_resume_preflight_run()
+        brief = {
+            "schema_version": 1,
+            "candidate_sha": "b" * 40,
+            "repair_attempt": 1,
+            "blocking_findings": [],
+        }
+        store.append_event(
+            "crashed-run",
+            "gate.cycle_completed",
+            state="validated",
+            data={
+                "checkpoint": "validated",
+                "candidate_sha": "b" * 40,
+                "gate_cycles": [{"next_action": "repair", "repair_brief": brief}],
+            },
+        )
+        store.append_event(
+            "crashed-run",
+            "repair.started",
+            data={
+                "checkpoint": "validated",
+                "repair_attempts_used": 1,
+                "repair_brief": brief,
+            },
+        )
+        store.append_event(
+            "crashed-run",
+            "run.attention_required",
+            state="attention_required",
+            data={
+                "checkpoint": "validated",
+                "attention": {"scope": "repair", "kind": "unavailable"},
+                "repair_attempts_used": 2,
+                "repair_brief": {
+                    **brief,
+                    "candidate_sha": "c" * 40,
+                    "repair_attempt": 2,
+                },
+            },
+        )
+
+        first = self.run_afk("resume")
+        second = self.run_afk("resume")
+
+        self.assertEqual(first.returncode, 2)
+        self.assertEqual(second.returncode, 2)
+        self.assertFalse(self.command_log.exists())
+        status = store.status("crashed-run")
+        self.assertEqual(status["attention"]["kind"], "invalid")
+        self.assertIn("open repair attempt is invalid", status["attention"]["summary"])
+
     def test_resume_rejects_unrelated_malformed_effect_before_commands(self):
         store, run_dir = self.create_resume_preflight_run()
         malformed = run_dir / "effects" / "unrelated.json"
