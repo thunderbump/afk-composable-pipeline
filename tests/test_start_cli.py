@@ -177,9 +177,11 @@ class StartCliTest(unittest.TestCase):
             for line in path.read_text(encoding="utf-8").splitlines()
         )
 
-    def command_count(self, command, prefix):
+    def command_count(self, command, prefix, *, argument=None):
         return sum(
-            record["command"] == command and record["args"][: len(prefix)] == prefix
+            record["command"] == command
+            and record["args"][: len(prefix)] == prefix
+            and (argument is None or argument in record["args"])
             for record in map(
                 json.loads,
                 self.command_log.read_text(encoding="utf-8").splitlines(),
@@ -428,16 +430,7 @@ class StartCliTest(unittest.TestCase):
         after = json.loads(self.run_afk("status", run_id, "--json").stdout)
         self.assertEqual(after["checkpoint"], "reviewed")
         self.assertEqual(after["pr_ready"], effect["observed"])
-        commands = [
-            json.loads(line)
-            for line in self.command_log.read_text(encoding="utf-8").splitlines()
-        ]
-        ready_commands = [
-            record
-            for record in commands
-            if record["command"] == "gh" and record["args"][:2] == ["pr", "ready"]
-        ]
-        self.assertEqual(len(ready_commands), 1)
+        self.assertEqual(self.command_count("gh", ["pr", "ready"]), 1)
 
     def test_resume_recovers_process_crash_before_pr_ready_mutation(self):
         run_id = self.start_reviewed_run()
@@ -518,22 +511,8 @@ class StartCliTest(unittest.TestCase):
         after = json.loads(self.run_afk("status", run_id, "--json").stdout)
         self.assertEqual(after["checkpoint"], "merged")
         self.assertEqual(after["pr_ready"], effect["observed"])
-        commands = [
-            json.loads(line)
-            for line in self.command_log.read_text(encoding="utf-8").splitlines()
-        ]
-        ready_commands = [
-            record
-            for record in commands
-            if record["command"] == "gh" and record["args"][:2] == ["pr", "ready"]
-        ]
-        merge_commands = [
-            record
-            for record in commands
-            if record["command"] == "gh" and record["args"][:2] == ["pr", "merge"]
-        ]
-        self.assertEqual(len(ready_commands), 1)
-        self.assertEqual(len(merge_commands), 1)
+        self.assertEqual(self.command_count("gh", ["pr", "ready"]), 1)
+        self.assertEqual(self.command_count("gh", ["pr", "merge"]), 1)
 
     def test_resume_squash_merges_the_exact_ready_candidate(self):
         run_id = self.start_reviewed_run()
@@ -678,16 +657,7 @@ class StartCliTest(unittest.TestCase):
         after = json.loads(self.run_afk("status", run_id, "--json").stdout)
         self.assertEqual(after["checkpoint"], "merged")
         self.assertEqual(after["merge"], effect["observed"])
-        commands = [
-            json.loads(line)
-            for line in self.command_log.read_text(encoding="utf-8").splitlines()
-        ]
-        merge_commands = [
-            record
-            for record in commands
-            if record["command"] == "gh" and record["args"][:2] == ["pr", "merge"]
-        ]
-        self.assertEqual(len(merge_commands), 1)
+        self.assertEqual(self.command_count("gh", ["pr", "merge"]), 1)
 
     def test_resume_recovers_crash_after_merged_state_append(self):
         run_id = self.start_reviewed_run()
@@ -721,22 +691,8 @@ class StartCliTest(unittest.TestCase):
         self.assertEqual(closed.returncode, 0, closed.stderr)
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assert_exact_terminal_completion(run_id)
-        commands = [
-            json.loads(line)
-            for line in self.command_log.read_text(encoding="utf-8").splitlines()
-        ]
-        merge_commands = [
-            record
-            for record in commands
-            if record["command"] == "gh" and record["args"][:2] == ["pr", "merge"]
-        ]
-        close_commands = [
-            record
-            for record in commands
-            if record["command"] == "bd" and record["args"][:1] == ["close"]
-        ]
-        self.assertEqual(len(merge_commands), 1)
-        self.assertEqual(len(close_commands), 1)
+        self.assertEqual(self.command_count("gh", ["pr", "merge"]), 1)
+        self.assertEqual(self.command_count("bd", ["close"]), 1)
 
     def test_resume_recovers_process_crash_before_pr_merge_mutation(self):
         run_id = self.start_reviewed_run()
@@ -1878,16 +1834,7 @@ class StartCliTest(unittest.TestCase):
         after = json.loads(self.run_afk("status", run_id, "--json").stdout)
         self.assertEqual(after["checkpoint"], "bead_closed")
         self.assertEqual(after["bead_closure"], effect["observed"])
-        commands = [
-            json.loads(line)
-            for line in self.command_log.read_text(encoding="utf-8").splitlines()
-        ]
-        close_commands = [
-            record
-            for record in commands
-            if record["command"] == "bd" and record["args"][:1] == ["close"]
-        ]
-        self.assertEqual(len(close_commands), 1)
+        self.assertEqual(self.command_count("bd", ["close"]), 1)
 
     def test_resume_recovers_crash_after_bead_closed_state_append(self):
         run_id = self.start_reviewed_run()
@@ -1920,16 +1867,7 @@ class StartCliTest(unittest.TestCase):
 
         self.assertEqual(resumed.returncode, 0, resumed.stderr)
         self.assert_exact_terminal_completion(run_id)
-        commands = [
-            json.loads(line)
-            for line in self.command_log.read_text(encoding="utf-8").splitlines()
-        ]
-        close_commands = [
-            record
-            for record in commands
-            if record["command"] == "bd" and record["args"][:1] == ["close"]
-        ]
-        self.assertEqual(len(close_commands), 1)
+        self.assertEqual(self.command_count("bd", ["close"]), 1)
 
     def test_resume_retries_only_bead_close_after_close_failure(self):
         run_id = self.start_reviewed_run()
@@ -2200,16 +2138,7 @@ class StartCliTest(unittest.TestCase):
         self.assertEqual(self.run_afk("resume").returncode, 0)
 
         self.assert_exact_terminal_completion(run_id)
-        commands = [
-            json.loads(line)
-            for line in self.command_log.read_text(encoding="utf-8").splitlines()
-        ]
-        deletes = [
-            record
-            for record in commands
-            if record["command"] == "git" and "--delete" in record["args"]
-        ]
-        self.assertEqual(deletes, [])
+        self.assertEqual(self.command_count("git", [], argument="--delete"), 0)
 
     def test_resume_recovers_crash_after_remote_delete_state_append(self):
         run_id = self.start_reviewed_run()
@@ -2240,22 +2169,8 @@ class StartCliTest(unittest.TestCase):
         self.assertEqual(self.run_afk("resume").returncode, 0)
 
         self.assert_exact_terminal_completion(run_id)
-        commands = [
-            json.loads(line)
-            for line in self.command_log.read_text(encoding="utf-8").splitlines()
-        ]
-        merge_commands = [
-            record
-            for record in commands
-            if record["command"] == "gh" and record["args"][:2] == ["pr", "merge"]
-        ]
-        delete_commands = [
-            record
-            for record in commands
-            if record["command"] == "git" and "--delete" in record["args"]
-        ]
-        self.assertEqual(len(merge_commands), 1)
-        self.assertEqual(delete_commands, [])
+        self.assertEqual(self.command_count("gh", ["pr", "merge"]), 1)
+        self.assertEqual(self.command_count("git", [], argument="--delete"), 0)
 
     def test_resume_closes_bead_without_reobserving_cleanup_origin(self):
         run_id = self.start_reviewed_run()
