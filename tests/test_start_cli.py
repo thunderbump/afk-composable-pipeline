@@ -80,6 +80,7 @@ class StartCliTest(unittest.TestCase):
         short_cleanup_timeout = overrides.pop("AFK_TEST_SHORT_CLEANUP_TIMEOUT", None)
         kill_before_event = overrides.pop("AFK_TEST_KILL_BEFORE_EVENT", None)
         kill_after_event = overrides.pop("AFK_TEST_KILL_AFTER_EVENT", None)
+        kill_after_event_write = overrides.pop("AFK_TEST_KILL_AFTER_EVENT_WRITE", None)
         env = os.environ.copy()
         env.update(
             {
@@ -104,11 +105,13 @@ class StartCliTest(unittest.TestCase):
         )
         env.update(overrides)
         command = [sys.executable, "-m", "afk", *args]
-        if kill_before_event or kill_after_event:
+        if kill_before_event or kill_after_event or kill_after_event_write:
             if kill_before_event:
                 env["AFK_TEST_KILL_BEFORE_EVENT"] = kill_before_event
             if kill_after_event:
                 env["AFK_TEST_KILL_AFTER_EVENT"] = kill_after_event
+            if kill_after_event_write:
+                env["AFK_TEST_KILL_AFTER_EVENT_WRITE"] = kill_after_event_write
             command = [
                 sys.executable,
                 "-c",
@@ -116,14 +119,21 @@ class StartCliTest(unittest.TestCase):
                     "import os, signal, sys\n"
                     "from afk.run_store import RunStore\n"
                     "original = RunStore.append_event\n"
+                    "original_write = RunStore._append_event_unlocked\n"
                     "before = os.environ.get('AFK_TEST_KILL_BEFORE_EVENT')\n"
                     "after = os.environ.get('AFK_TEST_KILL_AFTER_EVENT')\n"
+                    "after_write = os.environ.get('AFK_TEST_KILL_AFTER_EVENT_WRITE')\n"
                     "def injected(store, run_id, event, **kwargs):\n"
                     " if event == before: os.kill(os.getpid(), signal.SIGKILL)\n"
                     " result = original(store, run_id, event, **kwargs)\n"
                     " if event == after: os.kill(os.getpid(), signal.SIGKILL)\n"
                     " return result\n"
+                    "def injected_write(store, run_id, event, **kwargs):\n"
+                    " result = original_write(store, run_id, event, **kwargs)\n"
+                    " if event == after_write: os.kill(os.getpid(), signal.SIGKILL)\n"
+                    " return result\n"
                     "RunStore.append_event = injected\n"
+                    "RunStore._append_event_unlocked = injected_write\n"
                     "from afk.cli import main\n"
                     "raise SystemExit(main(sys.argv[1:]))\n"
                 ),
@@ -494,6 +504,76 @@ class StartCliTest(unittest.TestCase):
             if record["command"] == "gh" and record["args"][:2] == ["pr", "merge"]
         ]
         self.assertEqual(len(merge_commands), 1)
+
+    def test_resume_recovers_crash_before_merged_state_append(self):
+        run_id = self.start_reviewed_run()
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+
+        interrupted = self.run_afk(
+            "resume", AFK_TEST_KILL_BEFORE_EVENT="pr.squash_merged"
+        )
+
+        self.assertLess(interrupted.returncode, 0)
+        before = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(before["checkpoint"], "reviewed")
+        self.assertNotIn("merge", before)
+        store = RunStore(self.state_home / "afk")
+        self.assertEqual(store.effect(run_id, "pr-squash-merge")["status"], "confirmed")
+
+        resumed = self.run_afk("resume")
+
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        after = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(after["checkpoint"], "merged")
+        self.assertEqual(after["merge"]["candidate_sha"], "d" * 40)
+        commands = [
+            json.loads(line)
+            for line in self.command_log.read_text(encoding="utf-8").splitlines()
+        ]
+        merge_commands = [
+            record
+            for record in commands
+            if record["command"] == "gh" and record["args"][:2] == ["pr", "merge"]
+        ]
+        self.assertEqual(len(merge_commands), 1)
+
+    def test_resume_recovers_crash_after_merged_state_append(self):
+        run_id = self.start_reviewed_run()
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+
+        interrupted = self.run_afk(
+            "resume", AFK_TEST_KILL_AFTER_EVENT="pr.squash_merged"
+        )
+
+        self.assertLess(interrupted.returncode, 0)
+        before = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(before["checkpoint"], "merged")
+        self.assertEqual(before["merge"]["candidate_sha"], "d" * 40)
+
+        closed = self.run_afk("resume")
+        completed = self.run_afk("resume")
+
+        self.assertEqual(closed.returncode, 0, closed.stderr)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        after = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(after["checkpoint"], "completed")
+        self.assertTrue(after["completion"]["remote_branch_deleted"])
+        commands = [
+            json.loads(line)
+            for line in self.command_log.read_text(encoding="utf-8").splitlines()
+        ]
+        merge_commands = [
+            record
+            for record in commands
+            if record["command"] == "gh" and record["args"][:2] == ["pr", "merge"]
+        ]
+        close_commands = [
+            record
+            for record in commands
+            if record["command"] == "bd" and record["args"][:1] == ["close"]
+        ]
+        self.assertEqual(len(merge_commands), 1)
+        self.assertEqual(len(close_commands), 1)
 
     def test_resume_closes_bead_after_merged_candidate_branch_was_replaced(self):
         run_id = self.start_reviewed_run()
@@ -1247,6 +1327,55 @@ class StartCliTest(unittest.TestCase):
         self.assertTrue((self.state_home / "afk" / "worktrees" / run_id).exists())
         self.assertEqual(self.command_log.read_text(encoding="utf-8"), commands_before)
 
+    def test_resume_recovers_crash_before_completed_state_append(self):
+        run_id = self.start_reviewed_run()
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+
+        interrupted = self.run_afk("resume", AFK_TEST_KILL_BEFORE_EVENT="run.completed")
+
+        self.assertLess(interrupted.returncode, 0)
+        before = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(before["checkpoint"], "bead_closed")
+        evidence = f"gates/completion-{before['candidate_sha'][:12]}"
+        store = RunStore(self.state_home / "afk")
+        self.assertIsNotNone(store.sealed_evidence_result(run_id, evidence))
+        commands_before = self.command_log.read_text(encoding="utf-8")
+
+        resumed = self.run_afk("resume")
+
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        after = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(after["checkpoint"], "completed")
+        self.assertEqual(self.command_log.read_text(encoding="utf-8"), commands_before)
+
+    def test_resume_recovers_crash_after_completed_event_write(self):
+        run_id = self.start_reviewed_run()
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+
+        interrupted = self.run_afk(
+            "resume", AFK_TEST_KILL_AFTER_EVENT_WRITE="run.completed"
+        )
+
+        self.assertLess(interrupted.returncode, 0)
+        completed = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(completed["checkpoint"], "completed")
+        active = self.state_home / "afk" / "active.json"
+        self.assertTrue(active.is_file())
+
+        resumed = self.run_afk("resume")
+
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        self.assertEqual(resumed.stdout.strip(), run_id)
+        self.assertFalse(active.exists())
+        events = (self.state_home / "afk" / "runs" / run_id / "events.jsonl").read_text(
+            encoding="utf-8"
+        )
+        self.assertEqual(events.count('"event":"run.completed"'), 1)
+
     def test_resume_reconciles_interruption_after_bead_close_without_second_close(self):
         run_id = self.start_reviewed_run()
         self.assertEqual(self.run_afk("resume").returncode, 0)
@@ -1283,6 +1412,66 @@ class StartCliTest(unittest.TestCase):
         ]
         self.assertEqual(len(close_commands), 1)
         self.assertEqual(len(merge_commands), 1)
+
+    def test_resume_recovers_crash_before_bead_closed_state_append(self):
+        run_id = self.start_reviewed_run()
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+
+        interrupted = self.run_afk("resume", AFK_TEST_KILL_BEFORE_EVENT="bead.closed")
+
+        self.assertLess(interrupted.returncode, 0)
+        before = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(before["checkpoint"], "merged")
+        self.assertNotIn("bead_closure", before)
+        store = RunStore(self.state_home / "afk")
+        self.assertEqual(store.effect(run_id, "bead-close")["status"], "confirmed")
+
+        resumed = self.run_afk("resume")
+
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        after = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(after["checkpoint"], "bead_closed")
+        self.assertEqual(after["bead_closure"]["merge_commit"], "f" * 40)
+        commands = [
+            json.loads(line)
+            for line in self.command_log.read_text(encoding="utf-8").splitlines()
+        ]
+        close_commands = [
+            record
+            for record in commands
+            if record["command"] == "bd" and record["args"][:1] == ["close"]
+        ]
+        self.assertEqual(len(close_commands), 1)
+
+    def test_resume_recovers_crash_after_bead_closed_state_append(self):
+        run_id = self.start_reviewed_run()
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+
+        interrupted = self.run_afk("resume", AFK_TEST_KILL_AFTER_EVENT="bead.closed")
+
+        self.assertLess(interrupted.returncode, 0)
+        before = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(before["checkpoint"], "bead_closed")
+        self.assertEqual(before["bead_closure"]["merge_commit"], "f" * 40)
+
+        resumed = self.run_afk("resume")
+
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        after = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(after["checkpoint"], "completed")
+        self.assertEqual(after["completion"]["bead_closure"], before["bead_closure"])
+        commands = [
+            json.loads(line)
+            for line in self.command_log.read_text(encoding="utf-8").splitlines()
+        ]
+        close_commands = [
+            record
+            for record in commands
+            if record["command"] == "bd" and record["args"][:1] == ["close"]
+        ]
+        self.assertEqual(len(close_commands), 1)
 
     def test_resume_retries_only_bead_close_after_close_failure(self):
         run_id = self.start_reviewed_run()
@@ -1523,6 +1712,77 @@ class StartCliTest(unittest.TestCase):
             if record["command"] == "gh" and record["args"][:2] == ["pr", "merge"]
         ]
         self.assertEqual(len(merge_commands), 1)
+
+    def test_resume_recovers_crash_before_remote_delete_state_append(self):
+        run_id = self.start_reviewed_run()
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+
+        interrupted = self.run_afk(
+            "resume",
+            AFK_TEST_KILL_BEFORE_EVENT="pr.merge_reconciled",
+        )
+
+        self.assertLess(interrupted.returncode, 0)
+        before = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(before["checkpoint"], "merged")
+        self.assertFalse(before["remote_branch_deleted"])
+        store = RunStore(self.state_home / "afk")
+        self.assertEqual(
+            store.effect(run_id, "remote-branch-delete")["status"], "confirmed"
+        )
+
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+
+        after = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(after["checkpoint"], "completed")
+        self.assertTrue(after["completion"]["remote_branch_deleted"])
+        commands = [
+            json.loads(line)
+            for line in self.command_log.read_text(encoding="utf-8").splitlines()
+        ]
+        deletes = [
+            record
+            for record in commands
+            if record["command"] == "git" and "--delete" in record["args"]
+        ]
+        self.assertEqual(deletes, [])
+
+    def test_resume_recovers_crash_after_remote_delete_state_append(self):
+        run_id = self.start_reviewed_run()
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+
+        interrupted = self.run_afk(
+            "resume", AFK_TEST_KILL_AFTER_EVENT="pr.merge_reconciled"
+        )
+
+        self.assertLess(interrupted.returncode, 0)
+        before = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(before["checkpoint"], "merged")
+        self.assertTrue(before["remote_branch_deleted"])
+
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+
+        after = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(after["checkpoint"], "completed")
+        self.assertTrue(after["completion"]["remote_branch_deleted"])
+        commands = [
+            json.loads(line)
+            for line in self.command_log.read_text(encoding="utf-8").splitlines()
+        ]
+        merge_commands = [
+            record
+            for record in commands
+            if record["command"] == "gh" and record["args"][:2] == ["pr", "merge"]
+        ]
+        delete_commands = [
+            record
+            for record in commands
+            if record["command"] == "git" and "--delete" in record["args"]
+        ]
+        self.assertEqual(len(merge_commands), 1)
+        self.assertEqual(delete_commands, [])
 
     def test_resume_closes_bead_without_reobserving_cleanup_origin(self):
         run_id = self.start_reviewed_run()
