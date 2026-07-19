@@ -27,6 +27,15 @@ from afk.start import (  # noqa: E402
 
 
 BASE_SHA = "a" * 40
+CRASH_INJECTION_OVERRIDES = (
+    "AFK_TEST_KILL_BEFORE_EVENT",
+    "AFK_TEST_KILL_AFTER_EVENT",
+    "AFK_TEST_KILL_AFTER_EVENT_WRITE",
+    "AFK_TEST_KILL_BEFORE_EFFECT",
+    "AFK_TEST_KILL_AFTER_EFFECT",
+    "AFK_TEST_KILL_BEFORE_CONFIRM",
+    "AFK_TEST_KILL_AFTER_CONFIRM",
+)
 
 
 class StartCliTest(unittest.TestCase):
@@ -78,9 +87,11 @@ class StartCliTest(unittest.TestCase):
 
     def run_afk(self, *args, **overrides):
         short_cleanup_timeout = overrides.pop("AFK_TEST_SHORT_CLEANUP_TIMEOUT", None)
-        kill_before_event = overrides.pop("AFK_TEST_KILL_BEFORE_EVENT", None)
-        kill_after_event = overrides.pop("AFK_TEST_KILL_AFTER_EVENT", None)
-        kill_after_event_write = overrides.pop("AFK_TEST_KILL_AFTER_EVENT_WRITE", None)
+        crash_injections = {
+            key: target
+            for key in CRASH_INJECTION_OVERRIDES
+            if (target := overrides.pop(key, None))
+        }
         env = os.environ.copy()
         env.update(
             {
@@ -105,35 +116,51 @@ class StartCliTest(unittest.TestCase):
         )
         env.update(overrides)
         command = [sys.executable, "-m", "afk", *args]
-        if kill_before_event or kill_after_event or kill_after_event_write:
-            if kill_before_event:
-                env["AFK_TEST_KILL_BEFORE_EVENT"] = kill_before_event
-            if kill_after_event:
-                env["AFK_TEST_KILL_AFTER_EVENT"] = kill_after_event
-            if kill_after_event_write:
-                env["AFK_TEST_KILL_AFTER_EVENT_WRITE"] = kill_after_event_write
+        if crash_injections:
+            env["AFK_TEST_CRASH_INJECTIONS"] = json.dumps(
+                crash_injections, sort_keys=True
+            )
             command = [
                 sys.executable,
                 "-c",
                 (
-                    "import os, signal, sys\n"
+                    "import json, os, signal, sys\n"
                     "from afk.run_store import RunStore\n"
                     "original = RunStore.append_event\n"
                     "original_write = RunStore._append_event_unlocked\n"
-                    "before = os.environ.get('AFK_TEST_KILL_BEFORE_EVENT')\n"
-                    "after = os.environ.get('AFK_TEST_KILL_AFTER_EVENT')\n"
-                    "after_write = os.environ.get('AFK_TEST_KILL_AFTER_EVENT_WRITE')\n"
+                    "original_effect = RunStore.prepare_effect\n"
+                    "original_confirm = RunStore.confirm_effect\n"
+                    "injections = json.loads(os.environ['AFK_TEST_CRASH_INJECTIONS'])\n"
                     "def injected(store, run_id, event, **kwargs):\n"
-                    " if event == before: os.kill(os.getpid(), signal.SIGKILL)\n"
+                    " if event == injections.get('AFK_TEST_KILL_BEFORE_EVENT'):\n"
+                    "  os.kill(os.getpid(), signal.SIGKILL)\n"
                     " result = original(store, run_id, event, **kwargs)\n"
-                    " if event == after: os.kill(os.getpid(), signal.SIGKILL)\n"
+                    " if event == injections.get('AFK_TEST_KILL_AFTER_EVENT'):\n"
+                    "  os.kill(os.getpid(), signal.SIGKILL)\n"
                     " return result\n"
                     "def injected_write(store, run_id, event, **kwargs):\n"
                     " result = original_write(store, run_id, event, **kwargs)\n"
-                    " if event == after_write: os.kill(os.getpid(), signal.SIGKILL)\n"
+                    " if event == injections.get('AFK_TEST_KILL_AFTER_EVENT_WRITE'):\n"
+                    "  os.kill(os.getpid(), signal.SIGKILL)\n"
+                    " return result\n"
+                    "def injected_effect(store, run_id, effect_id, **kwargs):\n"
+                    " if effect_id == injections.get('AFK_TEST_KILL_BEFORE_EFFECT'):\n"
+                    "  os.kill(os.getpid(), signal.SIGKILL)\n"
+                    " result = original_effect(store, run_id, effect_id, **kwargs)\n"
+                    " if effect_id == injections.get('AFK_TEST_KILL_AFTER_EFFECT'):\n"
+                    "  os.kill(os.getpid(), signal.SIGKILL)\n"
+                    " return result\n"
+                    "def injected_confirm(store, run_id, effect_id, **kwargs):\n"
+                    " if effect_id == injections.get('AFK_TEST_KILL_BEFORE_CONFIRM'):\n"
+                    "  os.kill(os.getpid(), signal.SIGKILL)\n"
+                    " result = original_confirm(store, run_id, effect_id, **kwargs)\n"
+                    " if effect_id == injections.get('AFK_TEST_KILL_AFTER_CONFIRM'):\n"
+                    "  os.kill(os.getpid(), signal.SIGKILL)\n"
                     " return result\n"
                     "RunStore.append_event = injected\n"
                     "RunStore._append_event_unlocked = injected_write\n"
+                    "RunStore.prepare_effect = injected_effect\n"
+                    "RunStore.confirm_effect = injected_confirm\n"
                     "from afk.cli import main\n"
                     "raise SystemExit(main(sys.argv[1:]))\n"
                 ),
@@ -176,6 +203,33 @@ class StartCliTest(unittest.TestCase):
             json.loads(line)["mutation"] == name
             for line in path.read_text(encoding="utf-8").splitlines()
         )
+
+    def launch_events(self, run_id, event):
+        path = self.state_home / "afk" / "runs" / run_id / "events.jsonl"
+        return [
+            record
+            for record in map(json.loads, path.read_text(encoding="utf-8").splitlines())
+            if record["event"] == event
+        ]
+
+    def assert_launch_effect(self, store, run_id, status):
+        unit = f"afk-{run_id}-worker-1"
+        expected = {
+            "schema_version": 1,
+            "effect_id": "worker-launch-1",
+            "kind": "worker-launch",
+            "status": status,
+            "intended": {"unit": unit},
+        }
+        if status == "confirmed":
+            expected["observed"] = {"unit": unit}
+        self.assertEqual(store.effect(run_id, "worker-launch-1"), expected)
+        return unit
+
+    def assert_launch_event(self, run_id, event, count, unit):
+        records = self.launch_events(run_id, event)
+        self.assertEqual(len(records), count)
+        self.assertTrue(all(record["data"]["unit"] == unit for record in records))
 
     def command_count(self, command, prefix, *, argument=None):
         return sum(
@@ -315,6 +369,416 @@ class StartCliTest(unittest.TestCase):
         self.assertEqual(effect["status"], "prepared")
         commands = self.command_log.read_text(encoding="utf-8")
         self.assertIn('"command":"resume-probe","returncode":2', commands)
+
+    def test_resume_recovers_process_crash_before_worker_launch_mutation(self):
+        interrupted = self.run_afk(
+            "start",
+            "central-bnkl.1.1",
+            AFK_TEST_KILL_BEFORE_MUTATION="worker-launch",
+        )
+        self.assertLess(interrupted.returncode, 0)
+        run_id = json.loads(self.run_afk("status", "--json").stdout)["run_id"]
+        store = RunStore(self.state_home / "afk")
+        self.assertEqual(store.effect(run_id, "worker-launch-1")["status"], "prepared")
+        self.assertEqual(self.mutation_count("worker-launch"), 0)
+
+        resumed = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="absent")
+
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        self.assertEqual(store.effect(run_id, "worker-launch-1")["status"], "prepared")
+        self.assertEqual(self.mutation_count("worker-launch"), 1)
+
+    def test_resume_recovers_process_crash_before_worker_launch_effect(self):
+        interrupted = self.run_afk(
+            "start",
+            "central-bnkl.1.1",
+            AFK_TEST_KILL_BEFORE_EFFECT="worker-launch-1",
+        )
+        self.assertLess(interrupted.returncode, 0)
+        before = json.loads(self.run_afk("status", "--json").stdout)
+        run_id = before["run_id"]
+        self.assertEqual(before["last_event"], "bead.spec_recorded")
+        store = RunStore(self.state_home / "afk")
+        lingering = store.identity(run_id)["start_request"]["lingering"]
+        self.assertEqual(lingering, "enabled")
+        with self.assertRaisesRegex(RunStoreError, "Effect is missing"):
+            store.effect(run_id, "worker-launch-1")
+
+        resumed = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="absent")
+
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        effect = store.effect(run_id, "worker-launch-1")
+        self.assertEqual(effect["status"], "prepared")
+        events = [
+            json.loads(line)["event"]
+            for line in (self.state_home / "afk" / "runs" / run_id / "events.jsonl")
+            .read_text()
+            .splitlines()
+        ]
+        self.assertEqual(events.count("worker.launch_prepared"), 1)
+        self.assertEqual(events.count("worker.launch_retried"), 1)
+        prepared = self.launch_events(run_id, "worker.launch_prepared")[0]
+        self.assertEqual(prepared["data"]["lingering"], lingering)
+        self.assertEqual(store.status(run_id)["lingering"], lingering)
+        self.assertEqual(self.mutation_count("worker-launch"), 1)
+
+    def test_resume_recovers_process_crash_after_worker_launch_effect(self):
+        interrupted = self.run_afk(
+            "start",
+            "central-bnkl.1.1",
+            AFK_TEST_KILL_AFTER_EFFECT="worker-launch-1",
+        )
+        self.assertLess(interrupted.returncode, 0)
+        before = json.loads(self.run_afk("status", "--json").stdout)
+        run_id = before["run_id"]
+        self.assertEqual(before["last_event"], "bead.spec_recorded")
+        store = RunStore(self.state_home / "afk")
+        lingering = store.identity(run_id)["start_request"]["lingering"]
+        self.assertEqual(lingering, "enabled")
+        self.assertEqual(store.effect(run_id, "worker-launch-1")["status"], "prepared")
+
+        resumed = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="absent")
+
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        self.assertEqual(store.effect(run_id, "worker-launch-1")["status"], "prepared")
+        events = [
+            json.loads(line)["event"]
+            for line in (self.state_home / "afk" / "runs" / run_id / "events.jsonl")
+            .read_text()
+            .splitlines()
+        ]
+        self.assertEqual(events.count("worker.launch_prepared"), 1)
+        self.assertEqual(events.count("worker.launch_retried"), 1)
+        prepared = self.launch_events(run_id, "worker.launch_prepared")[0]
+        self.assertEqual(prepared["data"]["lingering"], lingering)
+        self.assertEqual(store.status(run_id)["lingering"], lingering)
+        self.assertEqual(self.mutation_count("worker-launch"), 1)
+
+        observed = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="active")
+        self.assertEqual(observed.returncode, 0, observed.stderr)
+        self.assertEqual(store.effect(run_id, "worker-launch-1")["status"], "confirmed")
+        self.assertEqual(self.mutation_count("worker-launch"), 1)
+
+    def test_resume_recovers_crash_before_worker_launch_prepared_event(self):
+        interrupted = self.run_afk(
+            "start",
+            "central-bnkl.1.1",
+            AFK_TEST_KILL_BEFORE_EVENT="worker.launch_prepared",
+        )
+        self.assertLess(interrupted.returncode, 0)
+        run_id = json.loads(self.run_afk("status", "--json").stdout)["run_id"]
+        store = RunStore(self.state_home / "afk")
+        unit = self.assert_launch_effect(store, run_id, "prepared")
+        self.assert_launch_event(run_id, "worker.launch_prepared", 0, unit)
+        self.assertEqual(self.mutation_count("worker-launch"), 0)
+
+        retried = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="absent")
+
+        self.assertEqual(retried.returncode, 0, retried.stderr)
+        self.assert_launch_effect(store, run_id, "prepared")
+        self.assert_launch_event(run_id, "worker.launch_prepared", 1, unit)
+        self.assert_launch_event(run_id, "worker.launch_retried", 1, unit)
+        self.assertEqual(self.mutation_count("worker-launch"), 1)
+        observed = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="active")
+        repeated = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="active")
+        self.assertEqual(observed.returncode, 0, observed.stderr)
+        self.assertEqual(repeated.returncode, 0, repeated.stderr)
+        self.assert_launch_effect(store, run_id, "confirmed")
+        self.assertEqual(self.mutation_count("worker-launch"), 1)
+
+    def test_resume_recovers_crash_after_worker_launch_prepared_event_write(self):
+        interrupted = self.run_afk(
+            "start",
+            "central-bnkl.1.1",
+            AFK_TEST_KILL_AFTER_EVENT_WRITE="worker.launch_prepared",
+        )
+        self.assertLess(interrupted.returncode, 0)
+        run_id = json.loads(self.run_afk("status", "--json").stdout)["run_id"]
+        store = RunStore(self.state_home / "afk")
+        unit = self.assert_launch_effect(store, run_id, "prepared")
+        self.assert_launch_event(run_id, "worker.launch_prepared", 1, unit)
+        self.assertEqual(self.mutation_count("worker-launch"), 0)
+
+        retried = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="absent")
+
+        self.assertEqual(retried.returncode, 0, retried.stderr)
+        self.assert_launch_event(run_id, "worker.launch_prepared", 1, unit)
+        self.assert_launch_event(run_id, "worker.launch_retried", 1, unit)
+        self.assertEqual(self.mutation_count("worker-launch"), 1)
+        observed = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="active")
+        repeated = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="active")
+        self.assertEqual(observed.returncode, 0, observed.stderr)
+        self.assertEqual(repeated.returncode, 0, repeated.stderr)
+        self.assert_launch_effect(store, run_id, "confirmed")
+        self.assertEqual(self.mutation_count("worker-launch"), 1)
+
+    def test_resume_recovers_crash_before_worker_launch_confirmation(self):
+        started = self.run_afk("start", "central-bnkl.1.1")
+        run_id = started.stdout.strip()
+        store = RunStore(self.state_home / "afk")
+        unit = self.assert_launch_effect(store, run_id, "prepared")
+
+        interrupted = self.run_afk(
+            "_worker",
+            run_id,
+            AFK_TEST_KILL_BEFORE_CONFIRM="worker-launch-1",
+        )
+
+        self.assertLess(interrupted.returncode, 0)
+        self.assert_launch_effect(store, run_id, "prepared")
+        self.assert_launch_event(run_id, "worker.launched", 0, unit)
+        ambiguous = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="ambiguous")
+        self.assertEqual(ambiguous.returncode, 2, ambiguous.stderr)
+        self.assertEqual(store.status(run_id)["attention"]["kind"], "inconclusive")
+        self.assertEqual(self.mutation_count("worker-launch"), 1)
+        retried = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="absent")
+        self.assertEqual(retried.returncode, 0, retried.stderr)
+        self.assert_launch_effect(store, run_id, "prepared")
+        self.assert_launch_event(run_id, "worker.launch_retried", 1, unit)
+        self.assertEqual(self.mutation_count("worker-launch"), 2)
+        observed = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="active")
+        repeated = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="active")
+        self.assertEqual(observed.returncode, 0, observed.stderr)
+        self.assertEqual(repeated.returncode, 0, repeated.stderr)
+        self.assert_launch_effect(store, run_id, "confirmed")
+        self.assertEqual(self.mutation_count("worker-launch"), 2)
+
+    def test_resume_pauses_after_worker_launch_confirmation_was_written(self):
+        started = self.run_afk("start", "central-bnkl.1.1")
+        run_id = started.stdout.strip()
+        store = RunStore(self.state_home / "afk")
+        unit = f"afk-{run_id}-worker-1"
+
+        interrupted = self.run_afk(
+            "_worker",
+            run_id,
+            AFK_TEST_KILL_AFTER_CONFIRM="worker-launch-1",
+        )
+
+        self.assertLess(interrupted.returncode, 0)
+        self.assert_launch_effect(store, run_id, "confirmed")
+        self.assert_launch_event(run_id, "worker.launched", 0, unit)
+        resumed = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="absent")
+        repeated = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="absent")
+        self.assertEqual(resumed.returncode, 2, resumed.stderr)
+        self.assertEqual(repeated.returncode, 2, repeated.stderr)
+        self.assertEqual(store.status(run_id)["attention"]["kind"], "inconclusive")
+        self.assertEqual(self.mutation_count("worker-launch"), 1)
+
+    def test_resume_recovers_crash_before_worker_launch_retried_event(self):
+        interrupted_start = self.run_afk(
+            "start",
+            "central-bnkl.1.1",
+            AFK_TEST_KILL_BEFORE_MUTATION="worker-launch",
+        )
+        self.assertLess(interrupted_start.returncode, 0)
+        run_id = json.loads(self.run_afk("status", "--json").stdout)["run_id"]
+        store = RunStore(self.state_home / "afk")
+        unit = self.assert_launch_effect(store, run_id, "prepared")
+
+        interrupted_retry = self.run_afk(
+            "resume",
+            AFK_FAKE_SYSTEMD_STATE="absent",
+            AFK_TEST_KILL_BEFORE_EVENT="worker.launch_retried",
+        )
+
+        self.assertLess(interrupted_retry.returncode, 0)
+        self.assert_launch_event(run_id, "worker.launch_retried", 0, unit)
+        self.assertEqual(self.mutation_count("worker-launch"), 1)
+        observed = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="active")
+        repeated = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="active")
+        self.assertEqual(observed.returncode, 0, observed.stderr)
+        self.assertEqual(repeated.returncode, 0, repeated.stderr)
+        self.assert_launch_effect(store, run_id, "confirmed")
+        self.assert_launch_event(run_id, "worker.launch_reconciled", 1, unit)
+        self.assertEqual(self.mutation_count("worker-launch"), 1)
+
+    def test_resume_recovers_crash_after_worker_launch_retried_event_write(self):
+        interrupted_start = self.run_afk(
+            "start",
+            "central-bnkl.1.1",
+            AFK_TEST_KILL_BEFORE_MUTATION="worker-launch",
+        )
+        self.assertLess(interrupted_start.returncode, 0)
+        run_id = json.loads(self.run_afk("status", "--json").stdout)["run_id"]
+        store = RunStore(self.state_home / "afk")
+        unit = self.assert_launch_effect(store, run_id, "prepared")
+
+        interrupted_retry = self.run_afk(
+            "resume",
+            AFK_FAKE_SYSTEMD_STATE="absent",
+            AFK_TEST_KILL_AFTER_EVENT_WRITE="worker.launch_retried",
+        )
+
+        self.assertLess(interrupted_retry.returncode, 0)
+        self.assert_launch_event(run_id, "worker.launch_retried", 1, unit)
+        self.assertEqual(self.mutation_count("worker-launch"), 1)
+        observed = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="active")
+        repeated = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="active")
+        self.assertEqual(observed.returncode, 0, observed.stderr)
+        self.assertEqual(repeated.returncode, 0, repeated.stderr)
+        self.assert_launch_effect(store, run_id, "confirmed")
+        self.assert_launch_event(run_id, "worker.launch_retried", 1, unit)
+        self.assert_launch_event(run_id, "worker.launch_reconciled", 1, unit)
+        self.assertEqual(self.mutation_count("worker-launch"), 1)
+
+    def test_resume_pauses_after_crash_before_worker_launched_event(self):
+        started = self.run_afk("start", "central-bnkl.1.1")
+        run_id = started.stdout.strip()
+        store = RunStore(self.state_home / "afk")
+        unit = f"afk-{run_id}-worker-1"
+
+        interrupted = self.run_afk(
+            "_worker",
+            run_id,
+            AFK_TEST_KILL_BEFORE_EVENT="worker.launched",
+        )
+
+        self.assertLess(interrupted.returncode, 0)
+        self.assert_launch_effect(store, run_id, "confirmed")
+        self.assert_launch_event(run_id, "worker.launched", 0, unit)
+        resumed = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="absent")
+        repeated = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="absent")
+        self.assertEqual(resumed.returncode, 2, resumed.stderr)
+        self.assertEqual(repeated.returncode, 2, repeated.stderr)
+        self.assertEqual(store.status(run_id)["attention"]["kind"], "inconclusive")
+        self.assertEqual(self.mutation_count("worker-launch"), 1)
+
+    def test_resume_pauses_after_worker_launched_event_write(self):
+        started = self.run_afk("start", "central-bnkl.1.1")
+        run_id = started.stdout.strip()
+        store = RunStore(self.state_home / "afk")
+        unit = f"afk-{run_id}-worker-1"
+
+        interrupted = self.run_afk(
+            "_worker",
+            run_id,
+            AFK_TEST_KILL_AFTER_EVENT_WRITE="worker.launched",
+        )
+
+        self.assertLess(interrupted.returncode, 0)
+        self.assert_launch_effect(store, run_id, "confirmed")
+        self.assert_launch_event(run_id, "worker.launched", 1, unit)
+        resumed = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="absent")
+        repeated = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="absent")
+        self.assertEqual(resumed.returncode, 2, resumed.stderr)
+        self.assertEqual(repeated.returncode, 2, repeated.stderr)
+        self.assertEqual(store.status(run_id)["attention"]["kind"], "inconclusive")
+        self.assert_launch_event(run_id, "worker.launched", 1, unit)
+        self.assertEqual(self.mutation_count("worker-launch"), 1)
+
+    def test_resume_reconciles_process_crash_after_worker_launch_mutation(self):
+        interrupted = self.run_afk(
+            "start",
+            "central-bnkl.1.1",
+            AFK_TEST_KILL_AFTER_MUTATION="worker-launch",
+        )
+        self.assertLess(interrupted.returncode, 0)
+        run_id = json.loads(self.run_afk("status", "--json").stdout)["run_id"]
+        store = RunStore(self.state_home / "afk")
+        self.assertEqual(store.effect(run_id, "worker-launch-1")["status"], "prepared")
+        self.assertEqual(self.mutation_count("worker-launch"), 1)
+
+        resumed = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="active")
+
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        self.assertEqual(store.effect(run_id, "worker-launch-1")["status"], "confirmed")
+        self.assertEqual(store.status(run_id)["last_event"], "worker.launch_reconciled")
+        self.assertEqual(self.mutation_count("worker-launch"), 1)
+
+    def test_resume_safely_retries_collected_unconfirmed_worker_launch(self):
+        interrupted = self.run_afk(
+            "start",
+            "central-bnkl.1.1",
+            AFK_TEST_KILL_AFTER_MUTATION="worker-launch",
+        )
+        self.assertLess(interrupted.returncode, 0)
+        run_id = json.loads(self.run_afk("status", "--json").stdout)["run_id"]
+        store = RunStore(self.state_home / "afk")
+        self.assertEqual(store.effect(run_id, "worker-launch-1")["status"], "prepared")
+        self.assertIsNone(store.effect_if_present(run_id, "bead-claim"))
+        run_dir = self.state_home / "afk" / "runs" / run_id
+        self.assertEqual(
+            sorted(path.name for path in (run_dir / "effects").iterdir()),
+            ["worker-launch-1.json"],
+        )
+        events_path = run_dir / "events.jsonl"
+        events = [
+            json.loads(line)["event"] for line in events_path.read_text().splitlines()
+        ]
+        self.assertNotIn("worker.launched", events)
+        self.assertNotIn("bead.claimed", events)
+        self.assertNotIn("worktree.ready", events)
+        self.assertEqual(self.mutation_count("worker-launch"), 1)
+
+        retried = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="absent")
+
+        self.assertEqual(retried.returncode, 0, retried.stderr)
+        self.assertEqual(store.effect(run_id, "worker-launch-1")["status"], "prepared")
+        self.assertIsNone(store.effect_if_present(run_id, "bead-claim"))
+        self.assertEqual(self.mutation_count("worker-launch"), 2)
+
+        reconciled = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="active")
+        self.assertEqual(reconciled.returncode, 0, reconciled.stderr)
+        self.assertEqual(store.effect(run_id, "worker-launch-1")["status"], "confirmed")
+        repeated = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="absent")
+        self.assertEqual(repeated.returncode, 2, repeated.stderr)
+        self.assertEqual(self.mutation_count("worker-launch"), 2)
+
+    def test_resume_recovers_crash_before_worker_reconciled_state_append(self):
+        store, run_dir = self.create_resume_preflight_run()
+        unit = self.assert_launch_effect(store, "crashed-run", "prepared")
+
+        interrupted = self.run_afk(
+            "resume",
+            AFK_FAKE_SYSTEMD_STATE="active",
+            AFK_TEST_KILL_BEFORE_EVENT="worker.launch_reconciled",
+        )
+
+        self.assertLess(interrupted.returncode, 0)
+        self.assertEqual(
+            store.effect("crashed-run", "worker-launch-1")["status"], "confirmed"
+        )
+        resumed = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="active")
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        repeated = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="active")
+        self.assertEqual(repeated.returncode, 0, repeated.stderr)
+        self.assert_launch_effect(store, "crashed-run", "confirmed")
+        events = [
+            json.loads(line)
+            for line in (run_dir / "events.jsonl").read_text().splitlines()
+        ]
+        self.assertEqual(
+            sum(event["event"] == "worker.launch_reconciled" for event in events), 1
+        )
+        self.assert_launch_event("crashed-run", "worker.launch_reconciled", 1, unit)
+        self.assertEqual(self.mutation_count("worker-launch"), 0)
+
+    def test_resume_recovers_crash_after_worker_reconciled_state_append(self):
+        store, run_dir = self.create_resume_preflight_run()
+        unit = self.assert_launch_effect(store, "crashed-run", "prepared")
+
+        interrupted = self.run_afk(
+            "resume",
+            AFK_FAKE_SYSTEMD_STATE="active",
+            AFK_TEST_KILL_AFTER_EVENT_WRITE="worker.launch_reconciled",
+        )
+
+        self.assertLess(interrupted.returncode, 0)
+        resumed = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="active")
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        repeated = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="active")
+        self.assertEqual(repeated.returncode, 0, repeated.stderr)
+        self.assert_launch_effect(store, "crashed-run", "confirmed")
+        events = [
+            json.loads(line)
+            for line in (run_dir / "events.jsonl").read_text().splitlines()
+        ]
+        self.assertEqual(
+            sum(event["event"] == "worker.launch_reconciled" for event in events), 1
+        )
+        self.assert_launch_event("crashed-run", "worker.launch_reconciled", 1, unit)
+        self.assertEqual(self.mutation_count("worker-launch"), 0)
 
     def test_new_worker_retries_until_launcher_releases_global_lock(self):
         completed = self.run_afk(
@@ -4632,8 +5096,13 @@ class StartCliTest(unittest.TestCase):
         self.assertEqual(
             store.effect("crashed-run", "worker-launch-1")["status"], "prepared"
         )
+        observed = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="active")
+        self.assertEqual(observed.returncode, 0, observed.stderr)
+        self.assertEqual(
+            store.effect("crashed-run", "worker-launch-1")["status"], "confirmed"
+        )
         commands = self.command_log.read_text(encoding="utf-8")
-        self.assertIn('"command":"systemd-run"', commands)
+        self.assertEqual(commands.count('"command":"systemd-run"'), 1)
 
     def test_resume_requires_attention_for_other_unit_states_and_query_failure(self):
         for unit_state in ("inactive", "ambiguous", "failure"):
@@ -5586,6 +6055,7 @@ class StartCliTest(unittest.TestCase):
                     else:
                         raise SystemExit(f"unexpected bd args: {args}")
                 elif command == "systemd-run":
+                    before_mutation("worker-launch")
                     if os.environ.get("AFK_FAKE_RESUME_DURING_LAUNCH"):
                         resumed = subprocess.run(
                             [sys.executable, "-m", "afk", "resume"],
@@ -5612,6 +6082,7 @@ class StartCliTest(unittest.TestCase):
                     if os.environ.get("AFK_FAKE_SYSTEMD_FAILURE"):
                         print("launch failed", file=sys.stderr)
                         raise SystemExit(1)
+                    after_mutation("worker-launch")
                 elif command == "systemctl":
                     state = os.environ.get("AFK_FAKE_SYSTEMD_STATE", "active")
                     if state == "failure":

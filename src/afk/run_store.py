@@ -385,7 +385,7 @@ class RunStore:
     def effect_if_present(self, run_id: str, effect_id: str) -> dict[str, Any] | None:
         _validate_run_id(effect_id)
         path = self._run_dir(run_id) / "effects" / f"{effect_id}.json"
-        if not path.exists():
+        if not path.exists() and not path.is_symlink():
             return None
         return self.effect(run_id, effect_id)
 

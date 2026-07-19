@@ -244,7 +244,19 @@ class RunStoreTest(unittest.TestCase):
             with self.subTest(field=field):
                 effect_path.write_text(json.dumps(record), encoding="utf-8")
                 with self.assertRaises(RunStoreError):
-                    self.store.effect("run-001", "worker-launch-1")
+                    self.store.effect_if_present("run-001", "worker-launch-1")
+
+    def test_effect_if_present_rejects_a_dangling_symlink(self):
+        self.create_run()
+        effect_path = (
+            self.root / "runs" / "run-001" / "effects" / "worker-launch-1.json"
+        )
+        effect_path.symlink_to(self.root / "missing-effect.json")
+
+        with self.assertRaisesRegex(
+            RunStoreError, "Effect is missing or invalid: worker-launch-1"
+        ):
+            self.store.effect_if_present("run-001", "worker-launch-1")
 
     def test_completed_evidence_is_redacted_manifested_read_only_and_verified(self):
         self.create_run()
