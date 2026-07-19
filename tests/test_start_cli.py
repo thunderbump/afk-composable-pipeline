@@ -869,6 +869,25 @@ class StartCliTest(unittest.TestCase):
             [record["args"] for record in commands if record["command"] == "git"],
         )
 
+    def test_terminal_cleanup_reconciles_local_branch_timeout_after_mutation(self):
+        run_id = self.start_reviewed_run()
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+        self.assertEqual(self.run_afk("resume").returncode, 0)
+
+        completed = self.run_afk(
+            "resume",
+            AFK_FAKE_LOCAL_BRANCH_DELETE_TIMES_OUT_AFTER_MUTATION="1",
+            AFK_TEST_SHORT_CLEANUP_TIMEOUT="1",
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertTrue(status["completion"]["worktree_removed"])
+        self.assertTrue(status["completion"]["local_branch_deleted"])
+        self.assertEqual(status["completion"]["cleanup_warnings"], [])
+        self.assertTrue((self.state_home / "fake-local-branch-removed").exists())
+
     def test_terminal_cleanup_preserves_replacement_at_manifest_path(self):
         run_id = self.start_reviewed_run()
         self.assertEqual(self.run_afk("resume").returncode, 0)
@@ -3674,6 +3693,11 @@ class StartCliTest(unittest.TestCase):
                         if len(args) != 4 or args[3] != current:
                             raise SystemExit(1)
                         local_branch_removed.write_text("removed", encoding="utf-8")
+                        if os.environ.get(
+                            "AFK_FAKE_LOCAL_BRANCH_DELETE_TIMES_OUT_AFTER_MUTATION"
+                        ):
+                            import time
+                            time.sleep(1)
                     elif args[:2] == ["branch", "--show-current"]:
                         run_id = Path.cwd().name
                         print("afk/" + os.environ["AFK_FAKE_BEAD"].replace(".", "-") + "-" + run_id + "/candidate")  # noqa: E501

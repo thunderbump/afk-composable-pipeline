@@ -1796,31 +1796,38 @@ def _cleanup_run_checkout(
                 "Run branch ownership could not be verified; cleanup skipped"
             )
         else:
-            _command(
-                [
-                    "git",
-                    "update-ref",
-                    "-d",
-                    f"refs/heads/{expected_branch}",
-                    candidate_sha,
-                ],
-                cwd=root,
-                check=False,
-            )
-            after_delete = _command(
-                [
-                    "git",
-                    "rev-parse",
-                    "--verify",
-                    "--quiet",
-                    f"refs/heads/{expected_branch}",
-                ],
-                cwd=root,
-                check=False,
-            )
-            local_branch_deleted = after_delete.returncode == 1
-            if not local_branch_deleted:
-                warnings.append("Run branch cleanup failed")
+            try:
+                _command(
+                    [
+                        "git",
+                        "update-ref",
+                        "-d",
+                        f"refs/heads/{expected_branch}",
+                        candidate_sha,
+                    ],
+                    cwd=root,
+                    check=False,
+                )
+            except ExternalCommandError:
+                pass
+            try:
+                after_delete = _command(
+                    [
+                        "git",
+                        "rev-parse",
+                        "--verify",
+                        "--quiet",
+                        f"refs/heads/{expected_branch}",
+                    ],
+                    cwd=root,
+                    check=False,
+                )
+            except ExternalCommandError:
+                warnings.append("Run branch cleanup could not be confirmed")
+            else:
+                local_branch_deleted = after_delete.returncode == 1
+                if not local_branch_deleted:
+                    warnings.append("Run branch cleanup failed")
     return worktree_removed, local_branch_deleted, warnings[:2]
 
 
