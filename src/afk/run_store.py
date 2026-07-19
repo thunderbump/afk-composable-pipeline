@@ -924,16 +924,14 @@ def _require_mode(path: Path, mode: int, label: str) -> None:
 
 def _projected_evidence_units(value: Any) -> set[str]:
     units: set[str] = set()
-    if isinstance(value, dict):
-        for key, nested in value.items():
-            if key == "evidence" and isinstance(nested, str):
-                parts = Path(nested).parts
-                if len(parts) >= 2 and parts[0] in EVIDENCE_ROOTS:
-                    units.add(f"{parts[0]}/{parts[1]}")
-            units.update(_projected_evidence_units(nested))
-    elif isinstance(value, list):
-        for nested in value:
-            units.update(_projected_evidence_units(nested))
+    for _, record in _walk_projected_values(value):
+        if not isinstance(record, dict):
+            continue
+        evidence = record.get("evidence")
+        if isinstance(evidence, str):
+            parts = Path(evidence).parts
+            if len(parts) >= 2 and parts[0] in EVIDENCE_ROOTS:
+                units.add(f"{parts[0]}/{parts[1]}")
     return units
 
 
@@ -959,16 +957,34 @@ def _projected_manifest_digests(projection: dict[str, Any]) -> dict[str, set[str
             )
         digests.setdefault(evidence, set()).add(digest)
 
-    if "validation" in projection:
-        add(projection["validation"], "validation")
-    if "bead_spec" in projection:
-        add(projection["bead_spec"], "Bead/spec")
-    cycles = projection.get("gate_cycles")
-    if isinstance(cycles, list):
-        for cycle in cycles:
-            if isinstance(cycle, dict) and "validation" in cycle:
-                add(cycle["validation"], "Gate validation")
+    for path, record in _walk_projected_values(projection):
+        label = None
+        if path == ("validation",):
+            label = "validation"
+        elif path == ("bead_spec",):
+            label = "Bead/spec"
+        elif (
+            len(path) == 3
+            and path[0] == "gate_cycles"
+            and isinstance(path[1], int)
+            and path[2] == "validation"
+        ):
+            label = "Gate validation"
+        if label is not None:
+            add(record, label)
     return digests
+
+
+def _walk_projected_values(
+    value: Any, path: tuple[str | int, ...] = ()
+) -> Iterator[tuple[tuple[str | int, ...], Any]]:
+    yield path, value
+    if isinstance(value, dict):
+        for key, nested in value.items():
+            yield from _walk_projected_values(nested, (*path, key))
+    elif isinstance(value, list):
+        for index, nested in enumerate(value):
+            yield from _walk_projected_values(nested, (*path, index))
 
 
 def _validate_manifest(manifest: Any) -> list[dict[str, Any]]:
