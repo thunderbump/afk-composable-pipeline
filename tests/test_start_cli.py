@@ -1708,6 +1708,59 @@ class StartCliTest(unittest.TestCase):
         self.assertEqual(unnamed.returncode, 2)
         self.assertIn("no Active Run", unnamed.stderr)
 
+    def create_named_completed_resume_preflight_run(self):
+        run_id = self.start_reviewed_run()
+        for _ in range(4):
+            self.assertEqual(self.run_afk("resume").returncode, 0)
+        run_dir = self.state_home / "afk" / "runs" / run_id
+        active = self.state_home / "afk" / "active.json"
+        active.write_text(json.dumps({"run_id": run_id}) + "\n", encoding="utf-8")
+        active.chmod(0o600)
+        self.command_log.unlink(missing_ok=True)
+        return run_id, run_dir, active
+
+    def assert_named_completed_resume_preflight_rejected(self, run_id, active, message):
+        active_before = active.read_text(encoding="utf-8")
+
+        resumed = self.run_afk("resume", run_id)
+
+        self.assertEqual(resumed.returncode, 2)
+        self.assertIn(message, resumed.stderr)
+        self.assertEqual(active.read_text(encoding="utf-8"), active_before)
+        self.assertFalse(self.command_log.exists())
+
+    def test_named_completed_resume_rejects_torn_event_tail_before_reconciliation(self):
+        run_id, run_dir, active = self.create_named_completed_resume_preflight_run()
+        with (run_dir / "events.jsonl").open("ab") as stream:
+            stream.write(b'{"schema_version":1')
+
+        self.assert_named_completed_resume_preflight_rejected(
+            run_id, active, "Event History has an incomplete trailing record"
+        )
+
+    def test_named_completed_resume_rejects_invalid_effect_before_reconciliation(self):
+        run_id, run_dir, active = self.create_named_completed_resume_preflight_run()
+        effect_path = run_dir / "effects" / "worker-launch-1.json"
+        effect = json.loads(effect_path.read_text(encoding="utf-8"))
+        effect["status"] = "invalid"
+        effect_path.write_text(json.dumps(effect) + "\n", encoding="utf-8")
+
+        self.assert_named_completed_resume_preflight_rejected(
+            run_id, active, "Effect is invalid: worker-launch-1"
+        )
+
+    def test_named_completed_resume_rejects_invalid_evidence_before_reconciliation(
+        self,
+    ):
+        run_id, run_dir, active = self.create_named_completed_resume_preflight_run()
+        result_path = run_dir / "gates" / "completion-dddddddddddd" / "result.json"
+        result_path.chmod(0o600)
+        result_path.write_text("{}\n", encoding="utf-8")
+
+        self.assert_named_completed_resume_preflight_rejected(
+            run_id, active, "evidence does not match its manifest"
+        )
+
     def test_named_resume_does_not_advance_noncompleted_active_run(self):
         run_id = self.start_reviewed_run()
 
@@ -2822,6 +2875,124 @@ class StartCliTest(unittest.TestCase):
 
         self.assertEqual(resumed.returncode, 2, resumed.stderr)
         status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(status["attention"]["scope"], "publication")
+        self.assertEqual(status["attention"]["kind"], "invalid")
+        with self.assertRaises(RunStoreError):
+            store.effect(run_id, "pr-mark-ready")
+        commands = self.command_log.read_text(encoding="utf-8")
+        self.assertNotIn('"args":["pr","ready"', commands)
+
+    def assert_projected_digest_rejected(self, field, *, digest=None, missing=False):
+        run_id = self.start_reviewed_run()
+        store = RunStore(self.state_home / "afk")
+        record = json.loads(json.dumps(store.status(run_id)[field]))
+        if missing:
+            record.pop("manifest_sha256")
+        else:
+            record["manifest_sha256"] = digest
+        store.append_event(
+            run_id,
+            f"{field}.digest_corrupted",
+            state="reviewed",
+            data={"checkpoint": "reviewed", field: record},
+        )
+        commands_before = self.command_log.read_text(encoding="utf-8")
+
+        resumed = self.run_afk("resume")
+
+        self.assertEqual(resumed.returncode, 2, resumed.stderr)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(status["attention"]["scope"], "publication")
+        self.assertEqual(status["attention"]["kind"], "invalid")
+        self.assertEqual(self.command_log.read_text(encoding="utf-8"), commands_before)
+
+    def test_resume_rejects_missing_projected_validation_manifest_digest(self):
+        self.assert_projected_digest_rejected("validation", missing=True)
+
+    def test_resume_rejects_wrong_type_projected_validation_manifest_digest(self):
+        self.assert_projected_digest_rejected("validation", digest=[])
+
+    def test_resume_rejects_malformed_projected_validation_manifest_digest(self):
+        self.assert_projected_digest_rejected("validation", digest="A" * 63)
+
+    def test_resume_rejects_missing_projected_bead_spec_manifest_digest(self):
+        self.assert_projected_digest_rejected("bead_spec", missing=True)
+
+    def test_resume_rejects_missing_projected_gate_validation_manifest_digest(self):
+        run_id = self.start_reviewed_run()
+        store = RunStore(self.state_home / "afk")
+        cycles = json.loads(json.dumps(store.status(run_id)["gate_cycles"]))
+        cycles[-1]["validation"].pop("manifest_sha256")
+        store.append_event(
+            run_id,
+            "gate.validation_digest_corrupted",
+            state="reviewed",
+            data={"checkpoint": "reviewed", "gate_cycles": cycles},
+        )
+        commands_before = self.command_log.read_text(encoding="utf-8")
+
+        resumed = self.run_afk("resume")
+
+        self.assertEqual(resumed.returncode, 2, resumed.stderr)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(status["attention"]["kind"], "invalid")
+        self.assertEqual(self.command_log.read_text(encoding="utf-8"), commands_before)
+
+    def test_resume_pauses_before_mutation_when_projected_validation_is_tampered(self):
+        run_id = self.start_reviewed_run()
+        store = RunStore(self.state_home / "afk")
+        evidence = store.status(run_id)["validation"]["evidence"]
+        manifest = (
+            self.state_home / "afk" / "runs" / run_id / evidence / "manifest.json"
+        )
+        evidence_dir = manifest.parent
+        outcome = evidence_dir / "afk" / "outcome.json"
+        evidence_dir.chmod(0o700)
+        manifest.chmod(0o600)
+        manifest.unlink()
+        outcome.chmod(0o600)
+        outcome.write_text("{}\n", encoding="utf-8")
+        store.seal_evidence(run_id, evidence)
+        self.assertTrue(store.verify_evidence(run_id, evidence))
+
+        resumed = self.run_afk("resume")
+
+        self.assertEqual(resumed.returncode, 2, resumed.stderr)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(status["attention"]["scope"], "publication")
+        self.assertEqual(status["attention"]["kind"], "invalid")
+        with self.assertRaises(RunStoreError):
+            store.effect(run_id, "pr-mark-ready")
+        commands = self.command_log.read_text(encoding="utf-8")
+        self.assertNotIn('"args":["pr","ready"', commands)
+
+    def test_resume_pauses_before_mutation_when_projected_completion_is_tampered(self):
+        run_id = self.start_reviewed_run()
+        store = RunStore(self.state_home / "afk")
+        evidence = "gates/completion-projected"
+        store.write_evidence_value(
+            run_id, f"{evidence}/result.json", {"evidence": evidence}
+        )
+        store.seal_evidence(run_id, evidence)
+        store.append_event(
+            run_id,
+            "completion.projected",
+            state="reviewed",
+            data={
+                "checkpoint": "reviewed",
+                "completion": {"evidence": evidence},
+            },
+        )
+        manifest = (
+            self.state_home / "afk" / "runs" / run_id / evidence / "manifest.json"
+        )
+        manifest.chmod(0o600)
+        manifest.write_text("{}\n", encoding="utf-8")
+
+        resumed = self.run_afk("resume")
+
+        self.assertEqual(resumed.returncode, 2, resumed.stderr)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
         self.assertEqual(status["attention"]["kind"], "invalid")
         with self.assertRaises(RunStoreError):
             store.effect(run_id, "pr-mark-ready")
@@ -3396,6 +3567,572 @@ class StartCliTest(unittest.TestCase):
         self.assertEqual(effect["status"], "confirmed")
         status = json.loads(self.run_afk("status", "--json").stdout)
         self.assertEqual(status["unit"], "afk-crashed-run-worker-1")
+
+    def create_resume_preflight_run(self):
+        store = RunStore(self.state_home / "afk")
+        store.create_run(
+            bead_id="central-bnkl.1.1",
+            repository="thunderbump/beads-webui",
+            base_branch="main",
+            base_sha=BASE_SHA,
+            start_request={"repository_root": str(self.project)},
+            run_id="crashed-run",
+        )
+        store.prepare_effect(
+            "crashed-run",
+            "worker-launch-1",
+            kind="worker-launch",
+            intended={"unit": "afk-crashed-run-worker-1"},
+        )
+        return store, self.state_home / "afk" / "runs" / "crashed-run"
+
+    def assert_resume_preflight_rejected(self, message):
+        resumed = self.run_afk("resume")
+        self.assertEqual(resumed.returncode, 2)
+        self.assertIn(message, resumed.stderr)
+        self.assertFalse(self.command_log.exists())
+
+    def test_resume_rejects_a_malformed_active_pointer_before_external_commands(self):
+        self.create_resume_preflight_run()
+        (self.state_home / "afk" / "active.json").write_text(
+            '{"run_id":', encoding="utf-8"
+        )
+
+        self.assert_resume_preflight_rejected("Active Run pointer is invalid")
+
+    def test_resume_rejects_invalid_event_schema_before_external_commands(self):
+        _, run_dir = self.create_resume_preflight_run()
+        events_path = run_dir / "events.jsonl"
+        event = json.loads(events_path.read_text(encoding="utf-8"))
+        event["data"] = []
+        events_path.write_text(json.dumps(event) + "\n", encoding="utf-8")
+
+        self.assert_resume_preflight_rejected("Event History record 1 is invalid")
+
+    def test_resume_rejects_wrong_event_version_before_external_commands(self):
+        _, run_dir = self.create_resume_preflight_run()
+        events_path = run_dir / "events.jsonl"
+        event = json.loads(events_path.read_text(encoding="utf-8"))
+        event["schema_version"] = 2
+        events_path.write_text(json.dumps(event) + "\n", encoding="utf-8")
+
+        self.assert_resume_preflight_rejected("Event History record 1 is invalid")
+
+    def test_resume_rejects_misbound_open_validation_attempt_before_commands(self):
+        store, _ = self.create_resume_preflight_run()
+        store.append_event(
+            "crashed-run",
+            "validation.attempt_started",
+            state="candidate_ready",
+            data={
+                "checkpoint": "candidate_ready",
+                "candidate_sha": "b" * 40,
+                "validation_attempt": {
+                    "status": "started",
+                    "candidate_sha": "c" * 40,
+                },
+            },
+        )
+
+        resumed = self.run_afk("resume")
+
+        self.assertEqual(resumed.returncode, 2)
+        self.assertFalse(self.command_log.exists())
+        status = store.status("crashed-run")
+        self.assertEqual(status["attention"]["kind"], "invalid")
+        self.assertIn(
+            "validation attempt lifecycle is invalid", status["attention"]["summary"]
+        )
+
+    def test_resume_repeatedly_rejects_malformed_outstanding_validation_attempt(self):
+        store, _ = self.create_resume_preflight_run()
+        attempt = {
+            "attempt_id": "validation-bbbbbbbbbbbb",
+            "candidate_sha": "b" * 40,
+            "status": "started",
+            "evidence": "attempts/validation-bbbbbbbbbbbb",
+        }
+        store.append_event(
+            "crashed-run",
+            "validation.attempt_started",
+            state="candidate_ready",
+            data={
+                "checkpoint": "candidate_ready",
+                "candidate_sha": "b" * 40,
+                "validation_attempt": attempt,
+            },
+        )
+        store.append_event(
+            "crashed-run",
+            "run.attention_required",
+            state="attention_required",
+            data={
+                "checkpoint": "candidate_ready",
+                "worker_exit_code": 0,
+                "attention": {"scope": "validation", "kind": "unavailable"},
+                "validation_attempt": {
+                    key: value for key, value in attempt.items() if key != "status"
+                },
+            },
+        )
+
+        first = self.run_afk("resume")
+        second = self.run_afk("resume")
+
+        self.assertEqual(first.returncode, 2)
+        self.assertEqual(second.returncode, 2)
+        self.assertFalse(self.command_log.exists())
+        status = store.status("crashed-run")
+        self.assertEqual(status["attention"]["kind"], "invalid")
+        self.assertIn(
+            "open validation attempt is invalid", status["attention"]["summary"]
+        )
+
+    def assert_repeated_validation_lifecycle_rejected(self, store, run_dir):
+        first = self.run_afk("resume")
+        second = self.run_afk("resume")
+
+        self.assertEqual(first.returncode, 2)
+        self.assertEqual(second.returncode, 2)
+        self.assertFalse(self.command_log.exists())
+        for root in ("attempts", "gates", "retrospective"):
+            self.assertEqual(list((run_dir / root).iterdir()), [])
+        status = store.status("crashed-run")
+        self.assertEqual(status["attention"]["kind"], "invalid")
+        self.assertIn(
+            "validation attempt lifecycle is invalid",
+            status["attention"]["summary"],
+        )
+
+    def test_resume_rejects_started_projection_after_attempt_finished(self):
+        store, run_dir = self.create_resume_preflight_run()
+        started = {
+            "attempt_id": "validation-bbbbbbbbbbbb",
+            "candidate_sha": "b" * 40,
+            "status": "started",
+            "evidence": "attempts/validation-bbbbbbbbbbbb",
+        }
+        store.append_event(
+            "crashed-run",
+            "validation.attempt_started",
+            state="candidate_ready",
+            data={
+                "checkpoint": "candidate_ready",
+                "candidate_sha": "b" * 40,
+                "validation_attempt": started,
+            },
+        )
+        store.append_event(
+            "crashed-run",
+            "validation.attempt_finished",
+            data={
+                "checkpoint": "candidate_ready",
+                "validation_attempt": {**started, "status": "interrupted"},
+            },
+        )
+        store.append_event(
+            "crashed-run",
+            "run.attention_required",
+            state="attention_required",
+            data={
+                "checkpoint": "candidate_ready",
+                "worker_exit_code": 0,
+                "attention": {"scope": "validation", "kind": "unavailable"},
+                "validation_attempt": started,
+            },
+        )
+
+        self.assert_repeated_validation_lifecycle_rejected(store, run_dir)
+
+    def test_resume_rejects_validation_attempt_started_while_one_is_open(self):
+        store, run_dir = self.create_resume_preflight_run()
+        for suffix in ("a", "b"):
+            attempt_id = f"validation-{suffix * 12}"
+            store.append_event(
+                "crashed-run",
+                "validation.attempt_started",
+                state="candidate_ready",
+                data={
+                    "checkpoint": "candidate_ready",
+                    "candidate_sha": "b" * 40,
+                    "validation_attempt": {
+                        "attempt_id": attempt_id,
+                        "candidate_sha": "b" * 40,
+                        "status": "started",
+                        "evidence": f"attempts/{attempt_id}",
+                    },
+                },
+            )
+
+        self.assert_repeated_validation_lifecycle_rejected(store, run_dir)
+
+    def test_resume_rejects_invalid_terminal_validation_status(self):
+        store, run_dir = self.create_resume_preflight_run()
+        started = {
+            "attempt_id": "validation-bbbbbbbbbbbb",
+            "candidate_sha": "b" * 40,
+            "status": "started",
+            "evidence": "attempts/validation-bbbbbbbbbbbb",
+        }
+        store.append_event(
+            "crashed-run",
+            "validation.attempt_started",
+            state="candidate_ready",
+            data={
+                "checkpoint": "candidate_ready",
+                "candidate_sha": "b" * 40,
+                "validation_attempt": started,
+            },
+        )
+        store.append_event(
+            "crashed-run",
+            "validation.attempt_finished",
+            data={
+                "checkpoint": "candidate_ready",
+                "validation_attempt": {**started, "status": "not-a-real-outcome"},
+            },
+        )
+        store.append_event(
+            "crashed-run",
+            "run.attention_required",
+            state="attention_required",
+            data={
+                "checkpoint": "candidate_ready",
+                "worker_exit_code": 0,
+                "attention": {"scope": "validation", "kind": "unavailable"},
+            },
+        )
+
+        self.assert_repeated_validation_lifecycle_rejected(store, run_dir)
+
+    def test_resume_repeatedly_rejects_misbound_outstanding_repair_attempt(self):
+        store, _ = self.create_resume_preflight_run()
+        brief = {
+            "schema_version": 1,
+            "candidate_sha": "b" * 40,
+            "repair_attempt": 1,
+            "blocking_findings": [],
+        }
+        store.append_event(
+            "crashed-run",
+            "gate.cycle_completed",
+            state="validated",
+            data={
+                "checkpoint": "validated",
+                "candidate_sha": "b" * 40,
+                "gate_cycles": [{"next_action": "repair", "repair_brief": brief}],
+            },
+        )
+        store.append_event(
+            "crashed-run",
+            "repair.started",
+            data={
+                "checkpoint": "validated",
+                "repair_attempts_used": 1,
+                "repair_brief": brief,
+            },
+        )
+        store.append_event(
+            "crashed-run",
+            "run.attention_required",
+            state="attention_required",
+            data={
+                "checkpoint": "validated",
+                "attention": {"scope": "repair", "kind": "unavailable"},
+                "repair_attempts_used": 2,
+                "repair_brief": {
+                    **brief,
+                    "candidate_sha": "c" * 40,
+                    "repair_attempt": 2,
+                },
+            },
+        )
+
+        first = self.run_afk("resume")
+        second = self.run_afk("resume")
+
+        self.assertEqual(first.returncode, 2)
+        self.assertEqual(second.returncode, 2)
+        self.assertFalse(self.command_log.exists())
+        status = store.status("crashed-run")
+        self.assertEqual(status["attention"]["kind"], "invalid")
+        self.assertIn("open repair attempt is invalid", status["attention"]["summary"])
+
+    def assert_repeated_repair_lifecycle_rejected(self, store, run_dir):
+        first = self.run_afk("resume")
+        second = self.run_afk("resume")
+
+        self.assertEqual(first.returncode, 2)
+        self.assertEqual(second.returncode, 2)
+        self.assertFalse(self.command_log.exists())
+        for root in ("attempts", "gates", "retrospective"):
+            self.assertEqual(list((run_dir / root).iterdir()), [])
+        status = store.status("crashed-run")
+        self.assertEqual(status["attention"]["kind"], "invalid")
+        self.assertIn(
+            "repair attempt lifecycle is invalid", status["attention"]["summary"]
+        )
+
+    def test_resume_rejects_repair_attempt_started_while_one_is_open(self):
+        store, run_dir = self.create_resume_preflight_run()
+        for attempt in (1, 2):
+            brief = {
+                "schema_version": 1,
+                "candidate_sha": "b" * 40,
+                "repair_attempt": attempt,
+                "blocking_findings": [],
+            }
+            store.append_event(
+                "crashed-run",
+                "repair.started",
+                state="validated",
+                data={
+                    "checkpoint": "validated",
+                    "candidate_sha": "b" * 40,
+                    "repair_attempts_used": attempt,
+                    "repair_brief": brief,
+                },
+            )
+
+        self.assert_repeated_repair_lifecycle_rejected(store, run_dir)
+
+    def test_resume_rejects_open_repair_projection_after_candidate_repaired(self):
+        store, run_dir = self.create_resume_preflight_run()
+        brief = {
+            "schema_version": 1,
+            "candidate_sha": "b" * 40,
+            "repair_attempt": 1,
+            "blocking_findings": [],
+        }
+        store.append_event(
+            "crashed-run",
+            "repair.started",
+            state="validated",
+            data={
+                "checkpoint": "validated",
+                "candidate_sha": "b" * 40,
+                "repair_attempts_used": 1,
+                "repair_brief": brief,
+            },
+        )
+        store.append_event(
+            "crashed-run",
+            "candidate.repaired",
+            state="candidate_ready",
+            data={
+                "checkpoint": "candidate_ready",
+                "previous_candidate_sha": "b" * 40,
+                "candidate_sha": "c" * 40,
+                "pr_number": 17,
+                "pr_url": "https://example.test/pr/17",
+                "pr_head_sha": "c" * 40,
+                "repair_attempts_used": 1,
+                "repair_dispositions": [],
+                "attention": {},
+            },
+        )
+        store.append_event(
+            "crashed-run",
+            "run.attention_required",
+            state="attention_required",
+            data={
+                "checkpoint": "validated",
+                "candidate_sha": "b" * 40,
+                "repair_attempts_used": 1,
+                "repair_brief": brief,
+                "attention": {"scope": "repair", "kind": "unavailable"},
+            },
+        )
+
+        self.assert_repeated_repair_lifecycle_rejected(store, run_dir)
+
+    def test_resume_rejects_malformed_repair_brief_hidden_by_closure(self):
+        store, run_dir = self.create_resume_preflight_run()
+        malformed_brief = {
+            "schema_version": 1,
+            "candidate_sha": "b" * 40,
+            "repair_attempt": 1,
+            "blocking_findings": [],
+            "unexpected": True,
+        }
+        store.append_event(
+            "crashed-run",
+            "repair.started",
+            state="validated",
+            data={
+                "checkpoint": "validated",
+                "candidate_sha": "b" * 40,
+                "repair_attempts_used": 1,
+                "repair_brief": malformed_brief,
+            },
+        )
+        store.append_event(
+            "crashed-run",
+            "candidate.repaired",
+            state="candidate_ready",
+            data={
+                "checkpoint": "candidate_ready",
+                "previous_candidate_sha": "b" * 40,
+                "candidate_sha": "c" * 40,
+                "pr_number": 17,
+                "pr_url": "https://example.test/pr/17",
+                "pr_head_sha": "c" * 40,
+                "repair_attempts_used": 1,
+                "repair_dispositions": [],
+                "attention": {},
+            },
+        )
+        store.append_event(
+            "crashed-run",
+            "run.attention_required",
+            state="attention_required",
+            data={
+                "checkpoint": "candidate_ready",
+                "worker_exit_code": 0,
+                "attention": {"scope": "validation", "kind": "unavailable"},
+            },
+        )
+
+        self.assert_repeated_repair_lifecycle_rejected(store, run_dir)
+
+    def test_resume_rejects_unrelated_malformed_effect_before_commands(self):
+        store, run_dir = self.create_resume_preflight_run()
+        malformed = run_dir / "effects" / "unrelated.json"
+        malformed.write_text("{", encoding="utf-8")
+        malformed.chmod(0o600)
+
+        resumed = self.run_afk("resume")
+
+        self.assertEqual(resumed.returncode, 2)
+        self.assertFalse(self.command_log.exists())
+        status = store.status("crashed-run")
+        self.assertEqual(status["attention"]["kind"], "invalid")
+        self.assertIn(
+            "Effect is missing or invalid: unrelated", status["attention"]["summary"]
+        )
+
+    def test_resume_rejects_torn_event_tail_before_external_commands(self):
+        _, run_dir = self.create_resume_preflight_run()
+        with (run_dir / "events.jsonl").open("ab") as stream:
+            stream.write(b'{"schema_version":1')
+
+        self.assert_resume_preflight_rejected(
+            "Event History has an incomplete trailing record"
+        )
+
+    def test_resume_rejects_invalid_run_identity_before_external_commands(self):
+        _, run_dir = self.create_resume_preflight_run()
+        identity_path = run_dir / "run.json"
+        identity = json.loads(identity_path.read_text(encoding="utf-8"))
+        identity["schema_version"] = 2
+        identity_path.write_text(json.dumps(identity) + "\n", encoding="utf-8")
+
+        self.assert_resume_preflight_rejected("Run identity is invalid: crashed-run")
+
+    def test_resume_rejects_malformed_run_identity_before_external_commands(self):
+        _, run_dir = self.create_resume_preflight_run()
+        identity_path = run_dir / "run.json"
+        identity = json.loads(identity_path.read_text(encoding="utf-8"))
+        identity["start_request"] = []
+        identity_path.write_text(json.dumps(identity) + "\n", encoding="utf-8")
+
+        self.assert_resume_preflight_rejected("Run identity is invalid: crashed-run")
+
+    def test_resume_rejects_tampered_sealed_evidence_before_external_commands(self):
+        store, _ = self.create_resume_preflight_run()
+        result_path = store.write_evidence_text(
+            "crashed-run", "attempts/attempt-1/result.txt", "complete\n"
+        )
+        store.seal_evidence("crashed-run", "attempts/attempt-1")
+        result_path.chmod(0o600)
+        result_path.write_text("tampered\n", encoding="utf-8")
+
+        self.assert_resume_preflight_rejected("evidence does not match its manifest")
+
+    def test_resume_rejects_external_symlinked_evidence_manifest_before_commands(self):
+        store, _ = self.create_resume_preflight_run()
+        store.write_evidence_text(
+            "crashed-run", "attempts/attempt-1/result.txt", "complete\n"
+        )
+        store.seal_evidence("crashed-run", "attempts/attempt-1")
+        evidence = self.state_home / "afk/runs/crashed-run/attempts/attempt-1"
+        manifest = evidence / "manifest.json"
+        external_manifest = self.temp / "external-manifest.json"
+        external_manifest.write_bytes(manifest.read_bytes())
+        external_manifest.chmod(0o400)
+        evidence.chmod(0o700)
+        manifest.unlink()
+        manifest.symlink_to(external_manifest)
+        evidence.chmod(0o500)
+
+        self.assert_resume_preflight_rejected("evidence manifest is invalid")
+
+    def test_resume_rejects_insecure_run_store_permissions_before_commands(self):
+        self.create_resume_preflight_run()
+        (self.state_home / "afk" / "active.json").chmod(0o644)
+
+        self.assert_resume_preflight_rejected(
+            "Active Run pointer permissions are invalid"
+        )
+
+    def test_resume_rejects_insecure_run_store_root_without_repairing_it(self):
+        self.create_resume_preflight_run()
+        root = self.state_home / "afk"
+        root.chmod(0o755)
+
+        self.assert_resume_preflight_rejected(
+            "Run Store directory permissions are invalid"
+        )
+        self.assertEqual(stat.S_IMODE(root.stat().st_mode), 0o755)
+
+    def test_resume_rejects_symlinked_lock_without_mutating_its_target(self):
+        self.create_resume_preflight_run()
+        root = self.state_home / "afk"
+        external_lock = self.temp / "external-lock"
+        external_lock.write_text("external lock sentinel\n", encoding="utf-8")
+        external_lock.chmod(0o644)
+        (root / "afk.lock").unlink()
+        (root / "afk.lock").symlink_to(external_lock)
+
+        self.assert_resume_preflight_rejected("AFK lock file is invalid")
+        self.assertEqual(stat.S_IMODE(external_lock.stat().st_mode), 0o644)
+        self.assertEqual(
+            external_lock.read_text(encoding="utf-8"), "external lock sentinel\n"
+        )
+
+    def test_resume_rejects_insecure_existing_lock_without_repairing_it(self):
+        self.create_resume_preflight_run()
+        lock = self.state_home / "afk" / "afk.lock"
+        lock.write_text("existing lock sentinel\n", encoding="utf-8")
+        lock.chmod(0o644)
+
+        self.assert_resume_preflight_rejected("AFK lock file permissions are invalid")
+        self.assertEqual(stat.S_IMODE(lock.stat().st_mode), 0o644)
+        self.assertEqual(lock.read_text(encoding="utf-8"), "existing lock sentinel\n")
+
+    def test_resume_regenerates_safe_active_pointer_and_projection(self):
+        store, run_dir = self.create_resume_preflight_run()
+        store.confirm_effect(
+            "crashed-run",
+            "worker-launch-1",
+            observed={"unit": "afk-crashed-run-worker-1"},
+        )
+        (self.state_home / "afk" / "active.json").unlink()
+        (run_dir / "state.json").write_text("{stale", encoding="utf-8")
+
+        resumed = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="active")
+
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        self.assertEqual(
+            json.loads(
+                (self.state_home / "afk" / "active.json").read_text(encoding="utf-8")
+            ),
+            {"run_id": "crashed-run"},
+        )
+        self.assertEqual(
+            json.loads((run_dir / "state.json").read_text(encoding="utf-8")),
+            store.status("crashed-run"),
+        )
 
     def test_worker_unit_persists_normalized_terminal_results(self):
         for exit_code, result in (
