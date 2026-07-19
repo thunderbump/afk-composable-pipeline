@@ -82,7 +82,7 @@ class RunStore:
         self._lock_owner: int | None = None
 
     @contextmanager
-    def lock(self) -> Iterator[None]:
+    def lock(self, *, validate_root_permissions: bool = False) -> Iterator[None]:
         owner = get_ident()
         if self._lock_descriptor is not None:
             if self._lock_owner != owner:
@@ -90,11 +90,38 @@ class RunStore:
             yield
             return
 
-        _secure_directory(self.root)
-        lock_path = self.root / "afk.lock"
-        descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
-        os.chmod(lock_path, 0o600)
+        root_descriptor = None
+        if validate_root_permissions:
+            try:
+                root_descriptor = os.open(
+                    self.root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+                )
+            except FileNotFoundError:
+                _secure_directory(self.root)
+                root_descriptor = os.open(
+                    self.root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+                )
+            except OSError as exc:
+                raise EventHistoryCorrupt("Run Store directory is invalid") from exc
+            metadata = os.fstat(root_descriptor)
+            if stat.S_IMODE(metadata.st_mode) != 0o700:
+                os.close(root_descriptor)
+                raise EventHistoryCorrupt("Run Store directory permissions are invalid")
+            try:
+                descriptor = os.open(
+                    "afk.lock",
+                    os.O_RDWR | os.O_CREAT,
+                    0o600,
+                    dir_fd=root_descriptor,
+                )
+            except OSError:
+                os.close(root_descriptor)
+                raise
+        else:
+            _secure_directory(self.root)
+            descriptor = os.open(self.root / "afk.lock", os.O_RDWR | os.O_CREAT, 0o600)
         try:
+            os.fchmod(descriptor, 0o600)
             try:
                 fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError as exc:
@@ -112,6 +139,8 @@ class RunStore:
                     os.close(descriptor)
             else:
                 os.close(descriptor)
+            if root_descriptor is not None:
+                os.close(root_descriptor)
 
     def create_run(
         self,
@@ -215,7 +244,7 @@ class RunStore:
         return _project(identity, events)
 
     def resume_status(self) -> dict[str, Any]:
-        with self.lock():
+        with self.lock(validate_root_permissions=True):
             _require_mode(self.root, 0o700, "Run Store directory")
             active_path = self.root / "active.json"
             if active_path.exists() or active_path.is_symlink():

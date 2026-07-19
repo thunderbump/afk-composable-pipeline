@@ -3573,6 +3573,16 @@ class StartCliTest(unittest.TestCase):
             "Active Run pointer permissions are invalid"
         )
 
+    def test_resume_rejects_insecure_run_store_root_without_repairing_it(self):
+        self.create_resume_preflight_run()
+        root = self.state_home / "afk"
+        root.chmod(0o755)
+
+        self.assert_resume_preflight_rejected(
+            "Run Store directory permissions are invalid"
+        )
+        self.assertEqual(stat.S_IMODE(root.stat().st_mode), 0o755)
+
     def test_resume_regenerates_safe_active_pointer_and_projection(self):
         store, run_dir = self.create_resume_preflight_run()
         store.confirm_effect(

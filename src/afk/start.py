@@ -168,11 +168,12 @@ def resume_run(
 ) -> tuple[str, int]:
     store = RunStore()
     if run_id is not None:
-        projection = store.reconcile_completed_active_pointer(run_id)
+        with store.lock(validate_root_permissions=True):
+            projection = store.reconcile_completed_active_pointer(run_id)
         if projection["state"] == "completed":
             return run_id, 0
         raise StartError("named resume is only available for a completed Run")
-    with store.lock():
+    with store.lock(validate_root_permissions=True):
         try:
             projection = store.resume_status()
         except ProjectedEvidenceTampered as exc:
