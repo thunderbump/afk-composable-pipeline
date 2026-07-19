@@ -437,6 +437,45 @@ class StartCliTest(unittest.TestCase):
         self.assertEqual(store.status(run_id)["last_event"], "worker.launch_reconciled")
         self.assertEqual(self.mutation_count("worker-launch"), 1)
 
+    def test_resume_safely_retries_collected_unconfirmed_worker_launch(self):
+        interrupted = self.run_afk(
+            "start",
+            "central-bnkl.1.1",
+            AFK_TEST_KILL_AFTER_MUTATION="worker-launch",
+        )
+        self.assertLess(interrupted.returncode, 0)
+        run_id = json.loads(self.run_afk("status", "--json").stdout)["run_id"]
+        store = RunStore(self.state_home / "afk")
+        self.assertEqual(store.effect(run_id, "worker-launch-1")["status"], "prepared")
+        self.assertIsNone(store.effect_if_present(run_id, "bead-claim"))
+        run_dir = self.state_home / "afk" / "runs" / run_id
+        self.assertEqual(
+            sorted(path.name for path in (run_dir / "effects").iterdir()),
+            ["worker-launch-1.json"],
+        )
+        events_path = run_dir / "events.jsonl"
+        events = [
+            json.loads(line)["event"] for line in events_path.read_text().splitlines()
+        ]
+        self.assertNotIn("worker.launched", events)
+        self.assertNotIn("bead.claimed", events)
+        self.assertNotIn("worktree.ready", events)
+        self.assertEqual(self.mutation_count("worker-launch"), 1)
+
+        retried = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="absent")
+
+        self.assertEqual(retried.returncode, 0, retried.stderr)
+        self.assertEqual(store.effect(run_id, "worker-launch-1")["status"], "prepared")
+        self.assertIsNone(store.effect_if_present(run_id, "bead-claim"))
+        self.assertEqual(self.mutation_count("worker-launch"), 2)
+
+        reconciled = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="active")
+        self.assertEqual(reconciled.returncode, 0, reconciled.stderr)
+        self.assertEqual(store.effect(run_id, "worker-launch-1")["status"], "confirmed")
+        repeated = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="absent")
+        self.assertEqual(repeated.returncode, 2, repeated.stderr)
+        self.assertEqual(self.mutation_count("worker-launch"), 2)
+
     def test_resume_recovers_crash_before_worker_reconciled_state_append(self):
         store, run_dir = self.create_resume_preflight_run()
 
