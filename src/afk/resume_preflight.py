@@ -7,6 +7,14 @@ from typing import Any
 SCHEMA_VERSION = 1
 ATTEMPT_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
+VALIDATION_TERMINAL_STATUSES = {
+    "passed",
+    "rejected",
+    "inconclusive",
+    "invalid",
+    "head_mismatch",
+    "interrupted",
+}
 
 
 def validate_open_attempts(
@@ -23,19 +31,9 @@ def validate_open_attempts(
     ):
         return "validation attempt lifecycle is invalid"
     if validation_is_open:
-        attempt_id = (
-            validation.get("attempt_id") if isinstance(validation, dict) else None
-        )
         if (
-            not isinstance(validation, dict)
-            or set(validation) != {"attempt_id", "candidate_sha", "status", "evidence"}
-            or validation.get("status") != "started"
-            or not isinstance(attempt_id, str)
-            or not ATTEMPT_ID_PATTERN.fullmatch(attempt_id)
-            or not isinstance(validation.get("candidate_sha"), str)
-            or not SHA_PATTERN.fullmatch(validation["candidate_sha"])
+            not _valid_validation_attempt(validation, {"started"})
             or validation.get("candidate_sha") != projection.get("candidate_sha")
-            or validation.get("evidence") != f"attempts/{attempt_id}"
             or validation != started_validation
         ):
             return "open validation attempt is invalid"
@@ -54,30 +52,8 @@ def validate_open_attempts(
     if repair_lifecycle_invalid or (not repair_is_open and projected_repair_is_open):
         return "repair attempt lifecycle is invalid"
     if repair_is_open and (
-        not isinstance(repair, dict)
-        or not repair
-        or set(repair)
-        not in (
-            {"candidate_sha", "repair_attempt", "blocking_findings"},
-            {
-                "schema_version",
-                "candidate_sha",
-                "repair_attempt",
-                "blocking_findings",
-            },
-        )
-        or (
-            "schema_version" in repair
-            and (
-                type(repair["schema_version"]) is not int
-                or repair["schema_version"] != SCHEMA_VERSION
-            )
-        )
-        or not isinstance(repair.get("candidate_sha"), str)
-        or not SHA_PATTERN.fullmatch(repair["candidate_sha"])
+        not _valid_repair_brief(repair)
         or repair.get("candidate_sha") != projection.get("candidate_sha")
-        or type(repair_attempt) is not int
-        or not 1 <= repair_attempt <= 4
         or type(consumed_slot) is not int
         or repair_attempt != consumed_slot
         or type(projection.get("repair_attempts_used")) is not int
@@ -96,23 +72,19 @@ def _open_validation_attempt(
     attempt: Any = None
     for event in events:
         if event["event"] == "validation.attempt_started":
-            if is_open:
+            started = event["data"].get("validation_attempt")
+            if is_open or not _valid_validation_attempt(started, {"started"}):
                 return True, is_open, attempt
             is_open = True
-            attempt = event["data"].get("validation_attempt")
+            attempt = started
         elif event["event"] == "validation.attempt_finished":
             finished = event["data"].get("validation_attempt")
             if not (
                 is_open
-                and isinstance(attempt, dict)
-                and isinstance(finished, dict)
-                and set(finished)
-                == {"attempt_id", "candidate_sha", "status", "evidence"}
+                and _valid_validation_attempt(finished, VALIDATION_TERMINAL_STATUSES)
                 and finished.get("attempt_id") == attempt.get("attempt_id")
                 and finished.get("candidate_sha") == attempt.get("candidate_sha")
                 and finished.get("evidence") == attempt.get("evidence")
-                and isinstance(finished.get("status"), str)
-                and finished["status"] != "started"
             ):
                 return True, is_open, attempt
             is_open = False
@@ -128,58 +100,136 @@ def _open_repair_attempt(
     consumed_slot: Any = None
     for event in events:
         if event["event"] == "repair.started":
-            if is_open:
+            started_brief = event["data"].get("repair_brief")
+            if is_open or not _valid_repair_brief(started_brief):
                 return True, is_open, brief, consumed_slot
             is_open = True
-            brief = event["data"].get("repair_brief")
+            brief = started_brief
             consumed_slot = event["data"].get("repair_attempts_used")
         elif event["event"] == "candidate.repaired" and (
             "repair_attempts_used" in event["data"]
         ):
-            candidate = event["data"].get("candidate_sha")
-            if not (
-                is_open
-                and isinstance(brief, dict)
-                and type(consumed_slot) is int
-                and type(event["data"].get("repair_attempts_used")) is int
-                and event["data"].get("repair_attempts_used") == consumed_slot
-                and event["data"].get("previous_candidate_sha")
-                == brief.get("candidate_sha")
-                and isinstance(candidate, str)
-                and SHA_PATTERN.fullmatch(candidate)
-                and candidate != brief.get("candidate_sha")
+            if not _valid_candidate_repaired_closure(
+                event["data"], brief, consumed_slot
             ):
                 return True, is_open, brief, consumed_slot
             is_open = False
             brief = None
             consumed_slot = None
         elif event["event"] == "repair.interrupted":
-            interruption = event["data"].get("interrupted_repair")
-            if not (
-                is_open
-                and isinstance(brief, dict)
-                and type(consumed_slot) is int
-                and type(event["data"].get("repair_attempts_used")) is int
-                and event["data"].get("repair_attempts_used") == consumed_slot
-                and isinstance(interruption, dict)
-                and set(interruption)
-                == {
-                    "schema_version",
-                    "candidate_sha",
-                    "repair_attempt",
-                    "status",
-                    "summary",
-                }
-                and type(interruption.get("schema_version")) is int
-                and interruption["schema_version"] == SCHEMA_VERSION
-                and interruption.get("status") == "interrupted"
-                and interruption.get("candidate_sha") == brief.get("candidate_sha")
-                and interruption.get("repair_attempt") == consumed_slot
-                and isinstance(interruption.get("summary"), str)
-                and bool(interruption["summary"])
+            if not _valid_repair_interrupted_closure(
+                event["data"], brief, consumed_slot
             ):
                 return True, is_open, brief, consumed_slot
             is_open = False
             brief = None
             consumed_slot = None
     return False, is_open, brief, consumed_slot
+
+
+def _valid_validation_attempt(value: Any, statuses: set[str]) -> bool:
+    if not isinstance(value, dict):
+        return False
+    attempt_id = value.get("attempt_id")
+    return (
+        set(value) == {"attempt_id", "candidate_sha", "status", "evidence"}
+        and isinstance(attempt_id, str)
+        and bool(ATTEMPT_ID_PATTERN.fullmatch(attempt_id))
+        and isinstance(value.get("candidate_sha"), str)
+        and bool(SHA_PATTERN.fullmatch(value["candidate_sha"]))
+        and value.get("status") in statuses
+        and value.get("evidence") == f"attempts/{attempt_id}"
+    )
+
+
+def _valid_repair_brief(value: Any) -> bool:
+    return (
+        isinstance(value, dict)
+        and set(value)
+        == {"schema_version", "candidate_sha", "repair_attempt", "blocking_findings"}
+        and type(value.get("schema_version")) is int
+        and value["schema_version"] == SCHEMA_VERSION
+        and isinstance(value.get("candidate_sha"), str)
+        and bool(SHA_PATTERN.fullmatch(value["candidate_sha"]))
+        and type(value.get("repair_attempt")) is int
+        and 1 <= value["repair_attempt"] <= 4
+        and isinstance(value.get("blocking_findings"), list)
+    )
+
+
+def _valid_candidate_repaired_closure(data: Any, brief: Any, slot: Any) -> bool:
+    if not isinstance(data, dict) or not isinstance(brief, dict):
+        return False
+    candidate = data.get("candidate_sha")
+    return (
+        set(data)
+        == {
+            "checkpoint",
+            "previous_candidate_sha",
+            "candidate_sha",
+            "pr_number",
+            "pr_url",
+            "pr_head_sha",
+            "repair_attempts_used",
+            "repair_dispositions",
+            "attention",
+        }
+        and data.get("checkpoint") == "candidate_ready"
+        and type(slot) is int
+        and type(data.get("repair_attempts_used")) is int
+        and data["repair_attempts_used"] == slot
+        and data.get("previous_candidate_sha") == brief.get("candidate_sha")
+        and isinstance(candidate, str)
+        and bool(SHA_PATTERN.fullmatch(candidate))
+        and candidate != brief.get("candidate_sha")
+        and type(data.get("pr_number")) is int
+        and data["pr_number"] > 0
+        and isinstance(data.get("pr_url"), str)
+        and bool(data["pr_url"])
+        and data.get("pr_head_sha") == candidate
+        and isinstance(data.get("repair_dispositions"), list)
+        and data.get("attention") == {}
+    )
+
+
+def _valid_repair_interrupted_closure(data: Any, brief: Any, slot: Any) -> bool:
+    if not isinstance(data, dict) or not isinstance(brief, dict):
+        return False
+    interruption = data.get("interrupted_repair")
+    next_brief = data.get("repair_brief")
+    return (
+        set(data)
+        == {
+            "checkpoint",
+            "repair_attempts_used",
+            "repair_brief",
+            "interrupted_repair",
+        }
+        and data.get("checkpoint") in {"validated", "candidate_ready"}
+        and type(slot) is int
+        and type(data.get("repair_attempts_used")) is int
+        and data["repair_attempts_used"] == slot
+        and isinstance(interruption, dict)
+        and set(interruption)
+        == {
+            "schema_version",
+            "candidate_sha",
+            "repair_attempt",
+            "status",
+            "summary",
+        }
+        and type(interruption.get("schema_version")) is int
+        and interruption["schema_version"] == SCHEMA_VERSION
+        and interruption.get("status") == "interrupted"
+        and interruption.get("candidate_sha") == brief.get("candidate_sha")
+        and interruption.get("repair_attempt") == slot
+        and isinstance(interruption.get("summary"), str)
+        and bool(interruption["summary"])
+        and (
+            next_brief == {}
+            if slot == 4
+            else _valid_repair_brief(next_brief)
+            and next_brief.get("candidate_sha") == brief.get("candidate_sha")
+            and next_brief.get("repair_attempt") == slot + 1
+        )
+    )

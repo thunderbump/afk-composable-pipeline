@@ -654,8 +654,10 @@ class CandidateGateTest(unittest.TestCase):
                         "worker_exit_code": 0,
                         "validation_contract": {"source": source},
                         "repair_brief": {
+                            "schema_version": 1,
                             "candidate_sha": "b" * 40,
                             "repair_attempt": 1,
+                            "blocking_findings": [],
                         },
                     },
                 )
@@ -666,8 +668,10 @@ class CandidateGateTest(unittest.TestCase):
                         "checkpoint": "candidate_ready",
                         "repair_attempts_used": 1,
                         "repair_brief": {
+                            "schema_version": 1,
                             "candidate_sha": "b" * 40,
                             "repair_attempt": 1,
+                            "blocking_findings": [],
                         },
                     },
                 )
@@ -679,7 +683,11 @@ class CandidateGateTest(unittest.TestCase):
                         "checkpoint": "candidate_ready",
                         "previous_candidate_sha": "b" * 40,
                         "candidate_sha": "c" * 40,
+                        "pr_number": 17,
+                        "pr_url": "https://example.test/pr/17",
+                        "pr_head_sha": "c" * 40,
                         "repair_attempts_used": 1,
+                        "repair_dispositions": [],
                         "attention": {},
                     },
                 )
@@ -717,6 +725,7 @@ class CandidateGateTest(unittest.TestCase):
                 run_id="run-1",
             )["run_id"]
             brief = {
+                "schema_version": 1,
                 "candidate_sha": "b" * 40,
                 "repair_attempt": 1,
                 "blocking_findings": [],

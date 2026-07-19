@@ -3766,6 +3766,45 @@ class StartCliTest(unittest.TestCase):
 
         self.assert_repeated_validation_lifecycle_rejected(store, run_dir)
 
+    def test_resume_rejects_invalid_terminal_validation_status(self):
+        store, run_dir = self.create_resume_preflight_run()
+        started = {
+            "attempt_id": "validation-bbbbbbbbbbbb",
+            "candidate_sha": "b" * 40,
+            "status": "started",
+            "evidence": "attempts/validation-bbbbbbbbbbbb",
+        }
+        store.append_event(
+            "crashed-run",
+            "validation.attempt_started",
+            state="candidate_ready",
+            data={
+                "checkpoint": "candidate_ready",
+                "candidate_sha": "b" * 40,
+                "validation_attempt": started,
+            },
+        )
+        store.append_event(
+            "crashed-run",
+            "validation.attempt_finished",
+            data={
+                "checkpoint": "candidate_ready",
+                "validation_attempt": {**started, "status": "not-a-real-outcome"},
+            },
+        )
+        store.append_event(
+            "crashed-run",
+            "run.attention_required",
+            state="attention_required",
+            data={
+                "checkpoint": "candidate_ready",
+                "worker_exit_code": 0,
+                "attention": {"scope": "validation", "kind": "unavailable"},
+            },
+        )
+
+        self.assert_repeated_validation_lifecycle_rejected(store, run_dir)
+
     def test_resume_repeatedly_rejects_misbound_outstanding_repair_attempt(self):
         store, _ = self.create_resume_preflight_run()
         brief = {
@@ -3884,7 +3923,11 @@ class StartCliTest(unittest.TestCase):
                 "checkpoint": "candidate_ready",
                 "previous_candidate_sha": "b" * 40,
                 "candidate_sha": "c" * 40,
+                "pr_number": 17,
+                "pr_url": "https://example.test/pr/17",
+                "pr_head_sha": "c" * 40,
                 "repair_attempts_used": 1,
+                "repair_dispositions": [],
                 "attention": {},
             },
         )
@@ -3898,6 +3941,55 @@ class StartCliTest(unittest.TestCase):
                 "repair_attempts_used": 1,
                 "repair_brief": brief,
                 "attention": {"scope": "repair", "kind": "unavailable"},
+            },
+        )
+
+        self.assert_repeated_repair_lifecycle_rejected(store, run_dir)
+
+    def test_resume_rejects_malformed_repair_brief_hidden_by_closure(self):
+        store, run_dir = self.create_resume_preflight_run()
+        malformed_brief = {
+            "schema_version": 1,
+            "candidate_sha": "b" * 40,
+            "repair_attempt": 1,
+            "blocking_findings": [],
+            "unexpected": True,
+        }
+        store.append_event(
+            "crashed-run",
+            "repair.started",
+            state="validated",
+            data={
+                "checkpoint": "validated",
+                "candidate_sha": "b" * 40,
+                "repair_attempts_used": 1,
+                "repair_brief": malformed_brief,
+            },
+        )
+        store.append_event(
+            "crashed-run",
+            "candidate.repaired",
+            state="candidate_ready",
+            data={
+                "checkpoint": "candidate_ready",
+                "previous_candidate_sha": "b" * 40,
+                "candidate_sha": "c" * 40,
+                "pr_number": 17,
+                "pr_url": "https://example.test/pr/17",
+                "pr_head_sha": "c" * 40,
+                "repair_attempts_used": 1,
+                "repair_dispositions": [],
+                "attention": {},
+            },
+        )
+        store.append_event(
+            "crashed-run",
+            "run.attention_required",
+            state="attention_required",
+            data={
+                "checkpoint": "candidate_ready",
+                "worker_exit_code": 0,
+                "attention": {"scope": "validation", "kind": "unavailable"},
             },
         )
 
