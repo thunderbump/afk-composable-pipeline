@@ -1673,7 +1673,7 @@ class StartCliTest(unittest.TestCase):
         active = self.state_home / "afk" / "active.json"
         self.assertTrue(active.is_file())
 
-        resumed = self.run_afk("resume")
+        resumed = self.run_afk("resume", run_id)
 
         self.assertEqual(resumed.returncode, 0, resumed.stderr)
         self.assertEqual(resumed.stdout.strip(), run_id)
@@ -1723,6 +1723,29 @@ class StartCliTest(unittest.TestCase):
         self.assertEqual(unnamed.returncode, 0, unnamed.stderr)
         after = json.loads(self.run_afk("status", run_id, "--json").stdout)
         self.assertEqual(after["pr_ready"]["candidate_sha"], "d" * 40)
+
+    def test_named_resume_of_completed_run_preserves_newer_active_run(self):
+        completed_run_id = self.start_reviewed_run()
+        for _ in range(4):
+            self.assertEqual(self.run_afk("resume").returncode, 0)
+        (self.state_home / "fake-bead-closed").unlink()
+        started = self.run_afk(
+            "start",
+            "central-bnkl.1.2",
+            AFK_FAKE_BEAD="central-bnkl.1.2",
+        )
+        self.assertEqual(started.returncode, 0, started.stderr)
+        active_run_id = started.stdout.strip()
+        active = self.state_home / "afk" / "active.json"
+        active_before = active.read_text(encoding="utf-8")
+
+        resumed = self.run_afk("resume", completed_run_id)
+
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        self.assertEqual(resumed.stdout.strip(), completed_run_id)
+        self.assertEqual(active.read_text(encoding="utf-8"), active_before)
+        current = json.loads(self.run_afk("status", active_run_id, "--json").stdout)
+        self.assertEqual(current["checkpoint"], "created")
 
     def test_resume_recovers_process_crash_before_bead_close_mutation(self):
         run_id = self.start_reviewed_run()

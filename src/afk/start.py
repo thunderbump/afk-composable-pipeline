@@ -162,11 +162,14 @@ def resume_run(
     run_id: str | None = None, *, note: str | None = None
 ) -> tuple[str, int]:
     store = RunStore()
+    if run_id is not None:
+        projection = store.reconcile_completed_active_pointer(run_id)
+        if projection["state"] == "completed":
+            return run_id, 0
+        raise StartError("named resume is only available for a completed Run")
     with store.lock():
-        projection = store.status(run_id)
+        projection = store.status()
         selected_run_id = projection["run_id"]
-        if run_id is not None and projection["state"] != "completed":
-            raise StartError("named resume is only available for a completed Run")
         if projection["state"] == "completed":
             return selected_run_id, 0
         run_id = selected_run_id
