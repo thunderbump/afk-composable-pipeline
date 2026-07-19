@@ -36,6 +36,7 @@ from afk.jsonutil import canonical_json
 from afk.redaction import redact_artifact_value
 from afk.run_store import (
     ProjectedEvidenceTampered,
+    ResumePreflightInvalid,
     RunStore,
     RunStoreBusy,
     RunStoreError,
@@ -176,7 +177,7 @@ def resume_run(
     with store.lock(validate_root_permissions=True):
         try:
             projection = store.resume_status()
-        except ProjectedEvidenceTampered as exc:
+        except (ProjectedEvidenceTampered, ResumePreflightInvalid) as exc:
             projection = store.status()
             selected_run_id = projection["run_id"]
             checkpoint = projection["checkpoint"]

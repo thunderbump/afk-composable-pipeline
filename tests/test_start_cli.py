@@ -3509,6 +3509,48 @@ class StartCliTest(unittest.TestCase):
 
         self.assert_resume_preflight_rejected("Event History record 1 is invalid")
 
+    def test_resume_rejects_misbound_open_validation_attempt_before_commands(self):
+        store, _ = self.create_resume_preflight_run()
+        store.append_event(
+            "crashed-run",
+            "validation.attempt_started",
+            state="candidate_ready",
+            data={
+                "checkpoint": "candidate_ready",
+                "candidate_sha": "b" * 40,
+                "validation_attempt": {
+                    "status": "started",
+                    "candidate_sha": "c" * 40,
+                },
+            },
+        )
+
+        resumed = self.run_afk("resume")
+
+        self.assertEqual(resumed.returncode, 2)
+        self.assertFalse(self.command_log.exists())
+        status = store.status("crashed-run")
+        self.assertEqual(status["attention"]["kind"], "invalid")
+        self.assertIn(
+            "open validation attempt is invalid", status["attention"]["summary"]
+        )
+
+    def test_resume_rejects_unrelated_malformed_effect_before_commands(self):
+        store, run_dir = self.create_resume_preflight_run()
+        malformed = run_dir / "effects" / "unrelated.json"
+        malformed.write_text("{", encoding="utf-8")
+        malformed.chmod(0o600)
+
+        resumed = self.run_afk("resume")
+
+        self.assertEqual(resumed.returncode, 2)
+        self.assertFalse(self.command_log.exists())
+        status = store.status("crashed-run")
+        self.assertEqual(status["attention"]["kind"], "invalid")
+        self.assertIn(
+            "Effect is missing or invalid: unrelated", status["attention"]["summary"]
+        )
+
     def test_resume_rejects_torn_event_tail_before_external_commands(self):
         _, run_dir = self.create_resume_preflight_run()
         with (run_dir / "events.jsonl").open("ab") as stream:

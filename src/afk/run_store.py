@@ -64,6 +64,10 @@ class ProjectedEvidenceTampered(EvidenceTampered):
     pass
 
 
+class ResumePreflightInvalid(EventHistoryCorrupt):
+    pass
+
+
 def default_state_root() -> Path:
     state_home = os.environ.get("XDG_STATE_HOME")
     if state_home:
@@ -257,7 +261,9 @@ class RunStore:
                     "Active Run pointer does not match Event History"
                 )
             self._validate_resume_permissions(projection["run_id"])
+            self._validate_resume_effects(projection["run_id"])
             self._verify_sealed_evidence(projection["run_id"], projection)
+            _validate_open_attempts(projection)
             _atomic_json(self._run_dir(projection["run_id"]) / "state.json", projection)
             if active_run_id is None:
                 _atomic_json(
@@ -837,6 +843,16 @@ class RunStore:
         for root_name in EVIDENCE_ROOTS:
             _require_mode(run_dir / root_name, 0o700, "evidence root")
 
+    def _validate_resume_effects(self, run_id: str) -> None:
+        effects = self._run_dir(run_id) / "effects"
+        for path in sorted(effects.iterdir()):
+            if path.suffix != ".json" or not RUN_ID_PATTERN.fullmatch(path.stem):
+                raise ResumePreflightInvalid(f"Effect record is invalid: {path.name}")
+            try:
+                self.effect(run_id, path.stem)
+            except RunStoreError as exc:
+                raise ResumePreflightInvalid(str(exc)) from exc
+
     def _evidence_path(self, run_id: str, relative: str) -> Path:
         parts = Path(relative).parts
         if (
@@ -998,6 +1014,61 @@ def _project(identity: dict[str, Any], events: list[dict[str, Any]]) -> dict[str
         if key in details:
             projection[key] = details[key]
     return projection
+
+
+def _validate_open_attempts(projection: dict[str, Any]) -> None:
+    validation = projection.get("validation_attempt")
+    if isinstance(validation, dict) and validation.get("status") == "started":
+        attempt_id = validation.get("attempt_id")
+        if (
+            set(validation) != {"attempt_id", "candidate_sha", "status", "evidence"}
+            or not isinstance(attempt_id, str)
+            or not RUN_ID_PATTERN.fullmatch(attempt_id)
+            or not isinstance(validation.get("candidate_sha"), str)
+            or not SHA_PATTERN.fullmatch(validation["candidate_sha"])
+            or validation.get("candidate_sha") != projection.get("candidate_sha")
+            or validation.get("evidence") != f"attempts/{attempt_id}"
+        ):
+            raise ResumePreflightInvalid("open validation attempt is invalid")
+
+    repair = projection.get("repair_brief")
+    repair_attempt = repair.get("repair_attempt") if isinstance(repair, dict) else None
+    attention = projection.get("attention")
+    repair_is_open = projection.get("last_event") == "repair.started" or (
+        isinstance(attention, dict)
+        and attention.get("scope") == "repair"
+        and repair_attempt == projection.get("repair_attempts_used")
+        and isinstance(repair, dict)
+        and repair.get("candidate_sha") == projection.get("candidate_sha")
+    )
+    if repair_is_open and (
+        not isinstance(repair, dict)
+        or not repair
+        or set(repair)
+        not in (
+            {"candidate_sha", "repair_attempt", "blocking_findings"},
+            {
+                "schema_version",
+                "candidate_sha",
+                "repair_attempt",
+                "blocking_findings",
+            },
+        )
+        or (
+            "schema_version" in repair
+            and (
+                type(repair["schema_version"]) is not int
+                or repair["schema_version"] != SCHEMA_VERSION
+            )
+        )
+        or not isinstance(repair.get("candidate_sha"), str)
+        or not SHA_PATTERN.fullmatch(repair["candidate_sha"])
+        or repair.get("candidate_sha") != projection.get("candidate_sha")
+        or type(repair_attempt) is not int
+        or not 1 <= repair_attempt <= 4
+        or not isinstance(repair.get("blocking_findings"), list)
+    ):
+        raise ResumePreflightInvalid("open repair attempt is invalid")
 
 
 def _secure_directory(path: Path) -> None:
