@@ -200,6 +200,7 @@ class StartCliTest(unittest.TestCase):
         status = json.loads(self.run_afk("status", run_id, "--json").stdout)
         completion = status["completion"]
         self.assertEqual(status["checkpoint"], "completed")
+        self.assertEqual(completion["schema_version"], 1)
         self.assertEqual(completion["repository"], "thunderbump/beads-webui")
         self.assertEqual(completion["bead_id"], "central-bnkl.1.1")
         self.assertEqual(completion["candidate_sha"], "d" * 40)
@@ -211,7 +212,24 @@ class StartCliTest(unittest.TestCase):
         self.assertTrue(completion["worktree_removed"])
         self.assertTrue(completion["local_branch_deleted"])
         self.assertEqual(completion["cleanup_warnings"], [])
+        self.assertEqual(completion["evidence"], "gates/completion-dddddddddddd")
         store = RunStore(self.state_home / "afk")
+        close_effect = store.effect(run_id, "bead-close")
+        self.assertEqual(close_effect["status"], "confirmed")
+        self.assertEqual(
+            close_effect["observed"],
+            {
+                "bead_id": "central-bnkl.1.1",
+                "repository": "thunderbump/beads-webui",
+                "pr_number": 17,
+                "pr_url": "https://example.test/pr/17",
+                "candidate_sha": "d" * 40,
+                "merge_commit": "f" * 40,
+                "status": "closed",
+                "close_reason": "merged via " + "f" * 40,
+            },
+        )
+        self.assertEqual(status["bead_closure"], close_effect["observed"])
         self.assertEqual(
             store.sealed_evidence_result(run_id, completion["evidence"]), completion
         )
@@ -390,14 +408,26 @@ class StartCliTest(unittest.TestCase):
         self.assertEqual(before["checkpoint"], "reviewed")
         self.assertNotIn("pr_ready", before)
         store = RunStore(self.state_home / "afk")
-        self.assertEqual(store.effect(run_id, "pr-mark-ready")["status"], "confirmed")
+        effect = store.effect(run_id, "pr-mark-ready")
+        self.assertEqual(effect["status"], "confirmed")
+        self.assertEqual(
+            effect["observed"],
+            {
+                "number": 17,
+                "url": "https://example.test/pr/17",
+                "candidate_sha": "d" * 40,
+                "head": f"afk/central-bnkl-1-1-{run_id}/candidate",
+                "base": "main",
+                "draft": False,
+            },
+        )
 
         resumed = self.run_afk("resume")
 
         self.assertEqual(resumed.returncode, 0, resumed.stderr)
         after = json.loads(self.run_afk("status", run_id, "--json").stdout)
         self.assertEqual(after["checkpoint"], "reviewed")
-        self.assertEqual(after["pr_ready"]["candidate_sha"], "d" * 40)
+        self.assertEqual(after["pr_ready"], effect["observed"])
         commands = [
             json.loads(line)
             for line in self.command_log.read_text(encoding="utf-8").splitlines()
@@ -467,13 +497,27 @@ class StartCliTest(unittest.TestCase):
         self.assertLess(interrupted.returncode, 0)
         before = json.loads(self.run_afk("status", run_id, "--json").stdout)
         self.assertEqual(before["checkpoint"], "reviewed")
-        self.assertEqual(before["pr_ready"]["candidate_sha"], "d" * 40)
+        effect = RunStore(self.state_home / "afk").effect(run_id, "pr-mark-ready")
+        self.assertEqual(effect["status"], "confirmed")
+        self.assertEqual(
+            effect["observed"],
+            {
+                "number": 17,
+                "url": "https://example.test/pr/17",
+                "candidate_sha": "d" * 40,
+                "head": f"afk/central-bnkl-1-1-{run_id}/candidate",
+                "base": "main",
+                "draft": False,
+            },
+        )
+        self.assertEqual(before["pr_ready"], effect["observed"])
 
         resumed = self.run_afk("resume")
 
         self.assertEqual(resumed.returncode, 0, resumed.stderr)
         after = json.loads(self.run_afk("status", run_id, "--json").stdout)
         self.assertEqual(after["checkpoint"], "merged")
+        self.assertEqual(after["pr_ready"], effect["observed"])
         commands = [
             json.loads(line)
             for line in self.command_log.read_text(encoding="utf-8").splitlines()
@@ -614,14 +658,26 @@ class StartCliTest(unittest.TestCase):
         self.assertEqual(before["checkpoint"], "reviewed")
         self.assertNotIn("merge", before)
         store = RunStore(self.state_home / "afk")
-        self.assertEqual(store.effect(run_id, "pr-squash-merge")["status"], "confirmed")
+        effect = store.effect(run_id, "pr-squash-merge")
+        self.assertEqual(effect["status"], "confirmed")
+        self.assertEqual(
+            effect["observed"],
+            {
+                "number": 17,
+                "url": "https://example.test/pr/17",
+                "candidate_sha": "d" * 40,
+                "head": f"afk/central-bnkl-1-1-{run_id}/candidate",
+                "base": "main",
+                "merge_commit": "f" * 40,
+            },
+        )
 
         resumed = self.run_afk("resume")
 
         self.assertEqual(resumed.returncode, 0, resumed.stderr)
         after = json.loads(self.run_afk("status", run_id, "--json").stdout)
         self.assertEqual(after["checkpoint"], "merged")
-        self.assertEqual(after["merge"]["candidate_sha"], "d" * 40)
+        self.assertEqual(after["merge"], effect["observed"])
         commands = [
             json.loads(line)
             for line in self.command_log.read_text(encoding="utf-8").splitlines()
@@ -644,16 +700,27 @@ class StartCliTest(unittest.TestCase):
         self.assertLess(interrupted.returncode, 0)
         before = json.loads(self.run_afk("status", run_id, "--json").stdout)
         self.assertEqual(before["checkpoint"], "merged")
-        self.assertEqual(before["merge"]["candidate_sha"], "d" * 40)
+        effect = RunStore(self.state_home / "afk").effect(run_id, "pr-squash-merge")
+        self.assertEqual(effect["status"], "confirmed")
+        self.assertEqual(
+            effect["observed"],
+            {
+                "number": 17,
+                "url": "https://example.test/pr/17",
+                "candidate_sha": "d" * 40,
+                "head": f"afk/central-bnkl-1-1-{run_id}/candidate",
+                "base": "main",
+                "merge_commit": "f" * 40,
+            },
+        )
+        self.assertEqual(before["merge"], effect["observed"])
 
         closed = self.run_afk("resume")
         completed = self.run_afk("resume")
 
         self.assertEqual(closed.returncode, 0, closed.stderr)
         self.assertEqual(completed.returncode, 0, completed.stderr)
-        after = json.loads(self.run_afk("status", run_id, "--json").stdout)
-        self.assertEqual(after["checkpoint"], "completed")
-        self.assertTrue(after["completion"]["remote_branch_deleted"])
+        self.assert_exact_terminal_completion(run_id)
         commands = [
             json.loads(line)
             for line in self.command_log.read_text(encoding="utf-8").splitlines()
@@ -1613,8 +1680,10 @@ class StartCliTest(unittest.TestCase):
         before = json.loads(self.run_afk("status", run_id, "--json").stdout)
         self.assertEqual(before["checkpoint"], "bead_closed")
         evidence = f"gates/completion-{before['candidate_sha'][:12]}"
+        self.assertEqual(evidence, "gates/completion-dddddddddddd")
         store = RunStore(self.state_home / "afk")
-        self.assertIsNotNone(store.sealed_evidence_result(run_id, evidence))
+        sealed_completion = store.sealed_evidence_result(run_id, evidence)
+        self.assertIsNotNone(sealed_completion)
         commands_before = self.command_log.read_text(encoding="utf-8")
 
         resumed = self.run_afk("resume")
@@ -1622,6 +1691,8 @@ class StartCliTest(unittest.TestCase):
         self.assertEqual(resumed.returncode, 0, resumed.stderr)
         after = json.loads(self.run_afk("status", run_id, "--json").stdout)
         self.assertEqual(after["checkpoint"], "completed")
+        self.assertEqual(after["completion"], sealed_completion)
+        self.assert_exact_terminal_completion(run_id)
         self.assertEqual(self.command_log.read_text(encoding="utf-8"), commands_before)
 
     def test_resume_recovers_crash_after_completed_event_write(self):
@@ -1637,6 +1708,12 @@ class StartCliTest(unittest.TestCase):
         self.assertLess(interrupted.returncode, 0)
         completed = json.loads(self.run_afk("status", run_id, "--json").stdout)
         self.assertEqual(completed["checkpoint"], "completed")
+        store = RunStore(self.state_home / "afk")
+        sealed_completion = store.sealed_evidence_result(
+            run_id, "gates/completion-dddddddddddd"
+        )
+        self.assertEqual(completed["completion"], sealed_completion)
+        self.assert_exact_terminal_completion(run_id)
         active = self.state_home / "afk" / "active.json"
         self.assertTrue(active.is_file())
 
@@ -1645,6 +1722,8 @@ class StartCliTest(unittest.TestCase):
         self.assertEqual(resumed.returncode, 0, resumed.stderr)
         self.assertEqual(resumed.stdout.strip(), run_id)
         self.assertFalse(active.exists())
+        after = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(after["completion"], sealed_completion)
         events = (self.state_home / "afk" / "runs" / run_id / "events.jsonl").read_text(
             encoding="utf-8"
         )
@@ -1777,14 +1856,28 @@ class StartCliTest(unittest.TestCase):
         self.assertEqual(before["checkpoint"], "merged")
         self.assertNotIn("bead_closure", before)
         store = RunStore(self.state_home / "afk")
-        self.assertEqual(store.effect(run_id, "bead-close")["status"], "confirmed")
+        effect = store.effect(run_id, "bead-close")
+        self.assertEqual(effect["status"], "confirmed")
+        self.assertEqual(
+            effect["observed"],
+            {
+                "bead_id": "central-bnkl.1.1",
+                "repository": "thunderbump/beads-webui",
+                "pr_number": 17,
+                "pr_url": "https://example.test/pr/17",
+                "candidate_sha": "d" * 40,
+                "merge_commit": "f" * 40,
+                "status": "closed",
+                "close_reason": "merged via " + "f" * 40,
+            },
+        )
 
         resumed = self.run_afk("resume")
 
         self.assertEqual(resumed.returncode, 0, resumed.stderr)
         after = json.loads(self.run_afk("status", run_id, "--json").stdout)
         self.assertEqual(after["checkpoint"], "bead_closed")
-        self.assertEqual(after["bead_closure"]["merge_commit"], "f" * 40)
+        self.assertEqual(after["bead_closure"], effect["observed"])
         commands = [
             json.loads(line)
             for line in self.command_log.read_text(encoding="utf-8").splitlines()
@@ -1806,14 +1899,27 @@ class StartCliTest(unittest.TestCase):
         self.assertLess(interrupted.returncode, 0)
         before = json.loads(self.run_afk("status", run_id, "--json").stdout)
         self.assertEqual(before["checkpoint"], "bead_closed")
-        self.assertEqual(before["bead_closure"]["merge_commit"], "f" * 40)
+        effect = RunStore(self.state_home / "afk").effect(run_id, "bead-close")
+        self.assertEqual(effect["status"], "confirmed")
+        self.assertEqual(
+            effect["observed"],
+            {
+                "bead_id": "central-bnkl.1.1",
+                "repository": "thunderbump/beads-webui",
+                "pr_number": 17,
+                "pr_url": "https://example.test/pr/17",
+                "candidate_sha": "d" * 40,
+                "merge_commit": "f" * 40,
+                "status": "closed",
+                "close_reason": "merged via " + "f" * 40,
+            },
+        )
+        self.assertEqual(before["bead_closure"], effect["observed"])
 
         resumed = self.run_afk("resume")
 
         self.assertEqual(resumed.returncode, 0, resumed.stderr)
-        after = json.loads(self.run_afk("status", run_id, "--json").stdout)
-        self.assertEqual(after["checkpoint"], "completed")
-        self.assertEqual(after["completion"]["bead_closure"], before["bead_closure"])
+        self.assert_exact_terminal_completion(run_id)
         commands = [
             json.loads(line)
             for line in self.command_log.read_text(encoding="utf-8").splitlines()
@@ -2079,16 +2185,21 @@ class StartCliTest(unittest.TestCase):
         self.assertEqual(before["checkpoint"], "merged")
         self.assertFalse(before["remote_branch_deleted"])
         store = RunStore(self.state_home / "afk")
+        effect = store.effect(run_id, "remote-branch-delete")
+        self.assertEqual(effect["status"], "confirmed")
         self.assertEqual(
-            store.effect(run_id, "remote-branch-delete")["status"], "confirmed"
+            effect["observed"],
+            {
+                "repository": "thunderbump/beads-webui",
+                "branch": f"afk/central-bnkl-1-1-{run_id}/candidate",
+                "deleted": True,
+            },
         )
 
         self.assertEqual(self.run_afk("resume").returncode, 0)
         self.assertEqual(self.run_afk("resume").returncode, 0)
 
-        after = json.loads(self.run_afk("status", run_id, "--json").stdout)
-        self.assertEqual(after["checkpoint"], "completed")
-        self.assertTrue(after["completion"]["remote_branch_deleted"])
+        self.assert_exact_terminal_completion(run_id)
         commands = [
             json.loads(line)
             for line in self.command_log.read_text(encoding="utf-8").splitlines()
@@ -2112,13 +2223,23 @@ class StartCliTest(unittest.TestCase):
         before = json.loads(self.run_afk("status", run_id, "--json").stdout)
         self.assertEqual(before["checkpoint"], "merged")
         self.assertTrue(before["remote_branch_deleted"])
+        effect = RunStore(self.state_home / "afk").effect(
+            run_id, "remote-branch-delete"
+        )
+        self.assertEqual(effect["status"], "confirmed")
+        self.assertEqual(
+            effect["observed"],
+            {
+                "repository": "thunderbump/beads-webui",
+                "branch": f"afk/central-bnkl-1-1-{run_id}/candidate",
+                "deleted": True,
+            },
+        )
 
         self.assertEqual(self.run_afk("resume").returncode, 0)
         self.assertEqual(self.run_afk("resume").returncode, 0)
 
-        after = json.loads(self.run_afk("status", run_id, "--json").stdout)
-        self.assertEqual(after["checkpoint"], "completed")
-        self.assertTrue(after["completion"]["remote_branch_deleted"])
+        self.assert_exact_terminal_completion(run_id)
         commands = [
             json.loads(line)
             for line in self.command_log.read_text(encoding="utf-8").splitlines()
