@@ -1708,6 +1708,59 @@ class StartCliTest(unittest.TestCase):
         self.assertEqual(unnamed.returncode, 2)
         self.assertIn("no Active Run", unnamed.stderr)
 
+    def create_named_completed_resume_preflight_run(self):
+        run_id = self.start_reviewed_run()
+        for _ in range(4):
+            self.assertEqual(self.run_afk("resume").returncode, 0)
+        run_dir = self.state_home / "afk" / "runs" / run_id
+        active = self.state_home / "afk" / "active.json"
+        active.write_text(json.dumps({"run_id": run_id}) + "\n", encoding="utf-8")
+        active.chmod(0o600)
+        self.command_log.unlink(missing_ok=True)
+        return run_id, run_dir, active
+
+    def assert_named_completed_resume_preflight_rejected(self, run_id, active, message):
+        active_before = active.read_text(encoding="utf-8")
+
+        resumed = self.run_afk("resume", run_id)
+
+        self.assertEqual(resumed.returncode, 2)
+        self.assertIn(message, resumed.stderr)
+        self.assertEqual(active.read_text(encoding="utf-8"), active_before)
+        self.assertFalse(self.command_log.exists())
+
+    def test_named_completed_resume_rejects_torn_event_tail_before_reconciliation(self):
+        run_id, run_dir, active = self.create_named_completed_resume_preflight_run()
+        with (run_dir / "events.jsonl").open("ab") as stream:
+            stream.write(b'{"schema_version":1')
+
+        self.assert_named_completed_resume_preflight_rejected(
+            run_id, active, "Event History has an incomplete trailing record"
+        )
+
+    def test_named_completed_resume_rejects_invalid_effect_before_reconciliation(self):
+        run_id, run_dir, active = self.create_named_completed_resume_preflight_run()
+        effect_path = run_dir / "effects" / "worker-launch-1.json"
+        effect = json.loads(effect_path.read_text(encoding="utf-8"))
+        effect["status"] = "invalid"
+        effect_path.write_text(json.dumps(effect) + "\n", encoding="utf-8")
+
+        self.assert_named_completed_resume_preflight_rejected(
+            run_id, active, "Effect is invalid: worker-launch-1"
+        )
+
+    def test_named_completed_resume_rejects_invalid_evidence_before_reconciliation(
+        self,
+    ):
+        run_id, run_dir, active = self.create_named_completed_resume_preflight_run()
+        result_path = run_dir / "gates" / "completion-dddddddddddd" / "result.json"
+        result_path.chmod(0o600)
+        result_path.write_text("{}\n", encoding="utf-8")
+
+        self.assert_named_completed_resume_preflight_rejected(
+            run_id, active, "evidence does not match its manifest"
+        )
+
     def test_named_resume_does_not_advance_noncompleted_active_run(self):
         run_id = self.start_reviewed_run()
 

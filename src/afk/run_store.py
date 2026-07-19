@@ -268,14 +268,11 @@ class RunStore:
                 _require_mode(active_path, 0o600, "Active Run pointer")
             active_run_id = self._active_pointer_run_id(invalid_is_error=True)
             projection = self.status()
-            events, _ = self._read_events(projection["run_id"], require_complete=True)
+            events = self._validate_resume_projection(projection)
             if active_run_id is not None and active_run_id != projection["run_id"]:
                 raise EventHistoryCorrupt(
                     "Active Run pointer does not match Event History"
                 )
-            self._validate_resume_permissions(projection["run_id"])
-            self._validate_resume_effects(projection["run_id"])
-            self._verify_sealed_evidence(projection["run_id"], projection)
             _validate_open_attempts(
                 projection,
                 open_validation_attempt=_open_validation_attempt(events),
@@ -289,9 +286,20 @@ class RunStore:
             return projection
 
     def reconcile_completed_active_pointer(self, run_id: str) -> dict[str, Any]:
-        with self.lock():
+        with self.lock(validate_root_permissions=True):
+            _require_mode(self.root, 0o700, "Run Store directory")
+            active_path = self.root / "active.json"
+            if active_path.exists() or active_path.is_symlink():
+                _require_mode(active_path, 0o600, "Active Run pointer")
+            active_run_id = self._active_pointer_run_id(invalid_is_error=True)
             projection = self.status(run_id)
-            if projection["state"] == "completed":
+            events = self._validate_resume_projection(projection)
+            _validate_open_attempts(
+                projection,
+                open_validation_attempt=_open_validation_attempt(events),
+                open_repair_attempt=_open_repair_attempt(events),
+            )
+            if projection["state"] == "completed" and active_run_id == run_id:
                 self._clear_active_pointer(run_id)
             return projection
 
@@ -869,6 +877,16 @@ class RunStore:
                 self.effect(run_id, path.stem)
             except RunStoreError as exc:
                 raise ResumePreflightInvalid(str(exc)) from exc
+
+    def _validate_resume_projection(
+        self, projection: dict[str, Any]
+    ) -> list[dict[str, Any]]:
+        run_id = projection["run_id"]
+        events, _ = self._read_events(run_id, require_complete=True)
+        self._validate_resume_permissions(run_id)
+        self._validate_resume_effects(run_id)
+        self._verify_sealed_evidence(run_id, projection)
+        return events
 
     def _evidence_path(self, run_id: str, relative: str) -> Path:
         parts = Path(relative).parts
