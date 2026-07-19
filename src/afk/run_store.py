@@ -96,6 +96,7 @@ class RunStore:
             return
 
         root_descriptor = None
+        lock_created = False
         if validate_root_permissions:
             try:
                 root_descriptor = os.open(
@@ -112,16 +113,25 @@ class RunStore:
             if stat.S_IMODE(metadata.st_mode) != 0o700:
                 os.close(root_descriptor)
                 raise EventHistoryCorrupt("Run Store directory permissions are invalid")
+            strict_flags = (
+                os.O_RDWR | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+            )
             try:
                 descriptor = os.open(
                     "afk.lock",
-                    os.O_RDWR
-                    | os.O_CREAT
-                    | getattr(os, "O_NOFOLLOW", 0)
-                    | getattr(os, "O_CLOEXEC", 0),
+                    strict_flags | os.O_CREAT | os.O_EXCL,
                     0o600,
                     dir_fd=root_descriptor,
                 )
+                lock_created = True
+            except FileExistsError:
+                try:
+                    descriptor = os.open(
+                        "afk.lock", strict_flags, dir_fd=root_descriptor
+                    )
+                except OSError as exc:
+                    os.close(root_descriptor)
+                    raise EventHistoryCorrupt("AFK lock file is invalid") from exc
             except OSError as exc:
                 os.close(root_descriptor)
                 raise EventHistoryCorrupt("AFK lock file is invalid") from exc
@@ -135,11 +145,16 @@ class RunStore:
                 os.close(descriptor)
                 os.close(root_descriptor)
                 raise EventHistoryCorrupt("AFK lock file is invalid")
+            if not lock_created and stat.S_IMODE(lock_metadata.st_mode) != 0o600:
+                os.close(descriptor)
+                os.close(root_descriptor)
+                raise EventHistoryCorrupt("AFK lock file permissions are invalid")
         else:
             _secure_directory(self.root)
             descriptor = os.open(self.root / "afk.lock", os.O_RDWR | os.O_CREAT, 0o600)
         try:
-            os.fchmod(descriptor, 0o600)
+            if not validate_root_permissions or lock_created:
+                os.fchmod(descriptor, 0o600)
             try:
                 fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError as exc:

@@ -3846,6 +3846,16 @@ class StartCliTest(unittest.TestCase):
             external_lock.read_text(encoding="utf-8"), "external lock sentinel\n"
         )
 
+    def test_resume_rejects_insecure_existing_lock_without_repairing_it(self):
+        self.create_resume_preflight_run()
+        lock = self.state_home / "afk" / "afk.lock"
+        lock.write_text("existing lock sentinel\n", encoding="utf-8")
+        lock.chmod(0o644)
+
+        self.assert_resume_preflight_rejected("AFK lock file permissions are invalid")
+        self.assertEqual(stat.S_IMODE(lock.stat().st_mode), 0o644)
+        self.assertEqual(lock.read_text(encoding="utf-8"), "existing lock sentinel\n")
+
     def test_resume_regenerates_safe_active_pointer_and_projection(self):
         store, run_dir = self.create_resume_preflight_run()
         store.confirm_effect(
