@@ -114,13 +114,26 @@ class RunStore:
             try:
                 descriptor = os.open(
                     "afk.lock",
-                    os.O_RDWR | os.O_CREAT,
+                    os.O_RDWR
+                    | os.O_CREAT
+                    | getattr(os, "O_NOFOLLOW", 0)
+                    | getattr(os, "O_CLOEXEC", 0),
                     0o600,
                     dir_fd=root_descriptor,
                 )
-            except OSError:
+            except OSError as exc:
                 os.close(root_descriptor)
-                raise
+                raise EventHistoryCorrupt("AFK lock file is invalid") from exc
+            try:
+                lock_metadata = os.fstat(descriptor)
+            except OSError as exc:
+                os.close(descriptor)
+                os.close(root_descriptor)
+                raise EventHistoryCorrupt("AFK lock file is invalid") from exc
+            if not stat.S_ISREG(lock_metadata.st_mode):
+                os.close(descriptor)
+                os.close(root_descriptor)
+                raise EventHistoryCorrupt("AFK lock file is invalid")
         else:
             _secure_directory(self.root)
             descriptor = os.open(self.root / "afk.lock", os.O_RDWR | os.O_CREAT, 0o600)

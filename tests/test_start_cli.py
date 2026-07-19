@@ -3625,6 +3625,21 @@ class StartCliTest(unittest.TestCase):
         )
         self.assertEqual(stat.S_IMODE(root.stat().st_mode), 0o755)
 
+    def test_resume_rejects_symlinked_lock_without_mutating_its_target(self):
+        self.create_resume_preflight_run()
+        root = self.state_home / "afk"
+        external_lock = self.temp / "external-lock"
+        external_lock.write_text("external lock sentinel\n", encoding="utf-8")
+        external_lock.chmod(0o644)
+        (root / "afk.lock").unlink()
+        (root / "afk.lock").symlink_to(external_lock)
+
+        self.assert_resume_preflight_rejected("AFK lock file is invalid")
+        self.assertEqual(stat.S_IMODE(external_lock.stat().st_mode), 0o644)
+        self.assertEqual(
+            external_lock.read_text(encoding="utf-8"), "external lock sentinel\n"
+        )
+
     def test_resume_regenerates_safe_active_pointer_and_projection(self):
         store, run_dir = self.create_resume_preflight_run()
         store.confirm_effect(
