@@ -2829,6 +2829,62 @@ class StartCliTest(unittest.TestCase):
         commands = self.command_log.read_text(encoding="utf-8")
         self.assertNotIn('"args":["pr","ready"', commands)
 
+    def assert_projected_digest_rejected(self, field, *, digest=None, missing=False):
+        run_id = self.start_reviewed_run()
+        store = RunStore(self.state_home / "afk")
+        record = json.loads(json.dumps(store.status(run_id)[field]))
+        if missing:
+            record.pop("manifest_sha256")
+        else:
+            record["manifest_sha256"] = digest
+        store.append_event(
+            run_id,
+            f"{field}.digest_corrupted",
+            state="reviewed",
+            data={"checkpoint": "reviewed", field: record},
+        )
+        commands_before = self.command_log.read_text(encoding="utf-8")
+
+        resumed = self.run_afk("resume")
+
+        self.assertEqual(resumed.returncode, 2, resumed.stderr)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(status["attention"]["scope"], "publication")
+        self.assertEqual(status["attention"]["kind"], "invalid")
+        self.assertEqual(self.command_log.read_text(encoding="utf-8"), commands_before)
+
+    def test_resume_rejects_missing_projected_validation_manifest_digest(self):
+        self.assert_projected_digest_rejected("validation", missing=True)
+
+    def test_resume_rejects_wrong_type_projected_validation_manifest_digest(self):
+        self.assert_projected_digest_rejected("validation", digest=[])
+
+    def test_resume_rejects_malformed_projected_validation_manifest_digest(self):
+        self.assert_projected_digest_rejected("validation", digest="A" * 63)
+
+    def test_resume_rejects_missing_projected_bead_spec_manifest_digest(self):
+        self.assert_projected_digest_rejected("bead_spec", missing=True)
+
+    def test_resume_rejects_missing_projected_gate_validation_manifest_digest(self):
+        run_id = self.start_reviewed_run()
+        store = RunStore(self.state_home / "afk")
+        cycles = json.loads(json.dumps(store.status(run_id)["gate_cycles"]))
+        cycles[-1]["validation"].pop("manifest_sha256")
+        store.append_event(
+            run_id,
+            "gate.validation_digest_corrupted",
+            state="reviewed",
+            data={"checkpoint": "reviewed", "gate_cycles": cycles},
+        )
+        commands_before = self.command_log.read_text(encoding="utf-8")
+
+        resumed = self.run_afk("resume")
+
+        self.assertEqual(resumed.returncode, 2, resumed.stderr)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(status["attention"]["kind"], "invalid")
+        self.assertEqual(self.command_log.read_text(encoding="utf-8"), commands_before)
+
     def test_resume_pauses_before_mutation_when_projected_validation_is_tampered(self):
         run_id = self.start_reviewed_run()
         store = RunStore(self.state_home / "afk")

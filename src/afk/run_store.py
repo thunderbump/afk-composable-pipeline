@@ -918,22 +918,37 @@ def _projected_evidence_units(value: Any) -> set[str]:
     return units
 
 
-def _projected_manifest_digests(value: Any) -> dict[str, set[str]]:
+def _projected_manifest_digests(projection: dict[str, Any]) -> dict[str, set[str]]:
     digests: dict[str, set[str]] = {}
-    if isinstance(value, dict):
-        evidence = value.get("evidence")
-        digest = value.get("manifest_sha256")
-        if isinstance(evidence, str) and isinstance(digest, str):
-            parts = Path(evidence).parts
-            if len(parts) == 2 and parts[0] in EVIDENCE_ROOTS:
-                digests.setdefault(evidence, set()).add(digest)
-        for nested in value.values():
-            for evidence, nested_digests in _projected_manifest_digests(nested).items():
-                digests.setdefault(evidence, set()).update(nested_digests)
-    elif isinstance(value, list):
-        for nested in value:
-            for evidence, nested_digests in _projected_manifest_digests(nested).items():
-                digests.setdefault(evidence, set()).update(nested_digests)
+
+    def add(record: Any, label: str) -> None:
+        if not isinstance(record, dict):
+            raise ProjectedEvidenceTampered(
+                f"projected {label} manifest digest is invalid"
+            )
+        evidence = record.get("evidence")
+        digest = record.get("manifest_sha256")
+        parts = Path(evidence).parts if isinstance(evidence, str) else ()
+        if (
+            len(parts) != 2
+            or parts[0] not in EVIDENCE_ROOTS
+            or not isinstance(digest, str)
+            or not SHA256_PATTERN.fullmatch(digest)
+        ):
+            raise ProjectedEvidenceTampered(
+                f"projected {label} manifest digest is invalid"
+            )
+        digests.setdefault(evidence, set()).add(digest)
+
+    if "validation" in projection:
+        add(projection["validation"], "validation")
+    if "bead_spec" in projection:
+        add(projection["bead_spec"], "Bead/spec")
+    cycles = projection.get("gate_cycles")
+    if isinstance(cycles, list):
+        for cycle in cycles:
+            if isinstance(cycle, dict) and "validation" in cycle:
+                add(cycle["validation"], "Gate validation")
     return digests
 
 
