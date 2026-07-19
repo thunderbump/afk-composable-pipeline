@@ -661,6 +661,18 @@ class CandidateGateTest(unittest.TestCase):
                 )
                 store.append_event(
                     run_id,
+                    "repair.started",
+                    data={
+                        "checkpoint": "candidate_ready",
+                        "repair_attempts_used": 1,
+                        "repair_brief": {
+                            "candidate_sha": "b" * 40,
+                            "repair_attempt": 1,
+                        },
+                    },
+                )
+                store.append_event(
+                    run_id,
                     "candidate.repaired",
                     state="candidate_ready",
                     data={

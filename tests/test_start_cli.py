@@ -3819,6 +3819,90 @@ class StartCliTest(unittest.TestCase):
         self.assertEqual(status["attention"]["kind"], "invalid")
         self.assertIn("open repair attempt is invalid", status["attention"]["summary"])
 
+    def assert_repeated_repair_lifecycle_rejected(self, store, run_dir):
+        first = self.run_afk("resume")
+        second = self.run_afk("resume")
+
+        self.assertEqual(first.returncode, 2)
+        self.assertEqual(second.returncode, 2)
+        self.assertFalse(self.command_log.exists())
+        for root in ("attempts", "gates", "retrospective"):
+            self.assertEqual(list((run_dir / root).iterdir()), [])
+        status = store.status("crashed-run")
+        self.assertEqual(status["attention"]["kind"], "invalid")
+        self.assertIn(
+            "repair attempt lifecycle is invalid", status["attention"]["summary"]
+        )
+
+    def test_resume_rejects_repair_attempt_started_while_one_is_open(self):
+        store, run_dir = self.create_resume_preflight_run()
+        for attempt in (1, 2):
+            brief = {
+                "schema_version": 1,
+                "candidate_sha": "b" * 40,
+                "repair_attempt": attempt,
+                "blocking_findings": [],
+            }
+            store.append_event(
+                "crashed-run",
+                "repair.started",
+                state="validated",
+                data={
+                    "checkpoint": "validated",
+                    "candidate_sha": "b" * 40,
+                    "repair_attempts_used": attempt,
+                    "repair_brief": brief,
+                },
+            )
+
+        self.assert_repeated_repair_lifecycle_rejected(store, run_dir)
+
+    def test_resume_rejects_open_repair_projection_after_candidate_repaired(self):
+        store, run_dir = self.create_resume_preflight_run()
+        brief = {
+            "schema_version": 1,
+            "candidate_sha": "b" * 40,
+            "repair_attempt": 1,
+            "blocking_findings": [],
+        }
+        store.append_event(
+            "crashed-run",
+            "repair.started",
+            state="validated",
+            data={
+                "checkpoint": "validated",
+                "candidate_sha": "b" * 40,
+                "repair_attempts_used": 1,
+                "repair_brief": brief,
+            },
+        )
+        store.append_event(
+            "crashed-run",
+            "candidate.repaired",
+            state="candidate_ready",
+            data={
+                "checkpoint": "candidate_ready",
+                "previous_candidate_sha": "b" * 40,
+                "candidate_sha": "c" * 40,
+                "repair_attempts_used": 1,
+                "attention": {},
+            },
+        )
+        store.append_event(
+            "crashed-run",
+            "run.attention_required",
+            state="attention_required",
+            data={
+                "checkpoint": "validated",
+                "candidate_sha": "b" * 40,
+                "repair_attempts_used": 1,
+                "repair_brief": brief,
+                "attention": {"scope": "repair", "kind": "unavailable"},
+            },
+        )
+
+        self.assert_repeated_repair_lifecycle_rejected(store, run_dir)
+
     def test_resume_rejects_unrelated_malformed_effect_before_commands(self):
         store, run_dir = self.create_resume_preflight_run()
         malformed = run_dir / "effects" / "unrelated.json"
