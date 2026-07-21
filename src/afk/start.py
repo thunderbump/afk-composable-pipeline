@@ -202,6 +202,8 @@ def resume_run(
         if projection["state"] == "completed":
             return selected_run_id, 0
         run_id = selected_run_id
+        if projection["last_event"] == "bead.claimed":
+            return run_id, _advance_bead_claim(store, run_id)
         if _validation_attempt_open(projection):
             return run_id, _recover_validation_attempt(store, run_id, projection)
         if _repair_interruption_pending(store, run_id, projection):
@@ -322,6 +324,8 @@ def resume_run(
             return run_id, 0
         if absent:
             if effect["status"] == "confirmed":
+                if _bead_claim_resume_ready(store, run_id, projection):
+                    return run_id, _advance_bead_claim(store, run_id)
                 if _candidate_resume_ready(projection):
                     return run_id, _advance_candidate(store, run_id)
                 if _validation_resume_ready(projection):
@@ -407,6 +411,15 @@ def _resume_worker_launch_effect(
             data["validation_contract"] = validation_contract
         store.append_event(run_id, "worker.launch_prepared", data=data)
     return effect, unit
+
+
+def _bead_claim_resume_ready(
+    store: RunStore, run_id: str, projection: dict[str, Any]
+) -> bool:
+    return projection["checkpoint"] == "created" and (
+        projection["last_event"] == "worker.launched"
+        or store.effect_if_present(run_id, "bead-claim") is not None
+    )
 
 
 def complete_run(run_id: str | None = None) -> dict[str, Any]:
@@ -1038,10 +1051,6 @@ def _run_worker_with_lock(store: RunStore, run_id: str) -> int:
     try:
         with store.lock():
             identity = store.identity(run_id)
-            request = identity.get("start_request", {})
-            bead_id = identity["bead_id"]
-            beads_workspace = Path(request["beads_workspace"])
-            claimant = request["claimant"]
             launch = store.effect(run_id, "worker-launch-1")
             unit = worker_unit(run_id)
             if launch["intended"] != {"unit": unit}:
@@ -1052,21 +1061,7 @@ def _run_worker_with_lock(store: RunStore, run_id: str) -> int:
                 "worker.launched",
                 data={"checkpoint": "created", "unit": unit},
             )
-            claim = store.prepare_effect(
-                run_id,
-                "bead-claim",
-                kind="bead-claim",
-                intended={"bead_id": bead_id, "claimant": claimant},
-            )
-            if claim["status"] != "confirmed":
-                observed = _claim_bead(bead_id, claimant, beads_workspace)
-                store.confirm_effect(run_id, "bead-claim", observed=observed)
-            store.append_event(
-                run_id,
-                "bead.claimed",
-                state="claimed",
-                data={"checkpoint": "claimed", "unit": worker_unit(run_id)},
-            )
+            _reconcile_bead_claim(store, run_id)
             worktree_path, branch = _prepare_worktree(store, identity)
             store.append_event(
                 run_id,
@@ -2144,8 +2139,65 @@ def _launch_worker(run_id: str, unit: str) -> None:
         raise _external_failure(command[0], completed)
 
 
-def _claim_bead(bead_id: str, claimant: str, workspace: Path) -> dict[str, str]:
+def _advance_bead_claim(store: RunStore, run_id: str) -> int:
+    try:
+        _reconcile_bead_claim(store, run_id)
+    except ExternalCommandError as exc:
+        _attention(
+            store,
+            run_id,
+            checkpoint="created",
+            scope="bead_claim",
+            kind="unavailable",
+            summary=str(exc),
+            classification=_error_classification(exc),
+        )
+        return 2
+    except (KeyError, OSError, RunStoreError, StartError, ValueError) as exc:
+        _attention(
+            store,
+            run_id,
+            checkpoint=store.status(run_id)["checkpoint"],
+            scope="bead_claim",
+            kind="conflict",
+            summary=str(exc),
+        )
+        return 2
+    return 0
+
+
+def _reconcile_bead_claim(store: RunStore, run_id: str) -> dict[str, Any]:
+    identity = store.identity(run_id)
+    bead_id = identity["bead_id"]
+    request = identity["start_request"]
+    claimant = request["claimant"]
+    workspace = Path(request["beads_workspace"])
+    project_label = f"project:{identity['repository'].rsplit('/', 1)[-1]}"
+    intended = {
+        "bead_id": bead_id,
+        "claimant": claimant,
+        "project_label": project_label,
+    }
+    projection = store.status(run_id)
+    durable_claim = projection.get("bead_claim")
+    effect = store.effect_if_present(run_id, "bead-claim")
+    if effect is not None and (
+        effect.get("kind") != "bead-claim" or effect.get("intended") != intended
+    ):
+        raise StartError("Bead claim Effect does not match this Run")
+    if durable_claim is not None:
+        if (
+            effect is None
+            or effect.get("status") != "confirmed"
+            or effect.get("observed") != durable_claim
+        ):
+            raise StartError("durable Bead claim lacks its confirmed Effect")
+    else:
+        effect = store.prepare_effect(
+            run_id, "bead-claim", kind="bead-claim", intended=intended
+        )
     bead = _show_bead(bead_id, workspace)
+    _validate_claim_identity(bead, bead_id, project_label)
     if bead.get("status") == "open" and not bead.get("assignee"):
         result = _bd_json(["bd", "update", bead_id, "--claim", "--json"], cwd=workspace)
         if isinstance(result, list):
@@ -2154,12 +2206,49 @@ def _claim_bead(bead_id: str, claimant: str, workspace: Path) -> dict[str, str]:
             result = result[0]
         elif not isinstance(result, dict):
             raise _malformed_beads_output()
-        bead = result
-    if bead.get("id") != bead_id:
-        raise StartError(f"Bead claim returned unexpected Bead: {bead_id}")
+        if (
+            result.get("id") != bead_id
+            or result.get("status") != "in_progress"
+            or result.get("assignee") != claimant
+        ):
+            raise StartError(f"Bead claim returned unexpected Bead: {bead_id}")
+        bead = _show_bead(bead_id, workspace)
+        _validate_claim_identity(bead, bead_id, project_label)
     if bead.get("status") != "in_progress" or bead.get("assignee") != claimant:
         raise StartError(f"Bead claim conflicts with current owner: {bead_id}")
-    return {"bead_id": bead_id, "claimant": claimant}
+    observed = {**intended, "status": "in_progress"}
+    if effect["status"] == "confirmed" and effect.get("observed") != observed:
+        raise StartError("confirmed Bead claim contradicts the Run")
+    store.confirm_effect(run_id, "bead-claim", observed=observed)
+    projection = store.status(run_id)
+    if durable_claim is None:
+        store.append_event(
+            run_id,
+            "bead.claimed",
+            state="claimed",
+            data={
+                "checkpoint": "claimed",
+                "unit": worker_unit(run_id),
+                "bead_claim": observed,
+                "attention": {},
+            },
+        )
+    elif projection["bead_claim"] != observed:
+        raise StartError("durable Bead claim contradicts the Run")
+    return observed
+
+
+def _validate_claim_identity(
+    bead: dict[str, Any], bead_id: str, project_label: str
+) -> None:
+    labels = bead.get("labels")
+    if (
+        bead.get("id") != bead_id
+        or not isinstance(labels, list)
+        or not all(isinstance(label, str) for label in labels)
+        or project_label not in labels
+    ):
+        raise StartError(f"Bead claim conflicts with project identity: {bead_id}")
 
 
 def _prepare_worktree(store: RunStore, identity: dict[str, Any]) -> tuple[Path, str]:
