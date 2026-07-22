@@ -64,6 +64,7 @@ class ExternalCommandError(StartError):
 @dataclass(frozen=True)
 class StartContext:
     root: Path
+    repository_common_dir: Path
     repository: str
     base_branch: str
     base_sha: str
@@ -94,6 +95,7 @@ def start_run(
             base_sha=context.base_sha,
             start_request={
                 "repository_root": str(context.root),
+                "repository_common_dir": str(context.repository_common_dir),
                 "beads_workspace": str(context.beads_workspace),
                 "claimant": context.claimant,
                 "lingering": lingering,
@@ -2050,6 +2052,7 @@ def preflight(
     bead_id: str, *, cwd: Path, bootstrap_contract: bool = False
 ) -> StartContext:
     root = Path(_required(["git", "rev-parse", "--show-toplevel"], cwd=cwd)).resolve()
+    repository_common_dir = _resolved_git_path(root, "--git-common-dir")
     repository_data = _json_command(
         ["gh", "repo", "view", "--json", "nameWithOwner,defaultBranchRef"],
         cwd=root,
@@ -2097,6 +2100,7 @@ def preflight(
     )
     return StartContext(
         root=root,
+        repository_common_dir=repository_common_dir,
         repository=repository,
         base_branch=default_branch,
         base_sha=base_sha,
@@ -2310,6 +2314,7 @@ def _reconcile_worktree(store: RunStore, run_id: str) -> dict[str, str]:
     intended = {
         "repository": identity["repository"],
         "repository_root": str(root),
+        "repository_common_dir": identity["start_request"]["repository_common_dir"],
         "base_sha": identity["base_sha"],
         "branch": branch,
         "worktree_path": str(worktree),
@@ -2350,6 +2355,10 @@ def _reconcile_worktree(store: RunStore, run_id: str) -> dict[str, str]:
     ).resolve()
     if observed_root != root.resolve():
         raise StartError("Run repository root has been replaced")
+    if _resolved_git_path(root, "--git-common-dir") != Path(
+        intended["repository_common_dir"]
+    ):
+        raise StartError("Run repository has been replaced")
     remote = _required(["git", "remote", "get-url", "origin"], cwd=root)
     if not _remote_matches_repository(remote, identity["repository"]):
         raise StartError("Run repository origin has been replaced")
@@ -2385,10 +2394,23 @@ def _reconcile_worktree(store: RunStore, run_id: str) -> dict[str, str]:
         cwd=root,
         check=False,
     )
-    if branch_ref.returncode not in {0, 1}:
+    branch_lines = branch_ref.stdout.splitlines()
+    if branch_ref.returncode == 0:
+        if (
+            len(branch_lines) != 1
+            or not _is_full_git_sha(branch_lines[0])
+            or branch_ref.stderr
+        ):
+            raise StartError("intended branch observation is malformed")
+        branch_sha = branch_lines[0]
+    elif branch_ref.returncode == 1:
+        if branch_ref.stdout or branch_ref.stderr:
+            raise StartError("intended branch absence is ambiguous")
+        branch_sha = None
+    else:
         raise _external_failure("git", branch_ref)
     path_present = worktree.exists() or worktree.is_symlink()
-    branch_present = branch_ref.returncode == 0
+    branch_present = branch_sha is not None
     absent = (
         not path_present
         and not registered
@@ -2396,6 +2418,8 @@ def _reconcile_worktree(store: RunStore, run_id: str) -> dict[str, str]:
         and not branch_present
     )
     if absent:
+        if durable is not None or effect.get("status") != "prepared":
+            raise StartError("confirmed worktree state has been removed")
         worktree.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         completed = _command(
             [
@@ -2423,7 +2447,7 @@ def _reconcile_worktree(store: RunStore, run_id: str) -> dict[str, str]:
         raise StartError("prepared worktree is not on the intended branch")
     if len(branch_records) != 1 or branch_records[0] != registered[0]:
         raise StartError("intended branch registration is ambiguous")
-    if not branch_present or branch_ref.stdout.strip() != identity["base_sha"]:
+    if branch_sha != identity["base_sha"]:
         raise StartError("intended branch is not at pinned base")
     if not _owned_worktree_checkout(root, worktree, identity["base_sha"], branch):
         raise StartError("prepared worktree is dirty or has conflicting Git identity")
@@ -2484,7 +2508,7 @@ def _worktree_records(root: Path) -> list[dict[str, str]]:
                 branch is not None
                 and (not branch.startswith("refs/heads/") or not branch[11:])
             )
-            or not ({"branch", "detached", "bare"} & set(item))
+            or len({"branch", "detached", "bare"} & set(item)) != 1
         ):
             raise StartError("Git worktree registration is malformed")
     return records
@@ -2629,6 +2653,11 @@ def _required(
     if completed.returncode != 0:
         raise _external_failure(command[0], completed)
     return completed.stdout.strip()
+
+
+def _resolved_git_path(root: Path, argument: str) -> Path:
+    path = Path(_required(["git", "rev-parse", argument], cwd=root))
+    return path.resolve() if path.is_absolute() else (root / path).resolve()
 
 
 def _json_command(command: list[str], *, cwd: Path) -> Any:

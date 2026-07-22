@@ -260,6 +260,7 @@ class StartCliTest(unittest.TestCase):
         intended = {
             "repository": "thunderbump/beads-webui",
             "repository_root": str(self.project),
+            "repository_common_dir": str(selected_state_home / "fake-git"),
             "base_sha": BASE_SHA,
             "branch": branch,
             "worktree_path": str(worktree),
@@ -1184,19 +1185,66 @@ class StartCliTest(unittest.TestCase):
                     self.mutation_count("worktree-create", state_home=state_home), 1
                 )
 
+    def test_resume_does_not_recreate_a_deleted_confirmed_worktree(self):
+        boundaries = {
+            "confirmed-effect": {"AFK_TEST_KILL_AFTER_CONFIRM": "worktree-create"},
+            "durable-ready": {"AFK_TEST_KILL_AFTER_EVENT_WRITE": "worktree.ready"},
+        }
+        for name, injection in boundaries.items():
+            with self.subTest(boundary=name):
+                state_home = self.temp / f"worktree-deleted-{name}"
+                run_id = self.run_afk(
+                    "start",
+                    "central-bnkl.1.1",
+                    XDG_STATE_HOME=str(state_home),
+                ).stdout.strip()
+                interrupted = self.run_afk(
+                    "_worker",
+                    run_id,
+                    XDG_STATE_HOME=str(state_home),
+                    **injection,
+                )
+                self.assertLess(interrupted.returncode, 0)
+                intended = self.assert_worktree_effect(
+                    RunStore(state_home / "afk"), run_id, state_home=state_home
+                )
+                Path(intended["worktree_path"]).rename(
+                    state_home / "externally-removed-worktree"
+                )
+                (state_home / "fake-worktree-created").unlink()
+
+                resumed = self.run_afk(
+                    "resume",
+                    XDG_STATE_HOME=str(state_home),
+                    AFK_FAKE_SYSTEMD_STATE="absent",
+                )
+
+                self.assertEqual(resumed.returncode, 2, resumed.stderr)
+                projection = RunStore(state_home / "afk").status(run_id)
+                self.assertEqual(projection["attention"]["scope"], "worktree")
+                self.assertEqual(
+                    self.mutation_count("worktree-create", state_home=state_home), 1
+                )
+
     def test_resume_does_not_create_worktree_from_ambiguous_or_replaced_state(self):
         cases = {
-            "branch-only": {"AFK_FAKE_WORKTREE_BRANCH_ONLY": "1"},
+            "branch-only": {"AFK_FAKE_WORKTREE_SCENARIO": "branch-only"},
             "branch-registered-elsewhere": {
-                "AFK_FAKE_WORKTREE_REGISTERED_ELSEWHERE": "1"
+                "AFK_FAKE_WORKTREE_SCENARIO": "registered-elsewhere"
             },
             "wrong-root": {"AFK_FAKE_REPOSITORY_ROOT": "/tmp/replaced-repository"},
             "wrong-repository": {
                 "AFK_FAKE_ORIGIN_REPOSITORY": "thunderbump/another-repo"
             },
-            "missing-base": {"AFK_FAKE_WORKTREE_BASE_UNAVAILABLE": "1"},
-            "unavailable-registration": {"AFK_FAKE_WORKTREE_LIST_FAILURE": "1"},
-            "malformed-registration": {"AFK_FAKE_WORKTREE_LIST_MALFORMED": "1"},
+            "replaced-repository": {
+                "AFK_FAKE_WORKTREE_SCENARIO": "replaced-repository"
+            },
+            "missing-base": {"AFK_FAKE_WORKTREE_SCENARIO": "missing-base"},
+            "unavailable-registration": {"AFK_FAKE_WORKTREE_SCENARIO": "list-failure"},
+            "malformed-registration": {"AFK_FAKE_WORKTREE_SCENARIO": "malformed-list"},
+            "ambiguous-missing-branch": {
+                "AFK_FAKE_WORKTREE_SCENARIO": "ambiguous-missing-branch",
+            },
         }
         for name, observation in cases.items():
             with self.subTest(case=name):
@@ -1231,6 +1279,78 @@ class StartCliTest(unittest.TestCase):
                 self.assertEqual(projection["attention"]["scope"], "worktree")
                 self.assertEqual(
                     self.mutation_count("worktree-create", state_home=state_home), 0
+                )
+
+    def test_resume_rejects_a_worktree_record_with_two_checkout_modes(self):
+        for mode in ("detached", "bare"):
+            with self.subTest(mode=mode):
+                state_home = self.temp / f"worktree-record-branch-{mode}"
+                run_id = self.run_afk(
+                    "start",
+                    "central-bnkl.1.1",
+                    XDG_STATE_HOME=str(state_home),
+                ).stdout.strip()
+                interrupted = self.run_afk(
+                    "_worker",
+                    run_id,
+                    XDG_STATE_HOME=str(state_home),
+                    AFK_TEST_KILL_BEFORE_MUTATION="worktree-create",
+                )
+                self.assertLess(interrupted.returncode, 0)
+                store = RunStore(state_home / "afk")
+                intended = self.assert_worktree_effect(
+                    store, run_id, status="prepared", state_home=state_home
+                )
+                Path(intended["worktree_path"]).mkdir(parents=True)
+
+                resumed = self.run_afk(
+                    "resume",
+                    XDG_STATE_HOME=str(state_home),
+                    AFK_FAKE_SYSTEMD_STATE="absent",
+                    AFK_FAKE_WORKTREE_RECORD_EXTRA_MODE=mode,
+                )
+
+                self.assertEqual(resumed.returncode, 2, resumed.stderr)
+                self.assert_worktree_effect(
+                    store, run_id, status="prepared", state_home=state_home
+                )
+                projection = store.status(run_id)
+                self.assertEqual(projection["checkpoint"], "claimed")
+                self.assertEqual(projection["attention"]["scope"], "worktree")
+                self.assertEqual(
+                    self.mutation_count("worktree-create", state_home=state_home), 0
+                )
+
+    def test_resume_accepts_worktree_record_metadata(self):
+        for metadata in ("locked", "prunable"):
+            with self.subTest(metadata=metadata):
+                state_home = self.temp / f"worktree-record-{metadata}"
+                run_id = self.run_afk(
+                    "start",
+                    "central-bnkl.1.1",
+                    XDG_STATE_HOME=str(state_home),
+                ).stdout.strip()
+                interrupted = self.run_afk(
+                    "_worker",
+                    run_id,
+                    XDG_STATE_HOME=str(state_home),
+                    AFK_TEST_KILL_AFTER_MUTATION="worktree-create",
+                )
+                self.assertLess(interrupted.returncode, 0)
+
+                resumed = self.run_afk(
+                    "resume",
+                    XDG_STATE_HOME=str(state_home),
+                    AFK_FAKE_SYSTEMD_STATE="absent",
+                    AFK_FAKE_WORKTREE_RECORD_METADATA=metadata,
+                )
+
+                self.assertEqual(resumed.returncode, 0, resumed.stderr)
+                self.assert_worktree_effect(
+                    RunStore(state_home / "afk"), run_id, state_home=state_home
+                )
+                self.assertEqual(
+                    self.mutation_count("worktree-create", state_home=state_home), 1
                 )
 
     def test_resume_preserves_replaced_worktree_parent(self):
@@ -1345,7 +1465,7 @@ class StartCliTest(unittest.TestCase):
         unavailable = self.run_afk(
             "resume",
             AFK_FAKE_SYSTEMD_STATE="absent",
-            AFK_FAKE_WORKTREE_LIST_FAILURE="1",
+            AFK_FAKE_WORKTREE_SCENARIO="list-failure",
         )
         store = RunStore(self.state_home / "afk")
         paused = store.status(run_id)
@@ -5964,6 +6084,20 @@ class StartCliTest(unittest.TestCase):
             },
         )
 
+    def test_start_pins_a_resolved_relative_repository_common_dir(self):
+        completed = self.run_afk(
+            "start",
+            "central-bnkl.1.1",
+            AFK_FAKE_REPOSITORY_COMMON_DIR=".git",
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        identity = RunStore(self.state_home / "afk").identity(completed.stdout.strip())
+        self.assertEqual(
+            identity["start_request"]["repository_common_dir"],
+            str((self.project / ".git").resolve()),
+        )
+
     def test_start_classifies_a_preflight_command_timeout(self):
         expired = subprocess.TimeoutExpired(["git", "rev-parse"], timeout=30)
 
@@ -6074,6 +6208,7 @@ class StartCliTest(unittest.TestCase):
                 bead_claimed = Path(os.environ["XDG_STATE_HOME"]) / "fake-bead-claimed"
                 bead_show_count = Path(os.environ["XDG_STATE_HOME"]) / "fake-bead-show-count"
                 mutation_log = Path(os.environ["XDG_STATE_HOME"]) / "fake-mutations.jsonl"
+                worktree_scenario = os.environ.get("AFK_FAKE_WORKTREE_SCENARIO")
 
                 def before_mutation(name):
                     if os.environ.get("AFK_TEST_KILL_BEFORE_MUTATION") == name:
@@ -6173,27 +6308,46 @@ class StartCliTest(unittest.TestCase):
                         git_dir.mkdir(parents=True, exist_ok=True)
                         print(git_dir)
                     elif args[:2] == ["rev-parse", "--git-common-dir"]:
-                        common_dir = Path(os.environ["XDG_STATE_HOME"]) / "fake-git"
+                        if worktree_scenario == "replaced-repository":
+                            common_dir = (
+                                Path(os.environ["XDG_STATE_HOME"])
+                                / "replaced-common-dir"
+                            )
+                        else:
+                            common_dir = Path(
+                                os.environ.get(
+                                    "AFK_FAKE_REPOSITORY_COMMON_DIR",
+                                    str(
+                                        Path(os.environ["XDG_STATE_HOME"])
+                                        / "fake-git"
+                                    ),
+                                )
+                            )
                         common_dir.mkdir(parents=True, exist_ok=True)
                         print(common_dir)
                     elif args[:1] == ["rev-parse"]:
                         if (
                             args[-1].endswith("^{commit}")
-                            and os.environ.get("AFK_FAKE_WORKTREE_BASE_UNAVAILABLE")
+                            and worktree_scenario == "missing-base"
                         ):
                             print("b" * 40)
                         elif args[-1].startswith("refs/heads/"):
                             if local_branch_replaced.exists():
                                 print("a" * 40)
-                            elif os.environ.get("AFK_FAKE_WORKTREE_BRANCH_ONLY"):
+                            elif worktree_scenario == "branch-only":
                                 print(sha)
                             elif os.environ.get(
-                                "AFK_FAKE_WORKTREE_REGISTERED_ELSEWHERE"
+                                "AFK_FAKE_WORKTREE_RECORD_EXTRA_MODE"
                             ):
+                                print(sha)
+                            elif worktree_scenario == "registered-elsewhere":
                                 print(sha)
                             elif worktree_created.exists() and not candidate_marker.exists():
                                 print(sha)
                             elif not candidate_marker.exists():
+                                if worktree_scenario == "ambiguous-missing-branch":
+                                    print(sha)
+                                    print("ambiguous branch", file=sys.stderr)
                                 raise SystemExit(1)
                             elif not local_branch_removed.exists():
                                 print(candidate_sha)
@@ -6234,9 +6388,9 @@ class StartCliTest(unittest.TestCase):
                         ):
                             raise SystemExit(1)
                     elif args[:3] == ["worktree", "list", "--porcelain"]:
-                        if os.environ.get("AFK_FAKE_WORKTREE_LIST_FAILURE"):
+                        if worktree_scenario == "list-failure":
                             raise SystemExit(1)
-                        if os.environ.get("AFK_FAKE_WORKTREE_LIST_MALFORMED"):
+                        if worktree_scenario == "malformed-list":
                             print("garbage")
                             raise SystemExit(0)
                         if os.environ.get(
@@ -6261,9 +6415,7 @@ class StartCliTest(unittest.TestCase):
                                     if worktrees.exists()
                                     else []
                                 )
-                            if os.environ.get(
-                                "AFK_FAKE_WORKTREE_REGISTERED_ELSEWHERE"
-                            ):
+                            if worktree_scenario == "registered-elsewhere":
                                 checkouts = [
                                     Path(os.environ["XDG_STATE_HOME"])
                                     / "user-owned-checkout"
@@ -6278,9 +6430,7 @@ class StartCliTest(unittest.TestCase):
                                 if os.environ.get("AFK_FAKE_WRONG_WORKTREE_BRANCH"):
                                     branch = "afk/wrong-branch"
                                 else:
-                                    if os.environ.get(
-                                        "AFK_FAKE_WORKTREE_REGISTERED_ELSEWHERE"
-                                    ):
+                                    if worktree_scenario == "registered-elsewhere":
                                         run_id = next(
                                             path.name
                                             for path in (
@@ -6299,6 +6449,18 @@ class StartCliTest(unittest.TestCase):
                                 print("worktree " + str(checkout))
                                 print("HEAD " + head)
                                 print("branch refs/heads/" + branch)
+                                extra_mode = os.environ.get(
+                                    "AFK_FAKE_WORKTREE_RECORD_EXTRA_MODE"
+                                )
+                                if extra_mode:
+                                    print(extra_mode)
+                                metadata = os.environ.get(
+                                    "AFK_FAKE_WORKTREE_RECORD_METADATA"
+                                )
+                                if metadata == "locked":
+                                    print("locked")
+                                elif metadata == "prunable":
+                                    print("prunable gitdir file points to missing location")
                                 print()
                     elif args[:2] == ["status", "--porcelain"]:
                         if os.environ.get("AFK_FAKE_DIRTY_WORKTREE"):
