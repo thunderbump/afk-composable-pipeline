@@ -261,6 +261,9 @@ class StartCliTest(unittest.TestCase):
             "repository": "thunderbump/beads-webui",
             "repository_root": str(self.project),
             "repository_common_dir": str(selected_state_home / "fake-git"),
+            "repository_common_dir_identity": store.identity(run_id)["start_request"][
+                "repository_common_dir_identity"
+            ],
             "base_sha": BASE_SHA,
             "branch": branch,
             "worktree_path": str(worktree),
@@ -1280,6 +1283,26 @@ class StartCliTest(unittest.TestCase):
                 self.assertEqual(
                     self.mutation_count("worktree-create", state_home=state_home), 0
                 )
+
+    def test_resume_rejects_a_same_path_replacement_of_the_git_common_dir(self):
+        run_id = self.run_afk("start", "central-bnkl.1.1").stdout.strip()
+        interrupted = self.run_afk(
+            "_worker", run_id, AFK_TEST_KILL_BEFORE_MUTATION="worktree-create"
+        )
+        self.assertLess(interrupted.returncode, 0)
+        common_dir = self.state_home / "fake-git"
+        common_dir.rename(self.state_home / "original-fake-git")
+        common_dir.mkdir()
+
+        resumed = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="absent")
+
+        self.assertEqual(resumed.returncode, 2, resumed.stderr)
+        store = RunStore(self.state_home / "afk")
+        projection = store.status(run_id)
+        self.assertEqual(projection["checkpoint"], "claimed")
+        self.assertEqual(projection["attention"]["scope"], "worktree")
+        self.assertIn("common directory", projection["attention"]["summary"])
+        self.assertEqual(self.mutation_count("worktree-create"), 0)
 
     def test_resume_rejects_a_worktree_record_with_two_checkout_modes(self):
         for mode in ("detached", "bare"):
@@ -6096,6 +6119,11 @@ class StartCliTest(unittest.TestCase):
         self.assertEqual(
             identity["start_request"]["repository_common_dir"],
             str((self.project / ".git").resolve()),
+        )
+        metadata = (self.project / ".git").stat()
+        self.assertEqual(
+            identity["start_request"]["repository_common_dir_identity"],
+            {"device": metadata.st_dev, "inode": metadata.st_ino},
         )
 
     def test_start_classifies_a_preflight_command_timeout(self):

@@ -8,6 +8,7 @@ import subprocess
 import sys
 import time
 import tomllib
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -65,6 +66,7 @@ class ExternalCommandError(StartError):
 class StartContext:
     root: Path
     repository_common_dir: Path
+    repository_common_dir_identity: dict[str, int]
     repository: str
     base_branch: str
     base_sha: str
@@ -96,6 +98,9 @@ def start_run(
             start_request={
                 "repository_root": str(context.root),
                 "repository_common_dir": str(context.repository_common_dir),
+                "repository_common_dir_identity": (
+                    context.repository_common_dir_identity
+                ),
                 "beads_workspace": str(context.beads_workspace),
                 "claimant": context.claimant,
                 "lingering": lingering,
@@ -2053,6 +2058,7 @@ def preflight(
 ) -> StartContext:
     root = Path(_required(["git", "rev-parse", "--show-toplevel"], cwd=cwd)).resolve()
     repository_common_dir = _resolved_git_path(root, "--git-common-dir")
+    repository_common_dir_identity = _filesystem_identity(repository_common_dir)
     repository_data = _json_command(
         ["gh", "repo", "view", "--json", "nameWithOwner,defaultBranchRef"],
         cwd=root,
@@ -2101,6 +2107,7 @@ def preflight(
     return StartContext(
         root=root,
         repository_common_dir=repository_common_dir,
+        repository_common_dir_identity=repository_common_dir_identity,
         repository=repository,
         base_branch=default_branch,
         base_sha=base_sha,
@@ -2150,14 +2157,29 @@ def _launch_worker(run_id: str, unit: str) -> None:
 
 
 def _advance_bead_claim(store: RunStore, run_id: str) -> int:
+    return _advance_reconciliation(
+        store,
+        run_id,
+        scope="bead_claim",
+        reconcile=lambda: _reconcile_bead_claim(store, run_id),
+    )
+
+
+def _advance_reconciliation(
+    store: RunStore,
+    run_id: str,
+    *,
+    scope: str,
+    reconcile: Callable[[], Any],
+) -> int:
     try:
-        _reconcile_bead_claim(store, run_id)
+        reconcile()
     except ExternalCommandError as exc:
         _attention(
             store,
             run_id,
             checkpoint=store.status(run_id)["checkpoint"],
-            scope="bead_claim",
+            scope=scope,
             kind="unavailable",
             summary=str(exc),
             classification=_error_classification(exc),
@@ -2168,7 +2190,7 @@ def _advance_bead_claim(store: RunStore, run_id: str) -> int:
             store,
             run_id,
             checkpoint=store.status(run_id)["checkpoint"],
-            scope="bead_claim",
+            scope=scope,
             kind="conflict",
             summary=str(exc),
         )
@@ -2279,42 +2301,29 @@ def _validate_claim_identity(
 
 
 def _advance_worktree(store: RunStore, run_id: str) -> int:
-    try:
-        _reconcile_worktree(store, run_id)
-    except ExternalCommandError as exc:
-        _attention(
-            store,
-            run_id,
-            checkpoint=store.status(run_id)["checkpoint"],
-            scope="worktree",
-            kind="unavailable",
-            summary=str(exc),
-            classification=_error_classification(exc),
-        )
-        return 2
-    except (KeyError, OSError, RunStoreError, StartError, ValueError) as exc:
-        _attention(
-            store,
-            run_id,
-            checkpoint=store.status(run_id)["checkpoint"],
-            scope="worktree",
-            kind="conflict",
-            summary=str(exc),
-        )
-        return 2
-    return 0
+    return _advance_reconciliation(
+        store,
+        run_id,
+        scope="worktree",
+        reconcile=lambda: _reconcile_worktree(store, run_id),
+    )
 
 
-def _reconcile_worktree(store: RunStore, run_id: str) -> dict[str, str]:
+def _reconcile_worktree(store: RunStore, run_id: str) -> dict[str, Any]:
     identity = store.identity(run_id)
     run_id = identity["run_id"]
-    root = Path(identity["start_request"]["repository_root"])
+    request = identity["start_request"]
+    root = Path(request["repository_root"])
+    common_dir_identity = _validated_filesystem_identity(
+        request["repository_common_dir_identity"]
+    )
     worktree = store.root / "worktrees" / run_id
     branch = f"afk/{identity['bead_id'].replace('.', '-')}-{run_id}/candidate"
     intended = {
         "repository": identity["repository"],
         "repository_root": str(root),
-        "repository_common_dir": identity["start_request"]["repository_common_dir"],
+        "repository_common_dir": request["repository_common_dir"],
+        "repository_common_dir_identity": common_dir_identity,
         "base_sha": identity["base_sha"],
         "branch": branch,
         "worktree_path": str(worktree),
@@ -2359,6 +2368,10 @@ def _reconcile_worktree(store: RunStore, run_id: str) -> dict[str, str]:
         intended["repository_common_dir"]
     ):
         raise StartError("Run repository has been replaced")
+    if _filesystem_identity(Path(intended["repository_common_dir"])) != (
+        common_dir_identity
+    ):
+        raise StartError("Run repository common directory has been replaced")
     remote = _required(["git", "remote", "get-url", "origin"], cwd=root)
     if not _remote_matches_repository(remote, identity["repository"]):
         raise StartError("Run repository origin has been replaced")
@@ -2658,6 +2671,30 @@ def _required(
 def _resolved_git_path(root: Path, argument: str) -> Path:
     path = Path(_required(["git", "rev-parse", argument], cwd=root))
     return path.resolve() if path.is_absolute() else (root / path).resolve()
+
+
+def _filesystem_identity(path: Path) -> dict[str, int]:
+    try:
+        link_metadata = path.lstat()
+        metadata = path.stat()
+    except OSError as exc:
+        raise StartError(f"repository common directory is unavailable: {path}") from exc
+    link_identity = {"device": link_metadata.st_dev, "inode": link_metadata.st_ino}
+    identity = {"device": metadata.st_dev, "inode": metadata.st_ino}
+    if link_identity != identity or not stat.S_ISDIR(metadata.st_mode):
+        raise StartError(f"repository common directory has been replaced: {path}")
+    return identity
+
+
+def _validated_filesystem_identity(value: Any) -> dict[str, int]:
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"device", "inode"}
+        or any(type(value[field]) is not int for field in ("device", "inode"))
+        or any(value[field] < 0 for field in ("device", "inode"))
+    ):
+        raise StartError("Run repository common directory identity is invalid")
+    return value
 
 
 def _json_command(command: list[str], *, cwd: Path) -> Any:
