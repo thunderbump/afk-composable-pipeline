@@ -34,8 +34,13 @@ def validate_open_attempts(
         terminal_implementation,
     ) = _open_implementation_attempt(events)
     implementation = projection.get("implementation_attempt")
+    implementation_lifecycle_exists = (
+        started_implementation is not None or terminal_implementation is not None
+    )
     if (
         implementation_invalid
+        or not implementation_lifecycle_exists
+        and "implementation_attempt" in projection
         or implementation_is_open
         and implementation != started_implementation
         or not implementation_is_open

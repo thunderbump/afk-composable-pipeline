@@ -2181,6 +2181,43 @@ class StartCliTest(unittest.TestCase):
             projection["attention"]["summary"],
         )
 
+    def test_resume_rejects_projected_implementation_without_lifecycle_events(self):
+        run_id = self.run_afk("start", "central-bnkl.1.1").stdout.strip()
+        interrupted = self.run_afk(
+            "_worker",
+            run_id,
+            AFK_TEST_KILL_BEFORE_EVENT="implementation.attempt_started",
+        )
+        self.assertLess(interrupted.returncode, 0)
+        store = RunStore(self.state_home / "afk")
+        store.append_event(
+            run_id,
+            "implementation.projection_corrupted",
+            data={
+                "checkpoint": "worktree_ready",
+                "implementation_attempt": {
+                    "attempt_id": "implementation-1",
+                    "starting_sha": BASE_SHA,
+                    "status": "started",
+                    "evidence": "attempts/implementation-1",
+                },
+            },
+        )
+        commands_before = self.command_log.read_text(encoding="utf-8")
+
+        resumed = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="absent")
+
+        self.assertEqual(resumed.returncode, 2, resumed.stderr)
+        projection = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(projection["checkpoint"], "worktree_ready")
+        self.assertEqual(projection["attention"]["scope"], "candidate")
+        self.assertEqual(projection["attention"]["kind"], "invalid")
+        self.assertIn(
+            "implementation attempt lifecycle is invalid",
+            projection["attention"]["summary"],
+        )
+        self.assertEqual(self.command_log.read_text(encoding="utf-8"), commands_before)
+
     def test_worker_claims_publishes_validates_and_reviews_the_exact_candidate(self):
         started = self.run_afk("start", "central-bnkl.1.1")
         run_id = started.stdout.strip()
