@@ -1033,6 +1033,36 @@ class StartCliTest(unittest.TestCase):
         self.assertEqual(status["attention"]["scope"], "bead_claim")
         self.assertEqual(self.mutation_count("bead-claim"), 1)
 
+    def test_resume_restores_durable_claim_after_observation_recovers(self):
+        run_id = self.run_afk("start", "central-bnkl.1.1").stdout.strip()
+        interrupted = self.run_afk(
+            "_worker", run_id, AFK_TEST_KILL_AFTER_EVENT_WRITE="bead.claimed"
+        )
+        self.assertLess(interrupted.returncode, 0)
+
+        unavailable = self.run_afk(
+            "resume",
+            AFK_FAKE_SYSTEMD_STATE="absent",
+            AFK_FAKE_BEAD_SHOW_FAILURE="1",
+        )
+        store = RunStore(self.state_home / "afk")
+        paused = store.status(run_id)
+        self.assertEqual(unavailable.returncode, 2, unavailable.stderr)
+        self.assertEqual(paused["checkpoint"], "claimed")
+        self.assertEqual(paused["attention"]["scope"], "bead_claim")
+
+        recovered = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="absent")
+        repeated = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="absent")
+
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        self.assertEqual(repeated.returncode, 0, repeated.stderr)
+        status = store.status(run_id)
+        self.assertEqual(status["state"], "claimed")
+        self.assertEqual(status["checkpoint"], "claimed")
+        self.assertEqual(status["attention"], {})
+        self.assertEqual(len(self.launch_events(run_id, "bead.claimed")), 1)
+        self.assertEqual(self.mutation_count("bead-claim"), 1)
+
     def test_worker_claims_publishes_validates_and_reviews_the_exact_candidate(self):
         started = self.run_afk("start", "central-bnkl.1.1")
         run_id = started.stdout.strip()

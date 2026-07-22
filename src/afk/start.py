@@ -202,7 +202,10 @@ def resume_run(
         if projection["state"] == "completed":
             return selected_run_id, 0
         run_id = selected_run_id
-        if projection["last_event"] == "bead.claimed":
+        if projection["last_event"] in {"bead.claimed", "bead.claim_reconciled"}:
+            return run_id, _advance_bead_claim(store, run_id)
+        attention = projection.get("attention")
+        if isinstance(attention, dict) and attention.get("scope") == "bead_claim":
             return run_id, _advance_bead_claim(store, run_id)
         if _validation_attempt_open(projection):
             return run_id, _recover_validation_attempt(store, run_id, projection)
@@ -2147,7 +2150,7 @@ def _advance_bead_claim(store: RunStore, run_id: str) -> int:
         _attention(
             store,
             run_id,
-            checkpoint="created",
+            checkpoint=store.status(run_id)["checkpoint"],
             scope="bead_claim",
             kind="unavailable",
             summary=str(exc),
@@ -2240,6 +2243,17 @@ def _reconcile_bead_claim(store: RunStore, run_id: str) -> dict[str, Any]:
         )
     elif projection["bead_claim"] != observed:
         raise StartError("durable Bead claim contradicts the Run")
+    elif projection.get("attention", {}).get("scope") == "bead_claim":
+        store.append_event(
+            run_id,
+            "bead.claim_reconciled",
+            state="claimed",
+            data={
+                "checkpoint": "claimed",
+                "bead_claim": observed,
+                "attention": {},
+            },
+        )
     return observed
 
 
