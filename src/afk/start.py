@@ -2200,7 +2200,11 @@ def _reconcile_bead_claim(store: RunStore, run_id: str) -> dict[str, Any]:
     bead = _show_bead(bead_id, workspace)
     _validate_claim_identity(bead, bead_id, project_label)
     if bead.get("status") == "open" and not bead.get("assignee"):
-        result = _bd_json(["bd", "update", bead_id, "--claim", "--json"], cwd=workspace)
+        result = _bd_json(
+            ["bd", "update", bead_id, "--claim", "--json"],
+            cwd=workspace,
+            actor=claimant,
+        )
         if isinstance(result, list):
             if len(result) != 1 or not isinstance(result[0], dict):
                 raise _malformed_beads_output()
@@ -2448,9 +2452,11 @@ def _json_command(command: list[str], *, cwd: Path) -> Any:
         ) from exc
 
 
-def _bd_json(command: list[str], *, cwd: Path) -> Any:
+def _bd_json(command: list[str], *, cwd: Path, actor: str | None = None) -> Any:
     environment = os.environ.copy()
     environment["BEADS_DOLT_PASSWORD"] = _beads_password()
+    if actor is not None:
+        environment["BEADS_ACTOR"] = actor
     completed = _command(command, cwd=cwd, check=False, env=environment)
     if completed.returncode != 0:
         raise _external_failure("bd", completed)

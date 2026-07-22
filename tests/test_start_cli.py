@@ -865,6 +865,32 @@ class StartCliTest(unittest.TestCase):
         self.assertEqual(projection["bead_claim"], observed)
         self.assertEqual(self.mutation_count("bead-claim"), 1)
 
+    def test_resume_claims_as_the_durable_actor_after_actor_drift(self):
+        run_id = self.run_afk(
+            "start", "central-bnkl.1.1", BEADS_ACTOR="pipeline-agent"
+        ).stdout.strip()
+        interrupted = self.run_afk(
+            "_worker",
+            run_id,
+            BEADS_ACTOR="pipeline-agent",
+            AFK_TEST_KILL_BEFORE_MUTATION="bead-claim",
+        )
+        self.assertLess(interrupted.returncode, 0)
+
+        resumed = self.run_afk(
+            "resume",
+            BEADS_ACTOR="different-agent",
+            AFK_FAKE_SYSTEMD_STATE="absent",
+        )
+
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        self.assert_bead_claim(
+            RunStore(self.state_home / "afk"),
+            run_id,
+            claimant="pipeline-agent",
+        )
+        self.assertEqual(self.mutation_count("bead-claim"), 1)
+
     def test_resume_reconciles_bead_claim_across_every_crash_boundary(self):
         boundaries = {
             "after-effect": {"AFK_TEST_KILL_AFTER_EFFECT": "bead-claim"},
