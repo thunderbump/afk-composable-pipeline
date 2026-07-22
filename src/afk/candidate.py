@@ -190,7 +190,7 @@ def produce_candidate(
             raise CandidateError("implementation evidence could not be verified")
         report = _read_report(attempt_path / "report.json")
     else:
-        raise CandidateError("interrupted implementation requires attention")
+        raise CandidateError(attempt_state["summary"])
 
     candidate_sha = _verify_candidate(
         worktree,
@@ -534,18 +534,23 @@ def _recover_implementation_attempt(
         )
         return report, finished
     head, observed_branch, dirty = _implementation_checkout(worktree)
-    retryable = (
-        interruption_is_retryable(attempt_state)
-        and head == base_sha
-        and observed_branch == branch
-        and not dirty
-    )
-    if not retryable:
+    checkout_is_intact = head == base_sha and observed_branch == branch and not dirty
+    if not checkout_is_intact:
         summary = _implementation_checkout_interruption_summary(
             head=head,
             dirty=dirty,
             base_sha=base_sha,
         )
+        _seal_implementation_interruption(
+            store,
+            run_id,
+            attempt_state=attempt_state,
+            summary=summary,
+            retryable=False,
+        )
+        raise CandidateError(summary, kind="invalid")
+    if not interruption_is_retryable(attempt_state):
+        summary = "interrupted implementation recovery budget is exhausted"
         _seal_implementation_interruption(
             store,
             run_id,

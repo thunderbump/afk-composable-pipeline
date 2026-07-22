@@ -1984,6 +1984,9 @@ class StartCliTest(unittest.TestCase):
             AFK_TEST_KILL_AFTER_EVENT_WRITE="implementation.attempt_started",
         )
         self.assertLess(second.returncode, 0)
+        RunStore(self.state_home / "afk").write_evidence_text(
+            run_id, "attempts/implementation-2/prompt.md", "survived\n"
+        )
 
         exhausted = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="absent")
         repeated = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="absent")
@@ -1997,6 +2000,14 @@ class StartCliTest(unittest.TestCase):
         )
         self.assertEqual(projection["implementation_attempt"]["status"], "interrupted")
         self.assertFalse(projection["implementation_attempt"]["retryable"])
+        self.assertEqual(
+            projection["implementation_attempt"]["summary"],
+            "interrupted implementation recovery budget is exhausted",
+        )
+        self.assertEqual(
+            projection["attention"]["summary"],
+            "interrupted implementation recovery budget is exhausted",
+        )
         self.assertEqual(
             len(self.launch_events(run_id, "implementation.attempt_started")), 2
         )
