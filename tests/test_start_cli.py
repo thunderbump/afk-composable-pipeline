@@ -195,6 +195,22 @@ class StartCliTest(unittest.TestCase):
         self.assertEqual(worker.returncode, 0, worker.stderr)
         return run_id
 
+    def start_open_implementation_attempt(self, *, state_home=None, home=None):
+        environment = {}
+        if state_home is not None:
+            environment["XDG_STATE_HOME"] = str(state_home)
+        if home is not None:
+            environment["HOME"] = str(home)
+        run_id = self.run_afk("start", "central-bnkl.1.1", **environment).stdout.strip()
+        interrupted = self.run_afk(
+            "_worker",
+            run_id,
+            AFK_TEST_KILL_AFTER_EVENT_WRITE="implementation.attempt_started",
+            **environment,
+        )
+        self.assertLess(interrupted.returncode, 0)
+        return run_id
+
     def mutation_count(self, name, *, state_home=None):
         path = (state_home or self.state_home) / "fake-mutations.jsonl"
         if not path.exists():
@@ -1570,15 +1586,7 @@ class StartCliTest(unittest.TestCase):
         self.assertEqual(self.mutation_count("worktree-create"), 1)
 
     def test_resume_restarts_one_interrupted_clean_implementation_attempt(self):
-        run_id = self.run_afk("start", "central-bnkl.1.1").stdout.strip()
-
-        interrupted = self.run_afk(
-            "_worker",
-            run_id,
-            AFK_TEST_KILL_AFTER_EVENT_WRITE="implementation.attempt_started",
-        )
-
-        self.assertLess(interrupted.returncode, 0)
+        run_id = self.start_open_implementation_attempt()
         before = json.loads(self.run_afk("status", run_id, "--json").stdout)
         self.assertEqual(before["checkpoint"], "worktree_ready")
         attempt = before["implementation_attempt"]
@@ -1613,13 +1621,7 @@ class StartCliTest(unittest.TestCase):
         )
 
     def test_resume_refuses_to_recover_an_attempt_from_a_different_origin(self):
-        run_id = self.run_afk("start", "central-bnkl.1.1").stdout.strip()
-        interrupted = self.run_afk(
-            "_worker",
-            run_id,
-            AFK_TEST_KILL_AFTER_EVENT_WRITE="implementation.attempt_started",
-        )
-        self.assertLess(interrupted.returncode, 0)
+        run_id = self.start_open_implementation_attempt()
         before = json.loads(self.run_afk("status", run_id, "--json").stdout)
         common_dir = self.state_home / "fake-git"
         metadata = common_dir.stat()
@@ -1665,13 +1667,7 @@ class StartCliTest(unittest.TestCase):
         )
 
     def test_resume_refuses_retry_when_checkout_drifts_before_second_attempt(self):
-        run_id = self.run_afk("start", "central-bnkl.1.1").stdout.strip()
-        interrupted = self.run_afk(
-            "_worker",
-            run_id,
-            AFK_TEST_KILL_AFTER_EVENT_WRITE="implementation.attempt_started",
-        )
-        self.assertLess(interrupted.returncode, 0)
+        run_id = self.start_open_implementation_attempt()
 
         resumed = self.run_afk(
             "resume",
@@ -1756,13 +1752,7 @@ class StartCliTest(unittest.TestCase):
         )
 
     def test_resume_seals_surviving_terminal_implementation_evidence(self):
-        run_id = self.run_afk("start", "central-bnkl.1.1").stdout.strip()
-        interrupted = self.run_afk(
-            "_worker",
-            run_id,
-            AFK_TEST_KILL_AFTER_EVENT_WRITE="implementation.attempt_started",
-        )
-        self.assertLess(interrupted.returncode, 0)
+        run_id = self.start_open_implementation_attempt()
         store = RunStore(self.state_home / "afk")
         store.write_evidence_value(
             run_id,
@@ -1799,13 +1789,7 @@ class StartCliTest(unittest.TestCase):
         )
 
     def test_resume_preserves_dirty_interrupted_implementation_state(self):
-        run_id = self.run_afk("start", "central-bnkl.1.1").stdout.strip()
-        interrupted = self.run_afk(
-            "_worker",
-            run_id,
-            AFK_TEST_KILL_AFTER_EVENT_WRITE="implementation.attempt_started",
-        )
-        self.assertLess(interrupted.returncode, 0)
+        run_id = self.start_open_implementation_attempt()
         RunStore(self.state_home / "afk").write_evidence_text(
             run_id, "attempts/implementation-1/prompt.md", "survived\n"
         )
@@ -1838,13 +1822,7 @@ class StartCliTest(unittest.TestCase):
         )
 
     def test_resume_does_not_infer_success_from_an_unreported_commit(self):
-        run_id = self.run_afk("start", "central-bnkl.1.1").stdout.strip()
-        interrupted = self.run_afk(
-            "_worker",
-            run_id,
-            AFK_TEST_KILL_AFTER_EVENT_WRITE="implementation.attempt_started",
-        )
-        self.assertLess(interrupted.returncode, 0)
+        run_id = self.start_open_implementation_attempt()
         RunStore(self.state_home / "afk").write_evidence_text(
             run_id, "attempts/implementation-1/prompt.md", "survived\n"
         )
@@ -1864,13 +1842,7 @@ class StartCliTest(unittest.TestCase):
         )
 
     def test_resume_seals_but_does_not_trust_a_malformed_implementation_report(self):
-        run_id = self.run_afk("start", "central-bnkl.1.1").stdout.strip()
-        interrupted = self.run_afk(
-            "_worker",
-            run_id,
-            AFK_TEST_KILL_AFTER_EVENT_WRITE="implementation.attempt_started",
-        )
-        self.assertLess(interrupted.returncode, 0)
+        run_id = self.start_open_implementation_attempt()
         store = RunStore(self.state_home / "afk")
         store.write_evidence_text(
             run_id,
@@ -1900,13 +1872,7 @@ class StartCliTest(unittest.TestCase):
     def test_resume_retries_but_never_completes_from_missing_implementation_evidence(
         self,
     ):
-        run_id = self.run_afk("start", "central-bnkl.1.1").stdout.strip()
-        interrupted = self.run_afk(
-            "_worker",
-            run_id,
-            AFK_TEST_KILL_AFTER_EVENT_WRITE="implementation.attempt_started",
-        )
-        self.assertLess(interrupted.returncode, 0)
+        run_id = self.start_open_implementation_attempt()
         attempts = self.state_home / "afk" / "runs" / run_id / "attempts"
         self.assertFalse((attempts / "implementation-1").exists())
 
@@ -1940,20 +1906,9 @@ class StartCliTest(unittest.TestCase):
                 state_home = self.temp / f"missing-evidence-{name}"
                 home = self.temp / f"missing-evidence-home-{name}"
                 home.mkdir()
-                run_id = self.run_afk(
-                    "start",
-                    "central-bnkl.1.1",
-                    XDG_STATE_HOME=str(state_home),
-                    HOME=str(home),
-                ).stdout.strip()
-                interrupted = self.run_afk(
-                    "_worker",
-                    run_id,
-                    XDG_STATE_HOME=str(state_home),
-                    HOME=str(home),
-                    AFK_TEST_KILL_AFTER_EVENT_WRITE="implementation.attempt_started",
+                run_id = self.start_open_implementation_attempt(
+                    state_home=state_home, home=home
                 )
-                self.assertLess(interrupted.returncode, 0)
                 if advanced:
                     (home / ".fake-candidate").write_text("d" * 40, encoding="utf-8")
 
@@ -2000,13 +1955,7 @@ class StartCliTest(unittest.TestCase):
                 )
 
     def test_resume_preserves_an_ambiguously_misbound_implementation_checkout(self):
-        run_id = self.run_afk("start", "central-bnkl.1.1").stdout.strip()
-        interrupted = self.run_afk(
-            "_worker",
-            run_id,
-            AFK_TEST_KILL_AFTER_EVENT_WRITE="implementation.attempt_started",
-        )
-        self.assertLess(interrupted.returncode, 0)
+        run_id = self.start_open_implementation_attempt()
         RunStore(self.state_home / "afk").write_evidence_text(
             run_id, "attempts/implementation-1/prompt.md", "survived\n"
         )
@@ -2028,13 +1977,7 @@ class StartCliTest(unittest.TestCase):
         )
 
     def test_resume_exhausts_after_one_fresh_implementation_attempt(self):
-        run_id = self.run_afk("start", "central-bnkl.1.1").stdout.strip()
-        first = self.run_afk(
-            "_worker",
-            run_id,
-            AFK_TEST_KILL_AFTER_EVENT_WRITE="implementation.attempt_started",
-        )
-        self.assertLess(first.returncode, 0)
+        run_id = self.start_open_implementation_attempt()
         second = self.run_afk(
             "resume",
             AFK_FAKE_SYSTEMD_STATE="absent",
@@ -2164,20 +2107,9 @@ class StartCliTest(unittest.TestCase):
                 state_home = self.temp / f"implementation-interruption-{name}"
                 home = self.temp / f"implementation-interruption-home-{name}"
                 home.mkdir()
-                run_id = self.run_afk(
-                    "start",
-                    "central-bnkl.1.1",
-                    XDG_STATE_HOME=str(state_home),
-                    HOME=str(home),
-                ).stdout.strip()
-                started = self.run_afk(
-                    "_worker",
-                    run_id,
-                    XDG_STATE_HOME=str(state_home),
-                    HOME=str(home),
-                    AFK_TEST_KILL_AFTER_EVENT_WRITE="implementation.attempt_started",
+                run_id = self.start_open_implementation_attempt(
+                    state_home=state_home, home=home
                 )
-                self.assertLess(started.returncode, 0)
                 interrupted = self.run_afk(
                     "resume",
                     XDG_STATE_HOME=str(state_home),
@@ -2221,13 +2153,7 @@ class StartCliTest(unittest.TestCase):
                 )
 
     def test_resume_rejects_a_second_open_implementation_attempt_in_event_history(self):
-        run_id = self.run_afk("start", "central-bnkl.1.1").stdout.strip()
-        interrupted = self.run_afk(
-            "_worker",
-            run_id,
-            AFK_TEST_KILL_AFTER_EVENT_WRITE="implementation.attempt_started",
-        )
-        self.assertLess(interrupted.returncode, 0)
+        run_id = self.start_open_implementation_attempt()
         store = RunStore(self.state_home / "afk")
         store.append_event(
             run_id,
