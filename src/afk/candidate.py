@@ -456,16 +456,13 @@ def _recover_implementation_attempt(
             raise CandidateError("implementation evidence could not be verified")
         recovery_path = attempt_path / "recovery.json"
         if recovery_path.exists():
-            interrupted = _implementation_interruption(
-                recovery_path, attempt_state=attempt_state
-            )
-            store.append_event(
+            recovery = _implementation_interruption(recovery_path)
+            interrupted = _publish_implementation_interruption(
+                store,
                 run_id,
-                "implementation.attempt_interrupted",
-                data={
-                    "checkpoint": "worktree_ready",
-                    "implementation_attempt": interrupted,
-                },
+                attempt_state=attempt_state,
+                summary=recovery["summary"],
+                retryable=recovery["retryable"],
             )
             if interrupted["retryable"]:
                 return None, interrupted
@@ -620,6 +617,23 @@ def _seal_implementation_interruption(
     else:
         store.write_evidence_value(run_id, f"{attempt}/recovery.json", recovery)
     store.seal_evidence(run_id, attempt)
+    return _publish_implementation_interruption(
+        store,
+        run_id,
+        attempt_state=attempt_state,
+        summary=summary,
+        retryable=retryable,
+    )
+
+
+def _publish_implementation_interruption(
+    store: RunStore,
+    run_id: str,
+    *,
+    attempt_state: dict[str, Any],
+    summary: str,
+    retryable: bool,
+) -> dict[str, Any]:
     interrupted = interrupted_attempt(
         attempt_state, summary=summary, retryable=retryable
     )
@@ -634,9 +648,7 @@ def _seal_implementation_interruption(
     return interrupted
 
 
-def _implementation_interruption(
-    path: Path, *, attempt_state: dict[str, Any]
-) -> dict[str, Any]:
+def _implementation_interruption(path: Path) -> dict[str, Any]:
     recovery = _read_json_object(path, "implementation recovery")
     if (
         set(recovery) != {"status", "summary", "retryable"}
@@ -646,7 +658,7 @@ def _implementation_interruption(
         or type(recovery.get("retryable")) is not bool
     ):
         raise CandidateError("implementation recovery evidence is malformed")
-    return {**attempt_state, **recovery}
+    return recovery
 
 
 def _read_json_object(path: Path, label: str) -> dict[str, Any]:

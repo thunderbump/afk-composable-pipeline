@@ -95,6 +95,21 @@ class CandidateTest(unittest.TestCase):
             check=True,
             capture_output=True,
         )
+        common_dir = Path(
+            subprocess.run(
+                [
+                    "git",
+                    "rev-parse",
+                    "--path-format=absolute",
+                    "--git-common-dir",
+                ],
+                cwd=self.checkout,
+                text=True,
+                capture_output=True,
+                check=True,
+            ).stdout.strip()
+        ).resolve()
+        common_dir_metadata = common_dir.stat()
         self.store = RunStore(self.state)
         self.store.create_run(
             bead_id="central-test.1",
@@ -103,6 +118,11 @@ class CandidateTest(unittest.TestCase):
             base_sha=self.base_sha,
             start_request={
                 "repository_root": str(self.checkout),
+                "repository_common_dir": str(common_dir),
+                "repository_common_dir_identity": {
+                    "device": common_dir_metadata.st_dev,
+                    "inode": common_dir_metadata.st_ino,
+                },
                 "beads_workspace": str(self.temp),
             },
             run_id="run-1",
@@ -151,7 +171,14 @@ class CandidateTest(unittest.TestCase):
             }
         )
         environment.update(env)
-        with mock.patch.dict(os.environ, environment, clear=True):
+        with (
+            mock.patch.dict(os.environ, environment, clear=True),
+            mock.patch.object(
+                candidate_module,
+                "github_repo_from_repo_url",
+                return_value="owner/project",
+            ),
+        ):
             return produce_candidate(
                 self.store,
                 "run-1",
