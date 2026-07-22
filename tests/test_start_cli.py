@@ -1613,6 +1613,36 @@ class StartCliTest(unittest.TestCase):
             len(self.launch_events(run_id, "implementation.attempt_finished")), 1
         )
 
+    def test_resume_refuses_retry_when_checkout_drifts_before_second_attempt(self):
+        run_id = self.run_afk("start", "central-bnkl.1.1").stdout.strip()
+        interrupted = self.run_afk(
+            "_worker",
+            run_id,
+            AFK_TEST_KILL_AFTER_EVENT_WRITE="implementation.attempt_started",
+        )
+        self.assertLess(interrupted.returncode, 0)
+
+        resumed = self.run_afk(
+            "resume",
+            AFK_FAKE_SYSTEMD_STATE="absent",
+            AFK_FAKE_DIRTY_AFTER_IMPLEMENTATION_INTERRUPTED="1",
+        )
+
+        self.assertEqual(resumed.returncode, 2, resumed.stderr)
+        projection = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(projection["checkpoint"], "worktree_ready")
+        self.assertEqual(projection["attention"]["scope"], "candidate")
+        self.assertEqual(projection["attention"]["kind"], "invalid")
+        self.assertIn("clean pinned base", projection["attention"]["summary"])
+        self.assertEqual(
+            projection["implementation_attempt"]["attempt_id"], "implementation-1"
+        )
+        self.assertEqual(projection["implementation_attempt"]["status"], "interrupted")
+        self.assertTrue(projection["implementation_attempt"]["retryable"])
+        self.assertEqual(
+            len(self.launch_events(run_id, "implementation.attempt_started")), 1
+        )
+
     def test_resume_starts_implementation_after_crash_before_attempt_intent(self):
         run_id = self.run_afk("start", "central-bnkl.1.1").stdout.strip()
 
@@ -1640,6 +1670,38 @@ class StartCliTest(unittest.TestCase):
         )
         self.assertEqual(
             len(self.launch_events(run_id, "implementation.attempt_interrupted")), 0
+        )
+
+    def test_worker_refuses_to_start_implementation_from_a_dirty_checkout(self):
+        run_id = self.run_afk("start", "central-bnkl.1.1").stdout.strip()
+        worker = self.run_afk("_worker", run_id, AFK_FAKE_DIRTY_AFTER_STATUS_CHECKS="1")
+
+        self.assertEqual(worker.returncode, 2, worker.stderr)
+        projection = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(projection["checkpoint"], "worktree_ready")
+        self.assertEqual(projection["attention"]["scope"], "candidate")
+        self.assertEqual(projection["attention"]["kind"], "invalid")
+        self.assertIn("clean pinned base", projection["attention"]["summary"])
+        self.assertNotIn("implementation_attempt", projection)
+        self.assertEqual(
+            len(self.launch_events(run_id, "implementation.attempt_started")), 0
+        )
+
+    def test_worker_refuses_to_start_implementation_from_a_replaced_repository(self):
+        run_id = self.run_afk("start", "central-bnkl.1.1").stdout.strip()
+        worker = self.run_afk(
+            "_worker", run_id, AFK_FAKE_REPOSITORY_REPLACED_AFTER_WORKTREE_CHECK="1"
+        )
+
+        self.assertEqual(worker.returncode, 2, worker.stderr)
+        projection = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(projection["checkpoint"], "worktree_ready")
+        self.assertEqual(projection["attention"]["scope"], "candidate")
+        self.assertEqual(projection["attention"]["kind"], "invalid")
+        self.assertIn("clean pinned base", projection["attention"]["summary"])
+        self.assertNotIn("implementation_attempt", projection)
+        self.assertEqual(
+            len(self.launch_events(run_id, "implementation.attempt_started")), 0
         )
 
     def test_resume_seals_surviving_terminal_implementation_evidence(self):
@@ -6067,7 +6129,7 @@ class StartCliTest(unittest.TestCase):
         self.assertEqual(resumed.stdout.strip(), "collected-run")
         self.assertFalse(self.command_log.exists())
 
-    def test_resume_advances_the_prior_implementation_unavailable_checkpoint(self):
+    def test_resume_refuses_prior_implementation_without_pinned_checkout_identity(self):
         store = RunStore(self.state_home / "afk")
         run_id = "prior-slice-run"
         branch = "afk/central-bnkl-1-1-prior-slice-run/candidate"
@@ -6123,9 +6185,11 @@ class StartCliTest(unittest.TestCase):
 
         self.assertEqual(resumed.returncode, 2, resumed.stderr)
         projection = store.status(run_id)
-        self.assertEqual(projection["checkpoint"], "candidate_ready")
-        self.assertEqual(projection["attention"]["scope"], "validation")
+        self.assertEqual(projection["checkpoint"], "worktree_ready")
+        self.assertEqual(projection["attention"]["scope"], "candidate")
         self.assertEqual(projection["attention"]["kind"], "invalid")
+        self.assertIn("clean pinned base", projection["attention"]["summary"])
+        self.assertNotIn("implementation_attempt", projection)
         commands = self.command_log.read_text(encoding="utf-8")
         self.assertNotIn('"command":"systemctl"', commands)
 
@@ -6768,7 +6832,22 @@ class StartCliTest(unittest.TestCase):
 
                 if command == "git":
                     if args[:2] == ["rev-parse", "--show-toplevel"]:
-                        print(os.environ.get("AFK_FAKE_REPOSITORY_ROOT", project))
+                        status_checks = (
+                            Path(os.environ["XDG_STATE_HOME"])
+                            / "fake-status-checks"
+                        )
+                        print(
+                            os.environ.get("AFK_FAKE_REPOSITORY_ROOT")
+                            or (
+                                "/tmp/replaced-repository"
+                                if os.environ.get(
+                                    "AFK_FAKE_REPOSITORY_REPLACED_AFTER_WORKTREE_CHECK"
+                                )
+                                and status_checks.exists()
+                                else ""
+                            )
+                            or Path.cwd()
+                        )
                     elif args[:2] == ["remote", "get-url"]:
                         repository = os.environ.get(
                             "AFK_FAKE_ORIGIN_REPOSITORY",
@@ -7005,7 +7084,31 @@ class StartCliTest(unittest.TestCase):
                                     print("prunable gitdir file points to missing location")
                                 print()
                     elif args[:2] == ["status", "--porcelain"]:
-                        if os.environ.get("AFK_FAKE_DIRTY_WORKTREE"):
+                        status_checks = Path(os.environ["XDG_STATE_HOME"]) / "fake-status-checks"
+                        check_count = int(status_checks.read_text()) if status_checks.exists() else 0
+                        status_checks.write_text(str(check_count + 1), encoding="utf-8")
+                        dirty_after = os.environ.get("AFK_FAKE_DIRTY_AFTER_STATUS_CHECKS")
+                        events = (
+                            Path(os.environ["XDG_STATE_HOME"])
+                            / "afk"
+                            / "runs"
+                            / Path.cwd().name
+                            / "events.jsonl"
+                        )
+                        dirty_after_interruption = (
+                            os.environ.get(
+                                "AFK_FAKE_DIRTY_AFTER_IMPLEMENTATION_INTERRUPTED"
+                            )
+                            and events.exists()
+                            and "implementation.attempt_interrupted"
+                            in events.read_text(encoding="utf-8")
+                        )
+                        if (
+                            os.environ.get("AFK_FAKE_DIRTY_WORKTREE")
+                            or dirty_after is not None
+                            and check_count >= int(dirty_after)
+                            or dirty_after_interruption
+                        ):
                             print("?? user-owned-file")
                     elif args[:2] == ["worktree", "move"]:
                         source = Path(args[-2])

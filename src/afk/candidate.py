@@ -4,6 +4,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import tempfile
 from pathlib import Path
@@ -222,6 +223,13 @@ def _run_implementation_attempt(
     branch: str,
     attempt_id: str,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
+    _require_implementation_start_checkout(
+        store,
+        run_id,
+        identity=identity,
+        worktree=worktree,
+        branch=branch,
+    )
     attempt = f"attempts/{attempt_id}"
     attempt_path = store.root / "runs" / run_id / attempt
     prompt = _implementation_prompt(
@@ -291,6 +299,69 @@ def _run_implementation_attempt(
         store, run_id, attempt_state=started, candidate_sha=candidate_sha
     )
     return report, finished
+
+
+def _require_implementation_start_checkout(
+    store: RunStore,
+    run_id: str,
+    *,
+    identity: dict[str, Any],
+    worktree: Path,
+    branch: str,
+) -> None:
+    request = identity.get("start_request")
+    common_dir = (
+        request.get("repository_common_dir") if isinstance(request, dict) else None
+    )
+    common_dir_identity = (
+        request.get("repository_common_dir_identity")
+        if isinstance(request, dict)
+        else None
+    )
+    expected_worktree = store.root / "worktrees" / run_id
+    head, observed_branch, dirty = _implementation_checkout(worktree)
+    observed_repository = github_repo_from_repo_url(
+        _git(worktree, "remote", "get-url", "origin")
+    )
+    if (
+        worktree.resolve() != expected_worktree.resolve()
+        or Path(_git(worktree, "rev-parse", "--show-toplevel")).resolve()
+        != worktree.resolve()
+        or not isinstance(common_dir, str)
+        or _resolved_git_path(worktree, "--git-common-dir")
+        != Path(common_dir).resolve()
+        or not _same_filesystem_identity(Path(common_dir), common_dir_identity)
+        or observed_repository is None
+        or observed_repository.casefold() != identity["repository"].casefold()
+        or head != identity["base_sha"]
+        or observed_branch != branch
+        or dirty
+    ):
+        raise CandidateError(
+            "implementation attempt requires the Run's exact clean pinned base",
+            kind="invalid",
+        )
+
+
+def _same_filesystem_identity(path: Path, expected: Any) -> bool:
+    try:
+        link_metadata = path.lstat()
+        metadata = path.stat()
+    except OSError as exc:
+        raise CandidateError(
+            "implementation repository identity is unavailable", kind="unavailable"
+        ) from exc
+    return (
+        isinstance(expected, dict)
+        and expected
+        == {
+            "device": metadata.st_dev,
+            "inode": metadata.st_ino,
+        }
+        and (link_metadata.st_dev, link_metadata.st_ino)
+        == (metadata.st_dev, metadata.st_ino)
+        and stat.S_ISDIR(metadata.st_mode)
+    )
 
 
 def _recover_implementation_attempt(
