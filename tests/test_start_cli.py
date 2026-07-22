@@ -1925,6 +1925,80 @@ class StartCliTest(unittest.TestCase):
         )
         self.assertTrue((attempts / "implementation-2/manifest.json").is_file())
 
+    def test_resume_seals_missing_evidence_when_checkout_is_unsafe(self):
+        scenarios = {
+            "dirty": ({"AFK_FAKE_DIRTY_WORKTREE": "1"}, "dirty", False),
+            "advanced": ({}, "advanced HEAD", True),
+            "misbound": (
+                {"AFK_FAKE_IMPLEMENTATION_BRANCH": "afk/user-owned-branch"},
+                "branch",
+                False,
+            ),
+        }
+        for name, (environment, expected_summary, advanced) in scenarios.items():
+            with self.subTest(scenario=name):
+                state_home = self.temp / f"missing-evidence-{name}"
+                home = self.temp / f"missing-evidence-home-{name}"
+                home.mkdir()
+                run_id = self.run_afk(
+                    "start",
+                    "central-bnkl.1.1",
+                    XDG_STATE_HOME=str(state_home),
+                    HOME=str(home),
+                ).stdout.strip()
+                interrupted = self.run_afk(
+                    "_worker",
+                    run_id,
+                    XDG_STATE_HOME=str(state_home),
+                    HOME=str(home),
+                    AFK_TEST_KILL_AFTER_EVENT_WRITE="implementation.attempt_started",
+                )
+                self.assertLess(interrupted.returncode, 0)
+                if advanced:
+                    (home / ".fake-candidate").write_text("d" * 40, encoding="utf-8")
+
+                resumed = self.run_afk(
+                    "resume",
+                    XDG_STATE_HOME=str(state_home),
+                    HOME=str(home),
+                    AFK_FAKE_SYSTEMD_STATE="absent",
+                    **environment,
+                )
+
+                self.assertEqual(resumed.returncode, 2, resumed.stderr)
+                projection = json.loads(
+                    self.run_afk(
+                        "status",
+                        run_id,
+                        "--json",
+                        XDG_STATE_HOME=str(state_home),
+                        HOME=str(home),
+                    ).stdout
+                )
+                attempt = projection["implementation_attempt"]
+                self.assertEqual(attempt["status"], "interrupted")
+                self.assertFalse(attempt["retryable"])
+                self.assertIn(expected_summary, attempt["summary"])
+                self.assertEqual(
+                    len(
+                        self.launch_events(
+                            run_id,
+                            "implementation.attempt_interrupted",
+                            state_home=state_home,
+                        )
+                    ),
+                    1,
+                )
+                self.assertTrue(
+                    (
+                        state_home
+                        / "afk"
+                        / "runs"
+                        / run_id
+                        / "attempts/implementation-1/manifest.json"
+                    ).is_file()
+                )
+
     def test_resume_preserves_an_ambiguously_misbound_implementation_checkout(self):
         run_id = self.run_afk("start", "central-bnkl.1.1").stdout.strip()
         interrupted = self.run_afk(

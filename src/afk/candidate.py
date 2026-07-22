@@ -498,9 +498,22 @@ def _recover_implementation_attempt(
                 "interrupted implementation recovery budget is exhausted",
                 kind="invalid",
             )
-        raise CandidateError(
-            "implementation attempt evidence is missing", kind="invalid"
+        if dirty:
+            summary = "interrupted implementation left a dirty worktree"
+        elif head != base_sha:
+            summary = (
+                "interrupted implementation advanced HEAD without terminal evidence"
+            )
+        else:
+            summary = "interrupted implementation changed the intended branch"
+        _seal_implementation_interruption(
+            store,
+            run_id,
+            attempt_state=attempt_state,
+            summary=summary,
+            retryable=False,
         )
+        raise CandidateError(summary, kind="invalid")
     if not attempt_path.is_dir() or attempt_path.is_symlink():
         raise CandidateError(
             "implementation attempt evidence is invalid", kind="invalid"
