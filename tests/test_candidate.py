@@ -95,6 +95,21 @@ class CandidateTest(unittest.TestCase):
             check=True,
             capture_output=True,
         )
+        common_dir = Path(
+            subprocess.run(
+                [
+                    "git",
+                    "rev-parse",
+                    "--path-format=absolute",
+                    "--git-common-dir",
+                ],
+                cwd=self.checkout,
+                text=True,
+                capture_output=True,
+                check=True,
+            ).stdout.strip()
+        ).resolve()
+        common_dir_metadata = common_dir.stat()
         self.store = RunStore(self.state)
         self.store.create_run(
             bead_id="central-test.1",
@@ -103,6 +118,11 @@ class CandidateTest(unittest.TestCase):
             base_sha=self.base_sha,
             start_request={
                 "repository_root": str(self.checkout),
+                "repository_common_dir": str(common_dir),
+                "repository_common_dir_identity": {
+                    "device": common_dir_metadata.st_dev,
+                    "inode": common_dir_metadata.st_ino,
+                },
                 "beads_workspace": str(self.temp),
             },
             run_id="run-1",
@@ -151,7 +171,14 @@ class CandidateTest(unittest.TestCase):
             }
         )
         environment.update(env)
-        with mock.patch.dict(os.environ, environment, clear=True):
+        with (
+            mock.patch.dict(os.environ, environment, clear=True),
+            mock.patch.object(
+                candidate_module,
+                "github_repo_from_repo_url",
+                return_value="owner/project",
+            ),
+        ):
             return produce_candidate(
                 self.store,
                 "run-1",
@@ -1081,12 +1108,33 @@ class CandidateTest(unittest.TestCase):
         with self.subTest("no change"):
             with self.assertRaisesRegex(CandidateError, "no_change"):
                 self.produce(CODEX_FAKE_OUTCOME="no_change")
+            attempt = self.state / "runs/run-1/attempts/implementation-1"
+            self.assertTrue((attempt / "manifest.json").is_file())
+            implementation = self.store.status("run-1")["implementation_attempt"]
+            self.assertEqual(implementation["status"], "interrupted")
+            self.assertFalse(implementation["retryable"])
 
         self.tearDown()
         self.setUp()
         with self.subTest("dirty"):
             with self.assertRaisesRegex(CandidateError, "dirty"):
                 self.produce(CODEX_FAKE_OUTCOME="dirty")
+            attempt = self.state / "runs/run-1/attempts/implementation-1"
+            self.assertTrue((attempt / "manifest.json").is_file())
+            implementation = self.store.status("run-1")["implementation_attempt"]
+            self.assertEqual(implementation["status"], "interrupted")
+            self.assertFalse(implementation["retryable"])
+            self.assertTrue((self.checkout / "dirty.txt").is_file())
+
+    def test_blocked_terminal_report_is_sealed_and_closed(self):
+        with self.assertRaisesRegex(CandidateError, "blocked"):
+            self.produce(CODEX_FAKE_OUTCOME="blocked")
+
+        attempt = self.state / "runs/run-1/attempts/implementation-1"
+        self.assertTrue((attempt / "manifest.json").is_file())
+        implementation = self.store.status("run-1")["implementation_attempt"]
+        self.assertEqual(implementation["status"], "interrupted")
+        self.assertFalse(implementation["retryable"])
 
     def test_legacy_flat_candidate_branch_fails_closed(self):
         with self.assertRaisesRegex(CandidateError, "per-Run namespace"):
@@ -1187,7 +1235,7 @@ class CandidateTest(unittest.TestCase):
                     subprocess.Popen([sys.executable, "-c", child], cwd=cwd)
                     signal.signal(signal.SIGTERM, signal.SIG_IGN)
                     time.sleep(30)
-                if outcome not in {"no_change", "nonzero", "malformed"}:
+                if outcome not in {"no_change", "blocked", "nonzero", "malformed"}:
                     (cwd / changed).write_text("candidate\\n", encoding="utf-8")
                     subprocess.run(["git", "add", changed], cwd=cwd, check=True)
                     subprocess.run(["git", "commit", "-m", "repair" if repair else "candidate"], cwd=cwd, check=True, capture_output=True)  # noqa: E501
@@ -1203,7 +1251,7 @@ class CandidateTest(unittest.TestCase):
                     report.write_text("not json", encoding="utf-8")
                 else:
                     value = {{
-                        "status": "no_change" if outcome == "no_change" else "completed",  # noqa: E501
+                        "status": outcome if outcome in {"no_change", "blocked"} else "completed",  # noqa: E501
                         "starting_sha": start,
                         "ending_sha": end,
                         "summary": "implemented",

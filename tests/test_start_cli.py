@@ -195,6 +195,22 @@ class StartCliTest(unittest.TestCase):
         self.assertEqual(worker.returncode, 0, worker.stderr)
         return run_id
 
+    def start_open_implementation_attempt(self, *, state_home=None, home=None):
+        environment = {}
+        if state_home is not None:
+            environment["XDG_STATE_HOME"] = str(state_home)
+        if home is not None:
+            environment["HOME"] = str(home)
+        run_id = self.run_afk("start", "central-bnkl.1.1", **environment).stdout.strip()
+        interrupted = self.run_afk(
+            "_worker",
+            run_id,
+            AFK_TEST_KILL_AFTER_EVENT_WRITE="implementation.attempt_started",
+            **environment,
+        )
+        self.assertLess(interrupted.returncode, 0)
+        return run_id
+
     def mutation_count(self, name, *, state_home=None):
         path = (state_home or self.state_home) / "fake-mutations.jsonl"
         if not path.exists():
@@ -914,7 +930,7 @@ class StartCliTest(unittest.TestCase):
         self.assertEqual(repeated.returncode, 0, repeated.stderr)
         observed = self.assert_bead_claim(store, run_id)
         projection = store.status(run_id)
-        self.assertEqual(projection["checkpoint"], "worktree_ready")
+        self.assertEqual(projection["checkpoint"], "reviewed")
         self.assertEqual(projection["bead_claim"], observed)
         self.assertEqual(projection["attention"], {})
         self.assertEqual(len(self.launch_events(run_id, "bead.claimed")), 1)
@@ -959,16 +975,20 @@ class StartCliTest(unittest.TestCase):
         for name, injection in boundaries.items():
             with self.subTest(boundary=name):
                 state_home = self.temp / f"claim-{name}"
+                home = self.temp / f"claim-home-{name}"
+                home.mkdir()
                 started = self.run_afk(
                     "start",
                     "central-bnkl.1.1",
                     XDG_STATE_HOME=str(state_home),
+                    HOME=str(home),
                 )
                 run_id = started.stdout.strip()
                 interrupted = self.run_afk(
                     "_worker",
                     run_id,
                     XDG_STATE_HOME=str(state_home),
+                    HOME=str(home),
                     **injection,
                 )
                 self.assertLess(interrupted.returncode, 0)
@@ -976,11 +996,13 @@ class StartCliTest(unittest.TestCase):
                 resumed = self.run_afk(
                     "resume",
                     XDG_STATE_HOME=str(state_home),
+                    HOME=str(home),
                     AFK_FAKE_SYSTEMD_STATE="absent",
                 )
                 repeated = self.run_afk(
                     "resume",
                     XDG_STATE_HOME=str(state_home),
+                    HOME=str(home),
                     AFK_FAKE_SYSTEMD_STATE="absent",
                 )
 
@@ -989,7 +1011,10 @@ class StartCliTest(unittest.TestCase):
                 store = RunStore(state_home / "afk")
                 observed = self.assert_bead_claim(store, run_id)
                 projection = store.status(run_id)
-                self.assertEqual(projection["checkpoint"], "worktree_ready")
+                expected_checkpoint = (
+                    "reviewed" if name == "after-event-write" else "worktree_ready"
+                )
+                self.assertEqual(projection["checkpoint"], expected_checkpoint)
                 self.assertEqual(projection["bead_claim"], observed)
                 events = self.launch_events(
                     run_id, "bead.claimed", state_home=state_home
@@ -1121,8 +1146,8 @@ class StartCliTest(unittest.TestCase):
         self.assertEqual(recovered.returncode, 0, recovered.stderr)
         self.assertEqual(repeated.returncode, 0, repeated.stderr)
         status = store.status(run_id)
-        self.assertEqual(status["state"], "worktree_ready")
-        self.assertEqual(status["checkpoint"], "worktree_ready")
+        self.assertEqual(status["state"], "reviewed")
+        self.assertEqual(status["checkpoint"], "reviewed")
         self.assertEqual(status["attention"], {})
         self.assertEqual(len(self.launch_events(run_id, "bead.claimed")), 1)
         self.assertEqual(self.mutation_count("bead-claim"), 1)
@@ -1141,16 +1166,20 @@ class StartCliTest(unittest.TestCase):
         for name, injection in boundaries.items():
             with self.subTest(boundary=name):
                 state_home = self.temp / f"worktree-{name}"
+                home = self.temp / f"worktree-home-{name}"
+                home.mkdir()
                 run_id = self.run_afk(
                     "start",
                     "central-bnkl.1.1",
                     XDG_STATE_HOME=str(state_home),
+                    HOME=str(home),
                 ).stdout.strip()
 
                 interrupted = self.run_afk(
                     "_worker",
                     run_id,
                     XDG_STATE_HOME=str(state_home),
+                    HOME=str(home),
                     **injection,
                 )
 
@@ -1158,11 +1187,13 @@ class StartCliTest(unittest.TestCase):
                 resumed = self.run_afk(
                     "resume",
                     XDG_STATE_HOME=str(state_home),
+                    HOME=str(home),
                     AFK_FAKE_SYSTEMD_STATE="absent",
                 )
                 repeated = self.run_afk(
                     "resume",
                     XDG_STATE_HOME=str(state_home),
+                    HOME=str(home),
                     AFK_FAKE_SYSTEMD_STATE="absent",
                 )
 
@@ -1173,7 +1204,7 @@ class StartCliTest(unittest.TestCase):
                     store, run_id, state_home=state_home
                 )
                 projection = store.status(run_id)
-                self.assertEqual(projection["checkpoint"], "worktree_ready")
+                self.assertEqual(projection["checkpoint"], "reviewed")
                 self.assertEqual(projection["worktree_path"], intended["worktree_path"])
                 self.assertEqual(projection["branch"], intended["branch"])
                 self.assertEqual(
@@ -1502,7 +1533,7 @@ class StartCliTest(unittest.TestCase):
         self.assertEqual(recovered.returncode, 0, recovered.stderr)
         self.assertEqual(repeated.returncode, 0, repeated.stderr)
         projection = store.status(run_id)
-        self.assertEqual(projection["checkpoint"], "worktree_ready")
+        self.assertEqual(projection["checkpoint"], "reviewed")
         self.assertEqual(projection["attention"], {})
         self.assertEqual(len(self.launch_events(run_id, "worktree.ready")), 1)
         self.assertEqual(len(self.launch_events(run_id, "worktree.reconciled")), 1)
@@ -1551,8 +1582,680 @@ class StartCliTest(unittest.TestCase):
         self.assertEqual(resumed.returncode, 0, resumed.stderr)
         self.assertEqual(repeated.returncode, 0, repeated.stderr)
         self.assert_worktree_effect(store, run_id)
-        self.assertEqual(store.status(run_id)["checkpoint"], "worktree_ready")
+        self.assertEqual(store.status(run_id)["checkpoint"], "reviewed")
         self.assertEqual(self.mutation_count("worktree-create"), 1)
+
+    def test_resume_restarts_one_interrupted_clean_implementation_attempt(self):
+        run_id = self.start_open_implementation_attempt()
+        before = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(before["checkpoint"], "worktree_ready")
+        attempt = before["implementation_attempt"]
+        self.assertEqual(attempt["attempt_id"], "implementation-1")
+        self.assertEqual(attempt["starting_sha"], BASE_SHA)
+        self.assertEqual(attempt["status"], "started")
+        self.assertEqual(attempt["evidence"], "attempts/implementation-1")
+        self.assertEqual(attempt["repository"], "thunderbump/beads-webui")
+        self.assertEqual(attempt["branch"], before["branch"])
+        self.assertEqual(attempt["worktree_path"], before["worktree_path"])
+
+        resumed = self.run_afk(
+            "resume",
+            AFK_FAKE_SYSTEMD_STATE="absent",
+        )
+
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        projection = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(projection["checkpoint"], "reviewed")
+        self.assertEqual(projection["implementation_attempt"]["status"], "completed")
+        self.assertEqual(
+            projection["implementation_attempt"]["attempt_id"], "implementation-2"
+        )
+        self.assertEqual(
+            len(self.launch_events(run_id, "implementation.attempt_started")), 2
+        )
+        self.assertEqual(
+            len(self.launch_events(run_id, "implementation.attempt_interrupted")), 1
+        )
+        self.assertEqual(
+            len(self.launch_events(run_id, "implementation.attempt_finished")), 1
+        )
+
+    def test_resume_refuses_to_recover_an_attempt_from_a_different_origin(self):
+        run_id = self.start_open_implementation_attempt()
+        before = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        common_dir = self.state_home / "fake-git"
+        metadata = common_dir.stat()
+        self.assertEqual(
+            before["implementation_attempt"],
+            {
+                "attempt_id": "implementation-1",
+                "starting_sha": BASE_SHA,
+                "status": "started",
+                "evidence": "attempts/implementation-1",
+                "repository": "thunderbump/beads-webui",
+                "repository_common_dir": str(common_dir),
+                "repository_common_dir_identity": {
+                    "device": metadata.st_dev,
+                    "inode": metadata.st_ino,
+                },
+                "origin": "git@github.com:thunderbump/beads-webui.git",
+                "branch": before["branch"],
+                "worktree_path": before["worktree_path"],
+            },
+        )
+
+        resumed = self.run_afk(
+            "resume",
+            AFK_FAKE_SYSTEMD_STATE="absent",
+            AFK_FAKE_ORIGIN_REPOSITORY="thunderbump/another-repo",
+        )
+
+        self.assertEqual(resumed.returncode, 2, resumed.stderr)
+        after = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(after["checkpoint"], "worktree_ready")
+        self.assertEqual(after["attention"]["scope"], "candidate")
+        self.assertEqual(after["attention"]["kind"], "invalid")
+        self.assertIn("identity", after["attention"]["summary"])
+        self.assertEqual(
+            after["implementation_attempt"], before["implementation_attempt"]
+        )
+        self.assertEqual(
+            len(self.launch_events(run_id, "implementation.attempt_started")), 1
+        )
+        self.assertEqual(
+            len(self.launch_events(run_id, "implementation.attempt_interrupted")), 0
+        )
+
+    def test_resume_refuses_retry_when_checkout_drifts_before_second_attempt(self):
+        run_id = self.start_open_implementation_attempt()
+
+        resumed = self.run_afk(
+            "resume",
+            AFK_FAKE_SYSTEMD_STATE="absent",
+            AFK_FAKE_DIRTY_AFTER_IMPLEMENTATION_INTERRUPTED="1",
+        )
+
+        self.assertEqual(resumed.returncode, 2, resumed.stderr)
+        projection = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(projection["checkpoint"], "worktree_ready")
+        self.assertEqual(projection["attention"]["scope"], "candidate")
+        self.assertEqual(projection["attention"]["kind"], "invalid")
+        self.assertIn("clean pinned base", projection["attention"]["summary"])
+        self.assertEqual(
+            projection["implementation_attempt"]["attempt_id"], "implementation-1"
+        )
+        self.assertEqual(projection["implementation_attempt"]["status"], "interrupted")
+        self.assertTrue(projection["implementation_attempt"]["retryable"])
+        self.assertEqual(
+            len(self.launch_events(run_id, "implementation.attempt_started")), 1
+        )
+
+    def test_resume_starts_implementation_after_crash_before_attempt_intent(self):
+        run_id = self.run_afk("start", "central-bnkl.1.1").stdout.strip()
+
+        interrupted = self.run_afk(
+            "_worker",
+            run_id,
+            AFK_TEST_KILL_BEFORE_EVENT="implementation.attempt_started",
+        )
+
+        self.assertLess(interrupted.returncode, 0)
+        before = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(before["checkpoint"], "worktree_ready")
+        self.assertNotIn("implementation_attempt", before)
+        resumed = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="absent")
+
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        projection = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(projection["checkpoint"], "reviewed")
+        self.assertEqual(
+            projection["implementation_attempt"]["attempt_id"], "implementation-1"
+        )
+        self.assertEqual(projection["implementation_attempt"]["status"], "completed")
+        self.assertEqual(
+            len(self.launch_events(run_id, "implementation.attempt_started")), 1
+        )
+        self.assertEqual(
+            len(self.launch_events(run_id, "implementation.attempt_interrupted")), 0
+        )
+
+    def test_worker_refuses_to_start_implementation_from_a_dirty_checkout(self):
+        run_id = self.run_afk("start", "central-bnkl.1.1").stdout.strip()
+        worker = self.run_afk("_worker", run_id, AFK_FAKE_DIRTY_AFTER_STATUS_CHECKS="1")
+
+        self.assertEqual(worker.returncode, 2, worker.stderr)
+        projection = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(projection["checkpoint"], "worktree_ready")
+        self.assertEqual(projection["attention"]["scope"], "candidate")
+        self.assertEqual(projection["attention"]["kind"], "invalid")
+        self.assertIn("clean pinned base", projection["attention"]["summary"])
+        self.assertNotIn("implementation_attempt", projection)
+        self.assertEqual(
+            len(self.launch_events(run_id, "implementation.attempt_started")), 0
+        )
+
+    def test_worker_refuses_to_start_implementation_from_a_replaced_repository(self):
+        run_id = self.run_afk("start", "central-bnkl.1.1").stdout.strip()
+        worker = self.run_afk(
+            "_worker", run_id, AFK_FAKE_REPOSITORY_REPLACED_AFTER_WORKTREE_CHECK="1"
+        )
+
+        self.assertEqual(worker.returncode, 2, worker.stderr)
+        projection = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(projection["checkpoint"], "worktree_ready")
+        self.assertEqual(projection["attention"]["scope"], "candidate")
+        self.assertEqual(projection["attention"]["kind"], "invalid")
+        self.assertIn("clean pinned base", projection["attention"]["summary"])
+        self.assertNotIn("implementation_attempt", projection)
+        self.assertEqual(
+            len(self.launch_events(run_id, "implementation.attempt_started")), 0
+        )
+
+    def test_resume_seals_surviving_terminal_implementation_evidence(self):
+        run_id = self.start_open_implementation_attempt()
+        store = RunStore(self.state_home / "afk")
+        store.write_evidence_value(
+            run_id,
+            "attempts/implementation-1/report.json",
+            {
+                "status": "completed",
+                "starting_sha": BASE_SHA,
+                "ending_sha": "d" * 40,
+                "summary": "implementation survived",
+                "checks": [],
+                "changed_areas": ["candidate.txt"],
+            },
+        )
+        (self.home / ".fake-candidate").write_text("d" * 40, encoding="utf-8")
+
+        resumed = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="absent")
+
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        projection = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(projection["checkpoint"], "reviewed")
+        self.assertEqual(projection["candidate_sha"], "d" * 40)
+        self.assertEqual(projection["implementation_attempt"]["status"], "completed")
+        self.assertEqual(
+            len(self.launch_events(run_id, "implementation.attempt_started")), 1
+        )
+        self.assertTrue(
+            (
+                self.state_home
+                / "afk"
+                / "runs"
+                / run_id
+                / "attempts/implementation-1/manifest.json"
+            ).is_file()
+        )
+
+    def test_resume_preserves_dirty_interrupted_implementation_state(self):
+        run_id = self.start_open_implementation_attempt()
+        RunStore(self.state_home / "afk").write_evidence_text(
+            run_id, "attempts/implementation-1/prompt.md", "survived\n"
+        )
+
+        resumed = self.run_afk(
+            "resume",
+            AFK_FAKE_SYSTEMD_STATE="absent",
+            AFK_FAKE_DIRTY_WORKTREE="1",
+        )
+
+        self.assertEqual(resumed.returncode, 2, resumed.stderr)
+        projection = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(projection["checkpoint"], "worktree_ready")
+        self.assertEqual(projection["attention"]["scope"], "candidate")
+        self.assertEqual(projection["attention"]["kind"], "invalid")
+        self.assertEqual(projection["implementation_attempt"]["status"], "interrupted")
+        self.assertFalse(projection["implementation_attempt"]["retryable"])
+        self.assertIn("dirty", projection["implementation_attempt"]["summary"])
+        self.assertEqual(
+            len(self.launch_events(run_id, "implementation.attempt_started")), 1
+        )
+        self.assertTrue(
+            (
+                self.state_home
+                / "afk"
+                / "runs"
+                / run_id
+                / "attempts/implementation-1/manifest.json"
+            ).is_file()
+        )
+
+    def test_resume_does_not_infer_success_from_an_unreported_commit(self):
+        run_id = self.start_open_implementation_attempt()
+        RunStore(self.state_home / "afk").write_evidence_text(
+            run_id, "attempts/implementation-1/prompt.md", "survived\n"
+        )
+        (self.home / ".fake-candidate").write_text("d" * 40, encoding="utf-8")
+
+        resumed = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="absent")
+
+        self.assertEqual(resumed.returncode, 2, resumed.stderr)
+        projection = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(projection["checkpoint"], "worktree_ready")
+        self.assertNotIn("candidate_sha", projection)
+        self.assertEqual(projection["implementation_attempt"]["status"], "interrupted")
+        self.assertFalse(projection["implementation_attempt"]["retryable"])
+        self.assertIn("without terminal evidence", projection["attention"]["summary"])
+        self.assertEqual(
+            len(self.launch_events(run_id, "implementation.attempt_started")), 1
+        )
+
+    def test_resume_seals_but_does_not_trust_a_malformed_implementation_report(self):
+        run_id = self.start_open_implementation_attempt()
+        store = RunStore(self.state_home / "afk")
+        store.write_evidence_text(
+            run_id,
+            "attempts/implementation-1/report.json",
+            "not-json\n",
+        )
+
+        resumed = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="absent")
+
+        self.assertEqual(resumed.returncode, 2, resumed.stderr)
+        projection = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(projection["checkpoint"], "worktree_ready")
+        self.assertNotIn("candidate_sha", projection)
+        self.assertEqual(projection["implementation_attempt"]["status"], "interrupted")
+        self.assertFalse(projection["implementation_attempt"]["retryable"])
+        self.assertIn("malformed", projection["attention"]["summary"])
+        self.assertTrue(
+            (
+                self.state_home
+                / "afk"
+                / "runs"
+                / run_id
+                / "attempts/implementation-1/manifest.json"
+            ).is_file()
+        )
+
+    def test_worker_seals_a_fresh_malformed_implementation_report(self):
+        run_id = self.run_afk("start", "central-bnkl.1.1").stdout.strip()
+        (self.home / ".fake-malformed-implementation-report").touch()
+
+        worker = self.run_afk("_worker", run_id)
+
+        self.assertEqual(worker.returncode, 2, worker.stderr)
+        projection = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(projection["checkpoint"], "worktree_ready")
+        self.assertNotIn("candidate_sha", projection)
+        self.assertEqual(
+            projection["attention"]["summary"],
+            "implementation report is missing or malformed",
+        )
+        self.assertEqual(projection["implementation_attempt"]["status"], "interrupted")
+        self.assertFalse(projection["implementation_attempt"]["retryable"])
+        attempt = (
+            self.state_home / "afk" / "runs" / run_id / "attempts/implementation-1"
+        )
+        self.assertEqual((attempt / "report.json").read_text(), "not-json\n")
+        self.assertTrue((attempt / "events.jsonl").is_file())
+        self.assertTrue((attempt / "stderr.txt").is_file())
+        self.assertTrue((attempt / "recovery.json").is_file())
+        self.assertTrue((attempt / "manifest.json").is_file())
+        interrupted = self.launch_events(run_id, "implementation.attempt_interrupted")
+        self.assertEqual(len(interrupted), 1)
+        self.assertFalse(interrupted[0]["data"]["implementation_attempt"]["retryable"])
+
+    def test_resume_retries_but_never_completes_from_missing_implementation_evidence(
+        self,
+    ):
+        run_id = self.start_open_implementation_attempt()
+        attempts = self.state_home / "afk" / "runs" / run_id / "attempts"
+        self.assertFalse((attempts / "implementation-1").exists())
+
+        resumed = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="absent")
+
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        projection = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(projection["checkpoint"], "reviewed")
+        self.assertEqual(projection["implementation_attempt"]["status"], "completed")
+        self.assertEqual(
+            projection["implementation_attempt"]["attempt_id"], "implementation-2"
+        )
+        self.assertNotIn(
+            "candidate_sha",
+            self.launch_events(run_id, "implementation.attempt_interrupted")[0]["data"],
+        )
+        self.assertTrue((attempts / "implementation-2/manifest.json").is_file())
+
+    def test_resume_seals_missing_evidence_when_checkout_is_unsafe(self):
+        scenarios = {
+            "dirty": ({"AFK_FAKE_DIRTY_WORKTREE": "1"}, "dirty", False),
+            "advanced": ({}, "advanced HEAD", True),
+            "misbound": (
+                {"AFK_FAKE_IMPLEMENTATION_BRANCH": "afk/user-owned-branch"},
+                "branch",
+                False,
+            ),
+        }
+        for name, (environment, expected_summary, advanced) in scenarios.items():
+            with self.subTest(scenario=name):
+                state_home = self.temp / f"missing-evidence-{name}"
+                home = self.temp / f"missing-evidence-home-{name}"
+                home.mkdir()
+                run_id = self.start_open_implementation_attempt(
+                    state_home=state_home, home=home
+                )
+                if advanced:
+                    (home / ".fake-candidate").write_text("d" * 40, encoding="utf-8")
+
+                resumed = self.run_afk(
+                    "resume",
+                    XDG_STATE_HOME=str(state_home),
+                    HOME=str(home),
+                    AFK_FAKE_SYSTEMD_STATE="absent",
+                    **environment,
+                )
+
+                self.assertEqual(resumed.returncode, 2, resumed.stderr)
+                projection = json.loads(
+                    self.run_afk(
+                        "status",
+                        run_id,
+                        "--json",
+                        XDG_STATE_HOME=str(state_home),
+                        HOME=str(home),
+                    ).stdout
+                )
+                attempt = projection["implementation_attempt"]
+                self.assertEqual(attempt["status"], "interrupted")
+                self.assertFalse(attempt["retryable"])
+                self.assertIn(expected_summary, attempt["summary"])
+                self.assertEqual(
+                    len(
+                        self.launch_events(
+                            run_id,
+                            "implementation.attempt_interrupted",
+                            state_home=state_home,
+                        )
+                    ),
+                    1,
+                )
+                self.assertTrue(
+                    (
+                        state_home
+                        / "afk"
+                        / "runs"
+                        / run_id
+                        / "attempts/implementation-1/manifest.json"
+                    ).is_file()
+                )
+
+    def test_resume_preserves_an_ambiguously_misbound_implementation_checkout(self):
+        run_id = self.start_open_implementation_attempt()
+        RunStore(self.state_home / "afk").write_evidence_text(
+            run_id, "attempts/implementation-1/prompt.md", "survived\n"
+        )
+
+        resumed = self.run_afk(
+            "resume",
+            AFK_FAKE_SYSTEMD_STATE="absent",
+            AFK_FAKE_IMPLEMENTATION_BRANCH="afk/user-owned-branch",
+        )
+
+        self.assertEqual(resumed.returncode, 2, resumed.stderr)
+        projection = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(projection["checkpoint"], "worktree_ready")
+        self.assertEqual(projection["implementation_attempt"]["status"], "interrupted")
+        self.assertFalse(projection["implementation_attempt"]["retryable"])
+        self.assertIn("branch", projection["attention"]["summary"])
+        self.assertEqual(
+            len(self.launch_events(run_id, "implementation.attempt_started")), 1
+        )
+
+    def test_resume_exhausts_after_one_fresh_implementation_attempt(self):
+        run_id = self.start_open_implementation_attempt()
+        second = self.run_afk(
+            "resume",
+            AFK_FAKE_SYSTEMD_STATE="absent",
+            AFK_TEST_KILL_AFTER_EVENT_WRITE="implementation.attempt_started",
+        )
+        self.assertLess(second.returncode, 0)
+        RunStore(self.state_home / "afk").write_evidence_text(
+            run_id, "attempts/implementation-2/prompt.md", "survived\n"
+        )
+
+        exhausted = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="absent")
+        repeated = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="absent")
+
+        self.assertEqual(exhausted.returncode, 2, exhausted.stderr)
+        self.assertEqual(repeated.returncode, 2, repeated.stderr)
+        projection = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(projection["checkpoint"], "worktree_ready")
+        self.assertEqual(
+            projection["implementation_attempt"]["attempt_id"], "implementation-2"
+        )
+        self.assertEqual(projection["implementation_attempt"]["status"], "interrupted")
+        self.assertFalse(projection["implementation_attempt"]["retryable"])
+        self.assertEqual(
+            projection["implementation_attempt"]["summary"],
+            "interrupted implementation recovery budget is exhausted",
+        )
+        self.assertEqual(
+            projection["attention"]["summary"],
+            "interrupted implementation recovery budget is exhausted",
+        )
+        self.assertEqual(
+            len(self.launch_events(run_id, "implementation.attempt_started")), 2
+        )
+        self.assertEqual(
+            len(self.launch_events(run_id, "implementation.attempt_interrupted")), 2
+        )
+        self.assertFalse(
+            (
+                self.state_home / "afk" / "runs" / run_id / "attempts/implementation-3"
+            ).exists()
+        )
+
+    def test_resume_reconciles_implementation_terminal_durable_boundaries(self):
+        boundaries = {
+            "before-finished": {
+                "AFK_TEST_KILL_BEFORE_EVENT": "implementation.attempt_finished"
+            },
+            "after-finished-write": {
+                "AFK_TEST_KILL_AFTER_EVENT_WRITE": "implementation.attempt_finished"
+            },
+            "before-change-committed": {
+                "AFK_TEST_KILL_BEFORE_EVENT": "candidate.change_committed"
+            },
+            "after-change-committed-write": {
+                "AFK_TEST_KILL_AFTER_EVENT_WRITE": "candidate.change_committed"
+            },
+        }
+        for name, injection in boundaries.items():
+            with self.subTest(boundary=name):
+                state_home = self.temp / f"implementation-boundary-{name}"
+                home = self.temp / f"implementation-home-{name}"
+                home.mkdir()
+                run_id = self.run_afk(
+                    "start",
+                    "central-bnkl.1.1",
+                    XDG_STATE_HOME=str(state_home),
+                    HOME=str(home),
+                ).stdout.strip()
+                interrupted = self.run_afk(
+                    "_worker",
+                    run_id,
+                    XDG_STATE_HOME=str(state_home),
+                    HOME=str(home),
+                    **injection,
+                )
+                self.assertLess(interrupted.returncode, 0)
+
+                resumed = self.run_afk(
+                    "resume",
+                    XDG_STATE_HOME=str(state_home),
+                    HOME=str(home),
+                    AFK_FAKE_SYSTEMD_STATE="absent",
+                )
+
+                self.assertEqual(resumed.returncode, 0, resumed.stderr)
+                projection = json.loads(
+                    self.run_afk(
+                        "status",
+                        run_id,
+                        "--json",
+                        XDG_STATE_HOME=str(state_home),
+                        HOME=str(home),
+                    ).stdout
+                )
+                self.assertEqual(projection["checkpoint"], "reviewed")
+                self.assertEqual(
+                    len(
+                        self.launch_events(
+                            run_id,
+                            "implementation.attempt_started",
+                            state_home=state_home,
+                        )
+                    ),
+                    1,
+                )
+                self.assertEqual(
+                    len(
+                        self.launch_events(
+                            run_id,
+                            "implementation.attempt_finished",
+                            state_home=state_home,
+                        )
+                    ),
+                    1,
+                )
+                self.assertEqual(
+                    len(
+                        self.launch_events(
+                            run_id,
+                            "candidate.change_committed",
+                            state_home=state_home,
+                        )
+                    ),
+                    1,
+                )
+
+    def test_resume_reconciles_implementation_interruption_publication_boundaries(self):
+        boundaries = {
+            "before-interrupted": {
+                "AFK_TEST_KILL_BEFORE_EVENT": "implementation.attempt_interrupted"
+            },
+            "after-interrupted-write": {
+                "AFK_TEST_KILL_AFTER_EVENT_WRITE": "implementation.attempt_interrupted"
+            },
+        }
+        for name, injection in boundaries.items():
+            with self.subTest(boundary=name):
+                state_home = self.temp / f"implementation-interruption-{name}"
+                home = self.temp / f"implementation-interruption-home-{name}"
+                home.mkdir()
+                run_id = self.start_open_implementation_attempt(
+                    state_home=state_home, home=home
+                )
+                interrupted = self.run_afk(
+                    "resume",
+                    XDG_STATE_HOME=str(state_home),
+                    HOME=str(home),
+                    AFK_FAKE_SYSTEMD_STATE="absent",
+                    **injection,
+                )
+                self.assertLess(interrupted.returncode, 0)
+
+                resumed = self.run_afk(
+                    "resume",
+                    XDG_STATE_HOME=str(state_home),
+                    HOME=str(home),
+                    AFK_FAKE_SYSTEMD_STATE="absent",
+                )
+
+                self.assertEqual(resumed.returncode, 0, resumed.stderr)
+                projection = json.loads(
+                    self.run_afk(
+                        "status",
+                        run_id,
+                        "--json",
+                        XDG_STATE_HOME=str(state_home),
+                        HOME=str(home),
+                    ).stdout
+                )
+                self.assertEqual(projection["checkpoint"], "reviewed")
+                self.assertEqual(
+                    projection["implementation_attempt"]["attempt_id"],
+                    "implementation-2",
+                )
+                self.assertEqual(
+                    len(
+                        self.launch_events(
+                            run_id,
+                            "implementation.attempt_interrupted",
+                            state_home=state_home,
+                        )
+                    ),
+                    1,
+                )
+
+    def test_resume_rejects_a_second_open_implementation_attempt_in_event_history(self):
+        run_id = self.start_open_implementation_attempt()
+        store = RunStore(self.state_home / "afk")
+        store.append_event(
+            run_id,
+            "implementation.attempt_started",
+            data={
+                "checkpoint": "worktree_ready",
+                "implementation_attempt": {
+                    "attempt_id": "implementation-2",
+                    "starting_sha": BASE_SHA,
+                    "status": "started",
+                    "evidence": "attempts/implementation-2",
+                },
+            },
+        )
+
+        resumed = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="absent")
+
+        self.assertEqual(resumed.returncode, 2, resumed.stderr)
+        projection = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(projection["checkpoint"], "worktree_ready")
+        self.assertEqual(projection["attention"]["scope"], "candidate")
+        self.assertEqual(projection["attention"]["kind"], "invalid")
+        self.assertIn(
+            "implementation attempt lifecycle is invalid",
+            projection["attention"]["summary"],
+        )
+
+    def test_resume_rejects_projected_implementation_without_lifecycle_events(self):
+        run_id = self.run_afk("start", "central-bnkl.1.1").stdout.strip()
+        interrupted = self.run_afk(
+            "_worker",
+            run_id,
+            AFK_TEST_KILL_BEFORE_EVENT="implementation.attempt_started",
+        )
+        self.assertLess(interrupted.returncode, 0)
+        store = RunStore(self.state_home / "afk")
+        store.append_event(
+            run_id,
+            "implementation.projection_corrupted",
+            data={
+                "checkpoint": "worktree_ready",
+                "implementation_attempt": {
+                    "attempt_id": "implementation-1",
+                    "starting_sha": BASE_SHA,
+                    "status": "started",
+                    "evidence": "attempts/implementation-1",
+                },
+            },
+        )
+        commands_before = self.command_log.read_text(encoding="utf-8")
+
+        resumed = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="absent")
+
+        self.assertEqual(resumed.returncode, 2, resumed.stderr)
+        projection = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(projection["checkpoint"], "worktree_ready")
+        self.assertEqual(projection["attention"]["scope"], "candidate")
+        self.assertEqual(projection["attention"]["kind"], "invalid")
+        self.assertIn(
+            "implementation attempt lifecycle is invalid",
+            projection["attention"]["summary"],
+        )
+        self.assertEqual(self.command_log.read_text(encoding="utf-8"), commands_before)
 
     def test_worker_claims_publishes_validates_and_reviews_the_exact_candidate(self):
         started = self.run_afk("start", "central-bnkl.1.1")
@@ -5553,7 +6256,7 @@ class StartCliTest(unittest.TestCase):
         self.assertEqual(resumed.stdout.strip(), "collected-run")
         self.assertFalse(self.command_log.exists())
 
-    def test_resume_advances_the_prior_implementation_unavailable_checkpoint(self):
+    def test_resume_refuses_prior_implementation_without_pinned_checkout_identity(self):
         store = RunStore(self.state_home / "afk")
         run_id = "prior-slice-run"
         branch = "afk/central-bnkl-1-1-prior-slice-run/candidate"
@@ -5609,13 +6312,15 @@ class StartCliTest(unittest.TestCase):
 
         self.assertEqual(resumed.returncode, 2, resumed.stderr)
         projection = store.status(run_id)
-        self.assertEqual(projection["checkpoint"], "candidate_ready")
-        self.assertEqual(projection["attention"]["scope"], "validation")
+        self.assertEqual(projection["checkpoint"], "worktree_ready")
+        self.assertEqual(projection["attention"]["scope"], "candidate")
         self.assertEqual(projection["attention"]["kind"], "invalid")
+        self.assertIn("clean pinned base", projection["attention"]["summary"])
+        self.assertNotIn("implementation_attempt", projection)
         commands = self.command_log.read_text(encoding="utf-8")
         self.assertNotIn('"command":"systemctl"', commands)
 
-    def test_resume_advances_legacy_collected_worker_without_terminal_observation(self):
+    def test_resume_refuses_legacy_collected_worker_without_attempt_evidence(self):
         store = RunStore(self.state_home / "afk")
         run_id = "legacy-prior-slice-run"
         branch = "afk/central-bnkl-1-1-legacy-prior-slice-run/candidate"
@@ -5673,9 +6378,10 @@ class StartCliTest(unittest.TestCase):
 
         self.assertEqual(resumed.returncode, 2, resumed.stderr)
         projection = store.status(run_id)
-        self.assertEqual(projection["checkpoint"], "candidate_ready")
-        self.assertEqual(projection["attention"]["scope"], "validation")
+        self.assertEqual(projection["checkpoint"], "worktree_ready")
+        self.assertEqual(projection["attention"]["scope"], "candidate")
         self.assertEqual(projection["attention"]["kind"], "invalid")
+        self.assertIn("clean pinned base", projection["attention"]["summary"])
 
     def test_resume_reconciles_a_candidate_push_completed_before_confirmation(self):
         home = str(self.temp)
@@ -6254,7 +6960,22 @@ class StartCliTest(unittest.TestCase):
 
                 if command == "git":
                     if args[:2] == ["rev-parse", "--show-toplevel"]:
-                        print(os.environ.get("AFK_FAKE_REPOSITORY_ROOT", project))
+                        status_checks = (
+                            Path(os.environ["XDG_STATE_HOME"])
+                            / "fake-status-checks"
+                        )
+                        print(
+                            os.environ.get("AFK_FAKE_REPOSITORY_ROOT")
+                            or (
+                                "/tmp/replaced-repository"
+                                if os.environ.get(
+                                    "AFK_FAKE_REPOSITORY_REPLACED_AFTER_WORKTREE_CHECK"
+                                )
+                                and status_checks.exists()
+                                else ""
+                            )
+                            or Path.cwd()
+                        )
                     elif args[:2] == ["remote", "get-url"]:
                         repository = os.environ.get(
                             "AFK_FAKE_ORIGIN_REPOSITORY",
@@ -6491,7 +7212,31 @@ class StartCliTest(unittest.TestCase):
                                     print("prunable gitdir file points to missing location")
                                 print()
                     elif args[:2] == ["status", "--porcelain"]:
-                        if os.environ.get("AFK_FAKE_DIRTY_WORKTREE"):
+                        status_checks = Path(os.environ["XDG_STATE_HOME"]) / "fake-status-checks"
+                        check_count = int(status_checks.read_text()) if status_checks.exists() else 0
+                        status_checks.write_text(str(check_count + 1), encoding="utf-8")
+                        dirty_after = os.environ.get("AFK_FAKE_DIRTY_AFTER_STATUS_CHECKS")
+                        events = (
+                            Path(os.environ["XDG_STATE_HOME"])
+                            / "afk"
+                            / "runs"
+                            / Path.cwd().name
+                            / "events.jsonl"
+                        )
+                        dirty_after_interruption = (
+                            os.environ.get(
+                                "AFK_FAKE_DIRTY_AFTER_IMPLEMENTATION_INTERRUPTED"
+                            )
+                            and events.exists()
+                            and "implementation.attempt_interrupted"
+                            in events.read_text(encoding="utf-8")
+                        )
+                        if (
+                            os.environ.get("AFK_FAKE_DIRTY_WORKTREE")
+                            or dirty_after is not None
+                            and check_count >= int(dirty_after)
+                            or dirty_after_interruption
+                        ):
                             print("?? user-owned-file")
                     elif args[:2] == ["worktree", "move"]:
                         source = Path(args[-2])
@@ -6567,7 +7312,14 @@ class StartCliTest(unittest.TestCase):
                             time.sleep(1)
                     elif args[:2] == ["branch", "--show-current"]:
                         run_id = Path.cwd().name
-                        print("afk/" + os.environ["AFK_FAKE_BEAD"].replace(".", "-") + "-" + run_id + "/candidate")  # noqa: E501
+                        print(
+                            os.environ.get("AFK_FAKE_IMPLEMENTATION_BRANCH")
+                            or "afk/"
+                            + os.environ["AFK_FAKE_BEAD"].replace(".", "-")
+                            + "-"
+                            + run_id
+                            + "/candidate"
+                        )
                     elif args[:2] == ["merge-base", "--is-ancestor"]:
                         pass
                     elif args[:1] == ["rev-list"]:
@@ -7043,6 +7795,13 @@ class StartCliTest(unittest.TestCase):
                     (scripts / "validation-worker.sh").write_text(
                         "candidate harness proposal\\n", encoding="utf-8"
                     )
+                if (
+                    Path(os.environ["HOME"])
+                    / ".fake-malformed-implementation-report"
+                ).exists():
+                    report.write_text("not-json\\n", encoding="utf-8")
+                    print(json.dumps({"type": "result"}))
+                    raise SystemExit(0)
                 report.write_text(json.dumps({
                     "status": "completed",
                     "starting_sha": base_sha,

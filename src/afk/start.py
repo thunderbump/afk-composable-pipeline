@@ -221,9 +221,14 @@ def resume_run(
                 return run_id, claim_exit_code
             return run_id, _advance_worktree(store, run_id)
         if projection["last_event"] in {"worktree.ready", "worktree.reconciled"}:
-            return run_id, _advance_worktree(store, run_id)
+            worktree_exit_code = _advance_worktree(store, run_id)
+            if worktree_exit_code:
+                return run_id, worktree_exit_code
+            return run_id, _advance_candidate(store, run_id)
         if isinstance(attention, dict) and attention.get("scope") == "worktree":
             return run_id, _advance_worktree(store, run_id)
+        if _implementation_attempt_resume_ready(projection):
+            return run_id, _advance_candidate(store, run_id)
         if _validation_attempt_open(projection):
             return run_id, _recover_validation_attempt(store, run_id, projection)
         if _repair_interruption_pending(store, run_id, projection):
@@ -504,6 +509,25 @@ def _candidate_resume_ready(projection: dict[str, Any]) -> bool:
                 and attention.get("scope") == "implementation"
                 and attention.get("kind") == "unavailable"
             )
+        )
+    )
+
+
+def _implementation_attempt_resume_ready(projection: dict[str, Any]) -> bool:
+    attempt = projection.get("implementation_attempt")
+    return isinstance(attempt, dict) and (
+        (
+            projection["checkpoint"] == "change_committed"
+            and attempt.get("status") == "completed"
+        )
+        or (
+            projection["checkpoint"] == "worktree_ready"
+            and attempt.get("status") in {"started", "completed"}
+        )
+        or (
+            projection["checkpoint"] == "worktree_ready"
+            and attempt.get("status") == "interrupted"
+            and attempt.get("retryable") is True
         )
     )
 
