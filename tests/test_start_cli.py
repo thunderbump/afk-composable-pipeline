@@ -195,8 +195,8 @@ class StartCliTest(unittest.TestCase):
         self.assertEqual(worker.returncode, 0, worker.stderr)
         return run_id
 
-    def mutation_count(self, name):
-        path = self.state_home / "fake-mutations.jsonl"
+    def mutation_count(self, name, *, state_home=None):
+        path = (state_home or self.state_home) / "fake-mutations.jsonl"
         if not path.exists():
             return 0
         return sum(
@@ -204,8 +204,10 @@ class StartCliTest(unittest.TestCase):
             for line in path.read_text(encoding="utf-8").splitlines()
         )
 
-    def launch_events(self, run_id, event):
-        path = self.state_home / "afk" / "runs" / run_id / "events.jsonl"
+    def launch_events(self, run_id, event, *, state_home=None):
+        path = (
+            (state_home or self.state_home) / "afk" / "runs" / run_id / "events.jsonl"
+        )
         return [
             record
             for record in map(json.loads, path.read_text(encoding="utf-8").splitlines())
@@ -230,6 +232,24 @@ class StartCliTest(unittest.TestCase):
         records = self.launch_events(run_id, event)
         self.assertEqual(len(records), count)
         self.assertTrue(all(record["data"]["unit"] == unit for record in records))
+
+    def assert_bead_claim(self, store, run_id, status="confirmed", claimant="bump"):
+        intended = {
+            "bead_id": "central-bnkl.1.1",
+            "claimant": claimant,
+            "project_label": "project:beads-webui",
+        }
+        expected = {
+            "schema_version": 1,
+            "effect_id": "bead-claim",
+            "kind": "bead-claim",
+            "status": status,
+            "intended": intended,
+        }
+        if status == "confirmed":
+            expected["observed"] = {**intended, "status": "in_progress"}
+        self.assertEqual(store.effect(run_id, "bead-claim"), expected)
+        return expected.get("observed")
 
     def command_count(self, command, prefix, *, argument=None):
         return sum(
@@ -644,7 +664,7 @@ class StartCliTest(unittest.TestCase):
         self.assertEqual(store.status(run_id)["attention"]["kind"], "inconclusive")
         self.assertEqual(self.mutation_count("worker-launch"), 1)
 
-    def test_resume_pauses_after_worker_launched_event_write(self):
+    def test_resume_recovers_after_worker_launched_event_write(self):
         started = self.run_afk("start", "central-bnkl.1.1")
         run_id = started.stdout.strip()
         store = RunStore(self.state_home / "afk")
@@ -661,11 +681,13 @@ class StartCliTest(unittest.TestCase):
         self.assert_launch_event(run_id, "worker.launched", 1, unit)
         resumed = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="absent")
         repeated = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="absent")
-        self.assertEqual(resumed.returncode, 2, resumed.stderr)
-        self.assertEqual(repeated.returncode, 2, repeated.stderr)
-        self.assertEqual(store.status(run_id)["attention"]["kind"], "inconclusive")
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        self.assertEqual(repeated.returncode, 0, repeated.stderr)
+        self.assertEqual(store.status(run_id)["checkpoint"], "claimed")
+        self.assert_bead_claim(store, run_id)
         self.assert_launch_event(run_id, "worker.launched", 1, unit)
         self.assertEqual(self.mutation_count("worker-launch"), 1)
+        self.assertEqual(self.mutation_count("bead-claim"), 1)
 
     def test_resume_reconciles_process_crash_after_worker_launch_mutation(self):
         interrupted = self.run_afk(
@@ -797,6 +819,284 @@ class StartCliTest(unittest.TestCase):
         self.assertEqual(projection["checkpoint"], "reviewed")
         effect = RunStore(self.state_home / "afk").effect(run_id, "worker-launch-1")
         self.assertEqual(effect["status"], "confirmed")
+
+    def test_start_forwards_the_intended_beads_claimant_to_the_worker(self):
+        completed = self.run_afk(
+            "start",
+            "central-bnkl.1.1",
+            AFK_FAKE_LAUNCH_WORKER="1",
+            BEADS_ACTOR="pipeline-agent",
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        run_id = completed.stdout.strip()
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            projection = json.loads(self.run_afk("status", run_id, "--json").stdout)
+            if projection["state"] in {"attention_required", "reviewed"}:
+                break
+            time.sleep(0.05)
+        self.assertEqual(projection["checkpoint"], "reviewed")
+        self.assert_bead_claim(
+            RunStore(self.state_home / "afk"),
+            run_id,
+            claimant="pipeline-agent",
+        )
+
+    def test_resume_recovers_crash_before_bead_claim_effect(self):
+        started = self.run_afk("start", "central-bnkl.1.1")
+        run_id = started.stdout.strip()
+        interrupted = self.run_afk(
+            "_worker", run_id, AFK_TEST_KILL_BEFORE_EFFECT="bead-claim"
+        )
+        self.assertLess(interrupted.returncode, 0)
+        store = RunStore(self.state_home / "afk")
+        self.assertIsNone(store.effect_if_present(run_id, "bead-claim"))
+        self.assertEqual(self.mutation_count("bead-claim"), 0)
+
+        resumed = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="absent")
+        repeated = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="absent")
+
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        self.assertEqual(repeated.returncode, 0, repeated.stderr)
+        observed = self.assert_bead_claim(store, run_id)
+        projection = store.status(run_id)
+        self.assertEqual(projection["checkpoint"], "claimed")
+        self.assertEqual(projection["bead_claim"], observed)
+        self.assertEqual(self.mutation_count("bead-claim"), 1)
+
+    def test_resume_recovers_initial_worker_bead_claim_outage(self):
+        run_id = self.run_afk("start", "central-bnkl.1.1").stdout.strip()
+
+        unavailable = self.run_afk("_worker", run_id, AFK_FAKE_BEAD_SHOW_FAILURE="1")
+
+        self.assertEqual(unavailable.returncode, 2, unavailable.stderr)
+        store = RunStore(self.state_home / "afk")
+        paused = store.status(run_id)
+        self.assertEqual(paused["checkpoint"], "created")
+        self.assertEqual(paused["attention"]["scope"], "bead_claim")
+        self.assert_bead_claim(store, run_id, status="prepared")
+        self.assertEqual(self.mutation_count("bead-claim"), 0)
+
+        resumed = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="absent")
+        repeated = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="absent")
+
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        self.assertEqual(repeated.returncode, 0, repeated.stderr)
+        observed = self.assert_bead_claim(store, run_id)
+        projection = store.status(run_id)
+        self.assertEqual(projection["checkpoint"], "claimed")
+        self.assertEqual(projection["bead_claim"], observed)
+        self.assertEqual(projection["attention"], {})
+        self.assertEqual(len(self.launch_events(run_id, "bead.claimed")), 1)
+        self.assertEqual(self.mutation_count("bead-claim"), 1)
+
+    def test_resume_claims_as_the_durable_actor_after_actor_drift(self):
+        run_id = self.run_afk(
+            "start", "central-bnkl.1.1", BEADS_ACTOR="pipeline-agent"
+        ).stdout.strip()
+        interrupted = self.run_afk(
+            "_worker",
+            run_id,
+            BEADS_ACTOR="pipeline-agent",
+            AFK_TEST_KILL_BEFORE_MUTATION="bead-claim",
+        )
+        self.assertLess(interrupted.returncode, 0)
+
+        resumed = self.run_afk(
+            "resume",
+            BEADS_ACTOR="different-agent",
+            AFK_FAKE_SYSTEMD_STATE="absent",
+        )
+
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        self.assert_bead_claim(
+            RunStore(self.state_home / "afk"),
+            run_id,
+            claimant="pipeline-agent",
+        )
+        self.assertEqual(self.mutation_count("bead-claim"), 1)
+
+    def test_resume_reconciles_bead_claim_across_every_crash_boundary(self):
+        boundaries = {
+            "after-effect": {"AFK_TEST_KILL_AFTER_EFFECT": "bead-claim"},
+            "before-mutation": {"AFK_TEST_KILL_BEFORE_MUTATION": "bead-claim"},
+            "after-mutation": {"AFK_TEST_KILL_AFTER_MUTATION": "bead-claim"},
+            "before-confirm": {"AFK_TEST_KILL_BEFORE_CONFIRM": "bead-claim"},
+            "after-confirm": {"AFK_TEST_KILL_AFTER_CONFIRM": "bead-claim"},
+            "before-event": {"AFK_TEST_KILL_BEFORE_EVENT": "bead.claimed"},
+            "after-event-write": {"AFK_TEST_KILL_AFTER_EVENT_WRITE": "bead.claimed"},
+        }
+        for name, injection in boundaries.items():
+            with self.subTest(boundary=name):
+                state_home = self.temp / f"claim-{name}"
+                started = self.run_afk(
+                    "start",
+                    "central-bnkl.1.1",
+                    XDG_STATE_HOME=str(state_home),
+                )
+                run_id = started.stdout.strip()
+                interrupted = self.run_afk(
+                    "_worker",
+                    run_id,
+                    XDG_STATE_HOME=str(state_home),
+                    **injection,
+                )
+                self.assertLess(interrupted.returncode, 0)
+
+                resumed = self.run_afk(
+                    "resume",
+                    XDG_STATE_HOME=str(state_home),
+                    AFK_FAKE_SYSTEMD_STATE="absent",
+                )
+                repeated = self.run_afk(
+                    "resume",
+                    XDG_STATE_HOME=str(state_home),
+                    AFK_FAKE_SYSTEMD_STATE="absent",
+                )
+
+                self.assertEqual(resumed.returncode, 0, resumed.stderr)
+                self.assertEqual(repeated.returncode, 0, repeated.stderr)
+                store = RunStore(state_home / "afk")
+                observed = self.assert_bead_claim(store, run_id)
+                projection = store.status(run_id)
+                self.assertEqual(projection["checkpoint"], "claimed")
+                self.assertEqual(projection["bead_claim"], observed)
+                events = self.launch_events(
+                    run_id, "bead.claimed", state_home=state_home
+                )
+                self.assertEqual(len(events), 1)
+                self.assertEqual(
+                    self.mutation_count("bead-claim", state_home=state_home), 1
+                )
+
+    def test_resume_pauses_on_conflicting_or_unavailable_bead_claim_state(self):
+        cases = {
+            "other-owner": {
+                "AFK_FAKE_BEAD_STATUS": "in_progress",
+                "AFK_FAKE_ASSIGNEE": "another-agent",
+            },
+            "wrong-project": {"AFK_FAKE_PROJECT_LABEL": "project:another-repository"},
+            "malformed-observation": {"AFK_FAKE_BEAD_SHOW_MALFORMED": "1"},
+            "missing-assignee": {"AFK_FAKE_BEAD_SCHEMA": "missing-assignee"},
+            "wrong-status-type": {"AFK_FAKE_BEAD_SCHEMA": "status-number"},
+            "wrong-assignee-type": {"AFK_FAKE_BEAD_SCHEMA": "assignee-list"},
+            "unavailable-observation": {"AFK_FAKE_BEAD_SHOW_FAILURE": "1"},
+        }
+        for name, observation in cases.items():
+            with self.subTest(case=name):
+                state_home = self.temp / f"claim-state-{name}"
+                run_id = self.run_afk(
+                    "start",
+                    "central-bnkl.1.1",
+                    XDG_STATE_HOME=str(state_home),
+                ).stdout.strip()
+                interrupted = self.run_afk(
+                    "_worker",
+                    run_id,
+                    XDG_STATE_HOME=str(state_home),
+                    AFK_TEST_KILL_BEFORE_MUTATION="bead-claim",
+                )
+                self.assertLess(interrupted.returncode, 0)
+
+                resumed = self.run_afk(
+                    "resume",
+                    XDG_STATE_HOME=str(state_home),
+                    AFK_FAKE_SYSTEMD_STATE="absent",
+                    **observation,
+                )
+
+                self.assertEqual(resumed.returncode, 2, resumed.stderr)
+                store = RunStore(state_home / "afk")
+                self.assert_bead_claim(store, run_id, status="prepared")
+                status = store.status(run_id)
+                self.assertEqual(status["checkpoint"], "created")
+                self.assertEqual(status["attention"]["scope"], "bead_claim")
+                if name in {
+                    "missing-assignee",
+                    "wrong-status-type",
+                    "wrong-assignee-type",
+                }:
+                    self.assertIn("project identity", status["attention"]["summary"])
+                self.assertEqual(
+                    self.mutation_count("bead-claim", state_home=state_home), 0
+                )
+
+    def test_resume_recovers_claim_after_malformed_mutation_output(self):
+        run_id = self.run_afk("start", "central-bnkl.1.1").stdout.strip()
+        interrupted = self.run_afk(
+            "_worker", run_id, AFK_TEST_KILL_BEFORE_MUTATION="bead-claim"
+        )
+        self.assertLess(interrupted.returncode, 0)
+
+        malformed = self.run_afk(
+            "resume",
+            AFK_FAKE_SYSTEMD_STATE="absent",
+            AFK_FAKE_CLAIM_MALFORMED="1",
+        )
+
+        self.assertEqual(malformed.returncode, 2, malformed.stderr)
+        store = RunStore(self.state_home / "afk")
+        self.assert_bead_claim(store, run_id, status="prepared")
+        self.assertEqual(store.status(run_id)["attention"]["scope"], "bead_claim")
+        self.assertEqual(self.mutation_count("bead-claim"), 1)
+
+        resumed = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="absent")
+        repeated = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="absent")
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        self.assertEqual(repeated.returncode, 0, repeated.stderr)
+        self.assert_bead_claim(store, run_id)
+        self.assertEqual(self.mutation_count("bead-claim"), 1)
+
+    def test_resume_refuses_durable_claim_without_its_confirmed_effect(self):
+        run_id = self.run_afk("start", "central-bnkl.1.1").stdout.strip()
+        interrupted = self.run_afk(
+            "_worker", run_id, AFK_TEST_KILL_AFTER_EVENT_WRITE="bead.claimed"
+        )
+        self.assertLess(interrupted.returncode, 0)
+        effect_path = (
+            self.state_home / "afk" / "runs" / run_id / "effects" / "bead-claim.json"
+        )
+        effect_path.unlink()
+
+        resumed = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="absent")
+
+        self.assertEqual(resumed.returncode, 2, resumed.stderr)
+        self.assertFalse(effect_path.exists())
+        status = RunStore(self.state_home / "afk").status(run_id)
+        self.assertEqual(status["checkpoint"], "claimed")
+        self.assertEqual(status["attention"]["scope"], "bead_claim")
+        self.assertEqual(self.mutation_count("bead-claim"), 1)
+
+    def test_resume_restores_durable_claim_after_observation_recovers(self):
+        run_id = self.run_afk("start", "central-bnkl.1.1").stdout.strip()
+        interrupted = self.run_afk(
+            "_worker", run_id, AFK_TEST_KILL_AFTER_EVENT_WRITE="bead.claimed"
+        )
+        self.assertLess(interrupted.returncode, 0)
+
+        unavailable = self.run_afk(
+            "resume",
+            AFK_FAKE_SYSTEMD_STATE="absent",
+            AFK_FAKE_BEAD_SHOW_FAILURE="1",
+        )
+        store = RunStore(self.state_home / "afk")
+        paused = store.status(run_id)
+        self.assertEqual(unavailable.returncode, 2, unavailable.stderr)
+        self.assertEqual(paused["checkpoint"], "claimed")
+        self.assertEqual(paused["attention"]["scope"], "bead_claim")
+
+        recovered = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="absent")
+        repeated = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="absent")
+
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        self.assertEqual(repeated.returncode, 0, repeated.stderr)
+        status = store.status(run_id)
+        self.assertEqual(status["state"], "claimed")
+        self.assertEqual(status["checkpoint"], "claimed")
+        self.assertEqual(status["attention"], {})
+        self.assertEqual(len(self.launch_events(run_id, "bead.claimed")), 1)
+        self.assertEqual(self.mutation_count("bead-claim"), 1)
 
     def test_worker_claims_publishes_validates_and_reviews_the_exact_candidate(self):
         started = self.run_afk("start", "central-bnkl.1.1")
@@ -5159,7 +5459,7 @@ class StartCliTest(unittest.TestCase):
         self.assertEqual(completed.returncode, 2)
         status = json.loads(self.run_afk("status", run_id, "--json").stdout)
         self.assertEqual(status["checkpoint"], "created")
-        self.assertEqual(status["attention"]["scope"], "worker")
+        self.assertEqual(status["attention"]["scope"], "bead_claim")
 
     def test_malformed_claim_result_stops_at_created_checkpoint(self):
         run_id = self.run_afk("start", "central-bnkl.1.1").stdout.strip()
@@ -5457,6 +5757,7 @@ class StartCliTest(unittest.TestCase):
                 local_branch_removed = Path(os.environ["XDG_STATE_HOME"]) / "fake-local-branch-removed"
                 local_branch_replaced = Path(os.environ["XDG_STATE_HOME"]) / "fake-local-branch-replaced"
                 bead_closed = Path(os.environ["XDG_STATE_HOME"]) / "fake-bead-closed"
+                bead_claimed = Path(os.environ["XDG_STATE_HOME"]) / "fake-bead-claimed"
                 bead_show_count = Path(os.environ["XDG_STATE_HOME"]) / "fake-bead-show-count"
                 mutation_log = Path(os.environ["XDG_STATE_HOME"]) / "fake-mutations.jsonl"
 
@@ -5954,12 +6255,19 @@ class StartCliTest(unittest.TestCase):
                             "password": os.environ["BEADS_DOLT_PASSWORD"],
                         }), file=sys.stderr)
                         raise SystemExit(1)
-                    status = (
-                        "closed"
-                        if bead_closed.exists()
-                        else os.environ["AFK_FAKE_BEAD_STATUS"]
-                    )
+                    status = os.environ["AFK_FAKE_BEAD_STATUS"]
                     assignee = os.environ["AFK_FAKE_ASSIGNEE"]
+                    if bead_claimed.exists():
+                        claim = json.loads(bead_claimed.read_text(encoding="utf-8"))
+                        if (
+                            claim["bead_id"] == os.environ["AFK_FAKE_BEAD"]
+                            and status == "open"
+                            and not assignee
+                        ):
+                            status = "in_progress"
+                            assignee = claim["assignee"]
+                    if bead_closed.exists():
+                        status = "closed"
                     labels = (
                         None
                         if os.environ.get("AFK_FAKE_INVALID_LABELS")
@@ -5970,6 +6278,9 @@ class StartCliTest(unittest.TestCase):
                         ]
                     )
                     if args[:1] == ["show"]:
+                        if os.environ.get("AFK_FAKE_BEAD_SHOW_FAILURE"):
+                            print("show failed", file=sys.stderr)
+                            raise SystemExit(1)
                         if os.environ.get("AFK_FAKE_BEAD_SHOW_MALFORMED"):
                             print("{}")
                             raise SystemExit(0)
@@ -5986,7 +6297,7 @@ class StartCliTest(unittest.TestCase):
                             )
                             if show_count:
                                 labels = ["project:another-repository"]
-                        print(json.dumps([{
+                        payload = {
                             "id": os.environ["AFK_FAKE_BEAD"],
                             "title": "Create the first slice",
                             "description": os.environ["AFK_FAKE_BEAD_DESCRIPTION"],
@@ -5999,13 +6310,32 @@ class StartCliTest(unittest.TestCase):
                             ),
                             "assignee": assignee,
                             "labels": labels,
-                        }]))
+                        }
+                        malformed_schema = os.environ.get("AFK_FAKE_BEAD_SCHEMA")
+                        if malformed_schema == "missing-assignee":
+                            del payload["assignee"]
+                        elif malformed_schema == "status-number":
+                            payload["status"] = 0
+                        elif malformed_schema == "assignee-list":
+                            payload["assignee"] = []
+                        print(json.dumps([payload]))
                     elif args[:1] == ["comments"]:
                         print(os.environ["AFK_FAKE_BEAD_COMMENTS"])
                     elif args[:1] == ["update"]:
                         if os.environ.get("AFK_FAKE_CLAIM_FAILURE"):
                             print("claim failed", file=sys.stderr)
                             raise SystemExit(1)
+                        before_mutation("bead-claim")
+                        bead_claimed.write_text(
+                            json.dumps({
+                                "bead_id": os.environ["AFK_FAKE_BEAD"],
+                                "assignee": os.environ.get(
+                                    "BEADS_ACTOR", os.environ["USER"]
+                                ),
+                            }),
+                            encoding="utf-8",
+                        )
+                        after_mutation("bead-claim")
                         if os.environ.get("AFK_FAKE_CLAIM_MALFORMED"):
                             print(
                                 '{"database_user":"raw-database-user",'
@@ -6037,7 +6367,9 @@ class StartCliTest(unittest.TestCase):
                                 else os.environ["AFK_FAKE_BEAD"]
                             ),
                             "status": "in_progress",
-                            "assignee": os.environ["USER"],
+                            "assignee": os.environ.get(
+                                "BEADS_ACTOR", os.environ["USER"]
+                            ),
                         }))
                     elif args[:1] == ["close"]:
                         if os.environ.get("AFK_FAKE_BEAD_CLOSE_FAILURE"):
@@ -6071,10 +6403,17 @@ class StartCliTest(unittest.TestCase):
                                 "returncode": resumed.returncode,
                             }, separators=(",", ":")) + "\\n")
                     if os.environ.get("AFK_FAKE_LAUNCH_WORKER"):
+                        worker_environment = os.environ.copy()
+                        worker_environment.pop("BEADS_ACTOR", None)
+                        for argument in args:
+                            if argument.startswith("--setenv=BEADS_ACTOR="):
+                                worker_environment["BEADS_ACTOR"] = argument.split(
+                                    "=", 2
+                                )[2]
                         subprocess.Popen(
                             args[-5:],
                             cwd=project,
-                            env=os.environ,
+                            env=worker_environment,
                             stdout=subprocess.DEVNULL,
                             stderr=subprocess.DEVNULL,
                             close_fds=True,
