@@ -952,6 +952,9 @@ class StartCliTest(unittest.TestCase):
             },
             "wrong-project": {"AFK_FAKE_PROJECT_LABEL": "project:another-repository"},
             "malformed-observation": {"AFK_FAKE_BEAD_SHOW_MALFORMED": "1"},
+            "missing-assignee": {"AFK_FAKE_BEAD_SCHEMA": "missing-assignee"},
+            "wrong-status-type": {"AFK_FAKE_BEAD_SCHEMA": "status-number"},
+            "wrong-assignee-type": {"AFK_FAKE_BEAD_SCHEMA": "assignee-list"},
             "unavailable-observation": {"AFK_FAKE_BEAD_SHOW_FAILURE": "1"},
         }
         for name, observation in cases.items():
@@ -983,6 +986,12 @@ class StartCliTest(unittest.TestCase):
                 status = store.status(run_id)
                 self.assertEqual(status["checkpoint"], "created")
                 self.assertEqual(status["attention"]["scope"], "bead_claim")
+                if name in {
+                    "missing-assignee",
+                    "wrong-status-type",
+                    "wrong-assignee-type",
+                }:
+                    self.assertIn("project identity", status["attention"]["summary"])
                 self.assertEqual(
                     self.mutation_count("bead-claim", state_home=state_home), 0
                 )
@@ -6262,7 +6271,7 @@ class StartCliTest(unittest.TestCase):
                             )
                             if show_count:
                                 labels = ["project:another-repository"]
-                        print(json.dumps([{
+                        payload = {
                             "id": os.environ["AFK_FAKE_BEAD"],
                             "title": "Create the first slice",
                             "description": os.environ["AFK_FAKE_BEAD_DESCRIPTION"],
@@ -6275,7 +6284,15 @@ class StartCliTest(unittest.TestCase):
                             ),
                             "assignee": assignee,
                             "labels": labels,
-                        }]))
+                        }
+                        malformed_schema = os.environ.get("AFK_FAKE_BEAD_SCHEMA")
+                        if malformed_schema == "missing-assignee":
+                            del payload["assignee"]
+                        elif malformed_schema == "status-number":
+                            payload["status"] = 0
+                        elif malformed_schema == "assignee-list":
+                            payload["assignee"] = []
+                        print(json.dumps([payload]))
                     elif args[:1] == ["comments"]:
                         print(os.environ["AFK_FAKE_BEAD_COMMENTS"])
                     elif args[:1] == ["update"]:
