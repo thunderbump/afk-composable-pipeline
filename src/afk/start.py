@@ -203,10 +203,20 @@ def resume_run(
             return selected_run_id, 0
         run_id = selected_run_id
         if projection["last_event"] in {"bead.claimed", "bead.claim_reconciled"}:
-            return run_id, _advance_bead_claim(store, run_id)
+            claim_exit_code = _advance_bead_claim(store, run_id)
+            if claim_exit_code:
+                return run_id, claim_exit_code
+            return run_id, _advance_worktree(store, run_id)
         attention = projection.get("attention")
         if isinstance(attention, dict) and attention.get("scope") == "bead_claim":
-            return run_id, _advance_bead_claim(store, run_id)
+            claim_exit_code = _advance_bead_claim(store, run_id)
+            if claim_exit_code:
+                return run_id, claim_exit_code
+            return run_id, _advance_worktree(store, run_id)
+        if projection["last_event"] in {"worktree.ready", "worktree.reconciled"}:
+            return run_id, _advance_worktree(store, run_id)
+        if isinstance(attention, dict) and attention.get("scope") == "worktree":
+            return run_id, _advance_worktree(store, run_id)
         if _validation_attempt_open(projection):
             return run_id, _recover_validation_attempt(store, run_id, projection)
         if _repair_interruption_pending(store, run_id, projection):
@@ -1053,7 +1063,6 @@ def run_worker_unit(run_id: str) -> int:
 def _run_worker_with_lock(store: RunStore, run_id: str) -> int:
     try:
         with store.lock():
-            identity = store.identity(run_id)
             launch = store.effect(run_id, "worker-launch-1")
             unit = worker_unit(run_id)
             if launch["intended"] != {"unit": unit}:
@@ -1067,18 +1076,9 @@ def _run_worker_with_lock(store: RunStore, run_id: str) -> int:
             claim_exit_code = _advance_bead_claim(store, run_id)
             if claim_exit_code:
                 return claim_exit_code
-            worktree_path, branch = _prepare_worktree(store, identity)
-            store.append_event(
-                run_id,
-                "worktree.ready",
-                state="worktree_ready",
-                data={
-                    "checkpoint": "worktree_ready",
-                    "unit": worker_unit(run_id),
-                    "worktree_path": str(worktree_path),
-                    "branch": branch,
-                },
-            )
+            worktree_exit_code = _advance_worktree(store, run_id)
+            if worktree_exit_code:
+                return worktree_exit_code
             return _advance_candidate(store, run_id)
     except RunStoreBusy:
         raise
@@ -2274,12 +2274,128 @@ def _validate_claim_identity(
         raise StartError(f"Bead claim conflicts with project identity: {bead_id}")
 
 
-def _prepare_worktree(store: RunStore, identity: dict[str, Any]) -> tuple[Path, str]:
+def _advance_worktree(store: RunStore, run_id: str) -> int:
+    try:
+        _reconcile_worktree(store, run_id)
+    except ExternalCommandError as exc:
+        _attention(
+            store,
+            run_id,
+            checkpoint=store.status(run_id)["checkpoint"],
+            scope="worktree",
+            kind="unavailable",
+            summary=str(exc),
+            classification=_error_classification(exc),
+        )
+        return 2
+    except (KeyError, OSError, RunStoreError, StartError, ValueError) as exc:
+        _attention(
+            store,
+            run_id,
+            checkpoint=store.status(run_id)["checkpoint"],
+            scope="worktree",
+            kind="conflict",
+            summary=str(exc),
+        )
+        return 2
+    return 0
+
+
+def _reconcile_worktree(store: RunStore, run_id: str) -> dict[str, str]:
+    identity = store.identity(run_id)
     run_id = identity["run_id"]
     root = Path(identity["start_request"]["repository_root"])
     worktree = store.root / "worktrees" / run_id
     branch = f"afk/{identity['bead_id'].replace('.', '-')}-{run_id}/candidate"
-    if not worktree.exists():
+    intended = {
+        "repository": identity["repository"],
+        "repository_root": str(root),
+        "base_sha": identity["base_sha"],
+        "branch": branch,
+        "worktree_path": str(worktree),
+    }
+    projection = store.status(run_id)
+    durable = None
+    if "worktree_path" in projection or "branch" in projection:
+        if "worktree_path" not in projection or "branch" not in projection:
+            raise StartError("durable worktree identity is incomplete")
+        durable = {
+            "worktree_path": projection["worktree_path"],
+            "branch": projection["branch"],
+        }
+    effect = store.effect_if_present(run_id, "worktree-create")
+    if effect is not None and (
+        effect.get("kind") != "worktree-create" or effect.get("intended") != intended
+    ):
+        raise StartError("worktree Effect does not match this Run")
+    if durable is not None:
+        if (
+            durable
+            != {
+                "worktree_path": intended["worktree_path"],
+                "branch": intended["branch"],
+            }
+            or effect is None
+            or effect.get("status") != "confirmed"
+            or effect.get("observed") != intended
+        ):
+            raise StartError("durable worktree identity lacks its confirmed Effect")
+    else:
+        effect = store.prepare_effect(
+            run_id, "worktree-create", kind="worktree-create", intended=intended
+        )
+
+    observed_root = Path(
+        _required(["git", "rev-parse", "--show-toplevel"], cwd=root)
+    ).resolve()
+    if observed_root != root.resolve():
+        raise StartError("Run repository root has been replaced")
+    remote = _required(["git", "remote", "get-url", "origin"], cwd=root)
+    if not _remote_matches_repository(remote, identity["repository"]):
+        raise StartError("Run repository origin has been replaced")
+    base = _required(
+        [
+            "git",
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            f"{identity['base_sha']}^{{commit}}",
+        ],
+        cwd=root,
+    )
+    if base != identity["base_sha"]:
+        raise StartError("Run base commit is unavailable")
+    if worktree.parent.is_symlink() or (
+        worktree.parent.exists() and not worktree.parent.is_dir()
+    ):
+        raise StartError("Run worktree parent has been replaced")
+
+    records = _worktree_records(root)
+    registered = [
+        item
+        for item in records
+        if item.get("worktree")
+        and Path(item["worktree"]).resolve() == worktree.resolve()
+    ]
+    branch_records = [
+        item for item in records if item.get("branch") == f"refs/heads/{branch}"
+    ]
+    branch_ref = _command(
+        ["git", "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"],
+        cwd=root,
+        check=False,
+    )
+    if branch_ref.returncode not in {0, 1}:
+        raise _external_failure("git", branch_ref)
+    path_present = worktree.exists() or worktree.is_symlink()
+    branch_present = branch_ref.returncode == 0
+    absent = (
+        not path_present
+        and not registered
+        and not branch_records
+        and not branch_present
+    )
+    if absent:
         worktree.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         completed = _command(
             [
@@ -2296,6 +2412,52 @@ def _prepare_worktree(store: RunStore, identity: dict[str, Any]) -> tuple[Path, 
         )
         if completed.returncode != 0:
             raise _external_failure("git", completed)
+        return _reconcile_worktree(store, run_id)
+    if not path_present or worktree.is_symlink():
+        raise StartError("Run worktree path conflicts with existing Git state")
+    if len(registered) != 1:
+        raise StartError("prepared worktree is not uniquely registered")
+    if registered[0].get("HEAD") != identity["base_sha"]:
+        raise StartError("prepared worktree is not at pinned base")
+    if registered[0].get("branch") != f"refs/heads/{branch}":
+        raise StartError("prepared worktree is not on the intended branch")
+    if len(branch_records) != 1 or branch_records[0] != registered[0]:
+        raise StartError("intended branch registration is ambiguous")
+    if not branch_present or branch_ref.stdout.strip() != identity["base_sha"]:
+        raise StartError("intended branch is not at pinned base")
+    if not _owned_worktree_checkout(root, worktree, identity["base_sha"], branch):
+        raise StartError("prepared worktree is dirty or has conflicting Git identity")
+    store.confirm_effect(run_id, "worktree-create", observed=intended)
+    projection = store.status(run_id)
+    if durable is None:
+        store.append_event(
+            run_id,
+            "worktree.ready",
+            state="worktree_ready",
+            data={
+                "checkpoint": "worktree_ready",
+                "unit": worker_unit(run_id),
+                "worktree_path": str(worktree),
+                "branch": branch,
+                "attention": {},
+            },
+        )
+    elif projection.get("attention", {}).get("scope") == "worktree":
+        store.append_event(
+            run_id,
+            "worktree.reconciled",
+            state="worktree_ready",
+            data={
+                "checkpoint": "worktree_ready",
+                "worktree_path": str(worktree),
+                "branch": branch,
+                "attention": {},
+            },
+        )
+    return intended
+
+
+def _worktree_records(root: Path) -> list[dict[str, str]]:
     listing = _required(["git", "worktree", "list", "--porcelain"], cwd=root)
     records: list[dict[str, str]] = []
     record: dict[str, str] = {}
@@ -2306,26 +2468,35 @@ def _prepare_worktree(store: RunStore, identity: dict[str, Any]) -> tuple[Path, 
                 record = {}
             continue
         key, _, value = line.partition(" ")
+        if key in record:
+            raise StartError("Git worktree registration is malformed")
         record[key] = value
-    registered = next(
-        (
-            item
-            for item in records
-            if item.get("worktree")
-            and Path(item["worktree"]).resolve() == worktree.resolve()
-        ),
-        None,
-    )
-    if registered is None:
-        raise StartError("prepared worktree is not registered")
-    if registered.get("HEAD") != identity["base_sha"]:
-        raise StartError("prepared worktree is not at pinned base")
-    if registered.get("branch") != f"refs/heads/{branch}":
-        raise StartError("prepared worktree is not on the intended branch")
-    dirty = _required(["git", "status", "--porcelain"], cwd=worktree)
-    if dirty:
-        raise StartError("prepared worktree is dirty")
-    return worktree, branch
+    for item in records:
+        path = item.get("worktree")
+        head = item.get("HEAD")
+        branch = item.get("branch")
+        if (
+            not isinstance(path, str)
+            or not Path(path).is_absolute()
+            or not isinstance(head, str)
+            or not _is_full_git_sha(head)
+            or (
+                branch is not None
+                and (not branch.startswith("refs/heads/") or not branch[11:])
+            )
+            or not ({"branch", "detached", "bare"} & set(item))
+        ):
+            raise StartError("Git worktree registration is malformed")
+    return records
+
+
+def _remote_matches_repository(remote: str, repository: str) -> bool:
+    value = remote.strip().removesuffix(".git")
+    return value in {
+        f"git@github.com:{repository}",
+        f"https://github.com/{repository}",
+        f"ssh://git@github.com/{repository}",
+    }
 
 
 def _show_bead(bead_id: str, workspace: Path) -> dict[str, Any]:
