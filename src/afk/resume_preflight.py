@@ -20,6 +20,25 @@ VALIDATION_TERMINAL_STATUSES = {
 def validate_open_attempts(
     projection: dict[str, Any], events: list[dict[str, Any]]
 ) -> str | None:
+    (
+        implementation_invalid,
+        implementation_is_open,
+        started_implementation,
+        terminal_implementation,
+    ) = _open_implementation_attempt(events)
+    implementation = projection.get("implementation_attempt")
+    if (
+        implementation_invalid
+        or implementation_is_open
+        and implementation != started_implementation
+        or not implementation_is_open
+        and terminal_implementation is not None
+        and implementation != terminal_implementation
+        or isinstance(implementation, dict)
+        and implementation.get("starting_sha") != projection.get("base_sha")
+    ):
+        return "implementation attempt lifecycle is invalid"
+
     lifecycle_invalid, validation_is_open, started_validation = (
         _open_validation_attempt(events)
     )
@@ -63,6 +82,96 @@ def validate_open_attempts(
     ):
         return "open repair attempt is invalid"
     return None
+
+
+def _open_implementation_attempt(
+    events: list[dict[str, Any]],
+) -> tuple[bool, bool, Any, Any]:
+    is_open = False
+    attempt: Any = None
+    terminal: Any = None
+    expected_attempt_id: str | None = "implementation-1"
+    for event in events:
+        if event["event"] == "implementation.attempt_started":
+            started = event["data"].get("implementation_attempt")
+            if (
+                is_open
+                or not _valid_implementation_attempt(started, {"started"})
+                or started.get("attempt_id") != expected_attempt_id
+            ):
+                return True, is_open, attempt, terminal
+            is_open = True
+            attempt = started
+            terminal = None
+            expected_attempt_id = None
+        elif event["event"] in {
+            "implementation.attempt_finished",
+            "implementation.attempt_interrupted",
+        }:
+            finished = event["data"].get("implementation_attempt")
+            statuses = (
+                {"completed"}
+                if event["event"] == "implementation.attempt_finished"
+                else {"interrupted"}
+            )
+            if not (
+                is_open
+                and _valid_implementation_attempt(finished, statuses)
+                and finished.get("attempt_id") == attempt.get("attempt_id")
+                and finished.get("starting_sha") == attempt.get("starting_sha")
+                and finished.get("evidence") == attempt.get("evidence")
+            ):
+                return True, is_open, attempt, terminal
+            is_open = False
+            terminal = finished
+            expected_attempt_id = (
+                "implementation-2"
+                if finished["status"] == "interrupted"
+                and finished["retryable"] is True
+                and finished["attempt_id"] == "implementation-1"
+                else None
+            )
+            attempt = None
+    return False, is_open, attempt, terminal
+
+
+def _valid_implementation_attempt(value: Any, statuses: set[str]) -> bool:
+    if not isinstance(value, dict):
+        return False
+    attempt_id = value.get("attempt_id")
+    common = {
+        "attempt_id",
+        "starting_sha",
+        "status",
+        "evidence",
+    }
+    extra = (
+        {"ending_sha"}
+        if value.get("status") == "completed"
+        else {"summary", "retryable"} if value.get("status") == "interrupted" else set()
+    )
+    return (
+        set(value) == common | extra
+        and isinstance(attempt_id, str)
+        and attempt_id in {"implementation-1", "implementation-2"}
+        and isinstance(value.get("starting_sha"), str)
+        and bool(SHA_PATTERN.fullmatch(value["starting_sha"]))
+        and value.get("status") in statuses
+        and value.get("evidence") == f"attempts/{attempt_id}"
+        and (
+            value.get("status") != "completed"
+            or isinstance(value.get("ending_sha"), str)
+            and bool(SHA_PATTERN.fullmatch(value["ending_sha"]))
+            and value["ending_sha"] != value["starting_sha"]
+        )
+        and (
+            value.get("status") != "interrupted"
+            or isinstance(value.get("summary"), str)
+            and bool(value["summary"])
+            and type(value.get("retryable")) is bool
+            and (value["retryable"] is False or attempt_id == "implementation-1")
+        )
+    )
 
 
 def _open_validation_attempt(

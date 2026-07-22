@@ -111,60 +111,66 @@ def produce_candidate(
     worktree = Path(_field(projection, "worktree_path"))
     branch = _field(projection, "branch")
     base_sha = identity["base_sha"]
-    attempt = "attempts/implementation-1"
-    attempt_path = store.root / "runs" / run_id / attempt
-
-    if (attempt_path / "manifest.json").exists():
+    attempt_state = projection.get("implementation_attempt")
+    if attempt_state is None:
+        report, attempt_state = _run_implementation_attempt(
+            store,
+            run_id,
+            identity=identity,
+            bead=bead,
+            worktree=worktree,
+            branch=branch,
+            attempt_id="implementation-1",
+        )
+    elif attempt_state.get("status") == "started":
+        report, attempt_state = _recover_implementation_attempt(
+            store,
+            run_id,
+            attempt_state=attempt_state,
+            worktree=worktree,
+            branch=branch,
+            base_sha=base_sha,
+        )
+        if report is None:
+            if not (
+                attempt_state.get("retryable") is True
+                and attempt_state.get("attempt_id") == "implementation-1"
+            ):
+                raise CandidateError(
+                    "interrupted implementation recovery budget is exhausted",
+                    kind="invalid",
+                )
+            report, attempt_state = _run_implementation_attempt(
+                store,
+                run_id,
+                identity=identity,
+                bead=bead,
+                worktree=worktree,
+                branch=branch,
+                attempt_id="implementation-2",
+            )
+    elif (
+        attempt_state.get("status") == "interrupted"
+        and attempt_state.get("retryable") is True
+        and attempt_state.get("attempt_id") == "implementation-1"
+    ):
+        report, attempt_state = _run_implementation_attempt(
+            store,
+            run_id,
+            identity=identity,
+            bead=bead,
+            worktree=worktree,
+            branch=branch,
+            attempt_id="implementation-2",
+        )
+    elif attempt_state.get("status") == "completed":
+        attempt = attempt_state["evidence"]
+        attempt_path = store.root / "runs" / run_id / attempt
         if not store.verify_evidence(run_id, attempt):
             raise CandidateError("implementation evidence could not be verified")
         report = _read_report(attempt_path / "report.json")
-    elif attempt_path.exists():
-        raise CandidateError("implementation attempt was interrupted before sealing")
     else:
-        prompt = _implementation_prompt(identity, bead, worktree, branch)
-        store.write_evidence_text(run_id, f"{attempt}/prompt.md", prompt)
-        store.write_evidence_text(
-            run_id,
-            f"{attempt}/schema.json",
-            canonical_json(REPORT_SCHEMA) + "\n",
-        )
-        with tempfile.TemporaryDirectory(prefix="afk-candidate-") as temporary:
-            report_path = Path(temporary) / "report.json"
-            permission_args = _codex_permission_args(worktree, branch)
-            command = [
-                "codex",
-                "exec",
-                "--ephemeral",
-                "--ignore-user-config",
-                *permission_args,
-                "--cd",
-                str(worktree),
-                "--output-schema",
-                str(attempt_path / "schema.json"),
-                "--output-last-message",
-                str(report_path),
-                "--json",
-                "-",
-            ]
-            completed = _run(
-                command,
-                cwd=worktree,
-                env=codex_environment(),
-                input_text=prompt,
-                timeout=COMMAND_TIMEOUT_SECONDS,
-            )
-            if completed.returncode == 0:
-                report = _read_report(report_path)
-        store.write_evidence_text(run_id, f"{attempt}/events.jsonl", completed.stdout)
-        store.write_evidence_text(run_id, f"{attempt}/stderr.txt", completed.stderr)
-        if completed.returncode != 0:
-            raise CandidateError(
-                f"implementation agent exited with status {completed.returncode}"
-            )
-        store.write_evidence_text(
-            run_id, f"{attempt}/report.json", canonical_json(report) + "\n"
-        )
-        store.seal_evidence(run_id, attempt)
+        raise CandidateError("interrupted implementation requires attention")
 
     candidate_sha = _verify_candidate(
         worktree,
@@ -172,12 +178,23 @@ def produce_candidate(
         base_sha=base_sha,
         report=report,
     )
-    store.append_event(
-        run_id,
-        "candidate.change_committed",
-        state="change_committed",
-        data={"checkpoint": "change_committed", "candidate_sha": candidate_sha},
-    )
+    if (
+        attempt_state.get("status") == "completed"
+        and attempt_state.get("ending_sha") != candidate_sha
+    ):
+        raise CandidateError("implementation Event History contradicts the Candidate")
+    if "candidate_sha" in projection:
+        if projection.get("candidate_sha") != candidate_sha:
+            raise CandidateError(
+                "durable Candidate does not match implementation evidence"
+            )
+    else:
+        store.append_event(
+            run_id,
+            "candidate.change_committed",
+            state="change_committed",
+            data={"checkpoint": "change_committed", "candidate_sha": candidate_sha},
+        )
     _reconcile_push(store, run_id, worktree, branch, candidate_sha)
     pr = _reconcile_pr(store, identity, run_id, worktree, branch, candidate_sha)
     _verify_published(identity, worktree, branch, candidate_sha, pr)
@@ -193,6 +210,296 @@ def produce_candidate(
             "pr_head_sha": pr["headRefOid"],
         },
     )
+
+
+def _run_implementation_attempt(
+    store: RunStore,
+    run_id: str,
+    *,
+    identity: dict[str, Any],
+    bead: dict[str, Any],
+    worktree: Path,
+    branch: str,
+    attempt_id: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    attempt = f"attempts/{attempt_id}"
+    attempt_path = store.root / "runs" / run_id / attempt
+    prompt = _implementation_prompt(
+        identity, bead, worktree, branch, attempt_id=attempt_id
+    )
+    started = {
+        "attempt_id": attempt_id,
+        "starting_sha": identity["base_sha"],
+        "status": "started",
+        "evidence": attempt,
+    }
+    store.append_event(
+        run_id,
+        "implementation.attempt_started",
+        data={"checkpoint": "worktree_ready", "implementation_attempt": started},
+    )
+    store.write_evidence_text(run_id, f"{attempt}/prompt.md", prompt)
+    store.write_evidence_text(
+        run_id,
+        f"{attempt}/schema.json",
+        canonical_json(REPORT_SCHEMA) + "\n",
+    )
+    with tempfile.TemporaryDirectory(prefix="afk-candidate-") as temporary:
+        report_path = Path(temporary) / "report.json"
+        permission_args = _codex_permission_args(worktree, branch)
+        command = [
+            "codex",
+            "exec",
+            "--ephemeral",
+            "--ignore-user-config",
+            *permission_args,
+            "--cd",
+            str(worktree),
+            "--output-schema",
+            str(attempt_path / "schema.json"),
+            "--output-last-message",
+            str(report_path),
+            "--json",
+            "-",
+        ]
+        completed = _run(
+            command,
+            cwd=worktree,
+            env=codex_environment(),
+            input_text=prompt,
+            timeout=COMMAND_TIMEOUT_SECONDS,
+        )
+        if completed.returncode == 0:
+            report = _read_report(report_path)
+    store.write_evidence_text(run_id, f"{attempt}/events.jsonl", completed.stdout)
+    store.write_evidence_text(run_id, f"{attempt}/stderr.txt", completed.stderr)
+    if completed.returncode != 0:
+        raise CandidateError(
+            f"implementation agent exited with status {completed.returncode}"
+        )
+    store.write_evidence_text(
+        run_id, f"{attempt}/report.json", canonical_json(report) + "\n"
+    )
+    candidate_sha = _verify_candidate(
+        worktree,
+        branch=branch,
+        base_sha=identity["base_sha"],
+        report=report,
+    )
+    store.seal_evidence(run_id, attempt)
+    finished = _finish_implementation_attempt(
+        store, run_id, attempt_state=started, candidate_sha=candidate_sha
+    )
+    return report, finished
+
+
+def _recover_implementation_attempt(
+    store: RunStore,
+    run_id: str,
+    *,
+    attempt_state: dict[str, Any],
+    worktree: Path,
+    branch: str,
+    base_sha: str,
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    attempt = attempt_state["evidence"]
+    attempt_path = store.root / "runs" / run_id / attempt
+    manifest = attempt_path / "manifest.json"
+    if manifest.exists():
+        if not store.verify_evidence(run_id, attempt):
+            raise CandidateError("implementation evidence could not be verified")
+        recovery_path = attempt_path / "recovery.json"
+        if recovery_path.exists():
+            interrupted = _implementation_interruption(
+                recovery_path, attempt_state=attempt_state
+            )
+            store.append_event(
+                run_id,
+                "implementation.attempt_interrupted",
+                data={
+                    "checkpoint": "worktree_ready",
+                    "implementation_attempt": interrupted,
+                },
+            )
+            if interrupted["retryable"]:
+                return None, interrupted
+            raise CandidateError(interrupted["summary"], kind="invalid")
+        report = _read_report(attempt_path / "report.json")
+        candidate_sha = _verify_candidate(
+            worktree, branch=branch, base_sha=base_sha, report=report
+        )
+        finished = _finish_implementation_attempt(
+            store, run_id, attempt_state=attempt_state, candidate_sha=candidate_sha
+        )
+        return report, finished
+    if not attempt_path.exists():
+        head, observed_branch, dirty = _implementation_checkout(worktree)
+        if head == base_sha and observed_branch == branch and not dirty:
+            summary = "implementation process ended without an evidence tree"
+            retryable = attempt_state["attempt_id"] == "implementation-1"
+            interrupted = _seal_implementation_interruption(
+                store,
+                run_id,
+                attempt_state=attempt_state,
+                summary=summary,
+                retryable=retryable,
+            )
+            if retryable:
+                return None, interrupted
+            raise CandidateError(
+                "interrupted implementation recovery budget is exhausted",
+                kind="invalid",
+            )
+        raise CandidateError(
+            "implementation attempt evidence is missing", kind="invalid"
+        )
+    if not attempt_path.is_dir() or attempt_path.is_symlink():
+        raise CandidateError(
+            "implementation attempt evidence is invalid", kind="invalid"
+        )
+    report_path = attempt_path / "report.json"
+    if report_path.exists():
+        try:
+            report = _read_report(report_path)
+            candidate_sha = _verify_candidate(
+                worktree, branch=branch, base_sha=base_sha, report=report
+            )
+        except CandidateError as exc:
+            if exc.kind == "unavailable":
+                raise
+            _seal_implementation_interruption(
+                store,
+                run_id,
+                attempt_state=attempt_state,
+                summary=exc.summary,
+                retryable=False,
+            )
+            raise
+        store.seal_evidence(run_id, attempt)
+        finished = _finish_implementation_attempt(
+            store, run_id, attempt_state=attempt_state, candidate_sha=candidate_sha
+        )
+        return report, finished
+    head, observed_branch, dirty = _implementation_checkout(worktree)
+    retryable = (
+        attempt_state["attempt_id"] == "implementation-1"
+        and head == base_sha
+        and observed_branch == branch
+        and not dirty
+    )
+    if not retryable:
+        if dirty:
+            summary = "interrupted implementation left a dirty worktree"
+        elif head != base_sha:
+            summary = (
+                "interrupted implementation advanced HEAD without terminal evidence"
+            )
+        else:
+            summary = "interrupted implementation changed the intended branch"
+        _seal_implementation_interruption(
+            store,
+            run_id,
+            attempt_state=attempt_state,
+            summary=summary,
+            retryable=False,
+        )
+        raise CandidateError(summary, kind="invalid")
+    summary = "implementation process ended before producing terminal evidence"
+    interrupted = _seal_implementation_interruption(
+        store,
+        run_id,
+        attempt_state=attempt_state,
+        summary=summary,
+        retryable=True,
+    )
+    return None, interrupted
+
+
+def _finish_implementation_attempt(
+    store: RunStore,
+    run_id: str,
+    *,
+    attempt_state: dict[str, Any],
+    candidate_sha: str,
+) -> dict[str, Any]:
+    finished = {
+        **attempt_state,
+        "status": "completed",
+        "ending_sha": candidate_sha,
+    }
+    store.append_event(
+        run_id,
+        "implementation.attempt_finished",
+        data={"checkpoint": "worktree_ready", "implementation_attempt": finished},
+    )
+    return finished
+
+
+def _implementation_checkout(worktree: Path) -> tuple[str, str, str]:
+    return (
+        _git(worktree, "rev-parse", "HEAD"),
+        _git(worktree, "branch", "--show-current"),
+        _git(worktree, "status", "--porcelain"),
+    )
+
+
+def _seal_implementation_interruption(
+    store: RunStore,
+    run_id: str,
+    *,
+    attempt_state: dict[str, Any],
+    summary: str,
+    retryable: bool,
+) -> dict[str, Any]:
+    attempt = attempt_state["evidence"]
+    recovery = {
+        "status": "interrupted",
+        "summary": summary,
+        "retryable": retryable,
+    }
+    recovery_path = store.root / "runs" / run_id / attempt / "recovery.json"
+    if recovery_path.exists():
+        observed = _read_json_object(recovery_path, "implementation recovery")
+        if observed != recovery:
+            raise CandidateError("implementation recovery evidence is ambiguous")
+    else:
+        store.write_evidence_value(run_id, f"{attempt}/recovery.json", recovery)
+    store.seal_evidence(run_id, attempt)
+    interrupted = {**attempt_state, **recovery}
+    store.append_event(
+        run_id,
+        "implementation.attempt_interrupted",
+        data={
+            "checkpoint": "worktree_ready",
+            "implementation_attempt": interrupted,
+        },
+    )
+    return interrupted
+
+
+def _implementation_interruption(
+    path: Path, *, attempt_state: dict[str, Any]
+) -> dict[str, Any]:
+    recovery = _read_json_object(path, "implementation recovery")
+    if (
+        set(recovery) != {"status", "summary", "retryable"}
+        or recovery.get("status") != "interrupted"
+        or not isinstance(recovery.get("summary"), str)
+        or not recovery["summary"]
+        or type(recovery.get("retryable")) is not bool
+    ):
+        raise CandidateError("implementation recovery evidence is malformed")
+    return {**attempt_state, **recovery}
+
+
+def _read_json_object(path: Path, label: str) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise CandidateError(f"{label} evidence is malformed") from exc
+    if not isinstance(value, dict):
+        raise CandidateError(f"{label} evidence is malformed")
+    return value
 
 
 def produce_repair_candidate(
@@ -485,12 +792,14 @@ def _implementation_prompt(
     bead: dict[str, Any],
     worktree: Path,
     branch: str,
+    *,
+    attempt_id: str = "implementation-1",
 ) -> str:
     bead = redact_artifact_value(bead)
     return f"""# AFK implementation attempt
 
 Run: {identity['run_id']}
-Attempt: implementation-1
+Attempt: {attempt_id}
 Repository: {identity['repository']}
 Worktree: {worktree}
 Branch: {branch}
@@ -1583,7 +1892,9 @@ def _remote_sha(worktree: Path, branch: str, remote: str = "origin") -> str:
 def _git(worktree: Path, *args: str) -> str:
     completed = _run(["git", *args], cwd=worktree)
     if completed.returncode != 0:
-        raise CandidateError(f"Git inspection failed: {' '.join(args)}")
+        raise CandidateError(
+            f"Git inspection failed: {' '.join(args)}", kind="unavailable"
+        )
     return completed.stdout.strip()
 
 
