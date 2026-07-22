@@ -120,6 +120,10 @@ def _open_implementation_attempt(
                 and finished.get("attempt_id") == attempt.get("attempt_id")
                 and finished.get("starting_sha") == attempt.get("starting_sha")
                 and finished.get("evidence") == attempt.get("evidence")
+                and all(
+                    finished.get(key) == attempt.get(key)
+                    for key in _IMPLEMENTATION_BINDING_FIELDS
+                )
             ):
                 return True, is_open, attempt, terminal
             is_open = False
@@ -144,6 +148,7 @@ def _valid_implementation_attempt(value: Any, statuses: set[str]) -> bool:
         "starting_sha",
         "status",
         "evidence",
+        *_IMPLEMENTATION_BINDING_FIELDS,
     }
     extra = (
         {"ending_sha"}
@@ -158,6 +163,17 @@ def _valid_implementation_attempt(value: Any, statuses: set[str]) -> bool:
         and bool(SHA_PATTERN.fullmatch(value["starting_sha"]))
         and value.get("status") in statuses
         and value.get("evidence") == f"attempts/{attempt_id}"
+        and all(
+            isinstance(value.get(key), str) and bool(value[key])
+            for key in (
+                "repository",
+                "repository_common_dir",
+                "origin",
+                "branch",
+                "worktree_path",
+            )
+        )
+        and _valid_filesystem_identity(value.get("repository_common_dir_identity"))
         and (
             value.get("status") != "completed"
             or isinstance(value.get("ending_sha"), str)
@@ -171,6 +187,27 @@ def _valid_implementation_attempt(value: Any, statuses: set[str]) -> bool:
             and type(value.get("retryable")) is bool
             and (value["retryable"] is False or attempt_id == "implementation-1")
         )
+    )
+
+
+_IMPLEMENTATION_BINDING_FIELDS = {
+    "repository",
+    "repository_common_dir",
+    "repository_common_dir_identity",
+    "origin",
+    "branch",
+    "worktree_path",
+}
+
+
+def _valid_filesystem_identity(value: Any) -> bool:
+    return (
+        isinstance(value, dict)
+        and set(value) == {"device", "inode"}
+        and type(value.get("device")) is int
+        and value["device"] >= 0
+        and type(value.get("inode")) is int
+        and value["inode"] > 0
     )
 
 

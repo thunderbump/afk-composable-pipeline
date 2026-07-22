@@ -128,6 +128,7 @@ def produce_candidate(
             store,
             run_id,
             attempt_state=attempt_state,
+            identity=identity,
             worktree=worktree,
             branch=branch,
             base_sha=base_sha,
@@ -155,6 +156,14 @@ def produce_candidate(
         and attempt_state.get("retryable") is True
         and attempt_state.get("attempt_id") == "implementation-1"
     ):
+        _require_implementation_attempt_binding(
+            store,
+            run_id,
+            identity=identity,
+            attempt_state=attempt_state,
+            worktree=worktree,
+            branch=branch,
+        )
         report, attempt_state = _run_implementation_attempt(
             store,
             run_id,
@@ -165,6 +174,14 @@ def produce_candidate(
             attempt_id="implementation-2",
         )
     elif attempt_state.get("status") == "completed":
+        _require_implementation_attempt_binding(
+            store,
+            run_id,
+            identity=identity,
+            attempt_state=attempt_state,
+            worktree=worktree,
+            branch=branch,
+        )
         attempt = attempt_state["evidence"]
         attempt_path = store.root / "runs" / run_id / attempt
         if not store.verify_evidence(run_id, attempt):
@@ -223,7 +240,7 @@ def _run_implementation_attempt(
     branch: str,
     attempt_id: str,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    _require_implementation_start_checkout(
+    binding = _require_implementation_start_checkout(
         store,
         run_id,
         identity=identity,
@@ -240,6 +257,7 @@ def _run_implementation_attempt(
         "starting_sha": identity["base_sha"],
         "status": "started",
         "evidence": attempt,
+        **binding,
     }
     store.append_event(
         run_id,
@@ -308,7 +326,31 @@ def _require_implementation_start_checkout(
     identity: dict[str, Any],
     worktree: Path,
     branch: str,
-) -> None:
+) -> dict[str, Any]:
+    binding = _observe_implementation_binding(
+        store,
+        run_id,
+        identity=identity,
+        worktree=worktree,
+        branch=branch,
+    )
+    head, observed_branch, dirty = _implementation_checkout(worktree)
+    if head != identity["base_sha"] or observed_branch != branch or dirty:
+        raise CandidateError(
+            "implementation attempt requires the Run's exact clean pinned base",
+            kind="invalid",
+        )
+    return binding
+
+
+def _observe_implementation_binding(
+    store: RunStore,
+    run_id: str,
+    *,
+    identity: dict[str, Any],
+    worktree: Path,
+    branch: str,
+) -> dict[str, Any]:
     request = identity.get("start_request")
     common_dir = (
         request.get("repository_common_dir") if isinstance(request, dict) else None
@@ -319,10 +361,8 @@ def _require_implementation_start_checkout(
         else None
     )
     expected_worktree = store.root / "worktrees" / run_id
-    head, observed_branch, dirty = _implementation_checkout(worktree)
-    observed_repository = github_repo_from_repo_url(
-        _git(worktree, "remote", "get-url", "origin")
-    )
+    origin = _git(worktree, "remote", "get-url", "origin")
+    observed_repository = github_repo_from_repo_url(origin)
     if (
         worktree.resolve() != expected_worktree.resolve()
         or Path(_git(worktree, "rev-parse", "--show-toplevel")).resolve()
@@ -333,13 +373,41 @@ def _require_implementation_start_checkout(
         or not _same_filesystem_identity(Path(common_dir), common_dir_identity)
         or observed_repository is None
         or observed_repository.casefold() != identity["repository"].casefold()
-        or head != identity["base_sha"]
-        or observed_branch != branch
-        or dirty
     ):
         raise CandidateError(
-            "implementation attempt requires the Run's exact clean pinned base",
+            "implementation attempt checkout identity does not match "
+            "the Run's clean pinned base",
             kind="invalid",
+        )
+    return {
+        "repository": identity["repository"],
+        "repository_common_dir": str(Path(common_dir).resolve()),
+        "repository_common_dir_identity": common_dir_identity,
+        "origin": origin,
+        "branch": branch,
+        "worktree_path": str(worktree.resolve()),
+    }
+
+
+def _require_implementation_attempt_binding(
+    store: RunStore,
+    run_id: str,
+    *,
+    identity: dict[str, Any],
+    attempt_state: dict[str, Any],
+    worktree: Path,
+    branch: str,
+) -> None:
+    observed = _observe_implementation_binding(
+        store,
+        run_id,
+        identity=identity,
+        worktree=worktree,
+        branch=branch,
+    )
+    if any(attempt_state.get(key) != value for key, value in observed.items()):
+        raise CandidateError(
+            "implementation attempt checkout identity changed", kind="invalid"
         )
 
 
@@ -369,10 +437,19 @@ def _recover_implementation_attempt(
     run_id: str,
     *,
     attempt_state: dict[str, Any],
+    identity: dict[str, Any],
     worktree: Path,
     branch: str,
     base_sha: str,
 ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    _require_implementation_attempt_binding(
+        store,
+        run_id,
+        identity=identity,
+        attempt_state=attempt_state,
+        worktree=worktree,
+        branch=branch,
+    )
     attempt = attempt_state["evidence"]
     attempt_path = store.root / "runs" / run_id / attempt
     manifest = attempt_path / "manifest.json"

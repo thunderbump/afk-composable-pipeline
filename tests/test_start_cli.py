@@ -1581,15 +1581,14 @@ class StartCliTest(unittest.TestCase):
         self.assertLess(interrupted.returncode, 0)
         before = json.loads(self.run_afk("status", run_id, "--json").stdout)
         self.assertEqual(before["checkpoint"], "worktree_ready")
-        self.assertEqual(
-            before["implementation_attempt"],
-            {
-                "attempt_id": "implementation-1",
-                "starting_sha": BASE_SHA,
-                "status": "started",
-                "evidence": "attempts/implementation-1",
-            },
-        )
+        attempt = before["implementation_attempt"]
+        self.assertEqual(attempt["attempt_id"], "implementation-1")
+        self.assertEqual(attempt["starting_sha"], BASE_SHA)
+        self.assertEqual(attempt["status"], "started")
+        self.assertEqual(attempt["evidence"], "attempts/implementation-1")
+        self.assertEqual(attempt["repository"], "thunderbump/beads-webui")
+        self.assertEqual(attempt["branch"], before["branch"])
+        self.assertEqual(attempt["worktree_path"], before["worktree_path"])
 
         resumed = self.run_afk(
             "resume",
@@ -1611,6 +1610,58 @@ class StartCliTest(unittest.TestCase):
         )
         self.assertEqual(
             len(self.launch_events(run_id, "implementation.attempt_finished")), 1
+        )
+
+    def test_resume_refuses_to_recover_an_attempt_from_a_different_origin(self):
+        run_id = self.run_afk("start", "central-bnkl.1.1").stdout.strip()
+        interrupted = self.run_afk(
+            "_worker",
+            run_id,
+            AFK_TEST_KILL_AFTER_EVENT_WRITE="implementation.attempt_started",
+        )
+        self.assertLess(interrupted.returncode, 0)
+        before = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        common_dir = self.state_home / "fake-git"
+        metadata = common_dir.stat()
+        self.assertEqual(
+            before["implementation_attempt"],
+            {
+                "attempt_id": "implementation-1",
+                "starting_sha": BASE_SHA,
+                "status": "started",
+                "evidence": "attempts/implementation-1",
+                "repository": "thunderbump/beads-webui",
+                "repository_common_dir": str(common_dir),
+                "repository_common_dir_identity": {
+                    "device": metadata.st_dev,
+                    "inode": metadata.st_ino,
+                },
+                "origin": "git@github.com:thunderbump/beads-webui.git",
+                "branch": before["branch"],
+                "worktree_path": before["worktree_path"],
+            },
+        )
+
+        resumed = self.run_afk(
+            "resume",
+            AFK_FAKE_SYSTEMD_STATE="absent",
+            AFK_FAKE_ORIGIN_REPOSITORY="thunderbump/another-repo",
+        )
+
+        self.assertEqual(resumed.returncode, 2, resumed.stderr)
+        after = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(after["checkpoint"], "worktree_ready")
+        self.assertEqual(after["attention"]["scope"], "candidate")
+        self.assertEqual(after["attention"]["kind"], "invalid")
+        self.assertIn("identity", after["attention"]["summary"])
+        self.assertEqual(
+            after["implementation_attempt"], before["implementation_attempt"]
+        )
+        self.assertEqual(
+            len(self.launch_events(run_id, "implementation.attempt_started")), 1
+        )
+        self.assertEqual(
+            len(self.launch_events(run_id, "implementation.attempt_interrupted")), 0
         )
 
     def test_resume_refuses_retry_when_checkout_drifts_before_second_attempt(self):
