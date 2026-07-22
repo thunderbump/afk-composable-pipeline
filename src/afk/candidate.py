@@ -293,40 +293,38 @@ def _run_implementation_attempt(
             input_text=prompt,
             timeout=COMMAND_TIMEOUT_SECONDS,
         )
+        report_text: str | None = None
+        report_read_error: OSError | UnicodeDecodeError | None = None
         if completed.returncode == 0:
-            report = _read_report(report_path)
+            try:
+                report_text = report_path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError) as exc:
+                report_read_error = exc
     store.write_evidence_text(run_id, f"{attempt}/events.jsonl", completed.stdout)
     store.write_evidence_text(run_id, f"{attempt}/stderr.txt", completed.stderr)
     if completed.returncode != 0:
         raise CandidateError(
             f"implementation agent exited with status {completed.returncode}"
         )
-    store.write_evidence_text(
-        run_id, f"{attempt}/report.json", canonical_json(report) + "\n"
-    )
-    try:
-        candidate_sha = _verify_candidate(
-            worktree,
-            branch=branch,
-            base_sha=identity["base_sha"],
-            report=report,
-        )
-    except CandidateError as exc:
-        if exc.kind == "unavailable":
-            raise
+    if report_text is None:
+        report_error = CandidateError("implementation report is missing or malformed")
         _seal_implementation_interruption(
             store,
             run_id,
             attempt_state=started,
-            summary=exc.summary,
+            summary=report_error.summary,
             retryable=False,
         )
-        raise
-    store.seal_evidence(run_id, attempt)
-    finished = _finish_implementation_attempt(
-        store, run_id, attempt_state=started, candidate_sha=candidate_sha
+        raise report_error from report_read_error
+    store.write_evidence_text(run_id, f"{attempt}/report.json", report_text)
+    return _accept_implementation_report(
+        store,
+        run_id,
+        attempt_state=started,
+        worktree=worktree,
+        branch=branch,
+        base_sha=identity["base_sha"],
     )
-    return report, finished
 
 
 def _require_implementation_start_checkout(
@@ -524,27 +522,14 @@ def _recover_implementation_attempt(
         )
     report_path = attempt_path / "report.json"
     if report_path.exists():
-        try:
-            report = _read_report(report_path)
-            candidate_sha = _verify_candidate(
-                worktree, branch=branch, base_sha=base_sha, report=report
-            )
-        except CandidateError as exc:
-            if exc.kind == "unavailable":
-                raise
-            _seal_implementation_interruption(
-                store,
-                run_id,
-                attempt_state=attempt_state,
-                summary=exc.summary,
-                retryable=False,
-            )
-            raise
-        store.seal_evidence(run_id, attempt)
-        finished = _finish_implementation_attempt(
-            store, run_id, attempt_state=attempt_state, candidate_sha=candidate_sha
+        return _accept_implementation_report(
+            store,
+            run_id,
+            attempt_state=attempt_state,
+            worktree=worktree,
+            branch=branch,
+            base_sha=base_sha,
         )
-        return report, finished
     head, observed_branch, dirty = _implementation_checkout(worktree)
     checkout_is_intact = head == base_sha and observed_branch == branch and not dirty
     if not checkout_is_intact:
@@ -609,6 +594,40 @@ def _finish_implementation_attempt(
         data={"checkpoint": "worktree_ready", "implementation_attempt": finished},
     )
     return finished
+
+
+def _accept_implementation_report(
+    store: RunStore,
+    run_id: str,
+    *,
+    attempt_state: dict[str, Any],
+    worktree: Path,
+    branch: str,
+    base_sha: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    attempt = attempt_state["evidence"]
+    report_path = store.root / "runs" / run_id / attempt / "report.json"
+    try:
+        report = _read_report(report_path)
+        candidate_sha = _verify_candidate(
+            worktree, branch=branch, base_sha=base_sha, report=report
+        )
+    except CandidateError as exc:
+        if exc.kind == "unavailable":
+            raise
+        _seal_implementation_interruption(
+            store,
+            run_id,
+            attempt_state=attempt_state,
+            summary=exc.summary,
+            retryable=False,
+        )
+        raise
+    store.seal_evidence(run_id, attempt)
+    finished = _finish_implementation_attempt(
+        store, run_id, attempt_state=attempt_state, candidate_sha=candidate_sha
+    )
+    return report, finished
 
 
 def _implementation_checkout(worktree: Path) -> tuple[str, str, str]:

@@ -1869,6 +1869,34 @@ class StartCliTest(unittest.TestCase):
             ).is_file()
         )
 
+    def test_worker_seals_a_fresh_malformed_implementation_report(self):
+        run_id = self.run_afk("start", "central-bnkl.1.1").stdout.strip()
+        (self.home / ".fake-malformed-implementation-report").touch()
+
+        worker = self.run_afk("_worker", run_id)
+
+        self.assertEqual(worker.returncode, 2, worker.stderr)
+        projection = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(projection["checkpoint"], "worktree_ready")
+        self.assertNotIn("candidate_sha", projection)
+        self.assertEqual(
+            projection["attention"]["summary"],
+            "implementation report is missing or malformed",
+        )
+        self.assertEqual(projection["implementation_attempt"]["status"], "interrupted")
+        self.assertFalse(projection["implementation_attempt"]["retryable"])
+        attempt = (
+            self.state_home / "afk" / "runs" / run_id / "attempts/implementation-1"
+        )
+        self.assertEqual((attempt / "report.json").read_text(), "not-json\n")
+        self.assertTrue((attempt / "events.jsonl").is_file())
+        self.assertTrue((attempt / "stderr.txt").is_file())
+        self.assertTrue((attempt / "recovery.json").is_file())
+        self.assertTrue((attempt / "manifest.json").is_file())
+        interrupted = self.launch_events(run_id, "implementation.attempt_interrupted")
+        self.assertEqual(len(interrupted), 1)
+        self.assertFalse(interrupted[0]["data"]["implementation_attempt"]["retryable"])
+
     def test_resume_retries_but_never_completes_from_missing_implementation_evidence(
         self,
     ):
@@ -7767,6 +7795,13 @@ class StartCliTest(unittest.TestCase):
                     (scripts / "validation-worker.sh").write_text(
                         "candidate harness proposal\\n", encoding="utf-8"
                     )
+                if (
+                    Path(os.environ["HOME"])
+                    / ".fake-malformed-implementation-report"
+                ).exists():
+                    report.write_text("not-json\\n", encoding="utf-8")
+                    print(json.dumps({"type": "result"}))
+                    raise SystemExit(0)
                 report.write_text(json.dumps({
                     "status": "completed",
                     "starting_sha": base_sha,
