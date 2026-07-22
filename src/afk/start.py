@@ -2113,6 +2113,7 @@ def _launch_worker(run_id: str, unit: str) -> None:
         "PYTHONPATH",
         "XDG_STATE_HOME",
         "AFK_BEADS_WORKSPACE",
+        "BEADS_ACTOR",
     ):
         value = os.environ.get(name)
         if value is not None:

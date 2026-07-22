@@ -233,10 +233,10 @@ class StartCliTest(unittest.TestCase):
         self.assertEqual(len(records), count)
         self.assertTrue(all(record["data"]["unit"] == unit for record in records))
 
-    def assert_bead_claim(self, store, run_id, status="confirmed"):
+    def assert_bead_claim(self, store, run_id, status="confirmed", claimant="bump"):
         intended = {
             "bead_id": "central-bnkl.1.1",
-            "claimant": "bump",
+            "claimant": claimant,
             "project_label": "project:beads-webui",
         }
         expected = {
@@ -819,6 +819,29 @@ class StartCliTest(unittest.TestCase):
         self.assertEqual(projection["checkpoint"], "reviewed")
         effect = RunStore(self.state_home / "afk").effect(run_id, "worker-launch-1")
         self.assertEqual(effect["status"], "confirmed")
+
+    def test_start_forwards_the_intended_beads_claimant_to_the_worker(self):
+        completed = self.run_afk(
+            "start",
+            "central-bnkl.1.1",
+            AFK_FAKE_LAUNCH_WORKER="1",
+            BEADS_ACTOR="pipeline-agent",
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        run_id = completed.stdout.strip()
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            projection = json.loads(self.run_afk("status", run_id, "--json").stdout)
+            if projection["state"] in {"attention_required", "reviewed"}:
+                break
+            time.sleep(0.05)
+        self.assertEqual(projection["checkpoint"], "reviewed")
+        self.assert_bead_claim(
+            RunStore(self.state_home / "afk"),
+            run_id,
+            claimant="pipeline-agent",
+        )
 
     def test_resume_recovers_crash_before_bead_claim_effect(self):
         started = self.run_afk("start", "central-bnkl.1.1")
@@ -6207,7 +6230,9 @@ class StartCliTest(unittest.TestCase):
                         bead_claimed.write_text(
                             json.dumps({
                                 "bead_id": os.environ["AFK_FAKE_BEAD"],
-                                "assignee": os.environ["USER"],
+                                "assignee": os.environ.get(
+                                    "BEADS_ACTOR", os.environ["USER"]
+                                ),
                             }),
                             encoding="utf-8",
                         )
@@ -6243,7 +6268,9 @@ class StartCliTest(unittest.TestCase):
                                 else os.environ["AFK_FAKE_BEAD"]
                             ),
                             "status": "in_progress",
-                            "assignee": os.environ["USER"],
+                            "assignee": os.environ.get(
+                                "BEADS_ACTOR", os.environ["USER"]
+                            ),
                         }))
                     elif args[:1] == ["close"]:
                         if os.environ.get("AFK_FAKE_BEAD_CLOSE_FAILURE"):
@@ -6277,10 +6304,17 @@ class StartCliTest(unittest.TestCase):
                                 "returncode": resumed.returncode,
                             }, separators=(",", ":")) + "\\n")
                     if os.environ.get("AFK_FAKE_LAUNCH_WORKER"):
+                        worker_environment = os.environ.copy()
+                        worker_environment.pop("BEADS_ACTOR", None)
+                        for argument in args:
+                            if argument.startswith("--setenv=BEADS_ACTOR="):
+                                worker_environment["BEADS_ACTOR"] = argument.split(
+                                    "=", 2
+                                )[2]
                         subprocess.Popen(
                             args[-5:],
                             cwd=project,
-                            env=os.environ,
+                            env=worker_environment,
                             stdout=subprocess.DEVNULL,
                             stderr=subprocess.DEVNULL,
                             close_fds=True,
