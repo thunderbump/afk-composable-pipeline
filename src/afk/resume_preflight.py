@@ -3,6 +3,13 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from afk.implementation_attempt import (
+    BINDING_FIELDS,
+    FIRST_ATTEMPT_ID,
+    next_attempt_id,
+    valid_attempt,
+)
+
 
 SCHEMA_VERSION = 1
 ATTEMPT_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -90,13 +97,13 @@ def _open_implementation_attempt(
     is_open = False
     attempt: Any = None
     terminal: Any = None
-    expected_attempt_id: str | None = "implementation-1"
+    expected_attempt_id: str | None = FIRST_ATTEMPT_ID
     for event in events:
         if event["event"] == "implementation.attempt_started":
             started = event["data"].get("implementation_attempt")
             if (
                 is_open
-                or not _valid_implementation_attempt(started, {"started"})
+                or not valid_attempt(started, {"started"})
                 or started.get("attempt_id") != expected_attempt_id
             ):
                 return True, is_open, attempt, terminal
@@ -116,99 +123,18 @@ def _open_implementation_attempt(
             )
             if not (
                 is_open
-                and _valid_implementation_attempt(finished, statuses)
+                and valid_attempt(finished, statuses)
                 and finished.get("attempt_id") == attempt.get("attempt_id")
                 and finished.get("starting_sha") == attempt.get("starting_sha")
                 and finished.get("evidence") == attempt.get("evidence")
-                and all(
-                    finished.get(key) == attempt.get(key)
-                    for key in _IMPLEMENTATION_BINDING_FIELDS
-                )
+                and all(finished.get(key) == attempt.get(key) for key in BINDING_FIELDS)
             ):
                 return True, is_open, attempt, terminal
             is_open = False
             terminal = finished
-            expected_attempt_id = (
-                "implementation-2"
-                if finished["status"] == "interrupted"
-                and finished["retryable"] is True
-                and finished["attempt_id"] == "implementation-1"
-                else None
-            )
+            expected_attempt_id = next_attempt_id(finished)
             attempt = None
     return False, is_open, attempt, terminal
-
-
-def _valid_implementation_attempt(value: Any, statuses: set[str]) -> bool:
-    if not isinstance(value, dict):
-        return False
-    attempt_id = value.get("attempt_id")
-    common = {
-        "attempt_id",
-        "starting_sha",
-        "status",
-        "evidence",
-        *_IMPLEMENTATION_BINDING_FIELDS,
-    }
-    extra = (
-        {"ending_sha"}
-        if value.get("status") == "completed"
-        else {"summary", "retryable"} if value.get("status") == "interrupted" else set()
-    )
-    return (
-        set(value) == common | extra
-        and isinstance(attempt_id, str)
-        and attempt_id in {"implementation-1", "implementation-2"}
-        and isinstance(value.get("starting_sha"), str)
-        and bool(SHA_PATTERN.fullmatch(value["starting_sha"]))
-        and value.get("status") in statuses
-        and value.get("evidence") == f"attempts/{attempt_id}"
-        and all(
-            isinstance(value.get(key), str) and bool(value[key])
-            for key in (
-                "repository",
-                "repository_common_dir",
-                "origin",
-                "branch",
-                "worktree_path",
-            )
-        )
-        and _valid_filesystem_identity(value.get("repository_common_dir_identity"))
-        and (
-            value.get("status") != "completed"
-            or isinstance(value.get("ending_sha"), str)
-            and bool(SHA_PATTERN.fullmatch(value["ending_sha"]))
-            and value["ending_sha"] != value["starting_sha"]
-        )
-        and (
-            value.get("status") != "interrupted"
-            or isinstance(value.get("summary"), str)
-            and bool(value["summary"])
-            and type(value.get("retryable")) is bool
-            and (value["retryable"] is False or attempt_id == "implementation-1")
-        )
-    )
-
-
-_IMPLEMENTATION_BINDING_FIELDS = {
-    "repository",
-    "repository_common_dir",
-    "repository_common_dir_identity",
-    "origin",
-    "branch",
-    "worktree_path",
-}
-
-
-def _valid_filesystem_identity(value: Any) -> bool:
-    return (
-        isinstance(value, dict)
-        and set(value) == {"device", "inode"}
-        and type(value.get("device")) is int
-        and value["device"] >= 0
-        and type(value.get("inode")) is int
-        and value["inode"] > 0
-    )
 
 
 def _open_validation_attempt(

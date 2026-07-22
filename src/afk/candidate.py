@@ -22,6 +22,14 @@ from afk.codex_permissions import (
     codex_permission_args,
 )
 from afk.jsonutil import canonical_json
+from afk.implementation_attempt import (
+    FIRST_ATTEMPT_ID,
+    completed_attempt,
+    interruption_is_retryable,
+    interrupted_attempt,
+    next_attempt_id,
+    started_attempt,
+)
 from afk.redaction import redact_artifact_value
 from afk.run_next import github_repo_from_repo_url
 from afk.run_store import RunStore, RunStoreError
@@ -121,7 +129,7 @@ def produce_candidate(
             bead=bead,
             worktree=worktree,
             branch=branch,
-            attempt_id="implementation-1",
+            attempt_id=FIRST_ATTEMPT_ID,
         )
     elif attempt_state.get("status") == "started":
         report, attempt_state = _recover_implementation_attempt(
@@ -134,10 +142,8 @@ def produce_candidate(
             base_sha=base_sha,
         )
         if report is None:
-            if not (
-                attempt_state.get("retryable") is True
-                and attempt_state.get("attempt_id") == "implementation-1"
-            ):
+            next_id = next_attempt_id(attempt_state)
+            if next_id is None:
                 raise CandidateError(
                     "interrupted implementation recovery budget is exhausted",
                     kind="invalid",
@@ -149,13 +155,9 @@ def produce_candidate(
                 bead=bead,
                 worktree=worktree,
                 branch=branch,
-                attempt_id="implementation-2",
+                attempt_id=next_id,
             )
-    elif (
-        attempt_state.get("status") == "interrupted"
-        and attempt_state.get("retryable") is True
-        and attempt_state.get("attempt_id") == "implementation-1"
-    ):
+    elif (next_id := next_attempt_id(attempt_state)) is not None:
         _require_implementation_attempt_binding(
             store,
             run_id,
@@ -171,7 +173,7 @@ def produce_candidate(
             bead=bead,
             worktree=worktree,
             branch=branch,
-            attempt_id="implementation-2",
+            attempt_id=next_id,
         )
     elif attempt_state.get("status") == "completed":
         _require_implementation_attempt_binding(
@@ -252,13 +254,9 @@ def _run_implementation_attempt(
     prompt = _implementation_prompt(
         identity, bead, worktree, branch, attempt_id=attempt_id
     )
-    started = {
-        "attempt_id": attempt_id,
-        "starting_sha": identity["base_sha"],
-        "status": "started",
-        "evidence": attempt,
-        **binding,
-    }
+    started = started_attempt(
+        attempt_id, starting_sha=identity["base_sha"], binding=binding
+    )
     store.append_event(
         run_id,
         "implementation.attempt_started",
@@ -484,7 +482,7 @@ def _recover_implementation_attempt(
         head, observed_branch, dirty = _implementation_checkout(worktree)
         if head == base_sha and observed_branch == branch and not dirty:
             summary = "implementation process ended without an evidence tree"
-            retryable = attempt_state["attempt_id"] == "implementation-1"
+            retryable = interruption_is_retryable(attempt_state)
             interrupted = _seal_implementation_interruption(
                 store,
                 run_id,
@@ -543,7 +541,7 @@ def _recover_implementation_attempt(
         return report, finished
     head, observed_branch, dirty = _implementation_checkout(worktree)
     retryable = (
-        attempt_state["attempt_id"] == "implementation-1"
+        interruption_is_retryable(attempt_state)
         and head == base_sha
         and observed_branch == branch
         and not dirty
@@ -583,11 +581,7 @@ def _finish_implementation_attempt(
     attempt_state: dict[str, Any],
     candidate_sha: str,
 ) -> dict[str, Any]:
-    finished = {
-        **attempt_state,
-        "status": "completed",
-        "ending_sha": candidate_sha,
-    }
+    finished = completed_attempt(attempt_state, ending_sha=candidate_sha)
     store.append_event(
         run_id,
         "implementation.attempt_finished",
@@ -626,7 +620,9 @@ def _seal_implementation_interruption(
     else:
         store.write_evidence_value(run_id, f"{attempt}/recovery.json", recovery)
     store.seal_evidence(run_id, attempt)
-    interrupted = {**attempt_state, **recovery}
+    interrupted = interrupted_attempt(
+        attempt_state, summary=summary, retryable=retryable
+    )
     store.append_event(
         run_id,
         "implementation.attempt_interrupted",
