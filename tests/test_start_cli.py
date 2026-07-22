@@ -6244,7 +6244,7 @@ class StartCliTest(unittest.TestCase):
         commands = self.command_log.read_text(encoding="utf-8")
         self.assertNotIn('"command":"systemctl"', commands)
 
-    def test_resume_advances_legacy_collected_worker_without_terminal_observation(self):
+    def test_resume_refuses_legacy_collected_worker_without_attempt_evidence(self):
         store = RunStore(self.state_home / "afk")
         run_id = "legacy-prior-slice-run"
         branch = "afk/central-bnkl-1-1-legacy-prior-slice-run/candidate"
@@ -6302,9 +6302,10 @@ class StartCliTest(unittest.TestCase):
 
         self.assertEqual(resumed.returncode, 2, resumed.stderr)
         projection = store.status(run_id)
-        self.assertEqual(projection["checkpoint"], "candidate_ready")
-        self.assertEqual(projection["attention"]["scope"], "validation")
+        self.assertEqual(projection["checkpoint"], "worktree_ready")
+        self.assertEqual(projection["attention"]["scope"], "candidate")
         self.assertEqual(projection["attention"]["kind"], "invalid")
+        self.assertIn("clean pinned base", projection["attention"]["summary"])
 
     def test_resume_reconciles_a_candidate_push_completed_before_confirmation(self):
         home = str(self.temp)
