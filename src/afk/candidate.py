@@ -304,12 +304,24 @@ def _run_implementation_attempt(
     store.write_evidence_text(
         run_id, f"{attempt}/report.json", canonical_json(report) + "\n"
     )
-    candidate_sha = _verify_candidate(
-        worktree,
-        branch=branch,
-        base_sha=identity["base_sha"],
-        report=report,
-    )
+    try:
+        candidate_sha = _verify_candidate(
+            worktree,
+            branch=branch,
+            base_sha=identity["base_sha"],
+            report=report,
+        )
+    except CandidateError as exc:
+        if exc.kind == "unavailable":
+            raise
+        _seal_implementation_interruption(
+            store,
+            run_id,
+            attempt_state=started,
+            summary=exc.summary,
+            retryable=False,
+        )
+        raise
     store.seal_evidence(run_id, attempt)
     finished = _finish_implementation_attempt(
         store, run_id, attempt_state=started, candidate_sha=candidate_sha

@@ -1108,12 +1108,33 @@ class CandidateTest(unittest.TestCase):
         with self.subTest("no change"):
             with self.assertRaisesRegex(CandidateError, "no_change"):
                 self.produce(CODEX_FAKE_OUTCOME="no_change")
+            attempt = self.state / "runs/run-1/attempts/implementation-1"
+            self.assertTrue((attempt / "manifest.json").is_file())
+            implementation = self.store.status("run-1")["implementation_attempt"]
+            self.assertEqual(implementation["status"], "interrupted")
+            self.assertFalse(implementation["retryable"])
 
         self.tearDown()
         self.setUp()
         with self.subTest("dirty"):
             with self.assertRaisesRegex(CandidateError, "dirty"):
                 self.produce(CODEX_FAKE_OUTCOME="dirty")
+            attempt = self.state / "runs/run-1/attempts/implementation-1"
+            self.assertTrue((attempt / "manifest.json").is_file())
+            implementation = self.store.status("run-1")["implementation_attempt"]
+            self.assertEqual(implementation["status"], "interrupted")
+            self.assertFalse(implementation["retryable"])
+            self.assertTrue((self.checkout / "dirty.txt").is_file())
+
+    def test_blocked_terminal_report_is_sealed_and_closed(self):
+        with self.assertRaisesRegex(CandidateError, "blocked"):
+            self.produce(CODEX_FAKE_OUTCOME="blocked")
+
+        attempt = self.state / "runs/run-1/attempts/implementation-1"
+        self.assertTrue((attempt / "manifest.json").is_file())
+        implementation = self.store.status("run-1")["implementation_attempt"]
+        self.assertEqual(implementation["status"], "interrupted")
+        self.assertFalse(implementation["retryable"])
 
     def test_legacy_flat_candidate_branch_fails_closed(self):
         with self.assertRaisesRegex(CandidateError, "per-Run namespace"):
@@ -1214,7 +1235,7 @@ class CandidateTest(unittest.TestCase):
                     subprocess.Popen([sys.executable, "-c", child], cwd=cwd)
                     signal.signal(signal.SIGTERM, signal.SIG_IGN)
                     time.sleep(30)
-                if outcome not in {"no_change", "nonzero", "malformed"}:
+                if outcome not in {"no_change", "blocked", "nonzero", "malformed"}:
                     (cwd / changed).write_text("candidate\\n", encoding="utf-8")
                     subprocess.run(["git", "add", changed], cwd=cwd, check=True)
                     subprocess.run(["git", "commit", "-m", "repair" if repair else "candidate"], cwd=cwd, check=True, capture_output=True)  # noqa: E501
@@ -1230,7 +1251,7 @@ class CandidateTest(unittest.TestCase):
                     report.write_text("not json", encoding="utf-8")
                 else:
                     value = {{
-                        "status": "no_change" if outcome == "no_change" else "completed",  # noqa: E501
+                        "status": outcome if outcome in {"no_change", "blocked"} else "completed",  # noqa: E501
                         "starting_sha": start,
                         "ending_sha": end,
                         "summary": "implemented",
