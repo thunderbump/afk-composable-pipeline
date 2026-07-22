@@ -493,14 +493,11 @@ def _recover_implementation_attempt(
                 "interrupted implementation recovery budget is exhausted",
                 kind="invalid",
             )
-        if dirty:
-            summary = "interrupted implementation left a dirty worktree"
-        elif head != base_sha:
-            summary = (
-                "interrupted implementation advanced HEAD without terminal evidence"
-            )
-        else:
-            summary = "interrupted implementation changed the intended branch"
+        summary = _implementation_checkout_interruption_summary(
+            head=head,
+            dirty=dirty,
+            base_sha=base_sha,
+        )
         _seal_implementation_interruption(
             store,
             run_id,
@@ -544,14 +541,11 @@ def _recover_implementation_attempt(
         and not dirty
     )
     if not retryable:
-        if dirty:
-            summary = "interrupted implementation left a dirty worktree"
-        elif head != base_sha:
-            summary = (
-                "interrupted implementation advanced HEAD without terminal evidence"
-            )
-        else:
-            summary = "interrupted implementation changed the intended branch"
+        summary = _implementation_checkout_interruption_summary(
+            head=head,
+            dirty=dirty,
+            base_sha=base_sha,
+        )
         _seal_implementation_interruption(
             store,
             run_id,
@@ -569,6 +563,19 @@ def _recover_implementation_attempt(
         retryable=True,
     )
     return None, interrupted
+
+
+def _implementation_checkout_interruption_summary(
+    *,
+    head: str,
+    dirty: str,
+    base_sha: str,
+) -> str:
+    if dirty:
+        return "interrupted implementation left a dirty worktree"
+    if head != base_sha:
+        return "interrupted implementation advanced HEAD without terminal evidence"
+    return "interrupted implementation changed the intended branch"
 
 
 def _finish_implementation_attempt(
