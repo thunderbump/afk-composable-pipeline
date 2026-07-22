@@ -1064,7 +1064,9 @@ def _run_worker_with_lock(store: RunStore, run_id: str) -> int:
                 "worker.launched",
                 data={"checkpoint": "created", "unit": unit},
             )
-            _reconcile_bead_claim(store, run_id)
+            claim_exit_code = _advance_bead_claim(store, run_id)
+            if claim_exit_code:
+                return claim_exit_code
             worktree_path, branch = _prepare_worktree(store, identity)
             store.append_event(
                 run_id,

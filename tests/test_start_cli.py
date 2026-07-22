@@ -865,6 +865,32 @@ class StartCliTest(unittest.TestCase):
         self.assertEqual(projection["bead_claim"], observed)
         self.assertEqual(self.mutation_count("bead-claim"), 1)
 
+    def test_resume_recovers_initial_worker_bead_claim_outage(self):
+        run_id = self.run_afk("start", "central-bnkl.1.1").stdout.strip()
+
+        unavailable = self.run_afk("_worker", run_id, AFK_FAKE_BEAD_SHOW_FAILURE="1")
+
+        self.assertEqual(unavailable.returncode, 2, unavailable.stderr)
+        store = RunStore(self.state_home / "afk")
+        paused = store.status(run_id)
+        self.assertEqual(paused["checkpoint"], "created")
+        self.assertEqual(paused["attention"]["scope"], "bead_claim")
+        self.assert_bead_claim(store, run_id, status="prepared")
+        self.assertEqual(self.mutation_count("bead-claim"), 0)
+
+        resumed = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="absent")
+        repeated = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="absent")
+
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        self.assertEqual(repeated.returncode, 0, repeated.stderr)
+        observed = self.assert_bead_claim(store, run_id)
+        projection = store.status(run_id)
+        self.assertEqual(projection["checkpoint"], "claimed")
+        self.assertEqual(projection["bead_claim"], observed)
+        self.assertEqual(projection["attention"], {})
+        self.assertEqual(len(self.launch_events(run_id, "bead.claimed")), 1)
+        self.assertEqual(self.mutation_count("bead-claim"), 1)
+
     def test_resume_claims_as_the_durable_actor_after_actor_drift(self):
         run_id = self.run_afk(
             "start", "central-bnkl.1.1", BEADS_ACTOR="pipeline-agent"
@@ -5433,7 +5459,7 @@ class StartCliTest(unittest.TestCase):
         self.assertEqual(completed.returncode, 2)
         status = json.loads(self.run_afk("status", run_id, "--json").stdout)
         self.assertEqual(status["checkpoint"], "created")
-        self.assertEqual(status["attention"]["scope"], "worker")
+        self.assertEqual(status["attention"]["scope"], "bead_claim")
 
     def test_malformed_claim_result_stops_at_created_checkpoint(self):
         run_id = self.run_afk("start", "central-bnkl.1.1").stdout.strip()
