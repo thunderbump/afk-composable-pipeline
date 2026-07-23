@@ -211,6 +211,19 @@ class StartCliTest(unittest.TestCase):
         self.assertLess(interrupted.returncode, 0)
         return run_id
 
+    def start_isolated_candidate_push_run(self, name):
+        state_home = self.temp / name
+        home = self.temp / f"{name}-home"
+        home.mkdir()
+        environment = {
+            "XDG_STATE_HOME": str(state_home),
+            "HOME": str(home),
+        }
+        started = self.run_afk("start", "central-bnkl.1.1", **environment)
+        self.assertEqual(started.returncode, 0, started.stderr)
+        run_id = started.stdout.strip()
+        return run_id, RunStore(state_home / "afk"), environment
+
     def mutation_count(self, name, *, state_home=None):
         path = (state_home or self.state_home) / "fake-mutations.jsonl"
         if not path.exists():
@@ -6383,34 +6396,354 @@ class StartCliTest(unittest.TestCase):
         self.assertEqual(projection["attention"]["kind"], "invalid")
         self.assertIn("clean pinned base", projection["attention"]["summary"])
 
-    def test_resume_reconciles_a_candidate_push_completed_before_confirmation(self):
+    def test_candidate_push_failure_after_mutation_reconciles_immediately(self):
         home = str(self.temp)
         started = self.run_afk("start", "central-bnkl.1.1", HOME=home)
         run_id = started.stdout.strip()
 
-        interrupted = self.run_afk(
+        worker = self.run_afk(
             "_worker_unit", run_id, HOME=home, AFK_FAKE_PUSH_INTERRUPTED="1"
         )
 
-        self.assertEqual(interrupted.returncode, 2, interrupted.stderr)
-        before = json.loads(self.run_afk("status", run_id, "--json").stdout)
-        self.assertEqual(before["checkpoint"], "change_committed")
-        self.assertEqual(before["attention"]["scope"], "candidate")
-        push_effect = RunStore(self.state_home / "afk").effect(
-            run_id, f'branch-push-{"d" * 40}'
-        )
-        self.assertEqual(push_effect["status"], "prepared")
-
-        resumed = self.run_afk("resume", HOME=home)
-
-        self.assertEqual(resumed.returncode, 0, resumed.stderr)
-        after = json.loads(self.run_afk("status", run_id, "--json").stdout)
-        self.assertEqual(after["checkpoint"], "reviewed")
-        self.assertEqual(after["validation"]["status"], "passed")
+        self.assertEqual(worker.returncode, 0, worker.stderr)
+        projection = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(projection["checkpoint"], "reviewed")
+        self.assertEqual(projection["validation"]["status"], "passed")
         push_effect = RunStore(self.state_home / "afk").effect(
             run_id, f'branch-push-{"d" * 40}'
         )
         self.assertEqual(push_effect["status"], "confirmed")
+        self.assertEqual(self.mutation_count("branch-push"), 1)
+        self.assertEqual(
+            len(self.launch_events(run_id, "candidate.branch_published")), 1
+        )
+
+    def test_resume_reconciles_candidate_push_mutation_boundaries_once(self):
+        scenarios = {
+            "before": {"AFK_TEST_KILL_BEFORE_MUTATION": "branch-push"},
+            "after": {"AFK_TEST_KILL_AFTER_MUTATION": "branch-push"},
+        }
+        for name, injection in scenarios.items():
+            with self.subTest(name=name):
+                run_id, store, environment = self.start_isolated_candidate_push_run(
+                    f"push-{name}"
+                )
+                state_home = Path(environment["XDG_STATE_HOME"])
+
+                interrupted = self.run_afk(
+                    "_worker",
+                    run_id,
+                    **environment,
+                    **injection,
+                )
+
+                self.assertLess(interrupted.returncode, 0)
+                effect_id = f'branch-push-{"d" * 40}'
+                self.assertEqual(store.effect(run_id, effect_id)["status"], "prepared")
+                self.assertEqual(
+                    self.mutation_count("branch-push", state_home=state_home),
+                    0 if name == "before" else 1,
+                )
+
+                resumed = self.run_afk(
+                    "resume",
+                    **environment,
+                )
+
+                self.assertEqual(resumed.returncode, 0, resumed.stderr)
+                effect = store.effect(run_id, effect_id)
+                self.assertEqual(effect["status"], "confirmed")
+                self.assertEqual(
+                    self.mutation_count("branch-push", state_home=state_home), 1
+                )
+                branch = f"afk/central-bnkl-1-1-{run_id}/candidate"
+                pushes = [
+                    record
+                    for record in map(
+                        json.loads,
+                        self.command_log.read_text(encoding="utf-8").splitlines(),
+                    )
+                    if record["command"] == "git"
+                    and record["args"][:1] == ["push"]
+                    and f'{"d" * 40}:refs/heads/{branch}' in record["args"]
+                ]
+                self.assertEqual(len(pushes), 2 if name == "before" else 1)
+                self.assertTrue(
+                    all(
+                        f"--force-with-lease=refs/heads/{branch}:" in push["args"]
+                        for push in pushes
+                    )
+                )
+                publications = self.launch_events(
+                    run_id, "candidate.branch_published", state_home=state_home
+                )
+                self.assertEqual(len(publications), 1)
+                self.assertEqual(
+                    publications[0]["data"]["candidate_publication"],
+                    effect["observed"],
+                )
+
+    def test_resume_reconciles_candidate_push_durable_boundaries_once(self):
+        candidate_sha = "d" * 40
+        effect_id = f"branch-push-{candidate_sha}"
+        scenarios = {
+            "before-effect": (
+                {"AFK_TEST_KILL_BEFORE_EFFECT": effect_id},
+                None,
+                0,
+                0,
+            ),
+            "after-effect": (
+                {"AFK_TEST_KILL_AFTER_EFFECT": effect_id},
+                "prepared",
+                0,
+                0,
+            ),
+            "before-confirm": (
+                {"AFK_TEST_KILL_BEFORE_CONFIRM": effect_id},
+                "prepared",
+                1,
+                0,
+            ),
+            "after-confirm": (
+                {"AFK_TEST_KILL_AFTER_CONFIRM": effect_id},
+                "confirmed",
+                1,
+                0,
+            ),
+            "before-event": (
+                {"AFK_TEST_KILL_BEFORE_EVENT": "candidate.branch_published"},
+                "confirmed",
+                1,
+                0,
+            ),
+            "after-event-write": (
+                {"AFK_TEST_KILL_AFTER_EVENT_WRITE": ("candidate.branch_published")},
+                "confirmed",
+                1,
+                1,
+            ),
+        }
+        for name, (
+            injection,
+            effect_status,
+            mutations,
+            event_count,
+        ) in scenarios.items():
+            with self.subTest(name=name):
+                run_id, store, environment = self.start_isolated_candidate_push_run(
+                    f"push-durable-{name}"
+                )
+                state_home = Path(environment["XDG_STATE_HOME"])
+
+                interrupted = self.run_afk(
+                    "_worker",
+                    run_id,
+                    **environment,
+                    **injection,
+                )
+
+                self.assertLess(interrupted.returncode, 0)
+                effect = store.effect_if_present(run_id, effect_id)
+                self.assertEqual(
+                    effect.get("status") if effect is not None else None,
+                    effect_status,
+                )
+                self.assertEqual(
+                    self.mutation_count("branch-push", state_home=state_home),
+                    mutations,
+                )
+                self.assertEqual(
+                    len(
+                        self.launch_events(
+                            run_id,
+                            "candidate.branch_published",
+                            state_home=state_home,
+                        )
+                    ),
+                    event_count,
+                )
+
+                resumed = self.run_afk(
+                    "resume",
+                    **environment,
+                )
+
+                self.assertEqual(resumed.returncode, 0, resumed.stderr)
+                self.assertEqual(store.effect(run_id, effect_id)["status"], "confirmed")
+                self.assertEqual(
+                    self.mutation_count("branch-push", state_home=state_home), 1
+                )
+                self.assertEqual(
+                    len(
+                        self.launch_events(
+                            run_id,
+                            "candidate.branch_published",
+                            state_home=state_home,
+                        )
+                    ),
+                    1,
+                )
+
+    def test_candidate_push_observation_fails_closed_before_mutation(self):
+        scenarios = {
+            "conflict": (
+                {"AFK_FAKE_CANDIDATE_REMOTE_SHA": "b" * 40},
+                "conflict",
+            ),
+            "malformed": (
+                {"AFK_FAKE_CANDIDATE_REMOTE_MALFORMED": "1"},
+                "invalid",
+            ),
+            "unavailable": (
+                {"AFK_FAKE_CANDIDATE_REMOTE_UNAVAILABLE": "1"},
+                "unavailable",
+            ),
+        }
+        for name, (observation, kind) in scenarios.items():
+            with self.subTest(name=name):
+                run_id, store, environment = self.start_isolated_candidate_push_run(
+                    f"push-observation-{name}"
+                )
+                state_home = Path(environment["XDG_STATE_HOME"])
+
+                paused = self.run_afk(
+                    "_worker",
+                    run_id,
+                    **environment,
+                    **observation,
+                )
+
+                self.assertEqual(paused.returncode, 2, paused.stderr)
+                projection = store.status(run_id)
+                self.assertEqual(projection["checkpoint"], "change_committed")
+                self.assertEqual(projection["attention"]["scope"], "candidate")
+                self.assertEqual(projection["attention"]["kind"], kind)
+                self.assertEqual(
+                    store.effect(run_id, f'branch-push-{"d" * 40}')["status"],
+                    "prepared",
+                )
+                self.assertEqual(
+                    self.mutation_count("branch-push", state_home=state_home), 0
+                )
+
+                if name == "unavailable":
+                    resumed = self.run_afk(
+                        "resume",
+                        **environment,
+                    )
+                    self.assertEqual(resumed.returncode, 0, resumed.stderr)
+                    self.assertEqual(
+                        self.mutation_count("branch-push", state_home=state_home), 1
+                    )
+
+    def test_confirmed_candidate_push_is_not_retried_after_remote_disappears(self):
+        run_id, store, environment = self.start_isolated_candidate_push_run(
+            "confirmed-push-disappears"
+        )
+        state_home = Path(environment["XDG_STATE_HOME"])
+        home = Path(environment["HOME"])
+        interrupted = self.run_afk(
+            "_worker",
+            run_id,
+            **environment,
+            AFK_TEST_KILL_BEFORE_EVENT="candidate.branch_published",
+        )
+        self.assertLess(interrupted.returncode, 0)
+        (home / ".fake-pushed").unlink()
+
+        resumed = self.run_afk(
+            "resume",
+            **environment,
+        )
+
+        self.assertEqual(resumed.returncode, 2, resumed.stderr)
+        projection = store.status(run_id)
+        self.assertEqual(projection["attention"]["kind"], "conflict")
+        self.assertEqual(
+            store.effect(run_id, f'branch-push-{"d" * 40}')["status"],
+            "confirmed",
+        )
+        self.assertEqual(self.mutation_count("branch-push", state_home=state_home), 1)
+
+    def test_candidate_push_reconciles_after_post_mutation_observation_outage(self):
+        run_id = self.run_afk("start", "central-bnkl.1.1").stdout.strip()
+
+        paused = self.run_afk(
+            "_worker",
+            run_id,
+            AFK_FAKE_CANDIDATE_REMOTE_UNAVAILABLE_AFTER_PUSH="1",
+        )
+
+        self.assertEqual(paused.returncode, 2, paused.stderr)
+        store = RunStore(self.state_home / "afk")
+        effect_id = f'branch-push-{"d" * 40}'
+        self.assertEqual(store.effect(run_id, effect_id)["status"], "prepared")
+        self.assertEqual(store.status(run_id)["attention"]["kind"], "unavailable")
+        self.assertEqual(self.mutation_count("branch-push"), 1)
+
+        resumed = self.run_afk("resume")
+
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        self.assertEqual(store.effect(run_id, effect_id)["status"], "confirmed")
+        self.assertEqual(self.mutation_count("branch-push"), 1)
+        self.assertEqual(
+            len(self.launch_events(run_id, "candidate.branch_published")), 1
+        )
+
+    def test_candidate_push_refuses_origin_drift_before_effect_or_mutation(self):
+        run_id = self.run_afk("start", "central-bnkl.1.1").stdout.strip()
+
+        paused = self.run_afk(
+            "_worker",
+            run_id,
+            AFK_FAKE_ORIGIN_CHANGE_AFTER_CHECKS="3",
+        )
+
+        self.assertEqual(paused.returncode, 2, paused.stderr)
+        store = RunStore(self.state_home / "afk")
+        projection = store.status(run_id)
+        self.assertEqual(projection["checkpoint"], "change_committed")
+        self.assertEqual(projection["attention"]["kind"], "conflict")
+        self.assertIsNone(store.effect_if_present(run_id, f'branch-push-{"d" * 40}'))
+        self.assertEqual(self.mutation_count("branch-push"), 0)
+
+    def test_resume_rejects_malformed_candidate_publication_before_commands(self):
+        run_id = self.run_afk("start", "central-bnkl.1.1").stdout.strip()
+        interrupted = self.run_afk(
+            "_worker",
+            run_id,
+            AFK_TEST_KILL_BEFORE_EVENT="candidate.branch_published",
+        )
+        self.assertLess(interrupted.returncode, 0)
+        store = RunStore(self.state_home / "afk")
+        store.append_event(
+            run_id,
+            "candidate.branch_published",
+            state="change_committed",
+            data={
+                "checkpoint": "change_committed",
+                "candidate_publication": {
+                    "repository": "thunderbump/beads-webui",
+                    "branch": "wrong-branch",
+                    "candidate_sha": "d" * 40,
+                    "remote": "origin",
+                },
+                "attention": {},
+            },
+        )
+        commands_before = self.command_log.read_text(encoding="utf-8")
+
+        resumed = self.run_afk("resume")
+
+        self.assertEqual(resumed.returncode, 2, resumed.stderr)
+        self.assertEqual(self.command_log.read_text(encoding="utf-8"), commands_before)
+        projection = store.status(run_id)
+        self.assertEqual(projection["attention"]["kind"], "invalid")
+        self.assertEqual(
+            projection["attention"]["summary"],
+            "Candidate branch publication lifecycle is invalid",
+        )
 
     def test_resume_reconciles_a_candidate_pr_completed_before_confirmation(self):
         home = str(self.temp)
@@ -6986,6 +7319,17 @@ class StartCliTest(unittest.TestCase):
                             origin_checks.write_text(str(checks + 1), encoding="utf-8")
                             if checks:
                                 repository = "thunderbump/another-repo"
+                        if os.environ.get("AFK_FAKE_ORIGIN_CHANGE_AFTER_CHECKS"):
+                            checks = (
+                                int(origin_checks.read_text())
+                                if origin_checks.exists()
+                                else 0
+                            )
+                            origin_checks.write_text(str(checks + 1), encoding="utf-8")
+                            if checks >= int(
+                                os.environ["AFK_FAKE_ORIGIN_CHANGE_AFTER_CHECKS"]
+                            ):
+                                repository = "thunderbump/another-repo"
                         if (
                             os.environ.get(
                                 "AFK_FAKE_CLEANUP_ORIGIN_CHANGE_AFTER_GET_URL"
@@ -7006,6 +7350,27 @@ class StartCliTest(unittest.TestCase):
                                 value = json.loads(pr_state.read_text())
                                 value["baseRefName"] = "release"
                                 pr_state.write_text(json.dumps(value), encoding="utf-8")
+                        elif os.environ.get(
+                            "AFK_FAKE_CANDIDATE_REMOTE_UNAVAILABLE"
+                        ):
+                            raise SystemExit(1)
+                        elif (
+                            os.environ.get(
+                                "AFK_FAKE_CANDIDATE_REMOTE_UNAVAILABLE_AFTER_PUSH"
+                            )
+                            and pushed_marker.exists()
+                        ):
+                            raise SystemExit(1)
+                        elif os.environ.get(
+                            "AFK_FAKE_CANDIDATE_REMOTE_MALFORMED"
+                        ):
+                            print("malformed")
+                        elif os.environ.get("AFK_FAKE_CANDIDATE_REMOTE_SHA"):
+                            print(
+                                os.environ["AFK_FAKE_CANDIDATE_REMOTE_SHA"]
+                                + "\\t"
+                                + requested
+                            )
                         elif (
                             os.environ.get(
                                 "AFK_FAKE_CLEANUP_ORIGIN_CHANGE_AFTER_GET_URL"
@@ -7355,7 +7720,9 @@ class StartCliTest(unittest.TestCase):
                                 import time
                                 time.sleep(1)
                         else:
+                            before_mutation("branch-push")
                             pushed_marker.write_text(candidate_sha, encoding="utf-8")
+                            after_mutation("branch-push")
                         if os.environ.get("AFK_FAKE_PUSH_INTERRUPTED"):
                             raise SystemExit(1)
                     else:

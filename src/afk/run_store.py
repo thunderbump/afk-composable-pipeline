@@ -1071,6 +1071,7 @@ def _project(identity: dict[str, Any], events: list[dict[str, Any]]) -> dict[str
         "worker_result",
         "implementation_attempt",
         "candidate_sha",
+        "candidate_publication",
         "pr_number",
         "pr_url",
         "pr_head_sha",

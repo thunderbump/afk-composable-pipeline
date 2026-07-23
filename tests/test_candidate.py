@@ -140,9 +140,16 @@ class CandidateTest(unittest.TestCase):
         self.gh_state = self.temp / "gh-state.json"
         self.codex_env = self.temp / "codex-env.json"
         self.codex_args = self.temp / "codex-args.json"
+        self.repository_url_patch = mock.patch.object(
+            candidate_module,
+            "github_repo_from_repo_url",
+            return_value="owner/project",
+        )
+        self.repository_url_patch.start()
         self._write_fakes()
 
     def tearDown(self):
+        self.repository_url_patch.stop()
         self.temporary_directory.cleanup()
 
     def git(self, *args):
@@ -171,14 +178,7 @@ class CandidateTest(unittest.TestCase):
             }
         )
         environment.update(env)
-        with (
-            mock.patch.dict(os.environ, environment, clear=True),
-            mock.patch.object(
-                candidate_module,
-                "github_repo_from_repo_url",
-                return_value="owner/project",
-            ),
-        ):
+        with mock.patch.dict(os.environ, environment, clear=True):
             return produce_candidate(
                 self.store,
                 "run-1",
@@ -389,6 +389,29 @@ class CandidateTest(unittest.TestCase):
         self.assertNotEqual(result["candidate_sha"], first["candidate_sha"])
         self.assertEqual(result["repair_attempts_used"], 1)
         self.assertEqual(result["previous_candidate_sha"], first["candidate_sha"])
+        publication = self.store.status("run-1")["candidate_publication"]
+        self.assertEqual(publication["candidate_sha"], result["candidate_sha"])
+        effect = self.store.effect("run-1", f'branch-push-{result["candidate_sha"]}')
+        self.assertEqual(
+            effect["intended"],
+            {
+                "repository": "owner/project",
+                "branch": self.branch,
+                "candidate_sha": result["candidate_sha"],
+                "remote": "origin",
+                "expected_previous_sha": first["candidate_sha"],
+            },
+        )
+        events = [
+            json.loads(line)
+            for line in (self.state / "runs" / "run-1" / "events.jsonl")
+            .read_text(encoding="utf-8")
+            .splitlines()
+        ]
+        self.assertEqual(
+            sum(event["event"] == "candidate.branch_published" for event in events),
+            2,
+        )
         attempt = self.state / "runs" / "run-1" / "attempts" / "repair-1"
         report = json.loads((attempt / "report.json").read_text(encoding="utf-8"))
         prompt = (attempt / "prompt.md").read_text(encoding="utf-8")
@@ -869,15 +892,35 @@ class CandidateTest(unittest.TestCase):
             "candidate_sha": resumed["candidate_sha"],
             "repair_attempt": 2,
         }
+        self.store.append_event(
+            "run-1",
+            "gate.cycle_completed",
+            state="candidate_ready",
+            data={
+                "checkpoint": "candidate_ready",
+                "gate_cycles": [
+                    *self.store.status("run-1")["gate_cycles"],
+                    {"next_action": "repair", "repair_brief": second_brief},
+                ],
+            },
+        )
         original_confirm = self.store.confirm_effect
+        original_run = candidate_module._run
+        repair_pushes = []
 
         def crash_before_push_confirmation(run_id, effect_id, *, observed):
             if effect_id.startswith("branch-push-"):
                 raise RuntimeError("crash after push before confirmation")
             return original_confirm(run_id, effect_id, observed=observed)
 
+        def count_repair_push(command, **kwargs):
+            if command[:2] == ["git", "push"]:
+                repair_pushes.append(command)
+            return original_run(command, **kwargs)
+
         with (
             mock.patch.dict(os.environ, self._candidate_environment(), clear=True),
+            mock.patch("afk.candidate._run", side_effect=count_repair_push),
             mock.patch.object(
                 self.store,
                 "confirm_effect",
@@ -898,14 +941,19 @@ class CandidateTest(unittest.TestCase):
             "prepared",
         )
         codex.rename(disabled_codex)
-        with mock.patch.dict(os.environ, self._candidate_environment(), clear=True):
-            second = produce_repair_candidate(
-                self.store,
-                "run-1",
-                bead=bead,
-                repair_brief=second_brief,
-            )
+        with (
+            mock.patch.dict(os.environ, self._candidate_environment(), clear=True),
+            mock.patch("afk.start.RunStore", return_value=self.store),
+            mock.patch("afk.start._show_bead", return_value=bead),
+            mock.patch("afk.start._advance_validation", return_value=0),
+            mock.patch("afk.start._advance_gate", return_value=0),
+            mock.patch("afk.candidate._run", side_effect=count_repair_push),
+        ):
+            resumed_run_id, resumed_exit = resume_run()
+        self.assertEqual((resumed_run_id, resumed_exit), ("run-1", 0))
+        second = self.store.status("run-1")
         self.assertEqual(second["repair_attempts_used"], 2)
+        self.assertEqual(len(repair_pushes), 1)
         self.assertEqual(
             self.store.effect("run-1", f"branch-push-{second_sha}")["status"],
             "confirmed",
@@ -917,19 +965,33 @@ class CandidateTest(unittest.TestCase):
             "candidate_sha": second["candidate_sha"],
             "repair_attempt": 3,
         }
+        self.store.append_event(
+            "run-1",
+            "gate.cycle_completed",
+            state="candidate_ready",
+            data={
+                "checkpoint": "candidate_ready",
+                "gate_cycles": [
+                    *self.store.status("run-1")["gate_cycles"],
+                    {"next_action": "repair", "repair_brief": third_brief},
+                ],
+            },
+        )
         original_append = self.store.append_event
+        repair_pushes.clear()
 
-        def crash_before_candidate_event(run_id, event, **kwargs):
-            if event == "candidate.repaired":
-                raise RuntimeError("crash before candidate repaired event")
+        def crash_before_branch_publication(run_id, event, **kwargs):
+            if event == "candidate.branch_published":
+                raise RuntimeError("crash before branch publication")
             return original_append(run_id, event, **kwargs)
 
         with (
             mock.patch.dict(os.environ, self._candidate_environment(), clear=True),
+            mock.patch("afk.candidate._run", side_effect=count_repair_push),
             mock.patch.object(
-                self.store, "append_event", side_effect=crash_before_candidate_event
+                self.store, "append_event", side_effect=crash_before_branch_publication
             ),
-            self.assertRaisesRegex(RuntimeError, "before candidate repaired event"),
+            self.assertRaisesRegex(RuntimeError, "before branch publication"),
         ):
             produce_repair_candidate(
                 self.store,
@@ -944,14 +1006,81 @@ class CandidateTest(unittest.TestCase):
             "confirmed",
         )
         codex.rename(disabled_codex)
-        with mock.patch.dict(os.environ, self._candidate_environment(), clear=True):
-            third = produce_repair_candidate(
+        with (
+            mock.patch.dict(os.environ, self._candidate_environment(), clear=True),
+            mock.patch("afk.start.RunStore", return_value=self.store),
+            mock.patch("afk.start._show_bead", return_value=bead),
+            mock.patch("afk.start._advance_validation", return_value=0),
+            mock.patch("afk.start._advance_gate", return_value=0),
+            mock.patch("afk.candidate._run", side_effect=count_repair_push),
+        ):
+            resumed_run_id, resumed_exit = resume_run()
+        self.assertEqual((resumed_run_id, resumed_exit), ("run-1", 0))
+        third = self.store.status("run-1")
+        self.assertEqual(third["repair_attempts_used"], 3)
+        self.assertEqual(len(repair_pushes), 1)
+
+        fourth_brief = {
+            **brief,
+            "candidate_sha": third["candidate_sha"],
+            "repair_attempt": 4,
+        }
+        self.store.append_event(
+            "run-1",
+            "gate.cycle_completed",
+            state="candidate_ready",
+            data={
+                "checkpoint": "candidate_ready",
+                "gate_cycles": [
+                    *self.store.status("run-1")["gate_cycles"],
+                    {"next_action": "repair", "repair_brief": fourth_brief},
+                ],
+            },
+        )
+        original_append = self.store.append_event
+        repair_pushes.clear()
+
+        def crash_after_branch_publication(run_id, event, **kwargs):
+            result = original_append(run_id, event, **kwargs)
+            if event == "candidate.branch_published":
+                raise RuntimeError("crash after branch publication")
+            return result
+
+        disabled_codex.rename(codex)
+        with (
+            mock.patch.dict(os.environ, self._candidate_environment(), clear=True),
+            mock.patch("afk.candidate._run", side_effect=count_repair_push),
+            mock.patch.object(
+                self.store, "append_event", side_effect=crash_after_branch_publication
+            ),
+            self.assertRaisesRegex(RuntimeError, "after branch publication"),
+        ):
+            produce_repair_candidate(
                 self.store,
                 "run-1",
                 bead=bead,
-                repair_brief=third_brief,
+                repair_brief=fourth_brief,
             )
-        self.assertEqual(third["repair_attempts_used"], 3)
+
+        fourth_sha = self.git("rev-parse", "HEAD")
+        self.assertEqual(
+            self.store.effect("run-1", f"branch-push-{fourth_sha}")["status"],
+            "confirmed",
+        )
+        codex.rename(disabled_codex)
+        with (
+            mock.patch.dict(os.environ, self._candidate_environment(), clear=True),
+            mock.patch("afk.start.RunStore", return_value=self.store),
+            mock.patch("afk.start._show_bead", return_value=bead),
+            mock.patch("afk.start._advance_validation", return_value=0),
+            mock.patch("afk.start._advance_gate", return_value=0),
+            mock.patch("afk.candidate._run", side_effect=count_repair_push),
+        ):
+            resumed_run_id, resumed_exit = resume_run()
+        self.assertEqual((resumed_run_id, resumed_exit), ("run-1", 0))
+        fourth = self.store.status("run-1")
+        self.assertEqual(fourth["repair_attempts_used"], 4)
+        self.assertEqual(len(repair_pushes), 1)
         events = [
             json.loads(line)
             for line in (self.state / "runs" / "run-1" / "events.jsonl")
@@ -959,7 +1088,7 @@ class CandidateTest(unittest.TestCase):
             .splitlines()
         ]
         self.assertEqual(
-            [event["event"] for event in events].count("candidate.repaired"), 3
+            [event["event"] for event in events].count("candidate.repaired"), 4
         )
 
     def _candidate_environment(self):
