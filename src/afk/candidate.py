@@ -1257,33 +1257,105 @@ def _reconcile_push(
     *,
     expected_previous_sha: str | None = None,
 ) -> None:
+    identity = store.identity(run_id)
+    remote = _pinned_origin(identity, worktree)
     effect_id = f"branch-push-{candidate_sha}"
+    intended = {
+        "repository": identity["repository"],
+        "branch": branch,
+        "candidate_sha": candidate_sha,
+        "remote": "origin",
+        "expected_previous_sha": expected_previous_sha or "",
+    }
     effect = store.prepare_effect(
         run_id,
         effect_id,
         kind="branch-push",
-        intended={"branch": branch, "candidate_sha": candidate_sha, "remote": "origin"},
+        intended=intended,
     )
-    remote_sha = _remote_sha(worktree, branch)
+    remote_sha = _remote_sha(worktree, branch, remote)
     allowed_remote = {candidate_sha}
     if expected_previous_sha is not None:
         allowed_remote.add(expected_previous_sha)
     if remote_sha and remote_sha not in allowed_remote:
-        raise CandidateError("remote Candidate branch has a contradictory head")
+        raise CandidateError(
+            "remote Candidate branch has a contradictory head", kind="conflict"
+        )
+    observed = {
+        "repository": identity["repository"],
+        "branch": branch,
+        "candidate_sha": candidate_sha,
+        "remote": "origin",
+    }
+    if effect["status"] == "confirmed":
+        if effect.get("observed") != observed or remote_sha != candidate_sha:
+            raise CandidateError(
+                "confirmed Candidate push contradicts the remote", kind="conflict"
+            )
+        _publish_candidate_branch(
+            store,
+            run_id,
+            observed,
+            expected_previous_sha=expected_previous_sha,
+        )
+        return
     if remote_sha != candidate_sha:
+        lease_sha = expected_previous_sha or ""
         pushed = _run(
-            ["git", "push", "origin", f"{candidate_sha}:refs/heads/{branch}"],
+            [
+                "git",
+                "push",
+                f"--force-with-lease=refs/heads/{branch}:{lease_sha}",
+                remote,
+                f"{candidate_sha}:refs/heads/{branch}",
+            ],
             cwd=worktree,
         )
-        if pushed.returncode != 0:
+        remote_sha = _remote_sha(worktree, branch, remote)
+        if pushed.returncode != 0 and remote_sha != candidate_sha:
             raise CandidateError("Candidate branch push failed")
-        remote_sha = _remote_sha(worktree, branch)
-    observed = {"branch": branch, "candidate_sha": remote_sha, "remote": "origin"}
     if remote_sha != candidate_sha:
         raise CandidateError("remote Candidate head could not be confirmed")
-    if effect["status"] == "confirmed" and effect.get("observed") != observed:
-        raise CandidateError("confirmed Candidate push contradicts the remote")
     store.confirm_effect(run_id, effect_id, observed=observed)
+    _publish_candidate_branch(
+        store,
+        run_id,
+        observed,
+        expected_previous_sha=expected_previous_sha,
+    )
+
+
+def _publish_candidate_branch(
+    store: RunStore,
+    run_id: str,
+    observed: dict[str, Any],
+    *,
+    expected_previous_sha: str | None,
+) -> None:
+    projection = store.status(run_id)
+    published = projection.get("candidate_publication")
+    if published is not None:
+        if published == observed:
+            return
+        expected_previous = {
+            **observed,
+            "candidate_sha": expected_previous_sha,
+        }
+        if expected_previous_sha is None or published != expected_previous:
+            raise CandidateError(
+                "durable Candidate branch publication contradicts the push",
+                kind="conflict",
+            )
+    store.append_event(
+        run_id,
+        "candidate.branch_published",
+        state="change_committed",
+        data={
+            "checkpoint": "change_committed",
+            "candidate_publication": observed,
+            "attention": {},
+        },
+    )
 
 
 def _reconcile_pr(
@@ -2092,12 +2164,16 @@ def _pinned_origin(identity: dict[str, Any], worktree: Path) -> str:
 def _remote_sha(worktree: Path, branch: str, remote: str = "origin") -> str:
     completed = _run(["git", "ls-remote", remote, f"refs/heads/{branch}"], cwd=worktree)
     if completed.returncode != 0:
-        raise CandidateError("remote Candidate head observation failed")
+        raise CandidateError(
+            "remote Candidate head observation failed", kind="unavailable"
+        )
     fields = completed.stdout.strip().split()
     if not fields:
         return ""
     if len(fields) != 2 or fields[1] != f"refs/heads/{branch}":
-        raise CandidateError("remote Candidate head observation was malformed")
+        raise CandidateError(
+            "remote Candidate head observation was malformed", kind="invalid"
+        )
     return fields[0]
 
 

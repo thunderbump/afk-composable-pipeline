@@ -140,9 +140,16 @@ class CandidateTest(unittest.TestCase):
         self.gh_state = self.temp / "gh-state.json"
         self.codex_env = self.temp / "codex-env.json"
         self.codex_args = self.temp / "codex-args.json"
+        self.repository_url_patch = mock.patch.object(
+            candidate_module,
+            "github_repo_from_repo_url",
+            return_value="owner/project",
+        )
+        self.repository_url_patch.start()
         self._write_fakes()
 
     def tearDown(self):
+        self.repository_url_patch.stop()
         self.temporary_directory.cleanup()
 
     def git(self, *args):
@@ -171,14 +178,7 @@ class CandidateTest(unittest.TestCase):
             }
         )
         environment.update(env)
-        with (
-            mock.patch.dict(os.environ, environment, clear=True),
-            mock.patch.object(
-                candidate_module,
-                "github_repo_from_repo_url",
-                return_value="owner/project",
-            ),
-        ):
+        with mock.patch.dict(os.environ, environment, clear=True):
             return produce_candidate(
                 self.store,
                 "run-1",
@@ -389,6 +389,29 @@ class CandidateTest(unittest.TestCase):
         self.assertNotEqual(result["candidate_sha"], first["candidate_sha"])
         self.assertEqual(result["repair_attempts_used"], 1)
         self.assertEqual(result["previous_candidate_sha"], first["candidate_sha"])
+        publication = self.store.status("run-1")["candidate_publication"]
+        self.assertEqual(publication["candidate_sha"], result["candidate_sha"])
+        effect = self.store.effect("run-1", f'branch-push-{result["candidate_sha"]}')
+        self.assertEqual(
+            effect["intended"],
+            {
+                "repository": "owner/project",
+                "branch": self.branch,
+                "candidate_sha": result["candidate_sha"],
+                "remote": "origin",
+                "expected_previous_sha": first["candidate_sha"],
+            },
+        )
+        events = [
+            json.loads(line)
+            for line in (self.state / "runs" / "run-1" / "events.jsonl")
+            .read_text(encoding="utf-8")
+            .splitlines()
+        ]
+        self.assertEqual(
+            sum(event["event"] == "candidate.branch_published" for event in events),
+            2,
+        )
         attempt = self.state / "runs" / "run-1" / "attempts" / "repair-1"
         report = json.loads((attempt / "report.json").read_text(encoding="utf-8"))
         prompt = (attempt / "prompt.md").read_text(encoding="utf-8")
