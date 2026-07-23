@@ -102,30 +102,34 @@ def _candidate_publication_invalid(
     projection: dict[str, Any], events: list[dict[str, Any]]
 ) -> bool:
     publications: list[dict[str, Any]] = []
+    checkpoint = "created"
     for event in events:
-        if event["event"] != "candidate.branch_published":
-            continue
         data = event.get("data")
-        publication = (
-            data.get("candidate_publication") if isinstance(data, dict) else None
-        )
-        if (
-            not isinstance(data, dict)
-            or set(data) != {"checkpoint", "candidate_publication", "attention"}
-            or data.get("checkpoint") != "change_committed"
-            or data.get("attention") != {}
-            or not isinstance(publication, dict)
-            or set(publication) != {"repository", "branch", "candidate_sha", "remote"}
-            or publication.get("repository") != projection.get("repository")
-            or publication.get("branch") != projection.get("branch")
-            or publication.get("remote") != "origin"
-            or not isinstance(publication.get("candidate_sha"), str)
-            or not SHA_PATTERN.fullmatch(publication["candidate_sha"])
-            or publications
-            and publications[-1] == publication
-        ):
-            return True
-        publications.append(publication)
+        if event["event"] == "candidate.branch_published":
+            publication = (
+                data.get("candidate_publication") if isinstance(data, dict) else None
+            )
+            if (
+                not isinstance(data, dict)
+                or set(data) != {"checkpoint", "candidate_publication", "attention"}
+                or data.get("checkpoint") != checkpoint
+                or event.get("state") != checkpoint
+                or data.get("attention") != {}
+                or not isinstance(publication, dict)
+                or set(publication)
+                != {"repository", "branch", "candidate_sha", "remote"}
+                or publication.get("repository") != projection.get("repository")
+                or publication.get("branch") != projection.get("branch")
+                or publication.get("remote") != "origin"
+                or not isinstance(publication.get("candidate_sha"), str)
+                or not SHA_PATTERN.fullmatch(publication["candidate_sha"])
+                or publications
+                and publications[-1] == publication
+            ):
+                return True
+            publications.append(publication)
+        if isinstance(data, dict) and isinstance(data.get("checkpoint"), str):
+            checkpoint = data["checkpoint"]
     projected = projection.get("candidate_publication")
     return (
         bool(publications) != ("candidate_publication" in projection)

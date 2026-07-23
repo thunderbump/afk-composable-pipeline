@@ -1349,9 +1349,9 @@ def _publish_candidate_branch(
     store.append_event(
         run_id,
         "candidate.branch_published",
-        state="change_committed",
+        state=projection["checkpoint"],
         data={
-            "checkpoint": "change_committed",
+            "checkpoint": projection["checkpoint"],
             "candidate_publication": observed,
             "attention": {},
         },
