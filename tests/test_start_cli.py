@@ -211,6 +211,19 @@ class StartCliTest(unittest.TestCase):
         self.assertLess(interrupted.returncode, 0)
         return run_id
 
+    def start_isolated_candidate_push_run(self, name):
+        state_home = self.temp / name
+        home = self.temp / f"{name}-home"
+        home.mkdir()
+        environment = {
+            "XDG_STATE_HOME": str(state_home),
+            "HOME": str(home),
+        }
+        started = self.run_afk("start", "central-bnkl.1.1", **environment)
+        self.assertEqual(started.returncode, 0, started.stderr)
+        run_id = started.stdout.strip()
+        return run_id, RunStore(state_home / "afk"), environment
+
     def mutation_count(self, name, *, state_home=None):
         path = (state_home or self.state_home) / "fake-mutations.jsonl"
         if not path.exists():
@@ -6412,27 +6425,19 @@ class StartCliTest(unittest.TestCase):
         }
         for name, injection in scenarios.items():
             with self.subTest(name=name):
-                state_home = self.temp / f"push-{name}"
-                home = self.temp / f"push-{name}-home"
-                home.mkdir()
-                started = self.run_afk(
-                    "start",
-                    "central-bnkl.1.1",
-                    XDG_STATE_HOME=str(state_home),
-                    HOME=str(home),
+                run_id, store, environment = self.start_isolated_candidate_push_run(
+                    f"push-{name}"
                 )
-                run_id = started.stdout.strip()
+                state_home = Path(environment["XDG_STATE_HOME"])
 
                 interrupted = self.run_afk(
                     "_worker",
                     run_id,
-                    XDG_STATE_HOME=str(state_home),
-                    HOME=str(home),
+                    **environment,
                     **injection,
                 )
 
                 self.assertLess(interrupted.returncode, 0)
-                store = RunStore(state_home / "afk")
                 effect_id = f'branch-push-{"d" * 40}'
                 self.assertEqual(store.effect(run_id, effect_id)["status"], "prepared")
                 self.assertEqual(
@@ -6442,8 +6447,7 @@ class StartCliTest(unittest.TestCase):
 
                 resumed = self.run_afk(
                     "resume",
-                    XDG_STATE_HOME=str(state_home),
-                    HOME=str(home),
+                    **environment,
                 )
 
                 self.assertEqual(resumed.returncode, 0, resumed.stderr)
@@ -6527,26 +6531,19 @@ class StartCliTest(unittest.TestCase):
             event_count,
         ) in scenarios.items():
             with self.subTest(name=name):
-                state_home = self.temp / f"push-durable-{name}"
-                home = self.temp / f"push-durable-{name}-home"
-                home.mkdir()
-                run_id = self.run_afk(
-                    "start",
-                    "central-bnkl.1.1",
-                    XDG_STATE_HOME=str(state_home),
-                    HOME=str(home),
-                ).stdout.strip()
+                run_id, store, environment = self.start_isolated_candidate_push_run(
+                    f"push-durable-{name}"
+                )
+                state_home = Path(environment["XDG_STATE_HOME"])
 
                 interrupted = self.run_afk(
                     "_worker",
                     run_id,
-                    XDG_STATE_HOME=str(state_home),
-                    HOME=str(home),
+                    **environment,
                     **injection,
                 )
 
                 self.assertLess(interrupted.returncode, 0)
-                store = RunStore(state_home / "afk")
                 effect = store.effect_if_present(run_id, effect_id)
                 self.assertEqual(
                     effect.get("status") if effect is not None else None,
@@ -6569,8 +6566,7 @@ class StartCliTest(unittest.TestCase):
 
                 resumed = self.run_afk(
                     "resume",
-                    XDG_STATE_HOME=str(state_home),
-                    HOME=str(home),
+                    **environment,
                 )
 
                 self.assertEqual(resumed.returncode, 0, resumed.stderr)
@@ -6606,26 +6602,19 @@ class StartCliTest(unittest.TestCase):
         }
         for name, (observation, kind) in scenarios.items():
             with self.subTest(name=name):
-                state_home = self.temp / f"push-observation-{name}"
-                home = self.temp / f"push-observation-{name}-home"
-                home.mkdir()
-                run_id = self.run_afk(
-                    "start",
-                    "central-bnkl.1.1",
-                    XDG_STATE_HOME=str(state_home),
-                    HOME=str(home),
-                ).stdout.strip()
+                run_id, store, environment = self.start_isolated_candidate_push_run(
+                    f"push-observation-{name}"
+                )
+                state_home = Path(environment["XDG_STATE_HOME"])
 
                 paused = self.run_afk(
                     "_worker",
                     run_id,
-                    XDG_STATE_HOME=str(state_home),
-                    HOME=str(home),
+                    **environment,
                     **observation,
                 )
 
                 self.assertEqual(paused.returncode, 2, paused.stderr)
-                store = RunStore(state_home / "afk")
                 projection = store.status(run_id)
                 self.assertEqual(projection["checkpoint"], "change_committed")
                 self.assertEqual(projection["attention"]["scope"], "candidate")
@@ -6641,8 +6630,7 @@ class StartCliTest(unittest.TestCase):
                 if name == "unavailable":
                     resumed = self.run_afk(
                         "resume",
-                        XDG_STATE_HOME=str(state_home),
-                        HOME=str(home),
+                        **environment,
                     )
                     self.assertEqual(resumed.returncode, 0, resumed.stderr)
                     self.assertEqual(
@@ -6650,20 +6638,15 @@ class StartCliTest(unittest.TestCase):
                     )
 
     def test_confirmed_candidate_push_is_not_retried_after_remote_disappears(self):
-        state_home = self.temp / "confirmed-push-disappears"
-        home = self.temp / "confirmed-push-disappears-home"
-        home.mkdir()
-        run_id = self.run_afk(
-            "start",
-            "central-bnkl.1.1",
-            XDG_STATE_HOME=str(state_home),
-            HOME=str(home),
-        ).stdout.strip()
+        run_id, store, environment = self.start_isolated_candidate_push_run(
+            "confirmed-push-disappears"
+        )
+        state_home = Path(environment["XDG_STATE_HOME"])
+        home = Path(environment["HOME"])
         interrupted = self.run_afk(
             "_worker",
             run_id,
-            XDG_STATE_HOME=str(state_home),
-            HOME=str(home),
+            **environment,
             AFK_TEST_KILL_BEFORE_EVENT="candidate.branch_published",
         )
         self.assertLess(interrupted.returncode, 0)
@@ -6671,12 +6654,10 @@ class StartCliTest(unittest.TestCase):
 
         resumed = self.run_afk(
             "resume",
-            XDG_STATE_HOME=str(state_home),
-            HOME=str(home),
+            **environment,
         )
 
         self.assertEqual(resumed.returncode, 2, resumed.stderr)
-        store = RunStore(state_home / "afk")
         projection = store.status(run_id)
         self.assertEqual(projection["attention"]["kind"], "conflict")
         self.assertEqual(
