@@ -16,6 +16,10 @@ from afk.candidate_validation import (
     CandidateValidationError,
     run_supervised_command,
 )
+from afk.candidate_publication import (
+    event as candidate_publication_event,
+    publication as candidate_publication,
+)
 from afk.codex_permissions import (
     codex_environment,
     codex_package_beneath_home,
@@ -1281,12 +1285,7 @@ def _reconcile_push(
         raise CandidateError(
             "remote Candidate branch has a contradictory head", kind="conflict"
         )
-    observed = {
-        "repository": identity["repository"],
-        "branch": branch,
-        "candidate_sha": candidate_sha,
-        "remote": "origin",
-    }
+    observed = candidate_publication(identity["repository"], branch, candidate_sha)
     if effect["status"] == "confirmed":
         if effect.get("observed") != observed or remote_sha != candidate_sha:
             raise CandidateError(
@@ -1346,15 +1345,12 @@ def _publish_candidate_branch(
                 "durable Candidate branch publication contradicts the push",
                 kind="conflict",
             )
+    publication_event = candidate_publication_event(projection["checkpoint"], observed)
     store.append_event(
         run_id,
-        "candidate.branch_published",
-        state=projection["checkpoint"],
-        data={
-            "checkpoint": projection["checkpoint"],
-            "candidate_publication": observed,
-            "attention": {},
-        },
+        publication_event["event"],
+        state=publication_event["state"],
+        data=publication_event["data"],
     )
 
 

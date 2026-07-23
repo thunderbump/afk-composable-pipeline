@@ -3,6 +3,10 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from afk.candidate_publication import (
+    EVENT as CANDIDATE_PUBLICATION_EVENT,
+    valid_event as valid_candidate_publication_event,
+)
 from afk.implementation_attempt import (
     BINDING_FIELDS,
     FIRST_ATTEMPT_ID,
@@ -105,24 +109,14 @@ def _candidate_publication_invalid(
     checkpoint = "created"
     for event in events:
         data = event.get("data")
-        if event["event"] == "candidate.branch_published":
+        if event["event"] == CANDIDATE_PUBLICATION_EVENT:
             publication = (
                 data.get("candidate_publication") if isinstance(data, dict) else None
             )
             if (
-                not isinstance(data, dict)
-                or set(data) != {"checkpoint", "candidate_publication", "attention"}
-                or data.get("checkpoint") != checkpoint
-                or event.get("state") != checkpoint
-                or data.get("attention") != {}
-                or not isinstance(publication, dict)
-                or set(publication)
-                != {"repository", "branch", "candidate_sha", "remote"}
-                or publication.get("repository") != projection.get("repository")
-                or publication.get("branch") != projection.get("branch")
-                or publication.get("remote") != "origin"
-                or not isinstance(publication.get("candidate_sha"), str)
-                or not SHA_PATTERN.fullmatch(publication["candidate_sha"])
+                not valid_candidate_publication_event(
+                    event, projection=projection, checkpoint=checkpoint
+                )
                 or publications
                 and publications[-1] == publication
             ):
