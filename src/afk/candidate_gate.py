@@ -201,20 +201,19 @@ def complete_gate_cycle(
                 "Gate Cycle requires the stable draft PR number",
                 kind="inconclusive",
             )
+        outcome = redact_artifact_value(outcome)
         outcome["pr_comment"] = _gate_comment_identity(
             store.identity(run_id),
             run_id,
             pr_number=pr_number,
             gate=outcome,
         )
-        redacted_outcome = redact_artifact_value(outcome)
         outcome_path = evidence_path / "outcome.json"
         if outcome_path.exists():
-            if _read_json(outcome_path) != redacted_outcome:
+            if _read_json(outcome_path) != outcome:
                 raise GateError(
                     "unsealed Gate Cycle outcome is ambiguous", kind="inconclusive"
                 )
-            outcome = redacted_outcome
         else:
             outcome = store.write_evidence_value(
                 run_id,

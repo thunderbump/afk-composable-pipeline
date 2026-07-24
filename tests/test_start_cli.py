@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import shutil
@@ -2446,6 +2447,40 @@ class StartCliTest(unittest.TestCase):
                     effect["observed"]["body_sha256"],
                     comment["body_sha256"],
                 )
+
+    def test_resume_posts_redacted_gate_evidence_with_its_exact_body_digest(self):
+        state_home = self.temp / "redacted-gate-comment"
+        run_id, store, environment = self.start_isolated_validation_run(
+            "redacted-gate-comment"
+        )
+        home = Path(environment["HOME"])
+        (home / ".fake-validation-summary").write_text(
+            "validation ghp_validationsecret", encoding="utf-8"
+        )
+        (home / ".fake-review-summary").write_text(
+            "review ghp_reviewsecret", encoding="utf-8"
+        )
+
+        resumed = self.run_afk("resume", **environment)
+
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        projection = store.status(run_id)
+        projected_comment = projection["gate_cycles"][-1]["pr_comment"]
+        external = json.loads(
+            (state_home / "fake-comment.json").read_text(encoding="utf-8")
+        )
+        body = external["body"]
+        self.assertNotIn("ghp_validationsecret", body)
+        self.assertNotIn("ghp_reviewsecret", body)
+        self.assertEqual(body.count("[REDACTED]"), 3)
+        self.assertEqual(
+            projected_comment["body_sha256"],
+            hashlib.sha256(body.encode("utf-8")).hexdigest(),
+        )
+        self.assertEqual(
+            self.mutation_count("gate-comment", state_home=state_home),
+            1,
+        )
 
     def test_resume_requires_attention_for_changed_gate_comment_observation(self):
         scenarios = ("duplicate", "edited", "drifted-url", "unavailable", "absent")
@@ -8625,11 +8660,13 @@ class StartCliTest(unittest.TestCase):
                             "request = json.loads(Path(sys.argv[sys.argv.index('--request') + 1]).read_text())\\n"
                             "status_path = Path.home() / '.fake-validation-status'\\n"
                             "status = status_path.read_text().strip() if status_path.exists() else 'passed'\\n"
+                            "summary_path = Path.home() / '.fake-validation-summary'\\n"
+                            "summary = summary_path.read_text() if summary_path.exists() else 'validation ' + status\\n"
                             "evidence = Path(request['evidence_dir'])\\n"
                             "(evidence / 'tests.log').write_text(status + '\\\\n')\\n"
                             "(evidence / 'result.json').write_text(json.dumps({"
                             "'schema_version': 1, 'candidate_sha': request['candidate_sha'], "
-                            "'status': status, 'summary': 'validation ' + status, "
+                            "'status': status, 'summary': summary, "
                             "'checks': [{'name': 'tests', 'status': status, 'log_path': 'tests.log'}]}))\\n"
                             "raise SystemExit({'passed': 0, 'rejected': 1, 'inconclusive': 2}[status])\\n",
                             encoding="utf-8",
@@ -9325,12 +9362,18 @@ class StartCliTest(unittest.TestCase):
                         if "# AFK standards review" in prompt
                         else "spec"
                     )
+                    summary_path = Path.home() / ".fake-review-summary"
+                    summary = (
+                        summary_path.read_text()
+                        if summary_path.exists()
+                        else "review passed"
+                    )
                     report.write_text(json.dumps({
                         "schema_version": 1,
                         "candidate_sha": candidate_sha,
                         "axis": axis,
                         "status": "passed",
-                        "summary": "review passed",
+                        "summary": summary,
                         "findings": [],
                     }), encoding="utf-8")
                     print(json.dumps({"type": "result"}))
