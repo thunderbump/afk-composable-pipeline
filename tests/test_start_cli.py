@@ -7719,6 +7719,92 @@ class StartCliTest(unittest.TestCase):
                     attempts,
                 )
 
+    def test_rejected_validation_state_boundaries_resume_without_duplicate_result(
+        self,
+    ):
+        scenarios = (
+            ("before", "AFK_TEST_KILL_BEFORE_EVENT", 0),
+            ("after", "AFK_TEST_KILL_AFTER_EVENT_WRITE", 2),
+        )
+        for name, injection, expected_returncode in scenarios:
+            with self.subTest(name=name):
+                run_id, _, environment = self.start_isolated_validation_run(
+                    f"validation-rejected-{name}"
+                )
+                (Path(environment["HOME"]) / ".fake-validation-status").write_text(
+                    "rejected", encoding="utf-8"
+                )
+
+                interrupted = self.run_afk(
+                    "resume",
+                    **environment,
+                    **{injection: "validation.rejected"},
+                )
+
+                self.assertLess(interrupted.returncode, 0)
+                before = json.loads(
+                    self.run_afk("status", run_id, "--json", **environment).stdout
+                )
+                if name == "before":
+                    self.assertNotIn("validation", before)
+                else:
+                    self.assertEqual(before["validation"]["status"], "rejected")
+                resumed = self.run_afk("resume", **environment)
+                self.assertEqual(
+                    resumed.returncode, expected_returncode, resumed.stderr
+                )
+                status = json.loads(
+                    self.run_afk("status", run_id, "--json", **environment).stdout
+                )
+                self.assertEqual(status["validation"]["status"], "rejected")
+                if name == "after":
+                    self.assertEqual(status["validation"], before["validation"])
+
+    def test_inconclusive_validation_attention_boundaries_resume(self):
+        scenarios = (
+            ("before", "AFK_TEST_KILL_BEFORE_EVENT"),
+            ("after", "AFK_TEST_KILL_AFTER_EVENT_WRITE"),
+        )
+        for name, injection in scenarios:
+            with self.subTest(name=name):
+                run_id, _, environment = self.start_isolated_validation_run(
+                    f"validation-inconclusive-{name}"
+                )
+                status_path = Path(environment["HOME"]) / ".fake-validation-status"
+                status_path.write_text("inconclusive", encoding="utf-8")
+
+                interrupted = self.run_afk(
+                    "resume",
+                    **environment,
+                    **{injection: "run.attention_required"},
+                )
+
+                self.assertLess(interrupted.returncode, 0)
+                before = json.loads(
+                    self.run_afk("status", run_id, "--json", **environment).stdout
+                )
+                if name == "before":
+                    self.assertNotIn("validation", before)
+                    self.assertEqual(before["attention"], {})
+                else:
+                    self.assertEqual(before["validation"]["status"], "inconclusive")
+                    self.assertEqual(before["attention"]["scope"], "validation")
+                    self.assertEqual(before["attention"]["kind"], "inconclusive")
+                paused = self.run_afk("resume", **environment)
+                if paused.returncode == 2:
+                    status = json.loads(
+                        self.run_afk("status", run_id, "--json", **environment).stdout
+                    )
+                    self.assertEqual(status["attention"]["scope"], "validation")
+                    self.assertEqual(status["attention"]["kind"], "inconclusive")
+                    status_path.unlink()
+                    paused = self.run_afk("resume", **environment)
+                self.assertEqual(paused.returncode, 0, paused.stderr)
+                status = json.loads(
+                    self.run_afk("status", run_id, "--json", **environment).stdout
+                )
+                self.assertEqual(status["validation"]["status"], "passed")
+
     def test_resume_requires_attention_for_confirmed_collected_worker_without_terminal(
         self,
     ):
@@ -8427,12 +8513,15 @@ class StartCliTest(unittest.TestCase):
                             "import json, sys\\n"
                             "from pathlib import Path\\n"
                             "request = json.loads(Path(sys.argv[sys.argv.index('--request') + 1]).read_text())\\n"
+                            "status_path = Path.home() / '.fake-validation-status'\\n"
+                            "status = status_path.read_text().strip() if status_path.exists() else 'passed'\\n"
                             "evidence = Path(request['evidence_dir'])\\n"
-                            "(evidence / 'tests.log').write_text('passed\\\\n')\\n"
+                            "(evidence / 'tests.log').write_text(status + '\\\\n')\\n"
                             "(evidence / 'result.json').write_text(json.dumps({"
                             "'schema_version': 1, 'candidate_sha': request['candidate_sha'], "
-                            "'status': 'passed', 'summary': 'validation passed', "
-                            "'checks': [{'name': 'tests', 'status': 'passed', 'log_path': 'tests.log'}]}))\\n",
+                            "'status': status, 'summary': 'validation ' + status, "
+                            "'checks': [{'name': 'tests', 'status': status, 'log_path': 'tests.log'}]}))\\n"
+                            "raise SystemExit({'passed': 0, 'rejected': 1, 'inconclusive': 2}[status])\\n",
                             encoding="utf-8",
                         )
                         validation_worker.chmod(0o700)
