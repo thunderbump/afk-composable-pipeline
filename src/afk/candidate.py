@@ -20,6 +20,10 @@ from afk.candidate_publication import (
     event as candidate_publication_event,
     publication as candidate_publication,
 )
+from afk.candidate_pr_publication import (
+    event as candidate_pr_publication_event,
+    marker as candidate_pr_marker,
+)
 from afk.codex_permissions import (
     codex_environment,
     codex_package_beneath_home,
@@ -221,7 +225,14 @@ def produce_candidate(
         )
     _reconcile_push(store, run_id, worktree, branch, candidate_sha)
     pr = _reconcile_pr(store, identity, run_id, worktree, branch, candidate_sha)
-    _verify_published(identity, worktree, branch, candidate_sha, pr)
+    _verify_published(
+        identity,
+        worktree,
+        branch,
+        candidate_sha,
+        pr,
+        expected_marker=candidate_pr_marker(run_id, candidate_sha),
+    )
     return store.append_event(
         run_id,
         "candidate.ready",
@@ -984,7 +995,14 @@ def _finish_repair_candidate(
     if len(prs) != 1:
         raise CandidateError("Candidate branch does not have exactly one stable PR")
     pr = prs[0]
-    _verify_published(identity, worktree, branch, candidate_sha, pr)
+    _verify_published(
+        identity,
+        worktree,
+        branch,
+        candidate_sha,
+        pr,
+        expected_marker=_projected_candidate_pr_marker(store.status(run_id)),
+    )
     return store.append_event(
         run_id,
         "candidate.repaired",
@@ -1362,8 +1380,18 @@ def _reconcile_pr(
     branch: str,
     candidate_sha: str,
 ) -> dict[str, Any]:
+    remote = _pinned_origin(identity, worktree)
+    _verify_pr_creation_inputs(
+        identity,
+        worktree,
+        branch,
+        candidate_sha,
+        remote=remote,
+    )
     title = f"{identity['bead_id']}: AFK Candidate"
+    marker = candidate_pr_marker(run_id, candidate_sha)
     body = (
+        f"{marker}\n"
         f"AFK Run `{run_id}` produced Candidate `{candidate_sha}` for "
         f"Bead `{identity['bead_id']}`.\n"
     )
@@ -1378,9 +1406,14 @@ def _reconcile_pr(
             "candidate_sha": candidate_sha,
             "title": title,
             "body": body,
+            "marker": marker,
         },
     )
     prs = _list_prs(worktree, identity["repository"], branch)
+    if effect["status"] == "confirmed" and not prs:
+        raise CandidateError(
+            "confirmed Candidate PR is absent from GitHub", kind="conflict"
+        )
     if not prs:
         completed = _run(
             [
@@ -1401,13 +1434,28 @@ def _reconcile_pr(
             ],
             cwd=worktree,
         )
-        if completed.returncode != 0:
-            raise CandidateError("draft Candidate PR creation failed")
         prs = _list_prs(worktree, identity["repository"], branch)
+        if completed.returncode != 0 and not prs:
+            raise CandidateError("draft Candidate PR creation failed")
     if len(prs) != 1:
-        raise CandidateError("Candidate branch does not have exactly one stable PR")
+        raise CandidateError(
+            "Candidate branch does not have exactly one stable PR", kind="conflict"
+        )
     pr = prs[0]
+    if (
+        pr.get("headRefOid") != candidate_sha
+        or pr.get("headRefName") != branch
+        or pr.get("baseRefName") != identity["base_branch"]
+        or pr.get("state") != "OPEN"
+        or pr.get("isDraft") is not True
+        or pr.get("title") != title
+        or marker not in str(pr.get("body", ""))
+    ):
+        raise CandidateError(
+            "Candidate PR identity contradicts the Run", kind="conflict"
+        )
     expected = {
+        "repository": identity["repository"],
         "number": pr.get("number"),
         "url": pr.get("url"),
         "head_sha": pr.get("headRefOid"),
@@ -1415,11 +1463,58 @@ def _reconcile_pr(
         "base": pr.get("baseRefName"),
         "state": pr.get("state"),
         "draft": pr.get("isDraft"),
+        "marker": marker,
     }
     if effect["status"] == "confirmed" and effect.get("observed") != expected:
         raise CandidateError("confirmed Candidate PR contradicts GitHub")
     store.confirm_effect(run_id, "pr-create", observed=expected)
+    _publish_candidate_pr(store, run_id, expected)
     return pr
+
+
+def _publish_candidate_pr(
+    store: RunStore, run_id: str, observed: dict[str, Any]
+) -> None:
+    projection = store.status(run_id)
+    published = projection.get("candidate_pr")
+    if published is not None:
+        if published == observed:
+            return
+        raise CandidateError(
+            "durable Candidate PR publication contradicts GitHub", kind="conflict"
+        )
+    publication_event = candidate_pr_publication_event(
+        projection["checkpoint"], observed
+    )
+    store.append_event(
+        run_id,
+        publication_event["event"],
+        state=publication_event["state"],
+        data=publication_event["data"],
+    )
+
+
+def _verify_pr_creation_inputs(
+    identity: dict[str, Any],
+    worktree: Path,
+    branch: str,
+    candidate_sha: str,
+    *,
+    remote: str,
+) -> None:
+    if (
+        _git(worktree, "rev-parse", "HEAD") != candidate_sha
+        or _git(worktree, "status", "--porcelain")
+        or _remote_sha(worktree, branch, remote) != candidate_sha
+    ):
+        raise CandidateError(
+            "Candidate branch no longer matches the exact local Candidate",
+            kind="conflict",
+        )
+    if _remote_sha(worktree, identity["base_branch"], remote) != identity["base_sha"]:
+        raise CandidateError(
+            "target branch no longer equals the pinned base", kind="conflict"
+        )
 
 
 def _list_prs(worktree: Path, repository: str, branch: str) -> list[dict[str, Any]]:
@@ -1435,19 +1530,45 @@ def _list_prs(worktree: Path, repository: str, branch: str) -> list[dict[str, An
             "--state",
             "all",
             "--json",
-            "number,url,state,isDraft,headRefOid,headRefName,baseRefName",
+            "number,url,state,isDraft,headRefOid,headRefName,baseRefName,title,body",
         ],
         cwd=worktree,
     )
     if completed.returncode != 0:
-        raise CandidateError("Candidate PR observation failed")
+        raise CandidateError("Candidate PR observation failed", kind="unavailable")
     try:
         value = json.loads(completed.stdout)
     except json.JSONDecodeError as exc:
-        raise CandidateError("Candidate PR observation was malformed") from exc
-    if not isinstance(value, list) or not all(isinstance(item, dict) for item in value):
-        raise CandidateError("Candidate PR observation was malformed")
+        raise CandidateError(
+            "Candidate PR observation was malformed", kind="invalid"
+        ) from exc
+    if not isinstance(value, list) or not all(
+        _valid_candidate_pr_observation(item) for item in value
+    ):
+        raise CandidateError("Candidate PR observation was malformed", kind="invalid")
     return value
+
+
+def _valid_candidate_pr_observation(value: Any) -> bool:
+    return (
+        isinstance(value, dict)
+        and type(value.get("number")) is int
+        and value["number"] > 0
+        and all(
+            isinstance(value.get(field), str) and bool(value[field])
+            for field in (
+                "url",
+                "state",
+                "headRefOid",
+                "headRefName",
+                "baseRefName",
+                "title",
+                "body",
+            )
+        )
+        and re.fullmatch(r"[0-9a-f]{40}", value["headRefOid"]) is not None
+        and type(value.get("isDraft")) is bool
+    )
 
 
 def _verify_published(
@@ -1460,6 +1581,7 @@ def _verify_published(
     expected_pr_number: int | None = None,
     expected_pr_url: str | None = None,
     expected_draft: bool | None = True,
+    expected_marker: str | None = None,
     remote: str = "origin",
 ) -> None:
     local = _git(worktree, "rev-parse", "HEAD")
@@ -1490,8 +1612,20 @@ def _verify_published(
         or (expected_draft is not None and pr.get("isDraft") is not expected_draft)
         or type(pr.get("number")) is not int
         or not isinstance(pr.get("url"), str)
+        or expected_marker is not None
+        and expected_marker not in str(pr.get("body", ""))
     ):
         raise CandidateError("PR Candidate facts disagree", kind="conflict")
+
+
+def _projected_candidate_pr_marker(projection: dict[str, Any]) -> str | None:
+    publication = projection.get("candidate_pr")
+    if publication is None:
+        return None
+    marker = publication.get("marker") if isinstance(publication, dict) else None
+    if not isinstance(marker, str) or not marker:
+        raise CandidateError("durable Candidate PR marker is invalid", kind="conflict")
+    return marker
 
 
 def verify_candidate_publication(
@@ -1520,6 +1654,7 @@ def verify_candidate_publication(
         prs[0],
         expected_pr_number=pr_number,
         expected_pr_url=pr_url,
+        expected_marker=_projected_candidate_pr_marker(projection),
     )
     return prs[0]
 
@@ -1549,6 +1684,7 @@ def mark_candidate_pr_ready(store: RunStore, run_id: str) -> dict[str, Any]:
         expected_pr_number=pr_number,
         expected_pr_url=pr_url,
         expected_draft=None,
+        expected_marker=_projected_candidate_pr_marker(projection),
     )
     if not pr["isDraft"]:
         try:
@@ -1584,6 +1720,7 @@ def mark_candidate_pr_ready(store: RunStore, run_id: str) -> dict[str, Any]:
             expected_pr_number=pr_number,
             expected_pr_url=pr_url,
             expected_draft=False,
+            expected_marker=_projected_candidate_pr_marker(projection),
         )
         if effect.get("observed") != observed:
             raise CandidateError(
@@ -1621,6 +1758,7 @@ def mark_candidate_pr_ready(store: RunStore, run_id: str) -> dict[str, Any]:
         expected_pr_number=pr_number,
         expected_pr_url=pr_url,
         expected_draft=False,
+        expected_marker=_projected_candidate_pr_marker(projection),
     )
     store.confirm_effect(run_id, "pr-mark-ready", observed=observed)
     return observed

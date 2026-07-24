@@ -24,6 +24,7 @@ from afk.candidate import (
     reconcile_candidate_branch_deletion,
     reconcile_interrupted_repair_worktree,
     seal_interrupted_repair_attempt,
+    verify_candidate_publication,
 )
 from afk.candidate_gate import GateError, complete_gate_cycle
 from afk.candidate_validation import (
@@ -281,6 +282,14 @@ def resume_run(
             return run_id, _advance_gate(store, run_id)
         if projection["last_event"] == "candidate.repaired":
             return run_id, _advance_repaired_candidate(store, run_id)
+        if projection["last_event"] == "candidate.ready":
+            return run_id, _advance_validation_then_gate(store, run_id)
+        if (
+            projection["checkpoint"] == "candidate_ready"
+            and isinstance(attention, dict)
+            and attention.get("scope") == "candidate"
+        ):
+            return run_id, _advance_validation_then_gate(store, run_id)
         if "worker_exit_code" in projection:
             if _candidate_resume_ready(projection):
                 return run_id, _advance_candidate(store, run_id)
@@ -1216,6 +1225,20 @@ def _advance_repaired_candidate(store: RunStore, run_id: str) -> int:
 
 
 def _advance_validation_then_gate(store: RunStore, run_id: str) -> int:
+    try:
+        projection = store.status(run_id)
+        if projection.get("candidate_pr") is not None:
+            verify_candidate_publication(store.identity(run_id), projection)
+    except CandidateError as exc:
+        _attention(
+            store,
+            run_id,
+            checkpoint=store.status(run_id)["checkpoint"],
+            scope="candidate",
+            kind=exc.kind,
+            summary=exc.summary,
+        )
+        return 2
     if _bootstrap_approval_missing(store.status(run_id)):
         _attention(
             store,

@@ -224,6 +224,18 @@ class StartCliTest(unittest.TestCase):
         run_id = started.stdout.strip()
         return run_id, RunStore(state_home / "afk"), environment
 
+    def start_isolated_candidate_pr_run(self, name):
+        run_id, store, environment = self.start_isolated_candidate_push_run(name)
+        interrupted = self.run_afk(
+            "_worker",
+            run_id,
+            **environment,
+            AFK_TEST_KILL_AFTER_EVENT="candidate.branch_published",
+        )
+        self.assertLess(interrupted.returncode, 0)
+        self.assertIsNone(store.effect_if_present(run_id, "pr-create"))
+        return run_id, store, environment
+
     def mutation_count(self, name, *, state_home=None):
         path = (state_home or self.state_home) / "fake-mutations.jsonl"
         if not path.exists():
@@ -2402,7 +2414,7 @@ class StartCliTest(unittest.TestCase):
         self.assertEqual(effect["observed"], status["pr_ready"])
         self.assertEqual(self.mutation_count("pr-ready"), 1)
 
-    def test_resume_requires_attention_when_crashed_pr_ready_is_ambiguous(self):
+    def test_resume_requires_attention_when_crashed_pr_ready_is_unavailable(self):
         run_id = self.start_reviewed_run()
         interrupted = self.run_afk("resume", AFK_TEST_KILL_AFTER_MUTATION="pr-ready")
         self.assertLess(interrupted.returncode, 0)
@@ -2413,7 +2425,7 @@ class StartCliTest(unittest.TestCase):
         status = json.loads(self.run_afk("status", run_id, "--json").stdout)
         self.assertEqual(status["checkpoint"], "reviewed")
         self.assertEqual(status["attention"]["scope"], "publication")
-        self.assertEqual(status["attention"]["kind"], "inconclusive")
+        self.assertEqual(status["attention"]["kind"], "unavailable")
         self.assertEqual(self.mutation_count("pr-ready"), 1)
 
     def test_resume_recovers_crash_after_ready_state_append(self):
@@ -6745,7 +6757,7 @@ class StartCliTest(unittest.TestCase):
             "Candidate branch publication lifecycle is invalid",
         )
 
-    def test_resume_reconciles_a_candidate_pr_completed_before_confirmation(self):
+    def test_candidate_pr_command_failure_after_mutation_reconciles_immediately(self):
         home = str(self.temp)
         started = self.run_afk("start", "central-bnkl.1.1", HOME=home)
         run_id = started.stdout.strip()
@@ -6754,22 +6766,16 @@ class StartCliTest(unittest.TestCase):
             "_worker_unit", run_id, HOME=home, AFK_FAKE_PR_INTERRUPTED="1"
         )
 
-        self.assertEqual(interrupted.returncode, 2, interrupted.stderr)
+        self.assertEqual(interrupted.returncode, 0, interrupted.stderr)
         before = json.loads(self.run_afk("status", run_id, "--json").stdout)
-        self.assertEqual(before["checkpoint"], "change_committed")
-        self.assertEqual(before["attention"]["scope"], "candidate")
+        self.assertEqual(before["checkpoint"], "reviewed")
+        self.assertEqual(before["validation"]["status"], "passed")
         store = RunStore(self.state_home / "afk")
-        self.assertEqual(store.effect(run_id, "pr-create")["status"], "prepared")
-
-        resumed = self.run_afk("resume", HOME=home)
-
-        self.assertEqual(resumed.returncode, 0, resumed.stderr)
-        after = json.loads(self.run_afk("status", run_id, "--json").stdout)
-        self.assertEqual(after["checkpoint"], "reviewed")
-        self.assertEqual(after["validation"]["status"], "passed")
         self.assertEqual(store.effect(run_id, "pr-create")["status"], "confirmed")
         commands = self.command_log.read_text(encoding="utf-8")
         self.assertEqual(commands.count('"command":"gh","args":["pr","create"'), 1)
+        self.assertEqual(self.mutation_count("pr-create"), 1)
+        self.assertEqual(len(self.launch_events(run_id, "candidate.pr_published")), 1)
 
         terminal_resume = self.run_afk("resume", HOME=home)
 
@@ -6777,6 +6783,434 @@ class StartCliTest(unittest.TestCase):
         terminal = json.loads(self.run_afk("status", run_id, "--json").stdout)
         self.assertEqual(terminal["checkpoint"], "reviewed")
         self.assertEqual(terminal["validation"]["status"], "passed")
+
+    def test_resume_reconciles_candidate_pr_mutation_boundaries_once(self):
+        scenarios = {
+            "before": {"AFK_TEST_KILL_BEFORE_MUTATION": "pr-create"},
+            "after": {"AFK_TEST_KILL_AFTER_MUTATION": "pr-create"},
+        }
+        for name, injection in scenarios.items():
+            with self.subTest(name=name):
+                run_id, store, environment = self.start_isolated_candidate_pr_run(
+                    f"pr-{name}"
+                )
+                state_home = Path(environment["XDG_STATE_HOME"])
+
+                interrupted = self.run_afk(
+                    "resume",
+                    **environment,
+                    **injection,
+                )
+
+                self.assertLess(interrupted.returncode, 0)
+                self.assertEqual(
+                    store.effect(run_id, "pr-create")["status"], "prepared"
+                )
+                self.assertEqual(
+                    self.mutation_count("pr-create", state_home=state_home),
+                    0 if name == "before" else 1,
+                )
+
+                resumed = self.run_afk("resume", **environment)
+
+                self.assertEqual(resumed.returncode, 0, resumed.stderr)
+                effect = store.effect(run_id, "pr-create")
+                self.assertEqual(effect["status"], "confirmed")
+                self.assertEqual(
+                    self.mutation_count("pr-create", state_home=state_home), 1
+                )
+                publications = self.launch_events(
+                    run_id, "candidate.pr_published", state_home=state_home
+                )
+                self.assertEqual(len(publications), 1)
+                self.assertEqual(
+                    publications[0]["data"]["candidate_pr"], effect["observed"]
+                )
+
+    def test_resume_reconciles_candidate_pr_durable_boundaries_once(self):
+        scenarios = {
+            "before-effect": (
+                {"AFK_TEST_KILL_BEFORE_EFFECT": "pr-create"},
+                None,
+                0,
+                0,
+            ),
+            "after-effect": (
+                {"AFK_TEST_KILL_AFTER_EFFECT": "pr-create"},
+                "prepared",
+                0,
+                0,
+            ),
+            "before-confirm": (
+                {"AFK_TEST_KILL_BEFORE_CONFIRM": "pr-create"},
+                "prepared",
+                1,
+                0,
+            ),
+            "after-confirm": (
+                {"AFK_TEST_KILL_AFTER_CONFIRM": "pr-create"},
+                "confirmed",
+                1,
+                0,
+            ),
+            "before-publication": (
+                {"AFK_TEST_KILL_BEFORE_EVENT": "candidate.pr_published"},
+                "confirmed",
+                1,
+                0,
+            ),
+            "after-publication": (
+                {"AFK_TEST_KILL_AFTER_EVENT_WRITE": "candidate.pr_published"},
+                "confirmed",
+                1,
+                1,
+            ),
+            "before-ready": (
+                {"AFK_TEST_KILL_BEFORE_EVENT": "candidate.ready"},
+                "confirmed",
+                1,
+                1,
+            ),
+            "after-ready": (
+                {"AFK_TEST_KILL_AFTER_EVENT_WRITE": "candidate.ready"},
+                "confirmed",
+                1,
+                1,
+            ),
+        }
+        for name, (
+            injection,
+            effect_status,
+            mutations,
+            event_count,
+        ) in scenarios.items():
+            with self.subTest(name=name):
+                run_id, store, environment = self.start_isolated_candidate_pr_run(
+                    f"pr-durable-{name}"
+                )
+                state_home = Path(environment["XDG_STATE_HOME"])
+
+                interrupted = self.run_afk("resume", **environment, **injection)
+
+                self.assertLess(interrupted.returncode, 0)
+                effect = store.effect_if_present(run_id, "pr-create")
+                self.assertEqual(
+                    effect.get("status") if effect is not None else None,
+                    effect_status,
+                )
+                self.assertEqual(
+                    self.mutation_count("pr-create", state_home=state_home), mutations
+                )
+                self.assertEqual(
+                    len(
+                        self.launch_events(
+                            run_id,
+                            "candidate.pr_published",
+                            state_home=state_home,
+                        )
+                    ),
+                    event_count,
+                )
+
+                resumed = self.run_afk("resume", **environment)
+
+                self.assertEqual(resumed.returncode, 0, resumed.stderr)
+                candidate_sha = "d" * 40
+                branch = f"afk/central-bnkl-1-1-{run_id}/candidate"
+                marker = f"<!-- afk-candidate:{run_id}:{candidate_sha} -->"
+                title = "central-bnkl.1.1: AFK Candidate"
+                body = (
+                    f"{marker}\n"
+                    f"AFK Run `{run_id}` produced Candidate `{candidate_sha}` for "
+                    "Bead `central-bnkl.1.1`.\n"
+                )
+                effect = store.effect(run_id, "pr-create")
+                self.assertEqual(
+                    effect["intended"],
+                    {
+                        "repository": "thunderbump/beads-webui",
+                        "base": "main",
+                        "head": branch,
+                        "candidate_sha": candidate_sha,
+                        "title": title,
+                        "body": body,
+                        "marker": marker,
+                    },
+                )
+                self.assertEqual(
+                    effect["observed"],
+                    {
+                        "repository": "thunderbump/beads-webui",
+                        "number": 17,
+                        "url": "https://example.test/pr/17",
+                        "head_sha": candidate_sha,
+                        "head": branch,
+                        "base": "main",
+                        "state": "OPEN",
+                        "draft": True,
+                        "marker": marker,
+                    },
+                )
+                self.assertEqual(
+                    self.mutation_count("pr-create", state_home=state_home), 1
+                )
+                publications = self.launch_events(
+                    run_id, "candidate.pr_published", state_home=state_home
+                )
+                self.assertEqual(len(publications), 1)
+                self.assertEqual(
+                    publications[0]["data"]["candidate_pr"], effect["observed"]
+                )
+
+    def test_resume_rejects_malformed_candidate_pr_publication_before_commands(self):
+        run_id, store, environment = self.start_isolated_candidate_pr_run(
+            "malformed-pr-publication"
+        )
+        interrupted = self.run_afk(
+            "resume",
+            **environment,
+            AFK_TEST_KILL_BEFORE_EVENT="candidate.pr_published",
+        )
+        self.assertLess(interrupted.returncode, 0)
+        store.append_event(
+            run_id,
+            "candidate.pr_published",
+            state="change_committed",
+            data={
+                "checkpoint": "change_committed",
+                "candidate_pr": {
+                    **store.effect(run_id, "pr-create")["observed"],
+                    "repository": "thunderbump/another-repo",
+                },
+                "attention": {},
+            },
+        )
+        commands_before = self.command_log.read_text(encoding="utf-8")
+
+        resumed = self.run_afk("resume", **environment)
+
+        self.assertEqual(resumed.returncode, 2, resumed.stderr)
+        self.assertEqual(self.command_log.read_text(encoding="utf-8"), commands_before)
+        projection = store.status(run_id)
+        self.assertEqual(projection["attention"]["kind"], "invalid")
+        self.assertEqual(
+            projection["attention"]["summary"],
+            "Candidate PR publication lifecycle is invalid",
+        )
+
+    def test_candidate_pr_observation_fails_closed_before_mutation(self):
+        scenarios = {
+            "unavailable": (
+                {"AFK_FAKE_CANDIDATE_PR_UNAVAILABLE": "1"},
+                "unavailable",
+            ),
+            "malformed": (
+                {"AFK_FAKE_CANDIDATE_PR_MALFORMED": "1"},
+                "invalid",
+            ),
+        }
+        for name, (observation, kind) in scenarios.items():
+            with self.subTest(name=name):
+                run_id, store, environment = self.start_isolated_candidate_pr_run(
+                    f"pr-observation-{name}"
+                )
+                state_home = Path(environment["XDG_STATE_HOME"])
+
+                paused = self.run_afk("resume", **environment, **observation)
+
+                self.assertEqual(paused.returncode, 2, paused.stderr)
+                projection = store.status(run_id)
+                self.assertEqual(projection["checkpoint"], "change_committed")
+                self.assertEqual(projection["attention"]["scope"], "candidate")
+                self.assertEqual(projection["attention"]["kind"], kind)
+                self.assertEqual(
+                    store.effect(run_id, "pr-create")["status"], "prepared"
+                )
+                self.assertEqual(
+                    self.mutation_count("pr-create", state_home=state_home), 0
+                )
+
+    def test_candidate_pr_refuses_repository_base_or_candidate_drift_before_effect(
+        self,
+    ):
+        scenarios = {
+            "repository": (
+                {"AFK_FAKE_ORIGIN_REPOSITORY": "thunderbump/another-repo"},
+                "invalid",
+            ),
+            "candidate": ({"AFK_FAKE_CANDIDATE_REMOTE_SHA": "e" * 40}, "conflict"),
+            "base": ({}, "conflict"),
+        }
+        for name, (drift, kind) in scenarios.items():
+            with self.subTest(name=name):
+                run_id, store, environment = self.start_isolated_candidate_pr_run(
+                    f"pr-input-{name}"
+                )
+                state_home = Path(environment["XDG_STATE_HOME"])
+                if name == "base":
+                    (state_home / "fake-target-drift").write_text(
+                        "drifted", encoding="utf-8"
+                    )
+
+                paused = self.run_afk("resume", **environment, **drift)
+
+                self.assertEqual(paused.returncode, 2, paused.stderr)
+                self.assertEqual(store.status(run_id)["attention"]["kind"], kind)
+                self.assertIsNone(store.effect_if_present(run_id, "pr-create"))
+                self.assertEqual(
+                    self.mutation_count("pr-create", state_home=state_home), 0
+                )
+
+    def test_candidate_pr_duplicate_or_identity_drift_requires_attention(self):
+        scenarios = {
+            "duplicate": ({"AFK_FAKE_CANDIDATE_PR_AMBIGUOUS": "1"}, "conflict"),
+            "head": ({"AFK_FAKE_CANDIDATE_PR_HEAD": "e" * 40}, "conflict"),
+            "base": ({"AFK_FAKE_CANDIDATE_PR_BASE": "release"}, "conflict"),
+            "marker": ({"AFK_FAKE_CANDIDATE_PR_BODY": "not this Run"}, "conflict"),
+            "malformed-number": (
+                {"AFK_FAKE_CANDIDATE_PR_NUMBER": "not-an-integer"},
+                "invalid",
+            ),
+        }
+        for name, (drift, kind) in scenarios.items():
+            with self.subTest(name=name):
+                run_id, store, environment = self.start_isolated_candidate_pr_run(
+                    f"pr-drift-{name}"
+                )
+                state_home = Path(environment["XDG_STATE_HOME"])
+                candidate_sha = "d" * 40
+                branch = f"afk/central-bnkl-1-1-{run_id}/candidate"
+                marker = f"<!-- afk-candidate:{run_id}:{candidate_sha} -->"
+                (state_home / "fake-pr.json").write_text(
+                    json.dumps(
+                        {
+                            "number": 17,
+                            "url": "https://example.test/pr/17",
+                            "state": "OPEN",
+                            "isDraft": True,
+                            "headRefOid": candidate_sha,
+                            "headRefName": branch,
+                            "baseRefName": "main",
+                            "title": "central-bnkl.1.1: AFK Candidate",
+                            "body": (
+                                f"{marker}\nAFK Run `{run_id}` produced Candidate "
+                                f"`{candidate_sha}` for Bead `central-bnkl.1.1`.\n"
+                            ),
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+
+                paused = self.run_afk("resume", **environment, **drift)
+
+                self.assertEqual(paused.returncode, 2, paused.stderr)
+                projection = store.status(run_id)
+                self.assertEqual(projection["attention"]["kind"], kind)
+                self.assertEqual(
+                    self.mutation_count("pr-create", state_home=state_home), 0
+                )
+
+    def test_candidate_pr_post_mutation_outage_resumes_without_duplicate(self):
+        run_id, store, environment = self.start_isolated_candidate_pr_run(
+            "pr-post-mutation-outage"
+        )
+        state_home = Path(environment["XDG_STATE_HOME"])
+
+        paused = self.run_afk(
+            "resume",
+            **environment,
+            AFK_FAKE_CANDIDATE_PR_UNAVAILABLE_AFTER_CREATE="1",
+        )
+
+        self.assertEqual(paused.returncode, 2, paused.stderr)
+        self.assertEqual(store.effect(run_id, "pr-create")["status"], "prepared")
+        self.assertEqual(store.status(run_id)["attention"]["kind"], "unavailable")
+        self.assertEqual(self.mutation_count("pr-create", state_home=state_home), 1)
+
+        resumed = self.run_afk("resume", **environment)
+
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        self.assertEqual(store.effect(run_id, "pr-create")["status"], "confirmed")
+        self.assertEqual(self.mutation_count("pr-create", state_home=state_home), 1)
+
+    def test_candidate_pr_observation_outage_after_ready_remains_resumable(self):
+        run_id, _, environment = self.start_isolated_candidate_pr_run(
+            "pr-ready-observation-outage"
+        )
+        state_home = Path(environment["XDG_STATE_HOME"])
+        interrupted = self.run_afk(
+            "resume",
+            **environment,
+            AFK_TEST_KILL_AFTER_EVENT_WRITE="candidate.ready",
+        )
+        self.assertLess(interrupted.returncode, 0)
+
+        paused = self.run_afk(
+            "resume",
+            **environment,
+            AFK_FAKE_CANDIDATE_PR_UNAVAILABLE="1",
+        )
+
+        self.assertEqual(paused.returncode, 2, paused.stderr)
+        status = json.loads(
+            self.run_afk("status", run_id, "--json", **environment).stdout
+        )
+        self.assertEqual(status["checkpoint"], "candidate_ready")
+        self.assertEqual(status["attention"]["scope"], "candidate")
+        self.assertEqual(status["attention"]["kind"], "unavailable")
+
+        resumed = self.run_afk("resume", **environment)
+
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        status = json.loads(
+            self.run_afk("status", run_id, "--json", **environment).stdout
+        )
+        self.assertEqual(status["checkpoint"], "reviewed")
+        self.assertEqual(self.mutation_count("pr-create", state_home=state_home), 1)
+
+    def test_confirmed_candidate_pr_is_not_recreated_after_disappearance(self):
+        run_id, store, environment = self.start_isolated_candidate_pr_run(
+            "confirmed-pr-disappears"
+        )
+        state_home = Path(environment["XDG_STATE_HOME"])
+        interrupted = self.run_afk(
+            "resume",
+            **environment,
+            AFK_TEST_KILL_BEFORE_EVENT="candidate.pr_published",
+        )
+        self.assertLess(interrupted.returncode, 0)
+        (state_home / "fake-pr.json").unlink()
+
+        resumed = self.run_afk("resume", **environment)
+
+        self.assertEqual(resumed.returncode, 2, resumed.stderr)
+        self.assertEqual(store.status(run_id)["attention"]["kind"], "conflict")
+        self.assertEqual(store.effect(run_id, "pr-create")["status"], "confirmed")
+        self.assertEqual(self.mutation_count("pr-create", state_home=state_home), 1)
+
+    def test_resume_rejects_a_published_candidate_pr_without_its_run_marker(self):
+        run_id, store, environment = self.start_isolated_candidate_pr_run(
+            "published-pr-marker-drift"
+        )
+        state_home = Path(environment["XDG_STATE_HOME"])
+        interrupted = self.run_afk(
+            "resume",
+            **environment,
+            AFK_TEST_KILL_AFTER_EVENT_WRITE="candidate.ready",
+        )
+        self.assertLess(interrupted.returncode, 0)
+        pr_path = state_home / "fake-pr.json"
+        pr = json.loads(pr_path.read_text(encoding="utf-8"))
+        pr["body"] = "marker removed"
+        pr_path.write_text(json.dumps(pr), encoding="utf-8")
+
+        resumed = self.run_afk("resume", **environment)
+
+        self.assertEqual(resumed.returncode, 2, resumed.stderr)
+        projection = store.status(run_id)
+        self.assertEqual(projection["checkpoint"], "candidate_ready")
+        self.assertEqual(projection["attention"]["kind"], "conflict")
+        self.assertEqual(self.mutation_count("pr-create", state_home=state_home), 1)
 
     def test_resume_requires_attention_for_confirmed_collected_worker_without_terminal(
         self,
@@ -7790,12 +8224,41 @@ class StartCliTest(unittest.TestCase):
                         for rule in rules:
                             print(json.dumps(rule, separators=(",", ":")))
                     elif args[:2] == ["pr", "list"]:
-                        if os.environ.get("AFK_FAKE_READY_PR_UNAVAILABLE"):
+                        if os.environ.get("AFK_FAKE_CANDIDATE_PR_UNAVAILABLE") or (
+                            os.environ.get(
+                                "AFK_FAKE_CANDIDATE_PR_UNAVAILABLE_AFTER_CREATE"
+                            )
+                            and pr_state.exists()
+                        ):
+                            raise SystemExit(1)
+                        elif os.environ.get("AFK_FAKE_CANDIDATE_PR_MALFORMED"):
+                            print("{")
+                        elif os.environ.get("AFK_FAKE_READY_PR_UNAVAILABLE"):
                             raise SystemExit(1)
                         elif os.environ.get("AFK_FAKE_READY_PR_MALFORMED"):
                             print("{")
                         else:
                             values = [json.loads(pr_state.read_text())] if pr_state.exists() else []  # noqa: E501
+                            if values and os.environ.get("AFK_FAKE_CANDIDATE_PR_HEAD"):
+                                values[0]["headRefOid"] = os.environ[
+                                    "AFK_FAKE_CANDIDATE_PR_HEAD"
+                                ]
+                            if values and os.environ.get("AFK_FAKE_CANDIDATE_PR_BASE"):
+                                values[0]["baseRefName"] = os.environ[
+                                    "AFK_FAKE_CANDIDATE_PR_BASE"
+                                ]
+                            if values and os.environ.get("AFK_FAKE_CANDIDATE_PR_BODY"):
+                                values[0]["body"] = os.environ[
+                                    "AFK_FAKE_CANDIDATE_PR_BODY"
+                                ]
+                            if values and os.environ.get("AFK_FAKE_CANDIDATE_PR_NUMBER"):
+                                values[0]["number"] = os.environ[
+                                    "AFK_FAKE_CANDIDATE_PR_NUMBER"
+                                ]
+                            if values and os.environ.get(
+                                "AFK_FAKE_CANDIDATE_PR_AMBIGUOUS"
+                            ):
+                                values.append(dict(values[0]))
                             if values and os.environ.get("AFK_FAKE_READY_PR_URL"):
                                 values[0]["url"] = os.environ["AFK_FAKE_READY_PR_URL"]
                             if values and os.environ.get("AFK_FAKE_READY_PR_AMBIGUOUS"):
@@ -7846,6 +8309,7 @@ class StartCliTest(unittest.TestCase):
                         ):
                             target_drift.write_text("drifted", encoding="utf-8")
                     elif args[:2] == ["pr", "create"]:
+                        before_mutation("pr-create")
                         value = {
                             "number": 17,
                             "url": "https://example.test/pr/17",
@@ -7854,8 +8318,11 @@ class StartCliTest(unittest.TestCase):
                             "headRefOid": candidate_sha,
                             "headRefName": args[args.index("--head") + 1],
                             "baseRefName": args[args.index("--base") + 1],
+                            "title": args[args.index("--title") + 1],
+                            "body": args[args.index("--body") + 1],
                         }
                         pr_state.write_text(json.dumps(value), encoding="utf-8")
+                        after_mutation("pr-create")
                         print(value["url"])
                         if os.environ.get("AFK_FAKE_TARGET_DRIFT_ON_PR"):
                             target_drift.write_text("drifted", encoding="utf-8")

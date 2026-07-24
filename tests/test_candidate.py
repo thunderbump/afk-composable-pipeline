@@ -1416,8 +1416,10 @@ class CandidateTest(unittest.TestCase):
                 elif args[:2] == ["pr", "create"]:
                     branch = args[args.index("--head") + 1]
                     base = args[args.index("--base") + 1]
+                    title = args[args.index("--title") + 1]
+                    body = args[args.index("--body") + 1]
                     oid = subprocess.run(["git", "rev-parse", "HEAD"], text=True, capture_output=True, check=True).stdout.strip()  # noqa: E501
-                    value = {"number": 7, "url": "https://example.test/pr/7", "state": "OPEN", "isDraft": True, "headRefOid": oid, "headRefName": branch, "baseRefName": base}  # noqa: E501
+                    value = {"number": 7, "url": "https://example.test/pr/7", "state": "OPEN", "isDraft": True, "headRefOid": oid, "headRefName": branch, "baseRefName": base, "title": title, "body": body}  # noqa: E501
                     state.write_text(json.dumps(value), encoding="utf-8")
                     print(value["url"])
                 else:
