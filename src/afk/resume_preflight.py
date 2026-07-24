@@ -7,6 +7,10 @@ from afk.candidate_publication import (
     EVENT as CANDIDATE_PUBLICATION_EVENT,
     valid_event as valid_candidate_publication_event,
 )
+from afk.candidate_pr_publication import (
+    EVENT as CANDIDATE_PR_PUBLICATION_EVENT,
+    valid_event as valid_candidate_pr_publication_event,
+)
 from afk.implementation_attempt import (
     BINDING_FIELDS,
     FIRST_ATTEMPT_ID,
@@ -56,6 +60,8 @@ def validate_open_attempts(
         return "implementation attempt lifecycle is invalid"
     if _candidate_publication_invalid(projection, events):
         return "Candidate branch publication lifecycle is invalid"
+    if _candidate_pr_publication_invalid(projection, events):
+        return "Candidate PR publication lifecycle is invalid"
 
     lifecycle_invalid, validation_is_open, started_validation = (
         _open_validation_attempt(events)
@@ -127,6 +133,38 @@ def _candidate_publication_invalid(
     projected = projection.get("candidate_publication")
     return (
         bool(publications) != ("candidate_publication" in projection)
+        or bool(publications)
+        and projected != publications[-1]
+    )
+
+
+def _candidate_pr_publication_invalid(
+    projection: dict[str, Any], events: list[dict[str, Any]]
+) -> bool:
+    publications: list[dict[str, Any]] = []
+    checkpoint = "created"
+    candidate_sha: Any = None
+    for event in events:
+        data = event.get("data")
+        if event["event"] == CANDIDATE_PR_PUBLICATION_EVENT:
+            publication = data.get("candidate_pr") if isinstance(data, dict) else None
+            if (
+                not valid_candidate_pr_publication_event(
+                    event,
+                    projection={**projection, "candidate_sha": candidate_sha},
+                    checkpoint=checkpoint,
+                )
+                or publications
+            ):
+                return True
+            publications.append(publication)
+        if isinstance(data, dict) and "candidate_sha" in data:
+            candidate_sha = data["candidate_sha"]
+        if isinstance(data, dict) and isinstance(data.get("checkpoint"), str):
+            checkpoint = data["checkpoint"]
+    projected = projection.get("candidate_pr")
+    return (
+        bool(publications) != ("candidate_pr" in projection)
         or bool(publications)
         and projected != publications[-1]
     )
