@@ -284,6 +284,12 @@ def resume_run(
             return run_id, _advance_repaired_candidate(store, run_id)
         if projection["last_event"] == "candidate.ready":
             return run_id, _advance_validation_then_gate(store, run_id)
+        if (
+            projection["checkpoint"] == "candidate_ready"
+            and isinstance(attention, dict)
+            and attention.get("scope") == "candidate"
+        ):
+            return run_id, _advance_validation_then_gate(store, run_id)
         if "worker_exit_code" in projection:
             if _candidate_resume_ready(projection):
                 return run_id, _advance_candidate(store, run_id)

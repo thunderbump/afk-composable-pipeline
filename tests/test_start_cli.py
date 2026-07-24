@@ -7133,6 +7133,41 @@ class StartCliTest(unittest.TestCase):
         self.assertEqual(store.effect(run_id, "pr-create")["status"], "confirmed")
         self.assertEqual(self.mutation_count("pr-create", state_home=state_home), 1)
 
+    def test_candidate_pr_observation_outage_after_ready_remains_resumable(self):
+        run_id, _, environment = self.start_isolated_candidate_pr_run(
+            "pr-ready-observation-outage"
+        )
+        state_home = Path(environment["XDG_STATE_HOME"])
+        interrupted = self.run_afk(
+            "resume",
+            **environment,
+            AFK_TEST_KILL_AFTER_EVENT_WRITE="candidate.ready",
+        )
+        self.assertLess(interrupted.returncode, 0)
+
+        paused = self.run_afk(
+            "resume",
+            **environment,
+            AFK_FAKE_CANDIDATE_PR_UNAVAILABLE="1",
+        )
+
+        self.assertEqual(paused.returncode, 2, paused.stderr)
+        status = json.loads(
+            self.run_afk("status", run_id, "--json", **environment).stdout
+        )
+        self.assertEqual(status["checkpoint"], "candidate_ready")
+        self.assertEqual(status["attention"]["scope"], "candidate")
+        self.assertEqual(status["attention"]["kind"], "unavailable")
+
+        resumed = self.run_afk("resume", **environment)
+
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        status = json.loads(
+            self.run_afk("status", run_id, "--json", **environment).stdout
+        )
+        self.assertEqual(status["checkpoint"], "reviewed")
+        self.assertEqual(self.mutation_count("pr-create", state_home=state_home), 1)
+
     def test_confirmed_candidate_pr_is_not_recreated_after_disappearance(self):
         run_id, store, environment = self.start_isolated_candidate_pr_run(
             "confirmed-pr-disappears"
