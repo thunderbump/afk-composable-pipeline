@@ -1221,7 +1221,8 @@ def _advance_repaired_candidate(store: RunStore, run_id: str) -> int:
 def _advance_validation_then_gate(store: RunStore, run_id: str) -> int:
     try:
         projection = store.status(run_id)
-        verify_candidate_publication(store.identity(run_id), projection)
+        if projection.get("candidate_pr") is not None:
+            verify_candidate_publication(store.identity(run_id), projection)
     except CandidateError as exc:
         _attention(
             store,

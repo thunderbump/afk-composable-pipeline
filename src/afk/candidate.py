@@ -1618,8 +1618,10 @@ def _verify_published(
         raise CandidateError("PR Candidate facts disagree", kind="conflict")
 
 
-def _projected_candidate_pr_marker(projection: dict[str, Any]) -> str:
+def _projected_candidate_pr_marker(projection: dict[str, Any]) -> str | None:
     publication = projection.get("candidate_pr")
+    if publication is None:
+        return None
     marker = publication.get("marker") if isinstance(publication, dict) else None
     if not isinstance(marker, str) or not marker:
         raise CandidateError("durable Candidate PR marker is invalid", kind="conflict")
