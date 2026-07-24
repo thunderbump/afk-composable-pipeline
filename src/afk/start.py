@@ -30,6 +30,7 @@ from afk.candidate_gate import (
     GateError,
     MAX_GATE_COMMENTS,
     complete_gate_cycle,
+    gate_comment_effect_id,
     reconcile_gate_comment,
 )
 from afk.candidate_validation import (
@@ -1366,7 +1367,7 @@ def _advance_pr_ready(store: RunStore, run_id: str) -> int:
             summary="PR readiness Gate identity is invalid",
         )
         return 2
-    comment_effect_id = f"gate-comment-{cycle}{f'-retry-{retry}' if retry else ''}"
+    comment_effect_id = gate_comment_effect_id(cycle, retry)
     try:
         reconcile_gate_comment(
             store,

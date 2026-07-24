@@ -306,7 +306,7 @@ def reconcile_gate_comment(
     retry = intended["retry"]
     marker = intended["marker"]
     body = _gate_comment_body(gate, marker)
-    effect_id = f"gate-comment-{cycle}{f'-retry-{retry}' if retry else ''}"
+    effect_id = gate_comment_effect_id(cycle, retry)
     existing = store.effect_if_present(run_id, effect_id)
     legacy_intended = {key: value for key, value in intended.items() if key != "marker"}
     legacy_effect = (
@@ -363,6 +363,10 @@ def reconcile_gate_comment(
             kind="conflict",
         )
     store.confirm_effect(run_id, effect_id, observed=observed)
+
+
+def gate_comment_effect_id(cycle: int, retry: int) -> str:
+    return f"gate-comment-{cycle}{f'-retry-{retry}' if retry else ''}"
 
 
 def _gate_comment_identity(
