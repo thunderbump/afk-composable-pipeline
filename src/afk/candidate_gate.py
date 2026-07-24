@@ -26,6 +26,7 @@ from afk.run_store import RunStore
 
 
 REVIEW_AXES = ("standards", "spec")
+MAX_GATE_COMMENTS = 5
 REVIEW_REPORT_SCHEMA = {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "type": "object",
@@ -100,6 +101,14 @@ def complete_gate_cycle(
         raise GateError("Gate retry number is invalid")
     bead = load_bead_spec(store, run_id, fallback=bead)
     projection = store.status(run_id)
+    cycles = projection.get("gate_cycles", [])
+    if not isinstance(cycles, list):
+        raise GateError("Gate Cycle history is invalid")
+    if len(cycles) >= MAX_GATE_COMMENTS:
+        raise GateError(
+            "Gate evidence comment budget exhausted after five comments",
+            kind="exhausted",
+        )
     _require_candidate_publication(store, run_id, projection)
     candidate_sha = _required_text(projection, "candidate_sha")
     validation_record = projection.get("validation")
@@ -235,9 +244,6 @@ def complete_gate_cycle(
         worktree=Path(_required_text(projection, "worktree_path")),
         gate=outcome,
     )
-    cycles = projection.get("gate_cycles", [])
-    if not isinstance(cycles, list):
-        raise GateError("Gate Cycle history is invalid")
     if not any(
         isinstance(item, dict)
         and item.get("cycle") == cycle

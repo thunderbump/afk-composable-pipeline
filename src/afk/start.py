@@ -28,6 +28,7 @@ from afk.candidate import (
 )
 from afk.candidate_gate import (
     GateError,
+    MAX_GATE_COMMENTS,
     complete_gate_cycle,
     reconcile_gate_comment,
 )
@@ -2117,6 +2118,22 @@ def _advance_completed_gate(
     next_action = outcome.get("next_action")
     if next_action == "complete":
         return 0
+    cycles = projection.get("gate_cycles", [])
+    if (
+        next_action in {"attention", "repair"}
+        and not outcome.get("stop_reason")
+        and isinstance(cycles, list)
+        and len(cycles) >= MAX_GATE_COMMENTS
+    ):
+        _attention(
+            store,
+            run_id,
+            checkpoint=projection["checkpoint"],
+            scope="gate",
+            kind="exhausted",
+            summary="Gate evidence comment budget exhausted after five comments",
+        )
+        return 2
     if next_action == "attention":
         _attention(
             store,

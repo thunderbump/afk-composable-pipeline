@@ -2482,6 +2482,66 @@ class StartCliTest(unittest.TestCase):
             1,
         )
 
+    def test_resume_stops_after_five_inconclusive_gate_comments(self):
+        state_home = self.temp / "bounded-gate-comments"
+        run_id, store, environment = self.start_isolated_validation_run(
+            "bounded-gate-comments"
+        )
+        home = Path(environment["HOME"])
+        (home / ".fake-review-status").write_text("inconclusive", encoding="utf-8")
+
+        for retry in range(5):
+            arguments = (
+                ("resume",)
+                if retry == 0
+                else ("resume", "--note", f"retry inconclusive Gate {retry}")
+            )
+            resumed = self.run_afk(*arguments, **environment)
+            self.assertEqual(resumed.returncode, 2, resumed.stderr)
+
+        before_exhaustion = store.status(run_id)
+        self.assertEqual(len(before_exhaustion["gate_cycles"]), 5)
+        self.assertEqual(before_exhaustion["attention"]["kind"], "exhausted")
+        self.assertEqual(
+            self.mutation_count("gate-comment", state_home=state_home),
+            5,
+        )
+
+        exhausted = self.run_afk(
+            "resume",
+            "--note",
+            "attempt a sixth Gate comment",
+            **environment,
+        )
+
+        self.assertEqual(exhausted.returncode, 2, exhausted.stderr)
+        status = json.loads(
+            self.run_afk("status", run_id, "--json", **environment).stdout
+        )
+        self.assertEqual(status["attention"]["scope"], "gate")
+        self.assertEqual(status["attention"]["kind"], "exhausted")
+        self.assertIn("five comments", status["attention"]["summary"])
+        self.assertEqual(len(status["gate_cycles"]), 5)
+        self.assertEqual(
+            self.mutation_count("gate-comment", state_home=state_home),
+            5,
+        )
+        self.assertIsNone(store.effect_if_present(run_id, "gate-comment-1-retry-5"))
+
+        repeated = self.run_afk("resume", **environment)
+
+        self.assertEqual(repeated.returncode, 2, repeated.stderr)
+        self.assertEqual(
+            json.loads(self.run_afk("status", run_id, "--json", **environment).stdout)[
+                "attention"
+            ],
+            status["attention"],
+        )
+        self.assertEqual(
+            self.mutation_count("gate-comment", state_home=state_home),
+            5,
+        )
+
     def test_resume_requires_attention_for_changed_gate_comment_observation(self):
         scenarios = ("duplicate", "edited", "drifted-url", "unavailable", "absent")
         for scenario in scenarios:
@@ -9368,11 +9428,17 @@ class StartCliTest(unittest.TestCase):
                         if summary_path.exists()
                         else "review passed"
                     )
+                    status_path = Path.home() / ".fake-review-status"
+                    status = (
+                        status_path.read_text().strip()
+                        if status_path.exists()
+                        else "passed"
+                    )
                     report.write_text(json.dumps({
                         "schema_version": 1,
                         "candidate_sha": candidate_sha,
                         "axis": axis,
-                        "status": "passed",
+                        "status": status,
                         "summary": summary,
                         "findings": [],
                     }), encoding="utf-8")
