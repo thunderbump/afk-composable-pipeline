@@ -232,6 +232,20 @@ def resume_run(
             return run_id, _advance_candidate(store, run_id)
         if _validation_attempt_open(projection):
             return run_id, _recover_validation_attempt(store, run_id, projection)
+        if _validation_outcome_pending(projection):
+            return run_id, _recover_validation_attempt(store, run_id, projection)
+        if _validation_interruption_attention_pending(projection):
+            attempt = projection["validation_attempt"]
+            _attention(
+                store,
+                run_id,
+                checkpoint="candidate_ready",
+                scope="validation",
+                kind="interrupted",
+                summary="validation attempt was interrupted before completion",
+                validation_attempt=attempt,
+            )
+            return run_id, 2
         if _repair_interruption_pending(store, run_id, projection):
             return run_id, _recover_interrupted_repair(store, run_id, projection)
         if _interrupted_repair_terminal(projection):
@@ -290,13 +304,15 @@ def resume_run(
             and attention.get("scope") == "candidate"
         ):
             return run_id, _advance_validation_then_gate(store, run_id)
+        if _validation_resume_ready(projection):
+            if _bootstrap_approval_missing(projection):
+                return run_id, 2
+            return run_id, _advance_validation(store, run_id)
         if "worker_exit_code" in projection:
             if _candidate_resume_ready(projection):
                 return run_id, _advance_candidate(store, run_id)
             if _bootstrap_approval_missing(projection):
                 return run_id, 2
-            if _validation_resume_ready(projection):
-                return run_id, _advance_validation(store, run_id)
             return run_id, projection["worker_exit_code"]
         effect, unit = _resume_worker_launch_effect(store, run_id, projection)
         try:
@@ -845,33 +861,68 @@ def _validation_attempt_open(projection: dict[str, Any]) -> bool:
     return isinstance(attempt, dict) and attempt.get("status") == "started"
 
 
+def _validation_outcome_pending(projection: dict[str, Any]) -> bool:
+    attempt = projection.get("validation_attempt")
+    return (
+        projection.get("checkpoint") == "candidate_ready"
+        and "validation" not in projection
+        and isinstance(attempt, dict)
+        and attempt.get("status") in {"passed", "rejected", "inconclusive"}
+    )
+
+
+def _validation_interruption_attention_pending(projection: dict[str, Any]) -> bool:
+    attempt = projection.get("validation_attempt")
+    return (
+        projection.get("checkpoint") == "candidate_ready"
+        and projection.get("attention") == {}
+        and isinstance(attempt, dict)
+        and attempt.get("status") == "interrupted"
+    )
+
+
 def _recover_validation_attempt(
     store: RunStore, run_id: str, projection: dict[str, Any]
 ) -> int:
     attempt = projection["validation_attempt"]
     validation = recover_candidate_validation(store, run_id, attempt)
     if validation is not None:
-        attempt_evidence = store.root / "runs" / run_id / attempt["evidence"]
-        if (attempt_evidence / "manifest.json").exists():
-            store.verify_evidence(run_id, attempt["evidence"])
-            attempt = {**attempt, "status": validation["status"]}
-            store.append_event(
-                run_id,
-                "validation.attempt_finished",
-                data={
-                    "checkpoint": "candidate_ready",
-                    "validation_attempt": attempt,
-                },
-            )
-        else:
-            attempt = _finish_validation_attempt(
-                store,
-                run_id,
-                attempt,
-                status=validation["status"],
-                summary=validation["summary"],
-            )
-        return _record_validation_outcome(store, run_id, validation)
+        if attempt["status"] == "started":
+            attempt_evidence = store.root / "runs" / run_id / attempt["evidence"]
+            if (attempt_evidence / "manifest.json").exists():
+                store.verify_evidence(run_id, attempt["evidence"])
+                attempt = {**attempt, "status": validation["status"]}
+                store.append_event(
+                    run_id,
+                    "validation.attempt_finished",
+                    data={
+                        "checkpoint": "candidate_ready",
+                        "validation_attempt": attempt,
+                    },
+                )
+            else:
+                attempt = _finish_validation_attempt(
+                    store,
+                    run_id,
+                    attempt,
+                    status=validation["status"],
+                    summary=validation["summary"],
+                )
+        elif attempt["status"] != validation["status"]:
+            validation = None
+        if validation is not None:
+            return _record_validation_outcome(store, run_id, validation)
+    if attempt["status"] != "started":
+        _attention(
+            store,
+            run_id,
+            checkpoint="candidate_ready",
+            scope="validation",
+            kind="invalid",
+            summary="completed validation evidence is missing or invalid",
+            validation_attempt=attempt,
+        )
+        return 2
     summary = "validation attempt was interrupted before completion"
     evidence_path = store.root / "runs" / run_id / attempt["evidence"]
     if (evidence_path / "manifest.json").exists():

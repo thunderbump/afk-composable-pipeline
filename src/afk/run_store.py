@@ -851,7 +851,7 @@ class RunStore:
                 manifest = unit / "manifest.json"
                 if manifest.exists() or manifest.is_symlink():
                     try:
-                        self.verify_evidence(run_id, relative)
+                        self._verify_or_finish_seal(run_id, relative)
                     except EvidenceTampered as exc:
                         if relative in projected_units:
                             raise ProjectedEvidenceTampered(str(exc)) from exc
@@ -947,6 +947,13 @@ def _projected_evidence_units(value: Any) -> set[str]:
             parts = Path(evidence).parts
             if len(parts) >= 2 and parts[0] in EVIDENCE_ROOTS:
                 units.add(f"{parts[0]}/{parts[1]}")
+    attempt = value.get("validation_attempt") if isinstance(value, dict) else None
+    if (
+        isinstance(attempt, dict)
+        and attempt.get("status") in {"started", "passed", "rejected", "inconclusive"}
+        and isinstance(attempt.get("attempt_id"), str)
+    ):
+        units.add(f"gates/{attempt['attempt_id']}")
     return units
 
 

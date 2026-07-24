@@ -35,6 +35,10 @@ CRASH_INJECTION_OVERRIDES = (
     "AFK_TEST_KILL_AFTER_EFFECT",
     "AFK_TEST_KILL_BEFORE_CONFIRM",
     "AFK_TEST_KILL_AFTER_CONFIRM",
+    "AFK_TEST_KILL_AFTER_MANIFEST",
+    "AFK_TEST_KILL_AFTER_VALIDATION_COMMAND",
+    "AFK_TEST_KILL_AFTER_EVIDENCE",
+    "AFK_TEST_KILL_AFTER_SEAL",
 )
 
 
@@ -130,6 +134,13 @@ class StartCliTest(unittest.TestCase):
                     "original_write = RunStore._append_event_unlocked\n"
                     "original_effect = RunStore.prepare_effect\n"
                     "original_confirm = RunStore.confirm_effect\n"
+                    "import afk.run_store as run_store_module\n"
+                    "original_write_json = run_store_module._write_new_json\n"
+                    "import afk.candidate_validation as validation_module\n"
+                    "original_run_contract = validation_module._run_contract\n"
+                    "original_write_evidence = RunStore.write_evidence_text\n"
+                    "original_ingest_evidence = RunStore.ingest_evidence_file\n"
+                    "original_seal_evidence = RunStore.seal_evidence\n"
                     "injections = json.loads(os.environ['AFK_TEST_CRASH_INJECTIONS'])\n"
                     "def injected(store, run_id, event, **kwargs):\n"
                     " if event == injections.get('AFK_TEST_KILL_BEFORE_EVENT'):\n"
@@ -157,10 +168,53 @@ class StartCliTest(unittest.TestCase):
                     " if effect_id == injections.get('AFK_TEST_KILL_AFTER_CONFIRM'):\n"
                     "  os.kill(os.getpid(), signal.SIGKILL)\n"
                     " return result\n"
+                    "def injected_write_json(path, value, root, **kwargs):\n"
+                    " result = original_write_json(path, value, root, **kwargs)\n"
+                    " target = injections.get('AFK_TEST_KILL_AFTER_MANIFEST')\n"
+                    " if target and path.name == 'manifest.json' "
+                    "and target in str(path):\n"
+                    "  os.kill(os.getpid(), signal.SIGKILL)\n"
+                    " return result\n"
+                    "def injected_run_contract(*args, **kwargs):\n"
+                    " result = original_run_contract(*args, **kwargs)\n"
+                    " if injections.get('AFK_TEST_KILL_AFTER_VALIDATION_COMMAND'):\n"
+                    "  os.kill(os.getpid(), signal.SIGKILL)\n"
+                    " return result\n"
+                    "def evidence_targeted(target, relative):\n"
+                    " return bool(target) and all(\n"
+                    "  part in relative for part in target.split('|')\n"
+                    " )\n"
+                    "def injected_write_evidence(store, run_id, relative, value):\n"
+                    " result = original_write_evidence(\n"
+                    "  store, run_id, relative, value\n"
+                    " )\n"
+                    " target = injections.get('AFK_TEST_KILL_AFTER_EVIDENCE')\n"
+                    " if evidence_targeted(target, relative):\n"
+                    "  os.kill(os.getpid(), signal.SIGKILL)\n"
+                    " return result\n"
+                    "def injected_ingest_evidence(store, run_id, relative, source):\n"
+                    " result = original_ingest_evidence(\n"
+                    "  store, run_id, relative, source\n"
+                    " )\n"
+                    " target = injections.get('AFK_TEST_KILL_AFTER_EVIDENCE')\n"
+                    " if evidence_targeted(target, relative):\n"
+                    "  os.kill(os.getpid(), signal.SIGKILL)\n"
+                    " return result\n"
+                    "def injected_seal_evidence(store, run_id, relative):\n"
+                    " result = original_seal_evidence(store, run_id, relative)\n"
+                    " target = injections.get('AFK_TEST_KILL_AFTER_SEAL')\n"
+                    " if evidence_targeted(target, relative):\n"
+                    "  os.kill(os.getpid(), signal.SIGKILL)\n"
+                    " return result\n"
                     "RunStore.append_event = injected\n"
                     "RunStore._append_event_unlocked = injected_write\n"
                     "RunStore.prepare_effect = injected_effect\n"
                     "RunStore.confirm_effect = injected_confirm\n"
+                    "run_store_module._write_new_json = injected_write_json\n"
+                    "validation_module._run_contract = injected_run_contract\n"
+                    "RunStore.write_evidence_text = injected_write_evidence\n"
+                    "RunStore.ingest_evidence_file = injected_ingest_evidence\n"
+                    "RunStore.seal_evidence = injected_seal_evidence\n"
                     "from afk.cli import main\n"
                     "raise SystemExit(main(sys.argv[1:]))\n"
                 ),
@@ -234,6 +288,18 @@ class StartCliTest(unittest.TestCase):
         )
         self.assertLess(interrupted.returncode, 0)
         self.assertIsNone(store.effect_if_present(run_id, "pr-create"))
+        return run_id, store, environment
+
+    def start_isolated_validation_run(self, name):
+        run_id, store, environment = self.start_isolated_candidate_push_run(name)
+        interrupted = self.run_afk(
+            "_worker",
+            run_id,
+            **environment,
+            AFK_TEST_KILL_AFTER_EVENT="candidate.ready",
+        )
+        self.assertLess(interrupted.returncode, 0)
+        self.assertEqual(store.status(run_id)["checkpoint"], "candidate_ready")
         return run_id, store, environment
 
     def mutation_count(self, name, *, state_home=None):
@@ -7211,6 +7277,447 @@ class StartCliTest(unittest.TestCase):
         self.assertEqual(projection["checkpoint"], "candidate_ready")
         self.assertEqual(projection["attention"]["kind"], "conflict")
         self.assertEqual(self.mutation_count("pr-create", state_home=state_home), 1)
+
+    def test_resume_finishes_a_validation_seal_after_its_manifest_is_durable(self):
+        run_id, store, environment = self.start_isolated_validation_run(
+            "validation-manifest-durable"
+        )
+        state_home = Path(environment["XDG_STATE_HOME"])
+
+        interrupted = self.run_afk(
+            "resume",
+            **environment,
+            AFK_TEST_KILL_AFTER_MANIFEST="gates/validation-",
+        )
+
+        self.assertLess(interrupted.returncode, 0)
+        attempt = store.status(run_id)["validation_attempt"]
+        manifest = (
+            store.root
+            / "runs"
+            / run_id
+            / f"gates/{attempt['attempt_id']}/manifest.json"
+        )
+        self.assertTrue(manifest.is_file())
+        self.assertNotEqual(manifest.parent.stat().st_mode & 0o222, 0)
+
+        resumed = self.run_afk("resume", **environment)
+
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        status = store.status(run_id)
+        self.assertEqual(status["checkpoint"], "validated")
+        self.assertEqual(status["validation"]["status"], "passed")
+        self.assertEqual(manifest.parent.stat().st_mode & 0o222, 0)
+        self.assertEqual(
+            len(
+                self.launch_events(
+                    run_id,
+                    "validation.attempt_started",
+                    state_home=state_home,
+                )
+            ),
+            1,
+        )
+
+    def test_resume_publishes_completed_validation_after_attempt_state_crash(self):
+        run_id, store, environment = self.start_isolated_validation_run(
+            "validation-attempt-finished"
+        )
+        state_home = Path(environment["XDG_STATE_HOME"])
+
+        interrupted = self.run_afk(
+            "resume",
+            **environment,
+            AFK_TEST_KILL_AFTER_EVENT_WRITE="validation.attempt_finished",
+        )
+
+        self.assertLess(interrupted.returncode, 0)
+        before = store.status(run_id)
+        self.assertEqual(before["checkpoint"], "candidate_ready")
+        self.assertEqual(before["validation_attempt"]["status"], "passed")
+        self.assertNotIn("validation", before)
+
+        resumed = self.run_afk("resume", **environment)
+
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        status = store.status(run_id)
+        self.assertEqual(status["checkpoint"], "validated")
+        self.assertEqual(status["validation"]["status"], "passed")
+        self.assertEqual(
+            len(
+                self.launch_events(
+                    run_id,
+                    "validation.attempt_started",
+                    state_home=state_home,
+                )
+            ),
+            1,
+        )
+
+    def test_resume_seals_validation_interrupted_after_worker_completion(self):
+        run_id, store, environment = self.start_isolated_validation_run(
+            "validation-worker-completed"
+        )
+        state_home = Path(environment["XDG_STATE_HOME"])
+
+        interrupted = self.run_afk(
+            "resume",
+            **environment,
+            AFK_TEST_KILL_AFTER_VALIDATION_COMMAND="1",
+        )
+
+        self.assertLess(interrupted.returncode, 0)
+        first_attempt = store.status(run_id)["validation_attempt"]
+        self.assertEqual(first_attempt["status"], "started")
+
+        sealed = self.run_afk("resume", **environment)
+
+        self.assertEqual(sealed.returncode, 2, sealed.stderr)
+        paused = store.status(run_id)
+        self.assertEqual(paused["attention"]["kind"], "interrupted")
+        self.assertEqual(paused["validation_attempt"]["status"], "interrupted")
+        self.assertTrue(
+            (
+                store.root
+                / "runs"
+                / run_id
+                / first_attempt["evidence"]
+                / "manifest.json"
+            ).is_file()
+        )
+
+        resumed = self.run_afk("resume", **environment)
+
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        status = store.status(run_id)
+        self.assertEqual(status["checkpoint"], "validated")
+        self.assertEqual(status["validation"]["status"], "passed")
+        self.assertEqual(
+            len(
+                self.launch_events(
+                    run_id,
+                    "validation.attempt_started",
+                    state_home=state_home,
+                )
+            ),
+            2,
+        )
+
+    def test_resume_publishes_attention_after_interrupted_attempt_state_crash(self):
+        run_id, store, environment = self.start_isolated_validation_run(
+            "validation-interrupted-state"
+        )
+        worker_crash = self.run_afk(
+            "resume",
+            **environment,
+            AFK_TEST_KILL_AFTER_VALIDATION_COMMAND="1",
+        )
+        self.assertLess(worker_crash.returncode, 0)
+
+        state_crash = self.run_afk(
+            "resume",
+            **environment,
+            AFK_TEST_KILL_AFTER_EVENT_WRITE="validation.attempt_finished",
+        )
+
+        self.assertLess(state_crash.returncode, 0)
+        before = store.status(run_id)
+        self.assertEqual(before["validation_attempt"]["status"], "interrupted")
+        self.assertEqual(before["attention"], {})
+
+        published = self.run_afk("resume", **environment)
+
+        self.assertEqual(published.returncode, 2, published.stderr)
+        paused = store.status(run_id)
+        self.assertEqual(paused["attention"]["scope"], "validation")
+        self.assertEqual(paused["attention"]["kind"], "interrupted")
+
+        resumed = self.run_afk("resume", **environment)
+
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        self.assertEqual(store.status(run_id)["checkpoint"], "validated")
+
+    def test_interruption_evidence_boundaries_resume_to_one_sealed_attempt(self):
+        scenarios = (
+            (
+                "stdout",
+                "AFK_TEST_KILL_AFTER_EVIDENCE",
+                "attempts/validation-|/afk/stdout.log",
+            ),
+            (
+                "stderr",
+                "AFK_TEST_KILL_AFTER_EVIDENCE",
+                "attempts/validation-|/afk/stderr.log",
+            ),
+            (
+                "outcome",
+                "AFK_TEST_KILL_AFTER_EVIDENCE",
+                "attempts/validation-|/afk/outcome.json",
+            ),
+            (
+                "manifest",
+                "AFK_TEST_KILL_AFTER_MANIFEST",
+                "attempts/validation-",
+            ),
+            ("seal", "AFK_TEST_KILL_AFTER_SEAL", "attempts/validation-"),
+        )
+        for name, injection, target in scenarios:
+            with self.subTest(name=name):
+                run_id, store, environment = self.start_isolated_validation_run(
+                    f"validation-interruption-{name}"
+                )
+                worker_crash = self.run_afk(
+                    "resume",
+                    **environment,
+                    AFK_TEST_KILL_AFTER_VALIDATION_COMMAND="1",
+                )
+                self.assertLess(worker_crash.returncode, 0)
+                attempt = store.status(run_id)["validation_attempt"]
+
+                recovery_crash = self.run_afk(
+                    "resume",
+                    **environment,
+                    **{injection: target},
+                )
+
+                self.assertLess(recovery_crash.returncode, 0)
+                published = self.run_afk("resume", **environment)
+                self.assertEqual(published.returncode, 2, published.stderr)
+                paused = store.status(run_id)
+                self.assertEqual(paused["validation_attempt"]["status"], "interrupted")
+                self.assertEqual(paused["attention"]["kind"], "interrupted")
+                self.assertTrue(
+                    (
+                        store.root
+                        / "runs"
+                        / run_id
+                        / attempt["evidence"]
+                        / "manifest.json"
+                    ).is_file()
+                )
+
+                resumed = self.run_afk("resume", **environment)
+                self.assertEqual(resumed.returncode, 0, resumed.stderr)
+                self.assertEqual(store.status(run_id)["checkpoint"], "validated")
+
+    def test_incomplete_validation_evidence_is_interrupted_never_reused(self):
+        for target in (
+            "/afk/request.json",
+            "/afk/stdout.log",
+            "/afk/stderr.log",
+            "/afk/outcome.json",
+            "/contract/result.json",
+            "/contract/tests.log",
+        ):
+            with self.subTest(target=target):
+                name = target.strip("/").replace("/", "-").replace(".", "-")
+                run_id, store, environment = self.start_isolated_validation_run(
+                    f"validation-incomplete-{name}"
+                )
+
+                interrupted = self.run_afk(
+                    "resume",
+                    **environment,
+                    AFK_TEST_KILL_AFTER_EVIDENCE=f"gates/validation-|{target}",
+                )
+
+                self.assertLess(interrupted.returncode, 0)
+                self.assertNotIn("validation", store.status(run_id))
+
+                sealed = self.run_afk("resume", **environment)
+
+                self.assertEqual(sealed.returncode, 2, sealed.stderr)
+                paused = store.status(run_id)
+                self.assertEqual(paused["attention"]["kind"], "interrupted")
+                self.assertEqual(paused["validation_attempt"]["status"], "interrupted")
+                self.assertNotIn("validation", paused)
+
+                resumed = self.run_afk("resume", **environment)
+
+                self.assertEqual(resumed.returncode, 0, resumed.stderr)
+                status = store.status(run_id)
+                self.assertEqual(status["checkpoint"], "validated")
+                self.assertEqual(status["validation"]["status"], "passed")
+
+    def test_resume_reuses_validation_completed_before_gate_seal_returned(self):
+        run_id, store, environment = self.start_isolated_validation_run(
+            "validation-gate-sealed"
+        )
+        state_home = Path(environment["XDG_STATE_HOME"])
+
+        interrupted = self.run_afk(
+            "resume",
+            **environment,
+            AFK_TEST_KILL_AFTER_SEAL="gates/validation-",
+        )
+
+        self.assertLess(interrupted.returncode, 0)
+        attempt = store.status(run_id)["validation_attempt"]
+        self.assertTrue(
+            (
+                store.root
+                / "runs"
+                / run_id
+                / f"gates/{attempt['attempt_id']}/manifest.json"
+            ).is_file()
+        )
+
+        resumed = self.run_afk("resume", **environment)
+
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        status = store.status(run_id)
+        self.assertEqual(status["checkpoint"], "validated")
+        self.assertEqual(status["validation"]["status"], "passed")
+        self.assertEqual(
+            len(
+                self.launch_events(
+                    run_id,
+                    "validation.attempt_started",
+                    state_home=state_home,
+                )
+            ),
+            1,
+        )
+
+    def test_changed_completed_validation_evidence_never_passes(self):
+        run_id, store, environment = self.start_isolated_validation_run(
+            "validation-completed-tampered"
+        )
+
+        interrupted = self.run_afk(
+            "resume",
+            **environment,
+            AFK_TEST_KILL_AFTER_SEAL="gates/validation-",
+        )
+
+        self.assertLess(interrupted.returncode, 0)
+        attempt = store.status(run_id)["validation_attempt"]
+        log = (
+            store.root
+            / "runs"
+            / run_id
+            / f"gates/{attempt['attempt_id']}/contract/tests.log"
+        )
+        log.chmod(0o600)
+        log.write_text("changed\n", encoding="utf-8")
+
+        resumed = self.run_afk("resume", **environment)
+
+        self.assertEqual(resumed.returncode, 2, resumed.stderr)
+        status = store.status(run_id)
+        self.assertEqual(status["checkpoint"], "candidate_ready")
+        self.assertEqual(status["attention"]["scope"], "validation")
+        self.assertEqual(status["attention"]["kind"], "invalid")
+        self.assertNotIn("validation", status)
+
+    def test_manifest_valid_validation_for_another_candidate_never_passes(self):
+        run_id, store, environment = self.start_isolated_validation_run(
+            "validation-wrong-candidate"
+        )
+
+        interrupted = self.run_afk(
+            "resume",
+            **environment,
+            AFK_TEST_KILL_AFTER_SEAL="gates/validation-",
+        )
+
+        self.assertLess(interrupted.returncode, 0)
+        attempt = store.status(run_id)["validation_attempt"]
+        gate = store.root / "runs" / run_id / f"gates/{attempt['attempt_id']}"
+        for path in [gate, *gate.rglob("*")]:
+            path.chmod(0o700 if path.is_dir() else 0o600)
+        (gate / "manifest.json").unlink()
+        outcome_path = gate / "afk/outcome.json"
+        outcome = json.loads(outcome_path.read_text(encoding="utf-8"))
+        outcome["candidate_sha"] = "e" * 40
+        outcome_path.write_text(json.dumps(outcome), encoding="utf-8")
+        store.seal_evidence(run_id, f"gates/{attempt['attempt_id']}")
+
+        resumed = self.run_afk("resume", **environment)
+
+        self.assertEqual(resumed.returncode, 2, resumed.stderr)
+        status = store.status(run_id)
+        self.assertEqual(status["attention"]["kind"], "interrupted")
+        self.assertEqual(status["validation_attempt"]["status"], "interrupted")
+        self.assertNotIn("validation", status)
+
+    def test_validation_state_boundaries_resume_without_duplicate_completion(self):
+        scenarios = (
+            (
+                "before-attempt-started",
+                "AFK_TEST_KILL_BEFORE_EVENT",
+                "validation.attempt_started",
+                "reviewed",
+                1,
+            ),
+            (
+                "after-attempt-started",
+                "AFK_TEST_KILL_AFTER_EVENT_WRITE",
+                "validation.attempt_started",
+                "validated",
+                2,
+            ),
+            (
+                "before-attempt-finished",
+                "AFK_TEST_KILL_BEFORE_EVENT",
+                "validation.attempt_finished",
+                "validated",
+                1,
+            ),
+            (
+                "after-attempt-finished",
+                "AFK_TEST_KILL_AFTER_EVENT_WRITE",
+                "validation.attempt_finished",
+                "validated",
+                1,
+            ),
+            (
+                "before-validation-passed",
+                "AFK_TEST_KILL_BEFORE_EVENT",
+                "validation.passed",
+                "validated",
+                1,
+            ),
+            (
+                "after-validation-passed",
+                "AFK_TEST_KILL_AFTER_EVENT_WRITE",
+                "validation.passed",
+                "reviewed",
+                1,
+            ),
+        )
+        for name, injection, event, checkpoint, attempts in scenarios:
+            with self.subTest(name=name):
+                run_id, store, environment = self.start_isolated_validation_run(
+                    f"validation-state-{name}"
+                )
+                state_home = Path(environment["XDG_STATE_HOME"])
+
+                interrupted = self.run_afk(
+                    "resume",
+                    **environment,
+                    **{injection: event},
+                )
+
+                self.assertLess(interrupted.returncode, 0)
+                resumed = self.run_afk("resume", **environment)
+                if resumed.returncode == 2:
+                    resumed = self.run_afk("resume", **environment)
+
+                self.assertEqual(resumed.returncode, 0, resumed.stderr)
+                status = store.status(run_id)
+                self.assertEqual(status["checkpoint"], checkpoint)
+                self.assertEqual(status["validation"]["status"], "passed")
+                self.assertEqual(
+                    len(
+                        self.launch_events(
+                            run_id,
+                            "validation.attempt_started",
+                            state_home=state_home,
+                        )
+                    ),
+                    attempts,
+                )
 
     def test_resume_requires_attention_for_confirmed_collected_worker_without_terminal(
         self,
