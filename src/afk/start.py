@@ -26,7 +26,11 @@ from afk.candidate import (
     seal_interrupted_repair_attempt,
     verify_candidate_publication,
 )
-from afk.candidate_gate import GateError, complete_gate_cycle
+from afk.candidate_gate import (
+    GateError,
+    complete_gate_cycle,
+    reconcile_gate_comment,
+)
 from afk.candidate_validation import (
     CandidateValidationError,
     VALIDATION_ENVIRONMENT_ALLOWLIST,
@@ -1363,6 +1367,13 @@ def _advance_pr_ready(store: RunStore, run_id: str) -> int:
         return 2
     comment_effect_id = f"gate-comment-{cycle}{f'-retry-{retry}' if retry else ''}"
     try:
+        reconcile_gate_comment(
+            store,
+            run_id,
+            pr_number=projection["pr_number"],
+            worktree=Path(projection["worktree_path"]),
+            gate=latest,
+        )
         comment_effect = store.effect(run_id, comment_effect_id)
         intended = comment_effect.get("intended")
         if (
@@ -1377,6 +1388,16 @@ def _advance_pr_ready(store: RunStore, run_id: str) -> int:
             raise RunStoreError("final Gate comment is not confirmed")
         observed = mark_candidate_pr_ready(store, run_id)
     except CandidateError as exc:
+        _attention(
+            store,
+            run_id,
+            checkpoint="reviewed",
+            scope="publication",
+            kind=exc.kind,
+            summary=exc.summary,
+        )
+        return 2
+    except GateError as exc:
         _attention(
             store,
             run_id,

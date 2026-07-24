@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import json
 import hashlib
+import json
 import os
 import re
 import subprocess
@@ -195,6 +195,18 @@ def complete_gate_cycle(
             and (validation["status"] == "rejected" or "rejected" in review_statuses)
         ):
             outcome["stop_reason"] = "repair budget exhausted after four attempts"
+        pr_number = projection.get("pr_number")
+        if type(pr_number) is not int or pr_number <= 0:
+            raise GateError(
+                "Gate Cycle requires the stable draft PR number",
+                kind="inconclusive",
+            )
+        outcome["pr_comment"] = _gate_comment_identity(
+            store.identity(run_id),
+            run_id,
+            pr_number=pr_number,
+            gate=outcome,
+        )
         redacted_outcome = redact_artifact_value(outcome)
         outcome_path = evidence_path / "outcome.json"
         if outcome_path.exists():
@@ -276,51 +288,145 @@ def reconcile_gate_comment(
     gate: dict[str, Any],
 ) -> None:
     identity = store.identity(run_id)
+    intended = _gate_comment_identity(
+        identity,
+        run_id,
+        pr_number=pr_number,
+        gate=gate,
+    )
+    projected = gate.get("pr_comment")
+    if projected is not None and projected != intended:
+        raise GateError("Gate Cycle PR comment projection contradicts its outcome")
+    cycle = intended["cycle"]
+    retry = intended["retry"]
+    marker = intended["marker"]
+    body = _gate_comment_body(gate, marker)
+    effect_id = f"gate-comment-{cycle}{f'-retry-{retry}' if retry else ''}"
+    existing = store.effect_if_present(run_id, effect_id)
+    legacy_intended = {key: value for key, value in intended.items() if key != "marker"}
+    legacy_effect = (
+        projected is None
+        and existing is not None
+        and existing.get("intended") == legacy_intended
+    )
+    effect_intended = legacy_intended if legacy_effect else intended
+    effect = store.prepare_effect(
+        run_id,
+        effect_id,
+        kind="gate-comment",
+        intended=effect_intended,
+    )
+    observed_identity = {"marker": marker} if legacy_effect else intended
+    observed = _observe_gate_comment(
+        identity["repository"],
+        pr_number,
+        worktree,
+        marker=marker,
+        body=body,
+        observed_identity=observed_identity,
+    )
+    if observed is None:
+        if effect["status"] == "confirmed":
+            raise GateError(
+                "confirmed Gate Cycle comment is absent from GitHub",
+                kind="conflict",
+            )
+        posted_url = _post_gate_comment(
+            identity["repository"], pr_number, body, worktree
+        )
+        observed = _observe_gate_comment(
+            identity["repository"],
+            pr_number,
+            worktree,
+            marker=marker,
+            body=body,
+            observed_identity=observed_identity,
+        )
+        if observed is None:
+            raise GateError(
+                "Gate Cycle PR evidence comment was not observable after posting",
+                kind="inconclusive",
+            )
+        if observed["url"] != posted_url:
+            raise GateError(
+                "Gate Cycle PR evidence comment URL drifted during posting",
+                kind="conflict",
+            )
+    if effect["status"] == "confirmed" and effect.get("observed") != observed:
+        raise GateError(
+            "confirmed Gate Cycle comment contradicts GitHub",
+            kind="conflict",
+        )
+    store.confirm_effect(run_id, effect_id, observed=observed)
+
+
+def _gate_comment_identity(
+    identity: dict[str, Any],
+    run_id: str,
+    *,
+    pr_number: int,
+    gate: dict[str, Any],
+) -> dict[str, Any]:
     cycle = gate.get("cycle")
     if type(cycle) is not int or cycle <= 0:
         raise GateError("Gate Cycle number is invalid")
     retry = gate.get("retry", 0)
     if type(retry) is not int or retry < 0:
         raise GateError("Gate retry number is invalid")
+    candidate_sha = gate.get("candidate_sha")
+    if not isinstance(candidate_sha, str) or not re.fullmatch(
+        r"[0-9a-f]{40}", candidate_sha
+    ):
+        raise GateError("Gate Cycle Candidate identity is invalid")
+    repository = identity.get("repository")
+    if not isinstance(repository, str) or not repository:
+        raise GateError("Gate Cycle repository identity is invalid")
+    if type(pr_number) is not int or pr_number <= 0:
+        raise GateError("Gate Cycle PR identity is invalid")
     retry_segment = f":retry-{retry}" if retry else ""
     marker = f"<!-- afk-gate:{run_id}:{cycle}{retry_segment} -->"
     body = _gate_comment_body(gate, marker)
-    effect_id = f"gate-comment-{cycle}{f'-retry-{retry}' if retry else ''}"
-    effect = store.prepare_effect(
-        run_id,
-        effect_id,
-        kind="gate-comment",
-        intended={
-            "repository": identity["repository"],
-            "pr_number": pr_number,
-            "cycle": cycle,
-            "retry": retry,
-            "candidate_sha": gate.get("candidate_sha"),
-            "body_sha256": hashlib.sha256(body.encode("utf-8")).hexdigest(),
-        },
-    )
+    return {
+        "repository": repository,
+        "pr_number": pr_number,
+        "candidate_sha": candidate_sha,
+        "cycle": cycle,
+        "retry": retry,
+        "marker": marker,
+        "body_sha256": hashlib.sha256(body.encode("utf-8")).hexdigest(),
+    }
+
+
+def _observe_gate_comment(
+    repository: str,
+    pr_number: int,
+    worktree: Path,
+    *,
+    marker: str,
+    body: str,
+    observed_identity: dict[str, Any],
+) -> dict[str, Any] | None:
     matching = [
         comment
-        for comment in _github_comments(identity["repository"], pr_number, worktree)
+        for comment in _github_comments(repository, pr_number, worktree)
         if marker in str(comment.get("body", ""))
     ]
     if len(matching) > 1:
-        raise GateError("Gate Cycle has duplicate PR evidence comments")
-    if matching:
-        if matching[0].get("body") != body:
-            raise GateError(
-                "Gate Cycle PR evidence comment content does not match",
-                kind="inconclusive",
-            )
-        url = matching[0].get("html_url") or matching[0].get("url")
-    else:
-        url = _post_gate_comment(identity["repository"], pr_number, body, worktree)
+        raise GateError(
+            "Gate Cycle has duplicate PR evidence comments",
+            kind="conflict",
+        )
+    if not matching:
+        return None
+    if matching[0].get("body") != body:
+        raise GateError(
+            "Gate Cycle PR evidence comment content does not match",
+            kind="conflict",
+        )
+    url = matching[0].get("html_url") or matching[0].get("url")
     if not isinstance(url, str) or not url:
         raise GateError("Gate Cycle PR evidence comment has no URL")
-    observed = {"url": url, "marker": marker}
-    if effect["status"] == "confirmed" and effect.get("observed") != observed:
-        raise GateError("confirmed Gate Cycle comment contradicts GitHub")
-    store.confirm_effect(run_id, effect_id, observed=observed)
+    return {**observed_identity, "url": url}
 
 
 def run_candidate_reviews(

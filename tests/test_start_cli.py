@@ -2361,6 +2361,28 @@ class StartCliTest(unittest.TestCase):
         self.assertEqual(projection["validation"]["status"], "passed")
         self.assertEqual(projection["candidate_sha"], "d" * 40)
         self.assertEqual(projection["pr_number"], 17)
+        gate_comment = projection["gate_cycles"][-1]["pr_comment"]
+        self.assertEqual(
+            gate_comment,
+            {
+                "repository": "thunderbump/beads-webui",
+                "pr_number": 17,
+                "candidate_sha": "d" * 40,
+                "cycle": 1,
+                "retry": 0,
+                "marker": f"<!-- afk-gate:{run_id}:1 -->",
+                "body_sha256": gate_comment["body_sha256"],
+            },
+        )
+        self.assertRegex(gate_comment["body_sha256"], r"^[0-9a-f]{64}$")
+        comment_effect = RunStore(self.state_home / "afk").effect(
+            run_id, "gate-comment-1"
+        )
+        self.assertEqual(comment_effect["intended"], gate_comment)
+        self.assertEqual(
+            comment_effect["observed"]["body_sha256"],
+            gate_comment["body_sha256"],
+        )
         self.assertEqual(
             projection["branch"],
             f"afk/central-bnkl-1-1-{run_id}/candidate",
@@ -2373,6 +2395,94 @@ class StartCliTest(unittest.TestCase):
             '"command":"bd","args":["update","central-bnkl.1.1","--claim"', commands
         )
         self.assertIn(BASE_SHA, commands)
+
+    def test_resume_reconciles_gate_comment_crashes_without_duplicate_mutation(self):
+        boundaries = (
+            ("before-mutation", {"AFK_TEST_KILL_BEFORE_MUTATION": "gate-comment"}),
+            ("after-mutation", {"AFK_TEST_KILL_AFTER_MUTATION": "gate-comment"}),
+            ("before-confirm", {"AFK_TEST_KILL_BEFORE_CONFIRM": "gate-comment-1"}),
+            ("after-confirm", {"AFK_TEST_KILL_AFTER_CONFIRM": "gate-comment-1"}),
+            (
+                "before-gate-append",
+                {"AFK_TEST_KILL_BEFORE_EVENT": "gate.cycle_completed"},
+            ),
+            (
+                "after-gate-append",
+                {"AFK_TEST_KILL_AFTER_EVENT": "gate.cycle_completed"},
+            ),
+        )
+        for name, injection in boundaries:
+            with self.subTest(boundary=name):
+                state_name = f"gate-comment-{name}"
+                state_home = self.temp / state_name
+                run_id, store, environment = self.start_isolated_validation_run(
+                    state_name
+                )
+
+                interrupted = self.run_afk(
+                    "resume",
+                    **environment,
+                    **injection,
+                )
+
+                self.assertLess(interrupted.returncode, 0, interrupted.stderr)
+                resumed = self.run_afk("resume", **environment)
+                self.assertEqual(resumed.returncode, 0, resumed.stderr)
+                projection = store.status(run_id)
+                comment = projection["gate_cycles"][-1]["pr_comment"]
+                self.assertEqual(comment["candidate_sha"], "d" * 40)
+                self.assertRegex(comment["body_sha256"], r"^[0-9a-f]{64}$")
+                external = json.loads(
+                    (state_home / "fake-comment.json").read_text(encoding="utf-8")
+                )
+                self.assertEqual(external["body"].splitlines()[0], comment["marker"])
+                self.assertEqual(
+                    self.mutation_count("gate-comment", state_home=state_home),
+                    1,
+                )
+                effect = store.effect(run_id, "gate-comment-1")
+                self.assertEqual(effect["status"], "confirmed")
+                self.assertEqual(
+                    effect["observed"]["body_sha256"],
+                    comment["body_sha256"],
+                )
+
+    def test_resume_requires_attention_for_changed_gate_comment_observation(self):
+        scenarios = ("duplicate", "edited", "drifted-url", "unavailable", "absent")
+        for scenario in scenarios:
+            with self.subTest(scenario=scenario):
+                state_name = f"changed-comment-{scenario}"
+                state_home = self.temp / state_name
+                run_id, store, environment = self.start_isolated_validation_run(
+                    state_name
+                )
+                completed = self.run_afk("resume", **environment)
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                comment_path = state_home / "fake-comment.json"
+                override = {}
+                if scenario == "edited":
+                    comment = json.loads(comment_path.read_text(encoding="utf-8"))
+                    comment["body"] += "edited\n"
+                    comment_path.write_text(json.dumps(comment), encoding="utf-8")
+                elif scenario == "absent":
+                    comment_path.unlink()
+                elif scenario == "duplicate":
+                    override["AFK_FAKE_COMMENT_DUPLICATE"] = "1"
+                elif scenario == "drifted-url":
+                    override["AFK_FAKE_COMMENT_URL"] = "https://example.test/comment/99"
+                else:
+                    override["AFK_FAKE_COMMENT_UNAVAILABLE"] = "1"
+
+                resumed = self.run_afk("resume", **environment, **override)
+
+                self.assertEqual(resumed.returncode, 2, resumed.stderr)
+                status = store.status(run_id)
+                self.assertEqual(status["checkpoint"], "reviewed")
+                self.assertEqual(status["attention"]["scope"], "publication")
+                self.assertEqual(
+                    self.mutation_count("gate-comment", state_home=state_home),
+                    1,
+                )
 
     def test_resume_marks_the_exact_reviewed_candidate_pr_ready_idempotently(self):
         run_id = self.start_reviewed_run()
@@ -8958,13 +9068,17 @@ class StartCliTest(unittest.TestCase):
                         if os.environ.get("AFK_FAKE_PR_MERGE_INTERRUPTED"):
                             raise SystemExit(1)
                     elif args[:1] == ["api"]:
+                        if os.environ.get("AFK_FAKE_COMMENT_UNAVAILABLE"):
+                            raise SystemExit(1)
                         if "--method" in args:
                             body = json.loads(sys.stdin.read())["body"]
+                            before_mutation("gate-comment")
                             value = {
                                 "body": body,
                                 "html_url": "https://example.test/comment/1",
                             }
                             comment_state.write_text(json.dumps(value), encoding="utf-8")
+                            after_mutation("gate-comment")
                             print(json.dumps(value))
                         else:
                             comments = (
@@ -8972,6 +9086,14 @@ class StartCliTest(unittest.TestCase):
                                 if comment_state.exists()
                                 else []
                             )
+                            if comments and os.environ.get("AFK_FAKE_COMMENT_URL"):
+                                comments[0]["html_url"] = os.environ[
+                                    "AFK_FAKE_COMMENT_URL"
+                                ]
+                            if comments and os.environ.get(
+                                "AFK_FAKE_COMMENT_DUPLICATE"
+                            ):
+                                comments.append(dict(comments[0]))
                             print(json.dumps(comments))
                     elif os.environ.get("AFK_FAKE_GH_NON_OBJECT"):
                         print("[]")
