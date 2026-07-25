@@ -186,22 +186,14 @@ class StartCliTest(unittest.TestCase):
                     " return bool(target) and all(\n"
                     "  part in relative for part in target.split('|')\n"
                     " )\n"
-                    "def injected_write_evidence(store, run_id, relative, value):\n"
-                    " result = original_write_evidence(\n"
-                    "  store, run_id, relative, value\n"
-                    " )\n"
-                    " target = injections.get('AFK_TEST_KILL_AFTER_EVIDENCE')\n"
-                    " if evidence_targeted(target, relative):\n"
-                    "  os.kill(os.getpid(), signal.SIGKILL)\n"
-                    " return result\n"
-                    "def injected_write_evidence_value(store, run_id, relative, value):\n"
-                    " result = original_write_evidence_value(\n"
-                    "  store, run_id, relative, value\n"
-                    " )\n"
-                    " target = injections.get('AFK_TEST_KILL_AFTER_EVIDENCE')\n"
-                    " if evidence_targeted(target, relative):\n"
-                    "  os.kill(os.getpid(), signal.SIGKILL)\n"
-                    " return result\n"
+                    "def injected_evidence_writer(original):\n"
+                    " def injected(store, run_id, relative, value):\n"
+                    "  result = original(store, run_id, relative, value)\n"
+                    "  target = injections.get('AFK_TEST_KILL_AFTER_EVIDENCE')\n"
+                    "  if evidence_targeted(target, relative):\n"
+                    "   os.kill(os.getpid(), signal.SIGKILL)\n"
+                    "  return result\n"
+                    " return injected\n"
                     "def injected_ingest_evidence(store, run_id, relative, source):\n"
                     " result = original_ingest_evidence(\n"
                     "  store, run_id, relative, source\n"
@@ -222,8 +214,12 @@ class StartCliTest(unittest.TestCase):
                     "RunStore.confirm_effect = injected_confirm\n"
                     "run_store_module._write_new_json = injected_write_json\n"
                     "validation_module._run_contract = injected_run_contract\n"
-                    "RunStore.write_evidence_text = injected_write_evidence\n"
-                    "RunStore.write_evidence_value = injected_write_evidence_value\n"
+                    "RunStore.write_evidence_text = injected_evidence_writer(\n"
+                    " original_write_evidence\n"
+                    ")\n"
+                    "RunStore.write_evidence_value = injected_evidence_writer(\n"
+                    " original_write_evidence_value\n"
+                    ")\n"
                     "RunStore.ingest_evidence_file = injected_ingest_evidence\n"
                     "RunStore.seal_evidence = injected_seal_evidence\n"
                     "from afk.cli import main\n"
@@ -2549,9 +2545,7 @@ class StartCliTest(unittest.TestCase):
         interrupted = self.run_afk(
             "resume",
             **environment,
-            AFK_TEST_KILL_AFTER_EVIDENCE=(
-                "review-cycle-1-standards|prompt.md"
-            ),
+            AFK_TEST_KILL_AFTER_EVIDENCE=("review-cycle-1-standards|prompt.md"),
         )
         self.assertLess(interrupted.returncode, 0, interrupted.stderr)
 
@@ -2569,9 +2563,7 @@ class StartCliTest(unittest.TestCase):
             [(review["axis"], review["status"]) for review in reviews],
             [("standards", "inconclusive"), ("spec", "passed")],
         )
-        report = json.loads(
-            self.run_afk("report", run_id, **environment).stdout
-        )
+        report = json.loads(self.run_afk("report", run_id, **environment).stdout)
         self.assertTrue(report["paused"])
         self.assertEqual(report["attention"], status["attention"])
         attempts = state_home / "afk" / "runs" / run_id / "attempts"
@@ -2595,11 +2587,7 @@ class StartCliTest(unittest.TestCase):
         self.assertEqual(len(final_status["gate_cycles"]), 2)
         self.assertEqual(final_status["gate_cycles"][-1]["retry"], 1)
         self.assertTrue(
-            (
-                attempts
-                / "review-cycle-1-retry-1-standards"
-                / "manifest.json"
-            ).is_file()
+            (attempts / "review-cycle-1-retry-1-standards" / "manifest.json").is_file()
         )
         self.assertEqual((standards / "outcome.json").read_bytes(), sealed_outcome)
 
@@ -2612,9 +2600,7 @@ class StartCliTest(unittest.TestCase):
         interrupted = self.run_afk(
             "resume",
             **environment,
-            AFK_TEST_KILL_AFTER_EVIDENCE=(
-                "review-cycle-1-standards|report.json"
-            ),
+            AFK_TEST_KILL_AFTER_EVIDENCE=("review-cycle-1-standards|report.json"),
         )
         self.assertLess(interrupted.returncode, 0, interrupted.stderr)
         attempts = state_home / "afk" / "runs" / run_id / "attempts"
@@ -2694,21 +2680,18 @@ class StartCliTest(unittest.TestCase):
         )
         self.assertEqual(self.command_log.read_bytes(), commands_before)
         command_records = [
-            json.loads(line)
-            for line in commands_before.decode().splitlines()
+            json.loads(line) for line in commands_before.decode().splitlines()
         ]
         self.assertEqual(
             sum(
-                record["command"] == "git"
-                and record["args"][:2] == ["reset", "--hard"]
+                record["command"] == "git" and record["args"][:2] == ["reset", "--hard"]
                 for record in command_records
             ),
             3,
         )
         self.assertEqual(
             sum(
-                record["command"] == "git"
-                and record["args"] == ["clean", "-ffdx"]
+                record["command"] == "git" and record["args"] == ["clean", "-ffdx"]
                 for record in command_records
             ),
             3,
