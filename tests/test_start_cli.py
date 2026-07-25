@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import signal
 import shutil
 import stat
 import subprocess
@@ -90,13 +91,7 @@ class StartCliTest(unittest.TestCase):
     def tearDown(self):
         self.temporary_directory.cleanup()
 
-    def run_afk(self, *args, **overrides):
-        short_cleanup_timeout = overrides.pop("AFK_TEST_SHORT_CLEANUP_TIMEOUT", None)
-        crash_injections = {
-            key: target
-            for key in CRASH_INJECTION_OVERRIDES
-            if (target := overrides.pop(key, None))
-        }
+    def afk_environment(self, **overrides):
         env = os.environ.copy()
         env.update(
             {
@@ -120,6 +115,16 @@ class StartCliTest(unittest.TestCase):
             }
         )
         env.update(overrides)
+        return env
+
+    def run_afk(self, *args, **overrides):
+        short_cleanup_timeout = overrides.pop("AFK_TEST_SHORT_CLEANUP_TIMEOUT", None)
+        crash_injections = {
+            key: target
+            for key in CRASH_INJECTION_OVERRIDES
+            if (target := overrides.pop(key, None))
+        }
+        env = self.afk_environment(**overrides)
         command = [sys.executable, "-m", "afk", *args]
         if crash_injections:
             env["AFK_TEST_CRASH_INJECTIONS"] = json.dumps(
@@ -1994,6 +1999,99 @@ class StartCliTest(unittest.TestCase):
         interrupted = self.launch_events(run_id, "implementation.attempt_interrupted")
         self.assertEqual(len(interrupted), 1)
         self.assertFalse(interrupted[0]["data"]["implementation_attempt"]["retryable"])
+
+    def _assert_resume_signal(self, signal_number, *, persistence_failure=False):
+        signal_name = signal.Signals(signal_number).name
+        state_name = f"lifecycle-{signal_name.lower()}"
+        state_home = self.temp / state_name
+        run_id, _, environment = self.start_isolated_validation_run(state_name)
+        home = Path(environment["HOME"])
+        marker = state_home / "fake-codex-waiting"
+        (home / ".fake-codex-wait-marker").write_text(str(marker), encoding="utf-8")
+        command = [sys.executable, "-m", "afk", "resume"]
+        if persistence_failure:
+            command = [
+                sys.executable,
+                "-c",
+                (
+                    "from afk.run_store import RunStore\n"
+                    "original = RunStore.append_event\n"
+                    "def append(store, run_id, event, **kwargs):\n"
+                    " if event == 'lifecycle.signal_interrupted':\n"
+                    "  raise OSError('injected persistence failure')\n"
+                    " return original(store, run_id, event, **kwargs)\n"
+                    "RunStore.append_event = append\n"
+                    "from afk.lifecycle_signals import main\n"
+                    "raise SystemExit(main(['resume']))\n"
+                ),
+            ]
+        lifecycle = subprocess.Popen(
+            command,
+            cwd=self.project,
+            env=self.afk_environment(**environment),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        processes = {}
+        try:
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline and not marker.exists():
+                self.assertIsNone(lifecycle.poll())
+                time.sleep(0.01)
+            self.assertTrue(marker.is_file())
+            processes = json.loads(marker.read_text(encoding="utf-8"))
+            before = json.loads(
+                self.run_afk("status", run_id, "--json", **environment).stdout
+            )
+
+            os.kill(lifecycle.pid, signal_number)
+            os.kill(lifecycle.pid, signal_number)
+            stdout, stderr = lifecycle.communicate(timeout=10)
+
+            self.assertEqual(lifecycle.returncode, -signal_number, (stdout, stderr))
+            status = json.loads(
+                self.run_afk("status", run_id, "--json", **environment).stdout
+            )
+            report = json.loads(self.run_afk("report", run_id, **environment).stdout)
+            if persistence_failure:
+                self.assertEqual(status["last_sequence"], before["last_sequence"])
+                self.assertEqual(status["state"], "validated")
+                self.assertNotIn("lifecycle_interruption", status)
+                self.assertFalse(report["complete"])
+                self.assertFalse(report["paused"])
+            else:
+                self.assertEqual(status["last_sequence"], before["last_sequence"] + 1)
+                self.assertEqual(status["last_event"], "lifecycle.signal_interrupted")
+                self.assertEqual(status["state"], "attention_required")
+                self.assertEqual(status["attention"]["scope"], "lifecycle")
+                self.assertEqual(status["attention"]["kind"], "interrupted")
+                self.assertEqual(
+                    status["lifecycle_interruption"]["signal"], signal_name
+                )
+                self.assertTrue(report["paused"])
+                self.assertEqual(report["attention"], status["attention"])
+            time.sleep(3.2)
+            self.assertFalse((home / ".fake-late-mutation").exists())
+        finally:
+            if lifecycle.poll() is None:
+                lifecycle.kill()
+                lifecycle.wait()
+            for pid in processes.values():
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+    def test_resume_records_shutdown_signals_and_terminates_supervised_descendants(
+        self,
+    ):
+        for signal_number in (signal.SIGTERM, signal.SIGINT):
+            with self.subTest(signal=signal.Signals(signal_number).name):
+                self._assert_resume_signal(signal_number)
+
+    def test_signal_persistence_failure_cannot_fabricate_success(self):
+        self._assert_resume_signal(signal.SIGTERM, persistence_failure=True)
 
     def test_resume_retries_but_never_completes_from_missing_implementation_evidence(
         self,
@@ -9660,7 +9758,10 @@ class StartCliTest(unittest.TestCase):
                 #!/usr/bin/env python3
                 import json
                 import os
+                import signal
+                import subprocess
                 import sys
+                import time
                 from pathlib import Path
 
                 args = sys.argv[1:]
@@ -9669,6 +9770,26 @@ class StartCliTest(unittest.TestCase):
                 candidate_sha = "d" * 40
                 worktree = Path(args[args.index("--cd") + 1])
                 report = Path(args[args.index("--output-last-message") + 1])
+                wait_config = Path.home() / ".fake-codex-wait-marker"
+                if wait_config.exists():
+                    wait_marker = wait_config.read_text(encoding="utf-8")
+                    late_mutation = Path.home() / ".fake-late-mutation"
+                    child_program = (
+                        "import signal,time;from pathlib import Path;"
+                        "signal.signal(signal.SIGTERM,signal.SIG_IGN);"
+                        "time.sleep(3);"
+                        f"Path({str(late_mutation)!r}).write_text('mutated')"
+                    )
+                    child = subprocess.Popen(
+                        [sys.executable, "-c", child_program],
+                        start_new_session=True,
+                    )
+                    Path(wait_marker).write_text(json.dumps({
+                        "root_pid": os.getpid(),
+                        "child_pid": child.pid,
+                    }), encoding="utf-8")
+                    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+                    time.sleep(60)
                 if "# AFK standards review" in prompt or "# AFK spec review" in prompt:
                     axis = (
                         "standards"

@@ -11,7 +11,7 @@ requires-python = ">=3.11"
 dependencies = []
 
 [project.scripts]
-afk = "afk.cli:main"
+afk = "afk.lifecycle_signals:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

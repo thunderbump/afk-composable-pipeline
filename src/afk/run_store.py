@@ -1099,6 +1099,7 @@ def _project(identity: dict[str, Any], events: list[dict[str, Any]]) -> dict[str
         "completion",
         "bead_spec",
         "interrupted_repair",
+        "lifecycle_interruption",
     ):
         if key in details:
             projection[key] = details[key]

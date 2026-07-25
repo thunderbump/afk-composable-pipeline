@@ -1,4 +1,4 @@
-from afk.cli import main
+from afk.lifecycle_signals import main
 
 
 if __name__ == "__main__":
