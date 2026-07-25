@@ -6,8 +6,8 @@ import sys
 from contextlib import contextmanager
 from typing import Any, Iterator
 
-from afk.cli import main as dispatch
-from afk.run_store import RunStore, RunStoreError
+from afk.cli import build_parser, main as dispatch
+from afk.run_store import RunStore, RunStoreError, new_durable_run_id
 
 
 LIFECYCLE_COMMANDS = {"start", "resume", "_worker", "_worker_unit", "complete"}
@@ -22,17 +22,34 @@ def main(argv: list[str] | None = None) -> int:
     arguments = sys.argv[1:] if argv is None else argv
     if not arguments or arguments[0] not in LIFECYCLE_COMMANDS:
         return dispatch(arguments)
+    target_run_id = lifecycle_target(arguments)
     interrupted: LifecycleSignal | None = None
     with lifecycle_signal_handlers():
         try:
-            return dispatch(arguments)
+            return dispatch(
+                arguments,
+                start_run_id=target_run_id if arguments[0] == "start" else None,
+            )
         except LifecycleSignal as exc:
-            record_lifecycle_interruption(exc.signal_number)
+            record_lifecycle_interruption(target_run_id, exc.signal_number)
             interrupted = exc
     assert interrupted is not None
     signal.signal(interrupted.signal_number, signal.SIG_DFL)
     os.kill(os.getpid(), interrupted.signal_number)
     return 128 + interrupted.signal_number
+
+
+def lifecycle_target(arguments: list[str]) -> str | None:
+    parsed = build_parser().parse_args(arguments)
+    if parsed.command == "start":
+        return new_durable_run_id()
+    run_id = getattr(parsed, "run_id", None)
+    if run_id is not None:
+        return run_id
+    try:
+        return RunStore().status()["run_id"]
+    except RunStoreError:
+        return None
 
 
 @contextmanager
@@ -59,7 +76,9 @@ def lifecycle_signal_handlers() -> Iterator[None]:
             signal.signal(signal_number, handler)
 
 
-def record_lifecycle_interruption(signal_number: int) -> None:
+def record_lifecycle_interruption(run_id: str | None, signal_number: int) -> None:
+    if run_id is None:
+        return
     try:
         signal_name = signal.Signals(signal_number).name
     except ValueError:
@@ -72,7 +91,7 @@ def record_lifecycle_interruption(signal_number: int) -> None:
     try:
         store = RunStore()
         with store.lock(validate_root_permissions=True):
-            projection = store.status()
+            projection = store.status(run_id)
             if projection["state"] == "completed":
                 return
             if (

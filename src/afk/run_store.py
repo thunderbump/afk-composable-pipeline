@@ -80,6 +80,10 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def new_durable_run_id() -> str:
+    return f"{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}-{uuid.uuid4().hex[:12]}"
+
+
 class RunStore:
     def __init__(self, root: Path | None = None):
         self.root = root or default_state_root()
@@ -186,10 +190,7 @@ class RunStore:
         run_id: str | None = None,
         created_at: str | None = None,
     ) -> dict[str, Any]:
-        run_id = (
-            run_id
-            or f"{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}-{uuid.uuid4().hex[:12]}"
-        )
+        run_id = run_id or new_durable_run_id()
         created_at = created_at or utc_now()
         _validate_run_id(run_id)
         if not bead_id.strip():

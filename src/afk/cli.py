@@ -67,7 +67,9 @@ PRODUCTION_REVIEW_TIMEOUT_SECONDS = 300
 DEFAULT_LEDGER_DIR = "ledgers"
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(
+    argv: list[str] | None = None, *, start_run_id: str | None = None
+) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
@@ -76,6 +78,7 @@ def main(argv: list[str] | None = None) -> int:
             run_id, exit_code = start_run(
                 args.bead_id,
                 bootstrap_contract=args.bootstrap_contract,
+                run_id=start_run_id,
             )
         except (StartError, RunStoreError) as exc:
             print(str(exc), file=sys.stderr)

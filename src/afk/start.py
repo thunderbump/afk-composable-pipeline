@@ -88,6 +88,7 @@ def start_run(
     *,
     cwd: Path | None = None,
     bootstrap_contract: bool = False,
+    run_id: str | None = None,
 ) -> tuple[str, int]:
     context = preflight(
         bead_id,
@@ -113,6 +114,7 @@ def start_run(
                 "lingering": lingering,
                 "validation_contract": context.validation_contract,
             },
+            run_id=run_id,
         )
         run_id = projection["run_id"]
         try:
