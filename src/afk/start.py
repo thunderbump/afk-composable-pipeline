@@ -26,7 +26,13 @@ from afk.candidate import (
     seal_interrupted_repair_attempt,
     verify_candidate_publication,
 )
-from afk.candidate_gate import GateError, complete_gate_cycle
+from afk.candidate_gate import (
+    GateError,
+    MAX_GATE_COMMENTS,
+    complete_gate_cycle,
+    gate_comment_effect_id,
+    reconcile_gate_comment,
+)
 from afk.candidate_validation import (
     CandidateValidationError,
     VALIDATION_ENVIRONMENT_ALLOWLIST,
@@ -264,6 +270,10 @@ def resume_run(
         if isinstance(attention, dict) and attention.get("scope") == "gate":
             gate_retry = _gate_retry_authorization(projection, note)
             if gate_retry is not None:
+                if not _reobserve_gate_comment(
+                    store, run_id, projection, projection["gate_cycles"][-1]
+                ):
+                    return run_id, 2
                 store.append_event(
                     run_id,
                     "gate.retry_authorized",
@@ -1361,8 +1371,15 @@ def _advance_pr_ready(store: RunStore, run_id: str) -> int:
             summary="PR readiness Gate identity is invalid",
         )
         return 2
-    comment_effect_id = f"gate-comment-{cycle}{f'-retry-{retry}' if retry else ''}"
+    comment_effect_id = gate_comment_effect_id(cycle, retry)
     try:
+        reconcile_gate_comment(
+            store,
+            run_id,
+            pr_number=projection["pr_number"],
+            worktree=Path(projection["worktree_path"]),
+            gate=latest,
+        )
         comment_effect = store.effect(run_id, comment_effect_id)
         intended = comment_effect.get("intended")
         if (
@@ -1377,6 +1394,16 @@ def _advance_pr_ready(store: RunStore, run_id: str) -> int:
             raise RunStoreError("final Gate comment is not confirmed")
         observed = mark_candidate_pr_ready(store, run_id)
     except CandidateError as exc:
+        _attention(
+            store,
+            run_id,
+            checkpoint="reviewed",
+            scope="publication",
+            kind=exc.kind,
+            summary=exc.summary,
+        )
+        return 2
+    except GateError as exc:
         _attention(
             store,
             run_id,
@@ -2076,6 +2103,7 @@ def _advance_completed_gate(
     bead: dict[str, Any] | None = None,
 ) -> int:
     projection = store.status(run_id)
+    resuming_completed_gate = outcome is None
     if outcome is None:
         cycles = projection.get("gate_cycles", [])
         if (
@@ -2093,9 +2121,29 @@ def _advance_completed_gate(
             )
             return 2
         outcome = cycles[-1]
+    if resuming_completed_gate and not _reobserve_gate_comment(
+        store, run_id, projection, outcome
+    ):
+        return 2
     next_action = outcome.get("next_action")
     if next_action == "complete":
         return 0
+    cycles = projection.get("gate_cycles", [])
+    if (
+        next_action in {"attention", "repair"}
+        and not outcome.get("stop_reason")
+        and isinstance(cycles, list)
+        and len(cycles) >= MAX_GATE_COMMENTS
+    ):
+        _attention(
+            store,
+            run_id,
+            checkpoint=projection["checkpoint"],
+            scope="gate",
+            kind="exhausted",
+            summary="Gate evidence comment budget exhausted after five comments",
+        )
+        return 2
     if next_action == "attention":
         _attention(
             store,
@@ -2149,6 +2197,45 @@ def _advance_completed_gate(
         )
         return 2
     return _advance_repaired_candidate(store, run_id)
+
+
+def _reobserve_gate_comment(
+    store: RunStore,
+    run_id: str,
+    projection: dict[str, Any],
+    outcome: dict[str, Any],
+) -> bool:
+    if outcome.get("pr_comment") is None:
+        return True
+    try:
+        reconcile_gate_comment(
+            store,
+            run_id,
+            pr_number=projection["pr_number"],
+            worktree=Path(projection["worktree_path"]),
+            gate=outcome,
+        )
+    except GateError as exc:
+        _attention(
+            store,
+            run_id,
+            checkpoint=projection["checkpoint"],
+            scope="gate",
+            kind=exc.kind,
+            summary=exc.summary,
+        )
+        return False
+    except (KeyError, OSError, RunStoreError, ValueError) as exc:
+        _attention(
+            store,
+            run_id,
+            checkpoint=projection["checkpoint"],
+            scope="gate",
+            kind="unavailable",
+            summary=str(exc),
+        )
+        return False
+    return True
 
 
 def preflight(

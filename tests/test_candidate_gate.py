@@ -963,16 +963,31 @@ class CandidateGateTest(unittest.TestCase):
                 },
             ]
             gh_calls = []
+            posted_body = None
 
             def gh(command, worktree, **kwargs):
+                nonlocal posted_body
                 gh_calls.append(command)
                 if "--method" not in command:
                     if len(gh_calls) == 1:
                         raise GateError(
                             "GitHub comment command failed", kind="inconclusive"
                         )
-                    return subprocess.CompletedProcess(command, 0, "[]\n", "")
+                    comments = (
+                        [
+                            {
+                                "body": posted_body,
+                                "html_url": "https://example.test/comment/1",
+                            }
+                        ]
+                        if posted_body is not None
+                        else []
+                    )
+                    return subprocess.CompletedProcess(
+                        command, 0, json.dumps(comments), ""
+                    )
                 body = json.loads(kwargs["input_text"])["body"]
+                posted_body = body
                 return subprocess.CompletedProcess(
                     command,
                     0,
@@ -2013,6 +2028,74 @@ class CandidateGateTest(unittest.TestCase):
                         )
                     replacement.assert_not_called()
 
+    def test_gate_comment_reconciles_a_confirmed_pre_projection_effect(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store = RunStore(root / "state")
+            run_id = store.create_run(
+                bead_id="central-test.1",
+                repository="owner/project",
+                base_branch="main",
+                base_sha="a" * 40,
+                start_request={},
+                run_id="run-1",
+            )["run_id"]
+            gate = {
+                "cycle": 1,
+                "candidate_sha": "b" * 40,
+                "validation": {"status": "rejected", "summary": "failed"},
+                "reviews": [],
+                "next_action": "repair",
+            }
+            identity = candidate_gate_module._gate_comment_identity(
+                store.identity(run_id),
+                run_id,
+                pr_number=7,
+                gate=gate,
+            )
+            marker = identity.pop("marker")
+            body = candidate_gate_module._gate_comment_body(gate, marker)
+            store.prepare_effect(
+                run_id,
+                "gate-comment-1",
+                kind="gate-comment",
+                intended=identity,
+            )
+            store.confirm_effect(
+                run_id,
+                "gate-comment-1",
+                observed={
+                    "url": "https://example.test/comment/1",
+                    "marker": marker,
+                },
+            )
+
+            with (
+                mock.patch(
+                    "afk.candidate_gate._github_comments",
+                    return_value=[
+                        {
+                            "url": "https://example.test/comment/1",
+                            "body": body,
+                        }
+                    ],
+                ),
+                mock.patch("afk.candidate_gate._post_gate_comment") as replacement,
+            ):
+                reconcile_gate_comment(
+                    store,
+                    run_id,
+                    pr_number=7,
+                    worktree=root,
+                    gate=gate,
+                )
+
+            replacement.assert_not_called()
+            self.assertEqual(
+                store.effect(run_id, "gate-comment-1")["intended"],
+                identity,
+            )
+
     def test_gate_comment_reconciliation_reads_all_paginated_comment_pages(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -2039,7 +2122,19 @@ class CandidateGateTest(unittest.TestCase):
                 return "https://example.test/comment/1"
 
             with (
-                mock.patch("afk.candidate_gate._github_comments", return_value=[]),
+                mock.patch(
+                    "afk.candidate_gate._github_comments",
+                    side_effect=lambda *args: (
+                        [
+                            {
+                                "url": "https://example.test/comment/1",
+                                "body": posted[0],
+                            }
+                        ]
+                        if posted
+                        else []
+                    ),
+                ),
                 mock.patch("afk.candidate_gate._post_gate_comment", side_effect=post),
             ):
                 reconcile_gate_comment(
