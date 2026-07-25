@@ -270,6 +270,10 @@ def resume_run(
         if isinstance(attention, dict) and attention.get("scope") == "gate":
             gate_retry = _gate_retry_authorization(projection, note)
             if gate_retry is not None:
+                if not _reobserve_gate_comment(
+                    store, run_id, projection, projection["gate_cycles"][-1]
+                ):
+                    return run_id, 2
                 store.append_event(
                     run_id,
                     "gate.retry_authorized",
@@ -2099,6 +2103,7 @@ def _advance_completed_gate(
     bead: dict[str, Any] | None = None,
 ) -> int:
     projection = store.status(run_id)
+    resuming_completed_gate = outcome is None
     if outcome is None:
         cycles = projection.get("gate_cycles", [])
         if (
@@ -2116,6 +2121,10 @@ def _advance_completed_gate(
             )
             return 2
         outcome = cycles[-1]
+    if resuming_completed_gate and not _reobserve_gate_comment(
+        store, run_id, projection, outcome
+    ):
+        return 2
     next_action = outcome.get("next_action")
     if next_action == "complete":
         return 0
@@ -2188,6 +2197,45 @@ def _advance_completed_gate(
         )
         return 2
     return _advance_repaired_candidate(store, run_id)
+
+
+def _reobserve_gate_comment(
+    store: RunStore,
+    run_id: str,
+    projection: dict[str, Any],
+    outcome: dict[str, Any],
+) -> bool:
+    if outcome.get("pr_comment") is None:
+        return True
+    try:
+        reconcile_gate_comment(
+            store,
+            run_id,
+            pr_number=projection["pr_number"],
+            worktree=Path(projection["worktree_path"]),
+            gate=outcome,
+        )
+    except GateError as exc:
+        _attention(
+            store,
+            run_id,
+            checkpoint=projection["checkpoint"],
+            scope="gate",
+            kind=exc.kind,
+            summary=exc.summary,
+        )
+        return False
+    except (KeyError, OSError, RunStoreError, ValueError) as exc:
+        _attention(
+            store,
+            run_id,
+            checkpoint=projection["checkpoint"],
+            scope="gate",
+            kind="unavailable",
+            summary=str(exc),
+        )
+        return False
+    return True
 
 
 def preflight(

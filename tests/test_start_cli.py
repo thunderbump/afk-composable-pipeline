@@ -2448,6 +2448,88 @@ class StartCliTest(unittest.TestCase):
                     comment["body_sha256"],
                 )
 
+    def test_resume_reobserves_rejected_gate_comment_before_starting_repair(self):
+        state_home = self.temp / "rejected-gate-comment-after-append"
+        run_id, store, environment = self.start_isolated_validation_run(
+            "rejected-gate-comment-after-append"
+        )
+        (Path(environment["HOME"]) / ".fake-validation-status").write_text(
+            "rejected", encoding="utf-8"
+        )
+        interrupted = self.run_afk(
+            "resume",
+            **environment,
+            AFK_TEST_KILL_AFTER_EVENT="gate.cycle_completed",
+        )
+        self.assertLess(interrupted.returncode, 0, interrupted.stderr)
+        comment_path = state_home / "fake-comment.json"
+        comment = json.loads(comment_path.read_text(encoding="utf-8"))
+        comment["body"] += "edited\n"
+        comment_path.write_text(json.dumps(comment), encoding="utf-8")
+
+        resumed = self.run_afk("resume", **environment)
+
+        self.assertEqual(resumed.returncode, 2, resumed.stderr)
+        status = store.status(run_id)
+        self.assertEqual(status["checkpoint"], "candidate_ready")
+        self.assertEqual(status["attention"]["scope"], "gate")
+        self.assertEqual(status["attention"]["kind"], "conflict")
+        self.assertEqual(
+            len(self.launch_events(run_id, "repair.started", state_home=state_home)),
+            0,
+        )
+        self.assertEqual(
+            self.mutation_count("gate-comment", state_home=state_home),
+            1,
+        )
+
+    def test_resume_reobserves_inconclusive_gate_comment_before_authorizing_retry(self):
+        state_home = self.temp / "inconclusive-gate-comment-after-append"
+        run_id, store, environment = self.start_isolated_validation_run(
+            "inconclusive-gate-comment-after-append"
+        )
+        (Path(environment["HOME"]) / ".fake-review-status").write_text(
+            "inconclusive", encoding="utf-8"
+        )
+        interrupted = self.run_afk(
+            "resume",
+            **environment,
+            AFK_TEST_KILL_AFTER_EVENT="gate.cycle_completed",
+        )
+        self.assertLess(interrupted.returncode, 0, interrupted.stderr)
+        paused = self.run_afk("resume", **environment)
+        self.assertEqual(paused.returncode, 2, paused.stderr)
+        self.assertEqual(store.status(run_id)["attention"]["kind"], "inconclusive")
+
+        resumed = self.run_afk(
+            "resume",
+            "--note",
+            "retry inconclusive Gate",
+            **environment,
+            AFK_FAKE_COMMENT_UNAVAILABLE="1",
+        )
+
+        self.assertEqual(resumed.returncode, 2, resumed.stderr)
+        status = store.status(run_id)
+        self.assertEqual(status["checkpoint"], "validated")
+        self.assertEqual(status["attention"]["scope"], "gate")
+        self.assertEqual(status["attention"]["kind"], "inconclusive")
+        self.assertIn("comment", status["attention"]["summary"].lower())
+        self.assertEqual(
+            len(
+                self.launch_events(
+                    run_id, "gate.retry_authorized", state_home=state_home
+                )
+            ),
+            0,
+        )
+        self.assertEqual(len(status["gate_cycles"]), 1)
+        self.assertIsNone(store.effect_if_present(run_id, "gate-comment-1-retry-1"))
+        self.assertEqual(
+            self.mutation_count("gate-comment", state_home=state_home),
+            1,
+        )
+
     def test_resume_posts_redacted_gate_evidence_with_its_exact_body_digest(self):
         state_home = self.temp / "redacted-gate-comment"
         run_id, store, environment = self.start_isolated_validation_run(
