@@ -515,8 +515,13 @@ def run_candidate_reviews(
         attempt_path = store.root / "runs" / run_id / attempt
         if attempt_path.exists():
             if not (attempt_path / "manifest.json").is_file():
-                raise GateError(
-                    f"{axis} review attempt is incomplete", kind="inconclusive"
+                _recover_unsealed_review_attempt(
+                    store,
+                    run_id,
+                    attempt=attempt,
+                    axis=axis,
+                    candidate_sha=candidate_sha,
+                    prompt=_review_prompt(axis, bundle_path, candidate_sha),
                 )
             if not store.verify_evidence(run_id, attempt):
                 raise GateError(f"{axis} review evidence could not be verified")
@@ -598,6 +603,70 @@ def run_candidate_reviews(
         store.seal_evidence(run_id, attempt)
         reviews.append(result)
     return reviews
+
+
+def _recover_unsealed_review_attempt(
+    store: RunStore,
+    run_id: str,
+    *,
+    attempt: str,
+    axis: str,
+    candidate_sha: str,
+    prompt: str,
+) -> None:
+    attempt_path = store.root / "runs" / run_id / attempt
+    allowed = {
+        "prompt.md",
+        "schema.json",
+        "events.jsonl",
+        "stderr.txt",
+        "raw-report.txt",
+        "report.json",
+        "outcome.json",
+    }
+    entries = {path.name for path in attempt_path.iterdir()}
+    if not entries <= allowed or any(
+        not path.is_file() or path.is_symlink() for path in attempt_path.iterdir()
+    ):
+        raise GateError(f"{axis} review attempt is ambiguous", kind="inconclusive")
+    expected_text = {
+        "prompt.md": prompt,
+        "schema.json": canonical_json(REVIEW_REPORT_SCHEMA) + "\n",
+    }
+    for name, value in expected_text.items():
+        path = attempt_path / name
+        if path.exists():
+            if path.read_text(encoding="utf-8") != value:
+                raise GateError(
+                    f"{axis} review attempt identity is invalid",
+                    kind="inconclusive",
+                )
+        else:
+            store.write_evidence_text(run_id, f"{attempt}/{name}", value)
+    result_paths = [
+        path
+        for name in ("report.json", "outcome.json")
+        if (path := attempt_path / name).is_file()
+    ]
+    if len(result_paths) > 1:
+        raise GateError(f"{axis} review evidence is ambiguous")
+    if result_paths:
+        _stored_review_result(axis, candidate_sha, result_paths[0])
+    else:
+        store.write_evidence_value(
+            run_id,
+            f"{attempt}/outcome.json",
+            {
+                "schema_version": 1,
+                "candidate_sha": candidate_sha,
+                "axis": axis,
+                "process_status": "failed",
+                "status": "inconclusive",
+                "summary": f"{axis} review attempt was interrupted before completion",
+                "findings": [],
+            },
+        )
+    store.seal_evidence(run_id, attempt)
 
 
 def _stored_review_result(axis: str, candidate_sha: str, path: Path) -> dict[str, Any]:

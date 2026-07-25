@@ -140,6 +140,7 @@ class StartCliTest(unittest.TestCase):
                     "import afk.candidate_validation as validation_module\n"
                     "original_run_contract = validation_module._run_contract\n"
                     "original_write_evidence = RunStore.write_evidence_text\n"
+                    "original_write_evidence_value = RunStore.write_evidence_value\n"
                     "original_ingest_evidence = RunStore.ingest_evidence_file\n"
                     "original_seal_evidence = RunStore.seal_evidence\n"
                     "injections = json.loads(os.environ['AFK_TEST_CRASH_INJECTIONS'])\n"
@@ -185,14 +186,14 @@ class StartCliTest(unittest.TestCase):
                     " return bool(target) and all(\n"
                     "  part in relative for part in target.split('|')\n"
                     " )\n"
-                    "def injected_write_evidence(store, run_id, relative, value):\n"
-                    " result = original_write_evidence(\n"
-                    "  store, run_id, relative, value\n"
-                    " )\n"
-                    " target = injections.get('AFK_TEST_KILL_AFTER_EVIDENCE')\n"
-                    " if evidence_targeted(target, relative):\n"
-                    "  os.kill(os.getpid(), signal.SIGKILL)\n"
-                    " return result\n"
+                    "def injected_evidence_writer(original):\n"
+                    " def injected(store, run_id, relative, value):\n"
+                    "  result = original(store, run_id, relative, value)\n"
+                    "  target = injections.get('AFK_TEST_KILL_AFTER_EVIDENCE')\n"
+                    "  if evidence_targeted(target, relative):\n"
+                    "   os.kill(os.getpid(), signal.SIGKILL)\n"
+                    "  return result\n"
+                    " return injected\n"
                     "def injected_ingest_evidence(store, run_id, relative, source):\n"
                     " result = original_ingest_evidence(\n"
                     "  store, run_id, relative, source\n"
@@ -213,7 +214,12 @@ class StartCliTest(unittest.TestCase):
                     "RunStore.confirm_effect = injected_confirm\n"
                     "run_store_module._write_new_json = injected_write_json\n"
                     "validation_module._run_contract = injected_run_contract\n"
-                    "RunStore.write_evidence_text = injected_write_evidence\n"
+                    "RunStore.write_evidence_text = injected_evidence_writer(\n"
+                    " original_write_evidence\n"
+                    ")\n"
+                    "RunStore.write_evidence_value = injected_evidence_writer(\n"
+                    " original_write_evidence_value\n"
+                    ")\n"
                     "RunStore.ingest_evidence_file = injected_ingest_evidence\n"
                     "RunStore.seal_evidence = injected_seal_evidence\n"
                     "from afk.cli import main\n"
@@ -2528,6 +2534,167 @@ class StartCliTest(unittest.TestCase):
         self.assertEqual(
             self.mutation_count("gate-comment", state_home=state_home),
             1,
+        )
+
+    def test_resume_seals_interrupted_review_then_authorizes_a_fresh_gate_retry(self):
+        state_home = self.temp / "interrupted-review"
+        run_id, store, environment = self.start_isolated_validation_run(
+            "interrupted-review"
+        )
+
+        interrupted = self.run_afk(
+            "resume",
+            **environment,
+            AFK_TEST_KILL_AFTER_EVIDENCE=("review-cycle-1-standards|prompt.md"),
+        )
+        self.assertLess(interrupted.returncode, 0, interrupted.stderr)
+
+        paused = self.run_afk("resume", **environment)
+
+        self.assertEqual(paused.returncode, 2, paused.stderr)
+        status = json.loads(
+            self.run_afk("status", run_id, "--json", **environment).stdout
+        )
+        self.assertEqual(status["attention"]["scope"], "gate")
+        self.assertEqual(status["attention"]["kind"], "inconclusive")
+        self.assertEqual(len(status["gate_cycles"]), 1)
+        reviews = status["gate_cycles"][0]["reviews"]
+        self.assertEqual(
+            [(review["axis"], review["status"]) for review in reviews],
+            [("standards", "inconclusive"), ("spec", "passed")],
+        )
+        report = json.loads(self.run_afk("report", run_id, **environment).stdout)
+        self.assertTrue(report["paused"])
+        self.assertEqual(report["attention"], status["attention"])
+        attempts = state_home / "afk" / "runs" / run_id / "attempts"
+        standards = attempts / "review-cycle-1-standards"
+        self.assertTrue((standards / "manifest.json").is_file())
+        self.assertTrue((standards / "outcome.json").is_file())
+        sealed_outcome = (standards / "outcome.json").read_bytes()
+
+        resumed = self.run_afk(
+            "resume",
+            "--note",
+            "retry interrupted Standards review",
+            **environment,
+        )
+
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        final_status = json.loads(
+            self.run_afk("status", run_id, "--json", **environment).stdout
+        )
+        self.assertEqual(final_status["checkpoint"], "reviewed")
+        self.assertEqual(len(final_status["gate_cycles"]), 2)
+        self.assertEqual(final_status["gate_cycles"][-1]["retry"], 1)
+        self.assertTrue(
+            (attempts / "review-cycle-1-retry-1-standards" / "manifest.json").is_file()
+        )
+        self.assertEqual((standards / "outcome.json").read_bytes(), sealed_outcome)
+
+    def test_resume_seals_and_reuses_a_completed_unsealed_review(self):
+        state_home = self.temp / "completed-unsealed-review"
+        run_id, store, environment = self.start_isolated_validation_run(
+            "completed-unsealed-review"
+        )
+
+        interrupted = self.run_afk(
+            "resume",
+            **environment,
+            AFK_TEST_KILL_AFTER_EVIDENCE=("review-cycle-1-standards|report.json"),
+        )
+        self.assertLess(interrupted.returncode, 0, interrupted.stderr)
+        attempts = state_home / "afk" / "runs" / run_id / "attempts"
+        standards = attempts / "review-cycle-1-standards"
+        durable_report = (standards / "report.json").read_bytes()
+        self.assertFalse((standards / "manifest.json").exists())
+
+        resumed = self.run_afk("resume", **environment)
+
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        status = json.loads(
+            self.run_afk("status", run_id, "--json", **environment).stdout
+        )
+        self.assertEqual(status["checkpoint"], "reviewed")
+        self.assertEqual(
+            [review["status"] for review in status["gate_cycles"][0]["reviews"]],
+            ["passed", "passed"],
+        )
+        self.assertTrue((standards / "manifest.json").is_file())
+        self.assertEqual((standards / "report.json").read_bytes(), durable_report)
+        self.assertFalse((standards / "outcome.json").exists())
+
+    def test_resume_charges_each_interrupted_repair_to_its_original_slot(self):
+        state_home = self.temp / "four-interrupted-repairs"
+        run_id, store, environment = self.start_isolated_validation_run(
+            "four-interrupted-repairs"
+        )
+        (Path(environment["HOME"]) / ".fake-validation-status").write_text(
+            "rejected", encoding="utf-8"
+        )
+
+        for slot in range(1, 5):
+            interrupted = self.run_afk(
+                "resume",
+                **environment,
+                AFK_TEST_KILL_AFTER_EVENT_WRITE="repair.started",
+            )
+            observed = json.loads(
+                self.run_afk("status", run_id, "--json", **environment).stdout
+            )
+            self.assertLess(
+                interrupted.returncode,
+                0,
+                f"slot {slot}: {interrupted.stderr} {observed}",
+            )
+            status = observed
+            self.assertEqual(status["repair_attempts_used"], slot)
+            self.assertEqual(status["repair_brief"]["repair_attempt"], slot)
+
+        exhausted = self.run_afk("resume", **environment)
+
+        self.assertEqual(exhausted.returncode, 2, exhausted.stderr)
+        status = json.loads(
+            self.run_afk("status", run_id, "--json", **environment).stdout
+        )
+        self.assertEqual(status["repair_attempts_used"], 4)
+        self.assertEqual(status["repair_brief"], {})
+        self.assertEqual(status["interrupted_repair"]["status"], "exhausted")
+        self.assertEqual(status["attention"]["scope"], "repair")
+        self.assertEqual(status["attention"]["kind"], "exhausted")
+        attempts = state_home / "afk" / "runs" / run_id / "attempts"
+        for slot in range(1, 5):
+            attempt = attempts / f"repair-{slot}"
+            self.assertTrue((attempt / "interruption.json").is_file())
+            self.assertTrue((attempt / "manifest.json").is_file())
+
+        started_before = len(
+            self.launch_events(run_id, "repair.started", state_home=state_home)
+        )
+        commands_before = self.command_log.read_bytes()
+        repeated = self.run_afk("resume", **environment)
+
+        self.assertEqual(repeated.returncode, 2, repeated.stderr)
+        self.assertEqual(
+            len(self.launch_events(run_id, "repair.started", state_home=state_home)),
+            started_before,
+        )
+        self.assertEqual(self.command_log.read_bytes(), commands_before)
+        command_records = [
+            json.loads(line) for line in commands_before.decode().splitlines()
+        ]
+        self.assertEqual(
+            sum(
+                record["command"] == "git" and record["args"][:2] == ["reset", "--hard"]
+                for record in command_records
+            ),
+            3,
+        )
+        self.assertEqual(
+            sum(
+                record["command"] == "git" and record["args"] == ["clean", "-ffdx"]
+                for record in command_records
+            ),
+            3,
         )
 
     def test_resume_posts_redacted_gate_evidence_with_its_exact_body_digest(self):
@@ -9009,6 +9176,10 @@ class StartCliTest(unittest.TestCase):
                     elif args[:1] == ["rev-list"]:
                         pass
                     elif args[:1] == ["diff"]:
+                        pass
+                    elif args[:2] == ["reset", "--hard"]:
+                        pass
+                    elif args == ["clean", "-ffdx"]:
                         pass
                     elif args[:1] == ["push"]:
                         if "--delete" in args:

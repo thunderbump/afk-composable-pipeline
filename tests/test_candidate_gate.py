@@ -2437,16 +2437,63 @@ class CandidateGateTest(unittest.TestCase):
                 data={"checkpoint": "candidate_ready", "repair_attempts_used": 2},
             )
             seal_bundle_before_crash(3, {"id": "central-test.1"})
-            store.write_evidence_text(
-                run_id, "attempts/review-cycle-3-standards/prompt.md", "started\n"
+            cycle_three_bundle = (
+                root
+                / "state"
+                / "runs"
+                / run_id
+                / f"gates/gate-cycle-3-{candidate_sha[:12]}/review-bundle"
             )
+            store.write_evidence_text(
+                run_id,
+                "attempts/review-cycle-3-standards/prompt.md",
+                candidate_gate_module._review_prompt(
+                    "standards", cycle_three_bundle, candidate_sha
+                ),
+            )
+
+            def recovered_reviewer(axis, bundle_path, attempt_path, worktree):
+                return (
+                    0,
+                    {
+                        "schema_version": 1,
+                        "candidate_sha": candidate_sha,
+                        "axis": axis,
+                        "status": "passed",
+                        "summary": f"{axis} passed",
+                        "findings": [],
+                    },
+                    "",
+                    "",
+                )
+
             with (
-                mock.patch("afk.candidate_gate._execute_reviewer") as ambiguous_rerun,
-                self.assertRaisesRegex(GateError, "incomplete") as raised,
+                mock.patch(
+                    "afk.candidate_gate._execute_reviewer",
+                    side_effect=recovered_reviewer,
+                ) as recovered,
             ):
-                complete_gate_cycle(store, run_id, bead={"id": "central-test.1"})
-            ambiguous_rerun.assert_not_called()
-            self.assertEqual(raised.exception.kind, "inconclusive")
+                recovered_reviews = run_candidate_reviews(
+                    store,
+                    run_id,
+                    cycle=3,
+                    bead={"id": "central-test.1"},
+                )
+            recovered.assert_called_once()
+            self.assertEqual(recovered.call_args.args[0], "spec")
+            self.assertEqual(
+                [review["status"] for review in recovered_reviews],
+                ["inconclusive", "passed"],
+            )
+            self.assertTrue(
+                (
+                    root
+                    / "state"
+                    / "runs"
+                    / run_id
+                    / "attempts/review-cycle-3-standards/manifest.json"
+                ).is_file()
+            )
 
             store.append_event(
                 run_id,
