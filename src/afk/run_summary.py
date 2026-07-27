@@ -9,6 +9,7 @@ from afk.retrospective_contract import (
     ARTIFACT_INVENTORY_LIMIT,
     TEXT_CHARACTER_LIMIT,
     TRUNCATION_SUFFIX,
+    expected_episode_state,
 )
 from afk.run_store import RunStore, RunStoreError
 
@@ -184,10 +185,7 @@ def build_run_summary(store: RunStore, run_id: str, *, episode_sequence: int) ->
 
 
 def _validate_episode(event: dict[str, Any], episode_sequence: int) -> None:
-    expected_state = {
-        "run.attention_required": "attention_required",
-        "run.completed": "completed",
-    }.get(event["event"])
+    expected_state = expected_episode_state(event["event"])
     if expected_state is None or event.get("state") != expected_state:
         raise RunStoreError(
             f"sequence {episode_sequence} is not a retrospective episode"

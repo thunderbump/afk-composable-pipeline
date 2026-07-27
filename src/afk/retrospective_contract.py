@@ -12,7 +12,10 @@ TEXT_CHARACTER_LIMIT = 512
 TRUNCATION_SUFFIX = "…[TRUNCATED]"
 INVENTORY_KEY = "_retrospective_inventory"
 INVENTORY_SCHEMA_VERSION = 1
-EPISODE_EVENTS = {"run.attention_required", "run.completed"}
+EPISODE_STATES = {
+    "run.attention_required": "attention_required",
+    "run.completed": "completed",
+}
 EFFECT_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 
@@ -22,7 +25,11 @@ class RetrospectiveContractError(ValueError):
 
 
 def is_episode_event(event: str) -> bool:
-    return event in EPISODE_EVENTS
+    return expected_episode_state(event) is not None
+
+
+def expected_episode_state(event: str) -> str | None:
+    return EPISODE_STATES.get(event)
 
 
 def attach_inventory(data: dict[str, Any], inventory: dict[str, Any]) -> dict[str, Any]:
