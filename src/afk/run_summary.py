@@ -15,6 +15,8 @@ from afk.run_store import EvidenceError, RunStore, RunStoreError
 
 
 MAX_RUN_SUMMARY_BYTES = 64 * 1024
+RUN_SUMMARY_SCHEMA_VERSION = 2
+RUN_SUMMARY_EVIDENCE_PREFIX = "retrospective/run-summary-v2-"
 MAX_EVENTS = 64
 MAX_EFFECTS = ARTIFACT_INVENTORY_LIMIT
 MAX_EVIDENCE_UNITS = ARTIFACT_INVENTORY_LIMIT
@@ -53,7 +55,7 @@ def build_run_summary(store: RunStore, run_id: str, *, episode_sequence: int) ->
     """Return bounded canonical JSON for one retrospective episode."""
     event = store.event(run_id, episode_sequence)
     _validate_episode(event, episode_sequence)
-    summary_evidence = f"retrospective/run-summary-{episode_sequence:020d}"
+    summary_evidence = f"{RUN_SUMMARY_EVIDENCE_PREFIX}{episode_sequence:020d}"
     snapshot = store.read_run_snapshot(run_id, through_sequence=episode_sequence)
     identity = snapshot["identity"]
     projection = snapshot["projection"]
@@ -89,7 +91,7 @@ def build_run_summary(store: RunStore, run_id: str, *, episode_sequence: int) ->
 
     summary = redact_artifact_value(
         {
-            "schema_version": 1,
+            "schema_version": RUN_SUMMARY_SCHEMA_VERSION,
             "run": {
                 "run_id": _bounded_text(identity["run_id"]),
                 "bead_id": _bounded_text(identity["bead_id"]),

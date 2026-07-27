@@ -7,7 +7,11 @@ from typing import Any
 from afk.durable_id import is_durable_id
 from afk.jsonutil import canonical_json
 from afk.retrospective_contract import TEXT_CHARACTER_LIMIT
-from afk.run_summary import MAX_RUN_SUMMARY_BYTES, citation_manifest
+from afk.run_summary import (
+    MAX_RUN_SUMMARY_BYTES,
+    RUN_SUMMARY_SCHEMA_VERSION,
+    citation_manifest,
+)
 
 
 COLLECTION_LIMIT = 32
@@ -73,7 +77,7 @@ def normalize_retrospective_result(
     if (
         not isinstance(summary, dict)
         or type(summary.get("schema_version")) is not int
-        or summary["schema_version"] != 1
+        or summary["schema_version"] != RUN_SUMMARY_SCHEMA_VERSION
         or canonical_json(summary) != run_summary
         or not isinstance(summary.get("run"), dict)
         or not isinstance(summary.get("episode"), dict)

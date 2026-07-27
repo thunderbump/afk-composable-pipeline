@@ -9,10 +9,11 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from afk.jsonutil import sha256_json  # noqa: E402
+from afk.jsonutil import canonical_json, sha256_json  # noqa: E402
 from afk.run_store import RunStore, RunStoreError  # noqa: E402
 from afk.run_summary import (  # noqa: E402
     MAX_RUN_SUMMARY_BYTES,
+    RUN_SUMMARY_EVIDENCE_PREFIX,
     build_run_summary,
 )
 
@@ -154,6 +155,91 @@ class RunSummaryTest(unittest.TestCase):
             "FULL-EVENT-DIFF-MUST-NOT-CROSS-BOUNDARY",
         ):
             self.assertNotIn(prohibited, serialized)
+
+    def test_builds_current_summary_without_mutating_sealed_v1_summary(self):
+        self.store.append_event(
+            "run-001",
+            "run.attention_required",
+            state="attention_required",
+            data={"checkpoint": "created"},
+            recorded_at="2026-07-27T10:01:00Z",
+        )
+        v1_summary = canonical_json(
+            {
+                "schema_version": 1,
+                "run": {
+                    "run_id": "run-001",
+                    "bead_id": "central-bhap.8.1",
+                    "repository": "https://example.invalid/acme/pipeline.git",
+                    "base_branch": "main",
+                    "base_sha": BASE_SHA,
+                    "created_at": "2026-07-27T10:00:00Z",
+                },
+                "episode": {
+                    "sequence": 2,
+                    "event": "run.attention_required",
+                    "recorded_at": "2026-07-27T10:01:00Z",
+                    "state": "attention_required",
+                    "checkpoint": "created",
+                },
+                "projection": {
+                    "state": "attention_required",
+                    "checkpoint": "created",
+                },
+                "events": [
+                    {
+                        "sequence": 1,
+                        "event": "run.created",
+                        "recorded_at": "2026-07-27T10:00:00Z",
+                        "state": "created",
+                    },
+                    {
+                        "sequence": 2,
+                        "event": "run.attention_required",
+                        "recorded_at": "2026-07-27T10:01:00Z",
+                        "state": "attention_required",
+                    },
+                ],
+                "effects": [],
+                "evidence": [],
+                "omitted": {
+                    "events": 0,
+                    "effects": 0,
+                    "evidence_units": 0,
+                    "evidence_files": 0,
+                },
+            }
+        )
+        v1_result = {
+            "schema_version": 1,
+            "run_id": "run-001",
+            "episode_sequence": 2,
+            "episode_event": "run.attention_required",
+            "episode_state": "attention_required",
+            "summary": v1_summary,
+        }
+        v1_identity = "retrospective/run-summary-00000000000000000002"
+        self.store.reconcile_evidence_result("run-001", v1_identity, v1_result)
+
+        current_summary = build_run_summary(
+            self.store,
+            "run-001",
+            episode_sequence=2,
+        )
+
+        self.assertEqual(json.loads(current_summary)["schema_version"], 2)
+        self.assertIn("citation_manifest", json.loads(current_summary))
+        self.assertEqual(
+            self.store.sealed_evidence_result("run-001", v1_identity),
+            v1_result,
+        )
+        self.assertEqual(
+            self.store.sealed_evidence_result(
+                "run-001",
+                f"{RUN_SUMMARY_EVIDENCE_PREFIX}{2:020d}",
+            )["summary"],
+            current_summary,
+        )
 
     def test_reuses_the_sealed_episode_summary_after_later_artifacts_are_added(self):
         self.store.append_event(
@@ -351,7 +437,7 @@ class RunSummaryTest(unittest.TestCase):
             data={"checkpoint": "created"},
             recorded_at="2026-07-27T10:01:00Z",
         )
-        evidence = "retrospective/run-summary-00000000000000000002"
+        evidence = f"{RUN_SUMMARY_EVIDENCE_PREFIX}{2:020d}"
         with patch.object(
             self.store,
             "seal_evidence",
@@ -385,7 +471,7 @@ class RunSummaryTest(unittest.TestCase):
 
     def fabricated_summary_result(self):
         summary = {
-            "schema_version": 1,
+            "schema_version": 2,
             "run": {
                 "run_id": "run-001",
                 "bead_id": "central-bhap.8.1",
@@ -435,6 +521,22 @@ class RunSummaryTest(unittest.TestCase):
                 "evidence_files": 0,
             },
         }
+        summary["citation_manifest"] = {
+            "effects.json": {"kind": "json", "summary_pointer": "/effects"},
+            "episode-checkpoint.txt": {
+                "kind": "text",
+                "summary_pointer": "/episode/checkpoint",
+            },
+            "episode.json": {"kind": "json", "summary_pointer": "/episode"},
+            "events.jsonl": {"kind": "event", "summary_pointer": "/events"},
+            "evidence.json": {"kind": "json", "summary_pointer": "/evidence"},
+            "omitted.json": {"kind": "json", "summary_pointer": "/omitted"},
+            "projection.json": {
+                "kind": "json",
+                "summary_pointer": "/projection",
+            },
+            "run.json": {"kind": "json", "summary_pointer": "/run"},
+        }
         return {
             "schema_version": 1,
             "run_id": "run-001",
@@ -461,7 +563,7 @@ class RunSummaryTest(unittest.TestCase):
         self.append_completion_episode()
         self.store.reconcile_evidence_result(
             "run-001",
-            "retrospective/run-summary-00000000000000000002",
+            f"{RUN_SUMMARY_EVIDENCE_PREFIX}{2:020d}",
             self.fabricated_summary_result(),
         )
 
@@ -474,7 +576,7 @@ class RunSummaryTest(unittest.TestCase):
         self.append_completion_episode()
         self.store.write_evidence_value(
             "run-001",
-            "retrospective/run-summary-00000000000000000002/result.json",
+            f"{RUN_SUMMARY_EVIDENCE_PREFIX}{2:020d}/result.json",
             self.fabricated_summary_result(),
         )
 

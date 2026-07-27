@@ -18,7 +18,7 @@ class RetrospectiveResultTest(unittest.TestCase):
     def summary(self):
         return canonical_json(
             {
-                "schema_version": 1,
+                "schema_version": 2,
                 "run": {"run_id": "run-001"},
                 "episode": {
                     "state": "attention_required",
