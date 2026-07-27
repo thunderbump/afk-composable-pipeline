@@ -379,6 +379,16 @@ def resume_run(
                     return run_id, _advance_candidate(store, run_id)
                 if _validation_resume_ready(projection):
                     return run_id, _advance_validation(store, run_id)
+                if projection["last_event"] == "worker.launch_prepared":
+                    store.append_event(
+                        run_id,
+                        "worker.launched",
+                        data={
+                            "unit": unit,
+                            "checkpoint": projection["checkpoint"],
+                        },
+                    )
+                    return run_id, 0
                 _attention(
                     store,
                     run_id,

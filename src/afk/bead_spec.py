@@ -43,15 +43,10 @@ def persist_bead_spec(
 ) -> dict[str, Any]:
     stored = store.write_evidence_value(run_id, BEAD_SPEC_ARTIFACT, bead)
     manifest = store.seal_evidence(run_id, BEAD_SPEC_EVIDENCE)
-    record = {
-        "schema_version": 1,
-        "evidence": BEAD_SPEC_EVIDENCE,
-        "manifest_sha256": _manifest_digest(manifest),
-    }
     store.append_event(
         run_id,
         "bead.spec_recorded",
-        data={"bead_spec": record},
+        data={"bead_spec": _bead_spec_record(manifest)},
     )
     return stored
 
@@ -78,13 +73,7 @@ def reconcile_bead_spec(
     store.append_event(
         run_id,
         "bead.spec_recorded",
-        data={
-            "bead_spec": {
-                "schema_version": 1,
-                "evidence": BEAD_SPEC_EVIDENCE,
-                "manifest_sha256": _manifest_digest(manifest),
-            }
-        },
+        data={"bead_spec": _bead_spec_record(manifest)},
     )
     return stored
 
@@ -112,11 +101,7 @@ def load_bead_spec(
                 raise RunStoreError(
                     "canonical Bead/spec evidence is malformed"
                 ) from exc
-            record = {
-                "schema_version": 1,
-                "evidence": BEAD_SPEC_EVIDENCE,
-                "manifest_sha256": _manifest_digest(recovered_manifest),
-            }
+            record = _bead_spec_record(recovered_manifest)
         elif fallback is not None:
             return redact_artifact_value(fallback)
     if not isinstance(record, dict) or set(record) != {
@@ -146,3 +131,11 @@ def load_bead_spec(
 
 def _manifest_digest(manifest: dict[str, Any]) -> str:
     return hashlib.sha256(canonical_json(manifest).encode("utf-8")).hexdigest()
+
+
+def _bead_spec_record(manifest: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "evidence": BEAD_SPEC_EVIDENCE,
+        "manifest_sha256": _manifest_digest(manifest),
+    }

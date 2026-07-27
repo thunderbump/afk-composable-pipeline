@@ -625,7 +625,7 @@ class StartCliTest(unittest.TestCase):
         self, boundary_type, phase, target, *, state_home, environment
     ):
         injection_name = {
-            "event": "AFK_TEST_KILL_AFTER_EVENT_WRITE",
+            "event-after": "AFK_TEST_KILL_AFTER_EVENT_WRITE",
             "event-before": "AFK_TEST_KILL_BEFORE_EVENT",
             "mutation-before": "AFK_TEST_KILL_BEFORE_MUTATION",
             "mutation-after": "AFK_TEST_KILL_AFTER_MUTATION",
@@ -696,36 +696,46 @@ class StartCliTest(unittest.TestCase):
                 else {}
             ),
             "recovery_environment": absent_worker if phase == "worker" else {},
-            "expects_attention": target == "validation.attempt_started",
-            "expects_worker_terminal": phase != "worker" or target == "worker.terminal",
+            "expects_attention": (
+                boundary_type == "event-after"
+                and target == "validation.attempt_started"
+            ),
+            "expects_worker_terminal": phase != "worker"
+            or (boundary_type == "event-after" and target == "worker.terminal"),
             "includes_remote_cleanup": target == "remote-branch-delete",
         }
 
     def test_full_lifecycle_resume_is_idempotent_across_crash_boundaries(self):
+        event_phases = (
+            ("bead.spec_recorded", "start"),
+            ("worker.launch_prepared", "start"),
+            ("worker.launched", "worker"),
+            ("bead.claimed", "worker"),
+            ("worktree.ready", "worker"),
+            ("implementation.attempt_started", "worker"),
+            ("implementation.attempt_finished", "worker"),
+            ("candidate.change_committed", "worker"),
+            ("candidate.branch_published", "worker"),
+            ("candidate.pr_published", "worker"),
+            ("candidate.ready", "worker"),
+            ("validation.attempt_started", "worker"),
+            ("validation.attempt_finished", "worker"),
+            ("validation.passed", "worker"),
+            ("gate.cycle_completed", "worker"),
+            ("worker.terminal", "worker"),
+            ("pr.marked_ready", "resume"),
+            ("pr.squash_merged", "resume"),
+            ("pr.merge_reconciled", "resume"),
+            ("bead.closed", "resume"),
+            ("run.completed", "resume"),
+        )
         event_boundaries = (
-            ("event", "start", "run.created"),
-            ("event-before", "start", "bead.spec_recorded"),
-            ("event", "start", "bead.spec_recorded"),
-            ("event", "start", "worker.launch_prepared"),
-            ("event", "worker", "worker.launched"),
-            ("event", "worker", "bead.claimed"),
-            ("event", "worker", "worktree.ready"),
-            ("event", "worker", "implementation.attempt_started"),
-            ("event", "worker", "implementation.attempt_finished"),
-            ("event", "worker", "candidate.change_committed"),
-            ("event", "worker", "candidate.branch_published"),
-            ("event", "worker", "candidate.pr_published"),
-            ("event", "worker", "candidate.ready"),
-            ("event", "worker", "validation.attempt_started"),
-            ("event", "worker", "validation.attempt_finished"),
-            ("event", "worker", "validation.passed"),
-            ("event", "worker", "gate.cycle_completed"),
-            ("event", "worker", "worker.terminal"),
-            ("event", "resume", "pr.marked_ready"),
-            ("event", "resume", "pr.squash_merged"),
-            ("event", "resume", "pr.merge_reconciled"),
-            ("event", "resume", "bead.closed"),
-            ("event", "resume", "run.completed"),
+            # Before run.created no durable Run exists for resume to select.
+            ("event-after", "start", "run.created"),
+        ) + tuple(
+            (f"event-{side}", phase, event)
+            for event, phase in event_phases
+            for side in ("before", "after")
         )
         mutation_phases = {
             "worker-launch": "start",
@@ -787,7 +797,17 @@ class StartCliTest(unittest.TestCase):
             },
             expected_mutation_boundaries,
         )
-        self.assertIn(("event", "worker", "worker.terminal"), event_boundaries)
+        expected_event_boundaries = {
+            (side, event)
+            for side in ("event-before", "event-after")
+            for event, _ in event_phases
+        } | {("event-after", "run.created")}
+        self.assertEqual(len(event_boundaries), 43)
+        self.assertEqual(len(boundaries), 69)
+        self.assertEqual(
+            {(boundary_type, target) for boundary_type, _, target in event_boundaries},
+            expected_event_boundaries,
+        )
 
         for index, (boundary_type, phase, target) in enumerate(boundaries):
             with self.subTest(boundary_type=boundary_type, phase=phase, target=target):
@@ -1234,7 +1254,7 @@ class StartCliTest(unittest.TestCase):
         self.assert_launch_event(run_id, "worker.launch_reconciled", 1, unit)
         self.assertEqual(self.mutation_count("worker-launch"), 1)
 
-    def test_resume_pauses_after_crash_before_worker_launched_event(self):
+    def test_resume_reconstructs_worker_launch_after_crash_before_event(self):
         started = self.run_afk("start", "central-bnkl.1.1")
         run_id = started.stdout.strip()
         store = RunStore(self.state_home / "afk")
@@ -1250,11 +1270,14 @@ class StartCliTest(unittest.TestCase):
         self.assert_launch_effect(store, run_id, "confirmed")
         self.assert_launch_event(run_id, "worker.launched", 0, unit)
         resumed = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="absent")
+        progressed = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="absent")
         repeated = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="absent")
-        self.assertEqual(resumed.returncode, 2, resumed.stderr)
-        self.assertEqual(repeated.returncode, 2, repeated.stderr)
-        self.assertEqual(store.status(run_id)["attention"]["kind"], "inconclusive")
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        self.assertEqual(progressed.returncode, 0, progressed.stderr)
+        self.assertEqual(repeated.returncode, 0, repeated.stderr)
+        self.assert_launch_event(run_id, "worker.launched", 1, unit)
         self.assertEqual(self.mutation_count("worker-launch"), 1)
+        self.assertEqual(self.mutation_count("bead-claim"), 1)
 
     def test_resume_recovers_after_worker_launched_event_write(self):
         started = self.run_afk("start", "central-bnkl.1.1")
