@@ -288,6 +288,25 @@ class RunStoreTest(unittest.TestCase):
         with self.assertRaisesRegex(RunStoreError, "has no sequence 2"):
             self.store.event("run-001", 2)
 
+    def test_terminal_inventory_rejects_a_symlinked_evidence_root(self):
+        self.create_run()
+        external = self.state_home / "external-attempts"
+        external.mkdir()
+        attempts = self.root / "runs" / "run-001" / "attempts"
+        attempts.rmdir()
+        attempts.symlink_to(external, target_is_directory=True)
+
+        with self.assertRaisesRegex(
+            EvidenceTampered, "attempts evidence root is invalid"
+        ):
+            self.store.append_event(
+                "run-001",
+                "run.attention_required",
+                state="attention_required",
+            )
+        with self.assertRaisesRegex(RunStoreError, "has no sequence 2"):
+            self.store.event("run-001", 2)
+
     def test_completed_evidence_is_redacted_manifested_read_only_and_verified(self):
         self.create_run()
         evidence_path = self.store.write_evidence_text(

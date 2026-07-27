@@ -850,6 +850,8 @@ class RunStore:
         records = []
         for root_name in sorted(EVIDENCE_ROOTS):
             root = run_directory / root_name
+            if root.is_symlink() or not root.is_dir():
+                raise EvidenceTampered(f"{root_name} evidence root is invalid")
             for unit in sorted(root.iterdir(), key=lambda item: item.name):
                 if unit.is_symlink() or not unit.is_dir():
                     raise EvidenceTampered(
