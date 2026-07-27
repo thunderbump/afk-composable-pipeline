@@ -289,7 +289,11 @@ def _resolve_pointer(document: Any, pointer: str) -> Any:
         if isinstance(current, dict):
             current = current[token]
         elif isinstance(current, list):
-            if not token.isdigit() or (len(token) > 1 and token.startswith("0")):
+            if (
+                not token.isascii()
+                or not token.isdigit()
+                or (len(token) > 1 and token.startswith("0"))
+            ):
                 raise ValueError("invalid array index")
             index = int(token)
             if index >= len(current):

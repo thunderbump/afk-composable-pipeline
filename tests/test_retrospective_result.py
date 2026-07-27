@@ -210,6 +210,33 @@ class RetrospectiveResultTest(unittest.TestCase):
                     ("process_findings[0].evidence[0] is unresolved",),
                 )
 
+    def test_json_pointer_array_indices_require_ascii_digits(self):
+        summary = json.loads(self.summary())
+        summary["projection"]["items"] = ["zero", "one"]
+        result = self.populated_result()
+        result["process_findings"][0]["evidence"] = [
+            {"artifact": "projection.json", "json_pointer": "/items/1"}
+        ]
+
+        self.assertEqual(
+            normalize_retrospective_result(canonical_json(summary), result),
+            result,
+        )
+
+        for digit in ("١", "१", "１"):
+            with self.subTest(digit=digit):
+                result["process_findings"][0]["evidence"][0][
+                    "json_pointer"
+                ] = f"/items/{digit}"
+
+                with self.assertRaises(RetrospectiveResultError) as raised:
+                    normalize_retrospective_result(canonical_json(summary), result)
+
+                self.assertEqual(
+                    raised.exception.errors,
+                    ("process_findings[0].evidence[0] is unresolved",),
+                )
+
     def test_invented_or_rewired_citation_manifest_is_rejected(self):
         for artifact, target in (
             (
