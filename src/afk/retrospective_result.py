@@ -7,7 +7,7 @@ from typing import Any
 from afk.durable_id import is_durable_id
 from afk.jsonutil import canonical_json
 from afk.retrospective_contract import TEXT_CHARACTER_LIMIT
-from afk.run_summary import MAX_RUN_SUMMARY_BYTES
+from afk.run_summary import MAX_RUN_SUMMARY_BYTES, citation_manifest
 
 
 COLLECTION_LIMIT = 32
@@ -76,6 +76,7 @@ def normalize_retrospective_result(
         or not isinstance(summary["run"].get("run_id"), str)
         or summary["episode"].get("state") not in {"attention_required", "completed"}
         or not isinstance(summary.get("citation_manifest"), dict)
+        or summary["citation_manifest"] != citation_manifest(summary)
     ):
         raise RetrospectiveResultError("Run Summary is invalid")
     if (

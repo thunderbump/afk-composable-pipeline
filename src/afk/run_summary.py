@@ -135,7 +135,7 @@ def build_run_summary(store: RunStore, run_id: str, *, episode_sequence: int) ->
             "omitted": omitted,
         }
     )
-    summary["citation_manifest"] = _citation_manifest(summary)
+    summary["citation_manifest"] = citation_manifest(summary)
     _fit_summary(summary)
     rendered = canonical_json(summary)
     if len(rendered.encode("utf-8")) > MAX_RUN_SUMMARY_BYTES:
@@ -219,7 +219,7 @@ def _validate_cached_summary(
     return rendered
 
 
-def _citation_manifest(summary: dict[str, Any]) -> dict[str, dict[str, str]]:
+def citation_manifest(summary: dict[str, Any]) -> dict[str, dict[str, str]]:
     manifest = {
         "effects.json": {"kind": "json", "summary_pointer": "/effects"},
         "episode.json": {"kind": "json", "summary_pointer": "/episode"},
@@ -229,7 +229,7 @@ def _citation_manifest(summary: dict[str, Any]) -> dict[str, dict[str, str]]:
         "projection.json": {"kind": "json", "summary_pointer": "/projection"},
         "run.json": {"kind": "json", "summary_pointer": "/run"},
     }
-    if isinstance(summary["episode"]["checkpoint"], str):
+    if isinstance(summary["episode"].get("checkpoint"), str):
         manifest["episode-checkpoint.txt"] = {
             "kind": "text",
             "summary_pointer": "/episode/checkpoint",

@@ -20,24 +20,50 @@ class RetrospectiveResultTest(unittest.TestCase):
             {
                 "schema_version": 1,
                 "run": {"run_id": "run-001"},
-                "episode": {"state": "attention_required"},
+                "episode": {
+                    "state": "attention_required",
+                    "checkpoint": "Validation could not produce a verdict.",
+                },
                 "events": [{"sequence": 7, "event": "validation.rejected"}],
+                "effects": [],
+                "evidence": [],
+                "omitted": {},
                 "projection": {
                     "attention": {"summary": "Validation could not produce a verdict."},
                     "items": [],
                 },
                 "citation_manifest": {
+                    "effects.json": {
+                        "kind": "json",
+                        "summary_pointer": "/effects",
+                    },
+                    "episode-checkpoint.txt": {
+                        "kind": "text",
+                        "summary_pointer": "/episode/checkpoint",
+                    },
+                    "episode.json": {
+                        "kind": "json",
+                        "summary_pointer": "/episode",
+                    },
                     "events.jsonl": {
                         "kind": "event",
                         "summary_pointer": "/events",
+                    },
+                    "evidence.json": {
+                        "kind": "json",
+                        "summary_pointer": "/evidence",
+                    },
+                    "omitted.json": {
+                        "kind": "json",
+                        "summary_pointer": "/omitted",
                     },
                     "projection.json": {
                         "kind": "json",
                         "summary_pointer": "/projection",
                     },
-                    "attention-summary.txt": {
-                        "kind": "text",
-                        "summary_pointer": "/projection/attention/summary",
+                    "run.json": {
+                        "kind": "json",
+                        "summary_pointer": "/run",
                     },
                 },
             }
@@ -77,7 +103,7 @@ class RetrospectiveResultTest(unittest.TestCase):
                             "json_pointer": "/attention/summary",
                         },
                         {
-                            "artifact": "attention-summary.txt",
+                            "artifact": "episode-checkpoint.txt",
                             "line_start": 1,
                             "line_end": 1,
                         },
@@ -133,7 +159,7 @@ class RetrospectiveResultTest(unittest.TestCase):
             {"artifact": "events.jsonl", "event_sequence": 99},
             {"artifact": "projection.json", "json_pointer": "/missing"},
             {"artifact": "projection.json", "json_pointer": "/attention/~2"},
-            {"artifact": "attention-summary.txt", "line_start": 2},
+            {"artifact": "episode-checkpoint.txt", "line_start": 2},
             {"artifact": "../projection.json", "json_pointer": ""},
             {"artifact": "unmanifested.json", "json_pointer": ""},
             {"artifact": "projection.json", "line_start": 1},
@@ -150,6 +176,30 @@ class RetrospectiveResultTest(unittest.TestCase):
                     raised.exception.errors,
                     ("process_findings[0].evidence[0] is unresolved",),
                 )
+
+    def test_invented_or_rewired_citation_manifest_is_rejected(self):
+        for artifact, target in (
+            (
+                "made-up.json",
+                {"kind": "json", "summary_pointer": "/citation_manifest"},
+            ),
+            (
+                "projection.json",
+                {"kind": "json", "summary_pointer": "/citation_manifest"},
+            ),
+        ):
+            with self.subTest(artifact=artifact):
+                summary = json.loads(self.summary())
+                summary["citation_manifest"][artifact] = target
+
+                with self.assertRaisesRegex(
+                    RetrospectiveResultError,
+                    "Run Summary is invalid",
+                ):
+                    normalize_retrospective_result(
+                        canonical_json(summary),
+                        self.populated_result(),
+                    )
 
     def test_duplicate_identities_and_absent_proposal_links_are_rejected(self):
         duplicate_finding = self.populated_result()
