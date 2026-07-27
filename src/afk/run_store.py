@@ -14,8 +14,20 @@ from pathlib import Path
 from threading import get_ident
 from typing import Any, Iterator
 
+from afk.durable_id import is_durable_id
 from afk.jsonutil import canonical_json
 from afk.redaction import redact_artifact_value, redact_text
+from afk.retrospective_contract import (
+    INVENTORY_KEY,
+    RetrospectiveContractError,
+    attach_inventory,
+    capture_inventory,
+    capture_unavailable_inventory,
+    decode_inventory,
+    is_episode_event,
+    manifest_digest,
+    select_inventory_items,
+)
 from afk.resume_preflight import validate_open_attempts
 
 
@@ -23,13 +35,16 @@ SCHEMA_VERSION = 1
 STREAM_BYTE_LIMIT = 64 * 1024 * 1024
 ATTEMPT_BYTE_LIMIT = 256 * 1024 * 1024
 GATE_BYTE_LIMIT = 512 * 1024 * 1024
-RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 EVIDENCE_ROOTS = {"attempts", "gates", "retrospective"}
 
 
 class RunStoreError(RuntimeError):
+    pass
+
+
+class _RetrospectiveInventoryUnavailable(RunStoreError):
     pass
 
 
@@ -324,6 +339,37 @@ class RunStore:
 
     def identity(self, run_id: str) -> dict[str, Any]:
         return self._identity(run_id)
+
+    def event(self, run_id: str, sequence: int) -> dict[str, Any]:
+        """Read one validated Event History record by its durable sequence."""
+        return self._read_events_through(
+            run_id,
+            sequence,
+            parameter_name="sequence",
+        )[-1]
+
+    def read_run_snapshot(
+        self, run_id: str, *, through_sequence: int
+    ) -> dict[str, Any]:
+        """Read validated durable facts available for one Event History position."""
+        selected_events = self._read_events_through(
+            run_id,
+            through_sequence,
+            parameter_name="through_sequence",
+        )
+        identity = self._identity(run_id)
+        effects, evidence, artifact_omitted = self._read_retrospective_inventory(
+            run_id,
+            selected_events[-1],
+        )
+        return {
+            "identity": identity,
+            "events": selected_events,
+            "projection": _project(identity, selected_events),
+            "effects": effects,
+            "evidence": evidence,
+            "artifact_omitted": artifact_omitted,
+        }
 
     def prepare_effect(
         self,
@@ -638,6 +684,26 @@ class RunStore:
             raise RunStoreError("event must not be empty")
         identity = self._identity(run_id)
         events, valid_bytes = self._read_events(run_id)
+        event_data = dict(data or {})
+        if is_episode_event(event):
+            try:
+                effects, omitted_effects = self._read_effect_inventory(run_id)
+                evidence, omitted_evidence_units = self._read_evidence_inventory(run_id)
+                inventory = capture_inventory(
+                    through_sequence=len(events) + 1,
+                    effects=effects,
+                    evidence=evidence,
+                    omitted_effects=omitted_effects,
+                    omitted_evidence_units=omitted_evidence_units,
+                )
+            except _RetrospectiveInventoryUnavailable:
+                inventory = capture_unavailable_inventory(
+                    through_sequence=len(events) + 1,
+                )
+            try:
+                event_data = attach_inventory(event_data, inventory)
+            except RetrospectiveContractError as exc:
+                raise RunStoreError(str(exc)) from exc
         record = redact_artifact_value(
             {
                 "schema_version": SCHEMA_VERSION,
@@ -645,7 +711,7 @@ class RunStore:
                 "recorded_at": recorded_at or utc_now(),
                 "event": event,
                 **({"state": state} if state is not None else {}),
-                "data": data or {},
+                "data": event_data,
             }
         )
         encoded = f"{canonical_json(record)}\n".encode("utf-8")
@@ -726,6 +792,130 @@ class RunStore:
                 )
             events.append(record)
         return events, complete_bytes
+
+    def _read_events_through(
+        self,
+        run_id: str,
+        sequence: int,
+        *,
+        parameter_name: str,
+    ) -> list[dict[str, Any]]:
+        if type(sequence) is not int or sequence < 1:
+            raise RunStoreError(f"{parameter_name} must be a positive integer")
+        events, _ = self._read_events(run_id)
+        if sequence > len(events):
+            raise RunStoreError(f"Event History has no sequence {sequence}: {run_id}")
+        return events[:sequence]
+
+    def _read_effect_inventory(self, run_id: str) -> tuple[list[dict[str, Any]], int]:
+        effects_directory = self._run_dir(run_id) / "effects"
+        if effects_directory.is_symlink() or not effects_directory.is_dir():
+            raise EventHistoryCorrupt("Effect directory is invalid")
+        paths = []
+        for path in sorted(effects_directory.iterdir(), key=lambda item: item.name):
+            if (
+                path.is_symlink()
+                or not path.is_file()
+                or path.suffix != ".json"
+                or path.stem == ""
+                or not is_durable_id(path.stem)
+            ):
+                raise RunStoreError("Effects directory contains an invalid record")
+            paths.append(path)
+        selected, omitted = select_inventory_items(
+            paths,
+            identity=lambda path: path.stem,
+        )
+        try:
+            effects = [self.effect(run_id, path.stem) for path in selected]
+        except RunStoreError as exc:
+            raise _RetrospectiveInventoryUnavailable from exc
+        return effects, omitted
+
+    def _read_retrospective_inventory(
+        self,
+        run_id: str,
+        event: dict[str, Any],
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, int]]:
+        inventory = event["data"].get(INVENTORY_KEY)
+        if inventory is None:
+            if is_episode_event(event["event"]):
+                raise RunStoreError(
+                    "retrospective inventory is unavailable "
+                    f"for episode {event['sequence']}"
+                )
+            return [], [], {"effects": 0, "evidence_units": 0}
+        try:
+            inventory = decode_inventory(
+                inventory,
+                sequence=event["sequence"],
+                evidence_roots=EVIDENCE_ROOTS,
+            )
+        except RetrospectiveContractError as exc:
+            raise EventHistoryCorrupt(str(exc)) from exc
+        if inventory.get("status") == "unavailable":
+            raise RunStoreError(
+                "retrospective inventory is unavailable "
+                f"for episode {event['sequence']}"
+            )
+        evidence = []
+        for reference in inventory["evidence"]:
+            unit = reference["unit"]
+            self.verify_evidence(run_id, unit)
+            manifest_path = self._evidence_path(run_id, unit) / "manifest.json"
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise EvidenceTampered(
+                    "evidence manifest is missing or invalid"
+                ) from exc
+            digest = manifest_digest(manifest)
+            if digest != reference["manifest_sha256"]:
+                raise EvidenceTampered(
+                    "retrospective evidence manifest digest does not match"
+                )
+            evidence.append({"unit": unit, "manifest": manifest})
+        return inventory["effects"], evidence, inventory["omitted"]
+
+    def _read_evidence_inventory(self, run_id: str) -> tuple[list[dict[str, Any]], int]:
+        run_directory = self._run_dir(run_id)
+        units = []
+        for root_name in sorted(EVIDENCE_ROOTS):
+            root = run_directory / root_name
+            if root.is_symlink() or not root.is_dir():
+                raise EvidenceTampered(f"{root_name} evidence root is invalid")
+            for unit in sorted(root.iterdir(), key=lambda item: item.name):
+                if unit.is_symlink() or not unit.is_dir():
+                    raise EvidenceTampered(
+                        f"{root_name} contains an invalid evidence unit"
+                    )
+                manifest_path = unit / "manifest.json"
+                if manifest_path.is_symlink() or (
+                    manifest_path.exists() and not manifest_path.is_file()
+                ):
+                    raise EvidenceTampered("evidence manifest is invalid")
+                if not manifest_path.exists():
+                    continue
+                units.append(f"{root_name}/{unit.name}")
+        selected, omitted = select_inventory_items(
+            units,
+            identity=lambda unit: unit,
+        )
+        records = []
+        for relative in selected:
+            try:
+                self.verify_evidence(run_id, relative)
+                manifest_path = self._evidence_path(run_id, relative) / "manifest.json"
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except (
+                EvidenceError,
+                OSError,
+                UnicodeDecodeError,
+                json.JSONDecodeError,
+            ) as exc:
+                raise _RetrospectiveInventoryUnavailable from exc
+            records.append({"unit": relative, "manifest": manifest})
+        return records, omitted
 
     def _identity(self, run_id: str) -> dict[str, Any]:
         _validate_run_id(run_id)
@@ -867,7 +1057,7 @@ class RunStore:
     def _validate_resume_effects(self, run_id: str) -> None:
         effects = self._run_dir(run_id) / "effects"
         for path in sorted(effects.iterdir()):
-            if path.suffix != ".json" or not RUN_ID_PATTERN.fullmatch(path.stem):
+            if path.suffix != ".json" or not is_durable_id(path.stem):
                 raise ResumePreflightInvalid(f"Effect record is invalid: {path.name}")
             try:
                 self.effect(run_id, path.stem)
@@ -885,6 +1075,8 @@ class RunStore:
         return events
 
     def _evidence_path(self, run_id: str, relative: str) -> Path:
+        if not isinstance(relative, str) or redact_text(relative) != relative:
+            raise EvidenceError("evidence path must not contain secret-shaped text")
         parts = Path(relative).parts
         if (
             not parts
@@ -908,7 +1100,7 @@ class RunStore:
 
 
 def _validate_run_id(run_id: str) -> None:
-    if not RUN_ID_PATTERN.fullmatch(run_id):
+    if not is_durable_id(run_id):
         raise RunStoreError("run_id contains unsupported characters")
 
 
