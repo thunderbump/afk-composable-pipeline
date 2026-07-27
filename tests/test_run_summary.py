@@ -273,7 +273,72 @@ class RunSummaryTest(unittest.TestCase):
         self.assertEqual(json.loads(recovered)["effects"], [])
         self.assertEqual(json.loads(recovered)["evidence"], [])
 
-    def test_rejects_a_presealed_summary_outside_the_public_contract(self):
+    def fabricated_summary_result(self):
+        summary = {
+            "schema_version": 1,
+            "run": {
+                "run_id": "run-001",
+                "bead_id": "central-bhap.8.1",
+                "repository": "https://example.invalid/acme/pipeline.git",
+                "base_branch": "main",
+                "base_sha": BASE_SHA,
+                "created_at": "2026-07-27T10:00:00Z",
+            },
+            "episode": {
+                "sequence": 2,
+                "event": "run.completed",
+                "recorded_at": "2026-07-27T11:00:00Z",
+                "state": "completed",
+                "checkpoint": "completed",
+            },
+            "projection": {
+                "state": "completed",
+                "checkpoint": "completed",
+                "candidate_sha": "b" * 40,
+            },
+            "events": [
+                {
+                    "sequence": 1,
+                    "event": "fabricated.event",
+                    "recorded_at": "2026-07-27T10:00:00Z",
+                    "state": "created",
+                },
+                {
+                    "sequence": 2,
+                    "event": "run.completed",
+                    "recorded_at": "2026-07-27T11:00:00Z",
+                    "state": "completed",
+                },
+            ],
+            "effects": [
+                {
+                    "effect_id": "fabricated-effect",
+                    "kind": "worker-launch",
+                    "status": "confirmed",
+                }
+            ],
+            "evidence": [],
+            "omitted": {
+                "events": 0,
+                "effects": 0,
+                "evidence_units": 0,
+                "evidence_files": 0,
+            },
+        }
+        return {
+            "schema_version": 1,
+            "run_id": "run-001",
+            "episode_sequence": 2,
+            "episode_event": "run.completed",
+            "episode_state": "completed",
+            "summary": json.dumps(
+                summary,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+        }
+
+    def append_completion_episode(self):
         self.store.append_event(
             "run-001",
             "run.completed",
@@ -281,36 +346,30 @@ class RunSummaryTest(unittest.TestCase):
             data={"checkpoint": "completed"},
             recorded_at="2026-07-27T11:00:00Z",
         )
+
+    def test_rejects_a_schema_valid_presealed_summary_with_fabricated_facts(self):
+        self.append_completion_episode()
         self.store.reconcile_evidence_result(
             "run-001",
             "retrospective/run-summary-00000000000000000002",
-            {
-                "schema_version": 1,
-                "run_id": "run-001",
-                "episode_sequence": 2,
-                "episode_event": "run.completed",
-                "episode_state": "completed",
-                "summary": json.dumps(
-                    {
-                        "run": {
-                            "run_id": "run-001",
-                            "repository": "Bearer abcdefghijklmnop",
-                        },
-                        "episode": {
-                            "sequence": 2,
-                            "event": "run.completed",
-                            "state": "completed",
-                        },
-                        "raw_log": "RAW-LOG-CONTENT",
-                    },
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ),
-            },
+            self.fabricated_summary_result(),
         )
 
         with self.assertRaisesRegex(
-            RunStoreError, "sealed Run Summary content is invalid"
+            RunStoreError, "Run Summary does not match durable facts"
+        ):
+            build_run_summary(self.store, "run-001", episode_sequence=2)
+
+    def test_rejects_a_schema_valid_unsealed_summary_with_fabricated_facts(self):
+        self.append_completion_episode()
+        self.store.write_evidence_value(
+            "run-001",
+            "retrospective/run-summary-00000000000000000002/result.json",
+            self.fabricated_summary_result(),
+        )
+
+        with self.assertRaisesRegex(
+            RunStoreError, "Run Summary does not match durable facts"
         ):
             build_run_summary(self.store, "run-001", episode_sequence=2)
 
