@@ -114,6 +114,19 @@ def main(
         exit_code = 0
         try:
             projection = store.status(args.run_id)
+            observation = None
+            if (
+                "worker_exit_code" not in projection
+                and projection["state"] != "completed"
+            ):
+                active_run_id = (
+                    projection["run_id"]
+                    if args.run_id is None
+                    else store.active_run_id()
+                )
+                if active_run_id == projection["run_id"]:
+                    observation = observe_worker_unit(projection["run_id"])
+                projection = store.status(projection["run_id"])
             output = dict(projection)
             if projection["state"] == "attention_required":
                 output["recommended_resume"] = ["afk", "resume"]
@@ -125,19 +138,13 @@ def main(
                     "worker_exit_code": projection["worker_exit_code"],
                     "worker_result": projection["worker_result"],
                 }
-            elif (
-                projection["state"] != "completed"
-                and (
-                    args.run_id is None
-                    or store.active_run_id() == projection["run_id"]
-                )
-            ):
-                output["unit_observation"] = observe_worker_unit(
-                    projection["run_id"]
-                )
-                if output["unit_observation"]["status"] == "interrupted":
+            elif observation is not None:
+                output["unit_observation"] = observation
+                if observation["status"] == "interrupted":
                     output["recommended_resume"] = ["afk", "resume"]
                     exit_code = 2
+            if "recommended_resume" in output:
+                output["resume_precondition"] = {"active_run_id": output["run_id"]}
         except (RunStoreError, StartError) as exc:
             print(str(exc), file=sys.stderr)
             return 1
@@ -173,6 +180,10 @@ def main(
             print(" ".join(fields))
             if "recommended_resume" in output:
                 print("recommended_resume=afk resume")
+                print(
+                    "resume_precondition=active_run_id:"
+                    f"{output['resume_precondition']['active_run_id']}"
+                )
         return exit_code
 
     if args.command == "report":

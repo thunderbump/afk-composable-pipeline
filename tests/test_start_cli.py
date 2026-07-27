@@ -7080,6 +7080,57 @@ class StartCliTest(unittest.TestCase):
         )
         self.assertFalse(self.command_log.exists())
 
+    def test_unnamed_status_prefers_completion_recorded_during_unit_observation(self):
+        self.create_resume_preflight_run()
+
+        completed = self.run_afk(
+            "status",
+            "--json",
+            AFK_FAKE_SYSTEMD_STATE="absent",
+            AFK_FAKE_TERMINAL_DURING_SYSTEMCTL="completed",
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        status = json.loads(completed.stdout)
+        self.assertEqual(status["state"], "completed")
+        self.assertEqual(status["last_event"], "run.completed")
+        self.assertEqual(
+            status["unit_observation"],
+            {
+                "status": "terminal",
+                "unit": "afk-crashed-run-worker-1",
+                "worker_exit_code": 0,
+                "worker_result": "completed",
+            },
+        )
+        self.assertNotIn("recommended_resume", status)
+
+    def test_named_status_prefers_terminal_recorded_during_unit_observation(self):
+        self.create_resume_preflight_run()
+
+        completed = self.run_afk(
+            "status",
+            "crashed-run",
+            "--json",
+            AFK_FAKE_SYSTEMD_STATE="absent",
+            AFK_FAKE_TERMINAL_DURING_SYSTEMCTL="terminal",
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        status = json.loads(completed.stdout)
+        self.assertEqual(status["state"], "created")
+        self.assertEqual(status["last_event"], "worker.terminal")
+        self.assertEqual(
+            status["unit_observation"],
+            {
+                "status": "terminal",
+                "unit": "afk-crashed-run-worker-1",
+                "worker_exit_code": 0,
+                "worker_result": "completed",
+            },
+        )
+        self.assertNotIn("recommended_resume", status)
+
     def test_json_status_recommends_resume_for_durable_attention(self):
         store = RunStore(self.state_home / "afk")
         store.create_run(
@@ -7113,6 +7164,10 @@ class StartCliTest(unittest.TestCase):
         self.assertEqual(status["state"], "attention_required")
         self.assertEqual(status["unit_observation"]["status"], "terminal")
         self.assertEqual(status["recommended_resume"], ["afk", "resume"])
+        self.assertEqual(
+            status["resume_precondition"],
+            {"active_run_id": "attention-run"},
+        )
         self.assertFalse(self.command_log.exists())
 
     def test_json_status_reports_a_running_active_unit_without_writing(self):
@@ -7177,6 +7232,10 @@ class StartCliTest(unittest.TestCase):
                     },
                 )
                 self.assertEqual(status["recommended_resume"], ["afk", "resume"])
+                self.assertEqual(
+                    status["resume_precondition"],
+                    {"active_run_id": "crashed-run"},
+                )
         after = {
             path.relative_to(store_root): path.read_bytes()
             for path in store_root.rglob("*")
@@ -7196,7 +7255,8 @@ class StartCliTest(unittest.TestCase):
             "checkpoint=created unit=afk-crashed-run-worker-1 "
             "unit_status=interrupted load_state=not-found "
             "active_state=inactive\n"
-            "recommended_resume=afk resume\n",
+            "recommended_resume=afk resume\n"
+            "resume_precondition=active_run_id:crashed-run\n",
         )
 
     def test_status_lookup_and_unit_failures_exit_one_without_writing(self):
@@ -10259,6 +10319,32 @@ class StartCliTest(unittest.TestCase):
                             encoding="utf-8",
                         )
                         time.sleep(60)
+                    transition = os.environ.get(
+                        "AFK_FAKE_TERMINAL_DURING_SYSTEMCTL"
+                    )
+                    if transition:
+                        from afk.run_store import RunStore
+                        store = RunStore(Path(os.environ["XDG_STATE_HOME"]) / "afk")
+                        run_id = args[2].removeprefix("afk-").removesuffix(
+                            "-worker-1"
+                        )
+                        store.append_event(
+                            run_id,
+                            "worker.terminal",
+                            data={
+                                "checkpoint": "created",
+                                "unit": args[2],
+                                "worker_exit_code": 0,
+                                "worker_result": "completed",
+                            },
+                        )
+                        if transition == "completed":
+                            store.append_event(
+                                run_id,
+                                "run.completed",
+                                state="completed",
+                                data={"checkpoint": "completed"},
+                            )
                     state = os.environ.get("AFK_FAKE_SYSTEMD_STATE", "active")
                     if state == "failure":
                         print("query failed", file=sys.stderr)
