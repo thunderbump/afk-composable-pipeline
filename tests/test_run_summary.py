@@ -171,6 +171,49 @@ class RunSummaryTest(unittest.TestCase):
         self.assertEqual(json.loads(second)["effects"], [])
         self.assertEqual(json.loads(second)["evidence"], [])
 
+    def test_concurrent_builder_returns_the_cache_sealed_during_reconciliation(self):
+        self.store.append_event(
+            "run-001",
+            "run.attention_required",
+            state="attention_required",
+            data={"checkpoint": "created"},
+            recorded_at="2026-07-27T10:01:00Z",
+        )
+        other = RunStore(self.store.root)
+        original_sealed = self.store.sealed_evidence_result
+        original_reconcile = self.store.reconcile_evidence_result
+        raced = []
+
+        def seal_from_other_builder():
+            if not raced:
+                raced.append(build_run_summary(other, "run-001", episode_sequence=2))
+
+        def sealed_during_lookup(*args, **kwargs):
+            result = original_sealed(*args, **kwargs)
+            if result is None:
+                seal_from_other_builder()
+            return result
+
+        def sealed_during_reconcile(*args, **kwargs):
+            seal_from_other_builder()
+            return original_reconcile(*args, **kwargs)
+
+        with (
+            patch.object(
+                self.store,
+                "sealed_evidence_result",
+                side_effect=sealed_during_lookup,
+            ),
+            patch.object(
+                self.store,
+                "reconcile_evidence_result",
+                side_effect=sealed_during_reconcile,
+            ),
+        ):
+            recovered = build_run_summary(self.store, "run-001", episode_sequence=2)
+
+        self.assertEqual(recovered, raced[0])
+
     def test_first_build_for_an_old_episode_excludes_later_artifacts(self):
         self.store.prepare_effect(
             "run-001",

@@ -11,7 +11,7 @@ from afk.retrospective_contract import (
     TRUNCATION_SUFFIX,
     expected_episode_state,
 )
-from afk.run_store import RunStore, RunStoreError
+from afk.run_store import EvidenceError, RunStore, RunStoreError
 
 
 MAX_RUN_SUMMARY_BYTES = 64 * 1024
@@ -148,33 +148,16 @@ def build_run_summary(store: RunStore, run_id: str, *, episode_sequence: int) ->
         "summary": rendered,
     }
 
-    cached = store.sealed_evidence_result(run_id, summary_evidence)
-    if cached is not None:
-        return _validate_cached_summary(
-            cached,
-            run_id=run_id,
-            episode_sequence=episode_sequence,
-            event=event,
-            expected_rendered=rendered,
+    try:
+        sealed = store.reconcile_evidence_result(
+            run_id,
+            summary_evidence,
+            result,
         )
-
-    unsealed = store.unsealed_evidence_result(run_id, summary_evidence)
-    if unsealed is not None:
-        recovered = _validate_cached_summary(
-            unsealed,
-            run_id=run_id,
-            episode_sequence=episode_sequence,
-            event=event,
-            expected_rendered=rendered,
-        )
-        store.reconcile_evidence_result(run_id, summary_evidence, unsealed)
-        return recovered
-
-    sealed = store.reconcile_evidence_result(
-        run_id,
-        summary_evidence,
-        result,
-    )
+    except EvidenceError as exc:
+        if str(exc) == "evidence result contradicts expected value":
+            raise RunStoreError("Run Summary does not match durable facts") from exc
+        raise
     return _validate_cached_summary(
         sealed,
         run_id=run_id,
