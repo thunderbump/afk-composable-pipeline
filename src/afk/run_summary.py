@@ -16,6 +16,7 @@ MAX_EVIDENCE_UNITS = 32
 MAX_EVIDENCE_FILES = 32
 MAX_NESTED_ITEMS = 16
 MAX_STRING_CHARACTERS = 512
+MAX_BOUNDED_VALUE_BYTES = 16 * 1024
 TRUNCATION_SUFFIX = "…[TRUNCATED]"
 PROJECTION_FIELDS = (
     "state",
@@ -394,6 +395,11 @@ def _valid_evidence_reference(value: Any) -> bool:
 
 
 def _valid_bounded_value(value: Any, *, depth: int = 0) -> bool:
+    if (
+        depth == 0
+        and len(canonical_json(value).encode("utf-8")) > MAX_BOUNDED_VALUE_BYTES
+    ):
+        return False
     if isinstance(value, str):
         return _valid_bounded_text(value)
     if value is None or type(value) in {bool, int, float}:
@@ -442,10 +448,10 @@ def _sha256(value: Any) -> bool:
 def _bounded_value(value: Any, *, depth: int = 0) -> Any:
     value = redact_artifact_value(value)
     if isinstance(value, str):
-        return _bounded_text(value)
-    if depth >= 4:
-        return "[TRUNCATED]"
-    if isinstance(value, dict):
+        bounded = _bounded_text(value)
+    elif depth >= 4:
+        bounded = "[TRUNCATED]"
+    elif isinstance(value, dict):
         keys = sorted(value, key=str)[:MAX_NESTED_ITEMS]
         bounded = {}
         for key in keys:
@@ -453,12 +459,18 @@ def _bounded_value(value: Any, *, depth: int = 0) -> Any:
             if bounded_key in bounded:
                 return "[TRUNCATED]"
             bounded[bounded_key] = _bounded_value(value[key], depth=depth + 1)
-        return bounded
-    if isinstance(value, list):
-        return [
+    elif isinstance(value, list):
+        bounded = [
             _bounded_value(item, depth=depth + 1) for item in value[:MAX_NESTED_ITEMS]
         ]
-    return value
+    else:
+        bounded = value
+    if (
+        depth == 0
+        and len(canonical_json(bounded).encode("utf-8")) > MAX_BOUNDED_VALUE_BYTES
+    ):
+        return "[TRUNCATED]"
+    return bounded
 
 
 def _bounded_text(value: str) -> str:

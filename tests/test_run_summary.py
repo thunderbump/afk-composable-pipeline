@@ -299,6 +299,33 @@ class RunSummaryTest(unittest.TestCase):
             )
         )
 
+    def test_replaces_a_wide_mandatory_checkpoint_with_one_bounded_marker(self):
+        def wide_value(depth):
+            if depth == 0:
+                return "leaf"
+            return {f"branch-{index}": wide_value(depth - 1) for index in range(16)}
+
+        self.store.append_event(
+            "run-001",
+            "run.completed",
+            state="completed",
+            data={
+                "checkpoint": wide_value(4),
+                "completion": {"status": "merged"},
+            },
+            recorded_at="2026-07-27T12:00:00Z",
+        )
+
+        first = build_run_summary(self.store, "run-001", episode_sequence=2)
+        second = build_run_summary(self.store, "run-001", episode_sequence=2)
+        summary = json.loads(first)
+
+        self.assertEqual(second, first)
+        self.assertLessEqual(len(first.encode("utf-8")), MAX_RUN_SUMMARY_BYTES)
+        self.assertEqual(summary["episode"]["checkpoint"], "[TRUNCATED]")
+        self.assertEqual(summary["projection"]["checkpoint"], "[TRUNCATED]")
+        self.assertEqual(summary["projection"]["completion"], {"status": "merged"})
+
     def test_bounds_an_oversized_checkpoint_key(self):
         oversized_key = "checkpoint-" + ("x" * MAX_RUN_SUMMARY_BYTES)
         secret_key = "token=checkpoint-key-secret"
