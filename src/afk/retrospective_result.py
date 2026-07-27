@@ -150,20 +150,19 @@ def _validate_finding(
                 f"process_findings[{index}].confidence is invalid"
             )
     evidence = value.get("evidence") if isinstance(value, dict) else None
-    if isinstance(evidence, list):
-        for citation_index, citation in enumerate(evidence):
-            if not _citation(citation, summary):
-                raise RetrospectiveResultError(
-                    f"process_findings[{index}].evidence"
-                    f"[{citation_index}] is unresolved"
-                )
+    if not isinstance(evidence, list) or not 0 < len(evidence) <= COLLECTION_LIMIT:
+        raise RetrospectiveResultError(f"process_findings[{index}] is invalid")
+    for citation_index, citation in enumerate(evidence):
+        if not _citation(citation, summary):
+            raise RetrospectiveResultError(
+                f"process_findings[{index}].evidence"
+                f"[{citation_index}] is unresolved"
+            )
     if (
         not isinstance(value, dict)
         or set(value) != FINDING_KEYS
         or not is_durable_id(value.get("id"))
         or not _text(value.get("title"))
-        or not isinstance(evidence, list)
-        or not 0 < len(evidence) <= COLLECTION_LIMIT
         or not _text(value.get("impact"))
     ):
         raise RetrospectiveResultError(f"process_findings[{index}] is invalid")
@@ -186,26 +185,24 @@ def _validate_proposal(
                 f"improvement_proposals[{index}].priority is invalid"
             )
     addresses = value.get("addresses") if isinstance(value, dict) else None
-    if isinstance(addresses, list) and all(
-        isinstance(address, str) for address in addresses
-    ):
-        if len(set(addresses)) != len(addresses):
+    if not isinstance(addresses, list) or not 0 < len(addresses) <= COLLECTION_LIMIT:
+        raise RetrospectiveResultError(f"improvement_proposals[{index}] is invalid")
+    if not all(isinstance(address, str) for address in addresses):
+        raise RetrospectiveResultError(f"improvement_proposals[{index}] is invalid")
+    if len(set(addresses)) != len(addresses):
+        raise RetrospectiveResultError(
+            f"improvement_proposals[{index}].addresses contains a duplicate"
+        )
+    for address_index, finding_id in enumerate(addresses):
+        if finding_id not in finding_ids:
             raise RetrospectiveResultError(
-                f"improvement_proposals[{index}].addresses contains a duplicate"
+                f"improvement_proposals[{index}].addresses"
+                f"[{address_index}] is unresolved"
             )
-        for address_index, finding_id in enumerate(addresses):
-            if finding_id not in finding_ids:
-                raise RetrospectiveResultError(
-                    f"improvement_proposals[{index}].addresses"
-                    f"[{address_index}] is unresolved"
-                )
     if (
         not isinstance(value, dict)
         or set(value) != PROPOSAL_KEYS
         or not is_durable_id(value.get("id"))
-        or not isinstance(addresses, list)
-        or not 0 < len(addresses) <= COLLECTION_LIMIT
-        or not all(isinstance(item, str) for item in addresses)
         or not _text(value.get("title"))
         or not _text(value.get("rationale"))
         or not _text(value.get("suggested_change"))

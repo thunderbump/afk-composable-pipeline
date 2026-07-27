@@ -281,6 +281,27 @@ class RetrospectiveResultTest(unittest.TestCase):
 
                 self.assertEqual(raised.exception.errors, (expected,))
 
+    def test_oversized_nested_collections_are_rejected_before_item_validation(self):
+        oversized_evidence = self.populated_result()
+        oversized_evidence["process_findings"][0]["evidence"] = [
+            {"artifact": "events.jsonl", "event_sequence": 7} for _ in range(32)
+        ] + [{"artifact": "events.jsonl", "event_sequence": 99}]
+        oversized_addresses = self.populated_result()
+        oversized_addresses["improvement_proposals"][0]["addresses"] = [
+            "finding-1"
+        ] * 33
+
+        for result, expected in (
+            (oversized_evidence, "process_findings[0] is invalid"),
+            (oversized_addresses, "improvement_proposals[0] is invalid"),
+        ):
+            with self.subTest(expected=expected):
+                with self.assertRaises(RetrospectiveResultError) as raised:
+                    normalize_retrospective_result(self.summary(), result)
+
+                self.assertEqual(raised.exception.errors, (expected,))
+                self.assertLessEqual(len(str(raised.exception)), 512)
+
     def test_malformed_and_oversized_untrusted_values_fail_closed(self):
         malformed_address = self.populated_result()
         malformed_address["improvement_proposals"][0]["addresses"] = [{}]
