@@ -96,23 +96,7 @@ def normalize_retrospective_result(
         raise RetrospectiveResultError("retrospective result is invalid")
     finding_ids = set()
     for index, finding in enumerate(findings):
-        if isinstance(finding, dict) and finding.get("category") not in CATEGORIES:
-            raise RetrospectiveResultError(
-                f"process_findings[{index}].category is invalid"
-            )
-        if isinstance(finding, dict) and finding.get("confidence") not in CONFIDENCE:
-            raise RetrospectiveResultError(
-                f"process_findings[{index}].confidence is invalid"
-            )
-        if isinstance(finding, dict) and isinstance(finding.get("evidence"), list):
-            for citation_index, citation in enumerate(finding["evidence"]):
-                if not _citation(citation, summary):
-                    raise RetrospectiveResultError(
-                        f"process_findings[{index}].evidence"
-                        f"[{citation_index}] is unresolved"
-                    )
-        if not _finding(finding, summary):
-            raise RetrospectiveResultError(f"process_findings[{index}] is invalid")
+        _validate_finding(finding, summary, index)
         if finding["id"] in finding_ids:
             raise RetrospectiveResultError(
                 f"process_findings[{index}].id duplicates an existing identity"
@@ -120,30 +104,7 @@ def normalize_retrospective_result(
         finding_ids.add(finding["id"])
     proposal_ids = set()
     for index, proposal in enumerate(proposals):
-        if isinstance(proposal, dict) and proposal.get("scope") not in SCOPES:
-            raise RetrospectiveResultError(
-                f"improvement_proposals[{index}].scope is invalid"
-            )
-        if isinstance(proposal, dict) and proposal.get("priority") not in PRIORITIES:
-            raise RetrospectiveResultError(
-                f"improvement_proposals[{index}].priority is invalid"
-            )
-        addresses = proposal.get("addresses") if isinstance(proposal, dict) else None
-        if isinstance(addresses, list) and all(
-            isinstance(address, str) for address in addresses
-        ):
-            if len(set(addresses)) != len(addresses):
-                raise RetrospectiveResultError(
-                    f"improvement_proposals[{index}].addresses " "contains a duplicate"
-                )
-            for address_index, finding_id in enumerate(addresses):
-                if finding_id not in finding_ids:
-                    raise RetrospectiveResultError(
-                        f"improvement_proposals[{index}].addresses"
-                        f"[{address_index}] is unresolved"
-                    )
-        if not _proposal(proposal, finding_ids):
-            raise RetrospectiveResultError(f"improvement_proposals[{index}] is invalid")
+        _validate_proposal(proposal, finding_ids, index)
         if proposal["id"] in finding_ids or proposal["id"] in proposal_ids:
             raise RetrospectiveResultError(
                 f"improvement_proposals[{index}].id " "duplicates an existing identity"
@@ -160,38 +121,77 @@ def _text(value: Any) -> bool:
     )
 
 
-def _finding(value: Any, summary: dict[str, Any]) -> bool:
-    return (
-        isinstance(value, dict)
-        and set(value) == FINDING_KEYS
-        and is_durable_id(value.get("id"))
-        and value.get("category") in CATEGORIES
-        and _text(value.get("title"))
-        and isinstance(value.get("evidence"), list)
-        and 0 < len(value["evidence"]) <= COLLECTION_LIMIT
-        and all(_citation(citation, summary) for citation in value["evidence"])
-        and _text(value.get("impact"))
-        and value.get("confidence") in CONFIDENCE
-    )
+def _validate_finding(
+    value: Any,
+    summary: dict[str, Any],
+    index: int,
+) -> None:
+    if isinstance(value, dict) and value.get("category") not in CATEGORIES:
+        raise RetrospectiveResultError(f"process_findings[{index}].category is invalid")
+    if isinstance(value, dict) and value.get("confidence") not in CONFIDENCE:
+        raise RetrospectiveResultError(
+            f"process_findings[{index}].confidence is invalid"
+        )
+    evidence = value.get("evidence") if isinstance(value, dict) else None
+    if isinstance(evidence, list):
+        for citation_index, citation in enumerate(evidence):
+            if not _citation(citation, summary):
+                raise RetrospectiveResultError(
+                    f"process_findings[{index}].evidence"
+                    f"[{citation_index}] is unresolved"
+                )
+    if (
+        not isinstance(value, dict)
+        or set(value) != FINDING_KEYS
+        or not is_durable_id(value.get("id"))
+        or not _text(value.get("title"))
+        or not isinstance(evidence, list)
+        or not 0 < len(evidence) <= COLLECTION_LIMIT
+        or not _text(value.get("impact"))
+    ):
+        raise RetrospectiveResultError(f"process_findings[{index}] is invalid")
 
 
-def _proposal(value: Any, finding_ids: set[str]) -> bool:
+def _validate_proposal(
+    value: Any,
+    finding_ids: set[str],
+    index: int,
+) -> None:
+    if isinstance(value, dict) and value.get("scope") not in SCOPES:
+        raise RetrospectiveResultError(
+            f"improvement_proposals[{index}].scope is invalid"
+        )
+    if isinstance(value, dict) and value.get("priority") not in PRIORITIES:
+        raise RetrospectiveResultError(
+            f"improvement_proposals[{index}].priority is invalid"
+        )
     addresses = value.get("addresses") if isinstance(value, dict) else None
-    return (
-        isinstance(value, dict)
-        and set(value) == PROPOSAL_KEYS
-        and is_durable_id(value.get("id"))
-        and isinstance(addresses, list)
-        and 0 < len(addresses) <= COLLECTION_LIMIT
-        and all(isinstance(item, str) and item in finding_ids for item in addresses)
-        and len(set(addresses)) == len(addresses)
-        and value.get("scope") in SCOPES
-        and value.get("priority") in PRIORITIES
-        and _text(value.get("title"))
-        and _text(value.get("rationale"))
-        and _text(value.get("suggested_change"))
-        and value.get("requires_human_decision") is True
-    )
+    if isinstance(addresses, list) and all(
+        isinstance(address, str) for address in addresses
+    ):
+        if len(set(addresses)) != len(addresses):
+            raise RetrospectiveResultError(
+                f"improvement_proposals[{index}].addresses contains a duplicate"
+            )
+        for address_index, finding_id in enumerate(addresses):
+            if finding_id not in finding_ids:
+                raise RetrospectiveResultError(
+                    f"improvement_proposals[{index}].addresses"
+                    f"[{address_index}] is unresolved"
+                )
+    if (
+        not isinstance(value, dict)
+        or set(value) != PROPOSAL_KEYS
+        or not is_durable_id(value.get("id"))
+        or not isinstance(addresses, list)
+        or not 0 < len(addresses) <= COLLECTION_LIMIT
+        or not all(isinstance(item, str) for item in addresses)
+        or not _text(value.get("title"))
+        or not _text(value.get("rationale"))
+        or not _text(value.get("suggested_change"))
+        or value.get("requires_human_decision") is not True
+    ):
+        raise RetrospectiveResultError(f"improvement_proposals[{index}] is invalid")
 
 
 def _citation(value: Any, summary: dict[str, Any]) -> bool:
