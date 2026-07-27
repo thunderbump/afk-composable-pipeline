@@ -125,6 +125,25 @@ class RunSummaryTest(unittest.TestCase):
             sha256_json(manifest),
         )
         self.assertEqual(summary["evidence"][0]["files"], manifest["files"])
+        self.assertEqual(
+            summary["citation_manifest"],
+            {
+                "effects.json": {"kind": "json", "summary_pointer": "/effects"},
+                "episode-checkpoint.txt": {
+                    "kind": "text",
+                    "summary_pointer": "/episode/checkpoint",
+                },
+                "episode.json": {"kind": "json", "summary_pointer": "/episode"},
+                "events.jsonl": {"kind": "event", "summary_pointer": "/events"},
+                "evidence.json": {"kind": "json", "summary_pointer": "/evidence"},
+                "omitted.json": {"kind": "json", "summary_pointer": "/omitted"},
+                "projection.json": {
+                    "kind": "json",
+                    "summary_pointer": "/projection",
+                },
+                "run.json": {"kind": "json", "summary_pointer": "/run"},
+            },
+        )
         serialized = first
         for prohibited in (
             "start-request-secret",
