@@ -68,7 +68,10 @@ DEFAULT_LEDGER_DIR = "ledgers"
 
 
 def main(
-    argv: list[str] | None = None, *, start_run_id: str | None = None
+    argv: list[str] | None = None,
+    *,
+    start_run_id: str | None = None,
+    on_lifecycle_target: Callable[[str], None] | None = None,
 ) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -88,7 +91,11 @@ def main(
 
     if args.command == "resume":
         try:
-            run_id, exit_code = resume_run(args.run_id, note=args.note)
+            run_id, exit_code = resume_run(
+                args.run_id,
+                note=args.note,
+                on_selected=on_lifecycle_target,
+            )
         except (StartError, RunStoreError) as exc:
             print(str(exc), file=sys.stderr)
             return 2
@@ -137,7 +144,10 @@ def main(
 
     if args.command == "complete":
         try:
-            projection = complete_run(args.run_id)
+            projection = complete_run(
+                args.run_id,
+                on_selected=on_lifecycle_target,
+            )
             report = _run_report(projection)
         except (StartError, RunStoreError) as exc:
             print(str(exc), file=sys.stderr)

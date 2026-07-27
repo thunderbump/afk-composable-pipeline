@@ -4,7 +4,7 @@ import os
 import signal
 import sys
 from contextlib import contextmanager
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 from afk.cli import build_parser, main as dispatch
 from afk.run_store import RunStore, RunStoreError, new_durable_run_id
@@ -18,20 +18,46 @@ class LifecycleSignal(BaseException):
         self.signal_number = signal_number
 
 
+class LifecycleTarget:
+    def __init__(self):
+        self.run_id: str | None = None
+        self.signal_number: int | None = None
+
+    def interrupt(self, signal_number: int, frame: Any) -> None:
+        if self.signal_number is not None:
+            return
+        self.signal_number = signal_number
+        if self.run_id is not None:
+            raise LifecycleSignal(signal_number)
+
+    def bind(self, run_id: str | None) -> None:
+        self.run_id = run_id
+        if run_id is not None:
+            self.raise_if_interrupted()
+
+    def raise_if_interrupted(self) -> None:
+        if self.signal_number is not None:
+            raise LifecycleSignal(self.signal_number)
+
+
 def main(argv: list[str] | None = None) -> int:
     arguments = sys.argv[1:] if argv is None else argv
     if not arguments or arguments[0] not in LIFECYCLE_COMMANDS:
         return dispatch(arguments)
-    target_run_id = lifecycle_target(arguments)
+    target = LifecycleTarget()
     interrupted: LifecycleSignal | None = None
-    with lifecycle_signal_handlers():
+    with lifecycle_signal_handlers(target.interrupt):
         try:
-            return dispatch(
+            target.bind(lifecycle_target(arguments))
+            exit_code = dispatch(
                 arguments,
-                start_run_id=target_run_id if arguments[0] == "start" else None,
+                start_run_id=target.run_id if arguments[0] == "start" else None,
+                on_lifecycle_target=target.bind,
             )
+            target.raise_if_interrupted()
+            return exit_code
         except LifecycleSignal as exc:
-            record_lifecycle_interruption(target_run_id, exc.signal_number)
+            record_lifecycle_interruption(target.run_id, exc.signal_number)
             interrupted = exc
     assert interrupted is not None
     signal.signal(interrupted.signal_number, signal.SIG_DFL)
@@ -44,28 +70,17 @@ def lifecycle_target(arguments: list[str]) -> str | None:
     if parsed.command == "start":
         return new_durable_run_id()
     run_id = getattr(parsed, "run_id", None)
-    if run_id is not None:
-        return run_id
-    try:
-        return RunStore().status()["run_id"]
-    except RunStoreError:
-        return None
+    return run_id
 
 
 @contextmanager
-def lifecycle_signal_handlers() -> Iterator[None]:
-    received = False
+def lifecycle_signal_handlers(
+    interrupt: Callable[[int, Any], None],
+) -> Iterator[None]:
     previous = {
         signal_number: signal.getsignal(signal_number)
         for signal_number in (signal.SIGTERM, signal.SIGINT)
     }
-
-    def interrupt(signal_number: int, frame: Any) -> None:
-        nonlocal received
-        if received:
-            return
-        received = True
-        raise LifecycleSignal(signal_number)
 
     try:
         for signal_number in previous:
