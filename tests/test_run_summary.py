@@ -135,6 +135,41 @@ class RunSummaryTest(unittest.TestCase):
         ):
             self.assertNotIn(prohibited, serialized)
 
+    def test_reuses_the_sealed_episode_summary_after_later_artifacts_are_added(self):
+        self.store.append_event(
+            "run-001",
+            "run.attention_required",
+            state="attention_required",
+            data={"checkpoint": "created"},
+            recorded_at="2026-07-27T10:01:00Z",
+        )
+
+        first = build_run_summary(self.store, "run-001", episode_sequence=2)
+
+        self.store.prepare_effect(
+            "run-001",
+            "later-effect",
+            kind="worker-launch",
+            intended={"token": "later-effect-secret"},
+        )
+        self.store.confirm_effect(
+            "run-001",
+            "later-effect",
+            observed={"status": "later"},
+        )
+        self.store.write_evidence_text(
+            "run-001",
+            "attempts/later/stdout.txt",
+            "later evidence\n",
+        )
+        self.store.seal_evidence("run-001", "attempts/later")
+
+        second = build_run_summary(self.store, "run-001", episode_sequence=2)
+
+        self.assertEqual(second, first)
+        self.assertEqual(json.loads(second)["effects"], [])
+        self.assertEqual(json.loads(second)["evidence"], [])
+
     def test_rejects_a_sequence_that_is_not_an_attention_or_completion_episode(self):
         with self.assertRaisesRegex(
             RunStoreError, "sequence 1 is not a retrospective episode"

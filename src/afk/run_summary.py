@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from afk.jsonutil import canonical_json, sha256_json
@@ -44,17 +45,21 @@ PROJECTION_FIELDS = (
 
 def build_run_summary(store: RunStore, run_id: str, *, episode_sequence: int) -> str:
     """Return bounded canonical JSON for one retrospective episode."""
-    snapshot = store.read_run_snapshot(run_id, through_sequence=episode_sequence)
-    event = snapshot["events"][-1]
-    expected_state = {
-        "run.attention_required": "attention_required",
-        "run.completed": "completed",
-    }.get(event["event"])
-    if expected_state is None or event.get("state") != expected_state:
-        raise RunStoreError(
-            f"sequence {episode_sequence} is not a retrospective episode"
+    if type(episode_sequence) is not int or episode_sequence < 1:
+        raise RunStoreError("episode_sequence must be a positive integer")
+    event = store.event(run_id, episode_sequence)
+    _validate_episode(event, episode_sequence)
+    summary_evidence = f"retrospective/run-summary-{episode_sequence:020d}"
+    cached = store.sealed_evidence_result(run_id, summary_evidence)
+    if cached is not None:
+        return _validate_cached_summary(
+            cached,
+            run_id=run_id,
+            episode_sequence=episode_sequence,
+            event=event,
         )
 
+    snapshot = store.read_run_snapshot(run_id, through_sequence=episode_sequence)
     identity = snapshot["identity"]
     projection = snapshot["projection"]
     events = snapshot["events"]
@@ -136,6 +141,84 @@ def build_run_summary(store: RunStore, run_id: str, *, episode_sequence: int) ->
     rendered = canonical_json(summary)
     if len(rendered.encode("utf-8")) > MAX_RUN_SUMMARY_BYTES:
         raise RunStoreError("Run Summary identity exceeds its byte limit")
+    sealed = store.reconcile_evidence_result(
+        run_id,
+        summary_evidence,
+        {
+            "schema_version": 1,
+            "run_id": run_id,
+            "episode_sequence": episode_sequence,
+            "episode_event": event["event"],
+            "episode_state": event["state"],
+            "summary": rendered,
+        },
+    )
+    return _validate_cached_summary(
+        sealed,
+        run_id=run_id,
+        episode_sequence=episode_sequence,
+        event=event,
+    )
+
+
+def _validate_episode(event: dict[str, Any], episode_sequence: int) -> None:
+    expected_state = {
+        "run.attention_required": "attention_required",
+        "run.completed": "completed",
+    }.get(event["event"])
+    if expected_state is None or event.get("state") != expected_state:
+        raise RunStoreError(
+            f"sequence {episode_sequence} is not a retrospective episode"
+        )
+
+
+def _validate_cached_summary(
+    cached: Any,
+    *,
+    run_id: str,
+    episode_sequence: int,
+    event: dict[str, Any],
+) -> str:
+    if (
+        not isinstance(cached, dict)
+        or set(cached)
+        != {
+            "schema_version",
+            "run_id",
+            "episode_sequence",
+            "episode_event",
+            "episode_state",
+            "summary",
+        }
+        or type(cached["schema_version"]) is not int
+        or cached["schema_version"] != 1
+        or cached["run_id"] != run_id
+        or type(cached["episode_sequence"]) is not int
+        or cached["episode_sequence"] != episode_sequence
+        or cached["episode_event"] != event["event"]
+        or cached["episode_state"] != event["state"]
+        or not isinstance(cached["summary"], str)
+    ):
+        raise RunStoreError("sealed Run Summary identity is invalid")
+    rendered = cached["summary"]
+    if len(rendered.encode("utf-8")) > MAX_RUN_SUMMARY_BYTES:
+        raise RunStoreError("sealed Run Summary exceeds its byte limit")
+    try:
+        summary = json.loads(rendered)
+    except json.JSONDecodeError as exc:
+        raise RunStoreError("sealed Run Summary is invalid") from exc
+    if canonical_json(summary) != rendered:
+        raise RunStoreError("sealed Run Summary is not canonical")
+    if (
+        not isinstance(summary, dict)
+        or not isinstance(summary.get("run"), dict)
+        or summary["run"].get("run_id") != run_id
+        or not isinstance(summary.get("episode"), dict)
+        or summary["episode"].get("sequence") != episode_sequence
+        or summary["episode"].get("event") != event["event"]
+        or summary["episode"].get("state") != event["state"]
+    ):
+        raise RunStoreError("sealed Run Summary content identity is invalid")
     return rendered
 
 

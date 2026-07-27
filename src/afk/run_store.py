@@ -325,6 +325,15 @@ class RunStore:
     def identity(self, run_id: str) -> dict[str, Any]:
         return self._identity(run_id)
 
+    def event(self, run_id: str, sequence: int) -> dict[str, Any]:
+        """Read one validated Event History record by its durable sequence."""
+        if type(sequence) is not int or sequence < 1:
+            raise RunStoreError("sequence must be a positive integer")
+        events, _ = self._read_events(run_id)
+        if sequence > len(events):
+            raise RunStoreError(f"Event History has no sequence {sequence}: {run_id}")
+        return events[sequence - 1]
+
     def read_run_snapshot(
         self, run_id: str, *, through_sequence: int
     ) -> dict[str, Any]:
