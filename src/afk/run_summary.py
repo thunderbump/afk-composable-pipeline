@@ -407,7 +407,9 @@ def _valid_bounded_value(value: Any, *, depth: int = 0) -> bool:
     if isinstance(value, dict):
         return (
             len(value) <= MAX_NESTED_ITEMS
-            and all(isinstance(key, str) for key in value)
+            and all(
+                _valid_bounded_text(key) and redact_text(key) == key for key in value
+            )
             and all(
                 _valid_bounded_value(item, depth=depth + 1) for item in value.values()
             )
@@ -445,7 +447,13 @@ def _bounded_value(value: Any, *, depth: int = 0) -> Any:
         return "[TRUNCATED]"
     if isinstance(value, dict):
         keys = sorted(value, key=str)[:MAX_NESTED_ITEMS]
-        return {str(key): _bounded_value(value[key], depth=depth + 1) for key in keys}
+        bounded = {}
+        for key in keys:
+            bounded_key = _bounded_key(str(key))
+            if bounded_key in bounded:
+                return "[TRUNCATED]"
+            bounded[bounded_key] = _bounded_value(value[key], depth=depth + 1)
+        return bounded
     if isinstance(value, list):
         return [
             _bounded_value(item, depth=depth + 1) for item in value[:MAX_NESTED_ITEMS]
@@ -458,6 +466,12 @@ def _bounded_text(value: str) -> str:
     if len(redacted) <= MAX_STRING_CHARACTERS:
         return redacted
     return f"{redacted[:MAX_STRING_CHARACTERS]}{TRUNCATION_SUFFIX}"
+
+
+def _bounded_key(value: str) -> str:
+    if len(value) > MAX_STRING_CHARACTERS:
+        return "[TRUNCATED]"
+    return _bounded_text(value)
 
 
 def _fit_summary(summary: dict[str, Any]) -> None:

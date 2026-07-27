@@ -299,6 +299,56 @@ class RunSummaryTest(unittest.TestCase):
             )
         )
 
+    def test_bounds_an_oversized_checkpoint_key(self):
+        oversized_key = "checkpoint-" + ("x" * MAX_RUN_SUMMARY_BYTES)
+        secret_key = "token=checkpoint-key-secret"
+        self.store.append_event(
+            "run-001",
+            "run.completed",
+            state="completed",
+            data={"checkpoint": {oversized_key: "kept", secret_key: "redacted"}},
+            recorded_at="2026-07-27T12:00:00Z",
+        )
+
+        first = build_run_summary(self.store, "run-001", episode_sequence=2)
+        second = build_run_summary(self.store, "run-001", episode_sequence=2)
+        summary = json.loads(first)
+        checkpoint = summary["episode"]["checkpoint"]
+
+        self.assertEqual(first, second)
+        self.assertLessEqual(len(first.encode("utf-8")), MAX_RUN_SUMMARY_BYTES)
+        self.assertNotIn(oversized_key, first)
+        self.assertNotIn(secret_key, first)
+        self.assertEqual(
+            checkpoint,
+            {"[TRUNCATED]": "kept", "token=[REDACTED]": "[REDACTED]"},
+        )
+        self.assertEqual(summary["projection"]["checkpoint"], checkpoint)
+
+    def test_truncates_a_mapping_when_bounded_keys_would_collide(self):
+        shared_prefix = "x" * MAX_RUN_SUMMARY_BYTES
+        self.store.append_event(
+            "run-001",
+            "run.completed",
+            state="completed",
+            data={
+                "checkpoint": {
+                    f"{shared_prefix}-first": "first",
+                    f"{shared_prefix}-second": "second",
+                }
+            },
+            recorded_at="2026-07-27T12:00:00Z",
+        )
+
+        first = build_run_summary(self.store, "run-001", episode_sequence=2)
+        second = build_run_summary(self.store, "run-001", episode_sequence=2)
+        summary = json.loads(first)
+
+        self.assertEqual(first, second)
+        self.assertLessEqual(len(first.encode("utf-8")), MAX_RUN_SUMMARY_BYTES)
+        self.assertEqual(summary["episode"]["checkpoint"], "[TRUNCATED]")
+        self.assertEqual(summary["projection"]["checkpoint"], "[TRUNCATED]")
+
 
 if __name__ == "__main__":
     unittest.main()
