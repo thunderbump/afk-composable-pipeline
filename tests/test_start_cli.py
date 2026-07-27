@@ -19,6 +19,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 import afk.run_store as run_store_module  # noqa: E402
+from afk.bead_spec import bead_spec_identity, persist_bead_spec  # noqa: E402
 from afk.run_store import RunStore, RunStoreBusy, RunStoreError  # noqa: E402
 from afk.start import (  # noqa: E402
     StartError,
@@ -1462,6 +1463,9 @@ class StartCliTest(unittest.TestCase):
         self.assertEqual(store.effect(run_id, "worker-launch-1")["status"], "confirmed")
         repeated = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="absent")
         self.assertEqual(repeated.returncode, 2, repeated.stderr)
+        attention = store.status(run_id)["attention"]
+        self.assertEqual(attention["kind"], "inconclusive")
+        self.assertIn("collected without a terminal observation", attention["summary"])
         self.assertEqual(self.mutation_count("worker-launch"), 2)
 
     def test_resume_recovers_crash_before_worker_reconciled_state_append(self):
@@ -7001,22 +7005,7 @@ class StartCliTest(unittest.TestCase):
         )
 
     def test_resume_confirms_launch_that_succeeded_before_effect_confirmation(self):
-        store = RunStore(self.state_home / "afk")
-        projection = store.create_run(
-            bead_id="central-bnkl.1.1",
-            repository="thunderbump/beads-webui",
-            base_branch="main",
-            base_sha=BASE_SHA,
-            start_request={"repository_root": str(self.project)},
-            run_id="crashed-run",
-        )
-        self.assertEqual(projection["state"], "created")
-        store.prepare_effect(
-            "crashed-run",
-            "worker-launch-1",
-            kind="worker-launch",
-            intended={"unit": "afk-crashed-run-worker-1"},
-        )
+        store, _ = self.create_worker_launch_run()
 
         resumed = self.run_afk("resume")
 
@@ -7027,22 +7016,69 @@ class StartCliTest(unittest.TestCase):
         self.assertEqual(status["unit"], "afk-crashed-run-worker-1")
 
     def create_resume_preflight_run(self):
-        store = RunStore(self.state_home / "afk")
+        return self.create_worker_launch_run()
+
+    def create_worker_launch_run(self, *, run_id="crashed-run", state_home=None):
+        selected_state_home = state_home or self.state_home
+        store = RunStore(selected_state_home / "afk")
+        common_dir = selected_state_home / "fake-git"
+        common_dir.mkdir(parents=True, exist_ok=True)
+        metadata = common_dir.stat()
+        bead = {
+            "id": "central-bnkl.1.1",
+            "title": "Create the first slice",
+            "description": "Implement one candidate.",
+            "acceptance_criteria": "Candidate is committed.",
+            "status": "open",
+            "close_reason": "",
+            "assignee": "",
+            "labels": ["project:beads-webui"],
+            "comments": [],
+        }
+        validation_contract = {
+            "source": "pinned_base",
+            "base_sha": BASE_SHA,
+            "blob_sha": "c" * 40,
+        }
         store.create_run(
             bead_id="central-bnkl.1.1",
             repository="thunderbump/beads-webui",
             base_branch="main",
             base_sha=BASE_SHA,
-            start_request={"repository_root": str(self.project)},
-            run_id="crashed-run",
+            start_request={
+                "repository_root": str(self.project),
+                "repository_common_dir": str(common_dir),
+                "repository_common_dir_identity": {
+                    "device": metadata.st_dev,
+                    "inode": metadata.st_ino,
+                },
+                "beads_workspace": str(self.temp / "beads"),
+                "claimant": "bump",
+                "lingering": "enabled",
+                "validation_contract": validation_contract,
+                "bead_spec_identity": bead_spec_identity(bead),
+            },
+            run_id=run_id,
         )
+        persist_bead_spec(store, run_id, bead)
+        unit = f"afk-{run_id}-worker-1"
         store.prepare_effect(
-            "crashed-run",
+            run_id,
             "worker-launch-1",
             kind="worker-launch",
-            intended={"unit": "afk-crashed-run-worker-1"},
+            intended={"unit": unit},
         )
-        return store, self.state_home / "afk" / "runs" / "crashed-run"
+        store.append_event(
+            run_id,
+            "worker.launch_prepared",
+            data={
+                "unit": unit,
+                "checkpoint": "created",
+                "lingering": "enabled",
+                "validation_contract": validation_contract,
+            },
+        )
+        return store, selected_state_home / "afk" / "runs" / run_id
 
     def assert_resume_preflight_rejected(self, message):
         resumed = self.run_afk("resume")
@@ -7061,18 +7097,22 @@ class StartCliTest(unittest.TestCase):
     def test_resume_rejects_invalid_event_schema_before_external_commands(self):
         _, run_dir = self.create_resume_preflight_run()
         events_path = run_dir / "events.jsonl"
-        event = json.loads(events_path.read_text(encoding="utf-8"))
+        events = events_path.read_text(encoding="utf-8").splitlines()
+        event = json.loads(events[0])
         event["data"] = []
-        events_path.write_text(json.dumps(event) + "\n", encoding="utf-8")
+        events[0] = json.dumps(event)
+        events_path.write_text("\n".join(events) + "\n", encoding="utf-8")
 
         self.assert_resume_preflight_rejected("Event History record 1 is invalid")
 
     def test_resume_rejects_wrong_event_version_before_external_commands(self):
         _, run_dir = self.create_resume_preflight_run()
         events_path = run_dir / "events.jsonl"
-        event = json.loads(events_path.read_text(encoding="utf-8"))
+        events = events_path.read_text(encoding="utf-8").splitlines()
+        event = json.loads(events[0])
         event["schema_version"] = 2
-        events_path.write_text(json.dumps(event) + "\n", encoding="utf-8")
+        events[0] = json.dumps(event)
+        events_path.write_text("\n".join(events) + "\n", encoding="utf-8")
 
         self.assert_resume_preflight_rejected("Event History record 1 is invalid")
 
@@ -7154,7 +7194,11 @@ class StartCliTest(unittest.TestCase):
         self.assertEqual(second.returncode, 2)
         self.assertFalse(self.command_log.exists())
         for root in ("attempts", "gates", "retrospective"):
-            self.assertEqual(list((run_dir / root).iterdir()), [])
+            expected = ["start-bead-spec"] if root == "attempts" else []
+            self.assertEqual(
+                sorted(path.name for path in (run_dir / root).iterdir()),
+                expected,
+            )
         status = store.status("crashed-run")
         self.assertEqual(status["attention"]["kind"], "invalid")
         self.assertIn(
@@ -7324,7 +7368,11 @@ class StartCliTest(unittest.TestCase):
         self.assertEqual(second.returncode, 2)
         self.assertFalse(self.command_log.exists())
         for root in ("attempts", "gates", "retrospective"):
-            self.assertEqual(list((run_dir / root).iterdir()), [])
+            expected = ["start-bead-spec"] if root == "attempts" else []
+            self.assertEqual(
+                sorted(path.name for path in (run_dir / root).iterdir()),
+                expected,
+            )
         status = store.status("crashed-run")
         self.assertEqual(status["attention"]["kind"], "invalid")
         self.assertIn(
@@ -7885,7 +7933,7 @@ class StartCliTest(unittest.TestCase):
         self.assertEqual(completed.returncode, 2, completed.stderr)
         self.assertEqual(
             completed.stdout,
-            "crashed-run created bead=central-bnkl.1.1 sequence=1 "
+            "crashed-run created bead=central-bnkl.1.1 sequence=3 "
             "checkpoint=created unit=afk-crashed-run-worker-1 "
             "unit_status=interrupted load_state=not-found "
             "active_state=inactive\n"
@@ -9566,24 +9614,10 @@ class StartCliTest(unittest.TestCase):
                 )
                 self.assertEqual(status["validation"]["status"], "passed")
 
-    def test_resume_requires_attention_for_confirmed_collected_worker_without_terminal(
+    def test_resume_recovers_confirmed_worker_at_prepared_seam(
         self,
     ):
-        store = RunStore(self.state_home / "afk")
-        store.create_run(
-            bead_id="central-bnkl.1.1",
-            repository="thunderbump/beads-webui",
-            base_branch="main",
-            base_sha=BASE_SHA,
-            start_request={"repository_root": str(self.project)},
-            run_id="missing-terminal-run",
-        )
-        store.prepare_effect(
-            "missing-terminal-run",
-            "worker-launch-1",
-            kind="worker-launch",
-            intended={"unit": "afk-missing-terminal-run-worker-1"},
-        )
+        store, _ = self.create_worker_launch_run(run_id="missing-terminal-run")
         store.confirm_effect(
             "missing-terminal-run",
             "worker-launch-1",
@@ -9592,30 +9626,16 @@ class StartCliTest(unittest.TestCase):
 
         resumed = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="absent")
 
-        self.assertEqual(resumed.returncode, 2)
+        self.assertEqual(resumed.returncode, 0)
         status = store.status("missing-terminal-run")
-        self.assertEqual(status["state"], "attention_required")
-        self.assertEqual(status["attention"]["kind"], "inconclusive")
+        self.assertEqual(status["state"], "created")
+        self.assertEqual(status["last_event"], "worker.launched")
         commands = self.command_log.read_text(encoding="utf-8")
         self.assertIn('"command":"systemctl"', commands)
         self.assertNotIn('"command":"systemd-run"', commands)
 
     def test_resume_leaves_confirmed_active_worker_running(self):
-        store = RunStore(self.state_home / "afk")
-        store.create_run(
-            bead_id="central-bnkl.1.1",
-            repository="thunderbump/beads-webui",
-            base_branch="main",
-            base_sha=BASE_SHA,
-            start_request={"repository_root": str(self.project)},
-            run_id="active-worker-run",
-        )
-        store.prepare_effect(
-            "active-worker-run",
-            "worker-launch-1",
-            kind="worker-launch",
-            intended={"unit": "afk-active-worker-run-worker-1"},
-        )
+        store, _ = self.create_worker_launch_run(run_id="active-worker-run")
         store.confirm_effect(
             "active-worker-run",
             "worker-launch-1",
@@ -9631,21 +9651,7 @@ class StartCliTest(unittest.TestCase):
         self.assertNotIn('"command":"systemd-run"', commands)
 
     def test_resume_does_not_confirm_an_activating_unit(self):
-        store = RunStore(self.state_home / "afk")
-        store.create_run(
-            bead_id="central-bnkl.1.1",
-            repository="thunderbump/beads-webui",
-            base_branch="main",
-            base_sha=BASE_SHA,
-            start_request={"repository_root": str(self.project)},
-            run_id="crashed-run",
-        )
-        store.prepare_effect(
-            "crashed-run",
-            "worker-launch-1",
-            kind="worker-launch",
-            intended={"unit": "afk-crashed-run-worker-1"},
-        )
+        store, _ = self.create_worker_launch_run()
 
         resumed = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="activating")
 
@@ -9657,21 +9663,7 @@ class StartCliTest(unittest.TestCase):
         self.assertEqual(status["state"], "attention_required")
 
     def test_resume_retries_a_proven_absent_unit(self):
-        store = RunStore(self.state_home / "afk")
-        store.create_run(
-            bead_id="central-bnkl.1.1",
-            repository="thunderbump/beads-webui",
-            base_branch="main",
-            base_sha=BASE_SHA,
-            start_request={"repository_root": str(self.project)},
-            run_id="crashed-run",
-        )
-        store.prepare_effect(
-            "crashed-run",
-            "worker-launch-1",
-            kind="worker-launch",
-            intended={"unit": "afk-crashed-run-worker-1"},
-        )
+        store, _ = self.create_worker_launch_run()
 
         resumed = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="absent")
 
@@ -9691,20 +9683,8 @@ class StartCliTest(unittest.TestCase):
         for unit_state in ("inactive", "ambiguous", "failure"):
             with self.subTest(unit_state=unit_state):
                 state_home = self.temp / f"state-{unit_state}"
-                store = RunStore(state_home / "afk")
-                store.create_run(
-                    bead_id="central-bnkl.1.1",
-                    repository="thunderbump/beads-webui",
-                    base_branch="main",
-                    base_sha=BASE_SHA,
-                    start_request={"repository_root": str(self.project)},
-                    run_id="crashed-run",
-                )
-                store.prepare_effect(
-                    "crashed-run",
-                    "worker-launch-1",
-                    kind="worker-launch",
-                    intended={"unit": "afk-crashed-run-worker-1"},
+                store, _ = self.create_worker_launch_run(
+                    state_home=state_home,
                 )
 
                 resumed = self.run_afk(
