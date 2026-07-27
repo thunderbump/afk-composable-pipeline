@@ -72,7 +72,8 @@ def normalize_retrospective_result(
         raise RetrospectiveResultError("Run Summary is invalid") from exc
     if (
         not isinstance(summary, dict)
-        or summary.get("schema_version") != 1
+        or type(summary.get("schema_version")) is not int
+        or summary["schema_version"] != 1
         or canonical_json(summary) != run_summary
         or not isinstance(summary.get("run"), dict)
         or not isinstance(summary.get("episode"), dict)
@@ -227,7 +228,8 @@ def _citation(value: Any, summary: dict[str, Any]) -> bool:
             and isinstance(source, list)
             and any(
                 isinstance(event, dict)
-                and event.get("sequence") == value["event_sequence"]
+                and type(event.get("sequence")) is int
+                and event["sequence"] == value["event_sequence"]
                 for event in source
             )
         )

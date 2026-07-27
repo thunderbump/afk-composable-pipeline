@@ -314,6 +314,35 @@ class RetrospectiveResultTest(unittest.TestCase):
         )
         self.assertLessEqual(len(str(raised.exception)), 512)
 
+    def test_boolean_run_summary_schema_version_is_rejected(self):
+        summary = json.loads(self.summary())
+        summary["schema_version"] = True
+
+        with self.assertRaisesRegex(
+            RetrospectiveResultError,
+            "Run Summary is invalid",
+        ):
+            normalize_retrospective_result(
+                canonical_json(summary),
+                self.populated_result(),
+            )
+
+    def test_boolean_source_event_sequence_does_not_resolve_integer_citation(self):
+        summary = json.loads(self.summary())
+        summary["events"][0]["sequence"] = True
+        result = self.populated_result()
+        result["process_findings"][0]["evidence"] = [
+            {"artifact": "events.jsonl", "event_sequence": 1}
+        ]
+
+        with self.assertRaises(RetrospectiveResultError) as raised:
+            normalize_retrospective_result(canonical_json(summary), result)
+
+        self.assertEqual(
+            raised.exception.errors,
+            ("process_findings[0].evidence[0] is unresolved",),
+        )
+
     def test_overlong_json_pointer_is_rejected_even_when_it_resolves(self):
         summary = json.loads(self.summary())
         long_key = "x" * 513
