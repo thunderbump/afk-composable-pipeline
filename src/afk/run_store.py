@@ -16,6 +16,11 @@ from typing import Any, Iterator
 
 from afk.jsonutil import canonical_json
 from afk.redaction import redact_artifact_value, redact_text
+from afk.retrospective_contract import (
+    ARTIFACT_INVENTORY_LIMIT,
+    TEXT_CHARACTER_LIMIT,
+    TRUNCATION_SUFFIX,
+)
 from afk.resume_preflight import validate_open_attempts
 
 
@@ -27,10 +32,10 @@ RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 EVIDENCE_ROOTS = {"attempts", "gates", "retrospective"}
-RETROSPECTIVE_INVENTORY_LIMIT = 32
+RETROSPECTIVE_INVENTORY_LIMIT = ARTIFACT_INVENTORY_LIMIT
 RETROSPECTIVE_INVENTORY_KEY = "_retrospective_inventory"
-RETROSPECTIVE_INVENTORY_TEXT_LIMIT = 512
-RETROSPECTIVE_TRUNCATION_SUFFIX = "…[TRUNCATED]"
+RETROSPECTIVE_INVENTORY_TEXT_LIMIT = TEXT_CHARACTER_LIMIT
+RETROSPECTIVE_TRUNCATION_SUFFIX = TRUNCATION_SUFFIX
 
 
 class RunStoreError(RuntimeError):

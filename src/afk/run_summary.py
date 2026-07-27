@@ -5,18 +5,22 @@ from typing import Any
 
 from afk.jsonutil import canonical_json, sha256_json
 from afk.redaction import redact_artifact_value, redact_text
+from afk.retrospective_contract import (
+    ARTIFACT_INVENTORY_LIMIT,
+    TEXT_CHARACTER_LIMIT,
+    TRUNCATION_SUFFIX,
+)
 from afk.run_store import RunStore, RunStoreError
 
 
 MAX_RUN_SUMMARY_BYTES = 64 * 1024
 MAX_EVENTS = 64
-MAX_EFFECTS = 32
-MAX_EVIDENCE_UNITS = 32
+MAX_EFFECTS = ARTIFACT_INVENTORY_LIMIT
+MAX_EVIDENCE_UNITS = ARTIFACT_INVENTORY_LIMIT
 MAX_EVIDENCE_FILES = 32
 MAX_NESTED_ITEMS = 16
-MAX_STRING_CHARACTERS = 512
+MAX_STRING_CHARACTERS = TEXT_CHARACTER_LIMIT
 MAX_BOUNDED_VALUE_BYTES = 16 * 1024
-TRUNCATION_SUFFIX = "…[TRUNCATED]"
 PROJECTION_FIELDS = (
     "state",
     "checkpoint",
