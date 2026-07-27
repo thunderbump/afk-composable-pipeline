@@ -60,6 +60,18 @@ def build_run_summary(store: RunStore, run_id: str, *, episode_sequence: int) ->
             identity=identity,
         )
 
+    unsealed = store.unsealed_evidence_result(run_id, summary_evidence)
+    if unsealed is not None:
+        rendered = _validate_cached_summary(
+            unsealed,
+            run_id=run_id,
+            episode_sequence=episode_sequence,
+            event=event,
+            identity=identity,
+        )
+        store.reconcile_evidence_result(run_id, summary_evidence, unsealed)
+        return rendered
+
     snapshot = store.read_run_snapshot(run_id, through_sequence=episode_sequence)
     identity = snapshot["identity"]
     projection = snapshot["projection"]
