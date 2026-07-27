@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Any, Collection
+from typing import Any, Callable, Collection
 
 from afk.durable_id import is_durable_id
 from afk.jsonutil import sha256_json
@@ -43,11 +43,17 @@ def capture_inventory(
     through_sequence: int,
     effects: list[dict[str, Any]],
     evidence: list[dict[str, Any]],
+    omitted_effects: int = 0,
+    omitted_evidence_units: int = 0,
 ) -> dict[str, Any]:
-    ordered_effects = sorted(effects, key=lambda record: record["effect_id"])
-    ordered_evidence = sorted(evidence, key=lambda record: record["unit"])
-    selected_effects = ordered_effects[:ARTIFACT_INVENTORY_LIMIT]
-    selected_evidence = ordered_evidence[:ARTIFACT_INVENTORY_LIMIT]
+    selected_effects, additionally_omitted_effects = select_inventory_items(
+        effects,
+        identity=lambda record: record["effect_id"],
+    )
+    selected_evidence, additionally_omitted_evidence = select_inventory_items(
+        evidence,
+        identity=lambda record: record["unit"],
+    )
     return {
         "schema_version": INVENTORY_SCHEMA_VERSION,
         "through_sequence": through_sequence,
@@ -67,10 +73,22 @@ def capture_inventory(
             for record in selected_evidence
         ],
         "omitted": {
-            "effects": len(ordered_effects) - len(selected_effects),
-            "evidence_units": len(ordered_evidence) - len(selected_evidence),
+            "effects": omitted_effects + additionally_omitted_effects,
+            "evidence_units": (omitted_evidence_units + additionally_omitted_evidence),
         },
     }
+
+
+def select_inventory_items(
+    items: list[Any],
+    *,
+    identity: Callable[[Any], str],
+) -> tuple[list[Any], int]:
+    ordered = sorted(items, key=identity)
+    return (
+        ordered[:ARTIFACT_INVENTORY_LIMIT],
+        max(0, len(ordered) - ARTIFACT_INVENTORY_LIMIT),
+    )
 
 
 def decode_inventory(

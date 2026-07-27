@@ -25,6 +25,7 @@ from afk.retrospective_contract import (
     decode_inventory,
     is_episode_event,
     manifest_digest,
+    select_inventory_items,
 )
 from afk.resume_preflight import validate_open_attempts
 
@@ -680,13 +681,17 @@ class RunStore:
         events, valid_bytes = self._read_events(run_id)
         event_data = dict(data or {})
         if is_episode_event(event):
+            effects, omitted_effects = self._read_effect_inventory(run_id)
+            evidence, omitted_evidence_units = self._read_evidence_inventory(run_id)
             try:
                 event_data = attach_inventory(
                     event_data,
                     capture_inventory(
                         through_sequence=len(events) + 1,
-                        effects=self._read_effects(run_id),
-                        evidence=self._read_evidence_manifests(run_id),
+                        effects=effects,
+                        evidence=evidence,
+                        omitted_effects=omitted_effects,
+                        omitted_evidence_units=omitted_evidence_units,
                     ),
                 )
             except RetrospectiveContractError as exc:
@@ -794,21 +799,26 @@ class RunStore:
             raise RunStoreError(f"Event History has no sequence {sequence}: {run_id}")
         return events[:sequence]
 
-    def _read_effects(self, run_id: str) -> list[dict[str, Any]]:
+    def _read_effect_inventory(self, run_id: str) -> tuple[list[dict[str, Any]], int]:
         effects_directory = self._run_dir(run_id) / "effects"
         if effects_directory.is_symlink() or not effects_directory.is_dir():
             raise EventHistoryCorrupt("Effect directory is invalid")
-        records = []
+        paths = []
         for path in sorted(effects_directory.iterdir(), key=lambda item: item.name):
             if (
                 path.is_symlink()
                 or not path.is_file()
                 or path.suffix != ".json"
                 or path.stem == ""
+                or not is_durable_id(path.stem)
             ):
                 raise RunStoreError("Effects directory contains an invalid record")
-            records.append(self.effect(run_id, path.stem))
-        return records
+            paths.append(path)
+        selected, omitted = select_inventory_items(
+            paths,
+            identity=lambda path: path.stem,
+        )
+        return [self.effect(run_id, path.stem) for path in selected], omitted
 
     def _read_retrospective_inventory(
         self,
@@ -850,9 +860,9 @@ class RunStore:
             evidence.append({"unit": unit, "manifest": manifest})
         return inventory["effects"], evidence, inventory["omitted"]
 
-    def _read_evidence_manifests(self, run_id: str) -> list[dict[str, Any]]:
+    def _read_evidence_inventory(self, run_id: str) -> tuple[list[dict[str, Any]], int]:
         run_directory = self._run_dir(run_id)
-        records = []
+        units = []
         for root_name in sorted(EVIDENCE_ROOTS):
             root = run_directory / root_name
             if root.is_symlink() or not root.is_dir():
@@ -863,18 +873,29 @@ class RunStore:
                         f"{root_name} contains an invalid evidence unit"
                     )
                 manifest_path = unit / "manifest.json"
-                if not manifest_path.exists() and not manifest_path.is_symlink():
+                if manifest_path.is_symlink() or (
+                    manifest_path.exists() and not manifest_path.is_file()
+                ):
+                    raise EvidenceTampered("evidence manifest is invalid")
+                if not manifest_path.exists():
                     continue
-                relative = f"{root_name}/{unit.name}"
-                self.verify_evidence(run_id, relative)
-                try:
-                    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-                except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-                    raise EvidenceTampered(
-                        "evidence manifest is missing or invalid"
-                    ) from exc
-                records.append({"unit": relative, "manifest": manifest})
-        return records
+                units.append(f"{root_name}/{unit.name}")
+        selected, omitted = select_inventory_items(
+            units,
+            identity=lambda unit: unit,
+        )
+        records = []
+        for relative in selected:
+            self.verify_evidence(run_id, relative)
+            manifest_path = self._evidence_path(run_id, relative) / "manifest.json"
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise EvidenceTampered(
+                    "evidence manifest is missing or invalid"
+                ) from exc
+            records.append({"unit": relative, "manifest": manifest})
+        return records, omitted
 
     def _identity(self, run_id: str) -> dict[str, Any]:
         _validate_run_id(run_id)

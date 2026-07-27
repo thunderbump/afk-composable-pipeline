@@ -31,6 +31,7 @@ from afk.run_store import (  # noqa: E402
     RunStoreBusy,
     RunStoreError,
 )
+from afk.retrospective_contract import INVENTORY_KEY  # noqa: E402
 from afk.start import resume_run  # noqa: E402
 
 
@@ -306,6 +307,41 @@ class RunStoreTest(unittest.TestCase):
             )
         with self.assertRaisesRegex(RunStoreError, "has no sequence 2"):
             self.store.event("run-001", 2)
+
+    def test_terminal_inventory_verifies_only_selected_evidence_units(self):
+        self.create_run()
+        for index in range(33):
+            unit = f"attempts/unit-{index:02d}"
+            self.store.write_evidence_text(
+                "run-001",
+                f"{unit}/stdout.txt",
+                "evidence\n",
+            )
+            self.store.seal_evidence("run-001", unit)
+        original_verify = self.store.verify_evidence
+        verified = []
+
+        def fail_if_omitted_unit_is_verified(run_id, unit):
+            verified.append(unit)
+            if unit == "attempts/unit-32":
+                raise AssertionError("omitted evidence must not be verified")
+            return original_verify(run_id, unit)
+
+        with patch.object(
+            self.store,
+            "verify_evidence",
+            side_effect=fail_if_omitted_unit_is_verified,
+        ):
+            self.store.append_event(
+                "run-001",
+                "run.attention_required",
+                state="attention_required",
+            )
+
+        inventory = self.store.event("run-001", 2)["data"][INVENTORY_KEY]
+        self.assertEqual(len(verified), 32)
+        self.assertNotIn("attempts/unit-32", verified)
+        self.assertEqual(inventory["omitted"]["evidence_units"], 1)
 
     def test_completed_evidence_is_redacted_manifested_read_only_and_verified(self):
         self.create_run()
