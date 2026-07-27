@@ -58,14 +58,17 @@ def normalize_retrospective_result(
     result: Any,
 ) -> dict[str, Any]:
     """Validate and normalize one untrusted retrospective result."""
-    if (
-        not isinstance(run_summary, str)
-        or len(run_summary.encode("utf-8")) > MAX_RUN_SUMMARY_BYTES
-    ):
+    if not isinstance(run_summary, str):
+        raise RetrospectiveResultError("Run Summary is invalid")
+    try:
+        run_summary_bytes = run_summary.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise RetrospectiveResultError("Run Summary is invalid") from exc
+    if len(run_summary_bytes) > MAX_RUN_SUMMARY_BYTES:
         raise RetrospectiveResultError("Run Summary is invalid")
     try:
         summary = json.loads(run_summary)
-    except (TypeError, json.JSONDecodeError) as exc:
+    except (TypeError, ValueError) as exc:
         raise RetrospectiveResultError("Run Summary is invalid") from exc
     if (
         not isinstance(summary, dict)
@@ -115,11 +118,13 @@ def normalize_retrospective_result(
 
 
 def _text(value: Any) -> bool:
-    return (
-        isinstance(value, str)
-        and bool(value.strip())
-        and len(value) <= TEXT_CHARACTER_LIMIT
-    )
+    if not isinstance(value, str):
+        return False
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return bool(value.strip()) and len(value) <= TEXT_CHARACTER_LIMIT
 
 
 def _validate_finding(

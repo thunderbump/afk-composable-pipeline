@@ -285,6 +285,35 @@ class RetrospectiveResultTest(unittest.TestCase):
                 },
             )
 
+    def test_lone_surrogate_run_summary_fails_closed_with_bounded_evidence(self):
+        with self.assertRaises(RetrospectiveResultError) as raised:
+            normalize_retrospective_result("\ud800", self.populated_result())
+
+        self.assertEqual(raised.exception.errors, ("Run Summary is invalid",))
+        self.assertLessEqual(len(str(raised.exception)), 512)
+
+    def test_oversized_json_integer_fails_closed_with_bounded_evidence(self):
+        run_summary = f'{{"schema_version": {"9" * 5000}}}'
+
+        with self.assertRaises(RetrospectiveResultError) as raised:
+            normalize_retrospective_result(run_summary, self.populated_result())
+
+        self.assertEqual(raised.exception.errors, ("Run Summary is invalid",))
+        self.assertLessEqual(len(str(raised.exception)), 512)
+
+    def test_lone_surrogate_result_string_fails_closed_with_bounded_evidence(self):
+        result = self.populated_result()
+        result["summary"] = "\ud800"
+
+        with self.assertRaises(RetrospectiveResultError) as raised:
+            normalize_retrospective_result(self.summary(), result)
+
+        self.assertEqual(
+            raised.exception.errors,
+            ("retrospective result is invalid",),
+        )
+        self.assertLessEqual(len(str(raised.exception)), 512)
+
     def test_overlong_json_pointer_is_rejected_even_when_it_resolves(self):
         summary = json.loads(self.summary())
         long_key = "x" * 513
