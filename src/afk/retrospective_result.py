@@ -72,13 +72,14 @@ def normalize_retrospective_result(
         raise RetrospectiveResultError("Run Summary is invalid")
     try:
         summary = json.loads(run_summary)
-    except (TypeError, ValueError) as exc:
+        normalized_summary = canonical_json(summary)
+    except (TypeError, ValueError, RecursionError) as exc:
         raise RetrospectiveResultError("Run Summary is invalid") from exc
     if (
         not isinstance(summary, dict)
         or type(summary.get("schema_version")) is not int
         or summary["schema_version"] != RUN_SUMMARY_SCHEMA_VERSION
-        or canonical_json(summary) != run_summary
+        or normalized_summary != run_summary
         or not isinstance(summary.get("run"), dict)
         or not isinstance(summary.get("episode"), dict)
         or not isinstance(summary["run"].get("run_id"), str)

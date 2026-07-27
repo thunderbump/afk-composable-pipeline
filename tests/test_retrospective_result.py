@@ -355,6 +355,16 @@ class RetrospectiveResultTest(unittest.TestCase):
         self.assertEqual(raised.exception.errors, ("Run Summary is invalid",))
         self.assertLessEqual(len(str(raised.exception)), 512)
 
+    def test_deeply_nested_run_summary_fails_closed_with_bounded_evidence(self):
+        nested = "[" * 10000 + "0" + "]" * 10000
+        run_summary = f'{{"schema_version":2,"padding":{nested}}}'
+
+        with self.assertRaises(RetrospectiveResultError) as raised:
+            normalize_retrospective_result(run_summary, self.populated_result())
+
+        self.assertEqual(raised.exception.errors, ("Run Summary is invalid",))
+        self.assertLessEqual(len(str(raised.exception)), 512)
+
     def test_lone_surrogate_result_string_fails_closed_with_bounded_evidence(self):
         result = self.populated_result()
         result["summary"] = "\ud800"
