@@ -171,6 +171,68 @@ class RunSummaryTest(unittest.TestCase):
         self.assertEqual(json.loads(second)["effects"], [])
         self.assertEqual(json.loads(second)["evidence"], [])
 
+    def test_first_build_for_an_old_episode_excludes_later_artifacts(self):
+        self.store.prepare_effect(
+            "run-001",
+            "prior-effect",
+            kind="worker-launch",
+            intended={},
+        )
+        self.store.confirm_effect("run-001", "prior-effect", observed={})
+        self.store.write_evidence_text(
+            "run-001",
+            "attempts/prior/stdout.txt",
+            "prior evidence\n",
+        )
+        self.store.seal_evidence("run-001", "attempts/prior")
+        self.store.append_event(
+            "run-001",
+            "run.attention_required",
+            state="attention_required",
+            data={"checkpoint": "created"},
+            recorded_at="2026-07-27T10:01:00Z",
+        )
+
+        self.store.prepare_effect(
+            "run-001",
+            "later-effect",
+            kind="worker-launch",
+            intended={},
+        )
+        self.store.write_evidence_text(
+            "run-001",
+            "attempts/later/stdout.txt",
+            "later evidence\n",
+        )
+        self.store.seal_evidence("run-001", "attempts/later")
+        self.store.append_event(
+            "run-001",
+            "run.activity_resumed",
+            state="created",
+            data={"checkpoint": "created"},
+            recorded_at="2026-07-27T10:02:00Z",
+        )
+
+        first = build_run_summary(self.store, "run-001", episode_sequence=2)
+        second = build_run_summary(self.store, "run-001", episode_sequence=2)
+        summary = json.loads(first)
+
+        self.assertEqual(second, first)
+        self.assertEqual(
+            summary["effects"],
+            [
+                {
+                    "effect_id": "prior-effect",
+                    "kind": "worker-launch",
+                    "status": "confirmed",
+                }
+            ],
+        )
+        self.assertEqual(
+            [record["unit"] for record in summary["evidence"]],
+            ["attempts/prior"],
+        )
+
     def test_seals_and_reuses_a_complete_summary_after_an_interrupted_seal(self):
         self.store.append_event(
             "run-001",

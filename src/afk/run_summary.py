@@ -79,13 +79,16 @@ def build_run_summary(store: RunStore, run_id: str, *, episode_sequence: int) ->
     events = snapshot["events"]
     effects = snapshot["effects"]
     evidence = snapshot["evidence"]
+    artifact_omitted = snapshot["artifact_omitted"]
     selected_events = events[-MAX_EVENTS:]
     selected_effects = effects[:MAX_EFFECTS]
     selected_evidence = evidence[:MAX_EVIDENCE_UNITS]
     omitted = {
         "events": len(events) - len(selected_events),
-        "effects": len(effects) - len(selected_effects),
-        "evidence_units": len(evidence) - len(selected_evidence),
+        "effects": artifact_omitted["effects"] + len(effects) - len(selected_effects),
+        "evidence_units": (
+            artifact_omitted["evidence_units"] + len(evidence) - len(selected_evidence)
+        ),
         "evidence_files": 0,
     }
 
