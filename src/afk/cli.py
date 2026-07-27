@@ -52,10 +52,12 @@ from afk.run_store import RunStore, RunStoreError
 from afk.start import (
     StartError,
     complete_run,
+    observe_worker_unit,
     resume_run,
     run_worker,
     run_worker_unit,
     start_run,
+    worker_unit,
 )
 
 
@@ -109,18 +111,64 @@ def main(
         return run_worker_unit(args.run_id)
 
     if args.command == "status":
+        store = RunStore()
+        exit_code = 0
         try:
-            projection = RunStore().status(args.run_id)
-        except RunStoreError as exc:
-            parser.error(str(exc))
+            projection = store.status(args.run_id)
+            observation = None
+            observation_error = None
+            if (
+                "worker_exit_code" not in projection
+                and projection["state"] != "completed"
+            ):
+                active_run_id = (
+                    projection["run_id"]
+                    if args.run_id is None
+                    else store.active_run_id()
+                )
+                if active_run_id == projection["run_id"]:
+                    try:
+                        observation = observe_worker_unit(projection["run_id"])
+                    except StartError as exc:
+                        observation_error = exc
+                projection = store.status(projection["run_id"])
+                if (
+                    observation_error is not None
+                    and "worker_exit_code" not in projection
+                    and projection["state"] != "completed"
+                ):
+                    raise observation_error
+            output = dict(projection)
+            if projection["state"] == "attention_required":
+                output["recommended_resume"] = ["afk", "resume"]
+                exit_code = 2
+            if "worker_exit_code" in projection:
+                output["unit_observation"] = {
+                    "status": "terminal",
+                    "unit": projection.get(
+                        "unit", worker_unit(projection["run_id"])
+                    ),
+                    "worker_exit_code": projection["worker_exit_code"],
+                    "worker_result": projection["worker_result"],
+                }
+            elif observation is not None:
+                output["unit_observation"] = observation
+                if observation["status"] == "interrupted":
+                    output["recommended_resume"] = ["afk", "resume"]
+                    exit_code = 2
+            if "recommended_resume" in output:
+                output["resume_precondition"] = {"active_run_id": output["run_id"]}
+        except (RunStoreError, StartError) as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
         if args.json:
-            print(canonical_json(projection))
+            print(canonical_json(output))
         else:
             fields = [
-                projection["run_id"],
-                projection["state"],
-                f"bead={projection['bead_id']}",
-                f"sequence={projection['last_sequence']}",
+                output["run_id"],
+                output["state"],
+                f"bead={output['bead_id']}",
+                f"sequence={output['last_sequence']}",
             ]
             for key in (
                 "checkpoint",
@@ -128,10 +176,28 @@ def main(
                 "worker_exit_code",
                 "worker_result",
             ):
-                if key in projection:
-                    fields.append(f"{key}={projection[key]}")
+                if key in output:
+                    fields.append(f"{key}={output[key]}")
+            observation = output.get("unit_observation")
+            if isinstance(observation, dict):
+                if "unit" not in output:
+                    fields.append(f"unit={observation['unit']}")
+                fields.append(f"unit_status={observation['status']}")
+                if observation["status"] != "terminal":
+                    fields.extend(
+                        (
+                            f"load_state={observation['load_state']}",
+                            f"active_state={observation['active_state']}",
+                        )
+                    )
             print(" ".join(fields))
-        return 0
+            if "recommended_resume" in output:
+                print("recommended_resume=afk resume")
+                print(
+                    "resume_precondition=active_run_id:"
+                    f"{output['resume_precondition']['active_run_id']}"
+                )
+        return exit_code
 
     if args.command == "report":
         try:

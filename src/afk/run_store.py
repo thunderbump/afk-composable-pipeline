@@ -266,16 +266,16 @@ class RunStore:
     def status(self, run_id: str | None = None) -> dict[str, Any]:
         selected = run_id or self._active_run_id()
         if selected is None:
-            recovered = self._reconcile_completed_active_pointer()
-            if recovered is not None:
-                return recovered
-            selected = self._active_run_id()
+            selected = self._active_pointer_run_id(invalid_is_error=True)
             if selected is None:
                 raise RunNotFound("no Active Run")
         _validate_run_id(selected)
         identity = self._identity(selected)
         events, _ = self._read_events(selected)
         return _project(identity, events)
+
+    def active_run_id(self) -> str | None:
+        return self._active_run_id()
 
     def resume_status(self) -> dict[str, Any]:
         with self.lock(validate_root_permissions=True):
@@ -293,6 +293,12 @@ class RunStore:
             invalid = validate_open_attempts(projection, events)
             if invalid is not None:
                 raise ResumePreflightInvalid(invalid)
+            if (
+                projection["state"] == "completed"
+                and active_run_id == projection["run_id"]
+            ):
+                self._clear_active_pointer(projection["run_id"])
+                return projection
             _atomic_json(self._run_dir(projection["run_id"]) / "state.json", projection)
             if active_run_id is None:
                 _atomic_json(
@@ -779,29 +785,6 @@ class RunStore:
         if len(active) > 1:
             raise EventHistoryCorrupt("multiple Active Runs exist")
         return active[0] if active else None
-
-    def _reconcile_completed_active_pointer(self) -> dict[str, Any] | None:
-        run_id = self._active_pointer_run_id()
-        if run_id is None:
-            return None
-        identity = self._identity(run_id)
-        events, _ = self._read_events(run_id)
-        projection = _project(identity, events)
-        if projection["state"] != "completed":
-            return None
-        try:
-            with self.lock():
-                if self._active_pointer_run_id() != run_id:
-                    return None
-                identity = self._identity(run_id)
-                events, _ = self._read_events(run_id)
-                projection = _project(identity, events)
-                if projection["state"] != "completed":
-                    return None
-                self._clear_active_pointer(run_id)
-        except RunStoreBusy:
-            pass
-        return projection
 
     def _clear_active_pointer(self, run_id: str) -> None:
         if self._active_pointer_run_id() != run_id:

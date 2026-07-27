@@ -619,6 +619,16 @@ class RunStoreTest(unittest.TestCase):
 
     def test_status_cli_reports_named_and_active_run(self):
         self.create_run()
+        self.store.append_event(
+            "run-001",
+            "worker.terminal",
+            data={
+                "checkpoint": "created",
+                "unit": "afk-run-001-worker-1",
+                "worker_exit_code": 2,
+                "worker_result": "attention_required",
+            },
+        )
         env = {"XDG_STATE_HOME": str(self.state_home)}
 
         named = run_afk("status", "run-001", "--json", env_overrides=env)

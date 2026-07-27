@@ -337,18 +337,7 @@ def resume_run(
             return run_id, projection["worker_exit_code"]
         effect, unit = _resume_worker_launch_effect(store, run_id, projection)
         try:
-            completed = _command(
-                [
-                    "systemctl",
-                    "--user",
-                    "show",
-                    unit,
-                    "--property=LoadState",
-                    "--property=ActiveState",
-                ],
-                cwd=Path.cwd(),
-                check=False,
-            )
+            completed, properties = _query_worker_unit(unit)
         except StartError as exc:
             _attention(
                 store,
@@ -361,13 +350,6 @@ def resume_run(
                 unit=unit,
             )
             return run_id, 2
-        properties: dict[str, str] = {}
-        for line in completed.stdout.splitlines():
-            key, separator, value = line.partition("=")
-            if not separator or key in properties:
-                properties = {}
-                break
-            properties[key] = value
         active = completed.returncode == 0 and properties == {
             "LoadState": "loaded",
             "ActiveState": "active",
@@ -2322,6 +2304,54 @@ def preflight(
 
 def worker_unit(run_id: str) -> str:
     return f"afk-{run_id}-worker-1"
+
+
+def observe_worker_unit(run_id: str) -> dict[str, str]:
+    unit = worker_unit(run_id)
+    completed, properties = _query_worker_unit(unit)
+    if completed.returncode != 0:
+        raise _external_failure("systemctl", completed)
+    if properties == {"LoadState": "loaded", "ActiveState": "active"}:
+        status = "running"
+    elif properties.get("ActiveState") in {"failed", "inactive"} and properties.get(
+        "LoadState"
+    ) in {"loaded", "not-found"}:
+        status = "interrupted"
+    else:
+        raise ExternalCommandError(
+            "malformed_output", "systemctl returned an unsupported unit state"
+        )
+    return {
+        "active_state": properties["ActiveState"],
+        "load_state": properties["LoadState"],
+        "status": status,
+        "unit": unit,
+    }
+
+
+def _query_worker_unit(
+    unit: str,
+) -> tuple[subprocess.CompletedProcess[str], dict[str, str]]:
+    completed = _command(
+        [
+            "systemctl",
+            "--user",
+            "show",
+            unit,
+            "--property=LoadState",
+            "--property=ActiveState",
+        ],
+        cwd=Path.cwd(),
+        check=False,
+    )
+    properties: dict[str, str] = {}
+    for line in completed.stdout.splitlines():
+        key, separator, value = line.partition("=")
+        if not separator or key in properties:
+            properties = {}
+            break
+        properties[key] = value
+    return completed, properties
 
 
 def _launch_worker(run_id: str, unit: str) -> None:
