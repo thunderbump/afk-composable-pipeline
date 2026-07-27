@@ -14,6 +14,7 @@ from pathlib import Path
 from threading import get_ident
 from typing import Any, Iterator
 
+from afk.durable_id import is_durable_id
 from afk.jsonutil import canonical_json
 from afk.redaction import redact_artifact_value, redact_text
 from afk.retrospective_contract import (
@@ -32,7 +33,6 @@ SCHEMA_VERSION = 1
 STREAM_BYTE_LIMIT = 64 * 1024 * 1024
 ATTEMPT_BYTE_LIMIT = 256 * 1024 * 1024
 GATE_BYTE_LIMIT = 512 * 1024 * 1024
-RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 EVIDENCE_ROOTS = {"attempts", "gates", "retrospective"}
@@ -1011,7 +1011,7 @@ class RunStore:
     def _validate_resume_effects(self, run_id: str) -> None:
         effects = self._run_dir(run_id) / "effects"
         for path in sorted(effects.iterdir()):
-            if path.suffix != ".json" or not RUN_ID_PATTERN.fullmatch(path.stem):
+            if path.suffix != ".json" or not is_durable_id(path.stem):
                 raise ResumePreflightInvalid(f"Effect record is invalid: {path.name}")
             try:
                 self.effect(run_id, path.stem)
@@ -1054,7 +1054,7 @@ class RunStore:
 
 
 def _validate_run_id(run_id: str) -> None:
-    if not RUN_ID_PATTERN.fullmatch(run_id):
+    if not is_durable_id(run_id):
         raise RunStoreError("run_id contains unsupported characters")
 
 

@@ -4,6 +4,7 @@ import re
 from pathlib import Path
 from typing import Any, Collection
 
+from afk.durable_id import is_durable_id
 from afk.jsonutil import sha256_json
 
 
@@ -16,7 +17,6 @@ EPISODE_STATES = {
     "run.attention_required": "attention_required",
     "run.completed": "completed",
 }
-EFFECT_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -110,8 +110,7 @@ def decode_inventory(
         if (
             not isinstance(record, dict)
             or set(record) != {"effect_id", "kind", "status"}
-            or not isinstance(record["effect_id"], str)
-            or EFFECT_ID_PATTERN.fullmatch(record["effect_id"]) is None
+            or not is_durable_id(record["effect_id"])
             or not isinstance(record["kind"], str)
             or not record["kind"].strip()
             or not _valid_bounded_text(record["kind"])
