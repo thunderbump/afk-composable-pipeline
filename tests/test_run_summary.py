@@ -8,7 +8,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from afk.jsonutil import canonical_json, sha256_json  # noqa: E402
+from afk.jsonutil import sha256_json  # noqa: E402
 from afk.run_store import RunStore, RunStoreError  # noqa: E402
 from afk.run_summary import (  # noqa: E402
     MAX_RUN_SUMMARY_BYTES,
@@ -176,55 +176,46 @@ class RunSummaryTest(unittest.TestCase):
         ):
             build_run_summary(self.store, "run-001", episode_sequence=1)
 
-    def test_caps_large_histories_and_reports_omitted_records(self):
-        events = [
-            {
-                "schema_version": 1,
-                "sequence": 1,
-                "recorded_at": "2026-07-27T10:00:00Z",
-                "event": "run.created",
-                "state": "created",
-                "data": {"bead_id": "central-bhap.8.1"},
-            }
-        ]
-        for sequence in range(80):
-            events.append(
-                {
-                    "schema_version": 1,
-                    "sequence": sequence + 2,
-                    "recorded_at": (
-                        f"2026-07-27T10:{sequence // 60:02d}:{sequence % 60:02d}Z"
-                    ),
-                    "event": f"step.observed.{sequence:03d}",
-                    "state": "working",
-                    "data": {"worker_result": {"stdout": "x" * 10_000}},
-                }
-            )
-        events.append(
-            {
-                "schema_version": 1,
-                "sequence": 82,
-                "recorded_at": "2026-07-27T12:00:00Z",
-                "event": "run.completed",
-                "state": "completed",
-                "data": {
-                    "checkpoint": "completed",
-                    "completion": {"status": "merged"},
+    def test_bounds_a_large_completion_fact_and_keeps_the_terminal_episode(self):
+        self.store.append_event(
+            "run-001",
+            "run.completed",
+            state="completed",
+            data={
+                "checkpoint": "completed",
+                "completion": {
+                    "status": "merged",
+                    "detail": [
+                        "x" * 1024 for _ in range((MAX_RUN_SUMMARY_BYTES * 2) // 1024)
+                    ],
                 },
-            }
-        )
-        events_path = self.store.root / "runs" / "run-001" / "events.jsonl"
-        events_path.write_text(
-            "".join(f"{canonical_json(event)}\n" for event in events),
-            encoding="utf-8",
+            },
+            recorded_at="2026-07-27T12:00:00Z",
         )
 
-        rendered = build_run_summary(self.store, "run-001", episode_sequence=82)
+        rendered = build_run_summary(self.store, "run-001", episode_sequence=2)
         summary = json.loads(rendered)
 
         self.assertLessEqual(len(rendered.encode("utf-8")), MAX_RUN_SUMMARY_BYTES)
-        self.assertGreater(summary["omitted"]["events"], 0)
-        self.assertEqual(summary["events"][-1]["sequence"], 82)
+        self.assertEqual(
+            summary["episode"],
+            {
+                "checkpoint": "completed",
+                "event": "run.completed",
+                "recorded_at": "2026-07-27T12:00:00Z",
+                "sequence": 2,
+                "state": "completed",
+            },
+        )
+        self.assertEqual(summary["events"][-1]["sequence"], 2)
+        self.assertEqual(summary["projection"]["completion"]["status"], "merged")
+        self.assertEqual(len(summary["projection"]["completion"]["detail"]), 16)
+        self.assertTrue(
+            all(
+                detail.endswith("…[TRUNCATED]")
+                for detail in summary["projection"]["completion"]["detail"]
+            )
+        )
 
 
 if __name__ == "__main__":
