@@ -1175,28 +1175,6 @@ class StartCliTest(unittest.TestCase):
         self.assert_launch_effect(store, run_id, "confirmed")
         self.assertEqual(self.mutation_count("worker-launch"), 2)
 
-    def test_resume_pauses_after_worker_launch_confirmation_was_written(self):
-        started = self.run_afk("start", "central-bnkl.1.1")
-        run_id = started.stdout.strip()
-        store = RunStore(self.state_home / "afk")
-        unit = f"afk-{run_id}-worker-1"
-
-        interrupted = self.run_afk(
-            "_worker",
-            run_id,
-            AFK_TEST_KILL_AFTER_CONFIRM="worker-launch-1",
-        )
-
-        self.assertLess(interrupted.returncode, 0)
-        self.assert_launch_effect(store, run_id, "confirmed")
-        self.assert_launch_event(run_id, "worker.launched", 0, unit)
-        resumed = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="absent")
-        repeated = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="absent")
-        self.assertEqual(resumed.returncode, 2, resumed.stderr)
-        self.assertEqual(repeated.returncode, 2, repeated.stderr)
-        self.assertEqual(store.status(run_id)["attention"]["kind"], "inconclusive")
-        self.assertEqual(self.mutation_count("worker-launch"), 1)
-
     def test_resume_recovers_crash_before_worker_launch_retried_event(self):
         interrupted_start = self.run_afk(
             "start",
@@ -1254,30 +1232,154 @@ class StartCliTest(unittest.TestCase):
         self.assert_launch_event(run_id, "worker.launch_reconciled", 1, unit)
         self.assertEqual(self.mutation_count("worker-launch"), 1)
 
-    def test_resume_reconstructs_worker_launch_after_crash_before_event(self):
-        started = self.run_afk("start", "central-bnkl.1.1")
-        run_id = started.stdout.strip()
-        store = RunStore(self.state_home / "afk")
-        unit = f"afk-{run_id}-worker-1"
-
-        interrupted = self.run_afk(
-            "_worker",
-            run_id,
-            AFK_TEST_KILL_BEFORE_EVENT="worker.launched",
+    def test_resume_reconstructs_exact_confirmed_worker_launch(self):
+        crash_windows = (
+            ("after-confirmation", "AFK_TEST_KILL_AFTER_CONFIRM", "worker-launch-1"),
+            ("before-event", "AFK_TEST_KILL_BEFORE_EVENT", "worker.launched"),
         )
+        for name, injection, target in crash_windows:
+            with self.subTest(name=name):
+                state_home = self.temp / f"state-{name}"
+                environment = {"XDG_STATE_HOME": str(state_home)}
+                started = self.run_afk(
+                    "start",
+                    "central-bnkl.1.1",
+                    **environment,
+                )
+                run_id = started.stdout.strip()
+                store = RunStore(state_home / "afk")
+                unit = f"afk-{run_id}-worker-1"
 
-        self.assertLess(interrupted.returncode, 0)
-        self.assert_launch_effect(store, run_id, "confirmed")
-        self.assert_launch_event(run_id, "worker.launched", 0, unit)
-        resumed = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="absent")
-        progressed = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="absent")
-        repeated = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="absent")
-        self.assertEqual(resumed.returncode, 0, resumed.stderr)
-        self.assertEqual(progressed.returncode, 0, progressed.stderr)
-        self.assertEqual(repeated.returncode, 0, repeated.stderr)
-        self.assert_launch_event(run_id, "worker.launched", 1, unit)
-        self.assertEqual(self.mutation_count("worker-launch"), 1)
-        self.assertEqual(self.mutation_count("bead-claim"), 1)
+                interrupted = self.run_afk(
+                    "_worker",
+                    run_id,
+                    **environment,
+                    **{injection: target},
+                )
+
+                self.assertLess(interrupted.returncode, 0)
+                self.assert_launch_effect(store, run_id, "confirmed")
+                self.assertEqual(
+                    self.launch_events(
+                        run_id,
+                        "worker.launched",
+                        state_home=state_home,
+                    ),
+                    [],
+                )
+                resumed = self.run_afk(
+                    "resume",
+                    **environment,
+                    AFK_FAKE_SYSTEMD_STATE="absent",
+                )
+                self.assertEqual(resumed.returncode, 0, resumed.stderr)
+                launched = self.launch_events(
+                    run_id,
+                    "worker.launched",
+                    state_home=state_home,
+                )
+                self.assertEqual(len(launched), 1)
+                self.assertEqual(launched[0]["data"]["unit"], unit)
+
+                progressed = self.run_afk(
+                    "resume",
+                    **environment,
+                    AFK_FAKE_SYSTEMD_STATE="absent",
+                )
+                self.assertEqual(progressed.returncode, 0, progressed.stderr)
+                self.assert_bead_claim(store, run_id)
+
+                repeated = self.run_afk(
+                    "resume",
+                    **environment,
+                    AFK_FAKE_SYSTEMD_STATE="absent",
+                )
+
+                self.assertEqual(repeated.returncode, 0, repeated.stderr)
+                self.assertEqual(
+                    len(
+                        self.launch_events(
+                            run_id,
+                            "worker.launched",
+                            state_home=state_home,
+                        )
+                    ),
+                    1,
+                )
+                self.assertEqual(
+                    self.mutation_count("worker-launch", state_home=state_home),
+                    1,
+                )
+                self.assertEqual(
+                    self.mutation_count("bead-claim", state_home=state_home),
+                    1,
+                )
+
+    def test_resume_refuses_unproven_confirmed_worker_launch_identity(self):
+        for name, observed in (
+            ("conflicting", {"unit": "afk-other-worker-1"}),
+            ("missing", {}),
+        ):
+            with self.subTest(name=name):
+                state_home = self.temp / f"state-{name}"
+                environment = {"XDG_STATE_HOME": str(state_home)}
+                started = self.run_afk(
+                    "start",
+                    "central-bnkl.1.1",
+                    **environment,
+                )
+                run_id = started.stdout.strip()
+                store = RunStore(state_home / "afk")
+                interrupted = self.run_afk(
+                    "_worker",
+                    run_id,
+                    **environment,
+                    AFK_TEST_KILL_BEFORE_EVENT="worker.launched",
+                )
+                self.assertLess(interrupted.returncode, 0)
+                effect_path = (
+                    state_home
+                    / "afk"
+                    / "runs"
+                    / run_id
+                    / "effects"
+                    / "worker-launch-1.json"
+                )
+                effect = json.loads(effect_path.read_text(encoding="utf-8"))
+                effect["observed"] = observed
+                effect_path.write_text(
+                    json.dumps(effect) + "\n",
+                    encoding="utf-8",
+                )
+
+                resumed = self.run_afk(
+                    "resume",
+                    **environment,
+                    AFK_FAKE_SYSTEMD_STATE="absent",
+                )
+
+                self.assertEqual(resumed.returncode, 2)
+                self.assertIn(
+                    "Effect observation conflict: worker-launch-1",
+                    resumed.stderr,
+                )
+                self.assertEqual(
+                    self.launch_events(
+                        run_id,
+                        "worker.launched",
+                        state_home=state_home,
+                    ),
+                    [],
+                )
+                self.assertIsNone(store.effect_if_present(run_id, "bead-claim"))
+                self.assertEqual(
+                    self.mutation_count("worker-launch", state_home=state_home),
+                    1,
+                )
+                self.assertEqual(
+                    self.mutation_count("bead-claim", state_home=state_home),
+                    0,
+                )
 
     def test_resume_recovers_after_worker_launched_event_write(self):
         started = self.run_afk("start", "central-bnkl.1.1")

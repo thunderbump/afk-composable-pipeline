@@ -455,6 +455,8 @@ def _resume_worker_launch_effect(
         )
     if effect["kind"] != "worker-launch" or effect["intended"] != {"unit": unit}:
         raise StartError("worker launch Effect does not match this Run")
+    if effect["status"] == "confirmed":
+        store.confirm_effect(run_id, "worker-launch-1", observed={"unit": unit})
     if projection["last_event"] == "bead.spec_recorded":
         start_request = store.identity(run_id)["start_request"]
         lingering = start_request.get("lingering")
