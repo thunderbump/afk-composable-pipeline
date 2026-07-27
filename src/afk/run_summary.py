@@ -15,7 +15,6 @@ MAX_EVIDENCE_UNITS = 32
 MAX_EVIDENCE_FILES = 32
 MAX_NESTED_ITEMS = 16
 MAX_STRING_CHARACTERS = 512
-EPISODE_EVENTS = {"run.attention_required", "run.completed"}
 PROJECTION_FIELDS = (
     "state",
     "checkpoint",
