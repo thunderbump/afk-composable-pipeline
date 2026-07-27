@@ -44,8 +44,6 @@ PROJECTION_FIELDS = (
 
 def build_run_summary(store: RunStore, run_id: str, *, episode_sequence: int) -> str:
     """Return bounded canonical JSON for one retrospective episode."""
-    if type(episode_sequence) is not int or episode_sequence < 1:
-        raise RunStoreError("episode_sequence must be a positive integer")
     event = store.event(run_id, episode_sequence)
     _validate_episode(event, episode_sequence)
     summary_evidence = f"retrospective/run-summary-{episode_sequence:020d}"

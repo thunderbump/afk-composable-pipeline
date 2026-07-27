@@ -327,26 +327,22 @@ class RunStore:
 
     def event(self, run_id: str, sequence: int) -> dict[str, Any]:
         """Read one validated Event History record by its durable sequence."""
-        if type(sequence) is not int or sequence < 1:
-            raise RunStoreError("sequence must be a positive integer")
-        events, _ = self._read_events(run_id)
-        if sequence > len(events):
-            raise RunStoreError(f"Event History has no sequence {sequence}: {run_id}")
-        return events[sequence - 1]
+        return self._read_events_through(
+            run_id,
+            sequence,
+            parameter_name="sequence",
+        )[-1]
 
     def read_run_snapshot(
         self, run_id: str, *, through_sequence: int
     ) -> dict[str, Any]:
         """Read validated durable facts available for one Event History position."""
-        if type(through_sequence) is not int or through_sequence < 1:
-            raise RunStoreError("through_sequence must be a positive integer")
+        selected_events = self._read_events_through(
+            run_id,
+            through_sequence,
+            parameter_name="through_sequence",
+        )
         identity = self._identity(run_id)
-        events, _ = self._read_events(run_id)
-        if through_sequence > len(events):
-            raise RunStoreError(
-                f"Event History has no sequence {through_sequence}: {run_id}"
-            )
-        selected_events = events[:through_sequence]
         effects = self._read_effects(run_id)
         evidence = self._read_evidence_manifests(run_id)
         return {
@@ -758,6 +754,20 @@ class RunStore:
                 )
             events.append(record)
         return events, complete_bytes
+
+    def _read_events_through(
+        self,
+        run_id: str,
+        sequence: int,
+        *,
+        parameter_name: str,
+    ) -> list[dict[str, Any]]:
+        if type(sequence) is not int or sequence < 1:
+            raise RunStoreError(f"{parameter_name} must be a positive integer")
+        events, _ = self._read_events(run_id)
+        if sequence > len(events):
+            raise RunStoreError(f"Event History has no sequence {sequence}: {run_id}")
+        return events[:sequence]
 
     def _read_effects(self, run_id: str) -> list[dict[str, Any]]:
         effects_directory = self._run_dir(run_id) / "effects"
