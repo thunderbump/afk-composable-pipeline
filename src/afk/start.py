@@ -13,7 +13,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from afk.bead_spec import BEAD_SPEC_EVIDENCE, load_bead_spec, persist_bead_spec
+from afk.bead_spec import (
+    BEAD_SPEC_EVIDENCE,
+    bead_spec_identity,
+    load_bead_spec,
+    reconcile_bead_spec,
+    validate_bead_spec_identity,
+)
 from afk.candidate import (
     CandidateError,
     delete_candidate_branch,
@@ -96,57 +102,40 @@ def start_run(
         bootstrap_contract=bootstrap_contract,
     )
     store = RunStore()
+    bead: dict[str, Any] | None = None
+    bead_error: StartError | None = None
+    try:
+        bead = _live_bead_spec(bead_id, context.beads_workspace)
+    except StartError as exc:
+        bead_error = exc
+    start_request: dict[str, Any] = {
+        "repository_root": str(context.root),
+        "repository_common_dir": str(context.repository_common_dir),
+        "repository_common_dir_identity": context.repository_common_dir_identity,
+        "beads_workspace": str(context.beads_workspace),
+        "claimant": context.claimant,
+        "lingering": _lingering(context.claimant),
+        "validation_contract": context.validation_contract,
+    }
+    if bead is not None:
+        start_request["bead_spec_identity"] = bead_spec_identity(bead)
     with store.lock():
-        lingering = _lingering(context.claimant)
         projection = store.create_run(
             bead_id=bead_id,
             repository=context.repository,
             base_branch=context.base_branch,
             base_sha=context.base_sha,
-            start_request={
-                "repository_root": str(context.root),
-                "repository_common_dir": str(context.repository_common_dir),
-                "repository_common_dir_identity": (
-                    context.repository_common_dir_identity
-                ),
-                "beads_workspace": str(context.beads_workspace),
-                "claimant": context.claimant,
-                "lingering": lingering,
-                "validation_contract": context.validation_contract,
-            },
+            start_request=start_request,
             run_id=run_id,
         )
         run_id = projection["run_id"]
-        try:
-            bead = _show_bead(bead_id, context.beads_workspace)
-            bead["comments"] = _bead_comments(bead_id, context.beads_workspace)
-        except StartError as exc:
-            _attention(
-                store,
-                run_id,
-                checkpoint="created",
-                scope="bead_preflight",
-                kind="unavailable",
-                summary=str(exc),
-                classification=_error_classification(exc),
-                validation_contract=context.validation_contract,
-            )
+        if _advance_start_bead_spec(
+            store,
+            run_id,
+            bead=bead,
+            bead_error=bead_error,
+        ):
             return run_id, 2
-        try:
-            _validate_start_bead(bead, bead_id, context.repository)
-        except StartError as exc:
-            _attention(
-                store,
-                run_id,
-                checkpoint="created",
-                scope="bead_preflight",
-                kind="invalid",
-                summary=str(exc),
-                classification=_error_classification(exc),
-                validation_contract=context.validation_contract,
-            )
-            return run_id, 2
-        persist_bead_spec(store, run_id, bead)
         unit = worker_unit(run_id)
         store.prepare_effect(
             run_id,
@@ -160,7 +149,7 @@ def start_run(
             data={
                 "unit": unit,
                 "checkpoint": "created",
-                "lingering": lingering,
+                "lingering": start_request["lingering"],
                 "validation_contract": context.validation_contract,
             },
         )
@@ -227,6 +216,13 @@ def resume_run(
         if projection["state"] == "completed":
             return selected_run_id, 0
         run_id = selected_run_id
+        attention = projection.get("attention")
+        if projection["last_event"] == "run.created" or (
+            isinstance(attention, dict)
+            and attention.get("scope") == "bead_preflight"
+            and "bead_spec" not in projection
+        ):
+            return run_id, _advance_start_bead_spec(store, run_id)
         if projection["last_event"] in {"bead.claimed", "bead.claim_reconciled"}:
             claim_exit_code = _advance_bead_claim(store, run_id)
             if claim_exit_code:
@@ -383,6 +379,16 @@ def resume_run(
                     return run_id, _advance_candidate(store, run_id)
                 if _validation_resume_ready(projection):
                     return run_id, _advance_validation(store, run_id)
+                if projection["last_event"] == "worker.launch_prepared":
+                    store.append_event(
+                        run_id,
+                        "worker.launched",
+                        data={
+                            "unit": unit,
+                            "checkpoint": projection["checkpoint"],
+                        },
+                    )
+                    return run_id, 0
                 _attention(
                     store,
                     run_id,
@@ -449,6 +455,8 @@ def _resume_worker_launch_effect(
         )
     if effect["kind"] != "worker-launch" or effect["intended"] != {"unit": unit}:
         raise StartError("worker launch Effect does not match this Run")
+    if effect["status"] == "confirmed":
+        store.confirm_effect(run_id, "worker-launch-1", observed={"unit": unit})
     if projection["last_event"] == "bead.spec_recorded":
         start_request = store.identity(run_id)["start_request"]
         lingering = start_request.get("lingering")
@@ -473,6 +481,106 @@ def _bead_claim_resume_ready(
         projection["last_event"] == "worker.launched"
         or store.effect_if_present(run_id, "bead-claim") is not None
     )
+
+
+def _live_bead_spec(bead_id: str, workspace: Path) -> dict[str, Any]:
+    bead = _show_bead(bead_id, workspace)
+    bead["comments"] = _bead_comments(bead_id, workspace)
+    return bead
+
+
+def _bead_preflight_attention(
+    store: RunStore,
+    run_id: str,
+    *,
+    kind: str,
+    error: Exception,
+) -> int:
+    contract = store.identity(run_id)["start_request"].get("validation_contract")
+    details = {"validation_contract": contract} if isinstance(contract, dict) else {}
+    _attention(
+        store,
+        run_id,
+        checkpoint="created",
+        scope="bead_preflight",
+        kind=kind,
+        summary=str(error),
+        classification=(
+            _error_classification(error) if isinstance(error, StartError) else None
+        ),
+        **details,
+    )
+    return 2
+
+
+def _advance_start_bead_spec(
+    store: RunStore,
+    run_id: str,
+    *,
+    bead: dict[str, Any] | None = None,
+    bead_error: StartError | None = None,
+) -> int:
+    identity = store.identity(run_id)
+    request = identity["start_request"]
+    workspace = Path(request["beads_workspace"])
+    pinned_identity = request.get("bead_spec_identity")
+    evidence = store.root / "runs" / run_id / BEAD_SPEC_EVIDENCE
+    if bead_error is not None:
+        return _bead_preflight_attention(
+            store,
+            run_id,
+            kind="unavailable",
+            error=bead_error,
+        )
+    try:
+        validate_bead_spec_identity(pinned_identity)
+    except RunStoreError as exc:
+        return _bead_preflight_attention(
+            store,
+            run_id,
+            kind="invalid",
+            error=exc,
+        )
+    if evidence.exists():
+        try:
+            reconcile_bead_spec(store, run_id, pinned_identity)
+        except (OSError, RunStoreError, ValueError) as exc:
+            return _bead_preflight_attention(
+                store,
+                run_id,
+                kind="invalid",
+                error=exc,
+            )
+        return 0
+    if bead is None:
+        try:
+            bead = _live_bead_spec(identity["bead_id"], workspace)
+        except StartError as exc:
+            return _bead_preflight_attention(
+                store,
+                run_id,
+                kind="unavailable",
+                error=exc,
+            )
+    try:
+        _validate_start_bead(bead, identity["bead_id"], identity["repository"])
+    except StartError as exc:
+        return _bead_preflight_attention(
+            store,
+            run_id,
+            kind="invalid",
+            error=exc,
+        )
+    try:
+        reconcile_bead_spec(store, run_id, pinned_identity, bead)
+    except (OSError, RunStoreError, ValueError) as exc:
+        return _bead_preflight_attention(
+            store,
+            run_id,
+            kind="invalid",
+            error=exc,
+        )
+    return 0
 
 
 def complete_run(

@@ -19,6 +19,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 import afk.run_store as run_store_module  # noqa: E402
+from afk.bead_spec import bead_spec_identity, persist_bead_spec  # noqa: E402
 from afk.run_store import RunStore, RunStoreBusy, RunStoreError  # noqa: E402
 from afk.start import (  # noqa: E402
     StartError,
@@ -420,8 +421,14 @@ class StartCliTest(unittest.TestCase):
         self.assertEqual(self.run_afk("resume").returncode, 0)
         return run_id
 
-    def assert_exact_terminal_completion(self, run_id):
-        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+    def assert_exact_terminal_completion(
+        self, run_id, *, state_home=None, environment=None
+    ):
+        selected_state_home = state_home or self.state_home
+        selected_environment = environment or {}
+        status = json.loads(
+            self.run_afk("status", run_id, "--json", **selected_environment).stdout
+        )
         completion = status["completion"]
         self.assertEqual(status["checkpoint"], "completed")
         self.assertEqual(completion["schema_version"], 1)
@@ -437,7 +444,7 @@ class StartCliTest(unittest.TestCase):
         self.assertTrue(completion["local_branch_deleted"])
         self.assertEqual(completion["cleanup_warnings"], [])
         self.assertEqual(completion["evidence"], "gates/completion-dddddddddddd")
-        store = RunStore(self.state_home / "afk")
+        store = RunStore(selected_state_home / "afk")
         close_effect = store.effect(run_id, "bead-close")
         self.assertEqual(close_effect["status"], "confirmed")
         self.assertEqual(
@@ -457,6 +464,463 @@ class StartCliTest(unittest.TestCase):
         self.assertEqual(
             store.sealed_evidence_result(run_id, completion["evidence"]), completion
         )
+
+    def test_resume_recovers_a_run_created_before_start_bead_spec(self):
+        interrupted = self.run_afk(
+            "start",
+            "central-bnkl.1.1",
+            AFK_TEST_KILL_AFTER_EVENT_WRITE="run.created",
+        )
+
+        self.assertLess(interrupted.returncode, 0)
+        runs = tuple((self.state_home / "afk" / "runs").iterdir())
+        self.assertEqual(len(runs), 1)
+        run_id = runs[0].name
+        active = self.state_home / "afk" / "active.json"
+        self.assertFalse(active.exists())
+        before = {
+            path.relative_to(self.state_home / "afk"): path.read_bytes()
+            for path in (self.state_home / "afk").rglob("*")
+            if path.is_file()
+        }
+
+        observed = self.run_afk(
+            "status",
+            run_id,
+            "--json",
+            AFK_FAKE_SYSTEMD_STATE="absent",
+        )
+
+        self.assertEqual(observed.returncode, 2, observed.stderr)
+        self.assertEqual(json.loads(observed.stdout)["run_id"], run_id)
+        after = {
+            path.relative_to(self.state_home / "afk"): path.read_bytes()
+            for path in (self.state_home / "afk").rglob("*")
+            if path.is_file()
+        }
+        self.assertEqual(after, before)
+
+        recorded = self.run_afk("resume")
+        launched = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="absent")
+        worker = self.run_afk("_worker", run_id)
+        resumed = [self.run_afk("resume") for _ in range(4)]
+
+        self.assertEqual(recorded.returncode, 0, recorded.stderr)
+        self.assertEqual(launched.returncode, 0, launched.stderr)
+        self.assertEqual(worker.returncode, 0, worker.stderr)
+        self.assertTrue(all(result.returncode == 0 for result in resumed))
+        self.assert_exact_terminal_completion(run_id)
+        events_path = runs[0] / "events.jsonl"
+        events_before = events_path.read_bytes()
+        self.assertEqual(self.run_afk("resume", run_id).returncode, 0)
+        self.assertEqual(self.run_afk("resume", run_id).returncode, 0)
+        self.assertEqual(events_path.read_bytes(), events_before)
+
+    def test_resume_rejects_live_bead_drift_after_run_created(self):
+        interrupted = self.run_afk(
+            "start",
+            "central-bnkl.1.1",
+            AFK_TEST_KILL_AFTER_EVENT_WRITE="run.created",
+        )
+        self.assertLess(interrupted.returncode, 0)
+        run_id = next((self.state_home / "afk" / "runs").iterdir()).name
+
+        resumed = self.run_afk(
+            "resume",
+            AFK_FAKE_BEAD_DESCRIPTION="changed after the Run was created",
+        )
+
+        self.assertEqual(resumed.returncode, 2, resumed.stderr)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(status["checkpoint"], "created")
+        self.assertEqual(status["attention"]["scope"], "bead_preflight")
+        self.assertEqual(status["attention"]["kind"], "invalid")
+        self.assertIn("changed", status["attention"]["summary"])
+        self.assertEqual(
+            status["validation_contract"],
+            {
+                "source": "pinned_base",
+                "base_sha": BASE_SHA,
+                "blob_sha": "c" * 40,
+            },
+        )
+        self.assertFalse(
+            (
+                self.state_home / "afk" / "runs" / run_id / "attempts/start-bead-spec"
+            ).exists()
+        )
+
+    def test_resumed_bead_preflight_attention_retains_validation_contract(self):
+        interrupted = self.run_afk(
+            "start",
+            "central-bnkl.1.1",
+            AFK_TEST_KILL_AFTER_EVENT_WRITE="run.created",
+        )
+        self.assertLess(interrupted.returncode, 0)
+        run_id = next((self.state_home / "afk" / "runs").iterdir()).name
+
+        resumed = self.run_afk("resume", AFK_FAKE_BEAD_SHOW_FAILURE="1")
+
+        self.assertEqual(resumed.returncode, 2, resumed.stderr)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(status["attention"]["scope"], "bead_preflight")
+        self.assertEqual(status["attention"]["kind"], "unavailable")
+        self.assertEqual(
+            status["validation_contract"],
+            {
+                "source": "pinned_base",
+                "base_sha": BASE_SHA,
+                "blob_sha": "c" * 40,
+            },
+        )
+
+    def test_resume_does_not_adopt_a_bead_when_start_could_not_pin_its_identity(self):
+        started = self.run_afk(
+            "start",
+            "central-bnkl.1.1",
+            AFK_FAKE_BEAD_SHOW_FAILURE="1",
+        )
+        self.assertEqual(started.returncode, 2)
+        run_id = started.stdout.strip()
+
+        resumed = self.run_afk("resume")
+
+        self.assertEqual(resumed.returncode, 2, resumed.stderr)
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(status["checkpoint"], "created")
+        self.assertEqual(status["attention"]["scope"], "bead_preflight")
+        self.assertEqual(status["attention"]["kind"], "invalid")
+        self.assertIn("identity", status["attention"]["summary"])
+        self.assertFalse(
+            (
+                self.state_home / "afk" / "runs" / run_id / "attempts/start-bead-spec"
+            ).exists()
+        )
+
+    def test_resume_rejects_an_unprovable_pinned_bead_identity(self):
+        interrupted = self.run_afk(
+            "start",
+            "central-bnkl.1.1",
+            AFK_TEST_KILL_AFTER_EVENT_WRITE="run.created",
+        )
+        self.assertLess(interrupted.returncode, 0)
+        run_dir = next((self.state_home / "afk" / "runs").iterdir())
+        identity_path = run_dir / "run.json"
+        identity = json.loads(identity_path.read_text(encoding="utf-8"))
+        identity["start_request"]["bead_spec_identity"]["sha256"] = "not-a-digest"
+        identity_path.write_text(
+            json.dumps(identity, sort_keys=True, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+
+        resumed = self.run_afk("resume")
+
+        self.assertEqual(resumed.returncode, 2, resumed.stderr)
+        status = json.loads(self.run_afk("status", run_dir.name, "--json").stdout)
+        self.assertEqual(status["attention"]["scope"], "bead_preflight")
+        self.assertEqual(status["attention"]["kind"], "invalid")
+        self.assertIn("identity", status["attention"]["summary"])
+        self.assertFalse((run_dir / "attempts/start-bead-spec").exists())
+
+    def _crash_full_lifecycle_at(
+        self, boundary_type, phase, target, *, state_home, environment
+    ):
+        injection_name = {
+            "event-after": "AFK_TEST_KILL_AFTER_EVENT_WRITE",
+            "event-before": "AFK_TEST_KILL_BEFORE_EVENT",
+            "mutation-before": "AFK_TEST_KILL_BEFORE_MUTATION",
+            "mutation-after": "AFK_TEST_KILL_AFTER_MUTATION",
+        }[boundary_type]
+        injection = {injection_name: target}
+        absent_worker = {"AFK_FAKE_SYSTEMD_STATE": "absent"}
+        if target == "remote-branch-delete":
+            environment = {
+                **environment,
+                "AFK_FAKE_REMOTE_BRANCH_LINGERS": "1",
+            }
+
+        started = self.run_afk(
+            "start",
+            "central-bnkl.1.1",
+            **environment,
+            **(injection if phase == "start" else {}),
+        )
+        runs = tuple((state_home / "afk" / "runs").iterdir())
+        self.assertEqual(len(runs), 1)
+        run_id = runs[0].name
+        crashed = started if phase == "start" else None
+
+        if phase == "start" and started.returncode < 0:
+            while RunStore(state_home / "afk").status(run_id)["last_event"] in {
+                "run.created",
+                "bead.spec_recorded",
+                "worker.launch_prepared",
+            }:
+                recovered = self.run_afk(
+                    "resume",
+                    **environment,
+                    **(
+                        absent_worker
+                        if target != "worker-launch"
+                        or boundary_type == "mutation-before"
+                        else {}
+                    ),
+                )
+                self.assertEqual(recovered.returncode, 0, recovered.stderr)
+
+        worker = self.run_afk(
+            "_worker_unit",
+            run_id,
+            **environment,
+            **(injection if phase == "worker" else {}),
+        )
+        if phase == "worker":
+            crashed = worker
+        else:
+            self.assertEqual(worker.returncode, 0, worker.stderr)
+
+        if phase == "resume":
+            for _ in range(6):
+                resumed = self.run_afk("resume", **environment, **injection)
+                if resumed.returncode < 0:
+                    crashed = resumed
+                    break
+            self.assertIsNotNone(crashed)
+
+        return {
+            "run_id": run_id,
+            "run_dir": runs[0],
+            "crashed": crashed,
+            "observation_environment": (
+                absent_worker
+                if phase == "worker" or (phase == "start" and target != "worker-launch")
+                else {}
+            ),
+            "recovery_environment": absent_worker if phase == "worker" else {},
+            "expects_attention": (
+                boundary_type == "event-after"
+                and target == "validation.attempt_started"
+            ),
+            "expects_worker_terminal": phase != "worker"
+            or (boundary_type == "event-after" and target == "worker.terminal"),
+            "includes_remote_cleanup": target == "remote-branch-delete",
+        }
+
+    def test_full_lifecycle_resume_is_idempotent_across_crash_boundaries(self):
+        event_phases = (
+            ("bead.spec_recorded", "start"),
+            ("worker.launch_prepared", "start"),
+            ("worker.launched", "worker"),
+            ("bead.claimed", "worker"),
+            ("worktree.ready", "worker"),
+            ("implementation.attempt_started", "worker"),
+            ("implementation.attempt_finished", "worker"),
+            ("candidate.change_committed", "worker"),
+            ("candidate.branch_published", "worker"),
+            ("candidate.pr_published", "worker"),
+            ("candidate.ready", "worker"),
+            ("validation.attempt_started", "worker"),
+            ("validation.attempt_finished", "worker"),
+            ("validation.passed", "worker"),
+            ("gate.cycle_completed", "worker"),
+            ("worker.terminal", "worker"),
+            ("pr.marked_ready", "resume"),
+            ("pr.squash_merged", "resume"),
+            ("pr.merge_reconciled", "resume"),
+            ("bead.closed", "resume"),
+            ("run.completed", "resume"),
+        )
+        event_boundaries = (
+            # Before run.created no durable Run exists for resume to select.
+            ("event-after", "start", "run.created"),
+        ) + tuple(
+            (f"event-{side}", phase, event)
+            for event, phase in event_phases
+            for side in ("before", "after")
+        )
+        mutation_phases = {
+            "worker-launch": "start",
+            "bead-claim": "worker",
+            "worktree-create": "worker",
+            "branch-push": "worker",
+            "pr-create": "worker",
+            "gate-comment": "worker",
+            "pr-ready": "resume",
+            "pr-merge": "resume",
+            "bead-close": "resume",
+            "remote-branch-delete": "resume",
+            "worktree-move": "resume",
+            "worktree-remove": "resume",
+            "local-branch-delete": "resume",
+        }
+        boundaries = event_boundaries + tuple(
+            (f"mutation-{side}", phase, mutation)
+            for mutation, phase in mutation_phases.items()
+            for side in ("before", "after")
+        )
+        unique_terminal_events = {
+            "candidate.branch_published",
+            "candidate.pr_published",
+            "gate.cycle_completed",
+            "pr.marked_ready",
+            "pr.squash_merged",
+            "bead.closed",
+            "run.completed",
+        }
+        happy_mutations = {
+            "worker-launch",
+            "bead-claim",
+            "worktree-create",
+            "branch-push",
+            "pr-create",
+            "gate-comment",
+            "pr-ready",
+            "pr-merge",
+            "bead-close",
+            "worktree-move",
+            "worktree-remove",
+            "local-branch-delete",
+        }
+        expected_mutation_boundaries = {
+            (side, mutation)
+            for side in ("mutation-before", "mutation-after")
+            for mutation in happy_mutations | {"remote-branch-delete"}
+        }
+        self.assertEqual(
+            set(mutation_phases),
+            happy_mutations | {"remote-branch-delete"},
+        )
+        self.assertEqual(
+            {
+                (boundary_type, target)
+                for boundary_type, _, target in boundaries
+                if boundary_type.startswith("mutation")
+            },
+            expected_mutation_boundaries,
+        )
+        expected_event_boundaries = {
+            (side, event)
+            for side in ("event-before", "event-after")
+            for event, _ in event_phases
+        } | {("event-after", "run.created")}
+        self.assertEqual(len(event_boundaries), 43)
+        self.assertEqual(len(boundaries), 69)
+        self.assertEqual(
+            {(boundary_type, target) for boundary_type, _, target in event_boundaries},
+            expected_event_boundaries,
+        )
+
+        for index, (boundary_type, phase, target) in enumerate(boundaries):
+            with self.subTest(boundary_type=boundary_type, phase=phase, target=target):
+                state_home = self.temp / f"full-lifecycle-{index}"
+                home = self.temp / f"full-lifecycle-home-{index}"
+                home.mkdir()
+                environment = {
+                    "XDG_STATE_HOME": str(state_home),
+                    "HOME": str(home),
+                }
+                scenario = self._crash_full_lifecycle_at(
+                    boundary_type,
+                    phase,
+                    target,
+                    state_home=state_home,
+                    environment=environment,
+                )
+                run_id = scenario["run_id"]
+                run_dir = scenario["run_dir"]
+                self.assertLess(scenario["crashed"].returncode, 0)
+                store_root = state_home / "afk"
+                before = {
+                    path.relative_to(store_root): path.read_bytes()
+                    for path in store_root.rglob("*")
+                    if path.is_file()
+                }
+                observed = self.run_afk(
+                    "status",
+                    run_id,
+                    "--json",
+                    **environment,
+                    **scenario["observation_environment"],
+                )
+                self.assertIn(observed.returncode, {0, 2}, observed.stderr)
+                self.assertEqual(json.loads(observed.stdout)["run_id"], run_id)
+                after = {
+                    path.relative_to(store_root): path.read_bytes()
+                    for path in store_root.rglob("*")
+                    if path.is_file()
+                }
+                self.assertEqual(after, before)
+
+                saw_attention = False
+                for _ in range(12):
+                    projection = RunStore(store_root).status(run_id)
+                    if projection["state"] == "completed":
+                        break
+                    resumed = self.run_afk(
+                        "resume",
+                        **environment,
+                        **scenario["recovery_environment"],
+                    )
+                    if resumed.returncode == 2:
+                        paused = RunStore(store_root).status(run_id)
+                        self.assertEqual(paused["state"], "attention_required")
+                        saw_attention = True
+                    else:
+                        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+
+                projection = RunStore(store_root).status(run_id)
+                self.assertEqual(projection["state"], "completed")
+                if scenario["expects_attention"]:
+                    self.assertTrue(saw_attention)
+                self.assert_exact_terminal_completion(
+                    run_id,
+                    state_home=state_home,
+                    environment=environment,
+                )
+                event_names = [
+                    json.loads(line)["event"]
+                    for line in (run_dir / "events.jsonl")
+                    .read_text(encoding="utf-8")
+                    .splitlines()
+                ]
+                self.assertTrue(
+                    all(
+                        event_names.count(event) == 1
+                        for event in unique_terminal_events
+                    )
+                )
+                self.assertEqual(
+                    event_names.count("worker.terminal"),
+                    int(scenario["expects_worker_terminal"]),
+                )
+                mutations = [
+                    json.loads(line)["mutation"]
+                    for line in (state_home / "fake-mutations.jsonl")
+                    .read_text(encoding="utf-8")
+                    .splitlines()
+                ]
+                expected_mutations = happy_mutations | (
+                    {"remote-branch-delete"}
+                    if scenario["includes_remote_cleanup"]
+                    else set()
+                )
+                self.assertEqual(set(mutations), expected_mutations)
+                self.assertTrue(
+                    all(
+                        mutations.count(mutation) == 1
+                        for mutation in expected_mutations
+                    )
+                )
+                events_before = (run_dir / "events.jsonl").read_bytes()
+                self.assertEqual(
+                    self.run_afk("resume", run_id, **environment).returncode, 0
+                )
+                self.assertEqual(
+                    self.run_afk("resume", run_id, **environment).returncode, 0
+                )
+                self.assertEqual((run_dir / "events.jsonl").read_bytes(), events_before)
+                rejected = self.run_afk("resume", "--force", **environment)
+                self.assertEqual(rejected.returncode, 2)
 
     def test_start_launches_numbered_transient_worker_and_reports_checkpoint(self):
         completed = self.run_afk("start", "central-bnkl.1.1")
@@ -712,28 +1176,6 @@ class StartCliTest(unittest.TestCase):
         self.assert_launch_effect(store, run_id, "confirmed")
         self.assertEqual(self.mutation_count("worker-launch"), 2)
 
-    def test_resume_pauses_after_worker_launch_confirmation_was_written(self):
-        started = self.run_afk("start", "central-bnkl.1.1")
-        run_id = started.stdout.strip()
-        store = RunStore(self.state_home / "afk")
-        unit = f"afk-{run_id}-worker-1"
-
-        interrupted = self.run_afk(
-            "_worker",
-            run_id,
-            AFK_TEST_KILL_AFTER_CONFIRM="worker-launch-1",
-        )
-
-        self.assertLess(interrupted.returncode, 0)
-        self.assert_launch_effect(store, run_id, "confirmed")
-        self.assert_launch_event(run_id, "worker.launched", 0, unit)
-        resumed = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="absent")
-        repeated = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="absent")
-        self.assertEqual(resumed.returncode, 2, resumed.stderr)
-        self.assertEqual(repeated.returncode, 2, repeated.stderr)
-        self.assertEqual(store.status(run_id)["attention"]["kind"], "inconclusive")
-        self.assertEqual(self.mutation_count("worker-launch"), 1)
-
     def test_resume_recovers_crash_before_worker_launch_retried_event(self):
         interrupted_start = self.run_afk(
             "start",
@@ -791,27 +1233,154 @@ class StartCliTest(unittest.TestCase):
         self.assert_launch_event(run_id, "worker.launch_reconciled", 1, unit)
         self.assertEqual(self.mutation_count("worker-launch"), 1)
 
-    def test_resume_pauses_after_crash_before_worker_launched_event(self):
-        started = self.run_afk("start", "central-bnkl.1.1")
-        run_id = started.stdout.strip()
-        store = RunStore(self.state_home / "afk")
-        unit = f"afk-{run_id}-worker-1"
-
-        interrupted = self.run_afk(
-            "_worker",
-            run_id,
-            AFK_TEST_KILL_BEFORE_EVENT="worker.launched",
+    def test_resume_reconstructs_exact_confirmed_worker_launch(self):
+        crash_windows = (
+            ("after-confirmation", "AFK_TEST_KILL_AFTER_CONFIRM", "worker-launch-1"),
+            ("before-event", "AFK_TEST_KILL_BEFORE_EVENT", "worker.launched"),
         )
+        for name, injection, target in crash_windows:
+            with self.subTest(name=name):
+                state_home = self.temp / f"state-{name}"
+                environment = {"XDG_STATE_HOME": str(state_home)}
+                started = self.run_afk(
+                    "start",
+                    "central-bnkl.1.1",
+                    **environment,
+                )
+                run_id = started.stdout.strip()
+                store = RunStore(state_home / "afk")
+                unit = f"afk-{run_id}-worker-1"
 
-        self.assertLess(interrupted.returncode, 0)
-        self.assert_launch_effect(store, run_id, "confirmed")
-        self.assert_launch_event(run_id, "worker.launched", 0, unit)
-        resumed = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="absent")
-        repeated = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="absent")
-        self.assertEqual(resumed.returncode, 2, resumed.stderr)
-        self.assertEqual(repeated.returncode, 2, repeated.stderr)
-        self.assertEqual(store.status(run_id)["attention"]["kind"], "inconclusive")
-        self.assertEqual(self.mutation_count("worker-launch"), 1)
+                interrupted = self.run_afk(
+                    "_worker",
+                    run_id,
+                    **environment,
+                    **{injection: target},
+                )
+
+                self.assertLess(interrupted.returncode, 0)
+                self.assert_launch_effect(store, run_id, "confirmed")
+                self.assertEqual(
+                    self.launch_events(
+                        run_id,
+                        "worker.launched",
+                        state_home=state_home,
+                    ),
+                    [],
+                )
+                resumed = self.run_afk(
+                    "resume",
+                    **environment,
+                    AFK_FAKE_SYSTEMD_STATE="absent",
+                )
+                self.assertEqual(resumed.returncode, 0, resumed.stderr)
+                launched = self.launch_events(
+                    run_id,
+                    "worker.launched",
+                    state_home=state_home,
+                )
+                self.assertEqual(len(launched), 1)
+                self.assertEqual(launched[0]["data"]["unit"], unit)
+
+                progressed = self.run_afk(
+                    "resume",
+                    **environment,
+                    AFK_FAKE_SYSTEMD_STATE="absent",
+                )
+                self.assertEqual(progressed.returncode, 0, progressed.stderr)
+                self.assert_bead_claim(store, run_id)
+
+                repeated = self.run_afk(
+                    "resume",
+                    **environment,
+                    AFK_FAKE_SYSTEMD_STATE="absent",
+                )
+
+                self.assertEqual(repeated.returncode, 0, repeated.stderr)
+                self.assertEqual(
+                    len(
+                        self.launch_events(
+                            run_id,
+                            "worker.launched",
+                            state_home=state_home,
+                        )
+                    ),
+                    1,
+                )
+                self.assertEqual(
+                    self.mutation_count("worker-launch", state_home=state_home),
+                    1,
+                )
+                self.assertEqual(
+                    self.mutation_count("bead-claim", state_home=state_home),
+                    1,
+                )
+
+    def test_resume_refuses_unproven_confirmed_worker_launch_identity(self):
+        for name, observed in (
+            ("conflicting", {"unit": "afk-other-worker-1"}),
+            ("missing", {}),
+        ):
+            with self.subTest(name=name):
+                state_home = self.temp / f"state-{name}"
+                environment = {"XDG_STATE_HOME": str(state_home)}
+                started = self.run_afk(
+                    "start",
+                    "central-bnkl.1.1",
+                    **environment,
+                )
+                run_id = started.stdout.strip()
+                store = RunStore(state_home / "afk")
+                interrupted = self.run_afk(
+                    "_worker",
+                    run_id,
+                    **environment,
+                    AFK_TEST_KILL_BEFORE_EVENT="worker.launched",
+                )
+                self.assertLess(interrupted.returncode, 0)
+                effect_path = (
+                    state_home
+                    / "afk"
+                    / "runs"
+                    / run_id
+                    / "effects"
+                    / "worker-launch-1.json"
+                )
+                effect = json.loads(effect_path.read_text(encoding="utf-8"))
+                effect["observed"] = observed
+                effect_path.write_text(
+                    json.dumps(effect) + "\n",
+                    encoding="utf-8",
+                )
+
+                resumed = self.run_afk(
+                    "resume",
+                    **environment,
+                    AFK_FAKE_SYSTEMD_STATE="absent",
+                )
+
+                self.assertEqual(resumed.returncode, 2)
+                self.assertIn(
+                    "Effect observation conflict: worker-launch-1",
+                    resumed.stderr,
+                )
+                self.assertEqual(
+                    self.launch_events(
+                        run_id,
+                        "worker.launched",
+                        state_home=state_home,
+                    ),
+                    [],
+                )
+                self.assertIsNone(store.effect_if_present(run_id, "bead-claim"))
+                self.assertEqual(
+                    self.mutation_count("worker-launch", state_home=state_home),
+                    1,
+                )
+                self.assertEqual(
+                    self.mutation_count("bead-claim", state_home=state_home),
+                    0,
+                )
 
     def test_resume_recovers_after_worker_launched_event_write(self):
         started = self.run_afk("start", "central-bnkl.1.1")
@@ -894,6 +1463,9 @@ class StartCliTest(unittest.TestCase):
         self.assertEqual(store.effect(run_id, "worker-launch-1")["status"], "confirmed")
         repeated = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="absent")
         self.assertEqual(repeated.returncode, 2, repeated.stderr)
+        attention = store.status(run_id)["attention"]
+        self.assertEqual(attention["kind"], "inconclusive")
+        self.assertIn("collected without a terminal observation", attention["summary"])
         self.assertEqual(self.mutation_count("worker-launch"), 2)
 
     def test_resume_recovers_crash_before_worker_reconciled_state_append(self):
@@ -6433,22 +7005,7 @@ class StartCliTest(unittest.TestCase):
         )
 
     def test_resume_confirms_launch_that_succeeded_before_effect_confirmation(self):
-        store = RunStore(self.state_home / "afk")
-        projection = store.create_run(
-            bead_id="central-bnkl.1.1",
-            repository="thunderbump/beads-webui",
-            base_branch="main",
-            base_sha=BASE_SHA,
-            start_request={"repository_root": str(self.project)},
-            run_id="crashed-run",
-        )
-        self.assertEqual(projection["state"], "created")
-        store.prepare_effect(
-            "crashed-run",
-            "worker-launch-1",
-            kind="worker-launch",
-            intended={"unit": "afk-crashed-run-worker-1"},
-        )
+        store, _ = self.create_worker_launch_run()
 
         resumed = self.run_afk("resume")
 
@@ -6459,22 +7016,69 @@ class StartCliTest(unittest.TestCase):
         self.assertEqual(status["unit"], "afk-crashed-run-worker-1")
 
     def create_resume_preflight_run(self):
-        store = RunStore(self.state_home / "afk")
+        return self.create_worker_launch_run()
+
+    def create_worker_launch_run(self, *, run_id="crashed-run", state_home=None):
+        selected_state_home = state_home or self.state_home
+        store = RunStore(selected_state_home / "afk")
+        common_dir = selected_state_home / "fake-git"
+        common_dir.mkdir(parents=True, exist_ok=True)
+        metadata = common_dir.stat()
+        bead = {
+            "id": "central-bnkl.1.1",
+            "title": "Create the first slice",
+            "description": "Implement one candidate.",
+            "acceptance_criteria": "Candidate is committed.",
+            "status": "open",
+            "close_reason": "",
+            "assignee": "",
+            "labels": ["project:beads-webui"],
+            "comments": [],
+        }
+        validation_contract = {
+            "source": "pinned_base",
+            "base_sha": BASE_SHA,
+            "blob_sha": "c" * 40,
+        }
         store.create_run(
             bead_id="central-bnkl.1.1",
             repository="thunderbump/beads-webui",
             base_branch="main",
             base_sha=BASE_SHA,
-            start_request={"repository_root": str(self.project)},
-            run_id="crashed-run",
+            start_request={
+                "repository_root": str(self.project),
+                "repository_common_dir": str(common_dir),
+                "repository_common_dir_identity": {
+                    "device": metadata.st_dev,
+                    "inode": metadata.st_ino,
+                },
+                "beads_workspace": str(self.temp / "beads"),
+                "claimant": "bump",
+                "lingering": "enabled",
+                "validation_contract": validation_contract,
+                "bead_spec_identity": bead_spec_identity(bead),
+            },
+            run_id=run_id,
         )
+        persist_bead_spec(store, run_id, bead)
+        unit = f"afk-{run_id}-worker-1"
         store.prepare_effect(
-            "crashed-run",
+            run_id,
             "worker-launch-1",
             kind="worker-launch",
-            intended={"unit": "afk-crashed-run-worker-1"},
+            intended={"unit": unit},
         )
-        return store, self.state_home / "afk" / "runs" / "crashed-run"
+        store.append_event(
+            run_id,
+            "worker.launch_prepared",
+            data={
+                "unit": unit,
+                "checkpoint": "created",
+                "lingering": "enabled",
+                "validation_contract": validation_contract,
+            },
+        )
+        return store, selected_state_home / "afk" / "runs" / run_id
 
     def assert_resume_preflight_rejected(self, message):
         resumed = self.run_afk("resume")
@@ -6493,18 +7097,22 @@ class StartCliTest(unittest.TestCase):
     def test_resume_rejects_invalid_event_schema_before_external_commands(self):
         _, run_dir = self.create_resume_preflight_run()
         events_path = run_dir / "events.jsonl"
-        event = json.loads(events_path.read_text(encoding="utf-8"))
+        events = events_path.read_text(encoding="utf-8").splitlines()
+        event = json.loads(events[0])
         event["data"] = []
-        events_path.write_text(json.dumps(event) + "\n", encoding="utf-8")
+        events[0] = json.dumps(event)
+        events_path.write_text("\n".join(events) + "\n", encoding="utf-8")
 
         self.assert_resume_preflight_rejected("Event History record 1 is invalid")
 
     def test_resume_rejects_wrong_event_version_before_external_commands(self):
         _, run_dir = self.create_resume_preflight_run()
         events_path = run_dir / "events.jsonl"
-        event = json.loads(events_path.read_text(encoding="utf-8"))
+        events = events_path.read_text(encoding="utf-8").splitlines()
+        event = json.loads(events[0])
         event["schema_version"] = 2
-        events_path.write_text(json.dumps(event) + "\n", encoding="utf-8")
+        events[0] = json.dumps(event)
+        events_path.write_text("\n".join(events) + "\n", encoding="utf-8")
 
         self.assert_resume_preflight_rejected("Event History record 1 is invalid")
 
@@ -6586,7 +7194,11 @@ class StartCliTest(unittest.TestCase):
         self.assertEqual(second.returncode, 2)
         self.assertFalse(self.command_log.exists())
         for root in ("attempts", "gates", "retrospective"):
-            self.assertEqual(list((run_dir / root).iterdir()), [])
+            expected = ["start-bead-spec"] if root == "attempts" else []
+            self.assertEqual(
+                sorted(path.name for path in (run_dir / root).iterdir()),
+                expected,
+            )
         status = store.status("crashed-run")
         self.assertEqual(status["attention"]["kind"], "invalid")
         self.assertIn(
@@ -6756,7 +7368,11 @@ class StartCliTest(unittest.TestCase):
         self.assertEqual(second.returncode, 2)
         self.assertFalse(self.command_log.exists())
         for root in ("attempts", "gates", "retrospective"):
-            self.assertEqual(list((run_dir / root).iterdir()), [])
+            expected = ["start-bead-spec"] if root == "attempts" else []
+            self.assertEqual(
+                sorted(path.name for path in (run_dir / root).iterdir()),
+                expected,
+            )
         status = store.status("crashed-run")
         self.assertEqual(status["attention"]["kind"], "invalid")
         self.assertIn(
@@ -7317,7 +7933,7 @@ class StartCliTest(unittest.TestCase):
         self.assertEqual(completed.returncode, 2, completed.stderr)
         self.assertEqual(
             completed.stdout,
-            "crashed-run created bead=central-bnkl.1.1 sequence=1 "
+            "crashed-run created bead=central-bnkl.1.1 sequence=3 "
             "checkpoint=created unit=afk-crashed-run-worker-1 "
             "unit_status=interrupted load_state=not-found "
             "active_state=inactive\n"
@@ -8998,24 +9614,10 @@ class StartCliTest(unittest.TestCase):
                 )
                 self.assertEqual(status["validation"]["status"], "passed")
 
-    def test_resume_requires_attention_for_confirmed_collected_worker_without_terminal(
+    def test_resume_recovers_confirmed_worker_at_prepared_seam(
         self,
     ):
-        store = RunStore(self.state_home / "afk")
-        store.create_run(
-            bead_id="central-bnkl.1.1",
-            repository="thunderbump/beads-webui",
-            base_branch="main",
-            base_sha=BASE_SHA,
-            start_request={"repository_root": str(self.project)},
-            run_id="missing-terminal-run",
-        )
-        store.prepare_effect(
-            "missing-terminal-run",
-            "worker-launch-1",
-            kind="worker-launch",
-            intended={"unit": "afk-missing-terminal-run-worker-1"},
-        )
+        store, _ = self.create_worker_launch_run(run_id="missing-terminal-run")
         store.confirm_effect(
             "missing-terminal-run",
             "worker-launch-1",
@@ -9024,30 +9626,16 @@ class StartCliTest(unittest.TestCase):
 
         resumed = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="absent")
 
-        self.assertEqual(resumed.returncode, 2)
+        self.assertEqual(resumed.returncode, 0)
         status = store.status("missing-terminal-run")
-        self.assertEqual(status["state"], "attention_required")
-        self.assertEqual(status["attention"]["kind"], "inconclusive")
+        self.assertEqual(status["state"], "created")
+        self.assertEqual(status["last_event"], "worker.launched")
         commands = self.command_log.read_text(encoding="utf-8")
         self.assertIn('"command":"systemctl"', commands)
         self.assertNotIn('"command":"systemd-run"', commands)
 
     def test_resume_leaves_confirmed_active_worker_running(self):
-        store = RunStore(self.state_home / "afk")
-        store.create_run(
-            bead_id="central-bnkl.1.1",
-            repository="thunderbump/beads-webui",
-            base_branch="main",
-            base_sha=BASE_SHA,
-            start_request={"repository_root": str(self.project)},
-            run_id="active-worker-run",
-        )
-        store.prepare_effect(
-            "active-worker-run",
-            "worker-launch-1",
-            kind="worker-launch",
-            intended={"unit": "afk-active-worker-run-worker-1"},
-        )
+        store, _ = self.create_worker_launch_run(run_id="active-worker-run")
         store.confirm_effect(
             "active-worker-run",
             "worker-launch-1",
@@ -9063,21 +9651,7 @@ class StartCliTest(unittest.TestCase):
         self.assertNotIn('"command":"systemd-run"', commands)
 
     def test_resume_does_not_confirm_an_activating_unit(self):
-        store = RunStore(self.state_home / "afk")
-        store.create_run(
-            bead_id="central-bnkl.1.1",
-            repository="thunderbump/beads-webui",
-            base_branch="main",
-            base_sha=BASE_SHA,
-            start_request={"repository_root": str(self.project)},
-            run_id="crashed-run",
-        )
-        store.prepare_effect(
-            "crashed-run",
-            "worker-launch-1",
-            kind="worker-launch",
-            intended={"unit": "afk-crashed-run-worker-1"},
-        )
+        store, _ = self.create_worker_launch_run()
 
         resumed = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="activating")
 
@@ -9089,21 +9663,7 @@ class StartCliTest(unittest.TestCase):
         self.assertEqual(status["state"], "attention_required")
 
     def test_resume_retries_a_proven_absent_unit(self):
-        store = RunStore(self.state_home / "afk")
-        store.create_run(
-            bead_id="central-bnkl.1.1",
-            repository="thunderbump/beads-webui",
-            base_branch="main",
-            base_sha=BASE_SHA,
-            start_request={"repository_root": str(self.project)},
-            run_id="crashed-run",
-        )
-        store.prepare_effect(
-            "crashed-run",
-            "worker-launch-1",
-            kind="worker-launch",
-            intended={"unit": "afk-crashed-run-worker-1"},
-        )
+        store, _ = self.create_worker_launch_run()
 
         resumed = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="absent")
 
@@ -9123,20 +9683,8 @@ class StartCliTest(unittest.TestCase):
         for unit_state in ("inactive", "ambiguous", "failure"):
             with self.subTest(unit_state=unit_state):
                 state_home = self.temp / f"state-{unit_state}"
-                store = RunStore(state_home / "afk")
-                store.create_run(
-                    bead_id="central-bnkl.1.1",
-                    repository="thunderbump/beads-webui",
-                    base_branch="main",
-                    base_sha=BASE_SHA,
-                    start_request={"repository_root": str(self.project)},
-                    run_id="crashed-run",
-                )
-                store.prepare_effect(
-                    "crashed-run",
-                    "worker-launch-1",
-                    kind="worker-launch",
-                    intended={"unit": "afk-crashed-run-worker-1"},
+                store, _ = self.create_worker_launch_run(
+                    state_home=state_home,
                 )
 
                 resumed = self.run_afk(
