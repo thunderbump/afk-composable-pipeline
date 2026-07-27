@@ -15,6 +15,8 @@ from afk.run_store import EvidenceError, RunStore, RunStoreError
 
 
 MAX_RUN_SUMMARY_BYTES = 64 * 1024
+RUN_SUMMARY_SCHEMA_VERSION = 2
+RUN_SUMMARY_EVIDENCE_PREFIX = "retrospective/run-summary-v2-"
 MAX_EVENTS = 64
 MAX_EFFECTS = ARTIFACT_INVENTORY_LIMIT
 MAX_EVIDENCE_UNITS = ARTIFACT_INVENTORY_LIMIT
@@ -53,7 +55,7 @@ def build_run_summary(store: RunStore, run_id: str, *, episode_sequence: int) ->
     """Return bounded canonical JSON for one retrospective episode."""
     event = store.event(run_id, episode_sequence)
     _validate_episode(event, episode_sequence)
-    summary_evidence = f"retrospective/run-summary-{episode_sequence:020d}"
+    summary_evidence = f"{RUN_SUMMARY_EVIDENCE_PREFIX}{episode_sequence:020d}"
     snapshot = store.read_run_snapshot(run_id, through_sequence=episode_sequence)
     identity = snapshot["identity"]
     projection = snapshot["projection"]
@@ -89,7 +91,7 @@ def build_run_summary(store: RunStore, run_id: str, *, episode_sequence: int) ->
 
     summary = redact_artifact_value(
         {
-            "schema_version": 1,
+            "schema_version": RUN_SUMMARY_SCHEMA_VERSION,
             "run": {
                 "run_id": _bounded_text(identity["run_id"]),
                 "bead_id": _bounded_text(identity["bead_id"]),
@@ -135,6 +137,7 @@ def build_run_summary(store: RunStore, run_id: str, *, episode_sequence: int) ->
             "omitted": omitted,
         }
     )
+    summary["citation_manifest"] = citation_manifest(summary)
     _fit_summary(summary)
     rendered = canonical_json(summary)
     if len(rendered.encode("utf-8")) > MAX_RUN_SUMMARY_BYTES:
@@ -216,6 +219,24 @@ def _validate_cached_summary(
     if rendered != expected_rendered:
         raise RunStoreError("Run Summary does not match durable facts")
     return rendered
+
+
+def citation_manifest(summary: dict[str, Any]) -> dict[str, dict[str, str]]:
+    manifest = {
+        "effects.json": {"kind": "json", "summary_pointer": "/effects"},
+        "episode.json": {"kind": "json", "summary_pointer": "/episode"},
+        "events.jsonl": {"kind": "event", "summary_pointer": "/events"},
+        "evidence.json": {"kind": "json", "summary_pointer": "/evidence"},
+        "omitted.json": {"kind": "json", "summary_pointer": "/omitted"},
+        "projection.json": {"kind": "json", "summary_pointer": "/projection"},
+        "run.json": {"kind": "json", "summary_pointer": "/run"},
+    }
+    if isinstance(summary["episode"].get("checkpoint"), str):
+        manifest["episode-checkpoint.txt"] = {
+            "kind": "text",
+            "summary_pointer": "/episode/checkpoint",
+        }
+    return manifest
 
 
 def _bounded_value(value: Any, *, depth: int = 0) -> Any:
