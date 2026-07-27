@@ -788,6 +788,8 @@ class RunStore:
 
     def _read_effects(self, run_id: str) -> list[dict[str, Any]]:
         effects_directory = self._run_dir(run_id) / "effects"
+        if effects_directory.is_symlink() or not effects_directory.is_dir():
+            raise EventHistoryCorrupt("Effect directory is invalid")
         records = []
         for path in sorted(effects_directory.iterdir(), key=lambda item: item.name):
             if (

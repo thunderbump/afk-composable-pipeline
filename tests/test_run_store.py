@@ -25,6 +25,7 @@ from afk.run_store import (  # noqa: E402
     EvidenceError,
     EvidenceTampered,
     EvidenceTooLarge,
+    EventHistoryCorrupt,
     RunNotFound,
     RunStore,
     RunStoreBusy,
@@ -257,6 +258,35 @@ class RunStoreTest(unittest.TestCase):
             RunStoreError, "Effect is missing or invalid: worker-launch-1"
         ):
             self.store.effect_if_present("run-001", "worker-launch-1")
+
+    def test_terminal_inventory_rejects_a_symlinked_effects_directory(self):
+        self.create_run()
+        external = self.state_home / "external-effects"
+        external.mkdir()
+        (external / "external-effect.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "effect_id": "external-effect",
+                    "kind": "worker-launch",
+                    "status": "prepared",
+                    "intended": {},
+                }
+            ),
+            encoding="utf-8",
+        )
+        effects = self.root / "runs" / "run-001" / "effects"
+        effects.rmdir()
+        effects.symlink_to(external, target_is_directory=True)
+
+        with self.assertRaisesRegex(EventHistoryCorrupt, "Effect directory is invalid"):
+            self.store.append_event(
+                "run-001",
+                "run.attention_required",
+                state="attention_required",
+            )
+        with self.assertRaisesRegex(RunStoreError, "has no sequence 2"):
+            self.store.event("run-001", 2)
 
     def test_completed_evidence_is_redacted_manifested_read_only_and_verified(self):
         self.create_run()
