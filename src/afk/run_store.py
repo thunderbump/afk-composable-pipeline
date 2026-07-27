@@ -1027,6 +1027,8 @@ class RunStore:
         return events
 
     def _evidence_path(self, run_id: str, relative: str) -> Path:
+        if not isinstance(relative, str) or redact_text(relative) != relative:
+            raise EvidenceError("evidence path must not contain secret-shaped text")
         parts = Path(relative).parts
         if (
             not parts

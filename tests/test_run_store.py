@@ -312,6 +312,54 @@ class RunStoreTest(unittest.TestCase):
         with self.assertRaises(EvidenceTampered):
             self.store.verify_evidence("run-001", "attempts/attempt-1")
 
+    def test_evidence_locators_must_remain_unchanged_at_the_redaction_boundary(self):
+        self.create_run()
+        unsafe_unit = "attempts/token=supersecret"
+
+        with self.assertRaisesRegex(
+            EvidenceError, "evidence path must not contain secret-shaped text"
+        ):
+            self.store.write_evidence_text(
+                "run-001",
+                f"{unsafe_unit}/stdout.txt",
+                "safe output\n",
+            )
+        self.assertFalse((self.root / "runs" / "run-001" / unsafe_unit).exists())
+
+        unsafe_directory = self.root / "runs" / "run-001" / unsafe_unit
+        unsafe_directory.mkdir(parents=True)
+        (unsafe_directory / "stdout.txt").write_text("safe output\n", encoding="utf-8")
+        with self.assertRaisesRegex(
+            EvidenceError, "evidence path must not contain secret-shaped text"
+        ):
+            self.store.seal_evidence("run-001", unsafe_unit)
+
+        safe_unit = "attempts/auth-failure"
+        self.store.write_evidence_text(
+            "run-001",
+            f"{safe_unit}/stdout.txt",
+            "authorization failed: missing credential\n",
+        )
+        self.store.write_evidence_text(
+            "run-001",
+            f"{safe_unit}/stderr.txt",
+            "request was unauthorized\n",
+        )
+        self.store.seal_evidence("run-001", safe_unit)
+        self.store.append_event(
+            "run-001",
+            "run.attention_required",
+            state="attention_required",
+            data={"checkpoint": "created"},
+        )
+
+        episode = self.store.event("run-001", 2)
+        inventory = episode["data"]["_retrospective_inventory"]
+        self.assertEqual(
+            [record["unit"] for record in inventory["evidence"]],
+            [safe_unit],
+        )
+
     def test_evidence_ingestion_redacts_before_writing_to_the_run_store(self):
         self.create_run()
         source_path = self.state_home / "worker-output.txt"
