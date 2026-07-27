@@ -115,6 +115,7 @@ def main(
         try:
             projection = store.status(args.run_id)
             observation = None
+            observation_error = None
             if (
                 "worker_exit_code" not in projection
                 and projection["state"] != "completed"
@@ -125,8 +126,17 @@ def main(
                     else store.active_run_id()
                 )
                 if active_run_id == projection["run_id"]:
-                    observation = observe_worker_unit(projection["run_id"])
+                    try:
+                        observation = observe_worker_unit(projection["run_id"])
+                    except StartError as exc:
+                        observation_error = exc
                 projection = store.status(projection["run_id"])
+                if (
+                    observation_error is not None
+                    and "worker_exit_code" not in projection
+                    and projection["state"] != "completed"
+                ):
+                    raise observation_error
             output = dict(projection)
             if projection["state"] == "attention_required":
                 output["recommended_resume"] = ["afk", "resume"]

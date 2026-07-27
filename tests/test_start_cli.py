@@ -7131,6 +7131,39 @@ class StartCliTest(unittest.TestCase):
         )
         self.assertNotIn("recommended_resume", status)
 
+    def test_unnamed_status_prefers_completion_over_unit_command_failure(self):
+        self.create_resume_preflight_run()
+
+        completed = self.run_afk(
+            "status",
+            "--json",
+            AFK_FAKE_SYSTEMD_STATE="failure",
+            AFK_FAKE_TERMINAL_DURING_SYSTEMCTL="completed",
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        status = json.loads(completed.stdout)
+        self.assertEqual(status["last_event"], "run.completed")
+        self.assertEqual(status["unit_observation"]["status"], "terminal")
+        self.assertNotIn("recommended_resume", status)
+
+    def test_named_status_prefers_terminal_over_malformed_unit_output(self):
+        self.create_resume_preflight_run()
+
+        completed = self.run_afk(
+            "status",
+            "crashed-run",
+            "--json",
+            AFK_FAKE_SYSTEMD_STATE="ambiguous",
+            AFK_FAKE_TERMINAL_DURING_SYSTEMCTL="terminal",
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        status = json.loads(completed.stdout)
+        self.assertEqual(status["last_event"], "worker.terminal")
+        self.assertEqual(status["unit_observation"]["status"], "terminal")
+        self.assertNotIn("recommended_resume", status)
+
     def test_json_status_recommends_resume_for_durable_attention(self):
         store = RunStore(self.state_home / "afk")
         store.create_run(
