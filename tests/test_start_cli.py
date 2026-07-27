@@ -473,7 +473,8 @@ class StartCliTest(unittest.TestCase):
         self.assertEqual(
             readable.stdout,
             f"{run_id} created bead=central-bnkl.1.1 sequence=3 "
-            f"checkpoint=created unit=afk-{run_id}-worker-1\n",
+            f"checkpoint=created unit=afk-{run_id}-worker-1 "
+            "unit_status=running load_state=loaded active_state=active\n",
         )
         effect = json.loads(
             (
@@ -2766,6 +2767,7 @@ class StartCliTest(unittest.TestCase):
         resumed = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="absent")
 
         self.assertEqual(resumed.returncode, 2, resumed.stderr)
+        self.assertEqual(self.command_log.read_text(encoding="utf-8"), commands_before)
         projection = json.loads(self.run_afk("status", run_id, "--json").stdout)
         self.assertEqual(projection["checkpoint"], "worktree_ready")
         self.assertEqual(projection["attention"]["scope"], "candidate")
@@ -2774,7 +2776,6 @@ class StartCliTest(unittest.TestCase):
             "implementation attempt lifecycle is invalid",
             projection["attention"]["summary"],
         )
-        self.assertEqual(self.command_log.read_text(encoding="utf-8"), commands_before)
 
     def test_worker_claims_publishes_validates_and_reviews_the_exact_candidate(self):
         started = self.run_afk("start", "central-bnkl.1.1")
@@ -5790,10 +5791,10 @@ class StartCliTest(unittest.TestCase):
         resumed = self.run_afk("resume")
 
         self.assertEqual(resumed.returncode, 2, resumed.stderr)
+        self.assertEqual(self.command_log.read_text(encoding="utf-8"), commands_before)
         status = json.loads(self.run_afk("status", run_id, "--json").stdout)
         self.assertEqual(status["attention"]["scope"], "publication")
         self.assertEqual(status["attention"]["kind"], "invalid")
-        self.assertEqual(self.command_log.read_text(encoding="utf-8"), commands_before)
 
     def test_resume_rejects_missing_projected_validation_manifest_digest(self):
         self.assert_projected_digest_rejected("validation", missing=True)
@@ -5823,9 +5824,9 @@ class StartCliTest(unittest.TestCase):
         resumed = self.run_afk("resume")
 
         self.assertEqual(resumed.returncode, 2, resumed.stderr)
+        self.assertEqual(self.command_log.read_text(encoding="utf-8"), commands_before)
         status = json.loads(self.run_afk("status", run_id, "--json").stdout)
         self.assertEqual(status["attention"]["kind"], "invalid")
-        self.assertEqual(self.command_log.read_text(encoding="utf-8"), commands_before)
 
     def test_resume_pauses_before_mutation_when_projected_validation_is_tampered(self):
         run_id = self.start_reviewed_run()
@@ -7074,8 +7075,199 @@ class StartCliTest(unittest.TestCase):
             completed.stdout,
             "terminal-run created bead=central-bnkl.1.1 sequence=2 "
             "checkpoint=created unit=afk-terminal-run-worker-1 "
-            "worker_exit_code=2 worker_result=attention_required\n",
+            "worker_exit_code=2 worker_result=attention_required "
+            "unit_status=terminal\n",
         )
+        self.assertFalse(self.command_log.exists())
+
+    def test_json_status_recommends_resume_for_durable_attention(self):
+        store = RunStore(self.state_home / "afk")
+        store.create_run(
+            bead_id="central-bnkl.1.1",
+            repository="thunderbump/beads-webui",
+            base_branch="main",
+            base_sha=BASE_SHA,
+            run_id="attention-run",
+        )
+        store.append_event(
+            "attention-run",
+            "run.attention_required",
+            state="attention_required",
+            data={"checkpoint": "created", "attention": {"scope": "worker"}},
+        )
+        store.append_event(
+            "attention-run",
+            "worker.terminal",
+            data={
+                "checkpoint": "created",
+                "unit": "afk-attention-run-worker-1",
+                "worker_exit_code": 2,
+                "worker_result": "attention_required",
+            },
+        )
+
+        completed = self.run_afk("status", "--json")
+
+        self.assertEqual(completed.returncode, 2, completed.stderr)
+        status = json.loads(completed.stdout)
+        self.assertEqual(status["state"], "attention_required")
+        self.assertEqual(status["unit_observation"]["status"], "terminal")
+        self.assertEqual(status["recommended_resume"], ["afk", "resume"])
+        self.assertFalse(self.command_log.exists())
+
+    def test_json_status_reports_a_running_active_unit_without_writing(self):
+        self.create_resume_preflight_run()
+        store_root = self.state_home / "afk"
+        before = {
+            path.relative_to(store_root): path.read_bytes()
+            for path in store_root.rglob("*")
+            if path.is_file()
+        }
+
+        completed = self.run_afk("status", "--json")
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        status = json.loads(completed.stdout)
+        self.assertEqual(
+            status["unit_observation"],
+            {
+                "active_state": "active",
+                "load_state": "loaded",
+                "status": "running",
+                "unit": "afk-crashed-run-worker-1",
+            },
+        )
+        self.assertNotIn("recommended_resume", status)
+        after = {
+            path.relative_to(store_root): path.read_bytes()
+            for path in store_root.rglob("*")
+            if path.is_file()
+        }
+        self.assertEqual(after, before)
+
+    def test_json_status_reports_inactive_active_unit_without_writing(self):
+        self.create_resume_preflight_run()
+        store_root = self.state_home / "afk"
+        before = {
+            path.relative_to(store_root): path.read_bytes()
+            for path in store_root.rglob("*")
+            if path.is_file()
+        }
+
+        for unit_state, load_state, active_state in (
+            ("absent", "not-found", "inactive"),
+            ("failed", "loaded", "failed"),
+        ):
+            with self.subTest(unit_state=unit_state):
+                completed = self.run_afk(
+                    "status",
+                    "--json",
+                    AFK_FAKE_SYSTEMD_STATE=unit_state,
+                )
+
+                self.assertEqual(completed.returncode, 2, completed.stderr)
+                status = json.loads(completed.stdout)
+                self.assertEqual(
+                    status["unit_observation"],
+                    {
+                        "active_state": active_state,
+                        "load_state": load_state,
+                        "status": "interrupted",
+                        "unit": "afk-crashed-run-worker-1",
+                    },
+                )
+                self.assertEqual(status["recommended_resume"], ["afk", "resume"])
+        after = {
+            path.relative_to(store_root): path.read_bytes()
+            for path in store_root.rglob("*")
+            if path.is_file()
+        }
+        self.assertEqual(after, before)
+
+    def test_human_status_reports_inactive_active_unit_and_resume(self):
+        self.create_resume_preflight_run()
+
+        completed = self.run_afk("status", AFK_FAKE_SYSTEMD_STATE="absent")
+
+        self.assertEqual(completed.returncode, 2, completed.stderr)
+        self.assertEqual(
+            completed.stdout,
+            "crashed-run created bead=central-bnkl.1.1 sequence=1 "
+            "checkpoint=created unit=afk-crashed-run-worker-1 "
+            "unit_status=interrupted load_state=not-found "
+            "active_state=inactive\n"
+            "recommended_resume=afk resume\n",
+        )
+
+    def test_status_lookup_and_unit_failures_exit_one_without_writing(self):
+        self.create_resume_preflight_run()
+        store_root = self.state_home / "afk"
+        before = {
+            path.relative_to(store_root): path.read_bytes()
+            for path in store_root.rglob("*")
+            if path.is_file()
+        }
+        cases = (
+            ("failure", "systemctl command failed"),
+            ("ambiguous", "systemctl returned an unsupported unit state"),
+        )
+
+        for unit_state, error in cases:
+            with self.subTest(unit_state=unit_state):
+                completed = self.run_afk(
+                    "status",
+                    "--json",
+                    AFK_FAKE_SYSTEMD_STATE=unit_state,
+                )
+                self.assertEqual(completed.returncode, 1)
+                self.assertEqual(completed.stdout, "")
+                self.assertIn(error, completed.stderr)
+
+        after = {
+            path.relative_to(store_root): path.read_bytes()
+            for path in store_root.rglob("*")
+            if path.is_file()
+        }
+        self.assertEqual(after, before)
+
+        missing = self.run_afk(
+            "status",
+            "--json",
+            XDG_STATE_HOME=str(self.temp / "missing-status"),
+        )
+        self.assertEqual(missing.returncode, 1)
+        self.assertEqual(missing.stdout, "")
+        self.assertIn("no Active Run", missing.stderr)
+
+    def test_status_does_not_repair_a_stale_completed_active_pointer(self):
+        store = RunStore(self.state_home / "afk")
+        store.create_run(
+            bead_id="central-bnkl.1.1",
+            repository="thunderbump/beads-webui",
+            base_branch="main",
+            base_sha=BASE_SHA,
+            run_id="completed-run",
+        )
+        store.append_event("completed-run", "run.completed", state="completed")
+        active_path = self.state_home / "afk" / "active.json"
+        active_path.write_text('{"run_id":"completed-run"}\n', encoding="utf-8")
+        store_root = self.state_home / "afk"
+        before = {
+            path.relative_to(store_root): path.read_bytes()
+            for path in store_root.rglob("*")
+            if path.is_file()
+        }
+
+        completed = self.run_afk("status", "--json")
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(json.loads(completed.stdout)["state"], "completed")
+        after = {
+            path.relative_to(store_root): path.read_bytes()
+            for path in store_root.rglob("*")
+            if path.is_file()
+        }
+        self.assertEqual(after, before)
 
     def test_worker_unit_retries_transient_terminal_persistence_failure(self):
         store = RunStore(self.state_home / "afk")
