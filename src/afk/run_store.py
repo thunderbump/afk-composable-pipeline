@@ -17,9 +17,13 @@ from typing import Any, Iterator
 from afk.jsonutil import canonical_json
 from afk.redaction import redact_artifact_value, redact_text
 from afk.retrospective_contract import (
-    ARTIFACT_INVENTORY_LIMIT,
-    TEXT_CHARACTER_LIMIT,
-    TRUNCATION_SUFFIX,
+    INVENTORY_KEY,
+    RetrospectiveContractError,
+    attach_inventory,
+    capture_inventory,
+    decode_inventory,
+    is_episode_event,
+    manifest_digest,
 )
 from afk.resume_preflight import validate_open_attempts
 
@@ -32,10 +36,6 @@ RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 EVIDENCE_ROOTS = {"attempts", "gates", "retrospective"}
-RETROSPECTIVE_INVENTORY_LIMIT = ARTIFACT_INVENTORY_LIMIT
-RETROSPECTIVE_INVENTORY_KEY = "_retrospective_inventory"
-RETROSPECTIVE_INVENTORY_TEXT_LIMIT = TEXT_CHARACTER_LIMIT
-RETROSPECTIVE_TRUNCATION_SUFFIX = TRUNCATION_SUFFIX
 
 
 class RunStoreError(RuntimeError):
@@ -679,15 +679,18 @@ class RunStore:
         identity = self._identity(run_id)
         events, valid_bytes = self._read_events(run_id)
         event_data = dict(data or {})
-        if event in {"run.attention_required", "run.completed"}:
-            if RETROSPECTIVE_INVENTORY_KEY in event_data:
-                raise RunStoreError("retrospective inventory is reserved")
-            event_data[RETROSPECTIVE_INVENTORY_KEY] = (
-                self._capture_retrospective_inventory(
-                    run_id,
-                    through_sequence=len(events) + 1,
+        if is_episode_event(event):
+            try:
+                event_data = attach_inventory(
+                    event_data,
+                    capture_inventory(
+                        through_sequence=len(events) + 1,
+                        effects=self._read_effects(run_id),
+                        evidence=self._read_evidence_manifests(run_id),
+                    ),
                 )
-            )
+            except RetrospectiveContractError as exc:
+                raise RunStoreError(str(exc)) from exc
         record = redact_artifact_value(
             {
                 "schema_version": SCHEMA_VERSION,
@@ -807,51 +810,22 @@ class RunStore:
             records.append(self.effect(run_id, path.stem))
         return records
 
-    def _capture_retrospective_inventory(
-        self,
-        run_id: str,
-        *,
-        through_sequence: int,
-    ) -> dict[str, Any]:
-        effects = self._read_effects(run_id)
-        evidence = self._read_evidence_manifests(run_id)
-        selected_effects = effects[:RETROSPECTIVE_INVENTORY_LIMIT]
-        selected_evidence = evidence[:RETROSPECTIVE_INVENTORY_LIMIT]
-        return {
-            "schema_version": SCHEMA_VERSION,
-            "through_sequence": through_sequence,
-            "effects": [
-                {
-                    "effect_id": record["effect_id"],
-                    "kind": _bounded_retrospective_text(record["kind"]),
-                    "status": record["status"],
-                }
-                for record in selected_effects
-            ],
-            "evidence": [
-                {
-                    "unit": record["unit"],
-                    "manifest_sha256": hashlib.sha256(
-                        canonical_json(record["manifest"]).encode("utf-8")
-                    ).hexdigest(),
-                }
-                for record in selected_evidence
-            ],
-            "omitted": {
-                "effects": len(effects) - len(selected_effects),
-                "evidence_units": len(evidence) - len(selected_evidence),
-            },
-        }
-
     def _read_retrospective_inventory(
         self,
         run_id: str,
         event: dict[str, Any],
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, int]]:
-        inventory = event["data"].get(RETROSPECTIVE_INVENTORY_KEY)
+        inventory = event["data"].get(INVENTORY_KEY)
         if inventory is None:
             return [], [], {"effects": 0, "evidence_units": 0}
-        _validate_retrospective_inventory(inventory, event["sequence"])
+        try:
+            inventory = decode_inventory(
+                inventory,
+                sequence=event["sequence"],
+                evidence_roots=EVIDENCE_ROOTS,
+            )
+        except RetrospectiveContractError as exc:
+            raise EventHistoryCorrupt(str(exc)) from exc
         evidence = []
         for reference in inventory["evidence"]:
             unit = reference["unit"]
@@ -863,9 +837,7 @@ class RunStore:
                 raise EvidenceTampered(
                     "evidence manifest is missing or invalid"
                 ) from exc
-            digest = hashlib.sha256(
-                canonical_json(manifest).encode("utf-8")
-            ).hexdigest()
+            digest = manifest_digest(manifest)
             if digest != reference["manifest_sha256"]:
                 raise EvidenceTampered(
                     "retrospective evidence manifest digest does not match"
@@ -1080,88 +1052,6 @@ class RunStore:
 def _validate_run_id(run_id: str) -> None:
     if not RUN_ID_PATTERN.fullmatch(run_id):
         raise RunStoreError("run_id contains unsupported characters")
-
-
-def _validate_retrospective_inventory(value: Any, sequence: int) -> None:
-    if (
-        not isinstance(value, dict)
-        or set(value)
-        != {
-            "schema_version",
-            "through_sequence",
-            "effects",
-            "evidence",
-            "omitted",
-        }
-        or type(value.get("schema_version")) is not int
-        or value["schema_version"] != SCHEMA_VERSION
-        or type(value.get("through_sequence")) is not int
-        or value["through_sequence"] != sequence
-        or not isinstance(value.get("effects"), list)
-        or len(value["effects"]) > RETROSPECTIVE_INVENTORY_LIMIT
-        or not isinstance(value.get("evidence"), list)
-        or len(value["evidence"]) > RETROSPECTIVE_INVENTORY_LIMIT
-        or not isinstance(value.get("omitted"), dict)
-        or set(value["omitted"]) != {"effects", "evidence_units"}
-        or any(
-            type(count) is not int or count < 0 for count in value["omitted"].values()
-        )
-    ):
-        raise EventHistoryCorrupt("retrospective inventory is invalid")
-
-    effect_ids = []
-    for record in value["effects"]:
-        if (
-            not isinstance(record, dict)
-            or set(record) != {"effect_id", "kind", "status"}
-            or not isinstance(record["effect_id"], str)
-            or RUN_ID_PATTERN.fullmatch(record["effect_id"]) is None
-            or not isinstance(record["kind"], str)
-            or not record["kind"].strip()
-            or (
-                len(record["kind"]) > RETROSPECTIVE_INVENTORY_TEXT_LIMIT
-                and (
-                    len(record["kind"])
-                    != RETROSPECTIVE_INVENTORY_TEXT_LIMIT
-                    + len(RETROSPECTIVE_TRUNCATION_SUFFIX)
-                    or not record["kind"].endswith(RETROSPECTIVE_TRUNCATION_SUFFIX)
-                )
-            )
-            or not isinstance(record["status"], str)
-            or record["status"] not in {"prepared", "confirmed"}
-        ):
-            raise EventHistoryCorrupt("retrospective inventory is invalid")
-        effect_ids.append(record["effect_id"])
-
-    evidence_units = []
-    for record in value["evidence"]:
-        unit = record.get("unit") if isinstance(record, dict) else None
-        parts = Path(unit).parts if isinstance(unit, str) else ()
-        if (
-            not isinstance(record, dict)
-            or set(record) != {"unit", "manifest_sha256"}
-            or len(parts) != 2
-            or parts[0] not in EVIDENCE_ROOTS
-            or not parts[1]
-            or not isinstance(record["manifest_sha256"], str)
-            or SHA256_PATTERN.fullmatch(record["manifest_sha256"]) is None
-        ):
-            raise EventHistoryCorrupt("retrospective inventory is invalid")
-        evidence_units.append(unit)
-
-    if effect_ids != sorted(set(effect_ids)) or evidence_units != sorted(
-        set(evidence_units)
-    ):
-        raise EventHistoryCorrupt("retrospective inventory is invalid")
-
-
-def _bounded_retrospective_text(value: str) -> str:
-    if len(value) <= RETROSPECTIVE_INVENTORY_TEXT_LIMIT:
-        return value
-    return (
-        f"{value[:RETROSPECTIVE_INVENTORY_TEXT_LIMIT]}"
-        f"{RETROSPECTIVE_TRUNCATION_SUFFIX}"
-    )
 
 
 def _require_mode(path: Path, mode: int, label: str) -> None:
