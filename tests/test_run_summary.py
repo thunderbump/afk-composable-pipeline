@@ -277,20 +277,8 @@ class RunSummaryTest(unittest.TestCase):
         )
 
     def test_preupgrade_episode_without_inventory_is_explicitly_unavailable(self):
-        self.append_completion_episode()
-        events_path = self.store.root / "runs" / "run-001" / "events.jsonl"
-        events = [
-            json.loads(line)
-            for line in events_path.read_text(encoding="utf-8").splitlines()
-        ]
-        events[-1]["data"].pop("_retrospective_inventory")
-        events_path.write_text(
-            "".join(
-                f"{json.dumps(event, sort_keys=True, separators=(',', ':'))}\n"
-                for event in events
-            ),
-            encoding="utf-8",
-        )
+        with patch("afk.run_store.is_episode_event", return_value=False):
+            self.append_completion_episode()
 
         self.assertEqual(self.store.status("run-001")["state"], "completed")
         self.assertEqual(self.store.event("run-001", 2)["event"], "run.completed")
