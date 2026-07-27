@@ -817,6 +817,11 @@ class RunStore:
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, int]]:
         inventory = event["data"].get(INVENTORY_KEY)
         if inventory is None:
+            if is_episode_event(event["event"]):
+                raise RunStoreError(
+                    "retrospective inventory is unavailable "
+                    f"for episode {event['sequence']}"
+                )
             return [], [], {"effects": 0, "evidence_units": 0}
         try:
             inventory = decode_inventory(

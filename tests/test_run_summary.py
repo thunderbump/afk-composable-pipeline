@@ -276,6 +276,30 @@ class RunSummaryTest(unittest.TestCase):
             ["attempts/prior"],
         )
 
+    def test_preupgrade_episode_without_inventory_is_explicitly_unavailable(self):
+        self.append_completion_episode()
+        events_path = self.store.root / "runs" / "run-001" / "events.jsonl"
+        events = [
+            json.loads(line)
+            for line in events_path.read_text(encoding="utf-8").splitlines()
+        ]
+        events[-1]["data"].pop("_retrospective_inventory")
+        events_path.write_text(
+            "".join(
+                f"{json.dumps(event, sort_keys=True, separators=(',', ':'))}\n"
+                for event in events
+            ),
+            encoding="utf-8",
+        )
+
+        self.assertEqual(self.store.status("run-001")["state"], "completed")
+        self.assertEqual(self.store.event("run-001", 2)["event"], "run.completed")
+        with self.assertRaisesRegex(
+            RunStoreError,
+            "retrospective inventory is unavailable for episode 2",
+        ):
+            build_run_summary(self.store, "run-001", episode_sequence=2)
+
     def test_seals_and_reuses_a_complete_summary_after_an_interrupted_seal(self):
         self.store.append_event(
             "run-001",
