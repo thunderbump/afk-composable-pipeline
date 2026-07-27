@@ -88,6 +88,7 @@ def start_run(
     *,
     cwd: Path | None = None,
     bootstrap_contract: bool = False,
+    run_id: str | None = None,
 ) -> tuple[str, int]:
     context = preflight(
         bead_id,
@@ -113,6 +114,7 @@ def start_run(
                 "lingering": lingering,
                 "validation_contract": context.validation_contract,
             },
+            run_id=run_id,
         )
         run_id = projection["run_id"]
         try:
@@ -180,12 +182,17 @@ def start_run(
 
 
 def resume_run(
-    run_id: str | None = None, *, note: str | None = None
+    run_id: str | None = None,
+    *,
+    note: str | None = None,
+    on_selected: Callable[[str], None] | None = None,
 ) -> tuple[str, int]:
     store = RunStore()
     if run_id is not None:
         with store.lock(validate_root_permissions=True):
             projection = store.reconcile_completed_active_pointer(run_id)
+            if on_selected is not None:
+                on_selected(projection["run_id"])
         if projection["state"] == "completed":
             return run_id, 0
         raise StartError("named resume is only available for a completed Run")
@@ -195,6 +202,8 @@ def resume_run(
         except (ProjectedEvidenceTampered, ResumePreflightInvalid) as exc:
             projection = store.status()
             selected_run_id = projection["run_id"]
+            if on_selected is not None:
+                on_selected(selected_run_id)
             checkpoint = projection["checkpoint"]
             _attention(
                 store,
@@ -213,6 +222,8 @@ def resume_run(
             )
             return selected_run_id, 2
         selected_run_id = projection["run_id"]
+        if on_selected is not None:
+            on_selected(selected_run_id)
         if projection["state"] == "completed":
             return selected_run_id, 0
         run_id = selected_run_id
@@ -482,10 +493,16 @@ def _bead_claim_resume_ready(
     )
 
 
-def complete_run(run_id: str | None = None) -> dict[str, Any]:
+def complete_run(
+    run_id: str | None = None,
+    *,
+    on_selected: Callable[[str], None] | None = None,
+) -> dict[str, Any]:
     store = RunStore()
     with store.lock():
         projection = store.status(run_id)
+        if on_selected is not None:
+            on_selected(projection["run_id"])
         if projection["state"] != "completed":
             raise StartError(
                 "afk complete cannot advance a Run; use afk resume to execute the "

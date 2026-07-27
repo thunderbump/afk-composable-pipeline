@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import signal
 import shutil
 import stat
 import subprocess
@@ -90,13 +91,7 @@ class StartCliTest(unittest.TestCase):
     def tearDown(self):
         self.temporary_directory.cleanup()
 
-    def run_afk(self, *args, **overrides):
-        short_cleanup_timeout = overrides.pop("AFK_TEST_SHORT_CLEANUP_TIMEOUT", None)
-        crash_injections = {
-            key: target
-            for key in CRASH_INJECTION_OVERRIDES
-            if (target := overrides.pop(key, None))
-        }
+    def afk_environment(self, **overrides):
         env = os.environ.copy()
         env.update(
             {
@@ -120,6 +115,16 @@ class StartCliTest(unittest.TestCase):
             }
         )
         env.update(overrides)
+        return env
+
+    def run_afk(self, *args, **overrides):
+        short_cleanup_timeout = overrides.pop("AFK_TEST_SHORT_CLEANUP_TIMEOUT", None)
+        crash_injections = {
+            key: target
+            for key in CRASH_INJECTION_OVERRIDES
+            if (target := overrides.pop(key, None))
+        }
+        env = self.afk_environment(**overrides)
         command = [sys.executable, "-m", "afk", *args]
         if crash_injections:
             env["AFK_TEST_CRASH_INJECTIONS"] = json.dumps(
@@ -1994,6 +1999,422 @@ class StartCliTest(unittest.TestCase):
         interrupted = self.launch_events(run_id, "implementation.attempt_interrupted")
         self.assertEqual(len(interrupted), 1)
         self.assertFalse(interrupted[0]["data"]["implementation_attempt"]["retryable"])
+
+    def _assert_resume_signal(self, signal_number, *, persistence_failure=False):
+        signal_name = signal.Signals(signal_number).name
+        state_name = f"lifecycle-{signal_name.lower()}"
+        state_home = self.temp / state_name
+        run_id, _, environment = self.start_isolated_validation_run(state_name)
+        home = Path(environment["HOME"])
+        marker = state_home / "fake-codex-waiting"
+        (home / ".fake-codex-wait-marker").write_text(str(marker), encoding="utf-8")
+        command = [sys.executable, "-m", "afk", "resume"]
+        if persistence_failure:
+            command = [
+                sys.executable,
+                "-c",
+                (
+                    "from afk.run_store import RunStore\n"
+                    "original = RunStore.append_event\n"
+                    "def append(store, run_id, event, **kwargs):\n"
+                    " if event == 'lifecycle.signal_interrupted':\n"
+                    "  raise OSError('injected persistence failure')\n"
+                    " return original(store, run_id, event, **kwargs)\n"
+                    "RunStore.append_event = append\n"
+                    "from afk.lifecycle_signals import main\n"
+                    "raise SystemExit(main(['resume']))\n"
+                ),
+            ]
+        lifecycle = subprocess.Popen(
+            command,
+            cwd=self.project,
+            env=self.afk_environment(**environment),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        processes = {}
+        try:
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline and not marker.exists():
+                self.assertIsNone(lifecycle.poll())
+                time.sleep(0.01)
+            self.assertTrue(marker.is_file())
+            processes = json.loads(marker.read_text(encoding="utf-8"))
+            before = json.loads(
+                self.run_afk("status", run_id, "--json", **environment).stdout
+            )
+
+            os.kill(lifecycle.pid, signal_number)
+            os.kill(lifecycle.pid, signal_number)
+            stdout, stderr = lifecycle.communicate(timeout=10)
+
+            self.assertEqual(lifecycle.returncode, -signal_number, (stdout, stderr))
+            status = json.loads(
+                self.run_afk("status", run_id, "--json", **environment).stdout
+            )
+            report = json.loads(self.run_afk("report", run_id, **environment).stdout)
+            if persistence_failure:
+                self.assertEqual(status["last_sequence"], before["last_sequence"])
+                self.assertEqual(status["state"], "validated")
+                self.assertNotIn("lifecycle_interruption", status)
+                self.assertFalse(report["complete"])
+                self.assertFalse(report["paused"])
+            else:
+                self.assertEqual(status["last_sequence"], before["last_sequence"] + 1)
+                self.assertEqual(status["last_event"], "lifecycle.signal_interrupted")
+                self.assertEqual(status["state"], "attention_required")
+                self.assertEqual(status["attention"]["scope"], "lifecycle")
+                self.assertEqual(status["attention"]["kind"], "interrupted")
+                self.assertEqual(
+                    status["lifecycle_interruption"]["signal"], signal_name
+                )
+                self.assertTrue(report["paused"])
+                self.assertEqual(report["attention"], status["attention"])
+            time.sleep(3.2)
+            self.assertFalse((home / ".fake-late-mutation").exists())
+        finally:
+            if lifecycle.poll() is None:
+                lifecycle.kill()
+                lifecycle.wait()
+            for pid in processes.values():
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+    def test_resume_records_shutdown_signals_and_terminates_supervised_descendants(
+        self,
+    ):
+        for signal_number in (signal.SIGTERM, signal.SIGINT):
+            with self.subTest(signal=signal.Signals(signal_number).name):
+                self._assert_resume_signal(signal_number)
+
+    def test_signal_persistence_failure_cannot_fabricate_success(self):
+        self._assert_resume_signal(signal.SIGTERM, persistence_failure=True)
+
+    def test_unnamed_resume_latches_signal_until_locked_target_lookup_completes(self):
+        state_name = "lifecycle-target-lookup"
+        run_id, _, environment = self.start_isolated_validation_run(state_name)
+        marker = self.temp / "lifecycle-target-lookup-waiting"
+        release = self.temp / "lifecycle-target-lookup-release"
+        before = json.loads(
+            self.run_afk("status", run_id, "--json", **environment).stdout
+        )
+        lifecycle = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import os, time\n"
+                    "from pathlib import Path\n"
+                    "from afk.run_store import RunStore\n"
+                    "original = RunStore.status\n"
+                    "waiting = True\n"
+                    "def status(store, run_id=None):\n"
+                    " global waiting\n"
+                    " if run_id is None and waiting:\n"
+                    "  waiting = False\n"
+                    "  Path(os.environ['AFK_TEST_STATUS_WAIT_MARKER']).touch()\n"
+                    "  release = Path(os.environ['AFK_TEST_STATUS_RELEASE'])\n"
+                    "  while not release.exists():\n"
+                    "   time.sleep(0.01)\n"
+                    " return original(store, run_id)\n"
+                    "RunStore.status = status\n"
+                    "from afk.lifecycle_signals import main\n"
+                    "raise SystemExit(main(['resume']))\n"
+                ),
+            ],
+            cwd=self.project,
+            env=self.afk_environment(
+                **environment,
+                AFK_TEST_STATUS_WAIT_MARKER=str(marker),
+                AFK_TEST_STATUS_RELEASE=str(release),
+            ),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline and not marker.exists():
+                self.assertIsNone(lifecycle.poll())
+                time.sleep(0.01)
+            self.assertTrue(marker.is_file())
+
+            os.kill(lifecycle.pid, signal.SIGTERM)
+            release.touch()
+            stdout, stderr = lifecycle.communicate(timeout=10)
+
+            self.assertEqual(lifecycle.returncode, -signal.SIGTERM, (stdout, stderr))
+            after = json.loads(
+                self.run_afk("status", run_id, "--json", **environment).stdout
+            )
+            self.assertEqual(after["last_sequence"], before["last_sequence"] + 1)
+            self.assertEqual(after["last_event"], "lifecycle.signal_interrupted")
+            self.assertEqual(
+                after["lifecycle_interruption"]["signal"],
+                signal.Signals(signal.SIGTERM).name,
+            )
+        finally:
+            if lifecycle.poll() is None:
+                lifecycle.kill()
+                lifecycle.wait()
+
+    def test_latched_signal_overrides_a_target_lookup_error(self):
+        state_home = self.temp / "lifecycle-missing-target"
+        marker = self.temp / "lifecycle-missing-target-waiting"
+        release = self.temp / "lifecycle-missing-target-release"
+        lifecycle = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import os, time\n"
+                    "from pathlib import Path\n"
+                    "from afk.run_store import RunStore\n"
+                    "original = RunStore.status\n"
+                    "def status(store, run_id=None):\n"
+                    " Path(os.environ['AFK_TEST_STATUS_WAIT_MARKER']).touch()\n"
+                    " release = Path(os.environ['AFK_TEST_STATUS_RELEASE'])\n"
+                    " while not release.exists():\n"
+                    "  time.sleep(0.01)\n"
+                    " return original(store, run_id)\n"
+                    "RunStore.status = status\n"
+                    "from afk.lifecycle_signals import main\n"
+                    "raise SystemExit(main(['resume']))\n"
+                ),
+            ],
+            cwd=self.project,
+            env=self.afk_environment(
+                XDG_STATE_HOME=str(state_home),
+                AFK_TEST_STATUS_WAIT_MARKER=str(marker),
+                AFK_TEST_STATUS_RELEASE=str(release),
+            ),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline and not marker.exists():
+                self.assertIsNone(lifecycle.poll())
+                time.sleep(0.01)
+            self.assertTrue(marker.is_file())
+
+            os.kill(lifecycle.pid, signal.SIGTERM)
+            release.touch()
+            stdout, stderr = lifecycle.communicate(timeout=10)
+
+            self.assertEqual(lifecycle.returncode, -signal.SIGTERM, (stdout, stderr))
+            self.assertFalse((state_home / "afk" / "runs").exists())
+        finally:
+            if lifecycle.poll() is None:
+                lifecycle.kill()
+                lifecycle.wait()
+
+    def test_unnamed_resume_records_the_run_selected_under_the_operation_lock(self):
+        state_name = "lifecycle-active-switch"
+        first_run_id, store, environment = self.start_isolated_validation_run(
+            state_name
+        )
+        home = Path(environment["HOME"])
+        operation_marker = self.temp / "lifecycle-active-switch-operation"
+        snapshot_marker = self.temp / "lifecycle-active-switch-snapshot"
+        snapshot_release = self.temp / "lifecycle-active-switch-release"
+        wait_config = home / ".fake-codex-wait-marker"
+        wait_config.write_text(str(operation_marker), encoding="utf-8")
+        lifecycle = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import os, time\n"
+                    "from pathlib import Path\n"
+                    "from afk.run_store import RunStore\n"
+                    "original = RunStore.status\n"
+                    "waiting = True\n"
+                    "def status(store, run_id=None):\n"
+                    " global waiting\n"
+                    " projection = original(store, run_id)\n"
+                    " if run_id is None and waiting:\n"
+                    "  waiting = False\n"
+                    "  Path(os.environ['AFK_TEST_SNAPSHOT_MARKER']).touch()\n"
+                    "  release = Path(os.environ['AFK_TEST_SNAPSHOT_RELEASE'])\n"
+                    "  while not release.exists():\n"
+                    "   time.sleep(0.01)\n"
+                    " return projection\n"
+                    "RunStore.status = status\n"
+                    "from afk.lifecycle_signals import main\n"
+                    "raise SystemExit(main(['resume']))\n"
+                ),
+            ],
+            cwd=self.project,
+            env=self.afk_environment(
+                **environment,
+                AFK_TEST_SNAPSHOT_MARKER=str(snapshot_marker),
+                AFK_TEST_SNAPSHOT_RELEASE=str(snapshot_release),
+                AFK_FAKE_SYSTEMCTL_WAIT_MARKER=str(operation_marker),
+            ),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        selected_run_id = first_run_id
+        processes = {}
+        try:
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline and not snapshot_marker.exists():
+                self.assertIsNone(lifecycle.poll())
+                time.sleep(0.01)
+            self.assertTrue(snapshot_marker.is_file())
+
+            switch_allowed = True
+            try:
+                with store.lock():
+                    pass
+            except RunStoreBusy:
+                switch_allowed = False
+            if switch_allowed:
+                wait_config.unlink()
+                store.append_event(
+                    first_run_id,
+                    "run.completed",
+                    state="completed",
+                    data={"checkpoint": "completed", "attention": {}},
+                )
+                (Path(environment["XDG_STATE_HOME"]) / "fake-bead-claimed").unlink()
+                started = self.run_afk("start", "central-bnkl.1.1", **environment)
+                self.assertEqual(started.returncode, 0, started.stderr)
+                selected_run_id = started.stdout.strip()
+            snapshot_release.touch()
+
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline and not operation_marker.exists():
+                self.assertIsNone(lifecycle.poll())
+                time.sleep(0.01)
+            self.assertTrue(operation_marker.is_file())
+            processes = json.loads(operation_marker.read_text(encoding="utf-8"))
+
+            before = store.status(selected_run_id)
+            os.kill(lifecycle.pid, signal.SIGTERM)
+            stdout, stderr = lifecycle.communicate(timeout=10)
+
+            self.assertEqual(lifecycle.returncode, -signal.SIGTERM, (stdout, stderr))
+            after = store.status(selected_run_id)
+            self.assertEqual(after["last_sequence"], before["last_sequence"] + 1)
+            self.assertEqual(after["last_event"], "lifecycle.signal_interrupted")
+            self.assertEqual(
+                after["lifecycle_interruption"]["signal"],
+                signal.Signals(signal.SIGTERM).name,
+            )
+        finally:
+            if lifecycle.poll() is None:
+                lifecycle.kill()
+                lifecycle.wait()
+            for pid in processes.values():
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+    def test_named_lifecycle_signal_never_interrupts_a_different_active_run(self):
+        state_name = "named-lifecycle-target"
+        run_id, _, environment = self.start_isolated_validation_run(state_name)
+        marker = self.temp / "named-lifecycle-target-waiting"
+        before = json.loads(
+            self.run_afk("status", run_id, "--json", **environment).stdout
+        )
+        command = [
+            sys.executable,
+            "-c",
+            (
+                "import os, time\n"
+                "from pathlib import Path\n"
+                "from afk.run_store import RunStore\n"
+                "original = RunStore.status\n"
+                "waiting = True\n"
+                "def status(store, run_id=None):\n"
+                " global waiting\n"
+                " if run_id == 'stale-run' and waiting:\n"
+                "  waiting = False\n"
+                "  Path(os.environ['AFK_TEST_STATUS_WAIT_MARKER']).touch()\n"
+                "  time.sleep(60)\n"
+                " return original(store, run_id)\n"
+                "RunStore.status = status\n"
+                "from afk.lifecycle_signals import main\n"
+                "raise SystemExit(main(['complete', 'stale-run']))\n"
+            ),
+        ]
+        lifecycle = subprocess.Popen(
+            command,
+            cwd=self.project,
+            env=self.afk_environment(
+                **environment,
+                AFK_TEST_STATUS_WAIT_MARKER=str(marker),
+            ),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline and not marker.exists():
+                self.assertIsNone(lifecycle.poll())
+                time.sleep(0.01)
+            self.assertTrue(marker.is_file())
+
+            os.kill(lifecycle.pid, signal.SIGTERM)
+            stdout, stderr = lifecycle.communicate(timeout=10)
+
+            self.assertEqual(lifecycle.returncode, -signal.SIGTERM, (stdout, stderr))
+            after = json.loads(
+                self.run_afk("status", run_id, "--json", **environment).stdout
+            )
+            self.assertEqual(after["last_sequence"], before["last_sequence"])
+            self.assertNotIn("lifecycle_interruption", after)
+        finally:
+            if lifecycle.poll() is None:
+                lifecycle.kill()
+                lifecycle.wait()
+
+    def test_start_signal_interrupts_only_the_run_it_created(self):
+        state_home = self.temp / "start-lifecycle-target"
+        marker = self.temp / "start-lifecycle-target-waiting"
+        environment = {
+            "XDG_STATE_HOME": str(state_home),
+            "AFK_FAKE_SYSTEMD_RUN_WAIT_MARKER": str(marker),
+        }
+        lifecycle = subprocess.Popen(
+            [sys.executable, "-m", "afk", "start", "central-bnkl.1.1"],
+            cwd=self.project,
+            env=self.afk_environment(**environment),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline and not marker.exists():
+                self.assertIsNone(lifecycle.poll())
+                time.sleep(0.01)
+            self.assertTrue(marker.is_file())
+
+            os.kill(lifecycle.pid, signal.SIGTERM)
+            stdout, stderr = lifecycle.communicate(timeout=10)
+
+            self.assertEqual(lifecycle.returncode, -signal.SIGTERM, (stdout, stderr))
+            status = json.loads(self.run_afk("status", "--json", **environment).stdout)
+            self.assertEqual(status["last_event"], "lifecycle.signal_interrupted")
+            self.assertEqual(status["state"], "attention_required")
+            self.assertEqual(
+                status["lifecycle_interruption"]["signal"],
+                signal.Signals(signal.SIGTERM).name,
+            )
+        finally:
+            if lifecycle.poll() is None:
+                lifecycle.kill()
+                lifecycle.wait()
 
     def test_resume_retries_but_never_completes_from_missing_implementation_evidence(
         self,
@@ -8716,6 +9137,7 @@ class StartCliTest(unittest.TestCase):
                 import os
                 import subprocess
                 import sys
+                import time
                 from pathlib import Path
 
                 command = Path(sys.argv[0]).name
@@ -9597,6 +10019,12 @@ class StartCliTest(unittest.TestCase):
                         raise SystemExit(f"unexpected bd args: {args}")
                 elif command == "systemd-run":
                     before_mutation("worker-launch")
+                    wait_marker = os.environ.get(
+                        "AFK_FAKE_SYSTEMD_RUN_WAIT_MARKER"
+                    )
+                    if wait_marker:
+                        Path(wait_marker).touch()
+                        time.sleep(60)
                     if os.environ.get("AFK_FAKE_RESUME_DURING_LAUNCH"):
                         resumed = subprocess.run(
                             [sys.executable, "-m", "afk", "resume"],
@@ -9632,6 +10060,13 @@ class StartCliTest(unittest.TestCase):
                         raise SystemExit(1)
                     after_mutation("worker-launch")
                 elif command == "systemctl":
+                    wait_marker = os.environ.get("AFK_FAKE_SYSTEMCTL_WAIT_MARKER")
+                    if wait_marker:
+                        Path(wait_marker).write_text(
+                            json.dumps({"root_pid": os.getpid()}),
+                            encoding="utf-8",
+                        )
+                        time.sleep(60)
                     state = os.environ.get("AFK_FAKE_SYSTEMD_STATE", "active")
                     if state == "failure":
                         print("query failed", file=sys.stderr)
@@ -9660,7 +10095,10 @@ class StartCliTest(unittest.TestCase):
                 #!/usr/bin/env python3
                 import json
                 import os
+                import signal
+                import subprocess
                 import sys
+                import time
                 from pathlib import Path
 
                 args = sys.argv[1:]
@@ -9669,6 +10107,26 @@ class StartCliTest(unittest.TestCase):
                 candidate_sha = "d" * 40
                 worktree = Path(args[args.index("--cd") + 1])
                 report = Path(args[args.index("--output-last-message") + 1])
+                wait_config = Path.home() / ".fake-codex-wait-marker"
+                if wait_config.exists():
+                    wait_marker = wait_config.read_text(encoding="utf-8")
+                    late_mutation = Path.home() / ".fake-late-mutation"
+                    child_program = (
+                        "import signal,time;from pathlib import Path;"
+                        "signal.signal(signal.SIGTERM,signal.SIG_IGN);"
+                        "time.sleep(3);"
+                        f"Path({str(late_mutation)!r}).write_text('mutated')"
+                    )
+                    child = subprocess.Popen(
+                        [sys.executable, "-c", child_program],
+                        start_new_session=True,
+                    )
+                    Path(wait_marker).write_text(json.dumps({
+                        "root_pid": os.getpid(),
+                        "child_pid": child.pid,
+                    }), encoding="utf-8")
+                    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+                    time.sleep(60)
                 if "# AFK standards review" in prompt or "# AFK spec review" in prompt:
                     axis = (
                         "standards"
