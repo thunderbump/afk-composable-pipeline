@@ -7080,6 +7080,39 @@ class StartCliTest(unittest.TestCase):
         )
         self.assertFalse(self.command_log.exists())
 
+    def test_status_derives_unit_for_legacy_terminal_observation(self):
+        store = RunStore(self.state_home / "afk")
+        store.create_run(
+            bead_id="central-bnkl.1.1",
+            repository="thunderbump/beads-webui",
+            base_branch="main",
+            base_sha=BASE_SHA,
+            run_id="legacy-terminal-run",
+        )
+        store.append_event(
+            "legacy-terminal-run",
+            "worker.terminal",
+            data={
+                "checkpoint": "created",
+                "worker_exit_code": 2,
+                "worker_result": "attention_required",
+            },
+        )
+
+        completed = self.run_afk("status", "legacy-terminal-run", "--json")
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        status = json.loads(completed.stdout)
+        self.assertEqual(
+            status["unit_observation"],
+            {
+                "status": "terminal",
+                "unit": "afk-legacy-terminal-run-worker-1",
+                "worker_exit_code": 2,
+                "worker_result": "attention_required",
+            },
+        )
+
     def test_unnamed_status_prefers_completion_recorded_during_unit_observation(self):
         self.create_resume_preflight_run()
 

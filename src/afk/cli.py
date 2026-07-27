@@ -57,6 +57,7 @@ from afk.start import (
     run_worker,
     run_worker_unit,
     start_run,
+    worker_unit,
 )
 
 
@@ -144,7 +145,9 @@ def main(
             if "worker_exit_code" in projection:
                 output["unit_observation"] = {
                     "status": "terminal",
-                    "unit": projection["unit"],
+                    "unit": projection.get(
+                        "unit", worker_unit(projection["run_id"])
+                    ),
                     "worker_exit_code": projection["worker_exit_code"],
                     "worker_result": projection["worker_result"],
                 }

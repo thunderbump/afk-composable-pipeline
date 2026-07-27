@@ -2122,8 +2122,10 @@ class CandidateValidationCliTest(unittest.TestCase):
 
     def status(self, run_id):
         completed = self.run_afk("status", run_id, "--json")
-        self.assertEqual(completed.returncode, 0, completed.stderr)
-        return json.loads(completed.stdout)
+        status = json.loads(completed.stdout)
+        expected_exit_code = 2 if status["state"] == "attention_required" else 0
+        self.assertEqual(completed.returncode, expected_exit_code, completed.stderr)
+        return status
 
     def git(self, *args):
         completed = subprocess.run(
