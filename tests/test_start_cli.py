@@ -420,8 +420,14 @@ class StartCliTest(unittest.TestCase):
         self.assertEqual(self.run_afk("resume").returncode, 0)
         return run_id
 
-    def assert_exact_terminal_completion(self, run_id):
-        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+    def assert_exact_terminal_completion(
+        self, run_id, *, state_home=None, environment=None
+    ):
+        selected_state_home = state_home or self.state_home
+        selected_environment = environment or {}
+        status = json.loads(
+            self.run_afk("status", run_id, "--json", **selected_environment).stdout
+        )
         completion = status["completion"]
         self.assertEqual(status["checkpoint"], "completed")
         self.assertEqual(completion["schema_version"], 1)
@@ -437,7 +443,7 @@ class StartCliTest(unittest.TestCase):
         self.assertTrue(completion["local_branch_deleted"])
         self.assertEqual(completion["cleanup_warnings"], [])
         self.assertEqual(completion["evidence"], "gates/completion-dddddddddddd")
-        store = RunStore(self.state_home / "afk")
+        store = RunStore(selected_state_home / "afk")
         close_effect = store.effect(run_id, "bead-close")
         self.assertEqual(close_effect["status"], "confirmed")
         self.assertEqual(
@@ -457,6 +463,274 @@ class StartCliTest(unittest.TestCase):
         self.assertEqual(
             store.sealed_evidence_result(run_id, completion["evidence"]), completion
         )
+
+    def test_resume_recovers_a_run_created_before_start_bead_spec(self):
+        interrupted = self.run_afk(
+            "start",
+            "central-bnkl.1.1",
+            AFK_TEST_KILL_AFTER_EVENT_WRITE="run.created",
+        )
+
+        self.assertLess(interrupted.returncode, 0)
+        runs = tuple((self.state_home / "afk" / "runs").iterdir())
+        self.assertEqual(len(runs), 1)
+        run_id = runs[0].name
+        active = self.state_home / "afk" / "active.json"
+        self.assertFalse(active.exists())
+        before = {
+            path.relative_to(self.state_home / "afk"): path.read_bytes()
+            for path in (self.state_home / "afk").rglob("*")
+            if path.is_file()
+        }
+
+        observed = self.run_afk(
+            "status",
+            run_id,
+            "--json",
+            AFK_FAKE_SYSTEMD_STATE="absent",
+        )
+
+        self.assertEqual(observed.returncode, 2, observed.stderr)
+        self.assertEqual(json.loads(observed.stdout)["run_id"], run_id)
+        after = {
+            path.relative_to(self.state_home / "afk"): path.read_bytes()
+            for path in (self.state_home / "afk").rglob("*")
+            if path.is_file()
+        }
+        self.assertEqual(after, before)
+
+        recorded = self.run_afk("resume")
+        launched = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="absent")
+        worker = self.run_afk("_worker", run_id)
+        resumed = [self.run_afk("resume") for _ in range(4)]
+
+        self.assertEqual(recorded.returncode, 0, recorded.stderr)
+        self.assertEqual(launched.returncode, 0, launched.stderr)
+        self.assertEqual(worker.returncode, 0, worker.stderr)
+        self.assertTrue(all(result.returncode == 0 for result in resumed))
+        self.assert_exact_terminal_completion(run_id)
+        events_path = runs[0] / "events.jsonl"
+        events_before = events_path.read_bytes()
+        self.assertEqual(self.run_afk("resume", run_id).returncode, 0)
+        self.assertEqual(self.run_afk("resume", run_id).returncode, 0)
+        self.assertEqual(events_path.read_bytes(), events_before)
+
+    def test_full_lifecycle_resume_is_idempotent_across_crash_boundaries(self):
+        boundaries = (
+            ("event", "start", "run.created"),
+            ("event-before", "start", "bead.spec_recorded"),
+            ("event", "start", "bead.spec_recorded"),
+            ("event", "start", "worker.launch_prepared"),
+            ("mutation", "start", "worker-launch"),
+            ("event", "worker", "worker.launched"),
+            ("mutation", "worker", "bead-claim"),
+            ("event", "worker", "bead.claimed"),
+            ("mutation", "worker", "worktree-create"),
+            ("event", "worker", "worktree.ready"),
+            ("event", "worker", "implementation.attempt_started"),
+            ("event", "worker", "implementation.attempt_finished"),
+            ("event", "worker", "candidate.change_committed"),
+            ("mutation", "worker", "branch-push"),
+            ("event", "worker", "candidate.branch_published"),
+            ("mutation", "worker", "pr-create"),
+            ("event", "worker", "candidate.pr_published"),
+            ("event", "worker", "candidate.ready"),
+            ("event", "worker", "validation.attempt_started"),
+            ("event", "worker", "validation.attempt_finished"),
+            ("event", "worker", "validation.passed"),
+            ("mutation", "worker", "gate-comment"),
+            ("event", "worker", "gate.cycle_completed"),
+            ("mutation", "resume", "pr-ready"),
+            ("event", "resume", "pr.marked_ready"),
+            ("mutation", "resume", "pr-merge"),
+            ("event", "resume", "pr.squash_merged"),
+            ("event", "resume", "pr.merge_reconciled"),
+            ("mutation", "resume", "bead-close"),
+            ("event", "resume", "bead.closed"),
+            ("mutation", "resume", "worktree-move"),
+            ("mutation", "resume", "worktree-remove"),
+            ("mutation", "resume", "local-branch-delete"),
+            ("event", "resume", "run.completed"),
+        )
+        unique_terminal_events = {
+            "candidate.branch_published",
+            "candidate.pr_published",
+            "gate.cycle_completed",
+            "pr.marked_ready",
+            "pr.squash_merged",
+            "bead.closed",
+            "run.completed",
+        }
+        happy_mutations = {
+            "worker-launch",
+            "bead-claim",
+            "worktree-create",
+            "branch-push",
+            "pr-create",
+            "gate-comment",
+            "pr-ready",
+            "pr-merge",
+            "bead-close",
+            "worktree-move",
+            "worktree-remove",
+            "local-branch-delete",
+        }
+
+        for index, (boundary_type, phase, target) in enumerate(boundaries):
+            with self.subTest(boundary_type=boundary_type, phase=phase, target=target):
+                state_home = self.temp / f"full-lifecycle-{index}"
+                home = self.temp / f"full-lifecycle-home-{index}"
+                home.mkdir()
+                environment = {
+                    "XDG_STATE_HOME": str(state_home),
+                    "HOME": str(home),
+                }
+                if boundary_type == "event":
+                    injection = {"AFK_TEST_KILL_AFTER_EVENT_WRITE": target}
+                elif boundary_type == "event-before":
+                    injection = {"AFK_TEST_KILL_BEFORE_EVENT": target}
+                else:
+                    injection = {"AFK_TEST_KILL_AFTER_MUTATION": target}
+                started = self.run_afk(
+                    "start",
+                    "central-bnkl.1.1",
+                    **environment,
+                    **(injection if phase == "start" else {}),
+                )
+                runs_root = state_home / "afk" / "runs"
+                runs = tuple(runs_root.iterdir())
+                self.assertEqual(len(runs), 1)
+                run_id = runs[0].name
+                crashed = started if phase == "start" else None
+
+                if phase == "start" and started.returncode < 0:
+                    while RunStore(state_home / "afk").status(run_id)["last_event"] in {
+                        "run.created",
+                        "bead.spec_recorded",
+                        "worker.launch_prepared",
+                    }:
+                        recovered = self.run_afk(
+                            "resume",
+                            **environment,
+                            **(
+                                {"AFK_FAKE_SYSTEMD_STATE": "absent"}
+                                if target != "worker-launch"
+                                else {}
+                            ),
+                        )
+                        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+
+                worker = self.run_afk(
+                    "_worker",
+                    run_id,
+                    **environment,
+                    **(injection if phase == "worker" else {}),
+                )
+                if phase == "worker":
+                    crashed = worker
+                else:
+                    self.assertEqual(worker.returncode, 0, worker.stderr)
+
+                if phase == "resume":
+                    for _ in range(6):
+                        resumed = self.run_afk("resume", **environment, **injection)
+                        if resumed.returncode < 0:
+                            crashed = resumed
+                            break
+                    self.assertIsNotNone(crashed)
+
+                self.assertLess(crashed.returncode, 0)
+                store_root = state_home / "afk"
+                before = {
+                    path.relative_to(store_root): path.read_bytes()
+                    for path in store_root.rglob("*")
+                    if path.is_file()
+                }
+                observed = self.run_afk(
+                    "status",
+                    run_id,
+                    "--json",
+                    **environment,
+                    **(
+                        {"AFK_FAKE_SYSTEMD_STATE": "absent"}
+                        if (
+                            phase == "worker"
+                            or (phase == "start" and target != "worker-launch")
+                        )
+                        else {}
+                    ),
+                )
+                self.assertIn(observed.returncode, {0, 2}, observed.stderr)
+                self.assertEqual(json.loads(observed.stdout)["run_id"], run_id)
+                after = {
+                    path.relative_to(store_root): path.read_bytes()
+                    for path in store_root.rglob("*")
+                    if path.is_file()
+                }
+                self.assertEqual(after, before)
+
+                saw_attention = False
+                for _ in range(12):
+                    projection = RunStore(store_root).status(run_id)
+                    if projection["state"] == "completed":
+                        break
+                    resumed = self.run_afk(
+                        "resume",
+                        **environment,
+                        **(
+                            {"AFK_FAKE_SYSTEMD_STATE": "absent"}
+                            if phase == "worker"
+                            else {}
+                        ),
+                    )
+                    if resumed.returncode == 2:
+                        paused = RunStore(store_root).status(run_id)
+                        self.assertEqual(paused["state"], "attention_required")
+                        saw_attention = True
+                    else:
+                        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+
+                projection = RunStore(store_root).status(run_id)
+                self.assertEqual(projection["state"], "completed")
+                if target == "validation.attempt_started":
+                    self.assertTrue(saw_attention)
+                self.assert_exact_terminal_completion(
+                    run_id,
+                    state_home=state_home,
+                    environment=environment,
+                )
+                event_names = [
+                    json.loads(line)["event"]
+                    for line in (runs[0] / "events.jsonl")
+                    .read_text(encoding="utf-8")
+                    .splitlines()
+                ]
+                self.assertTrue(
+                    all(
+                        event_names.count(event) == 1
+                        for event in unique_terminal_events
+                    )
+                )
+                mutations = [
+                    json.loads(line)["mutation"]
+                    for line in (state_home / "fake-mutations.jsonl")
+                    .read_text(encoding="utf-8")
+                    .splitlines()
+                ]
+                self.assertEqual(set(mutations), happy_mutations)
+                self.assertTrue(
+                    all(mutations.count(mutation) == 1 for mutation in happy_mutations)
+                )
+                events_before = (runs[0] / "events.jsonl").read_bytes()
+                self.assertEqual(
+                    self.run_afk("resume", run_id, **environment).returncode, 0
+                )
+                self.assertEqual(
+                    self.run_afk("resume", run_id, **environment).returncode, 0
+                )
+                self.assertEqual((runs[0] / "events.jsonl").read_bytes(), events_before)
+                rejected = self.run_afk("resume", "--force", **environment)
+                self.assertEqual(rejected.returncode, 2)
 
     def test_start_launches_numbered_transient_worker_and_reports_checkpoint(self):
         completed = self.run_afk("start", "central-bnkl.1.1")

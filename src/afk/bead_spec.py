@@ -31,6 +31,32 @@ def persist_bead_spec(
     return stored
 
 
+def reconcile_bead_spec(
+    store: RunStore, run_id: str, bead: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    if "bead_spec" in store.status(run_id):
+        return load_bead_spec(store, run_id)
+    root = store.root / "runs" / run_id / BEAD_SPEC_EVIDENCE
+    if not root.exists():
+        if bead is None:
+            raise RunStoreError("Run lacks canonical Bead/spec evidence")
+        return persist_bead_spec(store, run_id, bead)
+    stored = load_bead_spec(store, run_id)
+    manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+    store.append_event(
+        run_id,
+        "bead.spec_recorded",
+        data={
+            "bead_spec": {
+                "schema_version": 1,
+                "evidence": BEAD_SPEC_EVIDENCE,
+                "manifest_sha256": _manifest_digest(manifest),
+            }
+        },
+    )
+    return stored
+
+
 def load_bead_spec(
     store: RunStore,
     run_id: str,

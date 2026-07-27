@@ -13,7 +13,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from afk.bead_spec import BEAD_SPEC_EVIDENCE, load_bead_spec, persist_bead_spec
+from afk.bead_spec import (
+    BEAD_SPEC_EVIDENCE,
+    load_bead_spec,
+    persist_bead_spec,
+    reconcile_bead_spec,
+)
 from afk.candidate import (
     CandidateError,
     delete_candidate_branch,
@@ -227,6 +232,13 @@ def resume_run(
         if projection["state"] == "completed":
             return selected_run_id, 0
         run_id = selected_run_id
+        attention = projection.get("attention")
+        if projection["last_event"] == "run.created" or (
+            isinstance(attention, dict)
+            and attention.get("scope") == "bead_preflight"
+            and "bead_spec" not in projection
+        ):
+            return run_id, _advance_start_bead_spec(store, run_id)
         if projection["last_event"] in {"bead.claimed", "bead.claim_reconciled"}:
             claim_exit_code = _advance_bead_claim(store, run_id)
             if claim_exit_code:
@@ -473,6 +485,56 @@ def _bead_claim_resume_ready(
         projection["last_event"] == "worker.launched"
         or store.effect_if_present(run_id, "bead-claim") is not None
     )
+
+
+def _advance_start_bead_spec(store: RunStore, run_id: str) -> int:
+    identity = store.identity(run_id)
+    request = identity["start_request"]
+    workspace = Path(request["beads_workspace"])
+    evidence = store.root / "runs" / run_id / BEAD_SPEC_EVIDENCE
+    if evidence.exists():
+        try:
+            reconcile_bead_spec(store, run_id)
+        except (OSError, RunStoreError, ValueError) as exc:
+            _attention(
+                store,
+                run_id,
+                checkpoint="created",
+                scope="bead_preflight",
+                kind="invalid",
+                summary=str(exc),
+            )
+            return 2
+        return 0
+    try:
+        bead = _show_bead(identity["bead_id"], workspace)
+        bead["comments"] = _bead_comments(identity["bead_id"], workspace)
+    except StartError as exc:
+        _attention(
+            store,
+            run_id,
+            checkpoint="created",
+            scope="bead_preflight",
+            kind="unavailable",
+            summary=str(exc),
+            classification=_error_classification(exc),
+        )
+        return 2
+    try:
+        _validate_start_bead(bead, identity["bead_id"], identity["repository"])
+    except StartError as exc:
+        _attention(
+            store,
+            run_id,
+            checkpoint="created",
+            scope="bead_preflight",
+            kind="invalid",
+            summary=str(exc),
+            classification=_error_classification(exc),
+        )
+        return 2
+    reconcile_bead_spec(store, run_id, bead)
+    return 0
 
 
 def complete_run(
