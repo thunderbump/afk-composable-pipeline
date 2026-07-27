@@ -82,6 +82,7 @@ def normalize_retrospective_result(
         or not isinstance(summary.get("run"), dict)
         or not isinstance(summary.get("episode"), dict)
         or not isinstance(summary["run"].get("run_id"), str)
+        or not isinstance(summary["episode"].get("state"), str)
         or summary["episode"].get("state") not in {"attention_required", "completed"}
         or not isinstance(summary.get("citation_manifest"), dict)
         or summary["citation_manifest"] != citation_manifest(summary)
@@ -137,12 +138,17 @@ def _validate_finding(
     summary: dict[str, Any],
     index: int,
 ) -> None:
-    if isinstance(value, dict) and value.get("category") not in CATEGORIES:
-        raise RetrospectiveResultError(f"process_findings[{index}].category is invalid")
-    if isinstance(value, dict) and value.get("confidence") not in CONFIDENCE:
-        raise RetrospectiveResultError(
-            f"process_findings[{index}].confidence is invalid"
-        )
+    if isinstance(value, dict):
+        category = value.get("category")
+        if not isinstance(category, str) or category not in CATEGORIES:
+            raise RetrospectiveResultError(
+                f"process_findings[{index}].category is invalid"
+            )
+        confidence = value.get("confidence")
+        if not isinstance(confidence, str) or confidence not in CONFIDENCE:
+            raise RetrospectiveResultError(
+                f"process_findings[{index}].confidence is invalid"
+            )
     evidence = value.get("evidence") if isinstance(value, dict) else None
     if isinstance(evidence, list):
         for citation_index, citation in enumerate(evidence):
@@ -168,14 +174,17 @@ def _validate_proposal(
     finding_ids: set[str],
     index: int,
 ) -> None:
-    if isinstance(value, dict) and value.get("scope") not in SCOPES:
-        raise RetrospectiveResultError(
-            f"improvement_proposals[{index}].scope is invalid"
-        )
-    if isinstance(value, dict) and value.get("priority") not in PRIORITIES:
-        raise RetrospectiveResultError(
-            f"improvement_proposals[{index}].priority is invalid"
-        )
+    if isinstance(value, dict):
+        scope = value.get("scope")
+        if not isinstance(scope, str) or scope not in SCOPES:
+            raise RetrospectiveResultError(
+                f"improvement_proposals[{index}].scope is invalid"
+            )
+        priority = value.get("priority")
+        if not isinstance(priority, str) or priority not in PRIORITIES:
+            raise RetrospectiveResultError(
+                f"improvement_proposals[{index}].priority is invalid"
+            )
     addresses = value.get("addresses") if isinstance(value, dict) else None
     if isinstance(addresses, list) and all(
         isinstance(address, str) for address in addresses

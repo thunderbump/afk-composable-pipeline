@@ -154,6 +154,39 @@ class RetrospectiveResultTest(unittest.TestCase):
                 self.assertEqual(raised.exception.errors, (expected,))
                 self.assertLessEqual(len(str(raised.exception)), 512)
 
+    def test_unhashable_vocabulary_values_fail_closed_with_bounded_evidence(self):
+        cases = (
+            ("episode", "state", "Run Summary is invalid"),
+            ("finding", "category", "process_findings[0].category is invalid"),
+            ("finding", "confidence", "process_findings[0].confidence is invalid"),
+            ("proposal", "scope", "improvement_proposals[0].scope is invalid"),
+            ("proposal", "priority", "improvement_proposals[0].priority is invalid"),
+        )
+        for target_name, field, expected in cases:
+            for malformed in ([], {}):
+                with self.subTest(
+                    target=target_name,
+                    field=field,
+                    malformed=malformed,
+                ):
+                    summary = json.loads(self.summary())
+                    result = self.populated_result()
+                    if target_name == "episode":
+                        summary["episode"][field] = malformed
+                    elif target_name == "finding":
+                        result["process_findings"][0][field] = malformed
+                    else:
+                        result["improvement_proposals"][0][field] = malformed
+
+                    with self.assertRaises(RetrospectiveResultError) as raised:
+                        normalize_retrospective_result(
+                            canonical_json(summary),
+                            result,
+                        )
+
+                    self.assertEqual(raised.exception.errors, (expected,))
+                    self.assertLessEqual(len(str(raised.exception)), 512)
+
     def test_unresolved_escaped_and_mismatched_citations_are_rejected(self):
         cases = (
             {"artifact": "events.jsonl", "event_sequence": 99},
