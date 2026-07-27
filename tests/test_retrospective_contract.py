@@ -12,11 +12,33 @@ from afk.retrospective_contract import (  # noqa: E402
     TEXT_CHARACTER_LIMIT,
     TRUNCATION_SUFFIX,
     capture_inventory,
+    capture_unavailable_inventory,
     decode_inventory,
 )
 
 
 class RetrospectiveContractTest(unittest.TestCase):
+    def test_unavailable_inventory_is_explicit_and_validates_as_stored(self):
+        inventory = capture_unavailable_inventory(through_sequence=7)
+
+        self.assertIs(
+            decode_inventory(
+                inventory,
+                sequence=7,
+                evidence_roots={"attempts", "gates", "retrospective"},
+            ),
+            inventory,
+        )
+        self.assertEqual(
+            inventory,
+            {
+                "schema_version": 1,
+                "through_sequence": 7,
+                "status": "unavailable",
+                "reason": "artifact_inventory_invalid",
+            },
+        )
+
     def test_capture_is_ordered_bounded_and_validates_as_stored(self):
         effects = [
             {

@@ -22,6 +22,7 @@ from afk.retrospective_contract import (
     RetrospectiveContractError,
     attach_inventory,
     capture_inventory,
+    capture_unavailable_inventory,
     decode_inventory,
     is_episode_event,
     manifest_digest,
@@ -40,6 +41,10 @@ EVIDENCE_ROOTS = {"attempts", "gates", "retrospective"}
 
 
 class RunStoreError(RuntimeError):
+    pass
+
+
+class _RetrospectiveInventoryUnavailable(RunStoreError):
     pass
 
 
@@ -681,19 +686,22 @@ class RunStore:
         events, valid_bytes = self._read_events(run_id)
         event_data = dict(data or {})
         if is_episode_event(event):
-            effects, omitted_effects = self._read_effect_inventory(run_id)
-            evidence, omitted_evidence_units = self._read_evidence_inventory(run_id)
             try:
-                event_data = attach_inventory(
-                    event_data,
-                    capture_inventory(
-                        through_sequence=len(events) + 1,
-                        effects=effects,
-                        evidence=evidence,
-                        omitted_effects=omitted_effects,
-                        omitted_evidence_units=omitted_evidence_units,
-                    ),
+                effects, omitted_effects = self._read_effect_inventory(run_id)
+                evidence, omitted_evidence_units = self._read_evidence_inventory(run_id)
+                inventory = capture_inventory(
+                    through_sequence=len(events) + 1,
+                    effects=effects,
+                    evidence=evidence,
+                    omitted_effects=omitted_effects,
+                    omitted_evidence_units=omitted_evidence_units,
                 )
+            except _RetrospectiveInventoryUnavailable:
+                inventory = capture_unavailable_inventory(
+                    through_sequence=len(events) + 1,
+                )
+            try:
+                event_data = attach_inventory(event_data, inventory)
             except RetrospectiveContractError as exc:
                 raise RunStoreError(str(exc)) from exc
         record = redact_artifact_value(
@@ -818,7 +826,11 @@ class RunStore:
             paths,
             identity=lambda path: path.stem,
         )
-        return [self.effect(run_id, path.stem) for path in selected], omitted
+        try:
+            effects = [self.effect(run_id, path.stem) for path in selected]
+        except RunStoreError as exc:
+            raise _RetrospectiveInventoryUnavailable from exc
+        return effects, omitted
 
     def _read_retrospective_inventory(
         self,
@@ -841,6 +853,11 @@ class RunStore:
             )
         except RetrospectiveContractError as exc:
             raise EventHistoryCorrupt(str(exc)) from exc
+        if inventory.get("status") == "unavailable":
+            raise RunStoreError(
+                "retrospective inventory is unavailable "
+                f"for episode {event['sequence']}"
+            )
         evidence = []
         for reference in inventory["evidence"]:
             unit = reference["unit"]
@@ -886,14 +903,17 @@ class RunStore:
         )
         records = []
         for relative in selected:
-            self.verify_evidence(run_id, relative)
-            manifest_path = self._evidence_path(run_id, relative) / "manifest.json"
             try:
+                self.verify_evidence(run_id, relative)
+                manifest_path = self._evidence_path(run_id, relative) / "manifest.json"
                 manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-                raise EvidenceTampered(
-                    "evidence manifest is missing or invalid"
-                ) from exc
+            except (
+                EvidenceError,
+                OSError,
+                UnicodeDecodeError,
+                json.JSONDecodeError,
+            ) as exc:
+                raise _RetrospectiveInventoryUnavailable from exc
             records.append({"unit": relative, "manifest": manifest})
         return records, omitted
 

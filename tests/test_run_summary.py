@@ -288,6 +288,42 @@ class RunSummaryTest(unittest.TestCase):
         ):
             build_run_summary(self.store, "run-001", episode_sequence=2)
 
+    def test_corrupt_artifacts_do_not_block_attention_but_make_summary_unavailable(
+        self,
+    ):
+        self.store.write_evidence_text(
+            "run-001",
+            "gates/validation/result.json",
+            "{}\n",
+        )
+        self.store.seal_evidence("run-001", "gates/validation")
+        result_path = self.store.root / "runs/run-001/gates/validation/result.json"
+        result_path.chmod(0o600)
+        result_path.write_text("tampered\n", encoding="utf-8")
+
+        projection = self.store.append_event(
+            "run-001",
+            "run.attention_required",
+            state="attention_required",
+            data={
+                "checkpoint": "created",
+                "attention": {
+                    "scope": "validation",
+                    "kind": "invalid",
+                    "summary": "Validation evidence is invalid",
+                },
+            },
+            recorded_at="2026-07-27T10:01:00Z",
+        )
+
+        self.assertEqual(projection["attention"]["scope"], "validation")
+        self.assertEqual(projection["attention"]["kind"], "invalid")
+        with self.assertRaisesRegex(
+            RunStoreError,
+            "retrospective inventory is unavailable for episode 2",
+        ):
+            build_run_summary(self.store, "run-001", episode_sequence=2)
+
     def test_seals_and_reuses_a_complete_summary_after_an_interrupted_seal(self):
         self.store.append_event(
             "run-001",

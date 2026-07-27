@@ -79,6 +79,15 @@ def capture_inventory(
     }
 
 
+def capture_unavailable_inventory(*, through_sequence: int) -> dict[str, Any]:
+    return {
+        "schema_version": INVENTORY_SCHEMA_VERSION,
+        "through_sequence": through_sequence,
+        "status": "unavailable",
+        "reason": "artifact_inventory_invalid",
+    }
+
+
 def select_inventory_items(
     items: list[Any],
     *,
@@ -97,6 +106,17 @@ def decode_inventory(
     sequence: int,
     evidence_roots: Collection[str],
 ) -> dict[str, Any]:
+    if (
+        isinstance(value, dict)
+        and set(value) == {"schema_version", "through_sequence", "status", "reason"}
+        and type(value.get("schema_version")) is int
+        and value["schema_version"] == INVENTORY_SCHEMA_VERSION
+        and type(value.get("through_sequence")) is int
+        and value["through_sequence"] == sequence
+        and value.get("status") == "unavailable"
+        and value.get("reason") == "artifact_inventory_invalid"
+    ):
+        return value
     if (
         not isinstance(value, dict)
         or set(value)
