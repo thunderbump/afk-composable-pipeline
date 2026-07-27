@@ -325,6 +325,29 @@ class RunStore:
     def identity(self, run_id: str) -> dict[str, Any]:
         return self._identity(run_id)
 
+    def read_run_snapshot(
+        self, run_id: str, *, through_sequence: int
+    ) -> dict[str, Any]:
+        """Read validated durable facts available for one Event History position."""
+        if type(through_sequence) is not int or through_sequence < 1:
+            raise RunStoreError("through_sequence must be a positive integer")
+        identity = self._identity(run_id)
+        events, _ = self._read_events(run_id)
+        if through_sequence > len(events):
+            raise RunStoreError(
+                f"Event History has no sequence {through_sequence}: {run_id}"
+            )
+        selected_events = events[:through_sequence]
+        effects = self._read_effects(run_id)
+        evidence = self._read_evidence_manifests(run_id)
+        return {
+            "identity": identity,
+            "events": selected_events,
+            "projection": _project(identity, selected_events),
+            "effects": effects,
+            "evidence": evidence,
+        }
+
     def prepare_effect(
         self,
         run_id: str,
@@ -726,6 +749,44 @@ class RunStore:
                 )
             events.append(record)
         return events, complete_bytes
+
+    def _read_effects(self, run_id: str) -> list[dict[str, Any]]:
+        effects_directory = self._run_dir(run_id) / "effects"
+        records = []
+        for path in sorted(effects_directory.iterdir(), key=lambda item: item.name):
+            if (
+                path.is_symlink()
+                or not path.is_file()
+                or path.suffix != ".json"
+                or path.stem == ""
+            ):
+                raise RunStoreError("Effects directory contains an invalid record")
+            records.append(self.effect(run_id, path.stem))
+        return records
+
+    def _read_evidence_manifests(self, run_id: str) -> list[dict[str, Any]]:
+        run_directory = self._run_dir(run_id)
+        records = []
+        for root_name in sorted(EVIDENCE_ROOTS):
+            root = run_directory / root_name
+            for unit in sorted(root.iterdir(), key=lambda item: item.name):
+                if unit.is_symlink() or not unit.is_dir():
+                    raise EvidenceTampered(
+                        f"{root_name} contains an invalid evidence unit"
+                    )
+                manifest_path = unit / "manifest.json"
+                if not manifest_path.exists() and not manifest_path.is_symlink():
+                    continue
+                relative = f"{root_name}/{unit.name}"
+                self.verify_evidence(run_id, relative)
+                try:
+                    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                    raise EvidenceTampered(
+                        "evidence manifest is missing or invalid"
+                    ) from exc
+                records.append({"unit": relative, "manifest": manifest})
+        return records
 
     def _identity(self, run_id: str) -> dict[str, Any]:
         _validate_run_id(run_id)
