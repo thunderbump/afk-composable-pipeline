@@ -170,6 +170,47 @@ class RunSummaryTest(unittest.TestCase):
         self.assertEqual(json.loads(second)["effects"], [])
         self.assertEqual(json.loads(second)["evidence"], [])
 
+    def test_rejects_a_presealed_summary_outside_the_public_contract(self):
+        self.store.append_event(
+            "run-001",
+            "run.completed",
+            state="completed",
+            data={"checkpoint": "completed"},
+            recorded_at="2026-07-27T11:00:00Z",
+        )
+        self.store.reconcile_evidence_result(
+            "run-001",
+            "retrospective/run-summary-00000000000000000002",
+            {
+                "schema_version": 1,
+                "run_id": "run-001",
+                "episode_sequence": 2,
+                "episode_event": "run.completed",
+                "episode_state": "completed",
+                "summary": json.dumps(
+                    {
+                        "run": {
+                            "run_id": "run-001",
+                            "repository": "Bearer abcdefghijklmnop",
+                        },
+                        "episode": {
+                            "sequence": 2,
+                            "event": "run.completed",
+                            "state": "completed",
+                        },
+                        "raw_log": "RAW-LOG-CONTENT",
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            },
+        )
+
+        with self.assertRaisesRegex(
+            RunStoreError, "sealed Run Summary content is invalid"
+        ):
+            build_run_summary(self.store, "run-001", episode_sequence=2)
+
     def test_rejects_a_sequence_that_is_not_an_attention_or_completion_episode(self):
         with self.assertRaisesRegex(
             RunStoreError, "sequence 1 is not a retrospective episode"
