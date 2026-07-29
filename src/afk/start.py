@@ -215,6 +215,15 @@ def resume_run(
         selected_run_id = projection["run_id"]
         if on_selected is not None:
             on_selected(selected_run_id)
+        if (
+            projection["state"] == "attention_required"
+            and projection.get("attention_episode") is not None
+        ):
+            run_retrospective_attempt(
+                store,
+                selected_run_id,
+                episode_sequence=projection["attention_episode"]["episode_sequence"],
+            )
         if projection["state"] == "completed":
             if projection.get("completion_episode") is not None:
                 _reconcile_completed_run(store, selected_run_id, projection)

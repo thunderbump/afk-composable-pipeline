@@ -10268,6 +10268,49 @@ class StartCliTest(unittest.TestCase):
             outcome,
         )
 
+    def test_resume_reconciles_crashed_attention_before_lifecycle_mutation(self):
+        interrupted = self.run_afk(
+            "start",
+            "central-bnkl.1.1",
+            AFK_FAKE_SYSTEMD_FAILURE="1",
+            AFK_TEST_KILL_AFTER_EVENT_WRITE="run.attention_required",
+        )
+
+        self.assertLess(interrupted.returncode, 0)
+        store = RunStore(self.state_home / "afk")
+        status = store.status()
+        episode = status["attention_episode"]
+        self.assertIsNone(
+            store.sealed_evidence_result(status["run_id"], episode["evidence"])
+        )
+        events_path = (
+            self.state_home / "afk" / "runs" / status["run_id"] / "events.jsonl"
+        )
+        events_before = events_path.read_bytes()
+
+        resumed = self.run_afk(
+            "resume",
+            AFK_FAKE_SYSTEMD_STATE="active",
+            AFK_TEST_KILL_BEFORE_EVENT="worker.launch_reconciled",
+        )
+
+        self.assertLess(resumed.returncode, 0)
+        outcome = store.sealed_evidence_result(status["run_id"], episode["evidence"])
+        self.assertEqual(outcome["episode_sequence"], episode["episode_sequence"])
+        self.assertEqual(events_path.read_bytes(), events_before)
+
+        completed = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="active")
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(
+            events_path.read_bytes().count(b'"event":"run.attention_required"'),
+            1,
+        )
+        self.assertEqual(
+            store.sealed_evidence_result(status["run_id"], episode["evidence"]),
+            outcome,
+        )
+
     def test_unavailable_attention_retrospective_preserves_attention_contract(self):
         (self.fake_bin / "codex").unlink()
 
