@@ -523,6 +523,11 @@ class RunStore:
             parameter_name="sequence",
         )[-1]
 
+    def event_history(self, run_id: str) -> list[dict[str, Any]]:
+        """Return the complete validated Event History without mutating the Run."""
+        events, _ = self._read_events(run_id)
+        return events
+
     def read_run_snapshot(
         self, run_id: str, *, through_sequence: int
     ) -> dict[str, Any]:
@@ -798,6 +803,22 @@ class RunStore:
             if not manifest_path.is_file():
                 return None
             self._verify_or_finish_seal(run_id, relative_directory)
+            return _read_evidence_result(directory / "result.json")
+
+    def observe_sealed_evidence_result(
+        self, run_id: str, relative_directory: str
+    ) -> Any | None:
+        """Read a fully sealed result without completing or repairing its seal."""
+        with self.lock():
+            directory = self._evidence_path(run_id, relative_directory)
+            manifest_path = directory / "manifest.json"
+            if manifest_path.is_symlink() or (
+                manifest_path.exists() and not manifest_path.is_file()
+            ):
+                raise EvidenceTampered("evidence manifest is invalid")
+            if not manifest_path.is_file():
+                return None
+            self.verify_evidence(run_id, relative_directory)
             return _read_evidence_result(directory / "result.json")
 
     def sealed_evidence_payloads(

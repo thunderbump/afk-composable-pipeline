@@ -182,7 +182,7 @@ def _run_retrospective_attempt_locked(
     )
     sealed = store.sealed_evidence_result(run_id, evidence)
     if sealed is not None:
-        outcome = _normalize_outcome(
+        outcome = normalize_retrospective_outcome(
             sealed,
             run_id=run_id,
             episode_sequence=episode_sequence,
@@ -485,7 +485,7 @@ def _recover_prepared_attempt(
             analysis,
         )
     else:
-        outcome = _normalize_outcome(
+        outcome = normalize_retrospective_outcome(
             recorded,
             run_id=run_id,
             episode_sequence=episode_sequence,
@@ -539,7 +539,7 @@ def _persist_attempt(
     outcome: dict[str, Any],
     claim_id: str,
 ) -> dict[str, Any]:
-    outcome = _normalize_outcome(
+    outcome = normalize_retrospective_outcome(
         outcome,
         run_id=run_id,
         episode_sequence=episode_sequence,
@@ -565,7 +565,7 @@ def _persist_attempt(
     store.reconcile_evidence_value(run_id, f"{evidence}/result.json", outcome)
     store.reconcile_evidence_value(run_id, f"{evidence}/outcome.json", outcome)
     store.seal_evidence(run_id, evidence)
-    sealed = _normalize_outcome(
+    sealed = normalize_retrospective_outcome(
         store.sealed_evidence_result(run_id, evidence),
         run_id=run_id,
         episode_sequence=episode_sequence,
@@ -1013,7 +1013,7 @@ def _warning_outcome(
     }
 
 
-def _normalize_outcome(
+def normalize_retrospective_outcome(
     value: Any,
     *,
     run_id: str,

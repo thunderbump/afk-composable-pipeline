@@ -57,6 +57,7 @@ from afk.registry import (
     default_step_registry,
 )
 from afk.run_store import RunStore, RunStoreError
+from afk.retrospective_status import build_retrospective_status
 from afk.start import (
     StartError,
     complete_run,
@@ -147,6 +148,9 @@ def main(
                 ):
                     raise observation_error
             output = dict(projection)
+            output["retrospective"] = build_retrospective_status(
+                store, projection["run_id"]
+            )
             if projection["state"] == "attention_required":
                 output["recommended_resume"] = ["afk", "resume"]
                 exit_code = 2
@@ -203,11 +207,38 @@ def main(
                     "resume_precondition=active_run_id:"
                     f"{output['resume_precondition']['active_run_id']}"
                 )
+            retrospective = output["retrospective"]
+            counts = retrospective["episode_counts"]
+            latest = retrospective["latest"]
+            fields = [
+                f"retrospective_status={retrospective['status']}",
+                f"retrospective_episodes={counts['total']}",
+                f"retrospective_sealed={counts['sealed']}",
+                f"retrospective_warnings={counts['warning']}",
+                f"retrospective_absent={counts['absent']}",
+                (
+                    "retrospective_findings="
+                    f"{retrospective['process_findings_count']}"
+                ),
+                (
+                    "retrospective_proposals="
+                    f"{retrospective['improvement_proposals_count']}"
+                ),
+                (
+                    "retrospective_path="
+                    f"{latest['evidence_path'] if latest is not None else 'absent'}"
+                ),
+            ]
+            print(" ".join(fields))
         return exit_code
 
     if args.command == "report":
         try:
-            projection = RunStore().status(args.run_id)
+            store = RunStore()
+            projection = store.status(args.run_id)
+            projection["retrospective"] = build_retrospective_status(
+                store, projection["run_id"]
+            )
             report = _run_report(projection)
         except (CandidateValidationError, RunStoreError) as exc:
             parser.error(str(exc))
@@ -219,6 +250,9 @@ def main(
             projection = complete_run(
                 args.run_id,
                 on_selected=on_lifecycle_target,
+            )
+            projection["retrospective"] = build_retrospective_status(
+                RunStore(), projection["run_id"]
             )
             report = _run_report(projection)
         except (StartError, RunStoreError) as exc:
@@ -855,6 +889,7 @@ def _run_report(projection: dict[str, Any]) -> dict[str, Any]:
     for key in ("candidate_sha", "attention"):
         if key in projection:
             report[key] = projection[key]
+    report["retrospective"] = projection["retrospective"]
     contract = projection.get("validation_contract")
     candidate_sha = projection.get("candidate_sha")
     if (
