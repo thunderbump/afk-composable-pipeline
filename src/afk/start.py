@@ -3048,6 +3048,18 @@ def _attention(
     classification: str | None = None,
     **details: Any,
 ) -> None:
+    current = store.status(run_id)
+    prior_sequence = None
+    if (
+        current["state"] == "attention_required"
+        and current.get("attention_episode") is not None
+    ):
+        prior_sequence = current["attention_episode"]["episode_sequence"]
+        run_retrospective_attempt(
+            store,
+            run_id,
+            episode_sequence=prior_sequence,
+        )
     projection = store.record_attention_episode(
         run_id,
         checkpoint=checkpoint,
@@ -3060,11 +3072,12 @@ def _attention(
         details=details,
     )
     episode = projection["attention_episode"]
-    run_retrospective_attempt(
-        store,
-        run_id,
-        episode_sequence=episode["episode_sequence"],
-    )
+    if episode["episode_sequence"] != prior_sequence:
+        run_retrospective_attempt(
+            store,
+            run_id,
+            episode_sequence=episode["episode_sequence"],
+        )
 
 
 def _required(

@@ -17,7 +17,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from afk import candidate_validation  # noqa: E402
 from afk.run_store import RunStore  # noqa: E402
-from afk.start import approve_bootstrap_validation  # noqa: E402
+from afk.start import approve_bootstrap_validation, resume_run  # noqa: E402
 
 
 WRITE_PASSED_LOG = (
@@ -944,6 +944,73 @@ class CandidateValidationCliTest(unittest.TestCase):
         completed = self.run_afk("resume")
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertEqual(self.status(run_id)["checkpoint"], "validated")
+
+    def test_bootstrap_approval_seals_prior_crashed_attention_episode(self):
+        self.git("commit", "--allow-empty", "-m", "base without validation harness")
+        base_sha = self.git("rev-parse", "HEAD")
+        scripts = self.repository / "scripts"
+        scripts.mkdir()
+        harness = scripts / "validate.sh"
+        harness.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        harness.chmod(0o755)
+        self.git("add", ".")
+        self.git("commit", "-m", "propose bootstrap validation harness")
+        candidate_sha = self.git("rev-parse", "HEAD")
+        run_id = self.create_ready_run(
+            candidate_sha=candidate_sha,
+            base_sha=base_sha,
+            validation_contract={
+                "source": "approved_bootstrap",
+                "base_sha": base_sha,
+                "adapter_id": "afk.builtin.bootstrap-validation/v1",
+            },
+            legacy_attention=False,
+        )
+
+        with (
+            patch.dict(os.environ, {"XDG_STATE_HOME": str(self.state_home)}),
+            patch(
+                "afk.start.run_retrospective_attempt",
+                side_effect=RuntimeError("injected crash"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "injected crash"),
+        ):
+            resume_run()
+
+        store = RunStore(self.state_home / "afk")
+        crashed = store.status(run_id)
+        prior_episode = crashed["attention_episode"]
+        prior_event = store.event(run_id, prior_episode["episode_sequence"])
+        self.assertEqual(
+            prior_event["data"]["attention"]["summary"],
+            "bootstrap validation requires explicit operator approval",
+        )
+        self.assertIsNone(
+            store.sealed_evidence_result(run_id, prior_episode["evidence"])
+        )
+
+        with patch.dict(os.environ, {"XDG_STATE_HOME": str(self.state_home)}):
+            approve_bootstrap_validation(
+                "scripts/validate.sh",
+                timeout_seconds=5,
+                run_id=run_id,
+            )
+
+        approved = store.status(run_id)
+        approved_episode = approved["attention_episode"]
+        self.assertNotEqual(approved_episode, prior_episode)
+        self.assertEqual(
+            store.event(run_id, approved_episode["episode_sequence"])["data"][
+                "attention"
+            ]["summary"],
+            "approved bootstrap validation is ready",
+        )
+        for episode in (prior_episode, approved_episode):
+            outcome = store.sealed_evidence_result(run_id, episode["evidence"])
+            self.assertEqual(
+                outcome["episode_sequence"],
+                episode["episode_sequence"],
+            )
 
     def test_bootstrap_adapter_imports_as_a_package_module(self):
         environment = os.environ.copy()
@@ -2090,7 +2157,14 @@ class CandidateValidationCliTest(unittest.TestCase):
             candidate_sha,
         )
 
-    def create_ready_run(self, *, candidate_sha, base_sha, validation_contract):
+    def create_ready_run(
+        self,
+        *,
+        candidate_sha,
+        base_sha,
+        validation_contract,
+        legacy_attention=True,
+    ):
         store = RunStore(self.state_home / "afk")
         run_id = store.create_run(
             bead_id="central-test.1",
@@ -2124,28 +2198,29 @@ class CandidateValidationCliTest(unittest.TestCase):
                 ],
             },
         )
-        store.append_event(
-            run_id,
-            "run.attention_required",
-            state="attention_required",
-            data={
-                "checkpoint": "candidate_ready",
-                "attention": {
-                    "scope": "validation",
-                    "kind": "unavailable",
-                    "summary": "validation is not available in this AFK slice",
+        if legacy_attention:
+            store.append_event(
+                run_id,
+                "run.attention_required",
+                state="attention_required",
+                data={
+                    "checkpoint": "candidate_ready",
+                    "attention": {
+                        "scope": "validation",
+                        "kind": "unavailable",
+                        "summary": "validation is not available in this AFK slice",
+                    },
                 },
-            },
-        )
-        store.append_event(
-            run_id,
-            "worker.terminal",
-            data={
-                "checkpoint": "candidate_ready",
-                "worker_exit_code": 2,
-                "worker_result": "attention_required",
-            },
-        )
+            )
+            store.append_event(
+                run_id,
+                "worker.terminal",
+                data={
+                    "checkpoint": "candidate_ready",
+                    "worker_exit_code": 2,
+                    "worker_result": "attention_required",
+                },
+            )
         return run_id
 
     def run_afk(self, *args, **overrides):
