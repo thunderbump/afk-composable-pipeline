@@ -809,17 +809,16 @@ class RunStore:
         self, run_id: str, relative_directory: str
     ) -> Any | None:
         """Read a fully sealed result without completing or repairing its seal."""
-        with self.lock():
-            directory = self._evidence_path(run_id, relative_directory)
-            manifest_path = directory / "manifest.json"
-            if manifest_path.is_symlink() or (
-                manifest_path.exists() and not manifest_path.is_file()
-            ):
-                raise EvidenceTampered("evidence manifest is invalid")
-            if not manifest_path.is_file():
-                return None
-            self.verify_evidence(run_id, relative_directory)
-            return _read_evidence_result(directory / "result.json")
+        directory = self._evidence_path(run_id, relative_directory)
+        manifest_path = directory / "manifest.json"
+        if manifest_path.is_symlink() or (
+            manifest_path.exists() and not manifest_path.is_file()
+        ):
+            raise EvidenceTampered("evidence manifest is invalid")
+        if not manifest_path.is_file():
+            return None
+        self.verify_evidence(run_id, relative_directory)
+        return _read_evidence_result(directory / "result.json")
 
     def sealed_evidence_payloads(
         self, run_id: str, relative_directory: str

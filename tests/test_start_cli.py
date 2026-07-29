@@ -8928,6 +8928,102 @@ class StartCliTest(unittest.TestCase):
         self.assertFalse((run_dir / episode["evidence"] / "manifest.json").exists())
         self.assertFalse(self.command_log.exists())
 
+    def test_status_and_report_observe_retrospective_while_mutator_lock_is_held(self):
+        store = RunStore(self.state_home / "afk")
+        store.create_run(
+            bead_id="central-bnkl.1.1",
+            repository="thunderbump/beads-webui",
+            base_branch="main",
+            base_sha=BASE_SHA,
+            start_request={},
+            run_id="locked-retrospective-run",
+        )
+        store.record_attention_episode(
+            "locked-retrospective-run",
+            checkpoint="created",
+            attention={
+                "scope": "worker_launch",
+                "kind": "unavailable",
+                "summary": "worker launch unavailable",
+            },
+        )
+        store.append_event(
+            "locked-retrospective-run",
+            "worker.terminal",
+            data={
+                "checkpoint": "created",
+                "worker_exit_code": 2,
+                "worker_result": "attention_required",
+            },
+        )
+
+        with store.lock():
+            status = self.run_afk("status", "locked-retrospective-run", "--json")
+            report = self.run_afk("report", "locked-retrospective-run")
+
+        self.assertEqual(status.returncode, 2, status.stderr)
+        self.assertEqual(report.returncode, 0, report.stderr)
+        for completed in (status, report):
+            retrospective = json.loads(completed.stdout)["retrospective"]
+            self.assertEqual(retrospective["status"], "absent")
+            self.assertEqual(
+                retrospective["episode_counts"],
+                {"total": 1, "sealed": 0, "warning": 0, "absent": 1},
+            )
+
+    def test_status_and_report_do_not_recreate_the_removed_store_lock(self):
+        store_root = self.state_home / "afk"
+        store = RunStore(store_root)
+        store.create_run(
+            bead_id="central-bnkl.1.1",
+            repository="thunderbump/beads-webui",
+            base_branch="main",
+            base_sha=BASE_SHA,
+            start_request={},
+            run_id="lockless-retrospective-run",
+        )
+        store.record_attention_episode(
+            "lockless-retrospective-run",
+            checkpoint="created",
+            attention={
+                "scope": "worker_launch",
+                "kind": "unavailable",
+                "summary": "worker launch unavailable",
+            },
+        )
+        store.append_event(
+            "lockless-retrospective-run",
+            "worker.terminal",
+            data={
+                "checkpoint": "created",
+                "worker_exit_code": 2,
+                "worker_result": "attention_required",
+            },
+        )
+        lock_path = store_root / "afk.lock"
+        lock_path.unlink()
+
+        def snapshot():
+            paths = [store_root, *store_root.rglob("*")]
+            return {
+                path.relative_to(store_root).as_posix()
+                or ".": (
+                    path.read_bytes() if path.is_file() else None,
+                    stat.S_IMODE(path.stat().st_mode),
+                )
+                for path in paths
+            }
+
+        before = snapshot()
+
+        status = self.run_afk("status", "lockless-retrospective-run", "--json")
+        report = self.run_afk("report", "lockless-retrospective-run")
+
+        self.assertEqual(status.returncode, 2, status.stderr)
+        self.assertEqual(report.returncode, 0, report.stderr)
+        self.assertEqual(snapshot(), before)
+        self.assertFalse(lock_path.exists())
+
     def test_status_identifies_the_latest_completed_retrospective_episode(self):
         store = RunStore(self.state_home / "afk")
         store.create_run(
