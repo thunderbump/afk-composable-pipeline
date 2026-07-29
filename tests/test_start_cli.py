@@ -20,7 +20,12 @@ sys.path.insert(0, str(ROOT / "src"))
 
 import afk.run_store as run_store_module  # noqa: E402
 from afk.bead_spec import bead_spec_identity, persist_bead_spec  # noqa: E402
-from afk.run_store import RunStore, RunStoreBusy, RunStoreError  # noqa: E402
+from afk.run_store import (  # noqa: E402
+    ActiveRunExists,
+    RunStore,
+    RunStoreBusy,
+    RunStoreError,
+)
 from afk.start import (  # noqa: E402
     StartError,
     _beads_password,
@@ -5286,6 +5291,113 @@ class StartCliTest(unittest.TestCase):
         self.assertEqual(store.sealed_evidence_result(run_id, retrospective), outcome)
         self.assertEqual(manifest_path.read_bytes(), manifest_before)
         self.assertEqual(events_path.read_bytes().count(b'"event":"run.completed"'), 1)
+
+    def test_missing_active_pointer_recovers_pending_completion_episode(self):
+        run_id = self.start_reviewed_run()
+        for _ in range(3):
+            self.assertEqual(self.run_afk("resume").returncode, 0)
+        interrupted = self.run_afk(
+            "resume", AFK_TEST_KILL_AFTER_EVENT_WRITE="run.completed"
+        )
+        self.assertLess(interrupted.returncode, 0)
+        store = RunStore(self.state_home / "afk")
+        completed = store.status(run_id)
+        episode = completed["completion_episode"]
+        (self.state_home / "afk" / "active.json").unlink()
+
+        with self.assertRaises(ActiveRunExists):
+            store.create_run(
+                bead_id="central-bnkl.1.2",
+                repository="thunderbump/beads-webui",
+                base_branch="main",
+                base_sha="a" * 40,
+                run_id="new-run",
+            )
+
+        resumed = self.run_afk("resume")
+
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        self.assertEqual(resumed.stdout.strip(), run_id)
+        self.assertEqual(
+            store.sealed_evidence_result(run_id, episode["evidence"])[
+                "episode_sequence"
+            ],
+            episode["episode_sequence"],
+        )
+        effect = store.effect(run_id, episode["effect_id"])
+        self.assertEqual(effect["status"], "confirmed")
+        self.assertEqual(effect["observed"]["evidence"], episode["evidence"])
+        self.assertFalse((self.state_home / "afk" / "active.json").exists())
+
+    def test_named_resume_of_legacy_completion_does_not_start_retrospective(self):
+        store = RunStore(self.state_home / "afk")
+        store.create_run(
+            bead_id="central-bnkl.1.1",
+            repository="thunderbump/beads-webui",
+            base_branch="main",
+            base_sha="a" * 40,
+            run_id="legacy-completed",
+        )
+        legacy_completion = {
+            "schema_version": 1,
+            "repository": "thunderbump/beads-webui",
+            "bead_id": "central-bnkl.1.1",
+            "candidate_sha": "d" * 40,
+            "pr_number": 17,
+            "pr_url": "https://example.test/pr/17",
+            "merge_commit": "f" * 40,
+            "bead_closure": {"status": "closed"},
+            "remote_branch_deleted": True,
+            "worktree_removed": True,
+            "local_branch_deleted": True,
+            "cleanup_warnings": [],
+            "evidence": "gates/completion-dddddddddddd",
+        }
+        store.append_event(
+            "legacy-completed",
+            "run.completed",
+            state="completed",
+            data={
+                "checkpoint": "completed",
+                "attention": {},
+                "completion": legacy_completion,
+            },
+        )
+
+        with (
+            patch.dict(os.environ, self.afk_environment()),
+            patch("afk.start.run_retrospective_attempt") as retrospective,
+        ):
+            resumed = resume_run("legacy-completed")
+
+        self.assertEqual(resumed, ("legacy-completed", 0))
+        retrospective.assert_not_called()
+
+    def test_worker_terminal_after_completion_preserves_episode_replay(self):
+        run_id = self.start_reviewed_run()
+        for _ in range(4):
+            self.assertEqual(self.run_afk("resume").returncode, 0)
+        store = RunStore(self.state_home / "afk")
+        completed = store.status(run_id)
+        episode = completed["completion_episode"]
+        events_path = self.state_home / "afk" / "runs" / run_id / "events.jsonl"
+
+        with (
+            patch.dict(os.environ, self.afk_environment()),
+            patch("afk.start.run_worker", return_value=0),
+        ):
+            self.assertEqual(run_worker_unit(run_id), 0)
+
+        terminal = store.status(run_id)
+        self.assertEqual(terminal["last_event"], "worker.terminal")
+        self.assertEqual(terminal["completion_episode"], episode)
+        resumed = self.run_afk("resume", run_id)
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        self.assertEqual(store.status(run_id)["last_event"], "worker.terminal")
+        self.assertEqual(
+            events_path.read_bytes().count(b'"event":"run.completed"'),
+            1,
+        )
 
     def test_named_resume_of_retained_completed_run_is_idempotent(self):
         run_id = self.start_reviewed_run()

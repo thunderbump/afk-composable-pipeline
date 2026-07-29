@@ -167,6 +167,25 @@ class RunStoreTest(unittest.TestCase):
         next_run = self.create_run("run-002")
         self.assertEqual(next_run["run_id"], "run-002")
 
+    def test_record_completion_episode_persists_its_exact_retrospective_identity(self):
+        self.create_run()
+
+        completed = self.store.record_completion_episode(
+            "run-001",
+            completion={"schema_version": 1, "evidence": "gates/completion-aaaa"},
+        )
+
+        self.assertEqual(
+            completed["completion_episode"],
+            {
+                "schema_version": 1,
+                "episode_sequence": 2,
+                "evidence": "retrospective/completed-2",
+                "effect_id": "retrospective-analysis-2",
+            },
+        )
+        self.assertEqual(self.store.active_run_id(), "run-001")
+
     def test_resume_recovers_completion_after_active_pointer_unlink_fails(self):
         self.create_run()
         active_path = self.root / "active.json"

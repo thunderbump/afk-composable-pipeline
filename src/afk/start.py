@@ -180,14 +180,13 @@ def resume_run(
     store = RunStore()
     if run_id is not None:
         with store.lock(validate_root_permissions=True):
-            projection = store.reconcile_completed_active_pointer(run_id)
+            projection = store.resume_completed_status(run_id)
             if on_selected is not None:
                 on_selected(projection["run_id"])
             if projection["state"] == "completed":
-                if projection.get("completion") is not None:
+                if projection.get("completion_episode") is not None:
                     _reconcile_completed_run(store, run_id, projection)
                 return run_id, 0
-        raise StartError("named resume is only available for a completed Run")
     with store.lock(validate_root_permissions=True):
         try:
             projection = store.resume_status()
@@ -217,7 +216,7 @@ def resume_run(
         if on_selected is not None:
             on_selected(selected_run_id)
         if projection["state"] == "completed":
-            if projection.get("completion") is not None:
+            if projection.get("completion_episode") is not None:
                 _reconcile_completed_run(store, selected_run_id, projection)
             return selected_run_id, 0
         run_id = selected_run_id
@@ -1911,16 +1910,9 @@ def _record_completed_run(
     run_id: str,
     completion: dict[str, Any],
 ) -> None:
-    projection = store.append_event(
+    projection = store.record_completion_episode(
         run_id,
-        "run.completed",
-        state="completed",
-        data={
-            "checkpoint": "completed",
-            "attention": {},
-            "completion": completion,
-        },
-        finalize_completed=False,
+        completion=completion,
     )
     _reconcile_completed_run(store, run_id, projection)
 
@@ -1930,16 +1922,13 @@ def _reconcile_completed_run(
     run_id: str,
     projection: dict[str, Any],
 ) -> None:
-    episode_sequence = projection["last_sequence"]
+    episode = projection["completion_episode"]
     run_retrospective_attempt(
         store,
         run_id,
-        episode_sequence=episode_sequence,
+        episode_sequence=episode["episode_sequence"],
     )
-    store.reconcile_completed_active_pointer(
-        run_id,
-        retrospective_sequence=episode_sequence,
-    )
+    store.finalize_completion_episode(run_id)
 
 
 def _validate_completion_record(
