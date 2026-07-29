@@ -625,6 +625,24 @@ class RunStore:
             self._verify_or_finish_seal(run_id, relative_directory)
             return _read_evidence_result(directory / "result.json")
 
+    def sealed_evidence_payloads(
+        self, run_id: str, relative_directory: str
+    ) -> dict[str, str]:
+        """Return every verified UTF-8 payload from one sealed evidence unit."""
+        with self.lock():
+            directory = self._evidence_path(run_id, relative_directory)
+            self._verify_or_finish_seal(run_id, relative_directory)
+            payloads = {}
+            for path in _evidence_files(directory):
+                relative = path.relative_to(directory).as_posix()
+                try:
+                    payloads[relative] = path.read_text(encoding="utf-8")
+                except (OSError, UnicodeDecodeError) as exc:
+                    raise EvidenceTampered(
+                        "sealed evidence payload is invalid"
+                    ) from exc
+            return payloads
+
     def _verify_or_finish_seal(self, run_id: str, relative_directory: str) -> None:
         try:
             self.verify_evidence(run_id, relative_directory)
@@ -670,6 +688,77 @@ class RunStore:
             ):
                 raise EvidenceError("unsealed evidence result is partial or ambiguous")
             return _read_evidence_result(result_path)
+
+    def partial_evidence_result(
+        self, run_id: str, relative_directory: str
+    ) -> Any | None:
+        """Return an unsealed result marker while other evidence may be partial."""
+        with self.lock():
+            directory = self._evidence_path(run_id, relative_directory)
+            manifest_path = directory / "manifest.json"
+            if manifest_path.exists() or manifest_path.is_symlink():
+                raise EvidenceError("partial evidence contains an invalid manifest")
+            result_path = directory / "result.json"
+            if not result_path.exists() and not result_path.is_symlink():
+                return None
+            if result_path.is_symlink() or not result_path.is_file():
+                raise EvidenceError("partial evidence result is invalid")
+            return _read_evidence_result(result_path)
+
+    def partial_evidence_files(
+        self, run_id: str, relative_directory: str
+    ) -> tuple[str, ...]:
+        """Return validated relative file names from one unsealed evidence unit."""
+        with self.lock():
+            directory = self._evidence_path(run_id, relative_directory)
+            manifest_path = directory / "manifest.json"
+            if manifest_path.exists() or manifest_path.is_symlink():
+                raise EvidenceError("partial evidence contains an invalid manifest")
+            if not directory.exists():
+                return ()
+            if directory.is_symlink() or not directory.is_dir():
+                raise EvidenceError("partial evidence directory is invalid")
+            files = _evidence_files(directory)
+            _validate_evidence_sizes(files, _tree_limit(relative_directory))
+            return tuple(path.relative_to(directory).as_posix() for path in files)
+
+    def partial_evidence_value(self, run_id: str, relative_path: str) -> Any:
+        """Read one structured value from unsealed evidence."""
+        with self.lock():
+            path = self._evidence_path(run_id, relative_path)
+            run_dir = self._run_dir(run_id)
+            if _sealed_ancestor(path, run_dir):
+                raise EvidenceError("partial evidence is already sealed")
+            if path.is_symlink() or not path.is_file():
+                raise EvidenceError("partial evidence value is invalid")
+            return _read_evidence_result(path)
+
+    def reconcile_evidence_value(
+        self, run_id: str, relative_path: str, value: Any
+    ) -> Any:
+        """Write an unsealed value once or verify its exact canonical bytes."""
+        with self.lock():
+            path = self._evidence_path(run_id, relative_path)
+            run_dir = self._run_dir(run_id)
+            if path == _evidence_unit_root(path, run_dir) / "manifest.json":
+                raise EvidenceError("manifest.json is reserved")
+            if _sealed_ancestor(path, run_dir):
+                raise EvidenceError("completed evidence is read-only")
+            expected = redact_artifact_value(value)
+            encoded = (canonical_json(expected) + "\n").encode("utf-8")
+            if path.exists() or path.is_symlink():
+                if path.is_symlink() or not path.is_file():
+                    raise EvidenceError("partial evidence value is invalid")
+                try:
+                    observed = path.read_bytes()
+                except OSError as exc:
+                    raise EvidenceError("partial evidence value is invalid") from exc
+                if observed != encoded:
+                    raise EvidenceError(
+                        "partial evidence contradicts its expected value"
+                    )
+                return expected
+            return self.write_evidence_value(run_id, relative_path, expected)
 
     def _append_event_unlocked(
         self,

@@ -10,13 +10,13 @@ import stat
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 from contextlib import ExitStack
 from pathlib import Path
 from typing import Any
 
 from afk.jsonutil import canonical_json
+from afk.process_io import BoundedProcessIO
 from afk.redaction import redact_text
 from afk.run_store import GATE_BYTE_LIMIT, RunStore, RunStoreError
 from afk.validation_contract import (
@@ -778,47 +778,41 @@ def run_supervised_command(
         except CandidateValidationError:
             descendants.terminate_untracked(process)
             raise
-        assert process.stdout is not None and process.stderr is not None
-        input_bytes = memoryview(input_text.encode("utf-8")) if input_text else None
-        input_offset = 0
-        if process.stdin is not None:
-            os.set_blocking(process.stdin.fileno(), False)
-        captured = {"stdout": bytearray(), "stderr": bytearray()}
-        overflow = threading.Event()
-        readers = [
-            threading.Thread(
-                target=_capture_output,
-                args=(stream, captured[name], overflow),
-                daemon=True,
-            )
-            for name, stream in (
-                ("stdout", process.stdout),
-                ("stderr", process.stderr),
-            )
-        ]
-        for reader in readers:
-            reader.start()
-        while process.poll() is None and not overflow.is_set():
+        process_io = BoundedProcessIO(
+            process,
+            input_bytes=None if input_text is None else input_text.encode("utf-8"),
+            output_byte_limit=OUTPUT_BYTE_LIMIT,
+            cleanup_seconds=PROCESS_CLEANUP_SECONDS,
+        )
+        while process.poll() is None:
             descendants.discover(process.pid)
-            if time.monotonic() >= deadline:
-                _close_process_input(process)
+            stop_reason = process_io.observe(deadline)
+            if stop_reason == "timeout":
+                process_io.close_input()
                 descendants.terminate(process.pid)
                 process.poll()
-                _join_readers(readers)
-                stdout, stderr = _diagnostic_output(captured)
+                if not process_io.drain():
+                    raise CandidateValidationError(
+                        "interrupted",
+                        "validation output streams could not be drained",
+                    )
+                stdout, stderr = process_io.diagnostics()
                 raise CandidateValidationError(
                     "interrupted",
                     f"{subject} timed out and its process tree was terminated",
                     stdout=stdout,
                     stderr=stderr,
                 )
-            if process.stdin is not None:
-                input_offset = _feed_process_input(process, input_bytes, input_offset)
-            overflow.wait(0.01)
-        _close_process_input(process)
+            if stop_reason == "overflow":
+                break
+        process_io.close_input()
         descendants.terminate(process.pid)
-        _join_readers(readers)
-        if overflow.is_set():
+        process.poll()
+        if not process_io.drain():
+            raise CandidateValidationError(
+                "interrupted", "validation output streams could not be drained"
+            )
+        if process_io.overflowed:
             raise CandidateValidationError(
                 "invalid",
                 f"{subject} output exceeds the size limit",
@@ -831,7 +825,7 @@ def run_supervised_command(
                 signal_name = signal.Signals(signal_number).name
             except ValueError:
                 signal_name = str(signal_number)
-            stdout, stderr = _diagnostic_output(captured)
+            stdout, stderr = process_io.diagnostics()
             raise CandidateValidationError(
                 "interrupted",
                 f"{subject} exited after signal {signal_name}",
@@ -839,82 +833,16 @@ def run_supervised_command(
                 stderr=stderr,
             )
         try:
-            stdout = bytes(captured["stdout"]).decode("utf-8")
-            stderr = bytes(captured["stderr"]).decode("utf-8")
+            stdout, stderr = process_io.decoded_output()
         except UnicodeDecodeError as exc:
-            diagnostic_stdout, diagnostic_stderr = _diagnostic_output(captured)
+            diagnostic_stdout, diagnostic_stderr = process_io.diagnostics()
             raise CandidateValidationError(
                 "invalid",
                 f"{subject} output must be UTF-8 text",
                 stdout=diagnostic_stdout,
                 stderr=diagnostic_stderr,
             ) from exc
-        return subprocess.CompletedProcess(
-            command, process.returncode, redact_text(stdout), redact_text(stderr)
-        )
-
-
-def _feed_process_input(
-    process: subprocess.Popen[bytes],
-    input_bytes: memoryview | None,
-    input_offset: int,
-) -> int:
-    assert process.stdin is not None
-    if input_bytes is None or input_offset == len(input_bytes):
-        process.stdin.close()
-        process.stdin = None
-        return input_offset
-    try:
-        written = os.write(process.stdin.fileno(), input_bytes[input_offset:])
-    except BlockingIOError:
-        return input_offset
-    except BrokenPipeError:
-        process.stdin.close()
-        process.stdin = None
-        return input_offset
-    input_offset += written
-    if input_offset == len(input_bytes):
-        process.stdin.close()
-        process.stdin = None
-    return input_offset
-
-
-def _close_process_input(process: subprocess.Popen[bytes]) -> None:
-    if process.stdin is not None:
-        process.stdin.close()
-        process.stdin = None
-
-
-def _capture_output(
-    stream: Any,
-    captured: bytearray,
-    overflow: threading.Event,
-) -> None:
-    try:
-        while chunk := stream.read(64 * 1024):
-            if len(captured) + len(chunk) > OUTPUT_BYTE_LIMIT:
-                overflow.set()
-            elif not overflow.is_set():
-                captured.extend(chunk)
-    finally:
-        stream.close()
-
-
-def _diagnostic_output(captured: dict[str, bytearray]) -> tuple[str, str]:
-    return tuple(
-        redact_text(bytes(captured[name]).decode("utf-8", errors="replace"))
-        for name in ("stdout", "stderr")
-    )
-
-
-def _join_readers(readers: list[threading.Thread]) -> None:
-    deadline = time.monotonic() + PROCESS_CLEANUP_SECONDS
-    for reader in readers:
-        reader.join(timeout=max(deadline - time.monotonic(), 0))
-    if any(reader.is_alive() for reader in readers):
-        raise CandidateValidationError(
-            "interrupted", "validation output streams could not be drained"
-        )
+        return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
 
 
 class _LinuxDescendantSupervisor:

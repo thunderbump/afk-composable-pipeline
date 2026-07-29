@@ -15,7 +15,7 @@ from afk.run_summary import (
 
 
 COLLECTION_LIMIT = 32
-CATEGORIES = {
+CATEGORIES = (
     "orchestration",
     "implementation",
     "validation",
@@ -26,10 +26,10 @@ CATEGORIES = {
     "environment",
     "operator_process",
     "evidence",
-}
-CONFIDENCE = {"high", "medium", "low"}
-SCOPES = {"afk", "target_repository", "environment", "operator_process"}
-PRIORITIES = {"P0", "P1", "P2", "P3"}
+)
+CONFIDENCE = ("high", "medium", "low")
+SCOPES = ("afk", "target_repository", "environment", "operator_process")
+PRIORITIES = ("P0", "P1", "P2", "P3")
 RESULT_KEYS = {
     "schema_version",
     "run_id",
