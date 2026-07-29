@@ -7699,6 +7699,110 @@ class StartCliTest(unittest.TestCase):
 
         self.assert_resume_preflight_rejected("Event History record 1 is invalid")
 
+    def test_resume_rejects_forged_attention_marker_before_retrospective_mutation(
+        self,
+    ):
+        store, run_dir = self.create_resume_preflight_run()
+        attention = {
+            "scope": "worker_launch",
+            "kind": "unavailable",
+            "summary": "worker launch failed",
+        }
+        episode = store.record_attention_episode(
+            "crashed-run",
+            checkpoint="created",
+            attention=attention,
+        )["attention_episode"]
+        forged_sequence = store.status("crashed-run")["last_sequence"] + 1
+        store.append_event(
+            "crashed-run",
+            "attention.marker_forged",
+            data={
+                "attention_episode": {
+                    "schema_version": 1,
+                    "episode_sequence": forged_sequence,
+                    "evidence": f"retrospective/attention-{forged_sequence}",
+                    "effect_id": f"retrospective-analysis-{forged_sequence}",
+                }
+            },
+        )
+        events_before = (run_dir / "events.jsonl").read_bytes()
+        effects_before = {
+            path.name: path.read_bytes() for path in (run_dir / "effects").iterdir()
+        }
+        retrospective_before = tuple((run_dir / "retrospective").iterdir())
+
+        resumed = self.run_afk("resume")
+
+        self.assertEqual(resumed.returncode, 2)
+        self.assertIn("attention episode marker is invalid", resumed.stderr)
+        self.assertEqual((run_dir / "events.jsonl").read_bytes(), events_before)
+        self.assertEqual(
+            {path.name: path.read_bytes() for path in (run_dir / "effects").iterdir()},
+            effects_before,
+        )
+        self.assertEqual(
+            tuple((run_dir / "retrospective").iterdir()), retrospective_before
+        )
+        self.assertIsNone(
+            store.sealed_evidence_result("crashed-run", episode["evidence"])
+        )
+        self.assertFalse(self.command_log.exists())
+
+    def test_resume_rejects_erased_attention_marker_before_retrospective_mutation(self):
+        store, run_dir = self.create_resume_preflight_run()
+        episode = store.record_attention_episode(
+            "crashed-run",
+            checkpoint="created",
+            attention={
+                "scope": "worker_launch",
+                "kind": "unavailable",
+                "summary": "worker launch failed",
+            },
+        )["attention_episode"]
+        store.append_event(
+            "crashed-run",
+            "attention.marker_erased",
+            data={"attention_episode": None},
+        )
+        events_before = (run_dir / "events.jsonl").read_bytes()
+        effect_path = run_dir / "effects" / f"{episode['effect_id']}.json"
+        evidence_path = run_dir / episode["evidence"]
+
+        resumed = self.run_afk("resume")
+
+        self.assertEqual(resumed.returncode, 2)
+        self.assertIn("attention episode marker is invalid", resumed.stderr)
+        self.assertEqual((run_dir / "events.jsonl").read_bytes(), events_before)
+        self.assertFalse(effect_path.exists())
+        self.assertFalse(evidence_path.exists())
+        self.assertFalse(self.command_log.exists())
+
+    def test_resume_preserves_legacy_attention_without_an_episode_marker(self):
+        store, _ = self.create_resume_preflight_run()
+        store.append_event(
+            "crashed-run",
+            "run.attention_required",
+            state="attention_required",
+            data={
+                "checkpoint": "created",
+                "attention": {
+                    "scope": "worker_launch",
+                    "kind": "unavailable",
+                    "summary": "legacy worker launch failure",
+                },
+            },
+        )
+        self.assertNotIn("attention_episode", store.status("crashed-run"))
+
+        resumed = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="active")
+
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        self.assertEqual(
+            store.effect("crashed-run", "worker-launch-1")["status"],
+            "confirmed",
+        )
+
     def test_resume_rejects_misbound_open_validation_attempt_before_commands(self):
         store, _ = self.create_resume_preflight_run()
         store.append_event(

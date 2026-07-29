@@ -495,6 +495,7 @@ class RunStore:
             _require_mode(active_path, 0o600, "Active Run pointer")
         active_run_id = self._active_pointer_run_id(invalid_is_error=True)
         projection = self.status(run_id)
+        self._validated_attention_episode(projection["run_id"], projection)
         events = self._validate_resume_projection(projection)
         invalid = validate_open_attempts(projection, events)
         if invalid is not None:
@@ -1696,9 +1697,10 @@ def _episode_marker(
     evidence_name: str,
     projection_state: str | None = None,
 ) -> dict[str, Any] | None:
-    episode = projection.get(f"{name}_episode")
-    if episode is None:
+    marker_name = f"{name}_episode"
+    if marker_name not in projection:
         return None
+    episode = projection[marker_name]
     sequence = episode.get("episode_sequence") if isinstance(episode, dict) else None
     expected = {
         "schema_version": 1,
