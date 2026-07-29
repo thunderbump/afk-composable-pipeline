@@ -2723,6 +2723,35 @@ class StartCliTest(unittest.TestCase):
         )
         self.assertNotEqual(events_path.read_bytes(), events_after_handoff)
 
+        with patch.dict(os.environ, self.afk_environment()):
+            record_lifecycle_interruption(run_id, signal.SIGTERM)
+        repeated_signal = self.run_afk("resume")
+
+        self.assertEqual(repeated_signal.returncode, 2, repeated_signal.stderr)
+        later = store.status(run_id)["attention_episode"]
+        self.assertGreater(later["episode_sequence"], episode["episode_sequence"])
+        later_outcome = store.sealed_evidence_result(run_id, later["evidence"])
+        self.assertEqual(
+            later_outcome["episode_sequence"],
+            later["episode_sequence"],
+        )
+        self.assertEqual(
+            events_path.read_bytes().count(b'"event":"run.attention_required"'),
+            2,
+        )
+
+        recovered = self.run_afk("resume")
+
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        self.assertEqual(
+            events_path.read_bytes().count(b'"event":"run.attention_required"'),
+            2,
+        )
+        self.assertEqual(
+            store.sealed_evidence_result(run_id, later["evidence"]),
+            later_outcome,
+        )
+
     def test_unnamed_resume_latches_signal_until_locked_target_lookup_completes(self):
         state_name = "lifecycle-target-lookup"
         run_id, _, environment = self.start_isolated_validation_run(state_name)
