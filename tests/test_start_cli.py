@@ -20,10 +20,17 @@ sys.path.insert(0, str(ROOT / "src"))
 
 import afk.run_store as run_store_module  # noqa: E402
 from afk.bead_spec import bead_spec_identity, persist_bead_spec  # noqa: E402
-from afk.run_store import RunStore, RunStoreBusy, RunStoreError  # noqa: E402
+from afk.run_store import (  # noqa: E402
+    ActiveRunExists,
+    EventHistoryCorrupt,
+    RunStore,
+    RunStoreBusy,
+    RunStoreError,
+)
 from afk.start import (  # noqa: E402
     StartError,
     _beads_password,
+    resume_run,
     run_worker_unit,
     start_run,
 )
@@ -42,6 +49,7 @@ CRASH_INJECTION_OVERRIDES = (
     "AFK_TEST_KILL_AFTER_VALIDATION_COMMAND",
     "AFK_TEST_KILL_AFTER_EVIDENCE",
     "AFK_TEST_KILL_AFTER_SEAL",
+    "AFK_TEST_KILL_AFTER_COMPLETION_FINALIZATION",
 )
 
 
@@ -149,6 +157,8 @@ class StartCliTest(unittest.TestCase):
                     "original_write_evidence_value = RunStore.write_evidence_value\n"
                     "original_ingest_evidence = RunStore.ingest_evidence_file\n"
                     "original_seal_evidence = RunStore.seal_evidence\n"
+                    "original_completion_finalization = "
+                    "RunStore.record_completion_finalization\n"
                     "injections = json.loads(os.environ['AFK_TEST_CRASH_INJECTIONS'])\n"
                     "def injected(store, run_id, event, **kwargs):\n"
                     " if event == injections.get('AFK_TEST_KILL_BEFORE_EVENT'):\n"
@@ -214,6 +224,15 @@ class StartCliTest(unittest.TestCase):
                     " if evidence_targeted(target, relative):\n"
                     "  os.kill(os.getpid(), signal.SIGKILL)\n"
                     " return result\n"
+                    "def injected_completion_finalization(store, run_id, **kwargs):\n"
+                    " result = original_completion_finalization(\n"
+                    "  store, run_id, **kwargs\n"
+                    " )\n"
+                    " if run_id == injections.get(\n"
+                    "  'AFK_TEST_KILL_AFTER_COMPLETION_FINALIZATION'\n"
+                    " ):\n"
+                    "  os.kill(os.getpid(), signal.SIGKILL)\n"
+                    " return result\n"
                     "RunStore.append_event = injected\n"
                     "RunStore._append_event_unlocked = injected_write\n"
                     "RunStore.prepare_effect = injected_effect\n"
@@ -228,6 +247,8 @@ class StartCliTest(unittest.TestCase):
                     ")\n"
                     "RunStore.ingest_evidence_file = injected_ingest_evidence\n"
                     "RunStore.seal_evidence = injected_seal_evidence\n"
+                    "RunStore.record_completion_finalization = "
+                    "injected_completion_finalization\n"
                     "from afk.cli import main\n"
                     "raise SystemExit(main(sys.argv[1:]))\n"
                 ),
@@ -4983,6 +5004,108 @@ class StartCliTest(unittest.TestCase):
         self.assertEqual(status["merge"]["merge_commit"], "f" * 40)
         self.assertEqual(status["bead_closure"]["status"], "closed")
 
+    def test_completion_records_one_immutable_retrospective_episode(self):
+        run_id = self.start_reviewed_run()
+        for _ in range(3):
+            self.assertEqual(self.run_afk("resume").returncode, 0)
+
+        completed = self.run_afk("resume")
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        store = RunStore(self.state_home / "afk")
+        status = store.status(run_id)
+        self.assertEqual(status["state"], "completed")
+        episode_sequence = status["last_sequence"]
+        outcome = store.sealed_evidence_result(
+            run_id,
+            f"retrospective/completed-{episode_sequence}",
+        )
+        self.assertEqual(outcome["status"], "empty")
+        self.assertFalse(outcome["warning"])
+        self.assertEqual(outcome["episode_sequence"], episode_sequence)
+        claim = store.effect(
+            run_id,
+            f"retrospective-analysis-{episode_sequence}",
+        )
+        self.assertEqual(claim["status"], "confirmed")
+        events_before = (
+            self.state_home / "afk" / "runs" / run_id / "events.jsonl"
+        ).read_bytes()
+
+        repeated = self.run_afk("resume", run_id)
+
+        self.assertEqual(repeated.returncode, 0, repeated.stderr)
+        self.assertEqual(
+            (self.state_home / "afk" / "runs" / run_id / "events.jsonl").read_bytes(),
+            events_before,
+        )
+        self.assertEqual(
+            store.sealed_evidence_result(
+                run_id,
+                f"retrospective/completed-{episode_sequence}",
+            ),
+            outcome,
+        )
+
+    def test_unavailable_completion_retrospective_is_only_a_warning(self):
+        run_id = self.start_reviewed_run()
+        for _ in range(3):
+            self.assertEqual(self.run_afk("resume").returncode, 0)
+        (self.fake_bin / "codex").unlink()
+
+        completed = self.run_afk("resume")
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        store = RunStore(self.state_home / "afk")
+        status = store.status(run_id)
+        self.assertEqual(status["state"], "completed")
+        self.assertEqual(status["checkpoint"], "completed")
+        outcome = store.sealed_evidence_result(
+            run_id,
+            f"retrospective/completed-{status['last_sequence']}",
+        )
+        self.assertEqual(outcome["status"], "unavailable")
+        self.assertTrue(outcome["warning"])
+        self.assert_exact_terminal_completion(run_id)
+
+    def test_completion_retrospective_store_error_retains_single_completed_event(self):
+        run_id = self.start_reviewed_run()
+        for _ in range(3):
+            self.assertEqual(self.run_afk("resume").returncode, 0)
+
+        with (
+            patch.dict(os.environ, self.afk_environment()),
+            patch(
+                "afk.start.run_retrospective_attempt",
+                side_effect=RunStoreError("injected retrospective failure"),
+            ),
+        ):
+            self.assertEqual(resume_run(), (run_id, 2))
+
+        store = RunStore(self.state_home / "afk")
+        completed = store.status(run_id)
+        self.assertEqual(completed["state"], "completed")
+        active = self.state_home / "afk" / "active.json"
+        self.assertTrue(active.is_file())
+        events_path = self.state_home / "afk" / "runs" / run_id / "events.jsonl"
+        events = events_path.read_bytes()
+        self.assertEqual(events.count(b'"event":"run.completed"'), 1)
+        self.assertEqual(events.count(b'"event":"run.attention_required"'), 0)
+
+        resumed = self.run_afk("resume")
+
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        self.assertFalse(active.exists())
+        self.assertEqual(
+            events_path.read_bytes().count(b'"event":"run.completed"'),
+            1,
+        )
+        outcome = store.sealed_evidence_result(
+            run_id,
+            f"retrospective/completed-{completed['last_sequence']}",
+        )
+        self.assertEqual(outcome["episode_sequence"], completed["last_sequence"])
+
     def test_terminal_cleanup_filesystem_exception_is_a_durable_warning(self):
         run_id = self.start_reviewed_run()
         self.assertEqual(self.run_afk("resume").returncode, 0)
@@ -5134,6 +5257,29 @@ class StartCliTest(unittest.TestCase):
         self.assert_exact_terminal_completion(run_id)
         active = self.state_home / "afk" / "active.json"
         self.assertTrue(active.is_file())
+        episode_sequence = completed["last_sequence"]
+        retrospective = f"retrospective/completed-{episode_sequence}"
+        self.assertIsNone(store.sealed_evidence_result(run_id, retrospective))
+        events_path = self.state_home / "afk" / "runs" / run_id / "events.jsonl"
+        events_before = events_path.read_bytes()
+
+        with (
+            patch.dict(os.environ, self.afk_environment()),
+            patch(
+                "afk.start.run_retrospective_attempt",
+                side_effect=RunStoreError("injected retrospective failure"),
+            ),
+            self.assertRaisesRegex(RunStoreError, "injected retrospective failure"),
+        ):
+            resume_run(run_id)
+
+        self.assertTrue(active.is_file())
+        self.assertEqual(events_path.read_bytes(), events_before)
+        self.assertEqual(
+            events_before.count(b'"event":"run.attention_required"'),
+            0,
+        )
+        self.assertEqual(events_before.count(b'"event":"run.completed"'), 1)
 
         resumed = self.run_afk("resume", run_id)
 
@@ -5142,10 +5288,371 @@ class StartCliTest(unittest.TestCase):
         self.assertFalse(active.exists())
         after = json.loads(self.run_afk("status", run_id, "--json").stdout)
         self.assertEqual(after["completion"], sealed_completion)
-        events = (self.state_home / "afk" / "runs" / run_id / "events.jsonl").read_text(
-            encoding="utf-8"
+        outcome = store.sealed_evidence_result(run_id, retrospective)
+        self.assertEqual(outcome["episode_sequence"], episode_sequence)
+        claim = store.effect(
+            run_id,
+            f"retrospective-analysis-{episode_sequence}",
         )
-        self.assertEqual(events.count('"event":"run.completed"'), 1)
+        self.assertEqual(claim["status"], "confirmed")
+        manifest_path = (
+            self.state_home / "afk" / "runs" / run_id / retrospective / "manifest.json"
+        )
+        manifest_before = manifest_path.read_bytes()
+
+        repeated = self.run_afk("resume", run_id)
+
+        self.assertEqual(repeated.returncode, 0, repeated.stderr)
+        self.assertEqual(store.sealed_evidence_result(run_id, retrospective), outcome)
+        self.assertEqual(manifest_path.read_bytes(), manifest_before)
+        self.assertEqual(events_path.read_bytes().count(b'"event":"run.completed"'), 1)
+
+    def test_missing_active_pointer_recovers_pending_completion_episode(self):
+        run_id = self.start_reviewed_run()
+        for _ in range(3):
+            self.assertEqual(self.run_afk("resume").returncode, 0)
+        interrupted = self.run_afk(
+            "resume", AFK_TEST_KILL_AFTER_EVENT_WRITE="run.completed"
+        )
+        self.assertLess(interrupted.returncode, 0)
+        store = RunStore(self.state_home / "afk")
+        completed = store.status(run_id)
+        episode = completed["completion_episode"]
+        (self.state_home / "afk" / "active.json").unlink()
+
+        with self.assertRaises(ActiveRunExists):
+            store.create_run(
+                bead_id="central-bnkl.1.2",
+                repository="thunderbump/beads-webui",
+                base_branch="main",
+                base_sha="a" * 40,
+                run_id="new-run",
+            )
+
+        resumed = self.run_afk("resume")
+
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        self.assertEqual(resumed.stdout.strip(), run_id)
+        self.assertEqual(
+            store.sealed_evidence_result(run_id, episode["evidence"])[
+                "episode_sequence"
+            ],
+            episode["episode_sequence"],
+        )
+        effect = store.effect(run_id, episode["effect_id"])
+        self.assertEqual(effect["status"], "confirmed")
+        self.assertEqual(effect["observed"]["evidence"], episode["evidence"])
+        self.assertFalse((self.state_home / "afk" / "active.json").exists())
+
+    def test_named_resume_rejects_a_different_pointer_while_completion_is_pending(
+        self,
+    ):
+        store = RunStore(self.state_home / "afk")
+        store.create_run(
+            bead_id="central-bnkl.1.1",
+            repository="thunderbump/beads-webui",
+            base_branch="main",
+            base_sha="a" * 40,
+            run_id="pending-completion",
+        )
+        store.record_completion_episode(
+            "pending-completion",
+            completion={"schema_version": 1},
+        )
+        active = self.state_home / "afk" / "active.json"
+        active.write_text('{"run_id":"other-run"}\n', encoding="utf-8")
+        active.chmod(0o600)
+        run_dir = self.state_home / "afk" / "runs" / "pending-completion"
+        effects_before = tuple((run_dir / "effects").iterdir())
+        evidence_before = tuple((run_dir / "retrospective").iterdir())
+
+        with (
+            patch.dict(os.environ, self.afk_environment()),
+            patch("afk.start.run_retrospective_attempt") as retrospective,
+            self.assertRaisesRegex(
+                EventHistoryCorrupt,
+                "Active Run pointer does not match pending completion",
+            ),
+        ):
+            resume_run("pending-completion")
+
+        retrospective.assert_not_called()
+        self.assertEqual(tuple((run_dir / "effects").iterdir()), effects_before)
+        self.assertEqual(
+            tuple((run_dir / "retrospective").iterdir()),
+            evidence_before,
+        )
+        self.assertEqual(
+            json.loads(active.read_text(encoding="utf-8")),
+            {"run_id": "other-run"},
+        )
+
+    def test_sealed_attempt_without_finalization_fact_remains_active(self):
+        run_id = self.start_reviewed_run()
+        for _ in range(3):
+            self.assertEqual(self.run_afk("resume").returncode, 0)
+        store = RunStore(self.state_home / "afk")
+        episode_sequence = store.status(run_id)["last_sequence"] + 1
+
+        interrupted = self.run_afk(
+            "resume",
+            AFK_TEST_KILL_AFTER_CONFIRM=(f"retrospective-analysis-{episode_sequence}"),
+        )
+
+        self.assertLess(interrupted.returncode, 0)
+        completed = store.status(run_id)
+        episode = completed["completion_episode"]
+        run_dir = self.state_home / "afk" / "runs" / run_id
+        self.assertIsNotNone(store.sealed_evidence_result(run_id, episode["evidence"]))
+        self.assertEqual(
+            store.effect(run_id, episode["effect_id"])["status"], "confirmed"
+        )
+        self.assertFalse((run_dir / "completion-finalization.json").exists())
+        (self.state_home / "afk" / "active.json").unlink()
+        self.assertEqual(store.active_run_id(), run_id)
+        with self.assertRaises(ActiveRunExists):
+            store.create_run(
+                bead_id="central-bnkl.1.2",
+                repository="thunderbump/beads-webui",
+                base_branch="main",
+                base_sha="a" * 40,
+                run_id="new-run",
+            )
+        commands_before = self.command_log.read_bytes()
+
+        with patch.dict(os.environ, self.afk_environment()):
+            self.assertEqual(resume_run(), (run_id, 0))
+
+        self.assertEqual(self.command_log.read_bytes(), commands_before)
+        self.assertTrue((run_dir / "completion-finalization.json").is_file())
+        self.assertFalse((self.state_home / "afk" / "active.json").exists())
+
+    def test_finalization_fact_recovers_before_active_pointer_unlink(self):
+        run_id = self.start_reviewed_run()
+        for _ in range(3):
+            self.assertEqual(self.run_afk("resume").returncode, 0)
+        active_path = self.state_home / "afk" / "active.json"
+
+        interrupted = self.run_afk(
+            "resume",
+            AFK_TEST_KILL_AFTER_COMPLETION_FINALIZATION=run_id,
+        )
+
+        self.assertLess(interrupted.returncode, 0)
+        run_dir = self.state_home / "afk" / "runs" / run_id
+        self.assertTrue((run_dir / "completion-finalization.json").is_file())
+        self.assertTrue(active_path.is_file())
+        commands_before = self.command_log.read_bytes()
+
+        with patch.dict(os.environ, self.afk_environment()):
+            self.assertEqual(resume_run(), (run_id, 0))
+
+        self.assertEqual(self.command_log.read_bytes(), commands_before)
+        self.assertFalse(active_path.exists())
+
+    def test_tampered_completion_finalization_never_releases_ownership(self):
+        run_id = self.start_reviewed_run()
+        for _ in range(4):
+            self.assertEqual(self.run_afk("resume").returncode, 0)
+        store = RunStore(self.state_home / "afk")
+        finalization_path = (
+            self.state_home / "afk" / "runs" / run_id / "completion-finalization.json"
+        )
+        finalization = json.loads(finalization_path.read_text(encoding="utf-8"))
+        finalization["outcome_sha256"] = "0" * 64
+        finalization_path.write_text(
+            json.dumps(finalization) + "\n",
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(
+            EventHistoryCorrupt, "completion finalization is invalid"
+        ):
+            store.active_run_id()
+        with self.assertRaisesRegex(
+            EventHistoryCorrupt, "completion finalization is invalid"
+        ):
+            store.create_run(
+                bead_id="central-bnkl.1.2",
+                repository="thunderbump/beads-webui",
+                base_branch="main",
+                base_sha="a" * 40,
+                run_id="new-run",
+            )
+
+    def test_completion_finalization_requires_a_private_regular_file(self):
+        run_id = self.start_reviewed_run()
+        for _ in range(4):
+            self.assertEqual(self.run_afk("resume").returncode, 0)
+        store = RunStore(self.state_home / "afk")
+        finalization_path = (
+            self.state_home / "afk" / "runs" / run_id / "completion-finalization.json"
+        )
+        original = finalization_path.read_bytes()
+
+        finalization_path.chmod(0o644)
+        with self.assertRaisesRegex(
+            EventHistoryCorrupt, "Completion finalization permissions are invalid"
+        ):
+            store.active_run_id()
+        with (
+            patch.dict(os.environ, self.afk_environment()),
+            self.assertRaisesRegex(
+                EventHistoryCorrupt,
+                "Completion finalization permissions are invalid",
+            ),
+        ):
+            resume_run(run_id)
+
+        finalization_path.unlink()
+        target = self.temp / "completion-finalization.json"
+        target.write_bytes(original)
+        finalization_path.symlink_to(target)
+        with self.assertRaisesRegex(
+            EventHistoryCorrupt, "completion finalization is invalid"
+        ):
+            store.active_run_id()
+
+        finalization_path.unlink()
+        finalization_path.mkdir()
+        with self.assertRaisesRegex(
+            EventHistoryCorrupt, "completion finalization is invalid"
+        ):
+            store.active_run_id()
+
+    def test_named_resume_of_legacy_completion_does_not_start_retrospective(self):
+        store = RunStore(self.state_home / "afk")
+        store.create_run(
+            bead_id="central-bnkl.1.1",
+            repository="thunderbump/beads-webui",
+            base_branch="main",
+            base_sha="a" * 40,
+            run_id="legacy-completed",
+        )
+        legacy_completion = {
+            "schema_version": 1,
+            "repository": "thunderbump/beads-webui",
+            "bead_id": "central-bnkl.1.1",
+            "candidate_sha": "d" * 40,
+            "pr_number": 17,
+            "pr_url": "https://example.test/pr/17",
+            "merge_commit": "f" * 40,
+            "bead_closure": {"status": "closed"},
+            "remote_branch_deleted": True,
+            "worktree_removed": True,
+            "local_branch_deleted": True,
+            "cleanup_warnings": [],
+            "evidence": "gates/completion-dddddddddddd",
+        }
+        store.append_event(
+            "legacy-completed",
+            "run.completed",
+            state="completed",
+            data={
+                "checkpoint": "completed",
+                "attention": {},
+                "completion": legacy_completion,
+            },
+        )
+
+        with (
+            patch.dict(os.environ, self.afk_environment()),
+            patch("afk.start.run_retrospective_attempt") as retrospective,
+        ):
+            resumed = resume_run("legacy-completed")
+
+        self.assertEqual(resumed, ("legacy-completed", 0))
+        retrospective.assert_not_called()
+
+    def test_named_resume_rejects_a_later_forged_completion_episode_before_analysis(
+        self,
+    ):
+        store = RunStore(self.state_home / "afk")
+        store.create_run(
+            bead_id="central-bnkl.1.1",
+            repository="thunderbump/beads-webui",
+            base_branch="main",
+            base_sha="a" * 40,
+            run_id="legacy-completed",
+        )
+        completion = {"schema_version": 1}
+        store.append_event(
+            "legacy-completed",
+            "run.completed",
+            state="completed",
+            data={"checkpoint": "completed", "completion": completion},
+        )
+        marker = {
+            "schema_version": 1,
+            "episode_sequence": 2,
+            "evidence": "retrospective/completed-2",
+            "effect_id": "retrospective-analysis-2",
+        }
+        with self.assertRaisesRegex(
+            EventHistoryCorrupt, "completion episode marker is invalid"
+        ):
+            store.append_event(
+                "legacy-completed",
+                "worker.terminal",
+                data={
+                    "checkpoint": "completed",
+                    "completion_episode": marker,
+                    "worker_exit_code": 0,
+                    "worker_result": "completed",
+                },
+            )
+        run_dir = self.state_home / "afk" / "runs" / "legacy-completed"
+        effects_before = tuple((run_dir / "effects").iterdir())
+        evidence_before = tuple((run_dir / "retrospective").iterdir())
+        with self.assertRaisesRegex(
+            EventHistoryCorrupt, "completion episode marker is invalid"
+        ):
+            store.record_completion_episode(
+                "legacy-completed",
+                completion=completion,
+            )
+
+        with (
+            patch.dict(os.environ, self.afk_environment()),
+            patch("afk.start.run_retrospective_attempt") as retrospective,
+            self.assertRaisesRegex(
+                EventHistoryCorrupt, "completion episode marker is invalid"
+            ),
+        ):
+            resume_run("legacy-completed")
+
+        retrospective.assert_not_called()
+        self.assertEqual(tuple((run_dir / "effects").iterdir()), effects_before)
+        self.assertEqual(
+            tuple((run_dir / "retrospective").iterdir()),
+            evidence_before,
+        )
+
+    def test_worker_terminal_after_completion_preserves_episode_replay(self):
+        run_id = self.start_reviewed_run()
+        for _ in range(4):
+            self.assertEqual(self.run_afk("resume").returncode, 0)
+        store = RunStore(self.state_home / "afk")
+        completed = store.status(run_id)
+        episode = completed["completion_episode"]
+        events_path = self.state_home / "afk" / "runs" / run_id / "events.jsonl"
+
+        with (
+            patch.dict(os.environ, self.afk_environment()),
+            patch("afk.start.run_worker", return_value=0),
+        ):
+            self.assertEqual(run_worker_unit(run_id), 0)
+
+        terminal = store.status(run_id)
+        self.assertEqual(terminal["last_event"], "worker.terminal")
+        self.assertEqual(terminal["completion_episode"], episode)
+        resumed = self.run_afk("resume", run_id)
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        self.assertEqual(store.status(run_id)["last_event"], "worker.terminal")
+        self.assertEqual(
+            events_path.read_bytes().count(b'"event":"run.completed"'),
+            1,
+        )
 
     def test_named_resume_of_retained_completed_run_is_idempotent(self):
         run_id = self.start_reviewed_run()
@@ -10995,6 +11502,17 @@ class StartCliTest(unittest.TestCase):
 
                 args = sys.argv[1:]
                 prompt = sys.stdin.read()
+                if "--skip-git-repo-check" in args:
+                    summary = json.loads(prompt)
+                    print(json.dumps({
+                        "schema_version": 1,
+                        "run_id": summary["run"]["run_id"],
+                        "terminal_outcome": summary["episode"]["state"],
+                        "summary": "No actionable findings.",
+                        "process_findings": [],
+                        "improvement_proposals": [],
+                    }))
+                    raise SystemExit(0)
                 base_sha = "a" * 40
                 candidate_sha = "d" * 40
                 worktree = Path(args[args.index("--cd") + 1])
