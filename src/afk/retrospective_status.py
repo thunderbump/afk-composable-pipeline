@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from afk.retrospective_attempt import normalize_retrospective_outcome
 from afk.retrospective_contract import expected_episode_state
+from afk.retrospective_outcome import normalize_retrospective_outcome
 from afk.run_store import RunStore, RunStoreError
 
 
