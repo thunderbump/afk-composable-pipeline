@@ -212,6 +212,18 @@ def main(
             latest = retrospective["latest"]
             fields = [
                 f"retrospective_status={retrospective['status']}",
+                (
+                    "retrospective_latest_sequence="
+                    f"{latest['episode_sequence'] if latest is not None else 'absent'}"
+                ),
+                (
+                    "retrospective_latest_event="
+                    f"{latest['event'] if latest is not None else 'absent'}"
+                ),
+                (
+                    "retrospective_latest_state="
+                    f"{latest['state'] if latest is not None else 'absent'}"
+                ),
                 f"retrospective_episodes={counts['total']}",
                 f"retrospective_sealed={counts['sealed']}",
                 f"retrospective_warnings={counts['warning']}",

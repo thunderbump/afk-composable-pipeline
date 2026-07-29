@@ -963,7 +963,9 @@ class StartCliTest(unittest.TestCase):
             f"{run_id} created bead=central-bnkl.1.1 sequence=3 "
             f"checkpoint=created unit=afk-{run_id}-worker-1 "
             "unit_status=running load_state=loaded active_state=active\n"
-            "retrospective_status=absent retrospective_episodes=0 "
+            "retrospective_status=absent retrospective_latest_sequence=absent "
+            "retrospective_latest_event=absent retrospective_latest_state=absent "
+            "retrospective_episodes=0 "
             "retrospective_sealed=0 retrospective_warnings=0 "
             "retrospective_absent=0 retrospective_findings=0 "
             "retrospective_proposals=0 retrospective_path=absent\n",
@@ -8472,7 +8474,9 @@ class StartCliTest(unittest.TestCase):
             "checkpoint=created unit=afk-terminal-run-worker-1 "
             "worker_exit_code=2 worker_result=attention_required "
             "unit_status=terminal\n"
-            "retrospective_status=absent retrospective_episodes=0 "
+            "retrospective_status=absent retrospective_latest_sequence=absent "
+            "retrospective_latest_event=absent retrospective_latest_state=absent "
+            "retrospective_episodes=0 "
             "retrospective_sealed=0 retrospective_warnings=0 "
             "retrospective_absent=0 retrospective_findings=0 "
             "retrospective_proposals=0 retrospective_path=absent\n",
@@ -8905,9 +8909,23 @@ class StartCliTest(unittest.TestCase):
             for path in run_dir.rglob("*")
         }
 
+        human = self.run_afk("status", "partial-retrospective-run")
         completed = self.run_afk("status", "partial-retrospective-run", "--json")
 
+        self.assertEqual(human.returncode, 2, human.stderr)
         self.assertEqual(completed.returncode, 2, completed.stderr)
+        self.assertIn(
+            f"retrospective_latest_sequence={episode['episode_sequence']}",
+            human.stdout,
+        )
+        self.assertIn(
+            "retrospective_latest_event=run.attention_required",
+            human.stdout,
+        )
+        self.assertIn(
+            "retrospective_latest_state=attention_required",
+            human.stdout,
+        )
         retrospective = json.loads(completed.stdout)["retrospective"]
         self.assertEqual(retrospective["status"], "absent")
         self.assertEqual(
@@ -9139,7 +9157,9 @@ class StartCliTest(unittest.TestCase):
             "active_state=inactive\n"
             "recommended_resume=afk resume\n"
             "resume_precondition=active_run_id:crashed-run\n"
-            "retrospective_status=absent retrospective_episodes=0 "
+            "retrospective_status=absent retrospective_latest_sequence=absent "
+            "retrospective_latest_event=absent retrospective_latest_state=absent "
+            "retrospective_episodes=0 "
             "retrospective_sealed=0 retrospective_warnings=0 "
             "retrospective_absent=0 retrospective_findings=0 "
             "retrospective_proposals=0 retrospective_path=absent\n",
