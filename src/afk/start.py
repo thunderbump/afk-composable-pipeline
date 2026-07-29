@@ -224,6 +224,13 @@ def resume_run(
                 selected_run_id,
                 episode_sequence=projection["attention_episode"]["episode_sequence"],
             )
+        if projection["last_event"] == "validation.bootstrap_approved":
+            _approved_bootstrap_attention(
+                store,
+                selected_run_id,
+                projection["validation_contract"],
+            )
+            return selected_run_id, 2
         if projection["state"] == "completed":
             if projection.get("completion_episode") is not None:
                 _reconcile_completed_run(store, selected_run_id, projection)
@@ -638,23 +645,39 @@ def approve_bootstrap_validation(
         store.append_event(
             projection["run_id"],
             "validation.bootstrap_approved",
-            state="candidate_ready",
+            state="attention_required",
             data={
                 "checkpoint": "candidate_ready",
                 "validation_contract": contract,
-                "attention": {},
+                "attention": {
+                    "scope": "validation",
+                    "kind": "unavailable",
+                    "summary": "approved bootstrap validation is ready",
+                },
             },
         )
-        _attention(
+        _approved_bootstrap_attention(
             store,
             projection["run_id"],
-            checkpoint="candidate_ready",
-            scope="validation",
-            kind="unavailable",
-            summary="approved bootstrap validation is ready",
-            validation_contract=contract,
+            contract,
         )
         return projection["run_id"]
+
+
+def _approved_bootstrap_attention(
+    store: RunStore,
+    run_id: str,
+    contract: dict[str, Any],
+) -> None:
+    _attention(
+        store,
+        run_id,
+        checkpoint="candidate_ready",
+        scope="validation",
+        kind="unavailable",
+        summary="approved bootstrap validation is ready",
+        validation_contract=contract,
+    )
 
 
 def _candidate_resume_ready(projection: dict[str, Any]) -> bool:

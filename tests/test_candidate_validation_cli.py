@@ -17,6 +17,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from afk import candidate_validation  # noqa: E402
 from afk.run_store import RunStore  # noqa: E402
+from afk.start import approve_bootstrap_validation  # noqa: E402
 
 
 WRITE_PASSED_LOG = (
@@ -877,6 +878,69 @@ class CandidateValidationCliTest(unittest.TestCase):
             "scripts/validate.sh", "--run-id", run_id, "--timeout-seconds", "5"
         )
         self.assertEqual(approved.returncode, 0, approved.stderr)
+        completed = self.run_afk("resume")
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(self.status(run_id)["checkpoint"], "validated")
+
+    def test_bootstrap_approval_crash_reenters_attention_before_validation(self):
+        self.git("commit", "--allow-empty", "-m", "base without validation harness")
+        base_sha = self.git("rev-parse", "HEAD")
+        scripts = self.repository / "scripts"
+        scripts.mkdir()
+        harness = scripts / "validate.sh"
+        harness.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        harness.chmod(0o755)
+        self.git("add", ".")
+        self.git("commit", "-m", "propose bootstrap validation harness")
+        candidate_sha = self.git("rev-parse", "HEAD")
+        run_id = self.create_ready_run(
+            candidate_sha=candidate_sha,
+            base_sha=base_sha,
+            validation_contract={
+                "source": "approved_bootstrap",
+                "base_sha": base_sha,
+                "adapter_id": "afk.builtin.bootstrap-validation/v1",
+            },
+        )
+        paused = self.run_afk("resume")
+        self.assertEqual(paused.returncode, 2, paused.stderr)
+        initial_sequence = self.status(run_id)["last_sequence"]
+
+        with (
+            patch.dict(os.environ, {"XDG_STATE_HOME": str(self.state_home)}),
+            patch("afk.start._attention", side_effect=RuntimeError("injected crash")),
+            self.assertRaisesRegex(RuntimeError, "injected crash"),
+        ):
+            approve_bootstrap_validation(
+                "scripts/validate.sh",
+                timeout_seconds=5,
+                run_id=run_id,
+            )
+
+        interrupted = self.status(run_id)
+        self.assertEqual(interrupted["state"], "attention_required")
+        self.assertEqual(interrupted["last_event"], "validation.bootstrap_approved")
+        self.assertEqual(interrupted["attention"]["scope"], "validation")
+
+        reconciled = self.run_afk("resume")
+
+        self.assertEqual(reconciled.returncode, 2, reconciled.stderr)
+        attention = self.status(run_id)
+        self.assertEqual(attention["last_event"], "run.attention_required")
+        self.assertGreater(
+            attention["attention_episode"]["episode_sequence"],
+            initial_sequence,
+        )
+        store = RunStore(self.state_home / "afk")
+        outcome = store.sealed_evidence_result(
+            run_id, attention["attention_episode"]["evidence"]
+        )
+        self.assertEqual(
+            outcome["episode_sequence"],
+            attention["attention_episode"]["episode_sequence"],
+        )
+        self.assertNotIn("validation_attempt", attention)
+
         completed = self.run_afk("resume")
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertEqual(self.status(run_id)["checkpoint"], "validated")
