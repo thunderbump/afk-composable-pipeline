@@ -15,8 +15,17 @@ from afk.candidate_validation import (
     tracked_regular_file_identity,
 )
 from afk.checkouts import checkout_path_error
-from afk.contracts import ContractError, ProjectContract, default_validation_mode, load_project_contract
-from afk.integration import integrate_published_pr, integration_output_dir, load_workstream_payload
+from afk.contracts import (
+    ContractError,
+    ProjectContract,
+    default_validation_mode,
+    load_project_contract,
+)
+from afk.integration import (
+    integrate_published_pr,
+    integration_output_dir,
+    load_workstream_payload,
+)
 from afk.jsonutil import canonical_json, sha256_json
 from afk.redaction import redact_artifact_value
 from afk.recipes import (
@@ -36,7 +45,6 @@ from afk.run_next import (
 )
 from afk.pi_workers import (
     PONYTAIL_EXTENSION_SOURCE,
-    build_pi_mount_config,
     build_provider_pi_mount_config,
     build_pi_real_worker_agent,
     build_pi_print_command,
@@ -145,9 +153,7 @@ def main(
             if "worker_exit_code" in projection:
                 output["unit_observation"] = {
                     "status": "terminal",
-                    "unit": projection.get(
-                        "unit", worker_unit(projection["run_id"])
-                    ),
+                    "unit": projection.get("unit", worker_unit(projection["run_id"])),
                     "worker_exit_code": projection["worker_exit_code"],
                     "worker_result": projection["worker_result"],
                 }
@@ -233,7 +239,10 @@ def main(
             if validation is None:
                 validation = {}
             if not isinstance(validation, dict):
-                parser.error("--profile requires input.validation to be a JSON object when present")
+                parser.error(
+                    "--profile requires input.validation to be a JSON object "
+                    "when present"
+                )
             input_data = {
                 **input_data,
                 "validation": {
@@ -254,7 +263,9 @@ def main(
                 parser.error(str(exc))
 
         try:
-            result = run_step(args.step, input_data, resolve_ledger_dir(args.ledger), project_contract)
+            result = run_step(
+                args.step, input_data, resolve_ledger_dir(args.ledger), project_contract
+            )
         except UnknownStepError as exc:
             parser.error(str(exc))
         print(
@@ -288,7 +299,9 @@ def main(
             except ContractError as exc:
                 parser.error(str(exc))
         if args.retrospective_follow_up_mode != "disabled" and project_contract is None:
-            parser.error("--project is required when retrospective follow-up mode is enabled")
+            parser.error(
+                "--project is required when retrospective follow-up mode is enabled"
+            )
 
         try:
             result = run_workstream(
@@ -303,9 +316,14 @@ def main(
                     recipe_retrospective_follow_up_from_args(
                         args,
                         project_contract=project_contract,
-                        beads_workspace=Path(args.beads_workspace) if args.beads_workspace is not None else None,
+                        beads_workspace=(
+                            Path(args.beads_workspace)
+                            if args.beads_workspace is not None
+                            else None
+                        ),
                     )
-                    if args.retrospective_follow_up_mode != "disabled" and project_contract is not None
+                    if args.retrospective_follow_up_mode != "disabled"
+                    and project_contract is not None
                     else None
                 ),
             )
@@ -339,7 +357,8 @@ def main(
             parser.error(str(exc))
         if args.validation_profile not in project_contract.validation_profiles:
             parser.error(
-                f"--validation-profile must be declared by project {project_contract.project_slug}: "
+                "--validation-profile must be declared by project "
+                f"{project_contract.project_slug}: "
                 f"{', '.join(project_contract.validation_profiles)}"
             )
         path_error = checkout_path_error(args.checkout_root, args.checkout_path)
@@ -355,9 +374,15 @@ def main(
                 project_contract=project_contract,
                 default_create_allowed=True,
             )
-            validation_input = recipe_validation_input_from_args(args, project_contract=project_contract)
-            recipe_agent = recipe_agent_from_args(args, checkout_path=Path(args.checkout_path))
-            reviewer = recipe_reviewer_from_args(args, checkout_path=Path(args.checkout_path))
+            validation_input = recipe_validation_input_from_args(
+                args, project_contract=project_contract
+            )
+            recipe_agent = recipe_agent_from_args(
+                args, checkout_path=Path(args.checkout_path)
+            )
+            reviewer = recipe_reviewer_from_args(
+                args, checkout_path=Path(args.checkout_path)
+            )
             recipe_publisher = recipe_publisher_from_args(
                 args,
                 review_branch=f"afk/{branch_slug(args.workstream_id)}",
@@ -379,7 +404,8 @@ def main(
                 publisher=recipe_publisher,
                 enable_review_feedback=args.role_profile == PRODUCTION_ROLE_PROFILE,
                 expect_generated_smoke_dry_run=(
-                    args.role_profile == FAKE_LOCAL_ROLE_PROFILE and args.effective_validation_mode == "fake"
+                    args.role_profile == FAKE_LOCAL_ROLE_PROFILE
+                    and args.effective_validation_mode == "fake"
                 ),
             )
         except ValueError as exc:
@@ -408,7 +434,8 @@ def main(
             parser.error(str(exc))
         if args.validation_profile not in project_contract.validation_profiles:
             parser.error(
-                f"--validation-profile must be declared by project {project_contract.project_slug}: "
+                "--validation-profile must be declared by project "
+                f"{project_contract.project_slug}: "
                 f"{', '.join(project_contract.validation_profiles)}"
             )
         path_error = checkout_path_error(args.checkout_root, args.checkout_path)
@@ -424,7 +451,9 @@ def main(
                 project_contract=project_contract,
                 default_create_allowed=args.execute,
             )
-            validation_input = recipe_validation_input_from_args(args, project_contract=project_contract)
+            validation_input = recipe_validation_input_from_args(
+                args, project_contract=project_contract
+            )
             recipe_agent = recipe_agent_from_args(
                 args,
                 checkout_path=Path(args.checkout_path),
@@ -448,13 +477,15 @@ def main(
             if args.execute:
                 from afk.workstream import run_workstream
 
-                workstream_runner = lambda recipe, *, ledger_dir, project_contract: run_workstream(
-                    recipe,
-                    ledger_dir=ledger_dir,
-                    rerun_ledger_arg=rerun_ledger_argument(args.ledger),
-                    step_runner=run_step,
-                    project_contract=project_contract,
-                    runtime_retrospective_follow_up=retrospective_follow_up,
+                workstream_runner = (
+                    lambda recipe, *, ledger_dir, project_contract: run_workstream(
+                        recipe,
+                        ledger_dir=ledger_dir,
+                        rerun_ledger_arg=rerun_ledger_argument(args.ledger),
+                        step_runner=run_step,
+                        project_contract=project_contract,
+                        runtime_retrospective_follow_up=retrospective_follow_up,
+                    )
                 )
             payload = run_next_request(
                 RunNextRequest(
@@ -469,9 +500,11 @@ def main(
                         reviewer=reviewer,
                         retrospective_follow_up=retrospective_follow_up,
                         publisher_factory=recipe_publisher_factory,
-                        enable_review_feedback=args.role_profile == PRODUCTION_ROLE_PROFILE,
+                        enable_review_feedback=args.role_profile
+                        == PRODUCTION_ROLE_PROFILE,
                         expect_generated_smoke_dry_run=(
-                            args.role_profile == FAKE_LOCAL_ROLE_PROFILE and args.effective_validation_mode == "fake"
+                            args.role_profile == FAKE_LOCAL_ROLE_PROFILE
+                            and args.effective_validation_mode == "fake"
                         ),
                     ),
                     ready_tag=args.ready_tag,
@@ -498,7 +531,9 @@ def main(
             except ContractError as exc:
                 parser.error(str(exc))
         if args.retrospective_follow_up_mode != "disabled" and project_contract is None:
-            parser.error("--project is required when retrospective follow-up mode is enabled")
+            parser.error(
+                "--project is required when retrospective follow-up mode is enabled"
+            )
         try:
             policy = json.loads(args.policy)
         except json.JSONDecodeError as exc:
@@ -526,11 +561,18 @@ def main(
                 {
                     "command": "integrate-pr",
                     "decision": result["decision"],
-                    "result_path": str(integration_output_dir(Path(args.published_result).resolve(strict=True)) / "integration-result.json"),
+                    "result_path": str(
+                        integration_output_dir(
+                            Path(args.published_result).resolve(strict=True)
+                        )
+                        / "integration-result.json"
+                    ),
                     **(
                         {
                             "integration_retrospective_path": str(
-                                integration_output_dir(Path(args.published_result).resolve(strict=True))
+                                integration_output_dir(
+                                    Path(args.published_result).resolve(strict=True)
+                                )
                                 / "integration-retrospective.json"
                             )
                         }
@@ -593,9 +635,13 @@ def build_parser() -> argparse.ArgumentParser:
     run_step_parser = subcommands.add_parser("run-step", help="Run one pipeline step")
     run_step_parser.add_argument("step")
     run_step_parser.add_argument("--input", required=True, help="JSON input payload")
-    run_step_parser.add_argument("--profile", help="Validation profile for profile-aware steps")
+    run_step_parser.add_argument(
+        "--profile", help="Validation profile for profile-aware steps"
+    )
     run_step_parser.add_argument("--ledger", help="Ledger output directory")
-    run_step_parser.add_argument("--project", help="Project slug for contract resolution")
+    run_step_parser.add_argument(
+        "--project", help="Project slug for contract resolution"
+    )
     run_step_parser.add_argument(
         "--contracts-dir",
         default="project-contracts",
@@ -606,11 +652,15 @@ def build_parser() -> argparse.ArgumentParser:
         "run-workstream",
         help="Run a declarative workstream recipe and publish or update a PR",
     )
-    run_workstream_parser.add_argument("--input", required=True, help="JSON workstream recipe")
+    run_workstream_parser.add_argument(
+        "--input", required=True, help="JSON workstream recipe"
+    )
     run_workstream_parser.add_argument("--ledger", help="Ledger output directory")
     run_workstream_parser.add_argument("--parent", help="Parent workstream or issue id")
     run_workstream_parser.add_argument("--workstream-id", help="Workstream id")
-    run_workstream_parser.add_argument("--project", help="Project slug for contract resolution")
+    run_workstream_parser.add_argument(
+        "--project", help="Project slug for contract resolution"
+    )
     run_workstream_parser.add_argument(
         "--contracts-dir",
         default="project-contracts",
@@ -626,18 +676,36 @@ def build_parser() -> argparse.ArgumentParser:
         "generate-recipe",
         help="Generate an inspectable run-workstream recipe from a Beads work item",
     )
-    generate_recipe_parser.add_argument("--workstream-id", required=True, help="Beads item/workstream id to run")
-    generate_recipe_parser.add_argument("--project", required=True, help="Project slug for contract resolution")
+    generate_recipe_parser.add_argument(
+        "--workstream-id", required=True, help="Beads item/workstream id to run"
+    )
+    generate_recipe_parser.add_argument(
+        "--project", required=True, help="Project slug for contract resolution"
+    )
     generate_recipe_parser.add_argument(
         "--contracts-dir",
         default="project-contracts",
         help="Directory containing project contract JSON files",
     )
-    generate_recipe_parser.add_argument("--ledger", required=True, help="Ledger directory used when running the recipe")
-    generate_recipe_parser.add_argument("--beads-workspace", required=True, help="Absolute mounted central Beads workspace")
-    generate_recipe_parser.add_argument("--checkout-root", required=True, help="Explicit checkout root mount")
-    generate_recipe_parser.add_argument("--checkout-path", required=True, help="Explicit checkout path under checkout root")
-    generate_recipe_parser.add_argument("--validation-profile", required=True, help="Project validation profile name")
+    generate_recipe_parser.add_argument(
+        "--ledger", required=True, help="Ledger directory used when running the recipe"
+    )
+    generate_recipe_parser.add_argument(
+        "--beads-workspace",
+        required=True,
+        help="Absolute mounted central Beads workspace",
+    )
+    generate_recipe_parser.add_argument(
+        "--checkout-root", required=True, help="Explicit checkout root mount"
+    )
+    generate_recipe_parser.add_argument(
+        "--checkout-path",
+        required=True,
+        help="Explicit checkout path under checkout root",
+    )
+    generate_recipe_parser.add_argument(
+        "--validation-profile", required=True, help="Project validation profile name"
+    )
     generate_recipe_parser.add_argument(
         "--validation-mode",
         choices=("fake", "project-worker"),
@@ -653,7 +721,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--validation-stack-path",
         help=(
             "Absolute validation stack path for project-worker recipes. "
-            "Overrides the default host sibling contract when checkout_root is a nested mount."
+            "Overrides the default host sibling contract when checkout_root "
+            "is a nested mount."
         ),
     )
     add_role_profile_flag(generate_recipe_parser)
@@ -661,13 +730,20 @@ def build_parser() -> argparse.ArgumentParser:
     add_reviewer_flags(generate_recipe_parser)
     add_retrospective_judge_flags(generate_recipe_parser)
     add_publisher_flags(generate_recipe_parser)
-    generate_recipe_parser.add_argument("--output", required=True, help="Path to write the JSON recipe")
+    generate_recipe_parser.add_argument(
+        "--output", required=True, help="Path to write the JSON recipe"
+    )
 
     run_next_parser = subcommands.add_parser(
         "run-next",
-        help="Discover the next project item and emit an inspectable run-workstream recipe",
+        help=(
+            "Discover the next project item and emit an inspectable "
+            "run-workstream recipe"
+        ),
     )
-    run_next_parser.add_argument("--project", required=True, help="Project slug for contract resolution")
+    run_next_parser.add_argument(
+        "--project", required=True, help="Project slug for contract resolution"
+    )
     run_next_parser.add_argument(
         "--contracts-dir",
         default="project-contracts",
@@ -678,9 +754,17 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         help="Absolute mounted central Beads workspace",
     )
-    run_next_parser.add_argument("--checkout-root", required=True, help="Explicit checkout root mount")
-    run_next_parser.add_argument("--checkout-path", required=True, help="Explicit checkout path under checkout root")
-    run_next_parser.add_argument("--validation-profile", required=True, help="Project validation profile name")
+    run_next_parser.add_argument(
+        "--checkout-root", required=True, help="Explicit checkout root mount"
+    )
+    run_next_parser.add_argument(
+        "--checkout-path",
+        required=True,
+        help="Explicit checkout path under checkout root",
+    )
+    run_next_parser.add_argument(
+        "--validation-profile", required=True, help="Project validation profile name"
+    )
     run_next_parser.add_argument(
         "--validation-mode",
         choices=("fake", "project-worker"),
@@ -696,7 +780,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--validation-stack-path",
         help=(
             "Absolute validation stack path for project-worker recipes. "
-            "Overrides the default host sibling contract when checkout_root is a nested mount."
+            "Overrides the default host sibling contract when checkout_root "
+            "is a nested mount."
         ),
     )
     run_next_parser.add_argument(
@@ -704,7 +789,9 @@ def build_parser() -> argparse.ArgumentParser:
         default="ready-for-agent",
         help="Ready tag required on issues considered for autonomous selection",
     )
-    run_next_parser.add_argument("--ledger", help="Optional ledger directory for downstream execution")
+    run_next_parser.add_argument(
+        "--ledger", help="Optional ledger directory for downstream execution"
+    )
     run_next_parser.add_argument(
         "--execute",
         action="store_true",
@@ -719,20 +806,27 @@ def build_parser() -> argparse.ArgumentParser:
 
     integrate_parser = subcommands.add_parser(
         "integrate-pr",
-        help="Classify, merge, and close a published PR when terminal policy gates pass",
+        help=(
+            "Classify, merge, and close a published PR when terminal policy "
+            "gates pass"
+        ),
     )
     integrate_parser.add_argument(
         "--published-result",
         required=True,
         help="Path to publication-result.json or workstream-result.json",
     )
-    integrate_parser.add_argument("--policy", required=True, help="JSON terminal integration policy")
+    integrate_parser.add_argument(
+        "--policy", required=True, help="JSON terminal integration policy"
+    )
     integrate_parser.add_argument(
         "--gh-auth-config-dir",
         required=True,
         help="Absolute GitHub CLI auth config directory",
     )
-    integrate_parser.add_argument("--project", help="Project slug for contract resolution")
+    integrate_parser.add_argument(
+        "--project", help="Project slug for contract resolution"
+    )
     integrate_parser.add_argument(
         "--contracts-dir",
         default="project-contracts",
@@ -861,7 +955,8 @@ def add_role_profile_flag(parser: argparse.ArgumentParser) -> None:
         choices=(PRODUCTION_ROLE_PROFILE, FAKE_LOCAL_ROLE_PROFILE),
         default=PRODUCTION_ROLE_PROFILE,
         help=(
-            "Role defaults for generated recipes: production uses Pi-backed implementation, "
+            "Role defaults for generated recipes: production uses Pi-backed "
+            "implementation, "
             "and review; fake-local preserves local fake adapters."
         ),
     )
@@ -891,7 +986,10 @@ def add_implementation_agent_flags(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--agent-pi-coding-agent-dir",
-        help="Absolute mounted PI_CODING_AGENT_DIR directory for pi mode Codex subscription auth",
+        help=(
+            "Absolute mounted PI_CODING_AGENT_DIR directory for pi mode Codex "
+            "subscription auth"
+        ),
     )
     parser.add_argument(
         "--agent-timeout-seconds",
@@ -935,8 +1033,14 @@ def add_reviewer_flags(parser: argparse.ArgumentParser) -> None:
         choices=("fake", "pi"),
         help="Reviewer mode to embed in the generated recipe",
     )
-    parser.add_argument("--reviewer-timeout-seconds", type=int, help="Optional reviewer timeout in seconds")
-    parser.add_argument("--reviewer-pi-bin", default="pi", help="Reviewer Pi binary for pi mode")
+    parser.add_argument(
+        "--reviewer-timeout-seconds",
+        type=int,
+        help="Optional reviewer timeout in seconds",
+    )
+    parser.add_argument(
+        "--reviewer-pi-bin", default="pi", help="Reviewer Pi binary for pi mode"
+    )
     parser.add_argument(
         "--reviewer-pi-provider",
         default="openai-codex",
@@ -947,13 +1051,18 @@ def add_reviewer_flags(parser: argparse.ArgumentParser) -> None:
         default="gpt-5.4",
         help="Reviewer Pi model for pi mode (gpt-5.4 or lower)",
     )
-    parser.add_argument("--reviewer-pi-thinking", help="Optional reviewer Pi thinking level")
+    parser.add_argument(
+        "--reviewer-pi-thinking", help="Optional reviewer Pi thinking level"
+    )
     parser.add_argument(
         "--reviewer-ponytail",
         action="store_true",
         help="Enable default ponytail extension for reviewer pi mode",
     )
-    parser.add_argument("--reviewer-ponytail-extension", help="Reviewer ponytail extension package name for pi mode")
+    parser.add_argument(
+        "--reviewer-ponytail-extension",
+        help="Reviewer ponytail extension package name for pi mode",
+    )
     parser.add_argument(
         "--reviewer-ponytail-extension-source",
         help="Reviewer ponytail extension source string for pi mode",
@@ -964,7 +1073,10 @@ def add_retrospective_judge_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--retrospective-judge-mode",
         choices=("disabled", "pi"),
-        help="Deprecated no-op compatibility flag; generated recipes no longer embed runtime retrospective judge blocks",
+        help=(
+            "Deprecated no-op compatibility flag; generated recipes no longer "
+            "embed runtime retrospective judge blocks"
+        ),
     )
     parser.add_argument(
         "--retrospective-judge-timeout-seconds",
@@ -1027,7 +1139,9 @@ def add_publisher_flags(parser: argparse.ArgumentParser) -> None:
         help="Terminal publisher mode to embed in the generated recipe",
     )
     parser.add_argument("--publisher-repo", help="owner/repo for publisher create mode")
-    parser.add_argument("--publisher-base", help="Base branch for publisher create mode")
+    parser.add_argument(
+        "--publisher-base", help="Base branch for publisher create mode"
+    )
     parser.add_argument(
         "--publisher-gh-config-dir",
         help="Absolute mounted gh config dir for publisher create mode",
@@ -1055,7 +1169,9 @@ def _write_terminal_integration_retrospective(
         follow_up = recipe_retrospective_follow_up_from_args(
             args,
             project_contract=project_contract,
-            beads_workspace=Path(args.beads_workspace) if args.beads_workspace is not None else None,
+            beads_workspace=(
+                Path(args.beads_workspace) if args.beads_workspace is not None else None
+            ),
         )
     retrospective_result = retrospective_api.build_terminal_integration_retrospective(
         retrospective_api.TerminalIntegrationRetrospectiveContext(
@@ -1065,14 +1181,18 @@ def _write_terminal_integration_retrospective(
             output_dir=integration_output_dir(published_path),
         )
     )
-    (integration_output_dir(published_path) / "integration-retrospective.json").write_text(
+    (
+        integration_output_dir(published_path) / "integration-retrospective.json"
+    ).write_text(
         canonical_json(retrospective_result) + "\n",
         encoding="utf-8",
     )
     return retrospective_result
 
 
-def effective_validation_mode(args: argparse.Namespace, *, project_contract: ProjectContract) -> str:
+def effective_validation_mode(
+    args: argparse.Namespace, *, project_contract: ProjectContract
+) -> str:
     requested_mode = args.validation_mode or "fake"
     if args.role_profile == FAKE_LOCAL_ROLE_PROFILE:
         return requested_mode
@@ -1121,7 +1241,9 @@ def recipe_agent_from_args(
         else:
             command = None
     except TypeError:
-        raise ValueError("--agent-command-json is required when --agent-mode=real-local") from None
+        raise ValueError(
+            "--agent-command-json is required when --agent-mode=real-local"
+        ) from None
     except json.JSONDecodeError as exc:
         raise ValueError(f"--agent-command-json must be valid JSON: {exc.msg}") from exc
 
@@ -1148,14 +1270,22 @@ def recipe_agent_from_args(
         ponytail_extension = None
         ponytail_extension_source = None
         if args.agent_ponytail:
-            if args.agent_ponytail_extension is not None or args.agent_ponytail_extension_source is not None:
-                raise ValueError("--agent-ponytail cannot be combined with explicit ponytail extension values")
+            if (
+                args.agent_ponytail_extension is not None
+                or args.agent_ponytail_extension_source is not None
+            ):
+                raise ValueError(
+                    "--agent-ponytail cannot be combined with explicit "
+                    "ponytail extension values"
+                )
             ponytail_extension_source = PONYTAIL_EXTENSION_SOURCE
         else:
             ponytail_extension = args.agent_ponytail_extension
             ponytail_extension_source = args.agent_ponytail_extension_source
             if ponytail_extension is not None and ponytail_extension_source is not None:
-                raise ValueError("Specify ponytail-extension or ponytail-extension-source, not both")
+                raise ValueError(
+                    "Specify ponytail-extension or ponytail-extension-source, not both"
+                )
 
         return build_pi_real_worker_agent(
             pi_bin=args.agent_pi_bin,
@@ -1195,7 +1325,10 @@ def recipe_reviewer_from_args(
             args.reviewer_ponytail_extension is not None
             or args.reviewer_ponytail_extension_source is not None
         ):
-            raise ValueError("--reviewer-ponytail cannot be combined with explicit ponytail extension values")
+            raise ValueError(
+                "--reviewer-ponytail cannot be combined with explicit "
+                "ponytail extension values"
+            )
         ponytail_extension = None
         ponytail_extension_source = None
         if args.reviewer_ponytail:
@@ -1204,7 +1337,9 @@ def recipe_reviewer_from_args(
             ponytail_extension = args.reviewer_ponytail_extension
             ponytail_extension_source = args.reviewer_ponytail_extension_source
             if ponytail_extension is not None and ponytail_extension_source is not None:
-                raise ValueError("Specify ponytail-extension or ponytail-extension-source, not both")
+                raise ValueError(
+                    "Specify ponytail-extension or ponytail-extension-source, not both"
+                )
         command = build_pi_print_command(
             pi_bin=args.reviewer_pi_bin,
             provider=args.reviewer_pi_provider,
@@ -1259,21 +1394,29 @@ def recipe_retrospective_follow_up_from_args(
         return None
     if args.retrospective_follow_up_mode != "beads":
         raise ValueError(
-            f"Unsupported --retrospective-follow-up-mode: {args.retrospective_follow_up_mode}"
+            "Unsupported --retrospective-follow-up-mode: "
+            f"{args.retrospective_follow_up_mode}"
         )
     if beads_workspace is None or not str(beads_workspace).strip():
-        raise ValueError("--beads-workspace is required when retrospective follow-up mode is beads")
+        raise ValueError(
+            "--beads-workspace is required when retrospective follow-up mode is beads"
+        )
     workspace = validate_beads_workspace(beads_workspace)
     return {
         "enabled": True,
         "creator": "beads",
         "beads_workspace": str(workspace),
-        "labels": list(project_contract.beads_labels) + list(args.retrospective_follow_up_label),
+        "labels": list(project_contract.beads_labels)
+        + list(args.retrospective_follow_up_label),
     }
 
 
-def recipe_validation_input_from_args(args: argparse.Namespace, *, project_contract: ProjectContract) -> dict[str, Any]:
-    validation_mode = getattr(args, "effective_validation_mode", args.validation_mode or "fake")
+def recipe_validation_input_from_args(
+    args: argparse.Namespace, *, project_contract: ProjectContract
+) -> dict[str, Any]:
+    validation_mode = getattr(
+        args, "effective_validation_mode", args.validation_mode or "fake"
+    )
     timeout_seconds = args.validation_timeout_seconds
     if timeout_seconds is not None and timeout_seconds <= 0:
         raise ValueError("--validation-timeout-seconds must be greater than 0")
@@ -1293,7 +1436,8 @@ def recipe_validation_input_from_args(args: argparse.Namespace, *, project_contr
         }
     if default_validation_mode(project_contract) != "project-worker":
         raise ValueError(
-            "--validation-mode=project-worker requires a project contract with a default validation worker"
+            "--validation-mode=project-worker requires a project contract "
+            "with a default validation worker"
         )
     timeout_seconds = 3600 if timeout_seconds is None else timeout_seconds
     checkout_root = Path(args.checkout_root)
@@ -1304,7 +1448,8 @@ def recipe_validation_input_from_args(args: argparse.Namespace, *, project_contr
     )
     if getattr(args, "execute", False) and not validation_stack_path.is_dir():
         raise ValueError(
-            "project-worker validation requires an existing validation stack directory: "
+            "project-worker validation requires an existing validation stack "
+            "directory: "
             f"{validation_stack_path}"
         )
     return {
@@ -1312,7 +1457,9 @@ def recipe_validation_input_from_args(args: argparse.Namespace, *, project_contr
             "profile": args.validation_profile,
             "dry_run": False,
             "timeout_seconds": timeout_seconds,
-            "worker_home": str(checkout_root / ".validation-worker" / checkout_path.name),
+            "worker_home": str(
+                checkout_root / ".validation-worker" / checkout_path.name
+            ),
             "stack": {
                 "role": "validation",
                 "path": str(validation_stack_path),
@@ -1333,9 +1480,13 @@ def project_worker_validation_stack_path_from_args(
         raise ValueError("--validation-stack-path must be absolute")
     resolved_stack_path = validation_stack_path.resolve(strict=False)
     resolved_checkout_path = checkout_path.resolve(strict=False)
-    if resolved_stack_path == resolved_checkout_path or resolved_checkout_path in resolved_stack_path.parents:
+    if (
+        resolved_stack_path == resolved_checkout_path
+        or resolved_checkout_path in resolved_stack_path.parents
+    ):
         raise ValueError("--validation-stack-path must be outside checkout")
     return validation_stack_path
+
 
 def resolve_effective_publisher_settings(
     args: argparse.Namespace,
@@ -1353,19 +1504,24 @@ def resolve_effective_publisher_settings(
         if (
             default_create_allowed
             and args.role_profile == PRODUCTION_ROLE_PROFILE
-            and getattr(args, "effective_validation_mode", args.validation_mode or "fake") != "fake"
+            and getattr(
+                args, "effective_validation_mode", args.validation_mode or "fake"
+            )
+            != "fake"
         ):
             repo = repo or github_repo_from_repo_url(project_contract.repo_url)
             if not repo:
                 raise ValueError(
-                    "production default publisher requires a GitHub repo_url in the project contract; "
+                    "production default publisher requires a GitHub repo_url "
+                    "in the project contract; "
                     "pass --publisher-mode disabled to stay non-publishing"
                 )
             gh_config_dir = gh_config_dir or discover_gh_config_dir()
             if gh_config_dir is None:
                 raise ValueError(
-                    "production default publisher requires GitHub auth config; pass --publisher-gh-config-dir "
-                    "or configure GH_CONFIG_DIR / ~/.config/gh, or set --publisher-mode disabled"
+                    "production default publisher requires GitHub auth config; "
+                    "pass --publisher-gh-config-dir or configure GH_CONFIG_DIR "
+                    "/ ~/.config/gh, or set --publisher-mode disabled"
                 )
             mode = "create"
             base = base or project_contract.pr_target["branch"]
@@ -1409,7 +1565,9 @@ def recipe_publisher_from_args(
         review_branch=review_branch,
         repo=getattr(args, "effective_publisher_repo", args.publisher_repo),
         base=getattr(args, "effective_publisher_base", args.publisher_base),
-        gh_config_dir=getattr(args, "effective_publisher_gh_config_dir", args.publisher_gh_config_dir),
+        gh_config_dir=getattr(
+            args, "effective_publisher_gh_config_dir", args.publisher_gh_config_dir
+        ),
         checkout_path=checkout_path,
     )
     publisher["git"]["remote"] = getattr(args, "effective_publisher_remote", "origin")
@@ -1591,7 +1749,9 @@ class RunLedger:
             ledger_file.write("\n")
 
     def write_json(self, name: str, payload: dict[str, Any]) -> None:
-        (self.run_dir / name).write_text(canonical_json(payload) + "\n", encoding="utf-8")
+        (self.run_dir / name).write_text(
+            canonical_json(payload) + "\n", encoding="utf-8"
+        )
 
 
 def project_contract_fields(project_contract: ProjectContract | None) -> dict[str, Any]:
@@ -1663,4 +1823,8 @@ def new_run_id() -> str:
 
 
 def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
+    return (
+        datetime.now(timezone.utc)
+        .isoformat(timespec="microseconds")
+        .replace("+00:00", "Z")
+    )
