@@ -64,6 +64,10 @@ _Avoid_: Test command, worker adapter, validation profile
 The immutable, Candidate-bound evidence AFK gives a Repair Attempt to explain every validation or review rejection it must address.
 _Avoid_: Repair prompt, feedback list, retry context
 
+**Repair Attempt**:
+An Action Attempt bound to a rejected Candidate and its Repair Brief that consumes one of the Run's four repair slots while trying to produce a successor Candidate.
+_Avoid_: Retry, Gate Cycle, new Run
+
 **Event History**:
 The authoritative ordered record of facts and Action Attempt boundaries durably observed during one Run.
 _Avoid_: Log file, audit output, state cache
