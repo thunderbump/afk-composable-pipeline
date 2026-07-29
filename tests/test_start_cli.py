@@ -24,6 +24,7 @@ from afk.run_store import RunStore, RunStoreBusy, RunStoreError  # noqa: E402
 from afk.start import (  # noqa: E402
     StartError,
     _beads_password,
+    resume_run,
     run_worker_unit,
     start_run,
 )
@@ -5047,6 +5048,44 @@ class StartCliTest(unittest.TestCase):
         self.assertTrue(outcome["warning"])
         self.assert_exact_terminal_completion(run_id)
 
+    def test_completion_retrospective_store_error_retains_single_completed_event(self):
+        run_id = self.start_reviewed_run()
+        for _ in range(3):
+            self.assertEqual(self.run_afk("resume").returncode, 0)
+
+        with (
+            patch.dict(os.environ, self.afk_environment()),
+            patch(
+                "afk.start.run_retrospective_attempt",
+                side_effect=RunStoreError("injected retrospective failure"),
+            ),
+        ):
+            self.assertEqual(resume_run(), (run_id, 2))
+
+        store = RunStore(self.state_home / "afk")
+        completed = store.status(run_id)
+        self.assertEqual(completed["state"], "completed")
+        active = self.state_home / "afk" / "active.json"
+        self.assertTrue(active.is_file())
+        events_path = self.state_home / "afk" / "runs" / run_id / "events.jsonl"
+        events = events_path.read_bytes()
+        self.assertEqual(events.count(b'"event":"run.completed"'), 1)
+        self.assertEqual(events.count(b'"event":"run.attention_required"'), 0)
+
+        resumed = self.run_afk("resume")
+
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        self.assertFalse(active.exists())
+        self.assertEqual(
+            events_path.read_bytes().count(b'"event":"run.completed"'),
+            1,
+        )
+        outcome = store.sealed_evidence_result(
+            run_id,
+            f"retrospective/completed-{completed['last_sequence']}",
+        )
+        self.assertEqual(outcome["episode_sequence"], completed["last_sequence"])
+
     def test_terminal_cleanup_filesystem_exception_is_a_durable_warning(self):
         run_id = self.start_reviewed_run()
         self.assertEqual(self.run_afk("resume").returncode, 0)
@@ -5198,6 +5237,29 @@ class StartCliTest(unittest.TestCase):
         self.assert_exact_terminal_completion(run_id)
         active = self.state_home / "afk" / "active.json"
         self.assertTrue(active.is_file())
+        episode_sequence = completed["last_sequence"]
+        retrospective = f"retrospective/completed-{episode_sequence}"
+        self.assertIsNone(store.sealed_evidence_result(run_id, retrospective))
+        events_path = self.state_home / "afk" / "runs" / run_id / "events.jsonl"
+        events_before = events_path.read_bytes()
+
+        with (
+            patch.dict(os.environ, self.afk_environment()),
+            patch(
+                "afk.start.run_retrospective_attempt",
+                side_effect=RunStoreError("injected retrospective failure"),
+            ),
+            self.assertRaisesRegex(RunStoreError, "injected retrospective failure"),
+        ):
+            resume_run(run_id)
+
+        self.assertTrue(active.is_file())
+        self.assertEqual(events_path.read_bytes(), events_before)
+        self.assertEqual(
+            events_before.count(b'"event":"run.attention_required"'),
+            0,
+        )
+        self.assertEqual(events_before.count(b'"event":"run.completed"'), 1)
 
         resumed = self.run_afk("resume", run_id)
 
@@ -5206,10 +5268,24 @@ class StartCliTest(unittest.TestCase):
         self.assertFalse(active.exists())
         after = json.loads(self.run_afk("status", run_id, "--json").stdout)
         self.assertEqual(after["completion"], sealed_completion)
-        events = (self.state_home / "afk" / "runs" / run_id / "events.jsonl").read_text(
-            encoding="utf-8"
+        outcome = store.sealed_evidence_result(run_id, retrospective)
+        self.assertEqual(outcome["episode_sequence"], episode_sequence)
+        claim = store.effect(
+            run_id,
+            f"retrospective-analysis-{episode_sequence}",
         )
-        self.assertEqual(events.count('"event":"run.completed"'), 1)
+        self.assertEqual(claim["status"], "confirmed")
+        manifest_path = (
+            self.state_home / "afk" / "runs" / run_id / retrospective / "manifest.json"
+        )
+        manifest_before = manifest_path.read_bytes()
+
+        repeated = self.run_afk("resume", run_id)
+
+        self.assertEqual(repeated.returncode, 0, repeated.stderr)
+        self.assertEqual(store.sealed_evidence_result(run_id, retrospective), outcome)
+        self.assertEqual(manifest_path.read_bytes(), manifest_before)
+        self.assertEqual(events_path.read_bytes().count(b'"event":"run.completed"'), 1)
 
     def test_named_resume_of_retained_completed_run_is_idempotent(self):
         run_id = self.start_reviewed_run()

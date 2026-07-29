@@ -218,7 +218,9 @@ class RunStore:
             raise RunStoreError("base_sha must be a 40-character lowercase Git SHA")
 
         with self.lock():
-            active = self._active_run_id()
+            active = self._active_run_id() or self._active_pointer_run_id(
+                invalid_is_error=True
+            )
             if active is not None:
                 raise ActiveRunExists(f"Active Run already exists: {active}")
 
@@ -265,6 +267,7 @@ class RunStore:
         state: str | None = None,
         data: dict[str, Any] | None = None,
         recorded_at: str | None = None,
+        finalize_completed: bool = True,
     ) -> dict[str, Any]:
         with self.lock():
             projection = self._append_event_unlocked(
@@ -274,7 +277,11 @@ class RunStore:
                 data=data,
                 recorded_at=recorded_at,
             )
-            if projection["state"] == "completed" and self._active_run_id() is None:
+            if (
+                finalize_completed
+                and projection["state"] == "completed"
+                and self._active_run_id() is None
+            ):
                 self._clear_active_pointer(run_id)
             return projection
 
@@ -312,7 +319,8 @@ class RunStore:
                 projection["state"] == "completed"
                 and active_run_id == projection["run_id"]
             ):
-                self._clear_active_pointer(projection["run_id"])
+                if projection.get("completion") is None:
+                    self._clear_active_pointer(projection["run_id"])
                 return projection
             _atomic_json(self._run_dir(projection["run_id"]) / "state.json", projection)
             if active_run_id is None:
@@ -321,7 +329,12 @@ class RunStore:
                 )
             return projection
 
-    def reconcile_completed_active_pointer(self, run_id: str) -> dict[str, Any]:
+    def reconcile_completed_active_pointer(
+        self,
+        run_id: str,
+        *,
+        retrospective_sequence: int | None = None,
+    ) -> dict[str, Any]:
         with self.lock(validate_root_permissions=True):
             _require_mode(self.root, 0o700, "Run Store directory")
             active_path = self.root / "active.json"
@@ -333,7 +346,32 @@ class RunStore:
             invalid = validate_open_attempts(projection, events)
             if invalid is not None:
                 raise ResumePreflightInvalid(invalid)
-            if projection["state"] == "completed" and active_run_id == run_id:
+            if (
+                projection["state"] == "completed"
+                and projection.get("completion") is not None
+                and retrospective_sequence is not None
+            ):
+                if retrospective_sequence != projection["last_sequence"]:
+                    raise RunStoreError(
+                        "completion retrospective sequence contradicts the Run"
+                    )
+                evidence = f"retrospective/completed-{retrospective_sequence}"
+                outcome = self.sealed_evidence_result(run_id, evidence)
+                if (
+                    not isinstance(outcome, dict)
+                    or outcome.get("episode_sequence") != retrospective_sequence
+                ):
+                    raise RunStoreError(
+                        "completion retrospective is not sealed for the Run"
+                    )
+            if (
+                projection["state"] == "completed"
+                and active_run_id == run_id
+                and (
+                    projection.get("completion") is None
+                    or retrospective_sequence is not None
+                )
+            ):
                 self._clear_active_pointer(run_id)
             return projection
 
