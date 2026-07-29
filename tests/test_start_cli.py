@@ -2692,10 +2692,17 @@ class StartCliTest(unittest.TestCase):
         run_id = self.start_reviewed_run()
         with patch.dict(os.environ, self.afk_environment()):
             record_lifecycle_interruption(run_id, signal.SIGTERM)
+            record_lifecycle_interruption(run_id, signal.SIGINT)
         store = RunStore(self.state_home / "afk")
         interrupted = store.status(run_id)
         self.assertEqual(interrupted["last_event"], "lifecycle.signal_interrupted")
+        self.assertEqual(interrupted["lifecycle_interruption"]["signal"], "SIGTERM")
         self.assertNotIn("attention_episode", interrupted)
+        events_path = self.state_home / "afk" / "runs" / run_id / "events.jsonl"
+        self.assertEqual(
+            events_path.read_bytes().count(b'"event":"lifecycle.signal_interrupted"'),
+            1,
+        )
 
         paused = self.run_afk("resume")
 
@@ -2704,10 +2711,12 @@ class StartCliTest(unittest.TestCase):
         self.assertEqual(attention["last_event"], "run.attention_required")
         self.assertEqual(attention["checkpoint"], "reviewed")
         self.assertEqual(attention["attention"]["scope"], "lifecycle")
+        self.assertEqual(
+            attention["attention"]["summary"], "AFK lifecycle received SIGTERM"
+        )
         episode = attention["attention_episode"]
         outcome = store.sealed_evidence_result(run_id, episode["evidence"])
         self.assertEqual(outcome["episode_sequence"], episode["episode_sequence"])
-        events_path = self.state_home / "afk" / "runs" / run_id / "events.jsonl"
         events_after_handoff = events_path.read_bytes()
 
         resumed = self.run_afk("resume")
@@ -2724,11 +2733,13 @@ class StartCliTest(unittest.TestCase):
         self.assertNotEqual(events_path.read_bytes(), events_after_handoff)
 
         with patch.dict(os.environ, self.afk_environment()):
-            record_lifecycle_interruption(run_id, signal.SIGTERM)
+            record_lifecycle_interruption(run_id, signal.SIGINT)
         repeated_signal = self.run_afk("resume")
 
         self.assertEqual(repeated_signal.returncode, 2, repeated_signal.stderr)
-        later = store.status(run_id)["attention_episode"]
+        later_status = store.status(run_id)
+        self.assertEqual(later_status["lifecycle_interruption"]["signal"], "SIGINT")
+        later = later_status["attention_episode"]
         self.assertGreater(later["episode_sequence"], episode["episode_sequence"])
         later_outcome = store.sealed_evidence_result(run_id, later["evidence"])
         self.assertEqual(
