@@ -392,8 +392,16 @@ class RunStore:
                 raise RunStoreError(
                     "named resume is only available for a completed Run"
                 )
-            self._validated_completion_episode(run_id, projection)
-            self._completion_episode_finalized(run_id, projection)
+            episode = self._validated_completion_episode(run_id, projection)
+            finalized = self._completion_episode_finalized(run_id, projection)
+            if (
+                episode is not None
+                and not finalized
+                and active_run_id not in {None, run_id}
+            ):
+                raise EventHistoryCorrupt(
+                    "Active Run pointer does not match pending completion"
+                )
             if projection.get("completion_episode") is None and active_run_id == run_id:
                 self._clear_active_pointer(run_id)
             return projection

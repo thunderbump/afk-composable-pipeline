@@ -5344,6 +5344,49 @@ class StartCliTest(unittest.TestCase):
         self.assertEqual(effect["observed"]["evidence"], episode["evidence"])
         self.assertFalse((self.state_home / "afk" / "active.json").exists())
 
+    def test_named_resume_rejects_a_different_pointer_while_completion_is_pending(
+        self,
+    ):
+        store = RunStore(self.state_home / "afk")
+        store.create_run(
+            bead_id="central-bnkl.1.1",
+            repository="thunderbump/beads-webui",
+            base_branch="main",
+            base_sha="a" * 40,
+            run_id="pending-completion",
+        )
+        store.record_completion_episode(
+            "pending-completion",
+            completion={"schema_version": 1},
+        )
+        active = self.state_home / "afk" / "active.json"
+        active.write_text('{"run_id":"other-run"}\n', encoding="utf-8")
+        active.chmod(0o600)
+        run_dir = self.state_home / "afk" / "runs" / "pending-completion"
+        effects_before = tuple((run_dir / "effects").iterdir())
+        evidence_before = tuple((run_dir / "retrospective").iterdir())
+
+        with (
+            patch.dict(os.environ, self.afk_environment()),
+            patch("afk.start.run_retrospective_attempt") as retrospective,
+            self.assertRaisesRegex(
+                EventHistoryCorrupt,
+                "Active Run pointer does not match pending completion",
+            ),
+        ):
+            resume_run("pending-completion")
+
+        retrospective.assert_not_called()
+        self.assertEqual(tuple((run_dir / "effects").iterdir()), effects_before)
+        self.assertEqual(
+            tuple((run_dir / "retrospective").iterdir()),
+            evidence_before,
+        )
+        self.assertEqual(
+            json.loads(active.read_text(encoding="utf-8")),
+            {"run_id": "other-run"},
+        )
+
     def test_sealed_attempt_without_finalization_fact_remains_active(self):
         run_id = self.start_reviewed_run()
         for _ in range(3):
