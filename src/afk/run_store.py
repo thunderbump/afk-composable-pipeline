@@ -340,17 +340,32 @@ class RunStore:
             episode = self._validated_attention_episode(run_id, projection)
             if projection["state"] == "attention_required" and episode is not None:
                 events, _ = self._read_events(run_id)
-                continuous = not any(
-                    "state" in event and event["sequence"] > episode["episode_sequence"]
+                later = [
+                    event
                     for event in events
+                    if event["sequence"] > episode["episode_sequence"]
+                ]
+                continuous = not any("state" in event for event in later)
+                uncontradicted = all(
+                    not isinstance(event.get("data"), dict)
+                    or all(
+                        key not in event["data"] or event["data"][key] == value
+                        for key, value in payload.items()
+                    )
+                    for event in later
                 )
                 event = self.event(run_id, episode["episode_sequence"])
                 observed = dict(event["data"])
                 observed.pop(INVENTORY_KEY, None)
-                if continuous and observed == {
-                    **payload,
-                    "attention_episode": episode,
-                }:
+                if (
+                    continuous
+                    and uncontradicted
+                    and observed
+                    == {
+                        **payload,
+                        "attention_episode": episode,
+                    }
+                ):
                     return projection
 
             episode_sequence = projection["last_sequence"] + 1

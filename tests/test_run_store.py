@@ -277,6 +277,72 @@ class RunStoreTest(unittest.TestCase):
                 attention=attention,
             )
 
+    def test_state_less_observation_cannot_reuse_contradicted_attention_episode(self):
+        self.create_run()
+        attention = {
+            "scope": "validation",
+            "kind": "unavailable",
+            "summary": "validation service unavailable",
+        }
+        continuation = {"command": "afk resume run-001"}
+        first = self.store.record_attention_episode(
+            "run-001",
+            checkpoint="candidate_ready",
+            attention=attention,
+            details={"continuation": continuation},
+        )
+        self.store.append_event(
+            "run-001",
+            "worker.terminal",
+            data={
+                "checkpoint": "candidate_ready",
+                "worker_exit_code": 2,
+                "worker_result": "attention_required",
+            },
+        )
+
+        benign = self.store.record_attention_episode(
+            "run-001",
+            checkpoint="candidate_ready",
+            attention=attention,
+            details={"continuation": continuation},
+        )
+
+        self.assertEqual(benign["attention_episode"], first["attention_episode"])
+        self.assertEqual(benign["last_event"], "worker.terminal")
+
+        self.store.append_event(
+            "run-001",
+            "attention.observed",
+            data={
+                "checkpoint": "reviewed",
+                "attention": {
+                    "scope": "publication",
+                    "kind": "invalid",
+                    "summary": "contradictory observation",
+                },
+                "continuation": {"command": "afk complete run-001"},
+            },
+        )
+
+        corrected = self.store.record_attention_episode(
+            "run-001",
+            checkpoint="candidate_ready",
+            attention=attention,
+            details={"continuation": continuation},
+        )
+
+        self.assertGreater(
+            corrected["attention_episode"]["episode_sequence"],
+            first["attention_episode"]["episode_sequence"],
+        )
+        corrected_event = self.store.event(
+            "run-001", corrected["attention_episode"]["episode_sequence"]
+        )
+        self.assertEqual(corrected_event["data"]["checkpoint"], "candidate_ready")
+        self.assertEqual(corrected_event["data"]["attention"], attention)
+        self.assertEqual(corrected_event["data"]["continuation"], continuation)
+
     def test_resume_recovers_completion_after_active_pointer_unlink_fails(self):
         self.create_run()
         active_path = self.root / "active.json"
