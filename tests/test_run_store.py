@@ -240,6 +240,43 @@ class RunStoreTest(unittest.TestCase):
             attention,
         )
 
+    def test_attention_episode_rejects_a_marker_from_another_event(self):
+        self.create_run()
+        attention = {
+            "scope": "validation",
+            "kind": "unavailable",
+            "summary": "validation service unavailable",
+        }
+        self.store.record_attention_episode(
+            "run-001",
+            checkpoint="candidate_ready",
+            attention=attention,
+        )
+        self.store.append_event(
+            "run-001",
+            "validation.recovered",
+            state="candidate_ready",
+            data={
+                "checkpoint": "candidate_ready",
+                "attention": {},
+                "attention_episode": {
+                    "schema_version": 1,
+                    "episode_sequence": 1,
+                    "evidence": "retrospective/attention-1",
+                    "effect_id": "retrospective-analysis-1",
+                },
+            },
+        )
+
+        with self.assertRaisesRegex(
+            EventHistoryCorrupt, "attention episode marker is invalid"
+        ):
+            self.store.record_attention_episode(
+                "run-001",
+                checkpoint="candidate_ready",
+                attention=attention,
+            )
+
     def test_resume_recovers_completion_after_active_pointer_unlink_fails(self):
         self.create_run()
         active_path = self.root / "active.json"

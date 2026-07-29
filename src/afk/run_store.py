@@ -1306,33 +1306,56 @@ class RunStore:
         run_id: str,
         projection: dict[str, Any],
     ) -> dict[str, Any] | None:
-        episode = _completion_episode(projection)
-        if episode is None:
-            return None
-        event = self.event(run_id, episode["episode_sequence"])
-        if (
-            event.get("event") != "run.completed"
-            or event.get("state") != "completed"
-            or event.get("data", {}).get("completion_episode") != episode
-        ):
-            raise EventHistoryCorrupt("completion episode marker is invalid")
-        return episode
+        return self._validated_episode(
+            run_id,
+            projection,
+            name="completion",
+            evidence_name="completed",
+            event_name="run.completed",
+            event_state="completed",
+            projection_state="completed",
+        )
 
     def _validated_attention_episode(
         self,
         run_id: str,
         projection: dict[str, Any],
     ) -> dict[str, Any] | None:
-        episode = _attention_episode(projection)
+        return self._validated_episode(
+            run_id,
+            projection,
+            name="attention",
+            evidence_name="attention",
+            event_name="run.attention_required",
+            event_state="attention_required",
+        )
+
+    def _validated_episode(
+        self,
+        run_id: str,
+        projection: dict[str, Any],
+        *,
+        name: str,
+        evidence_name: str,
+        event_name: str,
+        event_state: str,
+        projection_state: str | None = None,
+    ) -> dict[str, Any] | None:
+        episode = _episode_marker(
+            projection,
+            name=name,
+            evidence_name=evidence_name,
+            projection_state=projection_state,
+        )
         if episode is None:
             return None
         event = self.event(run_id, episode["episode_sequence"])
         if (
-            event.get("event") != "run.attention_required"
-            or event.get("state") != "attention_required"
-            or event.get("data", {}).get("attention_episode") != episode
+            event.get("event") != event_name
+            or event.get("state") != event_state
+            or event.get("data", {}).get(f"{name}_episode") != episode
         ):
-            raise EventHistoryCorrupt("attention episode marker is invalid")
+            raise EventHistoryCorrupt(f"{name} episode marker is invalid")
         return episode
 
     def _clear_active_pointer(self, run_id: str) -> None:
@@ -1643,48 +1666,34 @@ def _project(identity: dict[str, Any], events: list[dict[str, Any]]) -> dict[str
     return projection
 
 
-def _completion_episode(projection: dict[str, Any]) -> dict[str, Any] | None:
-    episode = projection.get("completion_episode")
+def _episode_marker(
+    projection: dict[str, Any],
+    *,
+    name: str,
+    evidence_name: str,
+    projection_state: str | None = None,
+) -> dict[str, Any] | None:
+    episode = projection.get(f"{name}_episode")
     if episode is None:
         return None
     sequence = episode.get("episode_sequence") if isinstance(episode, dict) else None
     expected = {
         "schema_version": 1,
         "episode_sequence": sequence,
-        "evidence": f"retrospective/completed-{sequence}",
+        "evidence": f"retrospective/{evidence_name}-{sequence}",
         "effect_id": f"retrospective-analysis-{sequence}",
     }
     if (
         type(sequence) is not int
         or sequence < 1
         or episode != expected
-        or projection.get("state") != "completed"
+        or (
+            projection_state is not None and projection.get("state") != projection_state
+        )
         or type(projection.get("last_sequence")) is not int
         or projection["last_sequence"] < sequence
     ):
-        raise EventHistoryCorrupt("completion episode marker is invalid")
-    return episode
-
-
-def _attention_episode(projection: dict[str, Any]) -> dict[str, Any] | None:
-    episode = projection.get("attention_episode")
-    if episode is None:
-        return None
-    sequence = episode.get("episode_sequence") if isinstance(episode, dict) else None
-    expected = {
-        "schema_version": 1,
-        "episode_sequence": sequence,
-        "evidence": f"retrospective/attention-{sequence}",
-        "effect_id": f"retrospective-analysis-{sequence}",
-    }
-    if (
-        type(sequence) is not int
-        or sequence < 1
-        or episode != expected
-        or type(projection.get("last_sequence")) is not int
-        or projection["last_sequence"] < sequence
-    ):
-        raise EventHistoryCorrupt("attention episode marker is invalid")
+        raise EventHistoryCorrupt(f"{name} episode marker is invalid")
     return episode
 
 
