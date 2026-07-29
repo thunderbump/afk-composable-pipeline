@@ -428,6 +428,16 @@ class RunStore:
     def active_run_id(self) -> str | None:
         return self._active_run_id()
 
+    def validated_attention_episode(
+        self,
+        run_id: str,
+        projection: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Return the projected Attention episode after validating its provenance."""
+        if projection.get("run_id") != run_id:
+            raise EventHistoryCorrupt("attention episode marker is invalid")
+        return self._validated_attention_episode(run_id, projection)
+
     def resume_status(self) -> dict[str, Any]:
         with self.lock(validate_root_permissions=True):
             projection, active_run_id = self._validated_resume_context()
@@ -495,7 +505,7 @@ class RunStore:
             _require_mode(active_path, 0o600, "Active Run pointer")
         active_run_id = self._active_pointer_run_id(invalid_is_error=True)
         projection = self.status(run_id)
-        self._validated_attention_episode(projection["run_id"], projection)
+        self.validated_attention_episode(projection["run_id"], projection)
         events = self._validate_resume_projection(projection)
         invalid = validate_open_attempts(projection, events)
         if invalid is not None:

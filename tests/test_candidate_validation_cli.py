@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from afk import candidate_validation  # noqa: E402
-from afk.run_store import RunStore  # noqa: E402
+from afk.run_store import EventHistoryCorrupt, RunStore  # noqa: E402
 from afk.start import approve_bootstrap_validation, resume_run  # noqa: E402
 
 
@@ -1011,6 +1011,80 @@ class CandidateValidationCliTest(unittest.TestCase):
                 outcome["episode_sequence"],
                 episode["episode_sequence"],
             )
+
+    def test_bootstrap_approval_rejects_forged_attention_before_retrospective_mutation(
+        self,
+    ):
+        self.git("commit", "--allow-empty", "-m", "base without validation harness")
+        base_sha = self.git("rev-parse", "HEAD")
+        scripts = self.repository / "scripts"
+        scripts.mkdir()
+        harness = scripts / "validate.sh"
+        harness.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        harness.chmod(0o755)
+        self.git("add", ".")
+        self.git("commit", "-m", "propose bootstrap validation harness")
+        candidate_sha = self.git("rev-parse", "HEAD")
+        run_id = self.create_ready_run(
+            candidate_sha=candidate_sha,
+            base_sha=base_sha,
+            validation_contract={
+                "source": "approved_bootstrap",
+                "base_sha": base_sha,
+                "adapter_id": "afk.builtin.bootstrap-validation/v1",
+            },
+            legacy_attention=False,
+        )
+        store = RunStore(self.state_home / "afk")
+        legacy = store.append_event(
+            run_id,
+            "run.attention_required",
+            state="attention_required",
+            data={
+                "checkpoint": "candidate_ready",
+                "attention": {
+                    "scope": "validation",
+                    "kind": "unavailable",
+                    "summary": "legacy approval required",
+                },
+            },
+        )
+        forged_sequence = legacy["last_sequence"]
+        marker = {
+            "schema_version": 1,
+            "episode_sequence": forged_sequence,
+            "evidence": f"retrospective/attention-{forged_sequence}",
+            "effect_id": f"retrospective-analysis-{forged_sequence}",
+        }
+        store.append_event(
+            run_id,
+            "attention.marker_forged",
+            data={"attention_episode": marker},
+        )
+        effect_path = (
+            self.state_home
+            / "afk"
+            / "runs"
+            / run_id
+            / "effects"
+            / f"{marker['effect_id']}.json"
+        )
+        evidence_path = self.state_home / "afk" / "runs" / run_id / marker["evidence"]
+
+        with (
+            patch.dict(os.environ, {"XDG_STATE_HOME": str(self.state_home)}),
+            self.assertRaisesRegex(
+                EventHistoryCorrupt, "attention episode marker is invalid"
+            ),
+        ):
+            approve_bootstrap_validation(
+                "scripts/validate.sh",
+                timeout_seconds=5,
+                run_id=run_id,
+            )
+
+        self.assertFalse(effect_path.exists())
+        self.assertFalse(evidence_path.exists())
 
     def test_bootstrap_adapter_imports_as_a_package_module(self):
         environment = os.environ.copy()
