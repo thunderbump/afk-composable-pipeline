@@ -1355,7 +1355,7 @@ class RunStore:
         run_id: str,
         projection: dict[str, Any],
     ) -> dict[str, Any] | None:
-        return self._validated_episode(
+        episode = self._validated_episode(
             run_id,
             projection,
             name="attention",
@@ -1363,6 +1363,19 @@ class RunStore:
             event_name="run.attention_required",
             event_state="attention_required",
         )
+        if episode is None:
+            return None
+        events, _ = self._read_events(run_id)
+        latest = next(
+            event["data"]["attention_episode"]
+            for event in reversed(events)
+            if event["event"] == "run.attention_required"
+            and isinstance(event.get("data"), dict)
+            and "attention_episode" in event["data"]
+        )
+        if latest != episode:
+            raise EventHistoryCorrupt("attention episode marker is invalid")
+        return episode
 
     def _validated_episode(
         self,

@@ -7778,6 +7778,74 @@ class StartCliTest(unittest.TestCase):
         self.assertFalse(evidence_path.exists())
         self.assertFalse(self.command_log.exists())
 
+    def test_resume_rejects_attention_marker_rollback_and_preserves_latest_episode(
+        self,
+    ):
+        store, run_dir = self.create_resume_preflight_run()
+        first = store.record_attention_episode(
+            "crashed-run",
+            checkpoint="created",
+            attention={
+                "scope": "worker_launch",
+                "kind": "unavailable",
+                "summary": "first worker launch failure",
+            },
+        )["attention_episode"]
+        store.append_event(
+            "crashed-run",
+            "worker.launch_recovered",
+            state="created",
+            data={"checkpoint": "created", "attention": {}},
+        )
+        latest_attention = {
+            "scope": "worker_launch",
+            "kind": "unavailable",
+            "summary": "latest worker launch failure",
+        }
+        latest = store.record_attention_episode(
+            "crashed-run",
+            checkpoint="created",
+            attention=latest_attention,
+        )["attention_episode"]
+        store.append_event(
+            "crashed-run",
+            "attention.marker_rolled_back",
+            data={"attention_episode": first},
+        )
+        events_path = run_dir / "events.jsonl"
+        events_before = events_path.read_bytes()
+
+        resumed = self.run_afk("resume")
+
+        self.assertEqual(resumed.returncode, 2)
+        self.assertIn("attention episode marker is invalid", resumed.stderr)
+        self.assertEqual(events_path.read_bytes(), events_before)
+        self.assertIsNone(store.effect_if_present("crashed-run", latest["effect_id"]))
+        self.assertIsNone(
+            store.sealed_evidence_result("crashed-run", latest["evidence"])
+        )
+        self.assertFalse(self.command_log.exists())
+        with self.assertRaisesRegex(
+            EventHistoryCorrupt, "attention episode marker is invalid"
+        ):
+            store.record_attention_episode(
+                "crashed-run",
+                checkpoint="created",
+                attention=latest_attention,
+            )
+        self.assertEqual(events_path.read_bytes(), events_before)
+
+        store.append_event(
+            "crashed-run",
+            "attention.marker_restored",
+            data={"attention_episode": latest},
+        )
+        recovered = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="active")
+
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        outcome = store.sealed_evidence_result("crashed-run", latest["evidence"])
+        self.assertEqual(outcome["episode_sequence"], latest["episode_sequence"])
+
     def test_resume_preserves_legacy_attention_without_an_episode_marker(self):
         store, _ = self.create_resume_preflight_run()
         store.append_event(
