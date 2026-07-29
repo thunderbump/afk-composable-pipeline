@@ -707,7 +707,10 @@ def _run_retrospective_process(
             _terminate_process_group(process.pid)
             process.wait(timeout=PROCESS_CLEANUP_SECONDS)
         finally:
-            os.close(status_read)
+            try:
+                _close_process_streams(process)
+            finally:
+                os.close(status_read)
         raise
     process_io = None
     timed_out = False
@@ -756,9 +759,7 @@ def _run_retrospective_process(
                     _terminate_process_group(process.pid)
                     process.wait(timeout=PROCESS_CLEANUP_SECONDS)
                 finally:
-                    for stream in (process.stdin, process.stdout, process.stderr):
-                        if stream is not None:
-                            stream.close()
+                    _close_process_streams(process)
             else:
                 process_io.close_input()
         finally:
@@ -854,6 +855,12 @@ def _process_exited(pid_descriptor: int) -> bool:
     return bool(poller.poll(0))
 
 
+def _close_process_streams(process: subprocess.Popen[bytes]) -> None:
+    for stream in (process.stdin, process.stdout, process.stderr):
+        if stream is not None:
+            stream.close()
+
+
 def _terminate_process_group(process_group: int) -> None:
     for requested_signal in (signal.SIGTERM, signal.SIGKILL):
         try:
@@ -902,12 +909,16 @@ def _copy_auth_material(runtime_codex_home: Path) -> int | None:
         metadata = os.fstat(descriptor)
         if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > AUTH_BYTE_LIMIT:
             raise OSError("configured Codex auth is invalid")
+        identity = _auth_file_identity(metadata)
         payload = bytearray()
         while chunk := os.read(descriptor, AUTH_BYTE_LIMIT + 1 - len(payload)):
             payload.extend(chunk)
             if len(payload) > AUTH_BYTE_LIMIT:
                 raise OSError("configured Codex auth is invalid")
-        if len(payload) != metadata.st_size:
+        if (
+            len(payload) != metadata.st_size
+            or _auth_file_identity(os.fstat(descriptor)) != identity
+        ):
             raise OSError("configured Codex auth changed while being copied")
     finally:
         os.close(descriptor)
@@ -943,6 +954,17 @@ def _copy_auth_material(runtime_codex_home: Path) -> int | None:
         os.close(auth_descriptor)
         raise
     return auth_descriptor
+
+
+def _auth_file_identity(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        stat.S_IFMT(metadata.st_mode),
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
 
 
 def _runtime_config() -> str:

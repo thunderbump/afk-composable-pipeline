@@ -1,3 +1,4 @@
+import gc
 import json
 import os
 import shutil
@@ -9,6 +10,7 @@ import textwrap
 import threading
 import time
 import unittest
+import warnings
 from pathlib import Path
 from unittest.mock import patch
 
@@ -341,6 +343,67 @@ class RetrospectiveAttemptTest(unittest.TestCase):
         )
         self.assertTrue(store.verify_evidence("run-001", evidence))
 
+    def test_same_size_auth_mutation_during_copy_is_sealed_as_unavailable(self):
+        store, sequence = self.distinct_episode(151)
+        configured_codex_home = self.root / "torn-auth"
+        configured_codex_home.mkdir(mode=0o700)
+        auth = configured_codex_home / "auth.json"
+        auth.write_bytes(b"a" * 8192)
+        marker = self.root / "torn-auth-analyzer-launched"
+        analysis = self.empty_analysis(summary="No actionable findings.")
+        self.analyzer(
+            f"""
+            import json, pathlib
+            pathlib.Path({str(marker)!r}).touch()
+            print(json.dumps({analysis!r}))
+            """
+        )
+        real_read = os.read
+        changed = False
+
+        def read_chunk_then_mutate(descriptor, count):
+            nonlocal changed
+            payload = real_read(descriptor, min(count, 4096))
+            if payload and not changed:
+                changed = True
+                with auth.open("r+b") as stream:
+                    stream.seek(4096)
+                    stream.write(b"b" * 4096)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+            return payload
+
+        descriptors_before = set(os.listdir("/proc/self/fd"))
+        with (
+            patch.dict(
+                "os.environ",
+                {"CODEX_HOME": str(configured_codex_home)},
+                clear=False,
+            ),
+            patch(
+                "afk.retrospective_attempt.os.read",
+                side_effect=read_chunk_then_mutate,
+            ),
+        ):
+            outcome = run_retrospective_attempt(
+                store,
+                "run-001",
+                episode_sequence=sequence,
+            )
+
+        self.assertTrue(changed)
+        self.assertEqual(auth.stat().st_size, 8192)
+        self.assertEqual(outcome["status"], "unavailable")
+        self.assertIn("changed while being copied", outcome["warning_summary"])
+        self.assertFalse(marker.exists())
+        self.assertEqual(set(os.listdir("/proc/self/fd")), descriptors_before)
+        evidence = retrospective_evidence_identity(
+            store,
+            "run-001",
+            episode_sequence=sequence,
+        )
+        self.assertTrue(store.verify_evidence("run-001", evidence))
+
     def test_public_attempt_has_no_child_command_override(self):
         with self.assertRaisesRegex(
             TypeError,
@@ -423,6 +486,83 @@ class RetrospectiveAttemptTest(unittest.TestCase):
                 os.killpg(observed["pgid"], 0)
             self.assertFalse(Path(observed["codex_home"]).parents[1].exists())
             self.assertEqual(set(os.listdir("/proc/self/fd")), descriptors_before)
+            evidence = retrospective_evidence_identity(
+                self.store,
+                "run-001",
+                episode_sequence=2,
+            )
+            self.assertTrue(self.store.verify_evidence("run-001", evidence))
+            self.assertEqual(
+                run_retrospective_attempt(
+                    self.store,
+                    "run-001",
+                    episode_sequence=2,
+                ),
+                outcome,
+            )
+        finally:
+            if observed is not None:
+                try:
+                    os.killpg(observed["pgid"], signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+    def test_pidfd_failure_cleans_analysis_process_pipes_and_status_pipe(self):
+        observation = self.root / "pidfd-failure.json"
+        self.analyzer(
+            f"""
+            import json, os, pathlib, time
+            pathlib.Path({str(observation)!r}).write_text(
+                json.dumps({{
+                    "pgid": os.getpgid(0),
+                    "pid": os.getpid(),
+                }}),
+                encoding="utf-8",
+            )
+            time.sleep(60)
+            """
+        )
+
+        def fail_after_analysis_starts(_process_id):
+            deadline = time.monotonic() + 2
+            while not observation.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            if not observation.exists():
+                raise AssertionError("analysis process did not start")
+            raise OSError("injected pidfd failure")
+
+        descriptors_before = set(os.listdir("/proc/self/fd"))
+        observed = None
+        try:
+            with warnings.catch_warnings(record=True) as recorded:
+                warnings.simplefilter("always", ResourceWarning)
+                with patch(
+                    "afk.retrospective_attempt.os.pidfd_open",
+                    side_effect=fail_after_analysis_starts,
+                ):
+                    outcome = run_retrospective_attempt(
+                        self.store,
+                        "run-001",
+                        episode_sequence=2,
+                    )
+                gc.collect()
+
+            observed = json.loads(observation.read_text(encoding="utf-8"))
+            self.assertEqual(outcome["status"], "unavailable")
+            self.assertTrue(outcome["warning"])
+            self.assertEqual(outcome["warning_summary"], "injected pidfd failure")
+            self.assertFalse(self.process_is_live(observed["pid"]))
+            with self.assertRaises(ProcessLookupError):
+                os.killpg(observed["pgid"], 0)
+            self.assertEqual(set(os.listdir("/proc/self/fd")), descriptors_before)
+            self.assertEqual(
+                [
+                    warning
+                    for warning in recorded
+                    if isinstance(warning.message, ResourceWarning)
+                ],
+                [],
+            )
             evidence = retrospective_evidence_identity(
                 self.store,
                 "run-001",
