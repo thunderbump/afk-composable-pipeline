@@ -8989,6 +8989,115 @@ class StartCliTest(unittest.TestCase):
                 {"total": 1, "sealed": 0, "warning": 0, "absent": 1},
             )
 
+    def test_status_and_report_treat_publishing_retrospective_as_absent(self):
+        store_root = self.state_home / "afk"
+        store = RunStore(store_root)
+        run_id = "publishing-retrospective-run"
+        store.create_run(
+            bead_id="central-bnkl.1.1",
+            repository="thunderbump/beads-webui",
+            base_branch="main",
+            base_sha=BASE_SHA,
+            start_request={},
+            run_id=run_id,
+        )
+        projection = store.record_attention_episode(
+            run_id,
+            checkpoint="created",
+            attention={
+                "scope": "worker_launch",
+                "kind": "unavailable",
+                "summary": "worker launch unavailable",
+            },
+        )
+        episode = projection["attention_episode"]
+        store.write_evidence_value(
+            run_id,
+            f"{episode['evidence']}/result.json",
+            {
+                "schema_version": 1,
+                "run_id": run_id,
+                "episode_sequence": episode["episode_sequence"],
+                "status": "unavailable",
+                "warning": True,
+                "process_findings_count": 0,
+                "improvement_proposals_count": 0,
+                "warning_summary": "analysis unavailable",
+            },
+        )
+        store.append_event(
+            run_id,
+            "worker.terminal",
+            data={
+                "checkpoint": "created",
+                "worker_exit_code": 2,
+                "worker_result": "attention_required",
+            },
+        )
+        evidence = store_root / "runs" / run_id / episode["evidence"]
+        manifest_published = threading.Event()
+        finish_seal = threading.Event()
+        seal_errors = []
+        original_chmod = Path.chmod
+
+        def pause_before_root_read_only(path, mode, *args, **kwargs):
+            if path == evidence and mode == 0o500:
+                manifest_published.set()
+                finish_seal.wait(timeout=5)
+            return original_chmod(path, mode, *args, **kwargs)
+
+        def seal():
+            try:
+                store.seal_evidence(run_id, episode["evidence"])
+            except Exception as exc:  # pragma: no cover - surfaced by assertion
+                seal_errors.append(exc)
+
+        with patch.object(Path, "chmod", new=pause_before_root_read_only):
+            sealer = threading.Thread(target=seal)
+            sealer.start()
+            self.assertTrue(manifest_published.wait(timeout=5))
+
+            def snapshot():
+                paths = [store_root, *store_root.rglob("*")]
+                return {
+                    path.relative_to(store_root).as_posix()
+                    or ".": (
+                        path.read_bytes() if path.is_file() else None,
+                        stat.S_IMODE(path.stat().st_mode),
+                    )
+                    for path in paths
+                }
+
+            before = snapshot()
+            status = self.run_afk("status", run_id, "--json")
+            report = self.run_afk("report", run_id)
+            after = snapshot()
+            finish_seal.set()
+            sealer.join(timeout=5)
+
+        self.assertFalse(sealer.is_alive())
+        self.assertEqual(seal_errors, [])
+        self.assertEqual(status.returncode, 2, status.stderr)
+        self.assertEqual(report.returncode, 0, report.stderr)
+        self.assertEqual(after, before)
+        for completed in (status, report):
+            retrospective = json.loads(completed.stdout)["retrospective"]
+            self.assertEqual(retrospective["status"], "absent")
+            self.assertEqual(
+                retrospective["episode_counts"],
+                {"total": 1, "sealed": 0, "warning": 0, "absent": 1},
+            )
+        completed = self.run_afk("status", run_id, "--json")
+        self.assertEqual(completed.returncode, 2, completed.stderr)
+        self.assertEqual(
+            json.loads(completed.stdout)["retrospective"]["status"],
+            "unavailable",
+        )
+        evidence.chmod(0o700)
+        tampered = self.run_afk("status", run_id, "--json")
+        self.assertEqual(tampered.returncode, 1)
+        self.assertIn("sealed evidence is writable", tampered.stderr)
+
     def test_status_and_report_do_not_recreate_the_removed_store_lock(self):
         store_root = self.state_home / "afk"
         store = RunStore(store_root)

@@ -887,6 +887,9 @@ class RunStoreTest(unittest.TestCase):
             expected,
         )
         self.assertTrue(self.store.verify_evidence("run-001", "gates/completion"))
+        self.assertFalse(
+            (self.root / "runs" / "run-001" / ".evidence-publication").exists()
+        )
 
     def test_sealed_evidence_result_does_not_repair_changed_published_evidence(self):
         self.create_run()
