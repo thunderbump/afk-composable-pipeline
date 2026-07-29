@@ -109,10 +109,7 @@ def record_lifecycle_interruption(run_id: str | None, signal_number: int) -> Non
             projection = store.status(run_id)
             if projection["state"] == "completed":
                 return
-            if (
-                projection["last_event"] == "lifecycle.signal_interrupted"
-                and projection.get("lifecycle_interruption") == interruption
-            ):
+            if projection["last_event"] == "lifecycle.signal_interrupted":
                 return
             store.append_event(
                 projection["run_id"],

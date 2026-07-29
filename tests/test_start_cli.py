@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
 import time
 import unittest
 from io import StringIO
@@ -19,7 +20,9 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 import afk.run_store as run_store_module  # noqa: E402
+import afk.start as start_module  # noqa: E402
 from afk.bead_spec import bead_spec_identity, persist_bead_spec  # noqa: E402
+from afk.lifecycle_signals import record_lifecycle_interruption  # noqa: E402
 from afk.run_store import (  # noqa: E402
     ActiveRunExists,
     EventHistoryCorrupt,
@@ -2686,6 +2689,81 @@ class StartCliTest(unittest.TestCase):
 
     def test_signal_persistence_failure_cannot_fabricate_success(self):
         self._assert_resume_signal(signal.SIGTERM, persistence_failure=True)
+
+    def test_resume_backfills_signal_attention_before_checkpoint_continuation(self):
+        run_id = self.start_reviewed_run()
+        with patch.dict(os.environ, self.afk_environment()):
+            record_lifecycle_interruption(run_id, signal.SIGTERM)
+            record_lifecycle_interruption(run_id, signal.SIGINT)
+        store = RunStore(self.state_home / "afk")
+        interrupted = store.status(run_id)
+        self.assertEqual(interrupted["last_event"], "lifecycle.signal_interrupted")
+        self.assertEqual(interrupted["lifecycle_interruption"]["signal"], "SIGTERM")
+        self.assertNotIn("attention_episode", interrupted)
+        events_path = self.state_home / "afk" / "runs" / run_id / "events.jsonl"
+        self.assertEqual(
+            events_path.read_bytes().count(b'"event":"lifecycle.signal_interrupted"'),
+            1,
+        )
+
+        paused = self.run_afk("resume")
+
+        self.assertEqual(paused.returncode, 2, paused.stderr)
+        attention = store.status(run_id)
+        self.assertEqual(attention["last_event"], "run.attention_required")
+        self.assertEqual(attention["checkpoint"], "reviewed")
+        self.assertEqual(attention["attention"]["scope"], "lifecycle")
+        self.assertEqual(
+            attention["attention"]["summary"], "AFK lifecycle received SIGTERM"
+        )
+        episode = attention["attention_episode"]
+        outcome = store.sealed_evidence_result(run_id, episode["evidence"])
+        self.assertEqual(outcome["episode_sequence"], episode["episode_sequence"])
+        events_after_handoff = events_path.read_bytes()
+
+        resumed = self.run_afk("resume")
+
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        self.assertEqual(
+            events_path.read_bytes().count(b'"event":"run.attention_required"'),
+            1,
+        )
+        self.assertEqual(
+            store.sealed_evidence_result(run_id, episode["evidence"]),
+            outcome,
+        )
+        self.assertNotEqual(events_path.read_bytes(), events_after_handoff)
+
+        with patch.dict(os.environ, self.afk_environment()):
+            record_lifecycle_interruption(run_id, signal.SIGINT)
+        repeated_signal = self.run_afk("resume")
+
+        self.assertEqual(repeated_signal.returncode, 2, repeated_signal.stderr)
+        later_status = store.status(run_id)
+        self.assertEqual(later_status["lifecycle_interruption"]["signal"], "SIGINT")
+        later = later_status["attention_episode"]
+        self.assertGreater(later["episode_sequence"], episode["episode_sequence"])
+        later_outcome = store.sealed_evidence_result(run_id, later["evidence"])
+        self.assertEqual(
+            later_outcome["episode_sequence"],
+            later["episode_sequence"],
+        )
+        self.assertEqual(
+            events_path.read_bytes().count(b'"event":"run.attention_required"'),
+            2,
+        )
+
+        recovered = self.run_afk("resume")
+
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        self.assertEqual(
+            events_path.read_bytes().count(b'"event":"run.attention_required"'),
+            2,
+        )
+        self.assertEqual(
+            store.sealed_evidence_result(run_id, later["evidence"]),
+            later_outcome,
+        )
 
     def test_unnamed_resume_latches_signal_until_locked_target_lookup_completes(self):
         state_name = "lifecycle-target-lookup"
@@ -7623,6 +7701,178 @@ class StartCliTest(unittest.TestCase):
 
         self.assert_resume_preflight_rejected("Event History record 1 is invalid")
 
+    def test_resume_rejects_forged_attention_marker_before_retrospective_mutation(
+        self,
+    ):
+        store, run_dir = self.create_resume_preflight_run()
+        attention = {
+            "scope": "worker_launch",
+            "kind": "unavailable",
+            "summary": "worker launch failed",
+        }
+        episode = store.record_attention_episode(
+            "crashed-run",
+            checkpoint="created",
+            attention=attention,
+        )["attention_episode"]
+        forged_sequence = store.status("crashed-run")["last_sequence"] + 1
+        store.append_event(
+            "crashed-run",
+            "attention.marker_forged",
+            data={
+                "attention_episode": {
+                    "schema_version": 1,
+                    "episode_sequence": forged_sequence,
+                    "evidence": f"retrospective/attention-{forged_sequence}",
+                    "effect_id": f"retrospective-analysis-{forged_sequence}",
+                }
+            },
+        )
+        events_before = (run_dir / "events.jsonl").read_bytes()
+        effects_before = {
+            path.name: path.read_bytes() for path in (run_dir / "effects").iterdir()
+        }
+        retrospective_before = tuple((run_dir / "retrospective").iterdir())
+
+        resumed = self.run_afk("resume")
+
+        self.assertEqual(resumed.returncode, 2)
+        self.assertIn("attention episode marker is invalid", resumed.stderr)
+        self.assertEqual((run_dir / "events.jsonl").read_bytes(), events_before)
+        self.assertEqual(
+            {path.name: path.read_bytes() for path in (run_dir / "effects").iterdir()},
+            effects_before,
+        )
+        self.assertEqual(
+            tuple((run_dir / "retrospective").iterdir()), retrospective_before
+        )
+        self.assertIsNone(
+            store.sealed_evidence_result("crashed-run", episode["evidence"])
+        )
+        self.assertFalse(self.command_log.exists())
+
+    def test_resume_rejects_erased_attention_marker_before_retrospective_mutation(self):
+        store, run_dir = self.create_resume_preflight_run()
+        episode = store.record_attention_episode(
+            "crashed-run",
+            checkpoint="created",
+            attention={
+                "scope": "worker_launch",
+                "kind": "unavailable",
+                "summary": "worker launch failed",
+            },
+        )["attention_episode"]
+        store.append_event(
+            "crashed-run",
+            "attention.marker_erased",
+            data={"attention_episode": None},
+        )
+        events_before = (run_dir / "events.jsonl").read_bytes()
+        effect_path = run_dir / "effects" / f"{episode['effect_id']}.json"
+        evidence_path = run_dir / episode["evidence"]
+
+        resumed = self.run_afk("resume")
+
+        self.assertEqual(resumed.returncode, 2)
+        self.assertIn("attention episode marker is invalid", resumed.stderr)
+        self.assertEqual((run_dir / "events.jsonl").read_bytes(), events_before)
+        self.assertFalse(effect_path.exists())
+        self.assertFalse(evidence_path.exists())
+        self.assertFalse(self.command_log.exists())
+
+    def test_resume_rejects_attention_marker_rollback_and_preserves_latest_episode(
+        self,
+    ):
+        store, run_dir = self.create_resume_preflight_run()
+        first = store.record_attention_episode(
+            "crashed-run",
+            checkpoint="created",
+            attention={
+                "scope": "worker_launch",
+                "kind": "unavailable",
+                "summary": "first worker launch failure",
+            },
+        )["attention_episode"]
+        store.append_event(
+            "crashed-run",
+            "worker.launch_recovered",
+            state="created",
+            data={"checkpoint": "created", "attention": {}},
+        )
+        latest_attention = {
+            "scope": "worker_launch",
+            "kind": "unavailable",
+            "summary": "latest worker launch failure",
+        }
+        latest = store.record_attention_episode(
+            "crashed-run",
+            checkpoint="created",
+            attention=latest_attention,
+        )["attention_episode"]
+        store.append_event(
+            "crashed-run",
+            "attention.marker_rolled_back",
+            data={"attention_episode": first},
+        )
+        events_path = run_dir / "events.jsonl"
+        events_before = events_path.read_bytes()
+
+        resumed = self.run_afk("resume")
+
+        self.assertEqual(resumed.returncode, 2)
+        self.assertIn("attention episode marker is invalid", resumed.stderr)
+        self.assertEqual(events_path.read_bytes(), events_before)
+        self.assertIsNone(store.effect_if_present("crashed-run", latest["effect_id"]))
+        self.assertIsNone(
+            store.sealed_evidence_result("crashed-run", latest["evidence"])
+        )
+        self.assertFalse(self.command_log.exists())
+        with self.assertRaisesRegex(
+            EventHistoryCorrupt, "attention episode marker is invalid"
+        ):
+            store.record_attention_episode(
+                "crashed-run",
+                checkpoint="created",
+                attention=latest_attention,
+            )
+        self.assertEqual(events_path.read_bytes(), events_before)
+
+        store.append_event(
+            "crashed-run",
+            "attention.marker_restored",
+            data={"attention_episode": latest},
+        )
+        recovered = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="active")
+
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        outcome = store.sealed_evidence_result("crashed-run", latest["evidence"])
+        self.assertEqual(outcome["episode_sequence"], latest["episode_sequence"])
+
+    def test_resume_preserves_legacy_attention_without_an_episode_marker(self):
+        store, _ = self.create_resume_preflight_run()
+        store.append_event(
+            "crashed-run",
+            "run.attention_required",
+            state="attention_required",
+            data={
+                "checkpoint": "created",
+                "attention": {
+                    "scope": "worker_launch",
+                    "kind": "unavailable",
+                    "summary": "legacy worker launch failure",
+                },
+            },
+        )
+        self.assertNotIn("attention_episode", store.status("crashed-run"))
+
+        resumed = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="active")
+
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        self.assertEqual(
+            store.effect("crashed-run", "worker-launch-1")["status"],
+            "confirmed",
+        )
+
     def test_resume_rejects_misbound_open_validation_attempt_before_commands(self):
         store, _ = self.create_resume_preflight_run()
         store.append_event(
@@ -7695,12 +7945,14 @@ class StartCliTest(unittest.TestCase):
 
     def assert_repeated_validation_lifecycle_rejected(self, store, run_dir):
         first = self.run_afk("resume")
+        events_after_first = (run_dir / "events.jsonl").read_bytes()
         second = self.run_afk("resume")
 
         self.assertEqual(first.returncode, 2)
         self.assertEqual(second.returncode, 2)
+        self.assertEqual((run_dir / "events.jsonl").read_bytes(), events_after_first)
         self.assertFalse(self.command_log.exists())
-        for root in ("attempts", "gates", "retrospective"):
+        for root in ("attempts", "gates"):
             expected = ["start-bead-spec"] if root == "attempts" else []
             self.assertEqual(
                 sorted(path.name for path in (run_dir / root).iterdir()),
@@ -7711,6 +7963,13 @@ class StartCliTest(unittest.TestCase):
         self.assertIn(
             "validation attempt lifecycle is invalid",
             status["attention"]["summary"],
+        )
+        episode = status["attention_episode"]
+        self.assertEqual(
+            store.sealed_evidence_result("crashed-run", episode["evidence"])[
+                "episode_sequence"
+            ],
+            episode["episode_sequence"],
         )
 
     def test_resume_rejects_started_projection_after_attempt_finished(self):
@@ -7869,12 +8128,14 @@ class StartCliTest(unittest.TestCase):
 
     def assert_repeated_repair_lifecycle_rejected(self, store, run_dir):
         first = self.run_afk("resume")
+        events_after_first = (run_dir / "events.jsonl").read_bytes()
         second = self.run_afk("resume")
 
         self.assertEqual(first.returncode, 2)
         self.assertEqual(second.returncode, 2)
+        self.assertEqual((run_dir / "events.jsonl").read_bytes(), events_after_first)
         self.assertFalse(self.command_log.exists())
-        for root in ("attempts", "gates", "retrospective"):
+        for root in ("attempts", "gates"):
             expected = ["start-bead-spec"] if root == "attempts" else []
             self.assertEqual(
                 sorted(path.name for path in (run_dir / root).iterdir()),
@@ -7884,6 +8145,13 @@ class StartCliTest(unittest.TestCase):
         self.assertEqual(status["attention"]["kind"], "invalid")
         self.assertIn(
             "repair attempt lifecycle is invalid", status["attention"]["summary"]
+        )
+        episode = status["attention_episode"]
+        self.assertEqual(
+            store.sealed_evidence_result("crashed-run", episode["evidence"])[
+                "episode_sequence"
+            ],
+            episode["episode_sequence"],
         )
 
     def test_resume_rejects_repair_attempt_started_while_one_is_open(self):
@@ -10220,6 +10488,222 @@ class StartCliTest(unittest.TestCase):
         self.assertEqual(status["state"], "attention_required")
         self.assertEqual(status["checkpoint"], "created")
         self.assertEqual(status["attention"]["scope"], "worker_launch")
+        episode = status["attention_episode"]
+        self.assertEqual(episode["episode_sequence"], status["last_sequence"])
+        store = RunStore(self.state_home / "afk")
+        outcome = store.sealed_evidence_result(status["run_id"], episode["evidence"])
+        self.assertEqual(outcome["episode_sequence"], episode["episode_sequence"])
+        self.assertEqual(outcome["status"], "empty")
+        self.assertEqual(
+            store.effect(status["run_id"], episode["effect_id"])["status"],
+            "confirmed",
+        )
+
+        events_before = (
+            self.state_home / "afk" / "runs" / status["run_id"] / "events.jsonl"
+        ).read_bytes()
+        repeated = self.run_afk("status", "--json")
+
+        self.assertEqual(repeated.returncode, 2, repeated.stderr)
+        self.assertEqual(
+            (
+                self.state_home / "afk" / "runs" / status["run_id"] / "events.jsonl"
+            ).read_bytes(),
+            events_before,
+        )
+        self.assertEqual(
+            RunStore(self.state_home / "afk").sealed_evidence_result(
+                status["run_id"], episode["evidence"]
+            ),
+            outcome,
+        )
+
+    def test_resume_reconciles_crashed_attention_before_lifecycle_mutation(self):
+        interrupted = self.run_afk(
+            "start",
+            "central-bnkl.1.1",
+            AFK_FAKE_SYSTEMD_FAILURE="1",
+            AFK_TEST_KILL_AFTER_EVENT_WRITE="run.attention_required",
+        )
+
+        self.assertLess(interrupted.returncode, 0)
+        store = RunStore(self.state_home / "afk")
+        status = store.status()
+        episode = status["attention_episode"]
+        self.assertIsNone(
+            store.sealed_evidence_result(status["run_id"], episode["evidence"])
+        )
+        events_path = (
+            self.state_home / "afk" / "runs" / status["run_id"] / "events.jsonl"
+        )
+        events_before = events_path.read_bytes()
+
+        resumed = self.run_afk(
+            "resume",
+            AFK_FAKE_SYSTEMD_STATE="active",
+            AFK_TEST_KILL_BEFORE_EVENT="worker.launch_reconciled",
+        )
+
+        self.assertLess(resumed.returncode, 0)
+        outcome = store.sealed_evidence_result(status["run_id"], episode["evidence"])
+        self.assertEqual(outcome["episode_sequence"], episode["episode_sequence"])
+        self.assertEqual(events_path.read_bytes(), events_before)
+
+        completed = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="active")
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(
+            events_path.read_bytes().count(b'"event":"run.attention_required"'),
+            1,
+        )
+        self.assertEqual(
+            store.sealed_evidence_result(status["run_id"], episode["evidence"]),
+            outcome,
+        )
+
+    def test_unavailable_attention_retrospective_preserves_attention_contract(self):
+        (self.fake_bin / "codex").unlink()
+
+        completed = self.run_afk(
+            "start", "central-bnkl.1.1", AFK_FAKE_SYSTEMD_FAILURE="1"
+        )
+
+        self.assertEqual(completed.returncode, 2, completed.stderr)
+        status = json.loads(self.run_afk("status", "--json").stdout)
+        self.assertEqual(status["state"], "attention_required")
+        self.assertEqual(status["checkpoint"], "created")
+        self.assertEqual(status["attention"]["scope"], "worker_launch")
+        self.assertEqual(status["attention"]["kind"], "unavailable")
+        outcome = RunStore(self.state_home / "afk").sealed_evidence_result(
+            status["run_id"], status["attention_episode"]["evidence"]
+        )
+        self.assertEqual(outcome["status"], "unavailable")
+        self.assertTrue(outcome["warning"])
+
+    def test_concurrent_attention_reconciles_first_episode_before_superseding_it(self):
+        store, _ = self.create_resume_preflight_run()
+        first_episode_sequence = store.status("crashed-run")["last_sequence"] + 1
+        initial_status_barrier = threading.Barrier(2)
+        local = threading.local()
+        original_status = store.status
+        original_retrospective = start_module.run_retrospective_attempt
+        retrospective_attempts = []
+        attempts_lock = threading.Lock()
+        first_waiting = threading.Event()
+        first_attempted = threading.Event()
+        second_attempted = threading.Event()
+        errors = []
+
+        def synchronized_status(run_id=None):
+            projection = original_status(run_id)
+            if not getattr(local, "initial_status_read", False):
+                local.initial_status_read = True
+                if local.summary == "first concurrent attention":
+                    first_waiting.set()
+                try:
+                    initial_status_barrier.wait(timeout=2)
+                except threading.BrokenBarrierError:
+                    pass
+                if local.summary == "second concurrent attention":
+                    first_attempted.wait(timeout=2)
+            return projection
+
+        def crash_first_attempt(
+            selected_store,
+            run_id,
+            *,
+            episode_sequence,
+        ):
+            with attempts_lock:
+                retrospective_attempts.append(episode_sequence)
+                first_attempt = (
+                    episode_sequence == first_episode_sequence
+                    and retrospective_attempts.count(episode_sequence) == 1
+                )
+            if first_attempt:
+                first_attempted.set()
+                second_attempted.wait(timeout=0.2)
+                raise RuntimeError("injected first attention crash")
+            if episode_sequence == first_episode_sequence + 1:
+                second_attempted.set()
+            return original_retrospective(
+                selected_store,
+                run_id,
+                episode_sequence=episode_sequence,
+            )
+
+        def require_attention(summary):
+            local.summary = summary
+            while True:
+                try:
+                    start_module._attention(
+                        store,
+                        "crashed-run",
+                        checkpoint="created",
+                        scope="worker_launch",
+                        kind="unavailable",
+                        summary=summary,
+                    )
+                except RunStoreBusy:
+                    time.sleep(0.01)
+                    continue
+                except RuntimeError as exc:
+                    errors.append(str(exc))
+                return
+
+        with (
+            patch.dict(os.environ, self.afk_environment()),
+            patch.object(store, "status", new=synchronized_status),
+            patch(
+                "afk.start.run_retrospective_attempt",
+                side_effect=crash_first_attempt,
+            ),
+        ):
+            callers = [
+                threading.Thread(target=require_attention, args=(summary,))
+                for summary in (
+                    "first concurrent attention",
+                    "second concurrent attention",
+                )
+            ]
+            callers[0].start()
+            self.assertTrue(first_waiting.wait(timeout=2))
+            callers[1].start()
+            for caller in callers:
+                caller.join(timeout=10)
+
+        self.assertFalse(any(caller.is_alive() for caller in callers))
+        self.assertEqual(errors, ["injected first attention crash"])
+        self.assertEqual(
+            retrospective_attempts,
+            [
+                first_episode_sequence,
+                first_episode_sequence,
+                first_episode_sequence + 1,
+            ],
+        )
+        episodes = [
+            event["data"]["attention_episode"]
+            for sequence in range(1, store.status("crashed-run")["last_sequence"] + 1)
+            if (event := store.event("crashed-run", sequence))["event"]
+            == "run.attention_required"
+        ]
+        self.assertEqual(len(episodes), 2)
+        self.assertEqual(
+            {
+                store.event("crashed-run", episode["episode_sequence"])["data"][
+                    "attention"
+                ]["summary"]
+                for episode in episodes
+            },
+            {"first concurrent attention", "second concurrent attention"},
+        )
+        for episode in episodes:
+            outcome = store.sealed_evidence_result("crashed-run", episode["evidence"])
+            self.assertEqual(
+                outcome["episode_sequence"],
+                episode["episode_sequence"],
+            )
 
     def test_claim_failure_stops_at_created_checkpoint(self):
         run_id = self.run_afk("start", "central-bnkl.1.1").stdout.strip()

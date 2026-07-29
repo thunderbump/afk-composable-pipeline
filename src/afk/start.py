@@ -215,6 +215,34 @@ def resume_run(
         selected_run_id = projection["run_id"]
         if on_selected is not None:
             on_selected(selected_run_id)
+        if (
+            projection["state"] == "attention_required"
+            and projection.get("attention_episode") is not None
+        ):
+            run_retrospective_attempt(
+                store,
+                selected_run_id,
+                episode_sequence=projection["attention_episode"]["episode_sequence"],
+            )
+        if projection["last_event"] == "lifecycle.signal_interrupted":
+            interruption = projection["lifecycle_interruption"]
+            _attention(
+                store,
+                selected_run_id,
+                checkpoint=projection["checkpoint"],
+                scope="lifecycle",
+                kind="interrupted",
+                summary=f"AFK lifecycle received {interruption['signal']}",
+                lifecycle_interruption=interruption,
+            )
+            return selected_run_id, 2
+        if projection["last_event"] == "validation.bootstrap_approved":
+            _approved_bootstrap_attention(
+                store,
+                selected_run_id,
+                projection["validation_contract"],
+            )
+            return selected_run_id, 2
         if projection["state"] == "completed":
             if projection.get("completion_episode") is not None:
                 _reconcile_completed_run(store, selected_run_id, projection)
@@ -640,7 +668,28 @@ def approve_bootstrap_validation(
                 },
             },
         )
+        _approved_bootstrap_attention(
+            store,
+            projection["run_id"],
+            contract,
+        )
         return projection["run_id"]
+
+
+def _approved_bootstrap_attention(
+    store: RunStore,
+    run_id: str,
+    contract: dict[str, Any],
+) -> None:
+    _attention(
+        store,
+        run_id,
+        checkpoint="candidate_ready",
+        scope="validation",
+        kind="unavailable",
+        summary="approved bootstrap validation is ready",
+        validation_contract=contract,
+    )
 
 
 def _candidate_resume_ready(projection: dict[str, Any]) -> bool:
@@ -2999,21 +3048,35 @@ def _attention(
     classification: str | None = None,
     **details: Any,
 ) -> None:
-    store.append_event(
-        run_id,
-        "run.attention_required",
-        state="attention_required",
-        data={
-            "checkpoint": checkpoint,
-            "attention": {
+    with store.lock():
+        current = store.status(run_id)
+        prior_episode = store.validated_attention_episode(run_id, current)
+        prior_sequence = None
+        if current["state"] == "attention_required" and prior_episode is not None:
+            prior_sequence = prior_episode["episode_sequence"]
+            run_retrospective_attempt(
+                store,
+                run_id,
+                episode_sequence=prior_sequence,
+            )
+        projection = store.record_attention_episode(
+            run_id,
+            checkpoint=checkpoint,
+            attention={
                 "scope": scope,
                 "kind": kind,
                 "summary": summary,
                 **({"classification": classification} if classification else {}),
             },
-            **details,
-        },
-    )
+            details=details,
+        )
+        episode = projection["attention_episode"]
+        if episode["episode_sequence"] != prior_sequence:
+            run_retrospective_attempt(
+                store,
+                run_id,
+                episode_sequence=episode["episode_sequence"],
+            )
 
 
 def _required(
