@@ -293,7 +293,8 @@ class RunStore:
             if projection["state"] == "completed":
                 if (
                     projection.get("completion") == redact_artifact_value(completion)
-                    and projection.get("completion_episode") is not None
+                    and self._validated_completion_episode(run_id, projection)
+                    is not None
                 ):
                     return projection
                 raise RunStoreError("Run already has a different completion")
@@ -317,6 +318,37 @@ class RunStore:
                 recorded_at=recorded_at,
             )
 
+    def record_completion_finalization(
+        self,
+        run_id: str,
+        *,
+        outcome: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Bind an exactly reconciled retrospective to its completion episode."""
+        with self.lock():
+            projection = self.status(run_id)
+            episode = self._validated_completion_episode(run_id, projection)
+            if projection["state"] != "completed" or episode is None:
+                raise RunStoreError("Run has no pending completion episode")
+            sealed = self.sealed_evidence_result(run_id, episode["evidence"])
+            if sealed != redact_artifact_value(outcome):
+                raise RunStoreError(
+                    "completion retrospective outcome contradicts sealed evidence"
+                )
+            expected = self._expected_completion_finalization(
+                run_id,
+                episode,
+                outcome=sealed,
+            )
+            path = self._run_dir(run_id) / "completion-finalization.json"
+            if path.exists() or path.is_symlink():
+                observed = self._read_completion_finalization(run_id)
+                if observed != expected:
+                    raise EventHistoryCorrupt("completion finalization is invalid")
+                return observed
+            _atomic_json(path, expected)
+            return expected
+
     def status(self, run_id: str | None = None) -> dict[str, Any]:
         selected = run_id or self._active_run_id()
         if selected is None:
@@ -333,20 +365,11 @@ class RunStore:
 
     def resume_status(self) -> dict[str, Any]:
         with self.lock(validate_root_permissions=True):
-            _require_mode(self.root, 0o700, "Run Store directory")
-            active_path = self.root / "active.json"
-            if active_path.exists() or active_path.is_symlink():
-                _require_mode(active_path, 0o600, "Active Run pointer")
-            active_run_id = self._active_pointer_run_id(invalid_is_error=True)
-            projection = self.status()
-            events = self._validate_resume_projection(projection)
+            projection, active_run_id = self._validated_resume_context()
             if active_run_id is not None and active_run_id != projection["run_id"]:
                 raise EventHistoryCorrupt(
                     "Active Run pointer does not match Event History"
                 )
-            invalid = validate_open_attempts(projection, events)
-            if invalid is not None:
-                raise ResumePreflightInvalid(invalid)
             if (
                 projection["state"] == "completed"
                 and active_run_id == projection["run_id"]
@@ -364,36 +387,20 @@ class RunStore:
     def resume_completed_status(self, run_id: str) -> dict[str, Any]:
         """Validate a named Completed Run and reconcile a stale legacy pointer."""
         with self.lock(validate_root_permissions=True):
-            _require_mode(self.root, 0o700, "Run Store directory")
-            active_path = self.root / "active.json"
-            if active_path.exists() or active_path.is_symlink():
-                _require_mode(active_path, 0o600, "Active Run pointer")
-            active_run_id = self._active_pointer_run_id(invalid_is_error=True)
-            projection = self.status(run_id)
-            events = self._validate_resume_projection(projection)
-            invalid = validate_open_attempts(projection, events)
-            if invalid is not None:
-                raise ResumePreflightInvalid(invalid)
+            projection, active_run_id = self._validated_resume_context(run_id)
             if projection["state"] != "completed":
                 raise RunStoreError(
                     "named resume is only available for a completed Run"
                 )
+            self._validated_completion_episode(run_id, projection)
+            self._completion_episode_finalized(run_id, projection)
             if projection.get("completion_episode") is None and active_run_id == run_id:
                 self._clear_active_pointer(run_id)
             return projection
 
     def finalize_completion_episode(self, run_id: str) -> dict[str, Any]:
         with self.lock(validate_root_permissions=True):
-            _require_mode(self.root, 0o700, "Run Store directory")
-            active_path = self.root / "active.json"
-            if active_path.exists() or active_path.is_symlink():
-                _require_mode(active_path, 0o600, "Active Run pointer")
-            active_run_id = self._active_pointer_run_id(invalid_is_error=True)
-            projection = self.status(run_id)
-            events = self._validate_resume_projection(projection)
-            invalid = validate_open_attempts(projection, events)
-            if invalid is not None:
-                raise ResumePreflightInvalid(invalid)
+            projection, active_run_id = self._validated_resume_context(run_id)
             episode = self._validated_completion_episode(run_id, projection)
             if projection["state"] != "completed" or episode is None:
                 raise RunStoreError("Run has no pending completion episode")
@@ -404,6 +411,22 @@ class RunStore:
             if active_run_id == run_id:
                 self._clear_active_pointer(run_id)
             return projection
+
+    def _validated_resume_context(
+        self,
+        run_id: str | None = None,
+    ) -> tuple[dict[str, Any], str | None]:
+        _require_mode(self.root, 0o700, "Run Store directory")
+        active_path = self.root / "active.json"
+        if active_path.exists() or active_path.is_symlink():
+            _require_mode(active_path, 0o600, "Active Run pointer")
+        active_run_id = self._active_pointer_run_id(invalid_is_error=True)
+        projection = self.status(run_id)
+        events = self._validate_resume_projection(projection)
+        invalid = validate_open_attempts(projection, events)
+        if invalid is not None:
+            raise ResumePreflightInvalid(invalid)
+        return projection, active_run_id
 
     def identity(self, run_id: str) -> dict[str, Any]:
         return self._identity(run_id)
@@ -1144,29 +1167,89 @@ class RunStore:
         projection: dict[str, Any],
     ) -> bool:
         episode = self._validated_completion_episode(run_id, projection)
+        finalization = self._read_completion_finalization(run_id, missing_ok=True)
         if episode is None:
+            if finalization is not None:
+                raise EventHistoryCorrupt("completion finalization is invalid")
             return True
-        outcome = self.sealed_evidence_result(run_id, episode["evidence"])
-        if (
-            not isinstance(outcome, dict)
-            or outcome.get("schema_version") != 1
-            or outcome.get("run_id") != run_id
-            or outcome.get("episode_sequence") != episode["episode_sequence"]
-            or outcome.get("status")
-            not in {"passed", "empty", "invalid", "unavailable", "interrupted"}
-        ):
+        if finalization is None:
             return False
-        effect = self.effect_if_present(run_id, episode["effect_id"])
-        return bool(
-            effect is not None
-            and effect["kind"] == "retrospective-analysis"
-            and effect["status"] == "confirmed"
-            and effect["intended"].get("episode_sequence")
-            == episode["episode_sequence"]
-            and effect["intended"].get("evidence") == episode["evidence"]
-            and effect.get("observed")
-            == {"evidence": episode["evidence"], "status": outcome.get("status")}
+        outcome = self.sealed_evidence_result(run_id, episode["evidence"])
+        expected = self._expected_completion_finalization(
+            run_id,
+            episode,
+            outcome=outcome,
         )
+        if finalization != expected:
+            raise EventHistoryCorrupt("completion finalization is invalid")
+        return True
+
+    def _expected_completion_finalization(
+        self,
+        run_id: str,
+        episode: dict[str, Any],
+        *,
+        outcome: Any,
+    ) -> dict[str, Any]:
+        if not isinstance(outcome, dict):
+            raise EventHistoryCorrupt("completion retrospective outcome is invalid")
+        effect = self.effect(run_id, episode["effect_id"])
+        if (
+            effect["kind"] != "retrospective-analysis"
+            or effect["status"] != "confirmed"
+            or effect["intended"].get("episode_sequence") != episode["episode_sequence"]
+            or effect["intended"].get("evidence") != episode["evidence"]
+            or effect.get("observed")
+            != {"evidence": episode["evidence"], "status": outcome.get("status")}
+        ):
+            raise EventHistoryCorrupt("completion retrospective Effect is invalid")
+        self.verify_evidence(run_id, episode["evidence"])
+        manifest_path = (
+            self._evidence_path(run_id, episode["evidence"]) / "manifest.json"
+        )
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise EvidenceTampered(
+                "completion retrospective manifest is invalid"
+            ) from exc
+        bindings = {
+            "run_id": run_id,
+            "episode_sequence": episode["episode_sequence"],
+            "completion_episode_sha256": _canonical_sha256(episode),
+            "evidence": episode["evidence"],
+            "evidence_manifest_sha256": manifest_digest(manifest),
+            "outcome_sha256": _canonical_sha256(outcome),
+            "effect_id": episode["effect_id"],
+            "effect_sha256": _canonical_sha256(effect),
+        }
+        return {
+            "schema_version": 1,
+            **bindings,
+            "binding_sha256": _canonical_sha256(bindings),
+        }
+
+    def _read_completion_finalization(
+        self,
+        run_id: str,
+        *,
+        missing_ok: bool = False,
+    ) -> dict[str, Any] | None:
+        path = self._run_dir(run_id) / "completion-finalization.json"
+        if not path.exists() and not path.is_symlink():
+            if missing_ok:
+                return None
+            raise EventHistoryCorrupt("completion finalization is missing")
+        try:
+            if path.is_symlink() or not path.is_file():
+                raise EventHistoryCorrupt("completion finalization is invalid")
+            _require_mode(path, 0o600, "Completion finalization")
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise EventHistoryCorrupt("completion finalization is invalid") from exc
+        if not isinstance(value, dict):
+            raise EventHistoryCorrupt("completion finalization is invalid")
+        return value
 
     def _validated_completion_episode(
         self,
@@ -1513,6 +1596,10 @@ def _completion_episode(projection: dict[str, Any]) -> dict[str, Any] | None:
     ):
         raise EventHistoryCorrupt("completion episode marker is invalid")
     return episode
+
+
+def _canonical_sha256(value: Any) -> str:
+    return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
 
 
 def _secure_directory(path: Path) -> None:

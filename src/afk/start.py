@@ -1923,11 +1923,12 @@ def _reconcile_completed_run(
     projection: dict[str, Any],
 ) -> None:
     episode = projection["completion_episode"]
-    run_retrospective_attempt(
+    outcome = run_retrospective_attempt(
         store,
         run_id,
         episode_sequence=episode["episode_sequence"],
     )
+    store.record_completion_finalization(run_id, outcome=outcome)
     store.finalize_completion_episode(run_id)
 
 
