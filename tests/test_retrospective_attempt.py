@@ -434,7 +434,7 @@ class RetrospectiveAttemptTest(unittest.TestCase):
                 unrelated.terminate()
                 unrelated.wait(timeout=2)
 
-    def test_sigkill_worker_kills_analysis_tree_without_plaintext_auth_residue(self):
+    def test_sigkill_sigterm_blocked_worker_kills_analysis_tree_and_auth_access(self):
         configured_codex_home = self.root / "configured-codex"
         configured_codex_home.mkdir(mode=0o700)
         secret = b"hard-kill-auth-secret"
@@ -444,10 +444,14 @@ class RetrospectiveAttemptTest(unittest.TestCase):
             f"""
             import json, os, pathlib, subprocess, time
             descendant = subprocess.Popen(["sleep", "60"])
+            codex_home = pathlib.Path(os.environ["CODEX_HOME"])
             pathlib.Path({str(observation)!r}).write_text(
                 json.dumps({{
                     "analyzer_pid": os.getpid(),
-                    "codex_home": os.environ["CODEX_HOME"],
+                    "auth_loaded": (
+                        codex_home / "auth.json"
+                    ).read_bytes() == {secret!r},
+                    "codex_home": str(codex_home),
                     "descendant_pid": descendant.pid,
                 }}),
                 encoding="utf-8",
@@ -463,6 +467,7 @@ class RetrospectiveAttemptTest(unittest.TestCase):
         ):
             worker_pid = os.fork()
             if worker_pid == 0:
+                signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
                 run_retrospective_attempt(
                     self.store,
                     "run-001",
@@ -474,6 +479,7 @@ class RetrospectiveAttemptTest(unittest.TestCase):
                 time.sleep(0.01)
             self.assertTrue(observation.exists(), "analysis process did not start")
             observed = json.loads(observation.read_text(encoding="utf-8"))
+            self.assertTrue(observed["auth_loaded"])
             os.kill(worker_pid, signal.SIGKILL)
             os.waitpid(worker_pid, 0)
 
@@ -502,6 +508,9 @@ class RetrospectiveAttemptTest(unittest.TestCase):
             self.assertTrue(abandoned_runtime.exists())
             auth_link = Path(observed["codex_home"]) / "auth.json"
             self.assertTrue(auth_link.is_symlink())
+            self.assertFalse(auth_link.exists())
+            with self.assertRaises(FileNotFoundError):
+                auth_link.read_bytes()
             for path in abandoned_runtime.rglob("*"):
                 if not path.is_symlink() and path.is_file():
                     self.assertNotIn(secret, path.read_bytes(), path)
@@ -714,6 +723,271 @@ class RetrospectiveAttemptTest(unittest.TestCase):
                     forge_json(target, forged)
 
                 with self.assertRaises(RunStoreError):
+                    run_retrospective_attempt(
+                        store,
+                        "run-001",
+                        episode_sequence=sequence,
+                    )
+
+    def test_standalone_sealed_result_without_claim_cannot_bypass_launch(self):
+        evidence = retrospective_evidence_identity(
+            self.store,
+            "run-001",
+            episode_sequence=2,
+        )
+        outcome = {
+            "schema_version": 1,
+            "run_id": "run-001",
+            "episode_sequence": 2,
+            "status": "empty",
+            "warning": False,
+            "process_findings_count": 0,
+            "improvement_proposals_count": 0,
+        }
+        self.store.write_evidence_value(
+            "run-001",
+            f"{evidence}/result.json",
+            outcome,
+        )
+        self.store.seal_evidence("run-001", evidence)
+        marker = self.root / "must-not-launch"
+        self.analyzer(
+            f"""
+            import pathlib
+            pathlib.Path({str(marker)!r}).touch()
+            """
+        )
+
+        with self.assertRaisesRegex(
+            RunStoreError,
+            "sealed retrospective evidence lacks a valid claim",
+        ):
+            run_retrospective_attempt(
+                self.store,
+                "run-001",
+                episode_sequence=2,
+            )
+
+        self.assertFalse(marker.exists())
+
+    def test_sealed_bundle_with_claim_rejects_missing_required_file(self):
+        analysis = self.empty_analysis(summary="No actionable findings.")
+        self.analyzer(f"print({json.dumps(json.dumps(analysis))})")
+        with (
+            patch.object(
+                self.store,
+                "confirm_effect",
+                side_effect=RuntimeError("crash after seal"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "crash after seal"),
+        ):
+            run_retrospective_attempt(
+                self.store,
+                "run-001",
+                episode_sequence=2,
+            )
+        evidence = retrospective_evidence_identity(
+            self.store,
+            "run-001",
+            episode_sequence=2,
+        )
+        self.reseal_after(
+            self.store,
+            evidence,
+            lambda directory: (directory / "stdout.log").unlink(),
+        )
+
+        with self.assertRaisesRegex(
+            RunStoreError,
+            "sealed retrospective evidence files are invalid",
+        ):
+            run_retrospective_attempt(
+                self.store,
+                "run-001",
+                episode_sequence=2,
+            )
+
+    def test_complete_sealed_bundle_confirms_prepared_claim_without_relaunch(self):
+        evidence = self.create_sealed_prepared_attempt(self.store, 2)
+        self.analyzer("raise SystemExit('must not run')")
+
+        outcome = run_retrospective_attempt(
+            self.store,
+            "run-001",
+            episode_sequence=2,
+        )
+
+        self.assertEqual(outcome["status"], "empty")
+        self.assertEqual(
+            self.store.effect("run-001", "retrospective-analysis-2")["status"],
+            "confirmed",
+        )
+        self.assertTrue(self.store.verify_evidence("run-001", evidence))
+
+    def test_sealed_bundle_rejects_missing_forged_and_unexpected_payloads(self):
+        def write_json(path, value):
+            path.write_text(
+                json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n",
+                encoding="utf-8",
+            )
+
+        finding_analysis = self.empty_analysis(summary="A finding was forged.")
+        finding_analysis["process_findings"] = [
+            {
+                "id": "finding-forged",
+                "category": "orchestration",
+                "title": "Forged finding",
+                "evidence": [
+                    {"artifact": "events.jsonl", "event_sequence": 2},
+                ],
+                "impact": "The counts no longer match.",
+                "confidence": "high",
+            }
+        ]
+        forged_outcome = {
+            "schema_version": 1,
+            "run_id": "run-001",
+            "episode_sequence": 2,
+            "status": "interrupted",
+            "warning": True,
+            "process_findings_count": 0,
+            "improvement_proposals_count": 0,
+            "warning_summary": "forged",
+        }
+        cases = (
+            ("missing stderr", lambda path: (path / "stderr.log").unlink()),
+            ("missing input", lambda path: (path / "input.json").unlink()),
+            ("missing command", lambda path: (path / "command.json").unlink()),
+            ("missing outcome", lambda path: (path / "outcome.json").unlink()),
+            ("missing result", lambda path: (path / "result.json").unlink()),
+            ("missing analysis", lambda path: (path / "analysis.json").unlink()),
+            (
+                "unexpected file",
+                lambda path: write_json(path / "unexpected.json", {"forged": True}),
+            ),
+            (
+                "forged input",
+                lambda path: write_json(path / "input.json", {"forged": True}),
+            ),
+            (
+                "forged command",
+                lambda path: write_json(path / "command.json", {"forged": True}),
+            ),
+            (
+                "mismatched outcome",
+                lambda path: write_json(path / "outcome.json", forged_outcome),
+            ),
+            (
+                "analysis count mismatch",
+                lambda path: write_json(path / "analysis.json", finding_analysis),
+            ),
+        )
+        for index, (label, mutate) in enumerate(cases, start=1):
+            with self.subTest(label=label):
+                store, sequence = self.distinct_episode(index + 80)
+                evidence = self.create_sealed_prepared_attempt(store, sequence)
+                self.reseal_after(store, evidence, mutate)
+
+                with self.assertRaises(RunStoreError):
+                    run_retrospective_attempt(
+                        store,
+                        "run-001",
+                        episode_sequence=sequence,
+                    )
+
+    def test_sealed_warning_bundle_rejects_analysis_payload(self):
+        self.analyzer("print('not-json')")
+        with (
+            patch.object(
+                self.store,
+                "confirm_effect",
+                side_effect=RuntimeError("crash after seal"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "crash after seal"),
+        ):
+            run_retrospective_attempt(
+                self.store,
+                "run-001",
+                episode_sequence=2,
+            )
+        evidence = retrospective_evidence_identity(
+            self.store,
+            "run-001",
+            episode_sequence=2,
+        )
+        analysis = self.empty_analysis(summary="Forged warning analysis.")
+        self.reseal_after(
+            self.store,
+            evidence,
+            lambda directory: (directory / "analysis.json").write_text(
+                json.dumps(analysis, sort_keys=True, separators=(",", ":")) + "\n",
+                encoding="utf-8",
+            ),
+        )
+
+        with self.assertRaisesRegex(
+            RunStoreError,
+            "sealed retrospective evidence files are invalid",
+        ):
+            run_retrospective_attempt(
+                self.store,
+                "run-001",
+                episode_sequence=2,
+            )
+
+    def test_sealed_bundle_rejects_forged_claim_command_and_observation(self):
+        cases = ("command", "timeout", "observation")
+        for index, field in enumerate(cases, start=1):
+            with self.subTest(field=field):
+                store, sequence = self.distinct_episode(index + 100)
+                evidence = self.create_sealed_prepared_attempt(store, sequence)
+                effect_path = (
+                    store.root
+                    / "runs"
+                    / "run-001"
+                    / "effects"
+                    / f"retrospective-analysis-{sequence}.json"
+                )
+                effect = json.loads(effect_path.read_text(encoding="utf-8"))
+                if field in {"command", "timeout"}:
+                    if field == "command":
+                        effect["intended"]["command"]["argv"] = [
+                            "codex",
+                            "exec",
+                            "--evil",
+                        ]
+                    else:
+                        effect["intended"]["command"]["timeout_seconds"] = (
+                            RETROSPECTIVE_TIMEOUT_SECONDS - 1
+                        )
+                    self.reseal_after(
+                        store,
+                        evidence,
+                        lambda directory: (directory / "command.json").write_text(
+                            json.dumps(
+                                effect["intended"]["command"],
+                                sort_keys=True,
+                                separators=(",", ":"),
+                            )
+                            + "\n",
+                            encoding="utf-8",
+                        ),
+                    )
+                else:
+                    effect["status"] = "confirmed"
+                    effect["observed"] = {
+                        "evidence": evidence,
+                        "status": "passed",
+                    }
+                effect_path.write_text(
+                    json.dumps(effect, sort_keys=True, separators=(",", ":")) + "\n",
+                    encoding="utf-8",
+                )
+
+                with self.assertRaisesRegex(
+                    RunStoreError,
+                    "sealed retrospective evidence claim is invalid",
+                ):
                     run_retrospective_attempt(
                         store,
                         "run-001",
@@ -1011,13 +1285,12 @@ class RetrospectiveAttemptTest(unittest.TestCase):
                 "run-001",
                 episode_sequence=2,
             )
-
-        self.analyzer("raise SystemExit('must not run')")
-        second = run_retrospective_attempt(
-            self.store,
-            "run-001",
-            episode_sequence=2,
-        )
+            self.analyzer("raise SystemExit('must not run')")
+            second = run_retrospective_attempt(
+                self.store,
+                "run-001",
+                episode_sequence=2,
+            )
         self.assertEqual(first, second)
         self.assertEqual(first["status"], "interrupted")
         self.assertTrue(first["warning"])
@@ -1027,6 +1300,27 @@ class RetrospectiveAttemptTest(unittest.TestCase):
             observed["descendant_pid"],
         )
         self.assertFalse(any(self.process_is_live(pid) for pid in process_ids))
+
+    def test_combined_output_limit_is_sealed_as_invalid(self):
+        self.analyzer(
+            """
+            import os
+            os.write(1, b"x" * 9)
+            os.write(2, b"y" * 9)
+            """
+        )
+        with patch(
+            "afk.retrospective_attempt.RETROSPECTIVE_OUTPUT_BYTE_LIMIT",
+            16,
+        ):
+            outcome = run_retrospective_attempt(
+                self.store,
+                "run-001",
+                episode_sequence=2,
+            )
+
+        self.assertEqual(outcome["status"], "invalid")
+        self.assertIn("size limit", outcome["warning_summary"])
 
     def test_signal_exit_is_sealed_as_interrupted(self):
         self.analyzer(
@@ -1072,6 +1366,47 @@ class RetrospectiveAttemptTest(unittest.TestCase):
         except FileNotFoundError:
             return False
         return state != "Z"
+
+    def reseal_after(self, store, evidence, mutate):
+        directory = store.root / "runs" / "run-001" / evidence
+        directory.chmod(0o700)
+        manifest = directory / "manifest.json"
+        manifest.chmod(0o600)
+        manifest.unlink()
+        for path in directory.rglob("*"):
+            if path.is_file():
+                path.chmod(0o600)
+            elif path.is_dir():
+                path.chmod(0o700)
+        mutate(directory)
+        store.seal_evidence("run-001", evidence)
+
+    def create_sealed_prepared_attempt(self, store, sequence):
+        analysis = self.empty_analysis(summary="No actionable findings.")
+        self.analyzer(f"print({json.dumps(json.dumps(analysis))})")
+        with (
+            patch.object(
+                store,
+                "confirm_effect",
+                side_effect=RuntimeError("crash after seal"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "crash after seal"),
+        ):
+            run_retrospective_attempt(
+                store,
+                "run-001",
+                episode_sequence=sequence,
+            )
+        evidence = retrospective_evidence_identity(
+            store,
+            "run-001",
+            episode_sequence=sequence,
+        )
+        self.assertEqual(
+            store.effect("run-001", f"retrospective-analysis-{sequence}")["status"],
+            "prepared",
+        )
+        return evidence
 
     def distinct_episode(self, index):
         root = self.root / f"case-{index}"

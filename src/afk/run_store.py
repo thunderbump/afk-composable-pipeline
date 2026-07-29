@@ -625,6 +625,24 @@ class RunStore:
             self._verify_or_finish_seal(run_id, relative_directory)
             return _read_evidence_result(directory / "result.json")
 
+    def sealed_evidence_payloads(
+        self, run_id: str, relative_directory: str
+    ) -> dict[str, str]:
+        """Return every verified UTF-8 payload from one sealed evidence unit."""
+        with self.lock():
+            directory = self._evidence_path(run_id, relative_directory)
+            self._verify_or_finish_seal(run_id, relative_directory)
+            payloads = {}
+            for path in _evidence_files(directory):
+                relative = path.relative_to(directory).as_posix()
+                try:
+                    payloads[relative] = path.read_text(encoding="utf-8")
+                except (OSError, UnicodeDecodeError) as exc:
+                    raise EvidenceTampered(
+                        "sealed evidence payload is invalid"
+                    ) from exc
+            return payloads
+
     def _verify_or_finish_seal(self, run_id: str, relative_directory: str) -> None:
         try:
             self.verify_evidence(run_id, relative_directory)

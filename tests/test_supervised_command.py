@@ -125,6 +125,30 @@ class SupervisedCommandTest(unittest.TestCase):
                         label="Codex",
                     )
 
+    def test_signal_exit_keeps_redacted_diagnostics(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            command = [
+                sys.executable,
+                "-c",
+                (
+                    "import os,signal,sys;"
+                    "sys.stdout.write('password=hunter2\\n');sys.stdout.flush();"
+                    "os.kill(os.getpid(),signal.SIGKILL)"
+                ),
+            ]
+            with self.assertRaises(CandidateValidationError) as raised:
+                run_supervised_command(
+                    command,
+                    cwd=Path(temporary),
+                    environment=os.environ.copy(),
+                    timeout_seconds=1,
+                    label="Codex",
+                )
+
+        self.assertEqual(raised.exception.kind, "interrupted")
+        self.assertIn("SIGKILL", raised.exception.summary)
+        self.assertEqual(raised.exception.stdout, "password=[REDACTED]\n")
+
     def test_timeout_kills_detached_term_resistant_descendants_before_mutation(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
