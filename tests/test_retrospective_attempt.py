@@ -235,6 +235,112 @@ class RetrospectiveAttemptTest(unittest.TestCase):
             {"auth.json", "must-not-change"},
         )
 
+    def test_malformed_auth_returns_promptly_without_leaking_descriptors(self):
+        def timeout_handler(_signum, _frame):
+            raise AssertionError("auth validation blocked before analysis timeout")
+
+        for index, kind in enumerate(
+            ("fifo", "symlink", "directory", "oversized"),
+            start=1,
+        ):
+            with self.subTest(kind=kind):
+                store, sequence = self.distinct_episode(index + 140)
+                configured_codex_home = self.root / f"malformed-auth-{kind}"
+                configured_codex_home.mkdir(mode=0o700)
+                auth = configured_codex_home / "auth.json"
+                if kind == "fifo":
+                    os.mkfifo(auth, mode=0o600)
+                elif kind == "symlink":
+                    target = configured_codex_home / "target.json"
+                    target.write_text("{}\n", encoding="utf-8")
+                    auth.symlink_to(target)
+                elif kind == "directory":
+                    auth.mkdir(mode=0o700)
+                else:
+                    auth.write_bytes(b"x" * (1024 * 1024 + 1))
+                marker = self.root / f"malformed-auth-launched-{kind}"
+                self.analyzer(
+                    f"""
+                    import pathlib
+                    pathlib.Path({str(marker)!r}).touch()
+                    """
+                )
+                descriptors_before = set(os.listdir("/proc/self/fd"))
+                previous_handler = signal.signal(signal.SIGALRM, timeout_handler)
+                signal.setitimer(signal.ITIMER_REAL, 1)
+                try:
+                    with patch.dict(
+                        "os.environ",
+                        {"CODEX_HOME": str(configured_codex_home)},
+                        clear=False,
+                    ):
+                        outcome = run_retrospective_attempt(
+                            store,
+                            "run-001",
+                            episode_sequence=sequence,
+                        )
+                finally:
+                    signal.setitimer(signal.ITIMER_REAL, 0)
+                    signal.signal(signal.SIGALRM, previous_handler)
+
+                self.assertEqual(outcome["status"], "unavailable")
+                self.assertTrue(outcome["warning"])
+                self.assertFalse(marker.exists())
+                self.assertEqual(
+                    set(os.listdir("/proc/self/fd")),
+                    descriptors_before,
+                )
+                evidence = retrospective_evidence_identity(
+                    store,
+                    "run-001",
+                    episode_sequence=sequence,
+                )
+                self.assertTrue(store.verify_evidence("run-001", evidence))
+
+    def test_auth_changed_during_copy_is_sealed_as_unavailable(self):
+        store, sequence = self.distinct_episode(150)
+        configured_codex_home = self.root / "changing-auth"
+        configured_codex_home.mkdir(mode=0o700)
+        auth = configured_codex_home / "auth.json"
+        auth.write_bytes(b"auth")
+        real_read = os.read
+        changed = False
+
+        def read_then_change(descriptor, count):
+            nonlocal changed
+            payload = real_read(descriptor, count)
+            if payload and not changed:
+                changed = True
+                with auth.open("ab") as stream:
+                    stream.write(b"x")
+            return payload
+
+        descriptors_before = set(os.listdir("/proc/self/fd"))
+        with (
+            patch.dict(
+                "os.environ",
+                {"CODEX_HOME": str(configured_codex_home)},
+                clear=False,
+            ),
+            patch("afk.retrospective_attempt.os.read", side_effect=read_then_change),
+        ):
+            outcome = run_retrospective_attempt(
+                store,
+                "run-001",
+                episode_sequence=sequence,
+            )
+
+        self.assertTrue(changed)
+        self.assertEqual(outcome["status"], "unavailable")
+        self.assertIn("changed while being copied", outcome["warning_summary"])
+        self.assertEqual(set(os.listdir("/proc/self/fd")), descriptors_before)
+        evidence = retrospective_evidence_identity(
+            store,
+            "run-001",
+            episode_sequence=sequence,
+        )
+        self.assertTrue(store.verify_evidence("run-001", evidence))
+
     def test_public_attempt_has_no_child_command_override(self):
         with self.assertRaisesRegex(
             TypeError,
@@ -246,6 +352,97 @@ class RetrospectiveAttemptTest(unittest.TestCase):
                 episode_sequence=2,
                 codex_executable=["codex", "--dangerously-bypass-approvals"],
             )
+
+    def test_io_initialization_failure_cleans_analysis_runtime_and_descriptors(self):
+        configured_codex_home = self.root / "configured-codex"
+        configured_codex_home.mkdir(mode=0o700)
+        secret = b"initialization-failure-auth"
+        (configured_codex_home / "auth.json").write_bytes(secret)
+        observation = self.root / "initialization-failure.json"
+        self.analyzer(
+            f"""
+            import json, os, pathlib, time
+            codex_home = pathlib.Path(os.environ["CODEX_HOME"])
+            pathlib.Path({str(observation)!r}).write_text(
+                json.dumps({{
+                    "auth_loaded": (
+                        codex_home / "auth.json"
+                    ).read_bytes() == {secret!r},
+                    "codex_home": str(codex_home),
+                    "pgid": os.getpgid(0),
+                    "pid": os.getpid(),
+                }}),
+                encoding="utf-8",
+            )
+            time.sleep(60)
+            """
+        )
+
+        def fail_after_analysis_starts(_descriptor, _blocking):
+            deadline = time.monotonic() + 2
+            while not observation.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            if not observation.exists():
+                raise AssertionError("analysis process did not start")
+            raise OSError("injected I/O initialization failure")
+
+        descriptors_before = set(os.listdir("/proc/self/fd"))
+        observed = None
+        try:
+            with (
+                patch.dict(
+                    "os.environ",
+                    {"CODEX_HOME": str(configured_codex_home)},
+                    clear=False,
+                ),
+                patch(
+                    "afk.process_io.os.set_blocking",
+                    side_effect=fail_after_analysis_starts,
+                ),
+            ):
+                outcome = run_retrospective_attempt(
+                    self.store,
+                    "run-001",
+                    episode_sequence=2,
+                )
+
+            observed = json.loads(observation.read_text(encoding="utf-8"))
+            deadline = time.monotonic() + 2
+            while self.process_is_live(observed["pid"]) and time.monotonic() < deadline:
+                time.sleep(0.01)
+
+            self.assertEqual(outcome["status"], "unavailable")
+            self.assertTrue(outcome["warning"])
+            self.assertEqual(
+                outcome["warning_summary"],
+                "injected I/O initialization failure",
+            )
+            self.assertTrue(observed["auth_loaded"])
+            self.assertFalse(self.process_is_live(observed["pid"]))
+            with self.assertRaises(ProcessLookupError):
+                os.killpg(observed["pgid"], 0)
+            self.assertFalse(Path(observed["codex_home"]).parents[1].exists())
+            self.assertEqual(set(os.listdir("/proc/self/fd")), descriptors_before)
+            evidence = retrospective_evidence_identity(
+                self.store,
+                "run-001",
+                episode_sequence=2,
+            )
+            self.assertTrue(self.store.verify_evidence("run-001", evidence))
+            self.assertEqual(
+                run_retrospective_attempt(
+                    self.store,
+                    "run-001",
+                    episode_sequence=2,
+                ),
+                outcome,
+            )
+        finally:
+            if observed is not None:
+                try:
+                    os.killpg(observed["pgid"], signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
 
     def test_real_codex_profile_denies_external_write_and_direct_socket(self):
         if self.real_codex is None:
@@ -622,6 +819,67 @@ class RetrospectiveAttemptTest(unittest.TestCase):
         self.assertEqual(starts.read_text(encoding="utf-8"), "started\n")
         self.assertTrue(self.store.verify_evidence("run-001", evidence))
 
+    def test_stale_claim_rejects_forged_command_before_persisting_recovery(self):
+        cases = ("argv", "policy", "timeout")
+        for index, field in enumerate(cases, start=1):
+            with self.subTest(field=field):
+                store, sequence = self.distinct_episode(index + 120)
+                with (
+                    patch(
+                        "afk.retrospective_attempt._run_retrospective_process",
+                        side_effect=RuntimeError("crash before analysis"),
+                    ),
+                    self.assertRaisesRegex(RuntimeError, "crash before analysis"),
+                ):
+                    run_retrospective_attempt(
+                        store,
+                        "run-001",
+                        episode_sequence=sequence,
+                    )
+
+                effect_path = (
+                    store.root
+                    / "runs"
+                    / "run-001"
+                    / "effects"
+                    / f"retrospective-analysis-{sequence}.json"
+                )
+                effect = json.loads(effect_path.read_text(encoding="utf-8"))
+                command = effect["intended"]["command"]
+                if field == "argv":
+                    command["argv"] = [
+                        "codex",
+                        "exec",
+                        "--dangerously-bypass-approvals-and-sandbox",
+                    ]
+                elif field == "policy":
+                    command["policy"]["network"] = "enabled"
+                else:
+                    command["timeout_seconds"] = 1
+                effect_path.write_text(
+                    json.dumps(effect, sort_keys=True, separators=(",", ":")) + "\n",
+                    encoding="utf-8",
+                )
+                evidence = retrospective_evidence_identity(
+                    store,
+                    "run-001",
+                    episode_sequence=sequence,
+                )
+                evidence_path = store.root / "runs" / "run-001" / evidence
+                self.assertFalse(evidence_path.exists())
+
+                with self.assertRaisesRegex(
+                    RunStoreError,
+                    "retrospective analysis command is invalid",
+                ):
+                    run_retrospective_attempt(
+                        store,
+                        "run-001",
+                        episode_sequence=sequence,
+                    )
+
+                self.assertFalse(evidence_path.exists())
+
     def test_stale_claim_rejects_forged_partial_authoritative_evidence(self):
         def forge_json(path, value):
             path.write_text(
@@ -984,10 +1242,12 @@ class RetrospectiveAttemptTest(unittest.TestCase):
                     encoding="utf-8",
                 )
 
-                with self.assertRaisesRegex(
-                    RunStoreError,
-                    "sealed retrospective evidence claim is invalid",
-                ):
+                expected = (
+                    "retrospective analysis command is invalid"
+                    if field in {"command", "timeout"}
+                    else "sealed retrospective evidence claim is invalid"
+                )
+                with self.assertRaisesRegex(RunStoreError, expected):
                     run_retrospective_attempt(
                         store,
                         "run-001",
@@ -1321,6 +1581,84 @@ class RetrospectiveAttemptTest(unittest.TestCase):
 
         self.assertEqual(outcome["status"], "invalid")
         self.assertIn("size limit", outcome["warning_summary"])
+
+    def test_ignored_sigchld_preserves_real_analysis_status(self):
+        analysis = self.empty_analysis(summary="No actionable findings.")
+        cases = (
+            ("nonzero", "raise SystemExit(7)", "unavailable"),
+            (
+                "signalled",
+                "os.kill(os.getpid(), signal.SIGKILL)",
+                "interrupted",
+            ),
+            ("success", "pass", "empty"),
+        )
+        for index, (label, termination, expected) in enumerate(cases, start=1):
+            with self.subTest(label=label):
+                store, sequence = self.distinct_episode(index + 140)
+                self.analyzer(
+                    f"""
+                    import json, os, signal
+                    print(json.dumps({analysis!r}), flush=True)
+                    {termination}
+                    """
+                )
+                previous = signal.signal(signal.SIGCHLD, signal.SIG_IGN)
+                try:
+                    outcome = run_retrospective_attempt(
+                        store,
+                        "run-001",
+                        episode_sequence=sequence,
+                    )
+                finally:
+                    signal.signal(signal.SIGCHLD, previous)
+
+                self.assertEqual(outcome["status"], expected)
+                self.assertEqual(
+                    run_retrospective_attempt(
+                        store,
+                        "run-001",
+                        episode_sequence=sequence,
+                    ),
+                    outcome,
+                )
+
+    def test_missing_and_malformed_analysis_status_fail_closed(self):
+        analysis = self.empty_analysis(summary="No actionable findings.")
+        cases = (
+            (
+                "missing",
+                f"print({json.dumps(json.dumps(analysis))})",
+                "interrupted",
+            ),
+            (
+                "malformed",
+                (
+                    "import os,sys;"
+                    "os.write(int(sys.argv[3]),b'not-a-status\\n');"
+                    f"print({json.dumps(json.dumps(analysis))})"
+                ),
+                "invalid",
+            ),
+        )
+        for index, (label, guard, expected) in enumerate(cases, start=1):
+            with self.subTest(label=label):
+                store, sequence = self.distinct_episode(index + 160)
+                with patch("afk.retrospective_attempt._EXEC_GUARD", guard):
+                    outcome = run_retrospective_attempt(
+                        store,
+                        "run-001",
+                        episode_sequence=sequence,
+                    )
+
+                self.assertEqual(outcome["status"], expected)
+                self.assertTrue(outcome["warning"])
+                evidence = retrospective_evidence_identity(
+                    store,
+                    "run-001",
+                    episode_sequence=sequence,
+                )
+                self.assertTrue(store.verify_evidence("run-001", evidence))
 
     def test_signal_exit_is_sealed_as_interrupted(self):
         self.analyzer(

@@ -37,6 +37,7 @@ AUTH_BYTE_LIMIT = 1024 * 1024
 AUTH_DESCRIPTOR_MINIMUM = 200
 RETROSPECTIVE_OUTPUT_BYTE_LIMIT = 64 * 1024 * 1024
 PROCESS_CLEANUP_SECONDS = 1
+ANALYSIS_STATUS_BYTE_LIMIT = 32
 _EXEC_GUARD = """
 import ctypes
 import os
@@ -46,11 +47,18 @@ import sys
 
 expected_parent = int(sys.argv[1])
 auth_descriptor = int(sys.argv[2])
-command = sys.argv[3:]
+status_descriptor = int(sys.argv[3])
+command = sys.argv[4:]
 libc = ctypes.CDLL(None, use_errno=True)
 
 def terminate_group(signum, frame):
     os.killpg(0, signal.SIGKILL)
+
+def report_status(returncode):
+    payload = f"{returncode}\\n".encode("ascii")
+    while payload:
+        payload = payload[os.write(status_descriptor, payload):]
+    os.close(status_descriptor)
 
 signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGTERM})
 signal.signal(signal.SIGTERM, terminate_group)
@@ -59,8 +67,14 @@ if libc.prctl(1, signal.SIGTERM, 0, 0, 0) != 0:
 if os.getppid() != expected_parent:
     terminate_group(signal.SIGTERM, None)
 descriptors = () if auth_descriptor < 0 else (auth_descriptor,)
-child = subprocess.Popen(command, pass_fds=descriptors)
+signal.signal(signal.SIGCHLD, signal.SIG_DFL)
+try:
+    child = subprocess.Popen(command, pass_fds=descriptors)
+except OSError:
+    report_status(127)
+    raise
 returncode = child.wait()
+report_status(returncode)
 if returncode < 0:
     if -returncode != signal.SIGKILL:
         signal.signal(-returncode, signal.SIG_DFL)
@@ -345,7 +359,13 @@ def _claimed_command(
         or not isinstance(command, dict)
     ):
         raise RunStoreError("retrospective analysis claim is invalid")
+    _validate_command_record(command)
     return command
+
+
+def _validate_command_record(command_record: dict[str, Any]) -> None:
+    if command_record != _command_record(_contained_command()):
+        raise RunStoreError("retrospective analysis command is invalid")
 
 
 def _validate_sealed_attempt(
@@ -359,15 +379,6 @@ def _validate_sealed_attempt(
     outcome: dict[str, Any],
     claim: dict[str, Any],
 ) -> None:
-    expected_command = _command_record(_contained_command())
-    if (
-        set(command_record) != set(expected_command)
-        or command_record.get("schema_version") != expected_command["schema_version"]
-        or command_record.get("argv") != expected_command["argv"]
-        or command_record.get("policy") != expected_command["policy"]
-        or command_record.get("timeout_seconds") != expected_command["timeout_seconds"]
-    ):
-        raise RunStoreError("sealed retrospective evidence claim is invalid")
     expected_observed = {"evidence": evidence, "status": outcome["status"]}
     if claim["status"] == "confirmed" and claim.get("observed") != expected_observed:
         raise RunStoreError("sealed retrospective evidence claim is invalid")
@@ -660,41 +671,56 @@ def _run_retrospective_process(
     input_bytes = input_text.encode("utf-8")
     if len(input_bytes) > MAX_RUN_SUMMARY_BYTES:
         raise RetrospectiveProcessError("invalid", "retrospective input is too large")
+    status_read, status_write = os.pipe2(os.O_CLOEXEC)
     wrapper = [
         sys.executable,
         "-c",
         _EXEC_GUARD,
         str(os.getpid()),
         str(auth_descriptor if auth_descriptor is not None else -1),
+        str(status_write),
         *command,
     ]
-    inherited = () if auth_descriptor is None else (auth_descriptor,)
-    process = subprocess.Popen(
-        wrapper,
-        cwd=cwd,
-        env=environment,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        start_new_session=True,
-        pass_fds=inherited,
-    )
+    inherited = (status_write,)
+    if auth_descriptor is not None:
+        inherited = (auth_descriptor, status_write)
+    try:
+        process = subprocess.Popen(
+            wrapper,
+            cwd=cwd,
+            env=environment,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+            pass_fds=inherited,
+        )
+    except BaseException:
+        os.close(status_read)
+        os.close(status_write)
+        raise
+    os.close(status_write)
     try:
         pid_descriptor = os.pidfd_open(process.pid)
     except OSError:
-        _terminate_process_group(process.pid)
-        process.wait(timeout=PROCESS_CLEANUP_SECONDS)
+        try:
+            _terminate_process_group(process.pid)
+            process.wait(timeout=PROCESS_CLEANUP_SECONDS)
+        finally:
+            os.close(status_read)
         raise
-    process_io = BoundedProcessIO(
-        process,
-        input_bytes=input_bytes,
-        output_byte_limit=RETROSPECTIVE_OUTPUT_BYTE_LIMIT,
-        cleanup_seconds=PROCESS_CLEANUP_SECONDS,
-        combined_output_limit=True,
-    )
-    deadline = time.monotonic() + timeout_seconds
+    process_io = None
     timed_out = False
+    analysis_returncode = None
     try:
+        process_io = BoundedProcessIO(
+            process,
+            input_bytes=input_bytes,
+            output_byte_limit=RETROSPECTIVE_OUTPUT_BYTE_LIMIT,
+            cleanup_seconds=PROCESS_CLEANUP_SECONDS,
+            combined_output_limit=True,
+        )
+        deadline = time.monotonic() + timeout_seconds
         try:
             while not _process_exited(pid_descriptor):
                 stop_reason = process_io.observe(deadline)
@@ -721,9 +747,25 @@ def _run_retrospective_process(
                             "interrupted",
                             "retrospective output streams could not be drained",
                         )
+        if not timed_out and not process_io.overflowed:
+            analysis_returncode = _read_analysis_status(status_read)
     finally:
-        os.close(pid_descriptor)
-        process_io.close_input()
+        try:
+            if process_io is None:
+                try:
+                    _terminate_process_group(process.pid)
+                    process.wait(timeout=PROCESS_CLEANUP_SECONDS)
+                finally:
+                    for stream in (process.stdin, process.stdout, process.stderr):
+                        if stream is not None:
+                            stream.close()
+            else:
+                process_io.close_input()
+        finally:
+            try:
+                os.close(pid_descriptor)
+            finally:
+                os.close(status_read)
     if timed_out:
         stdout, stderr = process_io.diagnostics()
         raise RetrospectiveProcessError(
@@ -737,6 +779,8 @@ def _run_retrospective_process(
             "invalid",
             "retrospective analysis output exceeds the size limit",
         )
+    assert analysis_returncode is not None
+    returncode = analysis_returncode
     if returncode < 0:
         stdout, stderr = process_io.diagnostics()
         try:
@@ -765,6 +809,43 @@ def _run_retrospective_process(
         stdout,
         stderr,
     )
+
+
+def _read_analysis_status(descriptor: int) -> int:
+    try:
+        payload = os.read(descriptor, ANALYSIS_STATUS_BYTE_LIMIT + 1)
+    except OSError as exc:
+        raise RetrospectiveProcessError(
+            "interrupted",
+            "retrospective analysis status is unavailable",
+        ) from exc
+    if not payload:
+        raise RetrospectiveProcessError(
+            "interrupted",
+            "retrospective analysis status is unavailable",
+        )
+    if len(payload) > ANALYSIS_STATUS_BYTE_LIMIT:
+        raise RetrospectiveProcessError(
+            "invalid",
+            "retrospective analysis status is invalid",
+        )
+    try:
+        returncode = int(payload.decode("ascii"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise RetrospectiveProcessError(
+            "invalid",
+            "retrospective analysis status is invalid",
+        ) from exc
+    if (
+        payload != f"{returncode}\n".encode("ascii")
+        or returncode >= 256
+        or returncode <= -signal.NSIG
+    ):
+        raise RetrospectiveProcessError(
+            "invalid",
+            "retrospective analysis status is invalid",
+        )
+    return returncode
 
 
 def _process_exited(pid_descriptor: int) -> bool:
@@ -813,7 +894,7 @@ def _copy_auth_material(runtime_codex_home: Path) -> int | None:
     try:
         descriptor = os.open(
             source,
-            os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC,
         )
     except FileNotFoundError:
         return None
