@@ -224,6 +224,18 @@ def resume_run(
                 selected_run_id,
                 episode_sequence=projection["attention_episode"]["episode_sequence"],
             )
+        if projection["last_event"] == "lifecycle.signal_interrupted":
+            interruption = projection["lifecycle_interruption"]
+            _attention(
+                store,
+                selected_run_id,
+                checkpoint=projection["checkpoint"],
+                scope="lifecycle",
+                kind="interrupted",
+                summary=f"AFK lifecycle received {interruption['signal']}",
+                lifecycle_interruption=interruption,
+            )
+            return selected_run_id, 2
         if projection["last_event"] == "validation.bootstrap_approved":
             _approved_bootstrap_attention(
                 store,

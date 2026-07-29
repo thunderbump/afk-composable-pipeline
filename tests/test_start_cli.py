@@ -20,6 +20,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 import afk.run_store as run_store_module  # noqa: E402
 from afk.bead_spec import bead_spec_identity, persist_bead_spec  # noqa: E402
+from afk.lifecycle_signals import record_lifecycle_interruption  # noqa: E402
 from afk.run_store import (  # noqa: E402
     ActiveRunExists,
     EventHistoryCorrupt,
@@ -2686,6 +2687,41 @@ class StartCliTest(unittest.TestCase):
 
     def test_signal_persistence_failure_cannot_fabricate_success(self):
         self._assert_resume_signal(signal.SIGTERM, persistence_failure=True)
+
+    def test_resume_backfills_signal_attention_before_checkpoint_continuation(self):
+        run_id = self.start_reviewed_run()
+        with patch.dict(os.environ, self.afk_environment()):
+            record_lifecycle_interruption(run_id, signal.SIGTERM)
+        store = RunStore(self.state_home / "afk")
+        interrupted = store.status(run_id)
+        self.assertEqual(interrupted["last_event"], "lifecycle.signal_interrupted")
+        self.assertNotIn("attention_episode", interrupted)
+
+        paused = self.run_afk("resume")
+
+        self.assertEqual(paused.returncode, 2, paused.stderr)
+        attention = store.status(run_id)
+        self.assertEqual(attention["last_event"], "run.attention_required")
+        self.assertEqual(attention["checkpoint"], "reviewed")
+        self.assertEqual(attention["attention"]["scope"], "lifecycle")
+        episode = attention["attention_episode"]
+        outcome = store.sealed_evidence_result(run_id, episode["evidence"])
+        self.assertEqual(outcome["episode_sequence"], episode["episode_sequence"])
+        events_path = self.state_home / "afk" / "runs" / run_id / "events.jsonl"
+        events_after_handoff = events_path.read_bytes()
+
+        resumed = self.run_afk("resume")
+
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        self.assertEqual(
+            events_path.read_bytes().count(b'"event":"run.attention_required"'),
+            1,
+        )
+        self.assertEqual(
+            store.sealed_evidence_result(run_id, episode["evidence"]),
+            outcome,
+        )
+        self.assertNotEqual(events_path.read_bytes(), events_after_handoff)
 
     def test_unnamed_resume_latches_signal_until_locked_target_lookup_completes(self):
         state_name = "lifecycle-target-lookup"
