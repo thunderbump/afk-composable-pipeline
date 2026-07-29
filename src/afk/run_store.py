@@ -671,6 +671,22 @@ class RunStore:
                 raise EvidenceError("unsealed evidence result is partial or ambiguous")
             return _read_evidence_result(result_path)
 
+    def partial_evidence_result(
+        self, run_id: str, relative_directory: str
+    ) -> Any | None:
+        """Return an unsealed result marker while other evidence may be partial."""
+        with self.lock():
+            directory = self._evidence_path(run_id, relative_directory)
+            manifest_path = directory / "manifest.json"
+            if manifest_path.exists() or manifest_path.is_symlink():
+                raise EvidenceError("partial evidence contains an invalid manifest")
+            result_path = directory / "result.json"
+            if not result_path.exists() and not result_path.is_symlink():
+                return None
+            if result_path.is_symlink() or not result_path.is_file():
+                raise EvidenceError("partial evidence result is invalid")
+            return _read_evidence_result(result_path)
+
     def _append_event_unlocked(
         self,
         run_id: str,
