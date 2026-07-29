@@ -7695,12 +7695,14 @@ class StartCliTest(unittest.TestCase):
 
     def assert_repeated_validation_lifecycle_rejected(self, store, run_dir):
         first = self.run_afk("resume")
+        events_after_first = (run_dir / "events.jsonl").read_bytes()
         second = self.run_afk("resume")
 
         self.assertEqual(first.returncode, 2)
         self.assertEqual(second.returncode, 2)
+        self.assertEqual((run_dir / "events.jsonl").read_bytes(), events_after_first)
         self.assertFalse(self.command_log.exists())
-        for root in ("attempts", "gates", "retrospective"):
+        for root in ("attempts", "gates"):
             expected = ["start-bead-spec"] if root == "attempts" else []
             self.assertEqual(
                 sorted(path.name for path in (run_dir / root).iterdir()),
@@ -7711,6 +7713,13 @@ class StartCliTest(unittest.TestCase):
         self.assertIn(
             "validation attempt lifecycle is invalid",
             status["attention"]["summary"],
+        )
+        episode = status["attention_episode"]
+        self.assertEqual(
+            store.sealed_evidence_result("crashed-run", episode["evidence"])[
+                "episode_sequence"
+            ],
+            episode["episode_sequence"],
         )
 
     def test_resume_rejects_started_projection_after_attempt_finished(self):
@@ -7869,12 +7878,14 @@ class StartCliTest(unittest.TestCase):
 
     def assert_repeated_repair_lifecycle_rejected(self, store, run_dir):
         first = self.run_afk("resume")
+        events_after_first = (run_dir / "events.jsonl").read_bytes()
         second = self.run_afk("resume")
 
         self.assertEqual(first.returncode, 2)
         self.assertEqual(second.returncode, 2)
+        self.assertEqual((run_dir / "events.jsonl").read_bytes(), events_after_first)
         self.assertFalse(self.command_log.exists())
-        for root in ("attempts", "gates", "retrospective"):
+        for root in ("attempts", "gates"):
             expected = ["start-bead-spec"] if root == "attempts" else []
             self.assertEqual(
                 sorted(path.name for path in (run_dir / root).iterdir()),
@@ -7884,6 +7895,13 @@ class StartCliTest(unittest.TestCase):
         self.assertEqual(status["attention"]["kind"], "invalid")
         self.assertIn(
             "repair attempt lifecycle is invalid", status["attention"]["summary"]
+        )
+        episode = status["attention_episode"]
+        self.assertEqual(
+            store.sealed_evidence_result("crashed-run", episode["evidence"])[
+                "episode_sequence"
+            ],
+            episode["episode_sequence"],
         )
 
     def test_resume_rejects_repair_attempt_started_while_one_is_open(self):
@@ -10220,6 +10238,54 @@ class StartCliTest(unittest.TestCase):
         self.assertEqual(status["state"], "attention_required")
         self.assertEqual(status["checkpoint"], "created")
         self.assertEqual(status["attention"]["scope"], "worker_launch")
+        episode = status["attention_episode"]
+        self.assertEqual(episode["episode_sequence"], status["last_sequence"])
+        store = RunStore(self.state_home / "afk")
+        outcome = store.sealed_evidence_result(status["run_id"], episode["evidence"])
+        self.assertEqual(outcome["episode_sequence"], episode["episode_sequence"])
+        self.assertEqual(outcome["status"], "empty")
+        self.assertEqual(
+            store.effect(status["run_id"], episode["effect_id"])["status"],
+            "confirmed",
+        )
+
+        events_before = (
+            self.state_home / "afk" / "runs" / status["run_id"] / "events.jsonl"
+        ).read_bytes()
+        repeated = self.run_afk("status", "--json")
+
+        self.assertEqual(repeated.returncode, 2, repeated.stderr)
+        self.assertEqual(
+            (
+                self.state_home / "afk" / "runs" / status["run_id"] / "events.jsonl"
+            ).read_bytes(),
+            events_before,
+        )
+        self.assertEqual(
+            RunStore(self.state_home / "afk").sealed_evidence_result(
+                status["run_id"], episode["evidence"]
+            ),
+            outcome,
+        )
+
+    def test_unavailable_attention_retrospective_preserves_attention_contract(self):
+        (self.fake_bin / "codex").unlink()
+
+        completed = self.run_afk(
+            "start", "central-bnkl.1.1", AFK_FAKE_SYSTEMD_FAILURE="1"
+        )
+
+        self.assertEqual(completed.returncode, 2, completed.stderr)
+        status = json.loads(self.run_afk("status", "--json").stdout)
+        self.assertEqual(status["state"], "attention_required")
+        self.assertEqual(status["checkpoint"], "created")
+        self.assertEqual(status["attention"]["scope"], "worker_launch")
+        self.assertEqual(status["attention"]["kind"], "unavailable")
+        outcome = RunStore(self.state_home / "afk").sealed_evidence_result(
+            status["run_id"], status["attention_episode"]["evidence"]
+        )
+        self.assertEqual(outcome["status"], "unavailable")
+        self.assertTrue(outcome["warning"])
 
     def test_claim_failure_stops_at_created_checkpoint(self):
         run_id = self.run_afk("start", "central-bnkl.1.1").stdout.strip()

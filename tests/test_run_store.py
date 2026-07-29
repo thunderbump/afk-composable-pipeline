@@ -186,6 +186,60 @@ class RunStoreTest(unittest.TestCase):
         )
         self.assertEqual(self.store.active_run_id(), "run-001")
 
+    def test_attention_episode_is_idempotent_until_a_later_transition(self):
+        self.create_run()
+        attention = {
+            "scope": "validation",
+            "kind": "unavailable",
+            "summary": "validation service unavailable",
+        }
+
+        first = self.store.record_attention_episode(
+            "run-001",
+            checkpoint="candidate_ready",
+            attention=attention,
+            details={"continuation": {"command": "afk resume run-001"}},
+        )
+        repeated = self.store.record_attention_episode(
+            "run-001",
+            checkpoint="candidate_ready",
+            attention=attention,
+            details={"continuation": {"command": "afk resume run-001"}},
+        )
+        self.store.append_event(
+            "run-001",
+            "validation.recovered",
+            state="candidate_ready",
+            data={"checkpoint": "candidate_ready", "attention": {}},
+        )
+        later = self.store.record_attention_episode(
+            "run-001",
+            checkpoint="candidate_ready",
+            attention=attention,
+            details={"continuation": {"command": "afk resume run-001"}},
+        )
+
+        self.assertEqual(first["attention_episode"], repeated["attention_episode"])
+        self.assertEqual(repeated["last_sequence"], first["last_sequence"])
+        self.assertEqual(
+            first["attention_episode"],
+            {
+                "schema_version": 1,
+                "episode_sequence": 2,
+                "evidence": "retrospective/attention-2",
+                "effect_id": "retrospective-analysis-2",
+            },
+        )
+        self.assertEqual(later["attention_episode"]["episode_sequence"], 4)
+        self.assertNotEqual(
+            later["attention_episode"]["evidence"],
+            first["attention_episode"]["evidence"],
+        )
+        self.assertEqual(
+            self.store.event("run-001", 2)["data"]["attention"],
+            attention,
+        )
+
     def test_resume_recovers_completion_after_active_pointer_unlink_fails(self):
         self.create_run()
         active_path = self.root / "active.json"

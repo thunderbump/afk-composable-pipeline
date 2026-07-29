@@ -318,6 +318,48 @@ class RunStore:
                 recorded_at=recorded_at,
             )
 
+    def record_attention_episode(
+        self,
+        run_id: str,
+        *,
+        checkpoint: str,
+        attention: dict[str, Any],
+        details: dict[str, Any] | None = None,
+        recorded_at: str | None = None,
+    ) -> dict[str, Any]:
+        """Record one distinct transition into Attention Required."""
+        with self.lock():
+            projection = self.status(run_id)
+            payload = redact_artifact_value(
+                {
+                    "checkpoint": checkpoint,
+                    "attention": attention,
+                    **(details or {}),
+                }
+            )
+            episode = self._validated_attention_episode(run_id, projection)
+            if projection["state"] == "attention_required" and episode is not None:
+                event = self.event(run_id, episode["episode_sequence"])
+                observed = dict(event["data"])
+                observed.pop(INVENTORY_KEY, None)
+                if observed == {**payload, "attention_episode": episode}:
+                    return projection
+
+            episode_sequence = projection["last_sequence"] + 1
+            attention_episode = {
+                "schema_version": 1,
+                "episode_sequence": episode_sequence,
+                "evidence": f"retrospective/attention-{episode_sequence}",
+                "effect_id": f"retrospective-analysis-{episode_sequence}",
+            }
+            return self.append_event(
+                run_id,
+                "run.attention_required",
+                state="attention_required",
+                data={**payload, "attention_episode": attention_episode},
+                recorded_at=recorded_at,
+            )
+
     def record_completion_finalization(
         self,
         run_id: str,
@@ -1276,6 +1318,23 @@ class RunStore:
             raise EventHistoryCorrupt("completion episode marker is invalid")
         return episode
 
+    def _validated_attention_episode(
+        self,
+        run_id: str,
+        projection: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        episode = _attention_episode(projection)
+        if episode is None:
+            return None
+        event = self.event(run_id, episode["episode_sequence"])
+        if (
+            event.get("event") != "run.attention_required"
+            or event.get("state") != "attention_required"
+            or event.get("data", {}).get("attention_episode") != episode
+        ):
+            raise EventHistoryCorrupt("attention episode marker is invalid")
+        return episode
+
     def _clear_active_pointer(self, run_id: str) -> None:
         if self._active_pointer_run_id() != run_id:
             return
@@ -1574,6 +1633,7 @@ def _project(identity: dict[str, Any], events: list[dict[str, Any]]) -> dict[str
         "gate_retry",
         "completion",
         "completion_episode",
+        "attention_episode",
         "bead_spec",
         "interrupted_repair",
         "lifecycle_interruption",
@@ -1603,6 +1663,28 @@ def _completion_episode(projection: dict[str, Any]) -> dict[str, Any] | None:
         or projection["last_sequence"] < sequence
     ):
         raise EventHistoryCorrupt("completion episode marker is invalid")
+    return episode
+
+
+def _attention_episode(projection: dict[str, Any]) -> dict[str, Any] | None:
+    episode = projection.get("attention_episode")
+    if episode is None:
+        return None
+    sequence = episode.get("episode_sequence") if isinstance(episode, dict) else None
+    expected = {
+        "schema_version": 1,
+        "episode_sequence": sequence,
+        "evidence": f"retrospective/attention-{sequence}",
+        "effect_id": f"retrospective-analysis-{sequence}",
+    }
+    if (
+        type(sequence) is not int
+        or sequence < 1
+        or episode != expected
+        or type(projection.get("last_sequence")) is not int
+        or projection["last_sequence"] < sequence
+    ):
+        raise EventHistoryCorrupt("attention episode marker is invalid")
     return episode
 
 

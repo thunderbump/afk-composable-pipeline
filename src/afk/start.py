@@ -629,16 +629,21 @@ def approve_bootstrap_validation(
         store.append_event(
             projection["run_id"],
             "validation.bootstrap_approved",
-            state="attention_required",
+            state="candidate_ready",
             data={
                 "checkpoint": "candidate_ready",
                 "validation_contract": contract,
-                "attention": {
-                    "scope": "validation",
-                    "kind": "unavailable",
-                    "summary": "approved bootstrap validation is ready",
-                },
+                "attention": {},
             },
+        )
+        _attention(
+            store,
+            projection["run_id"],
+            checkpoint="candidate_ready",
+            scope="validation",
+            kind="unavailable",
+            summary="approved bootstrap validation is ready",
+            validation_contract=contract,
         )
         return projection["run_id"]
 
@@ -2999,20 +3004,22 @@ def _attention(
     classification: str | None = None,
     **details: Any,
 ) -> None:
-    store.append_event(
+    projection = store.record_attention_episode(
         run_id,
-        "run.attention_required",
-        state="attention_required",
-        data={
-            "checkpoint": checkpoint,
-            "attention": {
-                "scope": scope,
-                "kind": kind,
-                "summary": summary,
-                **({"classification": classification} if classification else {}),
-            },
-            **details,
+        checkpoint=checkpoint,
+        attention={
+            "scope": scope,
+            "kind": kind,
+            "summary": summary,
+            **({"classification": classification} if classification else {}),
         },
+        details=details,
+    )
+    episode = projection["attention_episode"]
+    run_retrospective_attempt(
+        store,
+        run_id,
+        episode_sequence=episode["episode_sequence"],
     )
 
 
