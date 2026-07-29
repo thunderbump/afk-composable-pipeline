@@ -277,16 +277,9 @@ def _run_retrospective_attempt_locked(
             )
         else:
             analysis = _normalize_output(summary, stdout)
-            status = (
-                "empty"
-                if not analysis["process_findings"]
-                and not analysis["improvement_proposals"]
-                else "passed"
-            )
             outcome = _successful_outcome(
                 run_id,
                 episode_sequence,
-                status,
                 analysis,
             )
     except OSError as exc:
@@ -417,15 +410,9 @@ def _validate_sealed_attempt(
         raise RunStoreError("sealed retrospective analysis is invalid") from exc
     if payloads["analysis.json"] != canonical_json(analysis) + "\n":
         raise RunStoreError("sealed retrospective analysis is invalid")
-    status = (
-        "empty"
-        if not analysis["process_findings"] and not analysis["improvement_proposals"]
-        else "passed"
-    )
     expected = _successful_outcome(
         run_id,
         episode_sequence,
-        status,
         analysis,
     )
     if outcome != expected:
@@ -492,16 +479,9 @@ def _recover_prepared_attempt(
             "prepared retrospective analysis has no sealed outcome",
         )
     elif recorded is None:
-        status = (
-            "empty"
-            if not analysis["process_findings"]
-            and not analysis["improvement_proposals"]
-            else "passed"
-        )
         outcome = _successful_outcome(
             run_id,
             episode_sequence,
-            status,
             analysis,
         )
     else:
@@ -519,7 +499,6 @@ def _recover_prepared_attempt(
         expected = _successful_outcome(
             run_id,
             episode_sequence,
-            outcome["status"],
             analysis,
         )
         if outcome != expected:
@@ -565,14 +544,12 @@ def _persist_attempt(
         run_id=run_id,
         episode_sequence=episode_sequence,
     )
-    _reconcile_value(
-        store,
+    store.reconcile_evidence_value(
         run_id,
         f"{evidence}/input.json",
         json.loads(summary),
     )
-    _reconcile_value(
-        store,
+    store.reconcile_evidence_value(
         run_id,
         f"{evidence}/command.json",
         command_record,
@@ -580,14 +557,13 @@ def _persist_attempt(
     _write_text_if_absent(store, run_id, f"{evidence}/stdout.log", stdout)
     _write_text_if_absent(store, run_id, f"{evidence}/stderr.log", stderr)
     if analysis is not None:
-        _reconcile_value(
-            store,
+        store.reconcile_evidence_value(
             run_id,
             f"{evidence}/analysis.json",
             analysis,
         )
-    _reconcile_value(store, run_id, f"{evidence}/result.json", outcome)
-    _reconcile_value(store, run_id, f"{evidence}/outcome.json", outcome)
+    store.reconcile_evidence_value(run_id, f"{evidence}/result.json", outcome)
+    store.reconcile_evidence_value(run_id, f"{evidence}/outcome.json", outcome)
     store.seal_evidence(run_id, evidence)
     sealed = _normalize_outcome(
         store.sealed_evidence_result(run_id, evidence),
@@ -600,15 +576,6 @@ def _persist_attempt(
         observed={"evidence": evidence, "status": sealed["status"]},
     )
     return sealed
-
-
-def _reconcile_value(
-    store: RunStore,
-    run_id: str,
-    path: str,
-    value: Any,
-) -> None:
-    store.reconcile_evidence_value(run_id, path, value)
 
 
 def _write_text_if_absent(
@@ -1009,9 +976,13 @@ def _normalize_output(summary: str, stdout: str) -> dict[str, Any]:
 def _successful_outcome(
     run_id: str,
     episode_sequence: int,
-    status: str,
     analysis: dict[str, Any],
 ) -> dict[str, Any]:
+    status = (
+        "empty"
+        if not analysis["process_findings"] and not analysis["improvement_proposals"]
+        else "passed"
+    )
     return {
         "schema_version": 1,
         "run_id": run_id,
