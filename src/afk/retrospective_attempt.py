@@ -1,17 +1,20 @@
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
+import select
+import signal
 import stat
+import subprocess
+import sys
 import tempfile
+import threading
+import time
 from pathlib import Path
 from typing import Any, Sequence
 
-from afk.candidate_validation import (
-    CandidateValidationError,
-    run_supervised_command,
-)
 from afk.durable_id import is_durable_id
 from afk.redaction import redact_command_list, redact_text
 from afk.retrospective_result import (
@@ -23,13 +26,61 @@ from afk.retrospective_result import (
     normalize_retrospective_result,
 )
 from afk.run_store import RunStore, RunStoreError
-from afk.run_summary import build_run_summary
+from afk.run_summary import MAX_RUN_SUMMARY_BYTES, build_run_summary
 
 
 RETROSPECTIVE_TIMEOUT_SECONDS = 10 * 60
 RETROSPECTIVE_EFFECT_KIND = "retrospective-analysis"
 RETROSPECTIVE_PERMISSION_PROFILE = "retrospective-analysis"
 AUTH_BYTE_LIMIT = 1024 * 1024
+AUTH_DESCRIPTOR_MINIMUM = 200
+RETROSPECTIVE_OUTPUT_BYTE_LIMIT = 64 * 1024 * 1024
+PROCESS_CLEANUP_SECONDS = 1
+_EXEC_GUARD = """
+import ctypes
+import os
+import signal
+import subprocess
+import sys
+
+expected_parent = int(sys.argv[1])
+auth_descriptor = int(sys.argv[2])
+command = sys.argv[3:]
+libc = ctypes.CDLL(None, use_errno=True)
+if libc.prctl(1, signal.SIGTERM, 0, 0, 0) != 0:
+    raise OSError(ctypes.get_errno(), "prctl(PR_SET_PDEATHSIG) failed")
+
+def terminate_group(signum, frame):
+    os.killpg(0, signal.SIGKILL)
+
+signal.signal(signal.SIGTERM, terminate_group)
+if os.getppid() != expected_parent:
+    terminate_group(signal.SIGTERM, None)
+descriptors = () if auth_descriptor < 0 else (auth_descriptor,)
+child = subprocess.Popen(command, pass_fds=descriptors)
+returncode = child.wait()
+if returncode < 0:
+    if -returncode != signal.SIGKILL:
+        signal.signal(-returncode, signal.SIG_DFL)
+    os.kill(os.getpid(), -returncode)
+raise SystemExit(returncode)
+""".strip()
+
+
+class RetrospectiveProcessError(RuntimeError):
+    def __init__(
+        self,
+        kind: str,
+        summary: str,
+        *,
+        stdout: str = "",
+        stderr: str = "",
+    ):
+        super().__init__(summary)
+        self.kind = kind
+        self.summary = summary
+        self.stdout = stdout
+        self.stderr = stderr
 
 
 def _prompt_list(values: Sequence[str]) -> str:
@@ -91,7 +142,6 @@ def run_retrospective_attempt(
     run_id: str,
     *,
     episode_sequence: int,
-    codex_executable: str = "codex",
 ) -> dict[str, Any]:
     """Run and seal the sole analysis attempt for one retrospective episode."""
     with store.lock():
@@ -99,7 +149,6 @@ def run_retrospective_attempt(
             store,
             run_id,
             episode_sequence=episode_sequence,
-            codex_executable=codex_executable,
         )
 
 
@@ -108,7 +157,6 @@ def _run_retrospective_attempt_locked(
     run_id: str,
     *,
     episode_sequence: int,
-    codex_executable: str,
 ) -> dict[str, Any]:
     claim_id = f"retrospective-analysis-{episode_sequence}"
     evidence = retrospective_evidence_identity(
@@ -153,7 +201,7 @@ def _run_retrospective_attempt_locked(
             claim_id=claim_id,
         )
 
-    command = _contained_command(codex_executable)
+    command = _contained_command()
     command_record = _command_record(command)
     store.prepare_effect(
         run_id,
@@ -167,18 +215,22 @@ def _run_retrospective_attempt_locked(
     try:
         with tempfile.TemporaryDirectory(prefix="afk-retrospective-") as temporary:
             runtime = _prepare_private_runtime(Path(temporary))
-            completed = run_supervised_command(
-                command,
-                cwd=runtime["workspace"],
-                environment=_contained_environment(
-                    home=runtime["home"],
-                    codex_home=runtime["codex_home"],
-                    temporary=runtime["temporary"],
-                ),
-                timeout_seconds=RETROSPECTIVE_TIMEOUT_SECONDS,
-                input_text=summary,
-                label="retrospective analysis",
-            )
+            try:
+                completed = _run_retrospective_process(
+                    command,
+                    cwd=runtime["workspace"],
+                    environment=_contained_environment(
+                        home=runtime["home"],
+                        codex_home=runtime["codex_home"],
+                        temporary=runtime["temporary"],
+                    ),
+                    timeout_seconds=RETROSPECTIVE_TIMEOUT_SECONDS,
+                    input_text=summary,
+                    auth_descriptor=runtime["auth_descriptor"],
+                )
+            finally:
+                if runtime["auth_descriptor"] is not None:
+                    os.close(runtime["auth_descriptor"])
         stdout = completed.stdout
         stderr = completed.stderr
         if completed.returncode != 0:
@@ -209,9 +261,9 @@ def _run_retrospective_attempt_locked(
             "unavailable",
             str(exc),
         )
-    except CandidateValidationError as exc:
-        stdout = exc.stdout or ""
-        stderr = exc.stderr or ""
+    except RetrospectiveProcessError as exc:
+        stdout = exc.stdout
+        stderr = exc.stderr
         status = "interrupted" if exc.kind == "interrupted" else "invalid"
         outcome = _warning_outcome(
             run_id,
@@ -285,13 +337,67 @@ def _recover_prepared_attempt(
     command_record: dict[str, Any],
     claim_id: str,
 ) -> dict[str, Any]:
-    recorded = store.partial_evidence_result(run_id, evidence)
-    if recorded is None:
+    files = set(store.partial_evidence_files(run_id, evidence))
+    allowed = {
+        "analysis.json",
+        "command.json",
+        "input.json",
+        "outcome.json",
+        "result.json",
+        "stderr.log",
+        "stdout.log",
+    }
+    if files - allowed:
+        raise RunStoreError("partial retrospective evidence is invalid")
+    predecessors = {
+        "command.json",
+        "input.json",
+        "stderr.log",
+        "stdout.log",
+    }
+    if (
+        ("outcome.json" in files and "result.json" not in files)
+        or ("result.json" in files and not predecessors.issubset(files))
+        or ("analysis.json" in files and not predecessors.issubset(files))
+    ):
+        raise RunStoreError("partial retrospective evidence order is invalid")
+
+    analysis = None
+    if "analysis.json" in files:
+        try:
+            analysis = normalize_retrospective_result(
+                summary,
+                store.partial_evidence_value(
+                    run_id,
+                    f"{evidence}/analysis.json",
+                ),
+            )
+        except (RetrospectiveResultError, ValueError) as exc:
+            raise RunStoreError("partial retrospective analysis is invalid") from exc
+
+    if "result.json" not in files:
+        recorded = None
+    else:
+        recorded = store.partial_evidence_result(run_id, evidence)
+    if recorded is None and analysis is None:
         outcome = _warning_outcome(
             run_id,
             episode_sequence,
             "interrupted",
             "prepared retrospective analysis has no sealed outcome",
+        )
+    elif recorded is None:
+        status = (
+            "empty"
+            if not analysis["process_findings"]
+            and not analysis["improvement_proposals"]
+            else "passed"
+        )
+        outcome = _successful_outcome(
+            run_id,
+            episode_sequence,
+            status,
+            analysis,
         )
     else:
         outcome = _normalize_outcome(
@@ -299,6 +405,27 @@ def _recover_prepared_attempt(
             run_id=run_id,
             episode_sequence=episode_sequence,
         )
+    if outcome["warning"]:
+        if analysis is not None:
+            raise RunStoreError("partial retrospective analysis contradicts outcome")
+    else:
+        if analysis is None:
+            raise RunStoreError("partial retrospective analysis is missing")
+        expected = _successful_outcome(
+            run_id,
+            episode_sequence,
+            outcome["status"],
+            analysis,
+        )
+        if outcome != expected:
+            raise RunStoreError("partial retrospective analysis contradicts outcome")
+    if "outcome.json" in files:
+        recorded_outcome = store.partial_evidence_value(
+            run_id,
+            f"{evidence}/outcome.json",
+        )
+        if recorded_outcome != outcome:
+            raise RunStoreError("partial retrospective outcome is contradictory")
     return _persist_attempt(
         store,
         run_id,
@@ -308,7 +435,7 @@ def _recover_prepared_attempt(
         command_record=command_record,
         stdout="",
         stderr="",
-        analysis=None,
+        analysis=analysis,
         outcome=outcome,
         claim_id=claim_id,
     )
@@ -333,13 +460,13 @@ def _persist_attempt(
         run_id=run_id,
         episode_sequence=episode_sequence,
     )
-    _write_value_if_absent(
+    _reconcile_value(
         store,
         run_id,
         f"{evidence}/input.json",
         json.loads(summary),
     )
-    _write_value_if_absent(
+    _reconcile_value(
         store,
         run_id,
         f"{evidence}/command.json",
@@ -348,14 +475,14 @@ def _persist_attempt(
     _write_text_if_absent(store, run_id, f"{evidence}/stdout.log", stdout)
     _write_text_if_absent(store, run_id, f"{evidence}/stderr.log", stderr)
     if analysis is not None:
-        _write_value_if_absent(
+        _reconcile_value(
             store,
             run_id,
             f"{evidence}/analysis.json",
             analysis,
         )
-    _write_value_if_absent(store, run_id, f"{evidence}/result.json", outcome)
-    _write_value_if_absent(store, run_id, f"{evidence}/outcome.json", outcome)
+    _reconcile_value(store, run_id, f"{evidence}/result.json", outcome)
+    _reconcile_value(store, run_id, f"{evidence}/outcome.json", outcome)
     store.seal_evidence(run_id, evidence)
     sealed = _normalize_outcome(
         store.sealed_evidence_result(run_id, evidence),
@@ -370,16 +497,13 @@ def _persist_attempt(
     return sealed
 
 
-def _write_value_if_absent(
+def _reconcile_value(
     store: RunStore,
     run_id: str,
     path: str,
     value: Any,
 ) -> None:
-    try:
-        store.write_evidence_value(run_id, path, value)
-    except FileExistsError:
-        pass
+    store.reconcile_evidence_value(run_id, path, value)
 
 
 def _write_text_if_absent(
@@ -414,15 +538,9 @@ def retrospective_evidence_identity(
     return f"retrospective/{label}-{episode_sequence}"
 
 
-def _contained_command(codex_executable: str) -> list[str]:
-    if (
-        not isinstance(codex_executable, str)
-        or not codex_executable.strip()
-        or "\x00" in codex_executable
-    ):
-        raise RunStoreError("retrospective Codex executable is invalid")
+def _contained_command() -> list[str]:
     return [
-        codex_executable,
+        "codex",
         "exec",
         "--ephemeral",
         "--ignore-rules",
@@ -436,7 +554,226 @@ def _contained_command(codex_executable: str) -> list[str]:
     ]
 
 
-def _prepare_private_runtime(root: Path) -> dict[str, Path]:
+def _run_retrospective_process(
+    command: list[str],
+    *,
+    cwd: Path,
+    environment: dict[str, str],
+    timeout_seconds: float,
+    input_text: str,
+    auth_descriptor: int | None,
+) -> subprocess.CompletedProcess[str]:
+    input_bytes = input_text.encode("utf-8")
+    if len(input_bytes) > MAX_RUN_SUMMARY_BYTES:
+        raise RetrospectiveProcessError("invalid", "retrospective input is too large")
+    wrapper = [
+        sys.executable,
+        "-c",
+        _EXEC_GUARD,
+        str(os.getpid()),
+        str(auth_descriptor if auth_descriptor is not None else -1),
+        *command,
+    ]
+    inherited = () if auth_descriptor is None else (auth_descriptor,)
+    process = subprocess.Popen(
+        wrapper,
+        cwd=cwd,
+        env=environment,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+        pass_fds=inherited,
+    )
+    try:
+        pid_descriptor = os.pidfd_open(process.pid)
+    except OSError:
+        _terminate_process_group(process.pid)
+        process.wait(timeout=PROCESS_CLEANUP_SECONDS)
+        raise
+    assert process.stdin is not None
+    assert process.stdout is not None
+    assert process.stderr is not None
+    os.set_blocking(process.stdin.fileno(), False)
+    captured = {"stdout": bytearray(), "stderr": bytearray()}
+    captured_bytes = [0]
+    capture_lock = threading.Lock()
+    overflow = threading.Event()
+    readers = [
+        threading.Thread(
+            target=_capture_retrospective_output,
+            args=(stream, captured[name], captured_bytes, capture_lock, overflow),
+            daemon=True,
+        )
+        for name, stream in (
+            ("stdout", process.stdout),
+            ("stderr", process.stderr),
+        )
+    ]
+    for reader in readers:
+        reader.start()
+    input_view = memoryview(input_bytes)
+    input_offset = 0
+    deadline = time.monotonic() + timeout_seconds
+    timed_out = False
+    try:
+        try:
+            while not _process_exited(pid_descriptor) and not overflow.is_set():
+                if time.monotonic() >= deadline:
+                    timed_out = True
+                    break
+                input_offset = _feed_retrospective_input(
+                    process,
+                    input_view,
+                    input_offset,
+                )
+                overflow.wait(0.01)
+        finally:
+            _close_retrospective_input(process)
+            try:
+                _terminate_process_group(process.pid)
+            finally:
+                try:
+                    returncode = process.wait(timeout=PROCESS_CLEANUP_SECONDS)
+                except subprocess.TimeoutExpired as exc:
+                    raise RetrospectiveProcessError(
+                        "interrupted",
+                        "retrospective process group could not be terminated",
+                    ) from exc
+                finally:
+                    _join_retrospective_readers(readers)
+    finally:
+        os.close(pid_descriptor)
+        _close_retrospective_input(process)
+    if timed_out:
+        stdout, stderr = _retrospective_diagnostics(captured)
+        raise RetrospectiveProcessError(
+            "interrupted",
+            "retrospective analysis timed out and its process group was terminated",
+            stdout=stdout,
+            stderr=stderr,
+        )
+    if overflow.is_set():
+        raise RetrospectiveProcessError(
+            "invalid",
+            "retrospective analysis output exceeds the size limit",
+        )
+    if returncode < 0:
+        stdout, stderr = _retrospective_diagnostics(captured)
+        try:
+            signal_name = signal.Signals(-returncode).name
+        except ValueError:
+            signal_name = str(-returncode)
+        raise RetrospectiveProcessError(
+            "interrupted",
+            f"retrospective analysis exited after signal {signal_name}",
+            stdout=stdout,
+            stderr=stderr,
+        )
+    try:
+        stdout = bytes(captured["stdout"]).decode("utf-8")
+        stderr = bytes(captured["stderr"]).decode("utf-8")
+    except UnicodeDecodeError as exc:
+        diagnostic_stdout, diagnostic_stderr = _retrospective_diagnostics(captured)
+        raise RetrospectiveProcessError(
+            "invalid",
+            "retrospective analysis output must be UTF-8 text",
+            stdout=diagnostic_stdout,
+            stderr=diagnostic_stderr,
+        ) from exc
+    return subprocess.CompletedProcess(
+        command,
+        returncode,
+        redact_text(stdout),
+        redact_text(stderr),
+    )
+
+
+def _process_exited(pid_descriptor: int) -> bool:
+    poller = select.poll()
+    poller.register(pid_descriptor, select.POLLIN)
+    return bool(poller.poll(0))
+
+
+def _feed_retrospective_input(
+    process: subprocess.Popen[bytes],
+    payload: memoryview,
+    offset: int,
+) -> int:
+    if process.stdin is None:
+        return offset
+    if offset == len(payload):
+        _close_retrospective_input(process)
+        return offset
+    try:
+        written = os.write(process.stdin.fileno(), payload[offset:])
+    except BlockingIOError:
+        return offset
+    except BrokenPipeError:
+        _close_retrospective_input(process)
+        return offset
+    offset += written
+    if offset == len(payload):
+        _close_retrospective_input(process)
+    return offset
+
+
+def _close_retrospective_input(process: subprocess.Popen[bytes]) -> None:
+    if process.stdin is not None:
+        process.stdin.close()
+        process.stdin = None
+
+
+def _capture_retrospective_output(
+    stream: Any,
+    captured: bytearray,
+    captured_bytes: list[int],
+    capture_lock: threading.Lock,
+    overflow: threading.Event,
+) -> None:
+    try:
+        while chunk := stream.read(64 * 1024):
+            with capture_lock:
+                captured_bytes[0] += len(chunk)
+                if captured_bytes[0] > RETROSPECTIVE_OUTPUT_BYTE_LIMIT:
+                    overflow.set()
+                elif not overflow.is_set():
+                    captured.extend(chunk)
+    finally:
+        stream.close()
+
+
+def _terminate_process_group(process_group: int) -> None:
+    for requested_signal in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(process_group, requested_signal)
+        except ProcessLookupError:
+            return
+        if requested_signal == signal.SIGTERM:
+            time.sleep(0.05)
+
+
+def _join_retrospective_readers(readers: list[threading.Thread]) -> None:
+    deadline = time.monotonic() + PROCESS_CLEANUP_SECONDS
+    for reader in readers:
+        reader.join(timeout=max(deadline - time.monotonic(), 0))
+    if any(reader.is_alive() for reader in readers):
+        raise RetrospectiveProcessError(
+            "interrupted",
+            "retrospective output streams could not be drained",
+        )
+
+
+def _retrospective_diagnostics(
+    captured: dict[str, bytearray],
+) -> tuple[str, str]:
+    return tuple(
+        redact_text(bytes(captured[name]).decode("utf-8", errors="replace"))
+        for name in ("stdout", "stderr")
+    )
+
+
+def _prepare_private_runtime(root: Path) -> dict[str, Any]:
     home = root / "home"
     codex_home = home / ".codex"
     workspace = root / "workspace"
@@ -446,16 +783,17 @@ def _prepare_private_runtime(root: Path) -> dict[str, Path]:
     config = codex_home / "config.toml"
     config.write_text(_runtime_config(), encoding="utf-8")
     config.chmod(0o600)
-    _copy_auth_material(codex_home)
+    auth_descriptor = _copy_auth_material(codex_home)
     return {
         "home": home,
         "codex_home": codex_home,
         "workspace": workspace,
         "temporary": temporary,
+        "auth_descriptor": auth_descriptor,
     }
 
 
-def _copy_auth_material(runtime_codex_home: Path) -> None:
+def _copy_auth_material(runtime_codex_home: Path) -> int | None:
     configured = os.environ.get("CODEX_HOME")
     if configured:
         configured_codex_home = Path(configured).expanduser()
@@ -468,7 +806,7 @@ def _copy_auth_material(runtime_codex_home: Path) -> None:
             os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
         )
     except FileNotFoundError:
-        return
+        return None
     try:
         metadata = os.fstat(descriptor)
         if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > AUTH_BYTE_LIMIT:
@@ -482,9 +820,38 @@ def _copy_auth_material(runtime_codex_home: Path) -> None:
             raise OSError("configured Codex auth changed while being copied")
     finally:
         os.close(descriptor)
-    destination = runtime_codex_home / "auth.json"
-    destination.write_bytes(bytes(payload))
-    destination.chmod(0o600)
+    initial_descriptor = os.memfd_create(
+        "afk-codex-auth",
+        os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING,
+    )
+    try:
+        auth_descriptor = fcntl.fcntl(
+            initial_descriptor,
+            fcntl.F_DUPFD_CLOEXEC,
+            AUTH_DESCRIPTOR_MINIMUM,
+        )
+    finally:
+        os.close(initial_descriptor)
+    try:
+        remaining = memoryview(payload)
+        while remaining:
+            written = os.write(auth_descriptor, remaining)
+            remaining = remaining[written:]
+        os.lseek(auth_descriptor, 0, os.SEEK_SET)
+        seals = (
+            fcntl.F_SEAL_GROW
+            | fcntl.F_SEAL_SEAL
+            | fcntl.F_SEAL_SHRINK
+            | fcntl.F_SEAL_WRITE
+        )
+        fcntl.fcntl(auth_descriptor, fcntl.F_ADD_SEALS, seals)
+        (runtime_codex_home / "auth.json").symlink_to(
+            f"/proc/self/fd/{auth_descriptor}"
+        )
+    except BaseException:
+        os.close(auth_descriptor)
+        raise
+    return auth_descriptor
 
 
 def _runtime_config() -> str:
