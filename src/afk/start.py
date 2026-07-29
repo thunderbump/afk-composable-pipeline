@@ -48,6 +48,7 @@ from afk.candidate_validation import (
 )
 from afk.jsonutil import canonical_json
 from afk.redaction import redact_artifact_value
+from afk.retrospective_attempt import run_retrospective_attempt
 from afk.run_store import (
     ProjectedEvidenceTampered,
     ResumePreflightInvalid,
@@ -1834,16 +1835,7 @@ def _advance_terminal_cleanup(store: RunStore, run_id: str) -> int:
                 evidence=evidence,
             )
             store.reconcile_evidence_result(run_id, evidence, sealed_completion)
-            store.append_event(
-                run_id,
-                "run.completed",
-                state="completed",
-                data={
-                    "checkpoint": "completed",
-                    "attention": {},
-                    "completion": sealed_completion,
-                },
-            )
+            _record_completed_run(store, run_id, sealed_completion)
             return 0
     except (StartError, RunStoreError) as exc:
         _attention(
@@ -1892,16 +1884,7 @@ def _advance_terminal_cleanup(store: RunStore, run_id: str) -> int:
     )
     try:
         store.reconcile_evidence_result(run_id, evidence, record)
-        store.append_event(
-            run_id,
-            "run.completed",
-            state="completed",
-            data={
-                "checkpoint": "completed",
-                "attention": {},
-                "completion": record,
-            },
-        )
+        _record_completed_run(store, run_id, record)
     except RunStoreError as exc:
         _attention(
             store,
@@ -1913,6 +1896,28 @@ def _advance_terminal_cleanup(store: RunStore, run_id: str) -> int:
         )
         return 2
     return 0
+
+
+def _record_completed_run(
+    store: RunStore,
+    run_id: str,
+    completion: dict[str, Any],
+) -> None:
+    projection = store.append_event(
+        run_id,
+        "run.completed",
+        state="completed",
+        data={
+            "checkpoint": "completed",
+            "attention": {},
+            "completion": completion,
+        },
+    )
+    run_retrospective_attempt(
+        store,
+        run_id,
+        episode_sequence=projection["last_sequence"],
+    )
 
 
 def _validate_completion_record(

@@ -4983,6 +4983,70 @@ class StartCliTest(unittest.TestCase):
         self.assertEqual(status["merge"]["merge_commit"], "f" * 40)
         self.assertEqual(status["bead_closure"]["status"], "closed")
 
+    def test_completion_records_one_immutable_retrospective_episode(self):
+        run_id = self.start_reviewed_run()
+        for _ in range(3):
+            self.assertEqual(self.run_afk("resume").returncode, 0)
+
+        completed = self.run_afk("resume")
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        store = RunStore(self.state_home / "afk")
+        status = store.status(run_id)
+        self.assertEqual(status["state"], "completed")
+        episode_sequence = status["last_sequence"]
+        outcome = store.sealed_evidence_result(
+            run_id,
+            f"retrospective/completed-{episode_sequence}",
+        )
+        self.assertEqual(outcome["status"], "empty")
+        self.assertFalse(outcome["warning"])
+        self.assertEqual(outcome["episode_sequence"], episode_sequence)
+        claim = store.effect(
+            run_id,
+            f"retrospective-analysis-{episode_sequence}",
+        )
+        self.assertEqual(claim["status"], "confirmed")
+        events_before = (
+            self.state_home / "afk" / "runs" / run_id / "events.jsonl"
+        ).read_bytes()
+
+        repeated = self.run_afk("resume", run_id)
+
+        self.assertEqual(repeated.returncode, 0, repeated.stderr)
+        self.assertEqual(
+            (self.state_home / "afk" / "runs" / run_id / "events.jsonl").read_bytes(),
+            events_before,
+        )
+        self.assertEqual(
+            store.sealed_evidence_result(
+                run_id,
+                f"retrospective/completed-{episode_sequence}",
+            ),
+            outcome,
+        )
+
+    def test_unavailable_completion_retrospective_is_only_a_warning(self):
+        run_id = self.start_reviewed_run()
+        for _ in range(3):
+            self.assertEqual(self.run_afk("resume").returncode, 0)
+        (self.fake_bin / "codex").unlink()
+
+        completed = self.run_afk("resume")
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        store = RunStore(self.state_home / "afk")
+        status = store.status(run_id)
+        self.assertEqual(status["state"], "completed")
+        self.assertEqual(status["checkpoint"], "completed")
+        outcome = store.sealed_evidence_result(
+            run_id,
+            f"retrospective/completed-{status['last_sequence']}",
+        )
+        self.assertEqual(outcome["status"], "unavailable")
+        self.assertTrue(outcome["warning"])
+        self.assert_exact_terminal_completion(run_id)
+
     def test_terminal_cleanup_filesystem_exception_is_a_durable_warning(self):
         run_id = self.start_reviewed_run()
         self.assertEqual(self.run_afk("resume").returncode, 0)
@@ -10995,6 +11059,17 @@ class StartCliTest(unittest.TestCase):
 
                 args = sys.argv[1:]
                 prompt = sys.stdin.read()
+                if "--skip-git-repo-check" in args:
+                    summary = json.loads(prompt)
+                    print(json.dumps({
+                        "schema_version": 1,
+                        "run_id": summary["run"]["run_id"],
+                        "terminal_outcome": summary["episode"]["state"],
+                        "summary": "No actionable findings.",
+                        "process_findings": [],
+                        "improvement_proposals": [],
+                    }))
+                    raise SystemExit(0)
                 base_sha = "a" * 40
                 candidate_sha = "d" * 40
                 worktree = Path(args[args.index("--cd") + 1])
