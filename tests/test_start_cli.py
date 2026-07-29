@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
 import time
 import unittest
 from io import StringIO
@@ -19,6 +20,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 import afk.run_store as run_store_module  # noqa: E402
+import afk.start as start_module  # noqa: E402
 from afk.bead_spec import bead_spec_identity, persist_bead_spec  # noqa: E402
 from afk.lifecycle_signals import record_lifecycle_interruption  # noqa: E402
 from afk.run_store import (  # noqa: E402
@@ -10577,6 +10579,131 @@ class StartCliTest(unittest.TestCase):
         )
         self.assertEqual(outcome["status"], "unavailable")
         self.assertTrue(outcome["warning"])
+
+    def test_concurrent_attention_reconciles_first_episode_before_superseding_it(self):
+        store, _ = self.create_resume_preflight_run()
+        first_episode_sequence = store.status("crashed-run")["last_sequence"] + 1
+        initial_status_barrier = threading.Barrier(2)
+        local = threading.local()
+        original_status = store.status
+        original_retrospective = start_module.run_retrospective_attempt
+        retrospective_attempts = []
+        attempts_lock = threading.Lock()
+        first_waiting = threading.Event()
+        first_attempted = threading.Event()
+        second_attempted = threading.Event()
+        errors = []
+
+        def synchronized_status(run_id=None):
+            projection = original_status(run_id)
+            if not getattr(local, "initial_status_read", False):
+                local.initial_status_read = True
+                if local.summary == "first concurrent attention":
+                    first_waiting.set()
+                try:
+                    initial_status_barrier.wait(timeout=2)
+                except threading.BrokenBarrierError:
+                    pass
+                if local.summary == "second concurrent attention":
+                    first_attempted.wait(timeout=2)
+            return projection
+
+        def crash_first_attempt(
+            selected_store,
+            run_id,
+            *,
+            episode_sequence,
+        ):
+            with attempts_lock:
+                retrospective_attempts.append(episode_sequence)
+                first_attempt = (
+                    episode_sequence == first_episode_sequence
+                    and retrospective_attempts.count(episode_sequence) == 1
+                )
+            if first_attempt:
+                first_attempted.set()
+                second_attempted.wait(timeout=0.2)
+                raise RuntimeError("injected first attention crash")
+            if episode_sequence == first_episode_sequence + 1:
+                second_attempted.set()
+            return original_retrospective(
+                selected_store,
+                run_id,
+                episode_sequence=episode_sequence,
+            )
+
+        def require_attention(summary):
+            local.summary = summary
+            while True:
+                try:
+                    start_module._attention(
+                        store,
+                        "crashed-run",
+                        checkpoint="created",
+                        scope="worker_launch",
+                        kind="unavailable",
+                        summary=summary,
+                    )
+                except RunStoreBusy:
+                    time.sleep(0.01)
+                    continue
+                except RuntimeError as exc:
+                    errors.append(str(exc))
+                return
+
+        with (
+            patch.dict(os.environ, self.afk_environment()),
+            patch.object(store, "status", new=synchronized_status),
+            patch(
+                "afk.start.run_retrospective_attempt",
+                side_effect=crash_first_attempt,
+            ),
+        ):
+            callers = [
+                threading.Thread(target=require_attention, args=(summary,))
+                for summary in (
+                    "first concurrent attention",
+                    "second concurrent attention",
+                )
+            ]
+            callers[0].start()
+            self.assertTrue(first_waiting.wait(timeout=2))
+            callers[1].start()
+            for caller in callers:
+                caller.join(timeout=10)
+
+        self.assertFalse(any(caller.is_alive() for caller in callers))
+        self.assertEqual(errors, ["injected first attention crash"])
+        self.assertEqual(
+            retrospective_attempts,
+            [
+                first_episode_sequence,
+                first_episode_sequence,
+                first_episode_sequence + 1,
+            ],
+        )
+        episodes = [
+            event["data"]["attention_episode"]
+            for sequence in range(1, store.status("crashed-run")["last_sequence"] + 1)
+            if (event := store.event("crashed-run", sequence))["event"]
+            == "run.attention_required"
+        ]
+        self.assertEqual(len(episodes), 2)
+        self.assertEqual(
+            {
+                store.event("crashed-run", episode["episode_sequence"])["data"][
+                    "attention"
+                ]["summary"]
+                for episode in episodes
+            },
+            {"first concurrent attention", "second concurrent attention"},
+        )
+        for episode in episodes:
+            outcome = store.sealed_evidence_result("crashed-run", episode["evidence"])
+            self.assertEqual(
+                outcome["episode_sequence"],
+                episode["episode_sequence"],
+            )
 
     def test_claim_failure_stops_at_created_checkpoint(self):
         run_id = self.run_afk("start", "central-bnkl.1.1").stdout.strip()

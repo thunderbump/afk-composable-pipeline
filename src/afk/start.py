@@ -3048,34 +3048,35 @@ def _attention(
     classification: str | None = None,
     **details: Any,
 ) -> None:
-    current = store.status(run_id)
-    prior_episode = store.validated_attention_episode(run_id, current)
-    prior_sequence = None
-    if current["state"] == "attention_required" and prior_episode is not None:
-        prior_sequence = prior_episode["episode_sequence"]
-        run_retrospective_attempt(
-            store,
+    with store.lock():
+        current = store.status(run_id)
+        prior_episode = store.validated_attention_episode(run_id, current)
+        prior_sequence = None
+        if current["state"] == "attention_required" and prior_episode is not None:
+            prior_sequence = prior_episode["episode_sequence"]
+            run_retrospective_attempt(
+                store,
+                run_id,
+                episode_sequence=prior_sequence,
+            )
+        projection = store.record_attention_episode(
             run_id,
-            episode_sequence=prior_sequence,
+            checkpoint=checkpoint,
+            attention={
+                "scope": scope,
+                "kind": kind,
+                "summary": summary,
+                **({"classification": classification} if classification else {}),
+            },
+            details=details,
         )
-    projection = store.record_attention_episode(
-        run_id,
-        checkpoint=checkpoint,
-        attention={
-            "scope": scope,
-            "kind": kind,
-            "summary": summary,
-            **({"classification": classification} if classification else {}),
-        },
-        details=details,
-    )
-    episode = projection["attention_episode"]
-    if episode["episode_sequence"] != prior_sequence:
-        run_retrospective_attempt(
-            store,
-            run_id,
-            episode_sequence=episode["episode_sequence"],
-        )
+        episode = projection["attention_episode"]
+        if episode["episode_sequence"] != prior_sequence:
+            run_retrospective_attempt(
+                store,
+                run_id,
+                episode_sequence=episode["episode_sequence"],
+            )
 
 
 def _required(
