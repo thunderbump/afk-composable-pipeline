@@ -9201,13 +9201,14 @@ class StartCliTest(unittest.TestCase):
         manifest_published = threading.Event()
         finish_seal = threading.Event()
         seal_errors = []
-        original_chmod = Path.chmod
+        original_fchmod = os.fchmod
 
-        def pause_before_root_read_only(path, mode, *args, **kwargs):
-            if path.resolve() == evidence.resolve() and mode == 0o500:
+        def pause_before_root_read_only(descriptor, mode):
+            selected = Path(f"/proc/self/fd/{descriptor}")
+            if selected.resolve() == evidence.resolve() and mode == 0o500:
                 manifest_published.set()
                 finish_seal.wait(timeout=5)
-            return original_chmod(path, mode, *args, **kwargs)
+            return original_fchmod(descriptor, mode)
 
         def seal():
             try:
@@ -9215,7 +9216,7 @@ class StartCliTest(unittest.TestCase):
             except Exception as exc:  # pragma: no cover - surfaced by assertion
                 seal_errors.append(exc)
 
-        with patch.object(Path, "chmod", new=pause_before_root_read_only):
+        with patch("afk.run_store.os.fchmod", new=pause_before_root_read_only):
             sealer = threading.Thread(target=seal)
             sealer.start()
             self.assertTrue(manifest_published.wait(timeout=5))

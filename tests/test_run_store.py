@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
 
@@ -963,15 +964,17 @@ class RunStoreTest(unittest.TestCase):
             "run-001", "gates/completion/result.json", expected
         )
         directory = self.root / "runs" / "run-001" / "gates" / "completion"
-        chmod = Path.chmod
+        fchmod = os.fchmod
 
-        def interrupt_root_seal(path, mode):
-            if path.resolve() == directory.resolve() and mode == 0o500:
+        def interrupt_root_seal(descriptor, mode):
+            selected = Path(f"/proc/self/fd/{descriptor}")
+            if selected.resolve() == directory.resolve() and mode == 0o500:
                 raise OSError("simulated interruption")
-            return chmod(path, mode)
+            return fchmod(descriptor, mode)
 
         with patch(
-            "afk.run_store.Path.chmod", autospec=True, side_effect=interrupt_root_seal
+            "afk.run_store.os.fchmod",
+            side_effect=interrupt_root_seal,
         ):
             with self.assertRaises(OSError):
                 self.store.seal_evidence("run-001", "gates/completion")
@@ -1641,6 +1644,117 @@ class RunStoreTest(unittest.TestCase):
                     "Run identity is invalid: run-001",
                 ):
                     action(store)
+
+    def test_evidence_apis_hold_the_open_unit_across_a_directory_swap(self):
+        cases = {
+            "write": (
+                False,
+                lambda store: store.write_evidence_value(
+                    "run-001", "attempts/open/output.json", {"source": "selected"}
+                ),
+                {"source": "selected"},
+            ),
+            "verify": (
+                True,
+                lambda store: store.verify_evidence("run-001", "attempts/open"),
+                True,
+            ),
+            "seal": (
+                False,
+                lambda store: store.seal_evidence("run-001", "attempts/open"),
+                None,
+            ),
+            "partial value": (
+                False,
+                lambda store: store.partial_evidence_value(
+                    "run-001", "attempts/open/input.json"
+                ),
+                {"source": "selected"},
+            ),
+            "partial files": (
+                False,
+                lambda store: store.partial_evidence_files("run-001", "attempts/open"),
+                ("input.json",),
+            ),
+            "reconcile": (
+                False,
+                lambda store: store.reconcile_evidence_value(
+                    "run-001",
+                    "attempts/open/input.json",
+                    {"source": "selected"},
+                ),
+                {"source": "selected"},
+            ),
+        }
+        for index, (name, (sealed, action, expected)) in enumerate(
+            cases.items(), start=1
+        ):
+            with self.subTest(api=name):
+                root = self.state_home / f"afk-swap-{index}"
+                store = RunStore(root)
+                store.create_run(
+                    bead_id="central-bhap.8.6",
+                    repository="https://example.invalid/acme/beads-webui.git",
+                    base_branch="main",
+                    base_sha=BASE_SHA,
+                    start_request={},
+                    run_id="run-001",
+                )
+                store.write_evidence_value(
+                    "run-001",
+                    "attempts/open/input.json",
+                    {"source": "selected"},
+                )
+                if sealed:
+                    store.seal_evidence("run-001", "attempts/open")
+                selected = root / "runs" / "run-001" / "attempts" / "open"
+                detached = selected.parent / f"detached-{index}"
+                external = self.state_home / f"external-{index}"
+                external.mkdir()
+                (external / "input.json").write_text(
+                    '{"source":"external"}\n',
+                    encoding="utf-8",
+                )
+                before = {
+                    path.relative_to(external).as_posix()
+                    or ".": (
+                        path.read_bytes() if path.is_file() else None,
+                        stat.S_IMODE(path.stat().st_mode),
+                    )
+                    for path in [external, *external.rglob("*")]
+                }
+                original_open = store._open_observation_evidence
+                swapped = False
+
+                @contextmanager
+                def swap_after_open(*args, **kwargs):
+                    nonlocal swapped
+                    with original_open(*args, **kwargs) as descriptors:
+                        if not swapped and args[1] == "attempts/open":
+                            swapped = True
+                            selected.rename(detached)
+                            selected.symlink_to(external, target_is_directory=True)
+                        yield descriptors
+
+                with patch.object(
+                    store,
+                    "_open_observation_evidence",
+                    new=swap_after_open,
+                ):
+                    observed = action(store)
+
+                if expected is not None:
+                    self.assertEqual(observed, expected)
+                self.assertTrue(swapped)
+                after = {
+                    path.relative_to(external).as_posix()
+                    or ".": (
+                        path.read_bytes() if path.is_file() else None,
+                        stat.S_IMODE(path.stat().st_mode),
+                    )
+                    for path in [external, *external.rglob("*")]
+                }
+                self.assertEqual(after, before)
 
     def test_sealed_evidence_result_does_not_repair_changed_published_evidence(self):
         self.create_run()
