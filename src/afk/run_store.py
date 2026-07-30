@@ -697,7 +697,9 @@ class RunStore:
 
     def seal_evidence(self, run_id: str, relative_directory: str) -> dict[str, Any]:
         with self.lock():
-            directory = self._evidence_path(run_id, relative_directory)
+            directory, relative_directory = self._evidence_directory_identity(
+                run_id, relative_directory
+            )
             if not directory.is_dir() or directory.is_symlink():
                 raise EvidenceError(
                     f"evidence directory does not exist: {relative_directory}"
@@ -815,7 +817,9 @@ class RunStore:
         self, run_id: str, relative_directory: str
     ) -> Any | None:
         """Read a fully sealed result without completing or repairing its seal."""
-        directory = self._evidence_path(run_id, relative_directory)
+        directory, relative_directory = self._evidence_directory_identity(
+            run_id, relative_directory
+        )
         receipt = self._read_evidence_receipt(run_id, relative_directory)
         if receipt is None:
             identity = self._identity(run_id)
@@ -852,6 +856,9 @@ class RunStore:
             return payloads
 
     def _verify_or_finish_seal(self, run_id: str, relative_directory: str) -> None:
+        directory, relative_directory = self._evidence_directory_identity(
+            run_id, relative_directory
+        )
         receipt = self._read_evidence_receipt(run_id, relative_directory)
         try:
             self.verify_evidence(run_id, relative_directory)
@@ -861,7 +868,6 @@ class RunStore:
             if str(exc) != "sealed evidence is writable" or receipt is not None:
                 raise
 
-        directory = self._evidence_path(run_id, relative_directory)
         manifest_path = directory / "manifest.json"
         files = _evidence_files(directory)
         nested_directories = [path for path in directory.rglob("*") if path.is_dir()]
@@ -1746,6 +1752,13 @@ class RunStore:
         if not path.resolve(strict=False).is_relative_to(run_dir):
             raise EvidenceError("evidence path escapes the Run directory")
         return path
+
+    def _evidence_directory_identity(
+        self, run_id: str, relative_directory: str
+    ) -> tuple[Path, str]:
+        directory = self._evidence_path(run_id, relative_directory)
+        canonical = directory.relative_to(self._run_dir(run_id)).as_posix()
+        return directory, canonical
 
 
 def _validate_run_id(run_id: str) -> None:

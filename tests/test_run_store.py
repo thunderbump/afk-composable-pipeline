@@ -898,6 +898,7 @@ class RunStoreTest(unittest.TestCase):
         self.create_run()
         expected = {"status": "complete"}
         unit = "gates/completion"
+        alias = "gates//completion"
         self.store.write_evidence_value("run-001", f"{unit}/result.json", expected)
         link = os.link
 
@@ -910,7 +911,7 @@ class RunStoreTest(unittest.TestCase):
             with self.assertRaisesRegex(
                 EvidenceTampered, "evidence receipt is invalid"
             ):
-                self.store.seal_evidence("run-001", unit)
+                self.store.seal_evidence("run-001", alias)
 
         evidence = self.root / "runs" / "run-001" / unit
         before = {
@@ -971,6 +972,57 @@ class RunStoreTest(unittest.TestCase):
         self.assertTrue(receipt_directory.is_symlink())
         self.assertEqual(stat.S_IMODE(external.stat().st_mode), 0o755)
         self.assertEqual(list(external.iterdir()), [])
+
+    def test_receipt_identity_canonicalizes_accepted_evidence_path_aliases(self):
+        aliases = (
+            "gates//completion",
+            "gates/./completion",
+            "gates/completion/.",
+        )
+        expected = {"status": "complete"}
+
+        for index, alias in enumerate(aliases, start=1):
+            with self.subTest(alias=alias):
+                root = self.state_home / f"afk-{index}"
+                store = RunStore(root)
+                run_id = f"alias-run-{index}"
+                store.create_run(
+                    bead_id="central-bnkl.1.1",
+                    repository="https://example.invalid/acme/beads-webui.git",
+                    base_branch="main",
+                    base_sha=BASE_SHA,
+                    start_request={},
+                    run_id=run_id,
+                )
+                store.write_evidence_value(
+                    run_id,
+                    "gates/completion/result.json",
+                    expected,
+                )
+                store.seal_evidence(run_id, alias)
+
+                self.assertEqual(
+                    store.observe_sealed_evidence_result(run_id, "gates/completion"),
+                    expected,
+                )
+                self.assertEqual(
+                    store.observe_sealed_evidence_result(run_id, alias),
+                    expected,
+                )
+                receipts = list(
+                    (root / "runs" / run_id / ".evidence-receipts").iterdir()
+                )
+                self.assertEqual(len(receipts), 1)
+                self.assertEqual(
+                    json.loads(receipts[0].read_text(encoding="utf-8"))["evidence"],
+                    "gates/completion",
+                )
+                for unsafe in ("gates/../outside", "/gates/completion"):
+                    with self.assertRaisesRegex(
+                        EvidenceError,
+                        "evidence path must stay under",
+                    ):
+                        store.observe_sealed_evidence_result(run_id, unsafe)
 
     def test_observation_rejects_a_forged_locked_receipt_for_writable_evidence(self):
         self.create_run()
