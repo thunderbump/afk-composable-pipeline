@@ -23,13 +23,19 @@ import afk.run_store as run_store_module  # noqa: E402
 import afk.start as start_module  # noqa: E402
 from afk.bead_spec import bead_spec_identity, persist_bead_spec  # noqa: E402
 from afk.lifecycle_signals import record_lifecycle_interruption  # noqa: E402
+from afk.retrospective_attempt import (  # noqa: E402
+    RETROSPECTIVE_OUTPUT_BYTE_LIMIT,
+)
+from afk.retrospective_contract import TEXT_CHARACTER_LIMIT  # noqa: E402
 from afk.run_store import (  # noqa: E402
+    ATTEMPT_BYTE_LIMIT,
     ActiveRunExists,
     EventHistoryCorrupt,
     RunStore,
     RunStoreBusy,
     RunStoreError,
 )
+from afk.run_summary import MAX_RUN_SUMMARY_BYTES  # noqa: E402
 from afk.start import (  # noqa: E402
     StartError,
     _beads_password,
@@ -40,6 +46,8 @@ from afk.start import (  # noqa: E402
 
 
 BASE_SHA = "a" * 40
+RAW_ANALYSIS_SENTINEL = "RAW_RETROSPECTIVE_ANALYSIS_SENTINEL"
+SENSITIVE_RETROSPECTIVE_SENTINEL = "sensitive-retrospective-token"
 CRASH_INJECTION_OVERRIDES = (
     "AFK_TEST_KILL_BEFORE_EVENT",
     "AFK_TEST_KILL_AFTER_EVENT",
@@ -11551,10 +11559,45 @@ class StartCliTest(unittest.TestCase):
             findings=1,
             proposals=1,
         )
+        self.assertEqual(attention_outcome["run_id"], run_id)
         run_dir = self.state_home / "afk" / "runs" / run_id
         attention_manifest = (
             run_dir / attention_episode["evidence"] / "manifest.json"
         ).read_bytes()
+        attention_payloads = store.sealed_evidence_payloads(
+            run_id,
+            attention_episode["evidence"],
+        )
+        retained_attention = "".join(attention_payloads.values())
+        self.assertLessEqual(
+            len(attention_payloads["input.json"].encode("utf-8")),
+            MAX_RUN_SUMMARY_BYTES,
+        )
+        self.assertLessEqual(
+            len(attention_payloads["stdout.log"].encode("utf-8"))
+            + len(attention_payloads["stderr.log"].encode("utf-8")),
+            RETROSPECTIVE_OUTPUT_BYTE_LIMIT,
+        )
+        self.assertLessEqual(
+            sum(
+                len(payload.encode("utf-8")) for payload in attention_payloads.values()
+            ),
+            ATTEMPT_BYTE_LIMIT,
+        )
+        attention_analysis = json.loads(attention_payloads["analysis.json"])
+        self.assertGreaterEqual(
+            len(attention_analysis["summary"]),
+            TEXT_CHARACTER_LIMIT - 64,
+        )
+        self.assertLessEqual(len(attention_analysis["summary"]), TEXT_CHARACTER_LIMIT)
+        self.assertIn(RAW_ANALYSIS_SENTINEL, retained_attention)
+        self.assertNotIn(SENSITIVE_RETROSPECTIVE_SENTINEL, retained_attention)
+        self.assertIn("[REDACTED]", retained_attention)
+        self.assertEqual(
+            json.loads(attention_payloads["input.json"])["run"]["run_id"],
+            run_id,
+        )
+        self.assertEqual(attention_analysis["run_id"], run_id)
         self.assertEqual(attention["state"], "attention_required")
 
         control.write_text("empty", encoding="utf-8")
@@ -11579,6 +11622,7 @@ class StartCliTest(unittest.TestCase):
             findings=0,
             proposals=0,
         )
+        self.assertEqual(completion_outcome["run_id"], run_id)
         completion_manifest = (
             run_dir / completion_episode["evidence"] / "manifest.json"
         ).read_bytes()
@@ -11586,6 +11630,24 @@ class StartCliTest(unittest.TestCase):
         structured_completed = json.loads(
             self.run_afk("status", run_id, "--json").stdout
         )
+        public_status = json.dumps(structured_completed, sort_keys=True)
+        human_status = self.run_afk("status", run_id)
+        report_result = self.run_afk("report", run_id)
+        self.assertEqual(human_status.returncode, 0, human_status.stderr)
+        self.assertEqual(report_result.returncode, 0, report_result.stderr)
+        report = json.loads(report_result.stdout)
+        self.assertEqual(structured_completed["run_id"], run_id)
+        self.assertEqual(report["run_id"], run_id)
+        self.assertEqual(
+            report["retrospective"],
+            structured_completed["retrospective"],
+        )
+        self.assertNotIn(RAW_ANALYSIS_SENTINEL, public_status)
+        self.assertNotIn(SENSITIVE_RETROSPECTIVE_SENTINEL, public_status)
+        self.assertNotIn(RAW_ANALYSIS_SENTINEL, human_status.stdout)
+        self.assertNotIn(SENSITIVE_RETROSPECTIVE_SENTINEL, human_status.stdout)
+        self.assertNotIn(RAW_ANALYSIS_SENTINEL, report_result.stdout)
+        self.assertNotIn(SENSITIVE_RETROSPECTIVE_SENTINEL, report_result.stdout)
         self.assertEqual(
             structured_completed["retrospective"],
             {
@@ -11615,6 +11677,23 @@ class StartCliTest(unittest.TestCase):
                 },
             },
         )
+        for evidence_path in structured_completed["retrospective"]["evidence_paths"]:
+            identity = Path(evidence_path)
+            self.assertFalse(identity.is_absolute())
+            self.assertNotIn("..", identity.parts)
+            self.assertEqual(identity.parts[0], "retrospective")
+            self.assertTrue((run_dir / identity / "manifest.json").is_file())
+        for evidence_directory in (run_dir / "retrospective").iterdir():
+            if not evidence_directory.is_dir():
+                continue
+            manifest = json.loads(
+                (evidence_directory / "manifest.json").read_text(encoding="utf-8")
+            )
+            for retained in manifest["files"]:
+                identity = Path(retained["path"])
+                self.assertFalse(identity.is_absolute())
+                self.assertNotIn("..", identity.parts)
+                self.assertTrue((evidence_directory / identity).is_file())
         events_path = run_dir / "events.jsonl"
         events_before_repeat = events_path.read_bytes()
         self.assertEqual(
@@ -13263,7 +13342,11 @@ class StartCliTest(unittest.TestCase):
                         "improvement_proposals": [],
                     }
                     if mode == "populated":
-                        result["summary"] = "One process issue was found."
+                        result["summary"] = (
+                            "RAW_RETROSPECTIVE_ANALYSIS_SENTINEL "
+                            "token=sensitive-retrospective-token "
+                            + ("x" * 512)
+                        )[:512]
                         result["process_findings"] = [{
                             "id": "finding-1",
                             "category": "orchestration",
