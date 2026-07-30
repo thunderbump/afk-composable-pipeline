@@ -12,7 +12,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import get_ident
-from typing import Any, Iterator, Literal, NamedTuple
+from typing import Any, Callable, Iterator, Literal, NamedTuple
 
 from afk.durable_id import is_durable_id
 from afk.jsonutil import canonical_json
@@ -996,41 +996,71 @@ class RunStore:
         relative_directory = _canonical_evidence_relative(relative_directory)
         with self._open_observation_run(run_id) as run_descriptor:
             identity = self._identity_at(run_descriptor, run_id)
-            receipt = self._read_evidence_receipt_at(run_descriptor, relative_directory)
-            if receipt is None:
-                if identity.get("evidence_receipt_version") == EVIDENCE_RECEIPT_VERSION:
-                    return None
-            with self._open_observation_evidence(
+            return self._observe_sealed_evidence_result_at(
                 run_descriptor,
+                identity,
                 relative_directory,
-                missing_ok=receipt is None,
-            ) as evidence_descriptors:
-                if evidence_descriptors is None:
-                    return None
-                evidence_descriptor, _ = evidence_descriptors
-                directory = Path(f"/proc/self/fd/{evidence_descriptor}")
-                manifest_path = directory / "manifest.json"
-                if manifest_path.is_symlink() or (
-                    manifest_path.exists() and not manifest_path.is_file()
-                ):
-                    raise EvidenceTampered("evidence manifest is invalid")
-                if not manifest_path.is_file():
-                    if receipt is None:
-                        return None
-                    raise EvidenceTampered("evidence manifest is missing or invalid")
-                verified = self._verify_evidence_directory(
-                    directory,
-                    relative_directory,
-                    payload_capture="result",
+            )
+
+    @contextmanager
+    def retrospective_observation(
+        self, run_id: str
+    ) -> Iterator[tuple[list[dict[str, Any]], Callable[[str], Any | None]]]:
+        """Hold one validated Run while observing its retrospective episodes."""
+        with self._open_observation_run(run_id) as run_descriptor:
+            identity = self._identity_at(run_descriptor, run_id)
+            events, _ = self._read_events_at(run_descriptor, run_id)
+
+            def observe(relative_directory: str) -> Any | None:
+                return self._observe_sealed_evidence_result_at(
+                    run_descriptor,
+                    identity,
+                    _canonical_evidence_relative(relative_directory),
                 )
-                if (
-                    receipt is not None
-                    and receipt["manifest_sha256"] != verified.manifest_digest
-                ):
-                    raise EvidenceTampered(
-                        "evidence receipt does not match its manifest"
-                    )
-                return _read_evidence_result_bytes(verified.result_bytes)
+
+            yield events, observe
+
+    def _observe_sealed_evidence_result_at(
+        self,
+        run_descriptor: int,
+        identity: dict[str, Any],
+        relative_directory: str,
+    ) -> Any | None:
+        receipt = self._read_evidence_receipt_at(run_descriptor, relative_directory)
+        if (
+            receipt is None
+            and identity.get("evidence_receipt_version") == EVIDENCE_RECEIPT_VERSION
+        ):
+            return None
+        with self._open_observation_evidence(
+            run_descriptor,
+            relative_directory,
+            missing_ok=receipt is None,
+        ) as evidence_descriptors:
+            if evidence_descriptors is None:
+                return None
+            evidence_descriptor, _ = evidence_descriptors
+            directory = Path(f"/proc/self/fd/{evidence_descriptor}")
+            manifest_path = directory / "manifest.json"
+            if manifest_path.is_symlink() or (
+                manifest_path.exists() and not manifest_path.is_file()
+            ):
+                raise EvidenceTampered("evidence manifest is invalid")
+            if not manifest_path.is_file():
+                if receipt is None:
+                    return None
+                raise EvidenceTampered("evidence manifest is missing or invalid")
+            verified = self._verify_evidence_directory(
+                directory,
+                relative_directory,
+                payload_capture="result",
+            )
+            if (
+                receipt is not None
+                and receipt["manifest_sha256"] != verified.manifest_digest
+            ):
+                raise EvidenceTampered("evidence receipt does not match its manifest")
+            return _read_evidence_result_bytes(verified.result_bytes)
 
     def sealed_evidence_payloads(
         self, run_id: str, relative_directory: str
@@ -1548,6 +1578,36 @@ class RunStore:
             payload = path.read_bytes()
         except FileNotFoundError as exc:
             raise RunNotFound(f"Run not found: {run_id}") from exc
+        return self._parse_event_history(payload, require_complete=require_complete)
+
+    def _read_events_at(
+        self,
+        run_descriptor: int,
+        run_id: str,
+        *,
+        require_complete: bool = False,
+    ) -> tuple[list[dict[str, Any]], int]:
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open("events.jsonl", flags, dir_fd=run_descriptor)
+        except FileNotFoundError as exc:
+            raise RunNotFound(f"Run not found: {run_id}") from exc
+        except OSError as exc:
+            raise EventHistoryCorrupt("Event History is invalid") from exc
+        try:
+            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                raise EventHistoryCorrupt("Event History is invalid")
+            with os.fdopen(os.dup(descriptor), "rb") as stream:
+                payload = stream.read()
+        except OSError as exc:
+            raise EventHistoryCorrupt("Event History is invalid") from exc
+        finally:
+            os.close(descriptor)
+        return self._parse_event_history(payload, require_complete=require_complete)
+
+    def _parse_event_history(
+        self, payload: bytes, *, require_complete: bool
+    ) -> tuple[list[dict[str, Any]], int]:
         complete_bytes = payload.rfind(b"\n") + 1
         if require_complete and complete_bytes != len(payload):
             raise EventHistoryCorrupt("Event History has an incomplete trailing record")

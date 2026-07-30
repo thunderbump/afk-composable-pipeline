@@ -2,6 +2,7 @@ import fcntl
 import hashlib
 import json
 import os
+import shutil
 import stat
 import subprocess
 import sys
@@ -34,6 +35,7 @@ from afk.run_store import (  # noqa: E402
     RunStoreError,
 )
 from afk.retrospective_contract import INVENTORY_KEY  # noqa: E402
+from afk.retrospective_status import build_retrospective_status  # noqa: E402
 from afk.start import resume_run  # noqa: E402
 
 
@@ -1703,6 +1705,114 @@ class RunStoreTest(unittest.TestCase):
         self.assertEqual(readable.returncode, 0, readable.stderr)
         self.assertIn("run-001", readable.stdout)
         self.assertIn("created", readable.stdout)
+
+    def test_retrospective_status_rejects_a_symlinked_run_without_episodes(self):
+        self.create_run()
+        selected_run = self.root / "runs" / "run-001"
+        external_run = self.state_home / "external-run"
+        selected_run.rename(external_run)
+        selected_run.symlink_to(external_run, target_is_directory=True)
+        before = {
+            path.relative_to(external_run).as_posix()
+            or ".": (
+                path.read_bytes() if path.is_file() else None,
+                stat.S_IMODE(path.stat().st_mode),
+            )
+            for path in [external_run, *external_run.rglob("*")]
+        }
+
+        with self.assertRaisesRegex(EvidenceError, "evidence path is invalid"):
+            build_retrospective_status(self.store, "run-001")
+
+        after = {
+            path.relative_to(external_run).as_posix()
+            or ".": (
+                path.read_bytes() if path.is_file() else None,
+                stat.S_IMODE(path.stat().st_mode),
+            )
+            for path in [external_run, *external_run.rglob("*")]
+        }
+        self.assertEqual(after, before)
+
+    def test_retrospective_status_keeps_one_run_open_across_events_and_evidence(self):
+        self.create_run()
+        projection = self.store.record_attention_episode(
+            "run-001",
+            checkpoint="created",
+            attention={
+                "scope": "worker_launch",
+                "kind": "unavailable",
+                "summary": "worker launch unavailable",
+            },
+        )
+        episode = projection["attention_episode"]
+        outcome = {
+            "schema_version": 1,
+            "run_id": "run-001",
+            "episode_sequence": episode["episode_sequence"],
+            "status": "unavailable",
+            "warning": True,
+            "process_findings_count": 0,
+            "improvement_proposals_count": 0,
+            "warning_summary": "analysis unavailable",
+        }
+        self.store.reconcile_evidence_result(
+            "run-001",
+            episode["evidence"],
+            outcome,
+        )
+        selected_run = self.root / "runs" / "run-001"
+        replacement_run = self.root / "runs" / "replacement"
+        detached_run = self.root / "runs" / "detached"
+        shutil.copytree(selected_run, replacement_run)
+        replacement_evidence = replacement_run / episode["evidence"]
+        replacement_evidence.chmod(0o700)
+        shutil.rmtree(replacement_evidence)
+        original_read_events_at = self.store._read_events_at
+        after_swap = {}
+
+        def swap_after_events(run_descriptor, run_id, *, require_complete=False):
+            observed = original_read_events_at(
+                run_descriptor,
+                run_id,
+                require_complete=require_complete,
+            )
+            selected_run.rename(detached_run)
+            replacement_run.rename(selected_run)
+            after_swap.update(
+                {
+                    f"{root.name}/{path.relative_to(root).as_posix() or '.'}": (
+                        path.read_bytes() if path.is_file() else None,
+                        stat.S_IMODE(path.stat().st_mode),
+                    )
+                    for root in (selected_run, detached_run)
+                    for path in (root, *root.rglob("*"))
+                }
+            )
+            return observed
+
+        with patch.object(
+            self.store,
+            "_read_events_at",
+            side_effect=swap_after_events,
+        ):
+            retrospective = build_retrospective_status(self.store, "run-001")
+
+        self.assertEqual(retrospective["status"], "unavailable")
+        self.assertEqual(
+            retrospective["episode_counts"],
+            {"total": 1, "sealed": 1, "warning": 1, "absent": 0},
+        )
+        self.assertEqual(retrospective["evidence_paths"], [episode["evidence"]])
+        observed_after = {
+            f"{root.name}/{path.relative_to(root).as_posix() or '.'}": (
+                path.read_bytes() if path.is_file() else None,
+                stat.S_IMODE(path.stat().st_mode),
+            )
+            for root in (selected_run, detached_run)
+            for path in (root, *root.rglob("*"))
+        }
+        self.assertEqual(observed_after, after_swap)
 
 
 if __name__ == "__main__":
