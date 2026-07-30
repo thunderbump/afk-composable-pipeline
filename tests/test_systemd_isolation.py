@@ -146,6 +146,23 @@ class SystemdIsolationTest(unittest.TestCase):
                 exact_child_identity_exists(),
                 "detached retrospective descendant survived the AFK unit stop",
             )
+            status = start_cli_tests.RunStore(fixture.state_home / "afk").status(run_id)
+            self.assertEqual(status["state"], "attention_required")
+            self.assertEqual(status["last_event"], "lifecycle.signal_interrupted")
+            self.assertEqual(
+                status["lifecycle_interruption"],
+                {
+                    "schema_version": 1,
+                    "status": "interrupted",
+                    "signal": "SIGTERM",
+                },
+            )
+            self.assertEqual(status["attention"]["scope"], "lifecycle")
+            self.assertEqual(status["attention"]["kind"], "interrupted")
+            self.assertEqual(
+                status["attention"]["summary"],
+                "AFK lifecycle received SIGTERM",
+            )
             self.assertFalse(mutation.exists())
         finally:
             if unit is not None:
