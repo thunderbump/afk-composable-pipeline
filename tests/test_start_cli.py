@@ -63,11 +63,62 @@ CRASH_INJECTION_OVERRIDES = (
     "AFK_TEST_KILL_AFTER_COMPLETION_FINALIZATION",
 )
 RETROSPECTIVE_OUTCOME_CASES = (
-    ("populated", "passed", False, 1, 1),
-    ("empty", "empty", False, 0, 0),
-    ("invalid", "invalid", True, 0, 0),
-    ("unavailable", "unavailable", True, 0, 0),
-    ("interrupted", "interrupted", True, 0, 0),
+    (
+        "populated",
+        {
+            "schema_version": 1,
+            "status": "passed",
+            "warning": False,
+            "process_findings_count": 1,
+            "improvement_proposals_count": 1,
+        },
+    ),
+    (
+        "empty",
+        {
+            "schema_version": 1,
+            "status": "empty",
+            "warning": False,
+            "process_findings_count": 0,
+            "improvement_proposals_count": 0,
+        },
+    ),
+    (
+        "invalid",
+        {
+            "schema_version": 1,
+            "status": "invalid",
+            "warning": True,
+            "process_findings_count": 0,
+            "improvement_proposals_count": 0,
+            "warning_summary": (
+                "Expecting property name enclosed in double quotes: "
+                "line 1 column 2 (char 1)"
+            ),
+        },
+    ),
+    (
+        "unavailable",
+        {
+            "schema_version": 1,
+            "status": "unavailable",
+            "warning": True,
+            "process_findings_count": 0,
+            "improvement_proposals_count": 0,
+            "warning_summary": "analysis process exited 7",
+        },
+    ),
+    (
+        "interrupted",
+        {
+            "schema_version": 1,
+            "status": "interrupted",
+            "warning": True,
+            "process_findings_count": 0,
+            "improvement_proposals_count": 0,
+            "warning_summary": ("retrospective analysis exited after signal SIGKILL"),
+        },
+    ),
 )
 
 
@@ -300,17 +351,17 @@ class StartCliTest(unittest.TestCase):
         run_id,
         episode,
         *,
-        expected_status,
-        warning,
-        findings,
-        proposals,
+        expected,
     ):
         outcome = store.sealed_evidence_result(run_id, episode["evidence"])
-        self.assertEqual(outcome["status"], expected_status)
-        self.assertEqual(outcome["warning"], warning)
-        self.assertEqual(outcome["process_findings_count"], findings)
-        self.assertEqual(outcome["improvement_proposals_count"], proposals)
-        self.assertEqual(outcome["episode_sequence"], episode["episode_sequence"])
+        self.assertEqual(
+            outcome,
+            {
+                **expected,
+                "run_id": run_id,
+                "episode_sequence": episode["episode_sequence"],
+            },
+        )
         self.assertTrue(store.verify_evidence(run_id, episode["evidence"]))
         return outcome
 
@@ -5193,13 +5244,7 @@ class StartCliTest(unittest.TestCase):
 
     def test_completion_retrospective_outcomes_remain_advisory_and_exact(self):
         control = self.fake_bin / ".fake-retrospective-mode"
-        for (
-            mode,
-            expected_status,
-            warning,
-            findings,
-            proposals,
-        ) in RETROSPECTIVE_OUTCOME_CASES:
+        for mode, expected in RETROSPECTIVE_OUTCOME_CASES:
             with self.subTest(mode=mode):
                 state_home = self.temp / f"completion-{mode}"
                 home = self.temp / f"completion-{mode}-home"
@@ -5232,10 +5277,7 @@ class StartCliTest(unittest.TestCase):
                     store,
                     run_id,
                     episode,
-                    expected_status=expected_status,
-                    warning=warning,
-                    findings=findings,
-                    proposals=proposals,
+                    expected=expected,
                 )
                 run_dir = state_home / "afk" / "runs" / run_id
                 events = (run_dir / "events.jsonl").read_bytes()
@@ -5266,7 +5308,7 @@ class StartCliTest(unittest.TestCase):
                 )
                 self.assertEqual(
                     retrospective["latest"]["status"],
-                    expected_status,
+                    expected["status"],
                 )
                 self.assertEqual(store.status(run_id), before)
                 self.assertEqual((run_dir / "events.jsonl").read_bytes(), events)
@@ -11401,13 +11443,7 @@ class StartCliTest(unittest.TestCase):
 
     def test_attention_retrospective_outcomes_remain_advisory_and_exact(self):
         control = self.fake_bin / ".fake-retrospective-mode"
-        for (
-            mode,
-            expected_status,
-            warning,
-            findings,
-            proposals,
-        ) in RETROSPECTIVE_OUTCOME_CASES:
+        for mode, expected in RETROSPECTIVE_OUTCOME_CASES:
             with self.subTest(mode=mode):
                 state_home = self.temp / f"attention-{mode}"
                 project_before = {
@@ -11432,10 +11468,7 @@ class StartCliTest(unittest.TestCase):
                     store,
                     before["run_id"],
                     episode,
-                    expected_status=expected_status,
-                    warning=warning,
-                    findings=findings,
-                    proposals=proposals,
+                    expected=expected,
                 )
                 manifest = (
                     state_home
@@ -11467,7 +11500,7 @@ class StartCliTest(unittest.TestCase):
                 )
                 self.assertEqual(
                     retrospective["latest"]["status"],
-                    expected_status,
+                    expected["status"],
                 )
                 self.assertEqual(store.status(before["run_id"]), before)
                 self.assertEqual(
