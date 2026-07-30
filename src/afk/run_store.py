@@ -537,8 +537,10 @@ class RunStore:
 
     def event_history(self, run_id: str) -> list[dict[str, Any]]:
         """Return the complete validated Event History without mutating the Run."""
-        events, _ = self._read_events(run_id)
-        return events
+        with self._open_observation_run(run_id) as run_descriptor:
+            self._identity_at(run_descriptor, run_id)
+            events, _ = self._read_events_at(run_descriptor, run_id)
+            return events
 
     def read_run_snapshot(
         self, run_id: str, *, through_sequence: int

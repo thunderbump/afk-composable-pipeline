@@ -1734,6 +1734,16 @@ class RunStoreTest(unittest.TestCase):
         }
         self.assertEqual(after, before)
 
+    def test_event_history_rejects_a_symlinked_selected_run(self):
+        self.create_run()
+        selected_run = self.root / "runs" / "run-001"
+        external_run = self.state_home / "external-run"
+        selected_run.rename(external_run)
+        selected_run.symlink_to(external_run, target_is_directory=True)
+
+        with self.assertRaisesRegex(EvidenceError, "evidence path is invalid"):
+            self.store.event_history("run-001")
+
     def test_retrospective_status_keeps_one_run_open_across_events_and_evidence(self):
         self.create_run()
         projection = self.store.record_attention_episode(
