@@ -11540,17 +11540,15 @@ class StartCliTest(unittest.TestCase):
                 )
                 self.assertFalse((state_home / "fake-mutations.jsonl").exists())
 
-    def test_one_run_retains_attention_and_completion_retrospectives_without_mutation(
-        self,
-    ):
+    def test_one_run_retains_advisory_retrospectives_without_command_mutations(self):
         self.install_retrospective_analyzer()
         control = self.fake_bin / ".fake-retrospective-mode"
         observer = self.fake_bin / ".fake-retrospective-observer.json"
-        observer_log = self.temp / "retrospective-mutations.jsonl"
+        command_mutation_log = self.temp / "retrospective-command-mutations.jsonl"
         invocation_log = self.temp / "retrospective-invocations.jsonl"
-        canary_root = self.temp / "retrospective-external-state"
-        canary_root.mkdir()
-        canaries = {}
+        command_canary_root = self.temp / "retrospective-command-canaries"
+        command_canary_root.mkdir()
+        command_canaries = {}
         for mutation_class in (
             "code",
             "pr",
@@ -11561,26 +11559,26 @@ class StartCliTest(unittest.TestCase):
             "analytics",
             "network",
         ):
-            canary = canary_root / f"{mutation_class}.json"
+            canary = command_canary_root / f"{mutation_class}.json"
             canary.write_text('{"revision":0}\n', encoding="utf-8")
-            canaries[mutation_class] = canary
+            command_canaries[mutation_class] = canary
         observer.write_text(
             json.dumps(
                 {
                     "lifecycle_home": str(self.home),
-                    "mutation_log": str(observer_log),
+                    "command_mutation_log": str(command_mutation_log),
                     "invocation_log": str(invocation_log),
-                    "canaries": {
+                    "command_canaries": {
                         mutation_class: str(canary)
-                        for mutation_class, canary in canaries.items()
+                        for mutation_class, canary in command_canaries.items()
                     },
                 }
             ),
             encoding="utf-8",
         )
-        canaries_before = {
+        command_canaries_before = {
             mutation_class: canary.read_bytes()
-            for mutation_class, canary in canaries.items()
+            for mutation_class, canary in command_canaries.items()
         }
         project_before = {
             path.relative_to(self.project): path.read_bytes()
@@ -11670,6 +11668,23 @@ class StartCliTest(unittest.TestCase):
         completion_manifest = (
             run_dir / completion_episode["evidence"] / "manifest.json"
         ).read_bytes()
+        expected_command_policy = {
+            "control_plane_network": "model-api-only",
+            "filesystem": "minimal-read",
+            "interactive": False,
+            "network": "disabled",
+            "permission_profile": "retrospective-analysis",
+            "runtime_home": "isolated",
+            "session": "fresh",
+        }
+        for episode in (attention_episode, completion_episode):
+            command = json.loads(
+                store.sealed_evidence_payloads(
+                    run_id,
+                    episode["evidence"],
+                )["command.json"]
+            )
+            self.assertEqual(command["policy"], expected_command_policy)
         self.assertEqual(completed["state"], "completed")
         structured_completed = json.loads(
             self.run_afk("status", run_id, "--json").stdout
@@ -11812,11 +11827,11 @@ class StartCliTest(unittest.TestCase):
         self.assertEqual(
             {
                 mutation_class: canary.read_bytes()
-                for mutation_class, canary in canaries.items()
+                for mutation_class, canary in command_canaries.items()
             },
-            canaries_before,
+            command_canaries_before,
         )
-        self.assertFalse(observer_log.exists())
+        self.assertFalse(command_mutation_log.exists())
         self.assertEqual(
             {
                 path.relative_to(self.project): path.read_bytes()
@@ -12328,7 +12343,9 @@ class StartCliTest(unittest.TestCase):
                             "analytics": "analytics",
                         }.get(command)
                         if mutation_class is not None:
-                            canary = Path(observer["canaries"][mutation_class])
+                            canary = Path(
+                                observer["command_canaries"][mutation_class]
+                            )
                             state = json.loads(canary.read_text(encoding="utf-8"))
                             state["revision"] += 1
                             state["last_command"] = command
@@ -12336,7 +12353,7 @@ class StartCliTest(unittest.TestCase):
                                 json.dumps(state, sort_keys=True) + "\\n",
                                 encoding="utf-8",
                             )
-                            with Path(observer["mutation_log"]).open(
+                            with Path(observer["command_mutation_log"]).open(
                                 "a", encoding="utf-8"
                             ) as stream:
                                 stream.write(json.dumps({
