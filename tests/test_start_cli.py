@@ -9204,7 +9204,7 @@ class StartCliTest(unittest.TestCase):
         original_chmod = Path.chmod
 
         def pause_before_root_read_only(path, mode, *args, **kwargs):
-            if path == evidence and mode == 0o500:
+            if path.resolve() == evidence.resolve() and mode == 0o500:
                 manifest_published.set()
                 finish_seal.wait(timeout=5)
             return original_chmod(path, mode, *args, **kwargs)
@@ -9232,6 +9232,18 @@ class StartCliTest(unittest.TestCase):
                 }
 
             before = snapshot()
+            self.assertEqual(stat.S_IMODE(evidence.stat().st_mode), 0o700)
+            self.assertEqual(
+                stat.S_IMODE((evidence / "result.json").stat().st_mode),
+                0o400,
+            )
+            self.assertEqual(
+                stat.S_IMODE((evidence / "manifest.json").stat().st_mode),
+                0o400,
+            )
+            self.assertFalse(
+                (store_root / "runs" / run_id / ".evidence-receipts").exists()
+            )
             status = self.run_afk("status", run_id, "--json")
             report = self.run_afk("report", run_id)
             after = snapshot()
