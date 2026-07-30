@@ -1674,13 +1674,14 @@ class RunStore:
         schema_version = (
             identity.get("schema_version") if isinstance(identity, dict) else None
         )
-        valid_format = (
-            schema_version == SCHEMA_VERSION and set(identity) == legacy_keys
-        ) or (
-            schema_version == RUN_IDENTITY_SCHEMA_VERSION
-            and set(identity) == receipt_keys
-            and type(identity.get("evidence_receipt_version")) is int
-            and identity["evidence_receipt_version"] == EVIDENCE_RECEIPT_VERSION
+        valid_format = type(schema_version) is int and (
+            (schema_version == SCHEMA_VERSION and set(identity) == legacy_keys)
+            or (
+                schema_version == RUN_IDENTITY_SCHEMA_VERSION
+                and set(identity) == receipt_keys
+                and type(identity.get("evidence_receipt_version")) is int
+                and identity["evidence_receipt_version"] == EVIDENCE_RECEIPT_VERSION
+            )
         )
         if (
             not valid_format

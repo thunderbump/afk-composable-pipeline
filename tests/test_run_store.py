@@ -123,6 +123,41 @@ class RunStoreTest(unittest.TestCase):
                 ):
                     self.store.identity("run-001")
 
+    def test_run_identity_schema_version_requires_an_exact_integer(self):
+        self.create_run()
+        identity_path = self.root / "runs" / "run-001" / "run.json"
+        current = json.loads(identity_path.read_text(encoding="utf-8"))
+        legacy = dict(current)
+        legacy.pop("evidence_receipt_version")
+
+        for identity, schema_version in (
+            (legacy, True),
+            (legacy, 1.0),
+            (current, True),
+            (current, 2.0),
+        ):
+            with self.subTest(
+                format=(
+                    "current" if "evidence_receipt_version" in identity else "legacy"
+                ),
+                schema_version=schema_version,
+            ):
+                identity_path.write_text(
+                    json.dumps(
+                        {**identity, "schema_version": schema_version},
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+
+                with self.assertRaisesRegex(
+                    EventHistoryCorrupt,
+                    "Run identity is invalid: run-001",
+                ):
+                    self.store.identity("run-001")
+
     def test_status_replays_stale_projection_and_ignores_torn_event_tail(self):
         self.create_run()
         self.store.append_event(
