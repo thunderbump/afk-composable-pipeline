@@ -1275,6 +1275,36 @@ class RunStoreTest(unittest.TestCase):
             substituted,
         )
 
+    def test_sealed_payloads_return_the_auxiliary_snapshot_verified_by_the_manifest(
+        self,
+    ):
+        self.create_run()
+        unit = "gates/completion"
+        self.store.write_evidence_value(
+            "run-001", f"{unit}/result.json", {"status": "verified"}
+        )
+        self.store.write_evidence_text("run-001", f"{unit}/extra.txt", "verified\n")
+        self.store.seal_evidence("run-001", unit)
+        extra_path = self.root / "runs" / "run-001" / unit / "extra.txt"
+        verify_or_finish_seal = self.store._verify_or_finish_seal
+
+        def substitute_auxiliary_after_verification(run_id, relative_directory):
+            verified = verify_or_finish_seal(run_id, relative_directory)
+            extra_path.chmod(0o600)
+            extra_path.write_text("substituted\n", encoding="utf-8")
+            extra_path.chmod(0o400)
+            return verified
+
+        with patch.object(
+            self.store,
+            "_verify_or_finish_seal",
+            side_effect=substitute_auxiliary_after_verification,
+        ):
+            payloads = self.store.sealed_evidence_payloads("run-001", unit)
+
+        self.assertEqual(payloads["extra.txt"], "verified\n")
+        self.assertEqual(extra_path.read_text(encoding="utf-8"), "substituted\n")
+
     def test_observation_rejects_a_symlinked_run_without_reading_external_evidence(
         self,
     ):

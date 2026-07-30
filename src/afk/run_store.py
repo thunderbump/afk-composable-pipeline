@@ -88,7 +88,11 @@ class ResumePreflightInvalid(EventHistoryCorrupt):
 
 class _VerifiedEvidence(NamedTuple):
     manifest_digest: str
-    result_bytes: bytes | None
+    payload_bytes: dict[str, bytes]
+
+    @property
+    def result_bytes(self) -> bytes | None:
+        return self.payload_bytes.get("result.json")
 
 
 def default_state_root() -> Path:
@@ -766,7 +770,7 @@ class RunStore:
         expected = _validate_manifest(manifest)
         try:
             files = _evidence_files(directory)
-            observed, result_bytes = _manifest_snapshot(
+            observed, payload_bytes = _manifest_snapshot(
                 directory, files, _tree_limit(relative_directory)
             )
         except EvidenceError as exc:
@@ -783,7 +787,7 @@ class RunStore:
         for path in [*files, manifest_path, *directories]:
             if stat.S_IMODE(path.stat().st_mode) & 0o222:
                 raise EvidenceTampered("sealed evidence is writable")
-        return _VerifiedEvidence(_canonical_sha256(manifest), result_bytes)
+        return _VerifiedEvidence(_canonical_sha256(manifest), payload_bytes)
 
     def reconcile_evidence_result(
         self, run_id: str, relative_directory: str, value: Any
@@ -995,14 +999,12 @@ class RunStore:
     ) -> dict[str, str]:
         """Return every verified UTF-8 payload from one sealed evidence unit."""
         with self.lock():
-            directory = self._evidence_path(run_id, relative_directory)
-            self._verify_or_finish_seal(run_id, relative_directory)
+            verified = self._verify_or_finish_seal(run_id, relative_directory)
             payloads = {}
-            for path in _evidence_files(directory):
-                relative = path.relative_to(directory).as_posix()
+            for relative, payload in verified.payload_bytes.items():
                 try:
-                    payloads[relative] = path.read_text(encoding="utf-8")
-                except (OSError, UnicodeDecodeError) as exc:
+                    payloads[relative] = payload.decode("utf-8")
+                except UnicodeDecodeError as exc:
                     raise EvidenceTampered(
                         "sealed evidence payload is invalid"
                     ) from exc
@@ -2541,10 +2543,10 @@ def _manifest_entries(
 
 def _manifest_snapshot(
     directory: Path, files: list[Path], byte_limit: int
-) -> tuple[list[dict[str, Any]], bytes | None]:
+) -> tuple[list[dict[str, Any]], dict[str, bytes]]:
     _validate_evidence_sizes(files, byte_limit)
     entries = []
-    result_bytes = None
+    payload_bytes = {}
     for path in files:
         size = path.stat().st_size
         try:
@@ -2557,8 +2559,7 @@ def _manifest_snapshot(
                 "evidence must cross the redaction boundary before sealing"
             )
         relative = path.relative_to(directory).as_posix()
-        if relative == "result.json":
-            result_bytes = payload
+        payload_bytes[relative] = payload
         entries.append(
             {
                 "path": relative,
@@ -2566,7 +2567,7 @@ def _manifest_snapshot(
                 "sha256": hashlib.sha256(payload).hexdigest(),
             }
         )
-    return entries, result_bytes
+    return entries, payload_bytes
 
 
 def _validate_evidence_sizes(files: list[Path], byte_limit: int) -> None:
