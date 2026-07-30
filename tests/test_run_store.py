@@ -16,6 +16,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+import afk.run_store as run_store_module  # noqa: E402
 from afk.bead_spec import (  # noqa: E402
     BEAD_SPEC_ARTIFACT,
     BEAD_SPEC_EVIDENCE,
@@ -1745,6 +1746,102 @@ class RunStoreTest(unittest.TestCase):
 
                 if expected is not None:
                     self.assertEqual(observed, expected)
+                self.assertTrue(swapped)
+                after = {
+                    path.relative_to(external).as_posix()
+                    or ".": (
+                        path.read_bytes() if path.is_file() else None,
+                        stat.S_IMODE(path.stat().st_mode),
+                    )
+                    for path in [external, *external.rglob("*")]
+                }
+                self.assertEqual(after, before)
+
+    def test_recursive_evidence_operations_hold_nested_entries_after_discovery(self):
+        cases = {
+            "seal": (
+                False,
+                lambda store: store.seal_evidence("run-001", "attempts/open"),
+                EvidenceTampered,
+            ),
+            "verify": (
+                True,
+                lambda store: store.verify_evidence("run-001", "attempts/open"),
+                EvidenceTampered,
+            ),
+            "sealed payloads": (
+                True,
+                lambda store: store.sealed_evidence_payloads(
+                    "run-001", "attempts/open"
+                ),
+                EvidenceTampered,
+            ),
+            "partial files": (
+                False,
+                lambda store: store.partial_evidence_files("run-001", "attempts/open"),
+                ("nested/input.txt",),
+            ),
+        }
+        for index, (name, (sealed, action, expected)) in enumerate(
+            cases.items(), start=1
+        ):
+            with self.subTest(api=name):
+                root = self.state_home / f"afk-nested-swap-{index}"
+                store = RunStore(root)
+                store.create_run(
+                    bead_id="central-bhap.8.6",
+                    repository="https://example.invalid/acme/beads-webui.git",
+                    base_branch="main",
+                    base_sha=BASE_SHA,
+                    start_request={},
+                    run_id="run-001",
+                )
+                store.write_evidence_text(
+                    "run-001",
+                    "attempts/open/nested/input.txt",
+                    "selected\n",
+                )
+                if sealed:
+                    store.seal_evidence("run-001", "attempts/open")
+                unit = root / "runs" / "run-001" / "attempts" / "open"
+                if sealed:
+                    unit.chmod(0o700)
+                nested = unit / "nested"
+                detached = unit / "detached"
+                external = self.state_home / f"nested-external-{index}"
+                external.mkdir()
+                (external / "input.txt").write_text("external\n", encoding="utf-8")
+                before = {
+                    path.relative_to(external).as_posix()
+                    or ".": (
+                        path.read_bytes() if path.is_file() else None,
+                        stat.S_IMODE(path.stat().st_mode),
+                    )
+                    for path in [external, *external.rglob("*")]
+                }
+                original_open_tree = run_store_module._open_evidence_tree
+                swapped = False
+
+                @contextmanager
+                def swap_after_discovery(directory):
+                    nonlocal swapped
+                    with original_open_tree(directory) as tree:
+                        if not swapped:
+                            swapped = True
+                            nested.rename(detached)
+                            nested.symlink_to(external, target_is_directory=True)
+                        yield tree
+
+                with patch(
+                    "afk.run_store._open_evidence_tree",
+                    new=swap_after_discovery,
+                ):
+                    if isinstance(expected, type) and issubclass(expected, Exception):
+                        with self.assertRaises(expected):
+                            action(store)
+                    else:
+                        self.assertEqual(action(store), expected)
+
                 self.assertTrue(swapped)
                 after = {
                     path.relative_to(external).as_posix()

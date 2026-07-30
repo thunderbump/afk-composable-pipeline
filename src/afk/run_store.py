@@ -95,6 +95,16 @@ class _VerifiedEvidence(NamedTuple):
         return self.payload_bytes.get("result.json")
 
 
+class _OpenEvidenceEntry(NamedTuple):
+    path: str
+    descriptor: int
+
+
+class _OpenEvidenceTree(NamedTuple):
+    files: tuple[_OpenEvidenceEntry, ...]
+    directories: tuple[_OpenEvidenceEntry, ...]
+
+
 def default_state_root() -> Path:
     state_home = os.environ.get("XDG_STATE_HOME")
     if state_home:
@@ -754,26 +764,27 @@ class RunStore:
                 manifest_path = directory / "manifest.json"
                 if manifest_path.exists() or manifest_path.is_symlink():
                     raise EvidenceError("evidence is already sealed")
-                files = _evidence_files(directory)
-                limit = _tree_limit(relative_directory)
-                _validate_evidence_sizes(files, limit)
-                entries = _manifest_entries(directory, files, limit)
-                manifest = {
-                    "schema_version": SCHEMA_VERSION,
-                    "files": entries,
-                    "total_bytes": sum(entry["bytes"] for entry in entries),
-                }
-                for path in files:
-                    path.chmod(0o400)
-                    _fsync_file(path)
-                for path in sorted(
-                    [entry for entry in directory.rglob("*") if entry.is_dir()],
-                    key=lambda item: len(item.parts),
-                    reverse=True,
-                ):
-                    path.chmod(0o500)
-                    _fsync_directory(path)
-                _write_new_json(manifest_path, manifest, self.root, mode=0o400)
+                with _open_evidence_tree(directory) as tree:
+                    limit = _tree_limit(relative_directory)
+                    _validate_evidence_sizes(tree.files, limit)
+                    entries = _manifest_entries(tree.files, limit)
+                    manifest = {
+                        "schema_version": SCHEMA_VERSION,
+                        "files": entries,
+                        "total_bytes": sum(entry["bytes"] for entry in entries),
+                    }
+                    for entry in tree.files:
+                        os.fchmod(entry.descriptor, 0o400)
+                        os.fsync(entry.descriptor)
+                    for entry in reversed(tree.directories):
+                        os.fchmod(entry.descriptor, 0o500)
+                        os.fsync(entry.descriptor)
+                    _write_new_json(
+                        manifest_path,
+                        manifest,
+                        self.root,
+                        mode=0o400,
+                    )
                 os.fchmod(evidence_descriptor, 0o500)
                 os.fsync(evidence_descriptor)
                 os.fsync(parent_descriptor)
@@ -817,23 +828,44 @@ class RunStore:
         payload_capture: Literal["none", "result", "all"],
     ) -> _VerifiedEvidence:
         manifest_path = directory / "manifest.json"
+        manifest_descriptor = -1
+        manifest_mode = 0
         try:
-            if not stat.S_ISREG(manifest_path.lstat().st_mode):
+            manifest_descriptor = os.open(
+                manifest_path,
+                os.O_RDONLY
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+            )
+            manifest_metadata = os.fstat(manifest_descriptor)
+            manifest_mode = stat.S_IMODE(manifest_metadata.st_mode)
+            if not stat.S_ISREG(manifest_metadata.st_mode):
                 raise EvidenceTampered("evidence manifest is invalid")
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            with os.fdopen(os.dup(manifest_descriptor), encoding="utf-8") as stream:
+                manifest = json.load(stream)
         except EvidenceTampered:
             raise
         except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise EvidenceTampered("evidence manifest is missing or invalid") from exc
+        finally:
+            if manifest_descriptor >= 0:
+                os.close(manifest_descriptor)
         expected = _validate_manifest(manifest)
         try:
-            files = _evidence_files(directory)
-            observed, payload_bytes = _manifest_snapshot(
-                directory,
-                files,
-                _tree_limit(relative_directory),
-                payload_capture=payload_capture,
-            )
+            with _open_evidence_tree(directory) as tree:
+                observed, payload_bytes = _manifest_snapshot(
+                    tree.files,
+                    _tree_limit(relative_directory),
+                    payload_capture=payload_capture,
+                )
+                file_modes = [
+                    stat.S_IMODE(os.fstat(entry.descriptor).st_mode)
+                    for entry in tree.files
+                ]
+                directory_modes = [
+                    stat.S_IMODE(os.fstat(entry.descriptor).st_mode)
+                    for entry in tree.directories
+                ]
         except EvidenceError as exc:
             raise EvidenceTampered(str(exc)) from exc
         if observed != expected:
@@ -841,13 +873,14 @@ class RunStore:
         total_bytes = manifest.get("total_bytes")
         if total_bytes != sum(entry["bytes"] for entry in observed):
             raise EvidenceTampered("evidence manifest total is invalid")
-        directories = [
-            directory,
-            *(path for path in directory.rglob("*") if path.is_dir()),
+        modes = [
+            *file_modes,
+            manifest_mode,
+            stat.S_IMODE(directory.stat().st_mode),
+            *directory_modes,
         ]
-        for path in [*files, manifest_path, *directories]:
-            if stat.S_IMODE(path.stat().st_mode) & 0o222:
-                raise EvidenceTampered("sealed evidence is writable")
+        if any(mode & 0o222 for mode in modes):
+            raise EvidenceTampered("sealed evidence is writable")
         return _VerifiedEvidence(_canonical_sha256(manifest), payload_bytes)
 
     def reconcile_evidence_result(
@@ -934,14 +967,12 @@ class RunStore:
         relative_directory: str,
     ) -> _VerifiedEvidence:
         directory = Path(f"/proc/self/fd/{evidence_descriptor}")
-        files = _evidence_files(directory)
-        if [path.relative_to(directory).as_posix() for path in files] != [
-            "result.json"
-        ]:
-            raise EvidenceError("unsealed evidence result is ambiguous")
-        limit = _tree_limit(relative_directory)
-        _validate_evidence_sizes(files, limit)
-        entries = _manifest_entries(directory, files, limit)
+        with _open_evidence_tree(directory) as tree:
+            if [entry.path for entry in tree.files] != ["result.json"]:
+                raise EvidenceError("unsealed evidence result is ambiguous")
+            limit = _tree_limit(relative_directory)
+            _validate_evidence_sizes(tree.files, limit)
+            entries = _manifest_entries(tree.files, limit)
         manifest = {
             "schema_version": SCHEMA_VERSION,
             "files": entries,
@@ -1168,11 +1199,25 @@ class RunStore:
             if str(exc) != "sealed evidence is writable" or receipt is not None:
                 raise
 
-        manifest_path = directory / "manifest.json"
-        files = _evidence_files(directory)
-        nested_directories = [path for path in directory.rglob("*") if path.is_dir()]
-        for path in [*files, manifest_path, *nested_directories]:
-            if stat.S_IMODE(path.stat().st_mode) & 0o222:
+        with _open_evidence_tree(directory) as tree:
+            modes = [
+                *(
+                    stat.S_IMODE(os.fstat(entry.descriptor).st_mode)
+                    for entry in tree.files
+                ),
+                *(
+                    stat.S_IMODE(os.fstat(entry.descriptor).st_mode)
+                    for entry in tree.directories
+                ),
+                stat.S_IMODE(
+                    os.stat(
+                        "manifest.json",
+                        dir_fd=evidence_descriptor,
+                        follow_symlinks=False,
+                    ).st_mode
+                ),
+            ]
+            if any(mode & 0o222 for mode in modes):
                 raise EvidenceTampered("sealed evidence is writable")
         os.fchmod(evidence_descriptor, 0o500)
         os.fsync(evidence_descriptor)
@@ -1556,9 +1601,12 @@ class RunStore:
                 if _entry_exists_at(evidence_descriptor, "manifest.json"):
                     raise EvidenceError("partial evidence contains an invalid manifest")
                 directory = Path(f"/proc/self/fd/{evidence_descriptor}")
-                files = _evidence_files(directory)
-                _validate_evidence_sizes(files, _tree_limit(relative_directory))
-                return tuple(path.relative_to(directory).as_posix() for path in files)
+                with _open_evidence_tree(directory) as tree:
+                    _validate_evidence_sizes(
+                        tree.files,
+                        _tree_limit(relative_directory),
+                    )
+                    return tuple(entry.path for entry in tree.files)
 
     def partial_evidence_value(self, run_id: str, relative_path: str) -> Any:
         """Read one structured value from unsealed evidence."""
@@ -2708,27 +2756,74 @@ def _atomic_bytes(path: Path, payload: bytes) -> None:
         temporary.unlink(missing_ok=True)
 
 
-def _evidence_files(directory: Path) -> list[Path]:
+@contextmanager
+def _open_evidence_tree(directory: Path) -> Iterator[_OpenEvidenceTree]:
+    directory_flags = (
+        os.O_RDONLY
+        | os.O_DIRECTORY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    file_flags = (
+        os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    )
+    root_descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+    descriptors = [root_descriptor]
     files = []
-    root_manifest = directory / "manifest.json"
-    for path in directory.rglob("*"):
-        if path == root_manifest:
-            continue
-        if path.is_symlink():
-            raise EvidenceError("evidence must not contain symlinks")
-        if path.is_dir():
-            continue
-        if not path.is_file():
-            raise EvidenceError("evidence must contain only regular files")
-        files.append(path)
-    return sorted(files, key=lambda path: path.relative_to(directory).as_posix())
+    directories = []
+
+    def walk(parent_descriptor: int, prefix: str) -> None:
+        for name in sorted(os.listdir(parent_descriptor)):
+            relative = f"{prefix}/{name}" if prefix else name
+            if relative == "manifest.json":
+                continue
+            try:
+                metadata = os.stat(
+                    name,
+                    dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+                if stat.S_ISDIR(metadata.st_mode):
+                    descriptor = os.open(
+                        name,
+                        directory_flags,
+                        dir_fd=parent_descriptor,
+                    )
+                    descriptors.append(descriptor)
+                    if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
+                        raise EvidenceError("evidence must contain only regular files")
+                    directories.append(_OpenEvidenceEntry(relative, descriptor))
+                    walk(descriptor, relative)
+                elif stat.S_ISREG(metadata.st_mode):
+                    descriptor = os.open(
+                        name,
+                        file_flags,
+                        dir_fd=parent_descriptor,
+                    )
+                    descriptors.append(descriptor)
+                    if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                        raise EvidenceError("evidence must contain only regular files")
+                    files.append(_OpenEvidenceEntry(relative, descriptor))
+                else:
+                    raise EvidenceError("evidence must contain only regular files")
+            except OSError as exc:
+                raise EvidenceError("evidence must not contain symlinks") from exc
+
+    try:
+        walk(root_descriptor, "")
+        yield _OpenEvidenceTree(
+            tuple(sorted(files, key=lambda entry: entry.path)),
+            tuple(sorted(directories, key=lambda entry: entry.path)),
+        )
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
 
 
 def _manifest_entries(
-    directory: Path, files: list[Path], byte_limit: int
+    files: tuple[_OpenEvidenceEntry, ...], byte_limit: int
 ) -> list[dict[str, Any]]:
     entries, _ = _manifest_snapshot(
-        directory,
         files,
         byte_limit,
         payload_capture="none",
@@ -2737,8 +2832,7 @@ def _manifest_entries(
 
 
 def _manifest_snapshot(
-    directory: Path,
-    files: list[Path],
+    files: tuple[_OpenEvidenceEntry, ...],
     byte_limit: int,
     *,
     payload_capture: Literal["none", "result", "all"],
@@ -2746,18 +2840,19 @@ def _manifest_snapshot(
     _validate_evidence_sizes(files, byte_limit)
     entries = []
     payload_bytes = {}
-    for path in files:
-        size = path.stat().st_size
+    for entry in files:
+        size = os.fstat(entry.descriptor).st_size
         try:
-            payload = path.read_bytes()
+            with os.fdopen(os.dup(entry.descriptor), "rb") as stream:
+                payload = stream.read()
             text = payload.decode("utf-8")
-        except UnicodeDecodeError as exc:
+        except (OSError, UnicodeDecodeError) as exc:
             raise EvidenceError("evidence must be regular UTF-8 text") from exc
         if redact_text(text) != text:
             raise EvidenceError(
                 "evidence must cross the redaction boundary before sealing"
             )
-        relative = path.relative_to(directory).as_posix()
+        relative = entry.path
         if payload_capture == "all" or (
             payload_capture == "result" and relative == "result.json"
         ):
@@ -2772,11 +2867,13 @@ def _manifest_snapshot(
     return entries, payload_bytes
 
 
-def _validate_evidence_sizes(files: list[Path], byte_limit: int) -> None:
+def _validate_evidence_sizes(
+    files: tuple[_OpenEvidenceEntry, ...], byte_limit: int
+) -> None:
     total = 0
-    for path in files:
-        size = path.stat().st_size
-        if _is_stream(path) and size > STREAM_BYTE_LIMIT:
+    for entry in files:
+        size = os.fstat(entry.descriptor).st_size
+        if _is_stream(Path(entry.path)) and size > STREAM_BYTE_LIMIT:
             raise EvidenceTooLarge(f"evidence stream exceeds {STREAM_BYTE_LIMIT} bytes")
         total += size
         if total > byte_limit:
