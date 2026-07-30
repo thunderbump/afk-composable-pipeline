@@ -856,7 +856,7 @@ class RunStore:
             receipt = self._read_evidence_receipt_at(run_descriptor, relative_directory)
             if receipt is None:
                 identity = self._identity_at(run_descriptor, run_id)
-                if identity["schema_version"] == RUN_IDENTITY_SCHEMA_VERSION:
+                if identity.get("evidence_receipt_version") == EVIDENCE_RECEIPT_VERSION:
                     return None
             with self._open_observation_evidence(
                 run_descriptor,
@@ -1677,7 +1677,7 @@ class RunStore:
         valid_format = type(schema_version) is int and (
             (schema_version == SCHEMA_VERSION and set(identity) == legacy_keys)
             or (
-                schema_version == RUN_IDENTITY_SCHEMA_VERSION
+                schema_version in (SCHEMA_VERSION, RUN_IDENTITY_SCHEMA_VERSION)
                 and set(identity) == receipt_keys
                 and type(identity.get("evidence_receipt_version")) is int
                 and identity["evidence_receipt_version"] == EVIDENCE_RECEIPT_VERSION
