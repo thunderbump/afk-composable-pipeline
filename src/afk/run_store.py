@@ -790,30 +790,132 @@ class RunStore:
     ) -> Any:
         """Recover or verify one evidence result, then seal its evidence unit."""
         with self.lock():
-            directory = self._evidence_path(run_id, relative_directory)
-            manifest_path = directory / "manifest.json"
-            result_path = directory / "result.json"
+            relative_directory = _canonical_evidence_relative(relative_directory)
             expected = redact_artifact_value(value)
-            if manifest_path.is_file():
-                verified = self._verify_or_finish_seal(run_id, relative_directory)
-                stored = _read_evidence_result_bytes(verified.result_bytes)
-                if stored != expected:
-                    raise EvidenceError("evidence result contradicts expected value")
-                return stored
+            with self._open_observation_run(run_id) as run_descriptor:
+                self._identity_at(run_descriptor, run_id)
+                with self._open_observation_evidence(
+                    run_descriptor,
+                    relative_directory,
+                    missing_ok=False,
+                    create_missing=True,
+                ) as evidence_descriptors:
+                    if evidence_descriptors is None:
+                        raise EvidenceError(
+                            f"evidence directory does not exist: {relative_directory}"
+                        )
+                    evidence_descriptor, parent_descriptor = evidence_descriptors
+                    try:
+                        manifest_metadata = os.stat(
+                            "manifest.json",
+                            dir_fd=evidence_descriptor,
+                            follow_symlinks=False,
+                        )
+                    except FileNotFoundError:
+                        manifest_metadata = None
+                    if manifest_metadata is not None:
+                        if not stat.S_ISREG(manifest_metadata.st_mode):
+                            raise EvidenceTampered("evidence manifest is invalid")
+                        verified = self._verify_or_finish_seal_at(
+                            run_descriptor,
+                            evidence_descriptor,
+                            parent_descriptor,
+                            relative_directory,
+                        )
+                        stored = _read_evidence_result_bytes(verified.result_bytes)
+                        if stored != expected:
+                            raise EvidenceError(
+                                "evidence result contradicts expected value"
+                            )
+                        return stored
 
-            if directory.exists():
-                entries = {path.name for path in directory.iterdir()}
-                if entries not in (set(), {"result.json"}):
-                    raise EvidenceError("unsealed evidence result is ambiguous")
-            if result_path.is_file():
-                if _read_evidence_result(result_path) != expected:
-                    raise EvidenceError("evidence result contradicts expected value")
-            else:
-                self.write_evidence_value(
-                    run_id, f"{relative_directory}/result.json", expected
-                )
-            self.seal_evidence(run_id, relative_directory)
-            return expected
+                    entries = set(os.listdir(evidence_descriptor))
+                    if entries not in (set(), {"result.json"}):
+                        raise EvidenceError("unsealed evidence result is ambiguous")
+                    if "result.json" in entries:
+                        stored = _read_evidence_result_at(
+                            evidence_descriptor, "result.json"
+                        )
+                        if stored != expected:
+                            raise EvidenceError(
+                                "evidence result contradicts expected value"
+                            )
+                    else:
+                        _write_new_json_at(
+                            evidence_descriptor,
+                            "result.json",
+                            expected,
+                            self.root,
+                        )
+                    verified = self._seal_reconciled_result_at(
+                        run_descriptor,
+                        evidence_descriptor,
+                        parent_descriptor,
+                        relative_directory,
+                    )
+                    stored = _read_evidence_result_bytes(verified.result_bytes)
+                    if stored != expected:
+                        raise EvidenceError(
+                            "evidence result contradicts expected value"
+                        )
+                    return stored
+
+    def _seal_reconciled_result_at(
+        self,
+        run_descriptor: int,
+        evidence_descriptor: int,
+        parent_descriptor: int,
+        relative_directory: str,
+    ) -> _VerifiedEvidence:
+        directory = Path(f"/proc/self/fd/{evidence_descriptor}")
+        files = _evidence_files(directory)
+        if [path.relative_to(directory).as_posix() for path in files] != [
+            "result.json"
+        ]:
+            raise EvidenceError("unsealed evidence result is ambiguous")
+        limit = _tree_limit(relative_directory)
+        _validate_evidence_sizes(files, limit)
+        entries = _manifest_entries(directory, files, limit)
+        manifest = {
+            "schema_version": SCHEMA_VERSION,
+            "files": entries,
+            "total_bytes": sum(entry["bytes"] for entry in entries),
+        }
+        try:
+            result_descriptor = os.open(
+                "result.json",
+                os.O_RDONLY
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=evidence_descriptor,
+            )
+        except OSError as exc:
+            raise EvidenceError("evidence result is missing or malformed") from exc
+        try:
+            metadata = os.fstat(result_descriptor)
+            if not stat.S_ISREG(metadata.st_mode):
+                raise EvidenceError("evidence result is missing or malformed")
+            os.fchmod(result_descriptor, 0o400)
+            os.fsync(result_descriptor)
+        finally:
+            os.close(result_descriptor)
+        _write_new_json_at(
+            evidence_descriptor,
+            "manifest.json",
+            manifest,
+            self.root,
+            mode=0o400,
+        )
+        os.fchmod(evidence_descriptor, 0o500)
+        os.fsync(evidence_descriptor)
+        os.fsync(parent_descriptor)
+        verified = self._verify_evidence_directory(directory, relative_directory)
+        self._publish_evidence_receipt_at(
+            run_descriptor,
+            relative_directory,
+            verified.manifest_digest,
+        )
+        return verified
 
     def sealed_evidence_result(
         self, run_id: str, relative_directory: str
@@ -1254,6 +1356,7 @@ class RunStore:
         relative_directory: str,
         *,
         missing_ok: bool,
+        create_missing: bool = False,
     ) -> Iterator[tuple[int, int] | None]:
         directory_flags = (
             os.O_RDONLY
@@ -1266,7 +1369,21 @@ class RunStore:
         try:
             try:
                 for part in Path(relative_directory).parts:
-                    descriptor = os.open(part, directory_flags, dir_fd=descriptor)
+                    parent_descriptor = descriptor
+                    try:
+                        descriptor = os.open(
+                            part, directory_flags, dir_fd=parent_descriptor
+                        )
+                    except FileNotFoundError:
+                        if not create_missing:
+                            raise
+                        os.mkdir(part, mode=0o700, dir_fd=parent_descriptor)
+                        descriptor = os.open(
+                            part, directory_flags, dir_fd=parent_descriptor
+                        )
+                        os.fchmod(descriptor, 0o700)
+                        os.fsync(descriptor)
+                        os.fsync(parent_descriptor)
                     descriptors.append(descriptor)
             except FileNotFoundError as exc:
                 if missing_ok:
@@ -2293,6 +2410,28 @@ def _read_evidence_result(path: Path) -> Any:
         return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise EvidenceError("evidence result is missing or malformed") from exc
+
+
+def _read_evidence_result_at(directory_descriptor: int, name: str) -> Any:
+    try:
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=directory_descriptor,
+        )
+    except OSError as exc:
+        raise EvidenceError("evidence result is missing or malformed") from exc
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise EvidenceError("evidence result is missing or malformed")
+        with os.fdopen(os.dup(descriptor), "rb") as stream:
+            value = stream.read()
+    except OSError as exc:
+        raise EvidenceError("evidence result is missing or malformed") from exc
+    finally:
+        os.close(descriptor)
+    return _read_evidence_result_bytes(value)
 
 
 def _read_evidence_result_bytes(value: bytes | None) -> Any:
