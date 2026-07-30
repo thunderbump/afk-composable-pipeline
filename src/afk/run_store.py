@@ -655,36 +655,45 @@ class RunStore:
             return confirmed
 
     def write_evidence_text(self, run_id: str, relative_path: str, value: str) -> Path:
+        durable_path = self._run_dir(run_id) / _canonical_evidence_relative(
+            relative_path
+        )
         with self.lock():
-            path = self._evidence_path(run_id, relative_path)
-            run_dir = self._run_dir(run_id)
-            if path == _evidence_unit_root(path, run_dir) / "manifest.json":
-                raise EvidenceError("manifest.json is reserved")
-            if _sealed_ancestor(path, run_dir):
-                raise EvidenceError("completed evidence is read-only")
-            encoded = redact_text(value).encode("utf-8")
-            if _is_stream(path) and len(encoded) > STREAM_BYTE_LIMIT:
-                raise EvidenceTooLarge(
-                    f"evidence stream exceeds {STREAM_BYTE_LIMIT} bytes"
-                )
-            _secure_directory(path.parent)
-            _write_new_bytes(path, encoded, self.root)
-            return path
+            with self._open_evidence_path(run_id, relative_path) as (
+                path,
+                run_dir,
+                _,
+            ):
+                if path == _evidence_unit_root(path, run_dir) / "manifest.json":
+                    raise EvidenceError("manifest.json is reserved")
+                if _sealed_ancestor(path, run_dir):
+                    raise EvidenceError("completed evidence is read-only")
+                encoded = redact_text(value).encode("utf-8")
+                if _is_stream(path) and len(encoded) > STREAM_BYTE_LIMIT:
+                    raise EvidenceTooLarge(
+                        f"evidence stream exceeds {STREAM_BYTE_LIMIT} bytes"
+                    )
+                _secure_directory(path.parent)
+                _write_new_bytes(path, encoded, self.root)
+                return durable_path
 
     def write_evidence_value(self, run_id: str, relative_path: str, value: Any) -> Any:
         """Redact and persist one canonical structured evidence value."""
         with self.lock():
-            path = self._evidence_path(run_id, relative_path)
-            run_dir = self._run_dir(run_id)
-            if path == _evidence_unit_root(path, run_dir) / "manifest.json":
-                raise EvidenceError("manifest.json is reserved")
-            if _sealed_ancestor(path, run_dir):
-                raise EvidenceError("completed evidence is read-only")
-            redacted = redact_artifact_value(value)
-            encoded = (canonical_json(redacted) + "\n").encode("utf-8")
-            _secure_directory(path.parent)
-            _write_new_bytes(path, encoded, self.root)
-            return redacted
+            with self._open_evidence_path(run_id, relative_path) as (
+                path,
+                run_dir,
+                _,
+            ):
+                if path == _evidence_unit_root(path, run_dir) / "manifest.json":
+                    raise EvidenceError("manifest.json is reserved")
+                if _sealed_ancestor(path, run_dir):
+                    raise EvidenceError("completed evidence is read-only")
+                redacted = redact_artifact_value(value)
+                encoded = (canonical_json(redacted) + "\n").encode("utf-8")
+                _secure_directory(path.parent)
+                _write_new_bytes(path, encoded, self.root)
+                return redacted
 
     def ingest_evidence_file(
         self, run_id: str, relative_path: str, source_path: Path
@@ -707,53 +716,61 @@ class RunStore:
 
     def seal_evidence(self, run_id: str, relative_directory: str) -> dict[str, Any]:
         with self.lock():
-            directory, relative_directory = self._evidence_directory_identity(
-                run_id, relative_directory
-            )
-            if not directory.is_dir() or directory.is_symlink():
-                raise EvidenceError(
-                    f"evidence directory does not exist: {relative_directory}"
-                )
-            manifest_path = directory / "manifest.json"
-            if manifest_path.exists() or manifest_path.is_symlink():
-                raise EvidenceError("evidence is already sealed")
-            files = _evidence_files(directory)
-            limit = _tree_limit(relative_directory)
-            _validate_evidence_sizes(files, limit)
-            entries = _manifest_entries(directory, files, limit)
-            manifest = {
-                "schema_version": SCHEMA_VERSION,
-                "files": entries,
-                "total_bytes": sum(entry["bytes"] for entry in entries),
-            }
-            for path in files:
-                path.chmod(0o400)
-                _fsync_file(path)
-            for path in sorted(
-                [entry for entry in directory.rglob("*") if entry.is_dir()],
-                key=lambda item: len(item.parts),
-                reverse=True,
+            relative_directory = _canonical_evidence_relative(relative_directory)
+            with self._open_evidence_path(run_id, relative_directory) as (
+                directory,
+                _,
+                run_descriptor,
             ):
-                path.chmod(0o500)
-                _fsync_directory(path)
-            _write_new_json(manifest_path, manifest, self.root, mode=0o400)
-            directory.chmod(0o500)
-            _fsync_directory(directory)
-            _fsync_directory(directory.parent)
-            manifest_digest = self._verify_evidence_manifest(run_id, relative_directory)
-            self._publish_evidence_receipt(run_id, relative_directory, manifest_digest)
-            return manifest
+                if not directory.is_dir() or directory.is_symlink():
+                    raise EvidenceError(
+                        f"evidence directory does not exist: {relative_directory}"
+                    )
+                manifest_path = directory / "manifest.json"
+                if manifest_path.exists() or manifest_path.is_symlink():
+                    raise EvidenceError("evidence is already sealed")
+                files = _evidence_files(directory)
+                limit = _tree_limit(relative_directory)
+                _validate_evidence_sizes(files, limit)
+                entries = _manifest_entries(directory, files, limit)
+                manifest = {
+                    "schema_version": SCHEMA_VERSION,
+                    "files": entries,
+                    "total_bytes": sum(entry["bytes"] for entry in entries),
+                }
+                for path in files:
+                    path.chmod(0o400)
+                    _fsync_file(path)
+                for path in sorted(
+                    [entry for entry in directory.rglob("*") if entry.is_dir()],
+                    key=lambda item: len(item.parts),
+                    reverse=True,
+                ):
+                    path.chmod(0o500)
+                    _fsync_directory(path)
+                _write_new_json(manifest_path, manifest, self.root, mode=0o400)
+                directory.chmod(0o500)
+                _fsync_directory(directory)
+                _fsync_directory(directory.parent)
+                verified = self._verify_evidence_directory(
+                    directory, relative_directory
+                )
+                self._publish_evidence_receipt_at(
+                    run_descriptor,
+                    relative_directory,
+                    verified.manifest_digest,
+                )
+                return manifest
 
     def verify_evidence(self, run_id: str, relative_directory: str) -> bool:
-        self._verify_evidence_manifest(run_id, relative_directory)
+        relative_directory = _canonical_evidence_relative(relative_directory)
+        with self._open_evidence_path(run_id, relative_directory) as (
+            directory,
+            _,
+            _,
+        ):
+            self._verify_evidence_directory(directory, relative_directory)
         return True
-
-    def _verify_evidence_manifest(self, run_id: str, relative_directory: str) -> str:
-        """Verify sealed evidence and return its canonical manifest digest."""
-        directory = self._evidence_path(run_id, relative_directory)
-        return self._verify_evidence_directory(
-            directory, relative_directory
-        ).manifest_digest
 
     def _verify_evidence_directory(
         self, directory: Path, relative_directory: str
@@ -1013,34 +1030,25 @@ class RunStore:
     def _verify_or_finish_seal(
         self, run_id: str, relative_directory: str
     ) -> _VerifiedEvidence:
-        directory, relative_directory = self._evidence_directory_identity(
-            run_id, relative_directory
-        )
-        receipt = self._read_evidence_receipt(run_id, relative_directory)
-        try:
-            verified = self._verify_evidence_directory(directory, relative_directory)
-            self._publish_evidence_receipt(
-                run_id, relative_directory, verified.manifest_digest
-            )
-            return verified
-        except EvidenceTampered as exc:
-            if str(exc) != "sealed evidence is writable" or receipt is not None:
-                raise
-
-        manifest_path = directory / "manifest.json"
-        files = _evidence_files(directory)
-        nested_directories = [path for path in directory.rglob("*") if path.is_dir()]
-        for path in [*files, manifest_path, *nested_directories]:
-            if stat.S_IMODE(path.stat().st_mode) & 0o222:
-                raise EvidenceTampered("sealed evidence is writable")
-        directory.chmod(0o500)
-        _fsync_directory(directory)
-        _fsync_directory(directory.parent)
-        verified = self._verify_evidence_directory(directory, relative_directory)
-        self._publish_evidence_receipt(
-            run_id, relative_directory, verified.manifest_digest
-        )
-        return verified
+        relative_directory = _canonical_evidence_relative(relative_directory)
+        with self._open_observation_run(run_id) as run_descriptor:
+            self._identity_at(run_descriptor, run_id)
+            with self._open_observation_evidence(
+                run_descriptor,
+                relative_directory,
+                missing_ok=False,
+            ) as evidence_descriptors:
+                if evidence_descriptors is None:
+                    raise EvidenceTampered(
+                        f"evidence directory does not exist: {relative_directory}"
+                    )
+                evidence_descriptor, parent_descriptor = evidence_descriptors
+                return self._verify_or_finish_seal_at(
+                    run_descriptor,
+                    evidence_descriptor,
+                    parent_descriptor,
+                    relative_directory,
+                )
 
     def _verify_or_finish_seal_at(
         self,
@@ -1079,34 +1087,6 @@ class RunStore:
             verified.manifest_digest,
         )
         return verified
-
-    def _evidence_receipt_path(self, run_id: str, relative_directory: str) -> Path:
-        digest = hashlib.sha256(relative_directory.encode("utf-8")).hexdigest()
-        return self._run_dir(run_id) / ".evidence-receipts" / f"{digest}.json"
-
-    def _read_evidence_receipt(
-        self, run_id: str, relative_directory: str
-    ) -> dict[str, Any] | None:
-        receipt = self._evidence_receipt_path(run_id, relative_directory)
-        receipt_directory = receipt.parent
-        try:
-            directory_descriptor = os.open(
-                receipt_directory,
-                os.O_RDONLY
-                | os.O_DIRECTORY
-                | getattr(os, "O_CLOEXEC", 0)
-                | getattr(os, "O_NOFOLLOW", 0),
-            )
-        except FileNotFoundError:
-            return None
-        except OSError as exc:
-            raise EvidenceTampered("evidence receipt is invalid") from exc
-        try:
-            return self._read_evidence_receipt_from_directory(
-                directory_descriptor, receipt.name, relative_directory
-            )
-        finally:
-            os.close(directory_descriptor)
 
     def _read_evidence_receipt_at(
         self, run_descriptor: int, relative_directory: str
@@ -1188,52 +1168,6 @@ class RunStore:
             raise EvidenceTampered("evidence receipt is invalid")
         return value
 
-    def _verify_evidence_receipt(
-        self,
-        run_id: str,
-        relative_directory: str,
-        manifest_digest: str,
-    ) -> None:
-        receipt = self._read_evidence_receipt(run_id, relative_directory)
-        if receipt is None:
-            raise EvidenceTampered("evidence receipt is missing")
-        if receipt["manifest_sha256"] != manifest_digest:
-            raise EvidenceTampered("evidence receipt does not match its manifest")
-
-    def _publish_evidence_receipt(
-        self,
-        run_id: str,
-        relative_directory: str,
-        manifest_digest: str,
-    ) -> None:
-        expected = {
-            "schema_version": SCHEMA_VERSION,
-            "evidence": relative_directory,
-            "manifest_sha256": manifest_digest,
-        }
-        receipt_path = self._evidence_receipt_path(run_id, relative_directory)
-        observed = self._read_evidence_receipt(run_id, relative_directory)
-        if observed is not None:
-            if observed != expected:
-                raise EvidenceTampered("evidence receipt does not match its manifest")
-            return
-        try:
-            directory_descriptor = self._open_evidence_receipt_directory(run_id)
-        except OSError as exc:
-            raise EvidenceTampered("evidence receipt is invalid") from exc
-        try:
-            _write_new_json_at(
-                directory_descriptor,
-                receipt_path.name,
-                expected,
-                self.root,
-                mode=0o400,
-            )
-        except OSError as exc:
-            raise EvidenceTampered("evidence receipt is invalid") from exc
-        finally:
-            os.close(directory_descriptor)
-
     def _publish_evidence_receipt_at(
         self,
         run_descriptor: int,
@@ -1271,26 +1205,6 @@ class RunStore:
             raise EvidenceTampered("evidence receipt is invalid") from exc
         finally:
             os.close(directory_descriptor)
-
-    def _open_evidence_receipt_directory(self, run_id: str) -> int:
-        directory_flags = (
-            os.O_RDONLY
-            | os.O_DIRECTORY
-            | getattr(os, "O_CLOEXEC", 0)
-            | getattr(os, "O_NOFOLLOW", 0)
-        )
-        descriptors = []
-        try:
-            descriptor = os.open(self.root, directory_flags)
-            descriptors.append(descriptor)
-            descriptor = os.open("runs", directory_flags, dir_fd=descriptor)
-            descriptors.append(descriptor)
-            descriptor = os.open(run_id, directory_flags, dir_fd=descriptor)
-            descriptors.append(descriptor)
-            return self._open_evidence_receipt_directory_at(descriptor)
-        finally:
-            for descriptor in reversed(descriptors):
-                os.close(descriptor)
 
     def _open_evidence_receipt_directory_at(self, run_descriptor: int) -> int:
         directory_flags = (
@@ -1409,97 +1323,123 @@ class RunStore:
     ) -> Any | None:
         """Return one complete unsealed result, rejecting partial evidence."""
         with self.lock():
-            directory = self._evidence_path(run_id, relative_directory)
-            manifest_path = directory / "manifest.json"
-            if manifest_path.exists() or manifest_path.is_symlink():
-                raise EvidenceError("unsealed evidence contains an invalid manifest")
-            if not directory.exists():
-                return None
-            if not directory.is_dir():
-                raise EvidenceError("unsealed evidence result is invalid")
-            entries = list(directory.iterdir())
-            if not entries:
-                return None
-            result_path = directory / "result.json"
-            if (
-                len(entries) != 1
-                or entries[0].name != "result.json"
-                or result_path.is_symlink()
-                or not result_path.is_file()
+            with self._open_evidence_path(run_id, relative_directory) as (
+                directory,
+                _,
+                _,
             ):
-                raise EvidenceError("unsealed evidence result is partial or ambiguous")
-            return _read_evidence_result(result_path)
+                manifest_path = directory / "manifest.json"
+                if manifest_path.exists() or manifest_path.is_symlink():
+                    raise EvidenceError(
+                        "unsealed evidence contains an invalid manifest"
+                    )
+                if not directory.exists():
+                    return None
+                if not directory.is_dir():
+                    raise EvidenceError("unsealed evidence result is invalid")
+                entries = list(directory.iterdir())
+                if not entries:
+                    return None
+                result_path = directory / "result.json"
+                if (
+                    len(entries) != 1
+                    or entries[0].name != "result.json"
+                    or result_path.is_symlink()
+                    or not result_path.is_file()
+                ):
+                    raise EvidenceError(
+                        "unsealed evidence result is partial or ambiguous"
+                    )
+                return _read_evidence_result(result_path)
 
     def partial_evidence_result(
         self, run_id: str, relative_directory: str
     ) -> Any | None:
         """Return an unsealed result marker while other evidence may be partial."""
         with self.lock():
-            directory = self._evidence_path(run_id, relative_directory)
-            manifest_path = directory / "manifest.json"
-            if manifest_path.exists() or manifest_path.is_symlink():
-                raise EvidenceError("partial evidence contains an invalid manifest")
-            result_path = directory / "result.json"
-            if not result_path.exists() and not result_path.is_symlink():
-                return None
-            if result_path.is_symlink() or not result_path.is_file():
-                raise EvidenceError("partial evidence result is invalid")
-            return _read_evidence_result(result_path)
+            with self._open_evidence_path(run_id, relative_directory) as (
+                directory,
+                _,
+                _,
+            ):
+                manifest_path = directory / "manifest.json"
+                if manifest_path.exists() or manifest_path.is_symlink():
+                    raise EvidenceError("partial evidence contains an invalid manifest")
+                result_path = directory / "result.json"
+                if not result_path.exists() and not result_path.is_symlink():
+                    return None
+                if result_path.is_symlink() or not result_path.is_file():
+                    raise EvidenceError("partial evidence result is invalid")
+                return _read_evidence_result(result_path)
 
     def partial_evidence_files(
         self, run_id: str, relative_directory: str
     ) -> tuple[str, ...]:
         """Return validated relative file names from one unsealed evidence unit."""
         with self.lock():
-            directory = self._evidence_path(run_id, relative_directory)
-            manifest_path = directory / "manifest.json"
-            if manifest_path.exists() or manifest_path.is_symlink():
-                raise EvidenceError("partial evidence contains an invalid manifest")
-            if not directory.exists():
-                return ()
-            if directory.is_symlink() or not directory.is_dir():
-                raise EvidenceError("partial evidence directory is invalid")
-            files = _evidence_files(directory)
-            _validate_evidence_sizes(files, _tree_limit(relative_directory))
-            return tuple(path.relative_to(directory).as_posix() for path in files)
+            with self._open_evidence_path(run_id, relative_directory) as (
+                directory,
+                _,
+                _,
+            ):
+                manifest_path = directory / "manifest.json"
+                if manifest_path.exists() or manifest_path.is_symlink():
+                    raise EvidenceError("partial evidence contains an invalid manifest")
+                if not directory.exists():
+                    return ()
+                if directory.is_symlink() or not directory.is_dir():
+                    raise EvidenceError("partial evidence directory is invalid")
+                files = _evidence_files(directory)
+                _validate_evidence_sizes(files, _tree_limit(relative_directory))
+                return tuple(path.relative_to(directory).as_posix() for path in files)
 
     def partial_evidence_value(self, run_id: str, relative_path: str) -> Any:
         """Read one structured value from unsealed evidence."""
         with self.lock():
-            path = self._evidence_path(run_id, relative_path)
-            run_dir = self._run_dir(run_id)
-            if _sealed_ancestor(path, run_dir):
-                raise EvidenceError("partial evidence is already sealed")
-            if path.is_symlink() or not path.is_file():
-                raise EvidenceError("partial evidence value is invalid")
-            return _read_evidence_result(path)
+            with self._open_evidence_path(run_id, relative_path) as (
+                path,
+                run_dir,
+                _,
+            ):
+                if _sealed_ancestor(path, run_dir):
+                    raise EvidenceError("partial evidence is already sealed")
+                if path.is_symlink() or not path.is_file():
+                    raise EvidenceError("partial evidence value is invalid")
+                return _read_evidence_result(path)
 
     def reconcile_evidence_value(
         self, run_id: str, relative_path: str, value: Any
     ) -> Any:
         """Write an unsealed value once or verify its exact canonical bytes."""
         with self.lock():
-            path = self._evidence_path(run_id, relative_path)
-            run_dir = self._run_dir(run_id)
-            if path == _evidence_unit_root(path, run_dir) / "manifest.json":
-                raise EvidenceError("manifest.json is reserved")
-            if _sealed_ancestor(path, run_dir):
-                raise EvidenceError("completed evidence is read-only")
-            expected = redact_artifact_value(value)
-            encoded = (canonical_json(expected) + "\n").encode("utf-8")
-            if path.exists() or path.is_symlink():
-                if path.is_symlink() or not path.is_file():
-                    raise EvidenceError("partial evidence value is invalid")
-                try:
-                    observed = path.read_bytes()
-                except OSError as exc:
-                    raise EvidenceError("partial evidence value is invalid") from exc
-                if observed != encoded:
-                    raise EvidenceError(
-                        "partial evidence contradicts its expected value"
-                    )
+            with self._open_evidence_path(run_id, relative_path) as (
+                path,
+                run_dir,
+                _,
+            ):
+                if path == _evidence_unit_root(path, run_dir) / "manifest.json":
+                    raise EvidenceError("manifest.json is reserved")
+                if _sealed_ancestor(path, run_dir):
+                    raise EvidenceError("completed evidence is read-only")
+                expected = redact_artifact_value(value)
+                encoded = (canonical_json(expected) + "\n").encode("utf-8")
+                if path.exists() or path.is_symlink():
+                    if path.is_symlink() or not path.is_file():
+                        raise EvidenceError("partial evidence value is invalid")
+                    try:
+                        observed = path.read_bytes()
+                    except OSError as exc:
+                        raise EvidenceError(
+                            "partial evidence value is invalid"
+                        ) from exc
+                    if observed != encoded:
+                        raise EvidenceError(
+                            "partial evidence contradicts its expected value"
+                        )
+                    return expected
+                _secure_directory(path.parent)
+                _write_new_bytes(path, encoded, self.root)
                 return expected
-            return self.write_evidence_value(run_id, relative_path, expected)
 
     def _append_event_unlocked(
         self,
@@ -2103,9 +2043,23 @@ class RunStore:
         return events
 
     def _evidence_path(self, run_id: str, relative: str) -> Path:
+        return self._evidence_path_from_run(self._run_dir(run_id), relative)
+
+    @contextmanager
+    def _open_evidence_path(
+        self, run_id: str, relative: str
+    ) -> Iterator[tuple[Path, Path, int]]:
+        with self._open_observation_run(run_id) as run_descriptor:
+            run_path = Path(f"/proc/self/fd/{run_descriptor}")
+            yield (
+                self._evidence_path_from_run(run_path, relative),
+                run_path,
+                run_descriptor,
+            )
+
+    def _evidence_path_from_run(self, run_path: Path, relative: str) -> Path:
         relative = _canonical_evidence_relative(relative)
         parts = Path(relative).parts
-        run_path = self._run_dir(run_id)
         path = run_path
         for part in parts:
             path /= part
@@ -2115,13 +2069,6 @@ class RunStore:
         if not path.resolve(strict=False).is_relative_to(run_dir):
             raise EvidenceError("evidence path escapes the Run directory")
         return path
-
-    def _evidence_directory_identity(
-        self, run_id: str, relative_directory: str
-    ) -> tuple[Path, str]:
-        canonical = _canonical_evidence_relative(relative_directory)
-        directory = self._evidence_path(run_id, canonical)
-        return directory, canonical
 
 
 def _validate_run_id(run_id: str) -> None:
