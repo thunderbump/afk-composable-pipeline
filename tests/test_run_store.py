@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import stat
@@ -890,6 +891,58 @@ class RunStoreTest(unittest.TestCase):
         self.assertFalse(
             (self.root / "runs" / "run-001" / ".evidence-publication").exists()
         )
+
+    def test_observation_rejects_writable_evidence_with_a_stale_publication_marker(
+        self,
+    ):
+        self.create_run()
+        expected = {"status": "complete"}
+        unit = "gates/completion"
+        self.store.write_evidence_value("run-001", f"{unit}/result.json", expected)
+        marker_directory = self.root / "runs" / "run-001" / ".evidence-publication"
+        unlink = Path.unlink
+
+        def interrupt_marker_removal(path, *args, **kwargs):
+            if path.parent == marker_directory:
+                raise OSError("simulated interruption")
+            return unlink(path, *args, **kwargs)
+
+        with patch.object(Path, "unlink", new=interrupt_marker_removal):
+            with self.assertRaises(OSError):
+                self.store.seal_evidence("run-001", unit)
+
+        self.assertEqual(
+            self.store.observe_sealed_evidence_result("run-001", unit),
+            expected,
+        )
+        evidence = self.root / "runs" / "run-001" / unit
+        evidence.chmod(0o700)
+
+        with self.assertRaisesRegex(EvidenceTampered, "sealed evidence is writable"):
+            self.store.observe_sealed_evidence_result("run-001", unit)
+
+    def test_observation_rejects_a_forged_publication_marker(self):
+        self.create_run()
+        unit = "gates/completion"
+        self.store.write_evidence_value(
+            "run-001", f"{unit}/result.json", {"status": "complete"}
+        )
+        self.store.seal_evidence("run-001", unit)
+        evidence = self.root / "runs" / "run-001" / unit
+        evidence.chmod(0o700)
+        marker_directory = self.root / "runs" / "run-001" / ".evidence-publication"
+        marker_directory.mkdir(mode=0o700)
+        marker = marker_directory / (
+            hashlib.sha256(unit.encode("utf-8")).hexdigest() + ".json"
+        )
+        marker.write_text(
+            json.dumps({"schema_version": 1, "evidence": unit}),
+            encoding="utf-8",
+        )
+        marker.chmod(0o600)
+
+        with self.assertRaisesRegex(EvidenceTampered, "sealed evidence is writable"):
+            self.store.observe_sealed_evidence_result("run-001", unit)
 
     def test_sealed_evidence_result_does_not_repair_changed_published_evidence(self):
         self.create_run()

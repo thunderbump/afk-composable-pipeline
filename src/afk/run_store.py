@@ -713,20 +713,23 @@ class RunStore:
                 "files": entries,
                 "total_bytes": sum(entry["bytes"] for entry in entries),
             }
-            self._begin_evidence_publication(run_id, relative_directory)
-            for path in files:
-                path.chmod(0o400)
-            for path in sorted(
-                [entry for entry in directory.rglob("*") if entry.is_dir()],
-                key=lambda item: len(item.parts),
-                reverse=True,
-            ):
-                path.chmod(0o500)
-            _write_new_json(manifest_path, manifest, self.root, mode=0o400)
-            directory.chmod(0o500)
-            _fsync_directory(directory)
-            _fsync_directory(directory.parent)
-            self._finish_evidence_publication(run_id, relative_directory)
+            publisher = self._begin_evidence_publication(run_id, relative_directory)
+            try:
+                for path in files:
+                    path.chmod(0o400)
+                for path in sorted(
+                    [entry for entry in directory.rglob("*") if entry.is_dir()],
+                    key=lambda item: len(item.parts),
+                    reverse=True,
+                ):
+                    path.chmod(0o500)
+                _write_new_json(manifest_path, manifest, self.root, mode=0o400)
+                directory.chmod(0o500)
+                _fsync_directory(directory)
+                _fsync_directory(directory.parent)
+                self._finish_evidence_publication(run_id, relative_directory)
+            finally:
+                os.close(publisher)
             return manifest
 
     def verify_evidence(self, run_id: str, relative_directory: str) -> bool:
@@ -813,7 +816,7 @@ class RunStore:
     ) -> Any | None:
         """Read a fully sealed result without completing or repairing its seal."""
         directory = self._evidence_path(run_id, relative_directory)
-        publishing = self._evidence_publication_in_progress(run_id, relative_directory)
+        publishing = self._evidence_publisher_is_active(run_id, relative_directory)
         manifest_path = directory / "manifest.json"
         if manifest_path.is_symlink() or (
             manifest_path.exists() and not manifest_path.is_file()
@@ -826,7 +829,7 @@ class RunStore:
         except EvidenceTampered as exc:
             if str(exc) == "sealed evidence is writable" and (
                 publishing
-                or self._evidence_publication_in_progress(run_id, relative_directory)
+                or self._evidence_publisher_is_active(run_id, relative_directory)
             ):
                 return None
             raise
@@ -917,19 +920,64 @@ class RunStore:
             raise EvidenceTampered("evidence publication marker is invalid")
         return True
 
-    def _begin_evidence_publication(self, run_id: str, relative_directory: str) -> None:
+    def _begin_evidence_publication(self, run_id: str, relative_directory: str) -> int:
         marker = self._evidence_publication_path(run_id, relative_directory)
-        if self._evidence_publication_in_progress(run_id, relative_directory):
-            return
-        _secure_directory(marker.parent)
-        _write_new_json(
+        if not self._evidence_publication_in_progress(run_id, relative_directory):
+            _secure_directory(marker.parent)
+            _write_new_json(
+                marker,
+                {
+                    "schema_version": 1,
+                    "evidence": relative_directory,
+                },
+                self.root,
+            )
+        descriptor = os.open(
             marker,
-            {
-                "schema_version": 1,
-                "evidence": relative_directory,
-            },
-            self.root,
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
         )
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+        except BaseException:
+            os.close(descriptor)
+            raise
+        return descriptor
+
+    def _evidence_publisher_is_active(
+        self, run_id: str, relative_directory: str
+    ) -> bool:
+        if not self._evidence_publication_in_progress(run_id, relative_directory):
+            return False
+        marker = self._evidence_publication_path(run_id, relative_directory)
+        try:
+            descriptor = os.open(
+                marker,
+                os.O_RDONLY
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+            )
+        except FileNotFoundError:
+            return False
+        except OSError as exc:
+            raise EvidenceTampered("evidence publication marker is invalid") from exc
+        try:
+            metadata = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or stat.S_IMODE(metadata.st_mode) != 0o600
+            ):
+                raise EvidenceTampered("evidence publication marker is invalid")
+            try:
+                fcntl.flock(
+                    descriptor,
+                    fcntl.LOCK_SH | fcntl.LOCK_NB,
+                )
+            except BlockingIOError:
+                return True
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            return False
+        finally:
+            os.close(descriptor)
 
     def _finish_evidence_publication(
         self, run_id: str, relative_directory: str
