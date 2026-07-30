@@ -1590,6 +1590,56 @@ class RunStoreTest(unittest.TestCase):
                 with self.assertRaisesRegex(EvidenceError, "evidence path is invalid"):
                     action(store, source)
 
+    def test_evidence_apis_reject_a_mismatched_selected_run_identity(self):
+        actions = {
+            "write": lambda store: store.write_evidence_value(
+                "run-001",
+                "attempts/open/input.json",
+                {"status": "external"},
+            ),
+            "verify": lambda store: store.verify_evidence(
+                "run-001",
+                "gates/sealed",
+            ),
+            "receipt-backed observation": lambda store: (
+                store.observe_sealed_evidence_result(
+                    "run-001",
+                    "gates/sealed",
+                )
+            ),
+        }
+        for index, (name, action) in enumerate(actions.items(), start=1):
+            with self.subTest(api=name):
+                root = self.state_home / f"afk-identity-{index}"
+                store = RunStore(root)
+                store.create_run(
+                    bead_id="central-bhap.8.6",
+                    repository="https://example.invalid/acme/beads-webui.git",
+                    base_branch="main",
+                    base_sha=BASE_SHA,
+                    start_request={},
+                    run_id="run-001",
+                )
+                store.write_evidence_value(
+                    "run-001",
+                    "gates/sealed/result.json",
+                    {"status": "external"},
+                )
+                store.seal_evidence("run-001", "gates/sealed")
+                identity_path = root / "runs" / "run-001" / "run.json"
+                identity = json.loads(identity_path.read_text(encoding="utf-8"))
+                identity["run_id"] = "other-run"
+                identity_path.write_text(
+                    json.dumps(identity, sort_keys=True, separators=(",", ":")) + "\n",
+                    encoding="utf-8",
+                )
+
+                with self.assertRaisesRegex(
+                    EventHistoryCorrupt,
+                    "Run identity is invalid: run-001",
+                ):
+                    action(store)
+
     def test_sealed_evidence_result_does_not_repair_changed_published_evidence(self):
         self.create_run()
         expected = {"status": "complete"}

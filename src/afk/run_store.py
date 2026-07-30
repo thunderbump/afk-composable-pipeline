@@ -995,9 +995,9 @@ class RunStore:
         """Read a fully sealed result without completing or repairing its seal."""
         relative_directory = _canonical_evidence_relative(relative_directory)
         with self._open_observation_run(run_id) as run_descriptor:
+            identity = self._identity_at(run_descriptor, run_id)
             receipt = self._read_evidence_receipt_at(run_descriptor, relative_directory)
             if receipt is None:
-                identity = self._identity_at(run_descriptor, run_id)
                 if identity.get("evidence_receipt_version") == EVIDENCE_RECEIPT_VERSION:
                     return None
             with self._open_observation_evidence(
@@ -2094,6 +2094,7 @@ class RunStore:
         self, run_id: str, relative: str
     ) -> Iterator[tuple[Path, Path, int]]:
         with self._open_observation_run(run_id) as run_descriptor:
+            self._identity_at(run_descriptor, run_id)
             run_path = Path(f"/proc/self/fd/{run_descriptor}")
             yield (
                 self._evidence_path_from_run(run_path, relative),
