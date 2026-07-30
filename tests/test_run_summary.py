@@ -440,7 +440,7 @@ class RunSummaryTest(unittest.TestCase):
         evidence = f"{RUN_SUMMARY_EVIDENCE_PREFIX}{2:020d}"
         with patch.object(
             self.store,
-            "seal_evidence",
+            "_seal_reconciled_result_at",
             side_effect=RuntimeError("crash before summary seal"),
         ):
             with self.assertRaisesRegex(RuntimeError, "crash before summary seal"):

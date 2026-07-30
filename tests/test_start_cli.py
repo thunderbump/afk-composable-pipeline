@@ -193,7 +193,7 @@ class StartCliTest(unittest.TestCase):
                     " result = original_write_json(path, value, root, **kwargs)\n"
                     " target = injections.get('AFK_TEST_KILL_AFTER_MANIFEST')\n"
                     " if target and path.name == 'manifest.json' "
-                    "and target in str(path):\n"
+                    "and target in str(path.resolve()):\n"
                     "  os.kill(os.getpid(), signal.SIGKILL)\n"
                     " return result\n"
                     "def injected_run_contract(*args, **kwargs):\n"
@@ -962,7 +962,13 @@ class StartCliTest(unittest.TestCase):
             readable.stdout,
             f"{run_id} created bead=central-bnkl.1.1 sequence=3 "
             f"checkpoint=created unit=afk-{run_id}-worker-1 "
-            "unit_status=running load_state=loaded active_state=active\n",
+            "unit_status=running load_state=loaded active_state=active\n"
+            "retrospective_status=absent retrospective_latest_sequence=absent "
+            "retrospective_latest_event=absent retrospective_latest_state=absent "
+            "retrospective_episodes=0 "
+            "retrospective_sealed=0 retrospective_warnings=0 "
+            "retrospective_absent=0 retrospective_findings=0 "
+            "retrospective_proposals=0 retrospective_path=absent\n",
         )
         effect = json.loads(
             (
@@ -6999,6 +7005,16 @@ class StartCliTest(unittest.TestCase):
         manifest.unlink()
         outcome.chmod(0o600)
         outcome.write_text("{}\n", encoding="utf-8")
+        receipt = (
+            self.state_home
+            / "afk"
+            / "runs"
+            / run_id
+            / ".evidence-receipts"
+            / f"{hashlib.sha256(evidence.encode('utf-8')).hexdigest()}.json"
+        )
+        receipt.chmod(0o600)
+        receipt.unlink()
         store.seal_evidence(run_id, evidence)
         self.assertTrue(store.verify_evidence(run_id, evidence))
 
@@ -8305,7 +8321,7 @@ class StartCliTest(unittest.TestCase):
         _, run_dir = self.create_resume_preflight_run()
         identity_path = run_dir / "run.json"
         identity = json.loads(identity_path.read_text(encoding="utf-8"))
-        identity["schema_version"] = 2
+        identity["schema_version"] = 3
         identity_path.write_text(json.dumps(identity) + "\n", encoding="utf-8")
 
         self.assert_resume_preflight_rejected("Run identity is invalid: crashed-run")
@@ -8318,6 +8334,21 @@ class StartCliTest(unittest.TestCase):
         identity_path.write_text(json.dumps(identity) + "\n", encoding="utf-8")
 
         self.assert_resume_preflight_rejected("Run identity is invalid: crashed-run")
+
+    def test_resume_accepts_transitional_receipt_aware_run_identity(self):
+        store, run_dir = self.create_resume_preflight_run()
+        identity_path = run_dir / "run.json"
+        identity = json.loads(identity_path.read_text(encoding="utf-8"))
+        identity["schema_version"] = 1
+        identity_path.write_text(
+            json.dumps(identity, sort_keys=True, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+
+        resumed = self.run_afk("resume")
+
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        self.assertEqual(store.identity("crashed-run"), identity)
 
     def test_resume_rejects_tampered_sealed_evidence_before_external_commands(self):
         store, _ = self.create_resume_preflight_run()
@@ -8467,7 +8498,13 @@ class StartCliTest(unittest.TestCase):
             "terminal-run created bead=central-bnkl.1.1 sequence=2 "
             "checkpoint=created unit=afk-terminal-run-worker-1 "
             "worker_exit_code=2 worker_result=attention_required "
-            "unit_status=terminal\n",
+            "unit_status=terminal\n"
+            "retrospective_status=absent retrospective_latest_sequence=absent "
+            "retrospective_latest_event=absent retrospective_latest_state=absent "
+            "retrospective_episodes=0 "
+            "retrospective_sealed=0 retrospective_warnings=0 "
+            "retrospective_absent=0 retrospective_findings=0 "
+            "retrospective_proposals=0 retrospective_path=absent\n",
         )
         self.assertFalse(self.command_log.exists())
 
@@ -8657,6 +8694,707 @@ class StartCliTest(unittest.TestCase):
         }
         self.assertEqual(after, before)
 
+    def test_status_and_report_expose_read_only_retrospective_counts_and_paths(self):
+        store = RunStore(self.state_home / "afk")
+        store.create_run(
+            bead_id="central-bnkl.1.1",
+            repository="thunderbump/beads-webui",
+            base_branch="main",
+            base_sha=BASE_SHA,
+            start_request={},
+            run_id="retrospective-run",
+        )
+        first = store.record_attention_episode(
+            "retrospective-run",
+            checkpoint="candidate_ready",
+            attention={
+                "scope": "validation",
+                "kind": "inconclusive",
+                "summary": "validation was inconclusive",
+            },
+        )
+        first_episode = first["attention_episode"]
+        store.reconcile_evidence_result(
+            "retrospective-run",
+            first_episode["evidence"],
+            {
+                "schema_version": 1,
+                "run_id": "retrospective-run",
+                "episode_sequence": first_episode["episode_sequence"],
+                "status": "passed",
+                "warning": False,
+                "process_findings_count": 2,
+                "improvement_proposals_count": 1,
+            },
+        )
+        store.append_event(
+            "retrospective-run",
+            "validation.recovered",
+            state="candidate_ready",
+            data={"checkpoint": "candidate_ready", "attention": {}},
+        )
+        second = store.record_attention_episode(
+            "retrospective-run",
+            checkpoint="candidate_ready",
+            attention={
+                "scope": "validation",
+                "kind": "unavailable",
+                "summary": "validation service unavailable",
+            },
+        )
+        second_episode = second["attention_episode"]
+        warning = {
+            "schema_version": 1,
+            "run_id": "retrospective-run",
+            "episode_sequence": second_episode["episode_sequence"],
+            "status": "unavailable",
+            "warning": True,
+            "process_findings_count": 0,
+            "improvement_proposals_count": 0,
+            "warning_summary": "analysis service unavailable",
+        }
+        store.write_evidence_value(
+            "retrospective-run",
+            f"{second_episode['evidence']}/result.json",
+            warning,
+        )
+        store.write_evidence_text(
+            "retrospective-run",
+            f"{second_episode['evidence']}/analysis.json",
+            "RAW-ANALYSIS-MUST-NOT-BE-EXPOSED\n",
+        )
+        store.seal_evidence("retrospective-run", second_episode["evidence"])
+        store.append_event(
+            "retrospective-run",
+            "worker.terminal",
+            data={
+                "checkpoint": "candidate_ready",
+                "worker_exit_code": 2,
+                "worker_result": "attention_required",
+            },
+        )
+        run_dir = self.state_home / "afk" / "runs" / "retrospective-run"
+        before = {
+            path.relative_to(run_dir).as_posix(): (
+                path.read_bytes() if path.is_file() else None,
+                stat.S_IMODE(path.stat().st_mode),
+            )
+            for path in run_dir.rglob("*")
+        }
+
+        human = self.run_afk("status", "retrospective-run")
+        structured = self.run_afk("status", "retrospective-run", "--json")
+        report = self.run_afk("report", "retrospective-run")
+
+        self.assertEqual(human.returncode, 2, human.stderr)
+        self.assertEqual(structured.returncode, 2, structured.stderr)
+        self.assertEqual(report.returncode, 0, report.stderr)
+        expected = {
+            "schema_version": 1,
+            "status": "unavailable",
+            "episode_counts": {
+                "total": 2,
+                "sealed": 2,
+                "warning": 1,
+                "absent": 0,
+            },
+            "process_findings_count": 2,
+            "improvement_proposals_count": 1,
+            "evidence_paths": [
+                first_episode["evidence"],
+                second_episode["evidence"],
+            ],
+            "latest": {
+                "episode_sequence": second_episode["episode_sequence"],
+                "event": "run.attention_required",
+                "state": "attention_required",
+                "status": "unavailable",
+                "warning": True,
+                "process_findings_count": 0,
+                "improvement_proposals_count": 0,
+                "evidence_path": second_episode["evidence"],
+            },
+        }
+        self.assertEqual(json.loads(structured.stdout)["retrospective"], expected)
+        self.assertEqual(json.loads(report.stdout)["retrospective"], expected)
+        self.assertIn("retrospective_status=unavailable", human.stdout)
+        self.assertIn("retrospective_episodes=2", human.stdout)
+        self.assertIn("retrospective_sealed=2", human.stdout)
+        self.assertIn("retrospective_warnings=1", human.stdout)
+        self.assertIn("retrospective_absent=0", human.stdout)
+        self.assertIn("retrospective_findings=2", human.stdout)
+        self.assertIn("retrospective_proposals=1", human.stdout)
+        self.assertIn(
+            f"retrospective_path={second_episode['evidence']}",
+            human.stdout,
+        )
+        self.assertNotIn("RAW-ANALYSIS-MUST-NOT-BE-EXPOSED", human.stdout)
+        self.assertNotIn("RAW-ANALYSIS-MUST-NOT-BE-EXPOSED", structured.stdout)
+        self.assertNotIn("RAW-ANALYSIS-MUST-NOT-BE-EXPOSED", report.stdout)
+        after = {
+            path.relative_to(run_dir).as_posix(): (
+                path.read_bytes() if path.is_file() else None,
+                stat.S_IMODE(path.stat().st_mode),
+            )
+            for path in run_dir.rglob("*")
+        }
+        self.assertEqual(after, before)
+        self.assertFalse(self.command_log.exists())
+
+    def test_status_and_report_observe_base_format_retrospective_evidence(self):
+        store_root = self.state_home / "afk"
+        store = RunStore(store_root)
+        run_id = "base-format-retrospective-run"
+        store.create_run(
+            bead_id="central-bhap.8.5",
+            repository="thunderbump/afk-composable-pipeline",
+            base_branch="main",
+            base_sha=BASE_SHA,
+            start_request={},
+            run_id=run_id,
+        )
+        run_path = store_root / "runs" / run_id
+        identity_path = run_path / "run.json"
+        identity = json.loads(identity_path.read_text(encoding="utf-8"))
+        base_identity_keys = {
+            "schema_version",
+            "run_id",
+            "bead_id",
+            "repository",
+            "base_branch",
+            "base_sha",
+            "created_at",
+            "start_request",
+        }
+        identity_path.write_text(
+            json.dumps(
+                {
+                    **{key: identity[key] for key in base_identity_keys},
+                    "schema_version": 1,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        projection = store.record_attention_episode(
+            run_id,
+            checkpoint="candidate_ready",
+            attention={
+                "scope": "validation",
+                "kind": "unavailable",
+                "summary": "validation unavailable",
+            },
+        )
+        episode = projection["attention_episode"]
+        store.reconcile_evidence_result(
+            run_id,
+            episode["evidence"],
+            {
+                "schema_version": 1,
+                "run_id": run_id,
+                "episode_sequence": episode["episode_sequence"],
+                "status": "unavailable",
+                "warning": True,
+                "process_findings_count": 0,
+                "improvement_proposals_count": 0,
+                "warning_summary": "analysis unavailable",
+            },
+        )
+        receipt = (
+            run_path
+            / ".evidence-receipts"
+            / f"{hashlib.sha256(episode['evidence'].encode('utf-8')).hexdigest()}.json"
+        )
+        receipt.unlink()
+        receipt.parent.rmdir()
+        store.append_event(
+            run_id,
+            "worker.terminal",
+            data={
+                "checkpoint": "candidate_ready",
+                "worker_exit_code": 2,
+                "worker_result": "attention_required",
+            },
+        )
+        before = {
+            path.relative_to(run_path).as_posix(): (
+                path.read_bytes() if path.is_file() else None,
+                stat.S_IMODE(path.stat().st_mode),
+            )
+            for path in run_path.rglob("*")
+        }
+
+        human = self.run_afk("status", run_id)
+        structured = self.run_afk("status", run_id, "--json")
+        report = self.run_afk("report", run_id)
+
+        self.assertEqual(human.returncode, 2, human.stderr)
+        self.assertEqual(structured.returncode, 2, structured.stderr)
+        self.assertEqual(report.returncode, 0, report.stderr)
+        expected = {
+            "schema_version": 1,
+            "status": "unavailable",
+            "episode_counts": {
+                "total": 1,
+                "sealed": 1,
+                "warning": 1,
+                "absent": 0,
+            },
+            "process_findings_count": 0,
+            "improvement_proposals_count": 0,
+            "evidence_paths": [episode["evidence"]],
+            "latest": {
+                "episode_sequence": episode["episode_sequence"],
+                "event": "run.attention_required",
+                "state": "attention_required",
+                "status": "unavailable",
+                "warning": True,
+                "process_findings_count": 0,
+                "improvement_proposals_count": 0,
+                "evidence_path": episode["evidence"],
+            },
+        }
+        self.assertEqual(json.loads(structured.stdout)["retrospective"], expected)
+        self.assertEqual(json.loads(report.stdout)["retrospective"], expected)
+        self.assertIn("retrospective_status=unavailable", human.stdout)
+        self.assertIn(
+            f"retrospective_latest_sequence={episode['episode_sequence']}",
+            human.stdout,
+        )
+        self.assertIn("retrospective_episodes=1", human.stdout)
+        self.assertIn("retrospective_sealed=1", human.stdout)
+        self.assertIn("retrospective_warnings=1", human.stdout)
+        self.assertIn(f"retrospective_path={episode['evidence']}", human.stdout)
+        after = {
+            path.relative_to(run_path).as_posix(): (
+                path.read_bytes() if path.is_file() else None,
+                stat.S_IMODE(path.stat().st_mode),
+            )
+            for path in run_path.rglob("*")
+        }
+        self.assertEqual(after, before)
+        self.assertFalse(self.command_log.exists())
+        evidence = run_path / episode["evidence"]
+        evidence.chmod(0o700)
+        tampered = self.run_afk("status", run_id, "--json")
+        self.assertEqual(tampered.returncode, 1)
+        self.assertIn("sealed evidence is writable", tampered.stderr)
+
+    def test_status_explicitly_reports_absent_retrospective_episodes(self):
+        store = RunStore(self.state_home / "afk")
+        store.create_run(
+            bead_id="central-bnkl.1.1",
+            repository="thunderbump/beads-webui",
+            base_branch="main",
+            base_sha=BASE_SHA,
+            start_request={},
+            run_id="no-retrospective-run",
+        )
+        store.append_event(
+            "no-retrospective-run",
+            "worker.terminal",
+            data={
+                "checkpoint": "created",
+                "worker_exit_code": 1,
+                "worker_result": "failed",
+            },
+        )
+
+        completed = self.run_afk("status", "no-retrospective-run", "--json")
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(
+            json.loads(completed.stdout)["retrospective"],
+            {
+                "schema_version": 1,
+                "status": "absent",
+                "episode_counts": {
+                    "total": 0,
+                    "sealed": 0,
+                    "warning": 0,
+                    "absent": 0,
+                },
+                "process_findings_count": 0,
+                "improvement_proposals_count": 0,
+                "latest": None,
+                "evidence_paths": [],
+            },
+        )
+
+    def test_status_does_not_finish_a_partial_retrospective_evidence_seal(self):
+        store = RunStore(self.state_home / "afk")
+        store.create_run(
+            bead_id="central-bnkl.1.1",
+            repository="thunderbump/beads-webui",
+            base_branch="main",
+            base_sha=BASE_SHA,
+            start_request={},
+            run_id="partial-retrospective-run",
+        )
+        projection = store.record_attention_episode(
+            "partial-retrospective-run",
+            checkpoint="created",
+            attention={
+                "scope": "worker_launch",
+                "kind": "unavailable",
+                "summary": "worker launch unavailable",
+            },
+        )
+        episode = projection["attention_episode"]
+        store.write_evidence_value(
+            "partial-retrospective-run",
+            f"{episode['evidence']}/result.json",
+            {
+                "schema_version": 1,
+                "run_id": "partial-retrospective-run",
+                "episode_sequence": episode["episode_sequence"],
+                "status": "unavailable",
+                "warning": True,
+                "process_findings_count": 0,
+                "improvement_proposals_count": 0,
+                "warning_summary": "analysis unavailable",
+            },
+        )
+        store.append_event(
+            "partial-retrospective-run",
+            "worker.terminal",
+            data={
+                "checkpoint": "created",
+                "worker_exit_code": 2,
+                "worker_result": "attention_required",
+            },
+        )
+        run_dir = self.state_home / "afk" / "runs" / "partial-retrospective-run"
+        before = {
+            path.relative_to(run_dir).as_posix(): (
+                path.read_bytes() if path.is_file() else None,
+                stat.S_IMODE(path.stat().st_mode),
+            )
+            for path in run_dir.rglob("*")
+        }
+
+        human = self.run_afk("status", "partial-retrospective-run")
+        completed = self.run_afk("status", "partial-retrospective-run", "--json")
+
+        self.assertEqual(human.returncode, 2, human.stderr)
+        self.assertEqual(completed.returncode, 2, completed.stderr)
+        self.assertIn(
+            f"retrospective_latest_sequence={episode['episode_sequence']}",
+            human.stdout,
+        )
+        self.assertIn(
+            "retrospective_latest_event=run.attention_required",
+            human.stdout,
+        )
+        self.assertIn(
+            "retrospective_latest_state=attention_required",
+            human.stdout,
+        )
+        retrospective = json.loads(completed.stdout)["retrospective"]
+        self.assertEqual(retrospective["status"], "absent")
+        self.assertEqual(
+            retrospective["episode_counts"],
+            {"total": 1, "sealed": 0, "warning": 0, "absent": 1},
+        )
+        self.assertEqual(retrospective["evidence_paths"], [])
+        self.assertEqual(retrospective["latest"]["status"], "absent")
+        self.assertIsNone(retrospective["latest"]["evidence_path"])
+        after = {
+            path.relative_to(run_dir).as_posix(): (
+                path.read_bytes() if path.is_file() else None,
+                stat.S_IMODE(path.stat().st_mode),
+            )
+            for path in run_dir.rglob("*")
+        }
+        self.assertEqual(after, before)
+        self.assertFalse((run_dir / episode["evidence"] / "manifest.json").exists())
+        self.assertFalse(self.command_log.exists())
+
+    def test_status_and_report_observe_retrospective_while_mutator_lock_is_held(self):
+        store = RunStore(self.state_home / "afk")
+        store.create_run(
+            bead_id="central-bnkl.1.1",
+            repository="thunderbump/beads-webui",
+            base_branch="main",
+            base_sha=BASE_SHA,
+            start_request={},
+            run_id="locked-retrospective-run",
+        )
+        store.record_attention_episode(
+            "locked-retrospective-run",
+            checkpoint="created",
+            attention={
+                "scope": "worker_launch",
+                "kind": "unavailable",
+                "summary": "worker launch unavailable",
+            },
+        )
+        store.append_event(
+            "locked-retrospective-run",
+            "worker.terminal",
+            data={
+                "checkpoint": "created",
+                "worker_exit_code": 2,
+                "worker_result": "attention_required",
+            },
+        )
+
+        with store.lock():
+            status = self.run_afk("status", "locked-retrospective-run", "--json")
+            report = self.run_afk("report", "locked-retrospective-run")
+
+        self.assertEqual(status.returncode, 2, status.stderr)
+        self.assertEqual(report.returncode, 0, report.stderr)
+        for completed in (status, report):
+            retrospective = json.loads(completed.stdout)["retrospective"]
+            self.assertEqual(retrospective["status"], "absent")
+            self.assertEqual(
+                retrospective["episode_counts"],
+                {"total": 1, "sealed": 0, "warning": 0, "absent": 1},
+            )
+
+    def test_status_and_report_treat_publishing_retrospective_as_absent(self):
+        store_root = self.state_home / "afk"
+        store = RunStore(store_root)
+        run_id = "publishing-retrospective-run"
+        store.create_run(
+            bead_id="central-bnkl.1.1",
+            repository="thunderbump/beads-webui",
+            base_branch="main",
+            base_sha=BASE_SHA,
+            start_request={},
+            run_id=run_id,
+        )
+        identity_path = store_root / "runs" / run_id / "run.json"
+        identity = json.loads(identity_path.read_text(encoding="utf-8"))
+        identity["schema_version"] = 1
+        identity_path.write_text(
+            json.dumps(identity, sort_keys=True, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        projection = store.record_attention_episode(
+            run_id,
+            checkpoint="created",
+            attention={
+                "scope": "worker_launch",
+                "kind": "unavailable",
+                "summary": "worker launch unavailable",
+            },
+        )
+        episode = projection["attention_episode"]
+        store.write_evidence_value(
+            run_id,
+            f"{episode['evidence']}/result.json",
+            {
+                "schema_version": 1,
+                "run_id": run_id,
+                "episode_sequence": episode["episode_sequence"],
+                "status": "unavailable",
+                "warning": True,
+                "process_findings_count": 0,
+                "improvement_proposals_count": 0,
+                "warning_summary": "analysis unavailable",
+            },
+        )
+        store.append_event(
+            run_id,
+            "worker.terminal",
+            data={
+                "checkpoint": "created",
+                "worker_exit_code": 2,
+                "worker_result": "attention_required",
+            },
+        )
+        evidence = store_root / "runs" / run_id / episode["evidence"]
+        manifest_published = threading.Event()
+        finish_seal = threading.Event()
+        seal_errors = []
+        original_fchmod = os.fchmod
+
+        def pause_before_root_read_only(descriptor, mode):
+            selected = Path(f"/proc/self/fd/{descriptor}")
+            if selected.resolve() == evidence.resolve() and mode == 0o500:
+                manifest_published.set()
+                finish_seal.wait(timeout=5)
+            return original_fchmod(descriptor, mode)
+
+        def seal():
+            try:
+                store.seal_evidence(run_id, episode["evidence"])
+            except Exception as exc:  # pragma: no cover - surfaced by assertion
+                seal_errors.append(exc)
+
+        with patch("afk.run_store.os.fchmod", new=pause_before_root_read_only):
+            sealer = threading.Thread(target=seal)
+            sealer.start()
+            self.assertTrue(manifest_published.wait(timeout=5))
+
+            def snapshot():
+                paths = [store_root, *store_root.rglob("*")]
+                return {
+                    path.relative_to(store_root).as_posix()
+                    or ".": (
+                        path.read_bytes() if path.is_file() else None,
+                        stat.S_IMODE(path.stat().st_mode),
+                    )
+                    for path in paths
+                }
+
+            before = snapshot()
+            self.assertEqual(stat.S_IMODE(evidence.stat().st_mode), 0o700)
+            self.assertEqual(
+                stat.S_IMODE((evidence / "result.json").stat().st_mode),
+                0o400,
+            )
+            self.assertEqual(
+                stat.S_IMODE((evidence / "manifest.json").stat().st_mode),
+                0o400,
+            )
+            self.assertFalse(
+                (store_root / "runs" / run_id / ".evidence-receipts").exists()
+            )
+            status = self.run_afk("status", run_id, "--json")
+            report = self.run_afk("report", run_id)
+            after = snapshot()
+            finish_seal.set()
+            sealer.join(timeout=5)
+
+        self.assertFalse(sealer.is_alive())
+        self.assertEqual(seal_errors, [])
+        self.assertEqual(status.returncode, 2, status.stderr)
+        self.assertEqual(report.returncode, 0, report.stderr)
+        self.assertEqual(after, before)
+        for completed in (status, report):
+            retrospective = json.loads(completed.stdout)["retrospective"]
+            self.assertEqual(retrospective["status"], "absent")
+            self.assertEqual(
+                retrospective["episode_counts"],
+                {"total": 1, "sealed": 0, "warning": 0, "absent": 1},
+            )
+        completed = self.run_afk("status", run_id, "--json")
+        self.assertEqual(completed.returncode, 2, completed.stderr)
+        self.assertEqual(
+            json.loads(completed.stdout)["retrospective"]["status"],
+            "unavailable",
+        )
+        evidence.chmod(0o700)
+        tampered = self.run_afk("status", run_id, "--json")
+        self.assertEqual(tampered.returncode, 1)
+        self.assertIn("sealed evidence is writable", tampered.stderr)
+
+    def test_status_and_report_do_not_recreate_the_removed_store_lock(self):
+        store_root = self.state_home / "afk"
+        store = RunStore(store_root)
+        store.create_run(
+            bead_id="central-bnkl.1.1",
+            repository="thunderbump/beads-webui",
+            base_branch="main",
+            base_sha=BASE_SHA,
+            start_request={},
+            run_id="lockless-retrospective-run",
+        )
+        store.record_attention_episode(
+            "lockless-retrospective-run",
+            checkpoint="created",
+            attention={
+                "scope": "worker_launch",
+                "kind": "unavailable",
+                "summary": "worker launch unavailable",
+            },
+        )
+        store.append_event(
+            "lockless-retrospective-run",
+            "worker.terminal",
+            data={
+                "checkpoint": "created",
+                "worker_exit_code": 2,
+                "worker_result": "attention_required",
+            },
+        )
+        lock_path = store_root / "afk.lock"
+        lock_path.unlink()
+
+        def snapshot():
+            paths = [store_root, *store_root.rglob("*")]
+            return {
+                path.relative_to(store_root).as_posix()
+                or ".": (
+                    path.read_bytes() if path.is_file() else None,
+                    stat.S_IMODE(path.stat().st_mode),
+                )
+                for path in paths
+            }
+
+        before = snapshot()
+
+        status = self.run_afk("status", "lockless-retrospective-run", "--json")
+        report = self.run_afk("report", "lockless-retrospective-run")
+
+        self.assertEqual(status.returncode, 2, status.stderr)
+        self.assertEqual(report.returncode, 0, report.stderr)
+        self.assertEqual(snapshot(), before)
+        self.assertFalse(lock_path.exists())
+
+    def test_status_identifies_the_latest_completed_retrospective_episode(self):
+        store = RunStore(self.state_home / "afk")
+        store.create_run(
+            bead_id="central-bnkl.1.1",
+            repository="thunderbump/beads-webui",
+            base_branch="main",
+            base_sha=BASE_SHA,
+            start_request={},
+            run_id="completed-retrospective-run",
+        )
+        completed = store.record_completion_episode(
+            "completed-retrospective-run",
+            completion={"schema_version": 1},
+        )
+        episode = completed["completion_episode"]
+        store.reconcile_evidence_result(
+            "completed-retrospective-run",
+            episode["evidence"],
+            {
+                "schema_version": 1,
+                "run_id": "completed-retrospective-run",
+                "episode_sequence": episode["episode_sequence"],
+                "status": "empty",
+                "warning": False,
+                "process_findings_count": 0,
+                "improvement_proposals_count": 0,
+            },
+        )
+
+        status = self.run_afk("status", "completed-retrospective-run", "--json")
+        report = self.run_afk("report", "completed-retrospective-run")
+
+        self.assertEqual(status.returncode, 0, status.stderr)
+        self.assertEqual(report.returncode, 0, report.stderr)
+        retrospective = json.loads(status.stdout)["retrospective"]
+        self.assertEqual(retrospective["status"], "empty")
+        self.assertEqual(
+            retrospective["episode_counts"],
+            {"total": 1, "sealed": 1, "warning": 0, "absent": 0},
+        )
+        self.assertEqual(
+            retrospective["latest"],
+            {
+                "episode_sequence": episode["episode_sequence"],
+                "event": "run.completed",
+                "state": "completed",
+                "status": "empty",
+                "warning": False,
+                "process_findings_count": 0,
+                "improvement_proposals_count": 0,
+                "evidence_path": episode["evidence"],
+            },
+        )
+        self.assertEqual(
+            json.loads(report.stdout)["retrospective"],
+            retrospective,
+        )
+
     def test_json_status_reports_inactive_active_unit_without_writing(self):
         self.create_resume_preflight_run()
         store_root = self.state_home / "afk"
@@ -8713,7 +9451,13 @@ class StartCliTest(unittest.TestCase):
             "unit_status=interrupted load_state=not-found "
             "active_state=inactive\n"
             "recommended_resume=afk resume\n"
-            "resume_precondition=active_run_id:crashed-run\n",
+            "resume_precondition=active_run_id:crashed-run\n"
+            "retrospective_status=absent retrospective_latest_sequence=absent "
+            "retrospective_latest_event=absent retrospective_latest_state=absent "
+            "retrospective_episodes=0 "
+            "retrospective_sealed=0 retrospective_warnings=0 "
+            "retrospective_absent=0 retrospective_findings=0 "
+            "retrospective_proposals=0 retrospective_path=absent\n",
         )
 
     def test_status_lookup_and_unit_failures_exit_one_without_writing(self):
@@ -10211,6 +10955,20 @@ class StartCliTest(unittest.TestCase):
         for path in [gate, *gate.rglob("*")]:
             path.chmod(0o700 if path.is_dir() else 0o600)
         (gate / "manifest.json").unlink()
+        receipt = (
+            store.root
+            / "runs"
+            / run_id
+            / ".evidence-receipts"
+            / (
+                hashlib.sha256(
+                    f"gates/{attempt['attempt_id']}".encode("utf-8")
+                ).hexdigest()
+                + ".json"
+            )
+        )
+        receipt.chmod(0o600)
+        receipt.unlink()
         outcome_path = gate / "afk/outcome.json"
         outcome = json.loads(outcome_path.read_text(encoding="utf-8"))
         outcome["candidate_sha"] = "e" * 40

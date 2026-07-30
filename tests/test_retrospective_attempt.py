@@ -1851,6 +1851,11 @@ class RetrospectiveAttemptTest(unittest.TestCase):
         manifest = directory / "manifest.json"
         manifest.chmod(0o600)
         manifest.unlink()
+        receipts = store.root / "runs" / "run-001" / ".evidence-receipts"
+        for receipt in receipts.iterdir():
+            if json.loads(receipt.read_text(encoding="utf-8"))["evidence"] == evidence:
+                receipt.chmod(0o600)
+                receipt.unlink()
         for path in directory.rglob("*"):
             if path.is_file():
                 path.chmod(0o600)

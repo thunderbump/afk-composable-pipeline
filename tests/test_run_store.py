@@ -1,10 +1,14 @@
+import fcntl
+import hashlib
 import json
 import os
+import shutil
 import stat
 import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
 
@@ -32,6 +36,7 @@ from afk.run_store import (  # noqa: E402
     RunStoreError,
 )
 from afk.retrospective_contract import INVENTORY_KEY  # noqa: E402
+from afk.retrospective_status import build_retrospective_status  # noqa: E402
 from afk.start import resume_run  # noqa: E402
 
 
@@ -83,8 +88,10 @@ class RunStoreTest(unittest.TestCase):
         active = json.loads((self.root / "active.json").read_text(encoding="utf-8"))
 
         self.assertEqual(projection["state"], "created")
+        self.assertEqual(identity["schema_version"], 2)
         self.assertEqual(identity["bead_id"], "central-bnkl.1.1")
         self.assertEqual(identity["start_request"]["note"], "token=[REDACTED]")
+        self.assertEqual(identity["evidence_receipt_version"], 1)
         self.assertEqual(json.loads(events[0])["sequence"], 1)
         self.assertEqual(active, {"run_id": "run-001"})
         self.assertEqual(stat.S_IMODE(self.root.stat().st_mode), 0o700)
@@ -95,6 +102,95 @@ class RunStoreTest(unittest.TestCase):
             run_dir / "state.json",
         ):
             self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+
+    def test_schema_two_run_identity_requires_receipt_protocol_version(self):
+        self.create_run()
+        identity_path = self.root / "runs" / "run-001" / "run.json"
+        original = json.loads(identity_path.read_text(encoding="utf-8"))
+
+        for replacement in (None, 0):
+            with self.subTest(evidence_receipt_version=replacement):
+                identity = dict(original)
+                if replacement is None:
+                    identity.pop("evidence_receipt_version")
+                else:
+                    identity["evidence_receipt_version"] = replacement
+                identity_path.write_text(
+                    json.dumps(identity, sort_keys=True, separators=(",", ":")) + "\n",
+                    encoding="utf-8",
+                )
+
+                with self.assertRaisesRegex(
+                    EventHistoryCorrupt,
+                    "Run identity is invalid: run-001",
+                ):
+                    self.store.identity("run-001")
+
+    def test_run_identity_schema_version_requires_an_exact_integer(self):
+        self.create_run()
+        identity_path = self.root / "runs" / "run-001" / "run.json"
+        current = json.loads(identity_path.read_text(encoding="utf-8"))
+        legacy = dict(current)
+        legacy.pop("evidence_receipt_version")
+
+        for identity, schema_version in (
+            (legacy, True),
+            (legacy, 1.0),
+            (current, True),
+            (current, 2.0),
+        ):
+            with self.subTest(
+                format=(
+                    "current" if "evidence_receipt_version" in identity else "legacy"
+                ),
+                schema_version=schema_version,
+            ):
+                identity_path.write_text(
+                    json.dumps(
+                        {**identity, "schema_version": schema_version},
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+
+                with self.assertRaisesRegex(
+                    EventHistoryCorrupt,
+                    "Run identity is invalid: run-001",
+                ):
+                    self.store.identity("run-001")
+
+    def test_receipt_aware_identity_version_requires_an_exact_integer(self):
+        self.create_run()
+        identity_path = self.root / "runs" / "run-001" / "run.json"
+        current = json.loads(identity_path.read_text(encoding="utf-8"))
+
+        for schema_version in (1, 2):
+            for receipt_version in (True, 1.0):
+                with self.subTest(
+                    schema_version=schema_version,
+                    evidence_receipt_version=receipt_version,
+                ):
+                    identity_path.write_text(
+                        json.dumps(
+                            {
+                                **current,
+                                "schema_version": schema_version,
+                                "evidence_receipt_version": receipt_version,
+                            },
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        )
+                        + "\n",
+                        encoding="utf-8",
+                    )
+
+                    with self.assertRaisesRegex(
+                        EventHistoryCorrupt,
+                        "Run identity is invalid: run-001",
+                    ):
+                        self.store.identity("run-001")
 
     def test_status_replays_stale_projection_and_ignores_torn_event_tail(self):
         self.create_run()
@@ -868,15 +964,17 @@ class RunStoreTest(unittest.TestCase):
             "run-001", "gates/completion/result.json", expected
         )
         directory = self.root / "runs" / "run-001" / "gates" / "completion"
-        chmod = Path.chmod
+        fchmod = os.fchmod
 
-        def interrupt_root_seal(path, mode):
-            if path == directory and mode == 0o500:
+        def interrupt_root_seal(descriptor, mode):
+            selected = Path(f"/proc/self/fd/{descriptor}")
+            if selected.resolve() == directory.resolve() and mode == 0o500:
                 raise OSError("simulated interruption")
-            return chmod(path, mode)
+            return fchmod(descriptor, mode)
 
         with patch(
-            "afk.run_store.Path.chmod", autospec=True, side_effect=interrupt_root_seal
+            "afk.run_store.os.fchmod",
+            side_effect=interrupt_root_seal,
         ):
             with self.assertRaises(OSError):
                 self.store.seal_evidence("run-001", "gates/completion")
@@ -887,6 +985,930 @@ class RunStoreTest(unittest.TestCase):
             expected,
         )
         self.assertTrue(self.store.verify_evidence("run-001", "gates/completion"))
+        self.assertEqual(
+            self.store.observe_sealed_evidence_result("run-001", "gates/completion"),
+            expected,
+        )
+
+    def test_observation_ignores_an_immutable_seal_until_recovery_publishes_it(self):
+        self.create_run()
+        expected = {"status": "complete"}
+        unit = "gates/completion"
+        alias = "gates//completion"
+        self.store.write_evidence_value("run-001", f"{unit}/result.json", expected)
+        link = os.link
+
+        def interrupt_receipt_publication(source, target, *args, **kwargs):
+            if kwargs.get("dst_dir_fd") is not None:
+                raise OSError("simulated interruption")
+            return link(source, target, *args, **kwargs)
+
+        with patch("afk.run_store.os.link", side_effect=interrupt_receipt_publication):
+            with self.assertRaisesRegex(
+                EvidenceTampered, "evidence receipt is invalid"
+            ):
+                self.store.seal_evidence("run-001", alias)
+
+        evidence = self.root / "runs" / "run-001" / unit
+        before = {
+            path.relative_to(evidence).as_posix()
+            or ".": (
+                path.read_bytes() if path.is_file() else None,
+                stat.S_IMODE(path.stat().st_mode),
+            )
+            for path in [evidence, *evidence.rglob("*")]
+        }
+        self.assertIsNone(self.store.observe_sealed_evidence_result("run-001", unit))
+        after = {
+            path.relative_to(evidence).as_posix()
+            or ".": (
+                path.read_bytes() if path.is_file() else None,
+                stat.S_IMODE(path.stat().st_mode),
+            )
+            for path in [evidence, *evidence.rglob("*")]
+        }
+        self.assertEqual(after, before)
+
+        self.assertEqual(
+            self.store.sealed_evidence_result("run-001", unit),
+            expected,
+        )
+        self.assertEqual(
+            self.store.observe_sealed_evidence_result("run-001", unit),
+            expected,
+        )
+
+    def test_recovery_receipts_the_exact_manifest_snapshot_that_was_verified(self):
+        self.create_run()
+        unit = "gates/completion"
+        self.store.write_evidence_value(
+            "run-001", f"{unit}/result.json", {"status": "complete"}
+        )
+        link = os.link
+
+        def interrupt_receipt_publication(source, target, *args, **kwargs):
+            if kwargs.get("dst_dir_fd") is not None:
+                raise OSError("simulated interruption")
+            return link(source, target, *args, **kwargs)
+
+        with patch("afk.run_store.os.link", side_effect=interrupt_receipt_publication):
+            with self.assertRaisesRegex(
+                EvidenceTampered, "evidence receipt is invalid"
+            ):
+                self.store.seal_evidence("run-001", unit)
+
+        manifest_path = self.root / "runs" / "run-001" / unit / "manifest.json"
+        verified_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        replacement_manifest = {**verified_manifest, "total_bytes": 999}
+        verify_evidence_directory = self.store._verify_evidence_directory
+
+        def replace_manifest_after_verification(
+            directory, relative_directory, *, payload_capture
+        ):
+            verified = verify_evidence_directory(
+                directory,
+                relative_directory,
+                payload_capture=payload_capture,
+            )
+            manifest_path.chmod(0o600)
+            manifest_path.write_text(
+                json.dumps(replacement_manifest),
+                encoding="utf-8",
+            )
+            manifest_path.chmod(0o400)
+            return verified
+
+        with patch.object(
+            self.store,
+            "_verify_evidence_directory",
+            side_effect=replace_manifest_after_verification,
+        ):
+            self.store.sealed_evidence_result("run-001", unit)
+
+        receipt_path = next(
+            (self.root / "runs" / "run-001" / ".evidence-receipts").iterdir()
+        )
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        verified_digest = hashlib.sha256(
+            json.dumps(
+                verified_manifest,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
+        self.assertEqual(receipt["manifest_sha256"], verified_digest)
+
+    def test_receipt_publication_rejects_a_directory_symlink_swap(self):
+        self.create_run()
+        unit = "gates/completion"
+        self.store.write_evidence_value(
+            "run-001", f"{unit}/result.json", {"status": "complete"}
+        )
+        receipt_directory = self.root / "runs" / "run-001" / ".evidence-receipts"
+        external = self.state_home / "external-receipts"
+        external.mkdir(mode=0o755)
+        original_read = self.store._read_evidence_receipt_at
+
+        def swap_after_absence(run_descriptor, relative_directory):
+            observed = original_read(run_descriptor, relative_directory)
+            if observed is None and not receipt_directory.exists():
+                receipt_directory.symlink_to(external, target_is_directory=True)
+            return observed
+
+        with patch.object(
+            self.store,
+            "_read_evidence_receipt_at",
+            side_effect=swap_after_absence,
+        ):
+            with self.assertRaisesRegex(
+                EvidenceTampered, "evidence receipt is invalid"
+            ):
+                self.store.seal_evidence("run-001", unit)
+
+        self.assertTrue(receipt_directory.is_symlink())
+        self.assertEqual(stat.S_IMODE(external.stat().st_mode), 0o755)
+        self.assertEqual(list(external.iterdir()), [])
+
+    def test_receipt_identity_canonicalizes_accepted_evidence_path_aliases(self):
+        aliases = (
+            "gates//completion",
+            "gates/./completion",
+            "gates/completion/.",
+        )
+        expected = {"status": "complete"}
+
+        for index, alias in enumerate(aliases, start=1):
+            with self.subTest(alias=alias):
+                root = self.state_home / f"afk-{index}"
+                store = RunStore(root)
+                run_id = f"alias-run-{index}"
+                store.create_run(
+                    bead_id="central-bnkl.1.1",
+                    repository="https://example.invalid/acme/beads-webui.git",
+                    base_branch="main",
+                    base_sha=BASE_SHA,
+                    start_request={},
+                    run_id=run_id,
+                )
+                store.write_evidence_value(
+                    run_id,
+                    "gates/completion/result.json",
+                    expected,
+                )
+                store.seal_evidence(run_id, alias)
+
+                self.assertEqual(
+                    store.observe_sealed_evidence_result(run_id, "gates/completion"),
+                    expected,
+                )
+                self.assertEqual(
+                    store.observe_sealed_evidence_result(run_id, alias),
+                    expected,
+                )
+                receipts = list(
+                    (root / "runs" / run_id / ".evidence-receipts").iterdir()
+                )
+                self.assertEqual(len(receipts), 1)
+                self.assertEqual(
+                    json.loads(receipts[0].read_text(encoding="utf-8"))["evidence"],
+                    "gates/completion",
+                )
+                for unsafe in ("gates/../outside", "/gates/completion"):
+                    with self.assertRaisesRegex(
+                        EvidenceError,
+                        "evidence path must stay under",
+                    ):
+                        store.observe_sealed_evidence_result(run_id, unsafe)
+
+    def test_observation_rejects_a_forged_locked_receipt_for_writable_evidence(self):
+        self.create_run()
+        unit = "gates/completion"
+        self.store.write_evidence_value(
+            "run-001", f"{unit}/result.json", {"status": "complete"}
+        )
+        self.store.seal_evidence("run-001", unit)
+        evidence = self.root / "runs" / "run-001" / unit
+        evidence.chmod(0o700)
+        receipt = next(
+            (self.root / "runs" / "run-001" / ".evidence-receipts").iterdir()
+        )
+        forged = receipt.read_bytes()
+        receipt.unlink()
+        receipt.write_bytes(forged)
+        receipt.chmod(0o400)
+        descriptor = os.open(receipt, os.O_RDONLY)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            with self.assertRaisesRegex(
+                EvidenceTampered, "sealed evidence is writable"
+            ):
+                self.store.observe_sealed_evidence_result("run-001", unit)
+            with self.assertRaisesRegex(
+                EvidenceTampered, "sealed evidence is writable"
+            ):
+                self.store.sealed_evidence_result("run-001", unit)
+        finally:
+            os.close(descriptor)
+
+    def test_observation_does_not_depend_on_filesystem_locks(self):
+        self.create_run()
+        unit = "gates/completion"
+        expected = {"status": "complete"}
+        self.store.write_evidence_value("run-001", f"{unit}/result.json", expected)
+        self.store.seal_evidence("run-001", unit)
+
+        with patch(
+            "afk.run_store.fcntl.flock",
+            side_effect=OSError("filesystem locks unavailable"),
+        ):
+            observed = self.store.observe_sealed_evidence_result("run-001", unit)
+
+        self.assertEqual(observed, expected)
+
+    def test_observation_returns_the_result_snapshot_verified_by_the_manifest(self):
+        self.create_run()
+        unit = "gates/completion"
+        expected = {"status": "verified"}
+        substituted = {"status": "substituted"}
+        self.store.write_evidence_value("run-001", f"{unit}/result.json", expected)
+        self.store.seal_evidence("run-001", unit)
+        result_path = self.root / "runs" / "run-001" / unit / "result.json"
+        verify_evidence_directory = self.store._verify_evidence_directory
+
+        def substitute_result_after_verification(
+            directory, relative_directory, *, payload_capture
+        ):
+            verified = verify_evidence_directory(
+                directory,
+                relative_directory,
+                payload_capture=payload_capture,
+            )
+            result_path.chmod(0o600)
+            result_path.write_text(json.dumps(substituted) + "\n", encoding="utf-8")
+            result_path.chmod(0o400)
+            return verified
+
+        with patch.object(
+            self.store,
+            "_verify_evidence_directory",
+            side_effect=substitute_result_after_verification,
+        ):
+            observed = self.store.observe_sealed_evidence_result("run-001", unit)
+
+        self.assertEqual(observed, expected)
+        self.assertEqual(
+            json.loads(result_path.read_text(encoding="utf-8")),
+            substituted,
+        )
+
+    def test_verification_captures_only_the_requested_payload_snapshots(self):
+        self.create_run()
+        unit = "gates/completion"
+        self.store.write_evidence_value(
+            "run-001", f"{unit}/result.json", {"status": "verified"}
+        )
+        self.store.write_evidence_text("run-001", f"{unit}/extra.txt", "extra\n")
+        self.store.seal_evidence("run-001", unit)
+        directory = self.root / "runs" / "run-001" / unit
+
+        manifest_only = self.store._verify_evidence_directory(
+            directory,
+            unit,
+            payload_capture="none",
+        )
+        result_only = self.store._verify_evidence_directory(
+            directory,
+            unit,
+            payload_capture="result",
+        )
+        all_payloads = self.store._verify_evidence_directory(
+            directory,
+            unit,
+            payload_capture="all",
+        )
+
+        self.assertEqual(manifest_only.payload_bytes, {})
+        self.assertEqual(
+            result_only.payload_bytes,
+            {"result.json": b'{"status":"verified"}\n'},
+        )
+        self.assertEqual(
+            all_payloads.payload_bytes,
+            {
+                "extra.txt": b"extra\n",
+                "result.json": b'{"status":"verified"}\n',
+            },
+        )
+
+    def test_recovery_returns_the_result_snapshot_verified_by_the_manifest(self):
+        self.create_run()
+        unit = "gates/completion"
+        expected = {"status": "verified"}
+        substituted = {"status": "substituted"}
+        self.store.write_evidence_value("run-001", f"{unit}/result.json", expected)
+        self.store.seal_evidence("run-001", unit)
+        result_path = self.root / "runs" / "run-001" / unit / "result.json"
+        verify_evidence_directory = self.store._verify_evidence_directory
+
+        def substitute_result_after_verification(
+            directory, relative_directory, *, payload_capture
+        ):
+            verified = verify_evidence_directory(
+                directory,
+                relative_directory,
+                payload_capture=payload_capture,
+            )
+            result_path.chmod(0o600)
+            result_path.write_text(json.dumps(substituted) + "\n", encoding="utf-8")
+            result_path.chmod(0o400)
+            return verified
+
+        with patch.object(
+            self.store,
+            "_verify_evidence_directory",
+            side_effect=substitute_result_after_verification,
+        ):
+            observed = self.store.sealed_evidence_result("run-001", unit)
+
+        self.assertEqual(observed, expected)
+        self.assertEqual(
+            json.loads(result_path.read_text(encoding="utf-8")),
+            substituted,
+        )
+
+    def test_sealed_payloads_return_the_auxiliary_snapshot_verified_by_the_manifest(
+        self,
+    ):
+        self.create_run()
+        unit = "gates/completion"
+        self.store.write_evidence_value(
+            "run-001", f"{unit}/result.json", {"status": "verified"}
+        )
+        self.store.write_evidence_text("run-001", f"{unit}/extra.txt", "verified\n")
+        self.store.seal_evidence("run-001", unit)
+        extra_path = self.root / "runs" / "run-001" / unit / "extra.txt"
+        verify_or_finish_seal = self.store._verify_or_finish_seal
+
+        def substitute_auxiliary_after_verification(
+            run_id, relative_directory, *, payload_capture
+        ):
+            verified = verify_or_finish_seal(
+                run_id,
+                relative_directory,
+                payload_capture=payload_capture,
+            )
+            extra_path.chmod(0o600)
+            extra_path.write_text("substituted\n", encoding="utf-8")
+            extra_path.chmod(0o400)
+            return verified
+
+        with patch.object(
+            self.store,
+            "_verify_or_finish_seal",
+            side_effect=substitute_auxiliary_after_verification,
+        ):
+            payloads = self.store.sealed_evidence_payloads("run-001", unit)
+
+        self.assertEqual(payloads["extra.txt"], "verified\n")
+        self.assertEqual(extra_path.read_text(encoding="utf-8"), "substituted\n")
+
+    def test_sealed_payloads_reject_a_symlinked_run_without_reading_external_evidence(
+        self,
+    ):
+        self.create_run()
+        unit = "gates/completion"
+        self.store.write_evidence_value(
+            "run-001", f"{unit}/result.json", {"status": "external"}
+        )
+        self.store.write_evidence_text("run-001", f"{unit}/extra.txt", "external\n")
+        self.store.seal_evidence("run-001", unit)
+        selected_run = self.root / "runs" / "run-001"
+        external_run = self.state_home / "external-run"
+        selected_run.rename(external_run)
+        selected_run.symlink_to(external_run, target_is_directory=True)
+
+        with self.assertRaisesRegex(EvidenceError, "evidence path is invalid"):
+            self.store.sealed_evidence_payloads("run-001", unit)
+
+    def test_observation_rejects_a_symlinked_run_without_reading_external_evidence(
+        self,
+    ):
+        self.create_run()
+        unit = "gates/completion"
+        expected = {"status": "external"}
+        self.store.write_evidence_value("run-001", f"{unit}/result.json", expected)
+        self.store.seal_evidence("run-001", unit)
+        selected_run = self.root / "runs" / "run-001"
+        external_run = self.state_home / "external-run"
+        selected_run.rename(external_run)
+        selected_run.symlink_to(external_run, target_is_directory=True)
+        before = {
+            path.relative_to(external_run).as_posix()
+            or ".": (
+                path.read_bytes() if path.is_file() else None,
+                stat.S_IMODE(path.stat().st_mode),
+            )
+            for path in [external_run, *external_run.rglob("*")]
+        }
+
+        with self.assertRaisesRegex(EvidenceError, "evidence path is invalid"):
+            self.store.observe_sealed_evidence_result("run-001", unit)
+
+        after = {
+            path.relative_to(external_run).as_posix()
+            or ".": (
+                path.read_bytes() if path.is_file() else None,
+                stat.S_IMODE(path.stat().st_mode),
+            )
+            for path in [external_run, *external_run.rglob("*")]
+        }
+        self.assertEqual(after, before)
+
+    def test_recovery_rejects_a_symlinked_run_without_rewriting_external_evidence(
+        self,
+    ):
+        self.create_run()
+        unit = "gates/completion"
+        expected = {"status": "external"}
+        self.store.write_evidence_value("run-001", f"{unit}/result.json", expected)
+        self.store.seal_evidence("run-001", unit)
+        selected_run = self.root / "runs" / "run-001"
+        external_run = self.state_home / "external-run"
+        selected_run.rename(external_run)
+        selected_run.symlink_to(external_run, target_is_directory=True)
+        before = {
+            path.relative_to(external_run).as_posix()
+            or ".": (
+                path.read_bytes() if path.is_file() else None,
+                stat.S_IMODE(path.stat().st_mode),
+            )
+            for path in [external_run, *external_run.rglob("*")]
+        }
+
+        with self.assertRaisesRegex(EvidenceError, "evidence path is invalid"):
+            self.store.sealed_evidence_result("run-001", unit)
+
+        after = {
+            path.relative_to(external_run).as_posix()
+            or ".": (
+                path.read_bytes() if path.is_file() else None,
+                stat.S_IMODE(path.stat().st_mode),
+            )
+            for path in [external_run, *external_run.rglob("*")]
+        }
+        self.assertEqual(after, before)
+
+    def test_reconcile_rejects_a_symlinked_run_without_rewriting_external_evidence(
+        self,
+    ):
+        self.create_run()
+        selected_run = self.root / "runs" / "run-001"
+        external_run = self.state_home / "external-run"
+        selected_run.rename(external_run)
+        selected_run.symlink_to(external_run, target_is_directory=True)
+        before = {
+            path.relative_to(external_run).as_posix()
+            or ".": (
+                path.read_bytes() if path.is_file() else None,
+                stat.S_IMODE(path.stat().st_mode),
+            )
+            for path in [external_run, *external_run.rglob("*")]
+        }
+
+        with self.assertRaisesRegex(EvidenceError, "evidence path is invalid"):
+            self.store.reconcile_evidence_result(
+                "run-001",
+                "gates/completion",
+                {"status": "external"},
+            )
+
+        after = {
+            path.relative_to(external_run).as_posix()
+            or ".": (
+                path.read_bytes() if path.is_file() else None,
+                stat.S_IMODE(path.stat().st_mode),
+            )
+            for path in [external_run, *external_run.rglob("*")]
+        }
+        self.assertEqual(after, before)
+
+    def test_reconcile_value_rejects_a_symlinked_run_without_rewriting_external(
+        self,
+    ):
+        self.create_run()
+        selected_run = self.root / "runs" / "run-001"
+        external_run = self.state_home / "external-run"
+        selected_run.rename(external_run)
+        selected_run.symlink_to(external_run, target_is_directory=True)
+        before = {
+            path.relative_to(external_run).as_posix()
+            or ".": (
+                path.read_bytes() if path.is_file() else None,
+                stat.S_IMODE(path.stat().st_mode),
+            )
+            for path in [external_run, *external_run.rglob("*")]
+        }
+
+        with self.assertRaisesRegex(EvidenceError, "evidence path is invalid"):
+            self.store.reconcile_evidence_value(
+                "run-001",
+                "retrospective/attention-2/input.json",
+                {"status": "external"},
+            )
+
+        after = {
+            path.relative_to(external_run).as_posix()
+            or ".": (
+                path.read_bytes() if path.is_file() else None,
+                stat.S_IMODE(path.stat().st_mode),
+            )
+            for path in [external_run, *external_run.rglob("*")]
+        }
+        self.assertEqual(after, before)
+
+    def test_path_backed_evidence_apis_reject_a_symlinked_run(self):
+        actions = {
+            "write text": lambda store, source: store.write_evidence_text(
+                "run-001", "attempts/open/new.txt", "external\n"
+            ),
+            "write value": lambda store, source: store.write_evidence_value(
+                "run-001", "attempts/open/new.json", {"status": "external"}
+            ),
+            "ingest file": lambda store, source: store.ingest_evidence_file(
+                "run-001", "attempts/open/ingested.txt", source
+            ),
+            "seal": lambda store, source: store.seal_evidence(
+                "run-001", "attempts/open"
+            ),
+            "verify": lambda store, source: store.verify_evidence(
+                "run-001", "gates/sealed"
+            ),
+            "unsealed result": lambda store, source: store.unsealed_evidence_result(
+                "run-001", "attempts/open"
+            ),
+            "partial result": lambda store, source: store.partial_evidence_result(
+                "run-001", "attempts/open"
+            ),
+            "partial files": lambda store, source: store.partial_evidence_files(
+                "run-001", "attempts/open"
+            ),
+            "partial value": lambda store, source: store.partial_evidence_value(
+                "run-001", "attempts/open/input.json"
+            ),
+        }
+        for index, (name, action) in enumerate(actions.items(), start=1):
+            with self.subTest(api=name):
+                root = self.state_home / f"afk-sibling-{index}"
+                store = RunStore(root)
+                store.create_run(
+                    bead_id="central-bhap.8.6",
+                    repository="https://example.invalid/acme/beads-webui.git",
+                    base_branch="main",
+                    base_sha=BASE_SHA,
+                    start_request={},
+                    run_id="run-001",
+                )
+                store.write_evidence_value(
+                    "run-001",
+                    "attempts/open/result.json",
+                    {"status": "external"},
+                )
+                store.write_evidence_value(
+                    "run-001",
+                    "attempts/open/input.json",
+                    {"status": "external"},
+                )
+                store.write_evidence_value(
+                    "run-001",
+                    "gates/sealed/result.json",
+                    {"status": "external"},
+                )
+                store.seal_evidence("run-001", "gates/sealed")
+                source = self.state_home / f"source-{index}.txt"
+                source.write_text("external\n", encoding="utf-8")
+                selected_run = root / "runs" / "run-001"
+                external_run = self.state_home / f"external-run-{index}"
+                selected_run.rename(external_run)
+                selected_run.symlink_to(external_run, target_is_directory=True)
+
+                with self.assertRaisesRegex(EvidenceError, "evidence path is invalid"):
+                    action(store, source)
+
+    def test_evidence_apis_reject_a_mismatched_selected_run_identity(self):
+        actions = {
+            "write": lambda store: store.write_evidence_value(
+                "run-001",
+                "attempts/open/input.json",
+                {"status": "external"},
+            ),
+            "verify": lambda store: store.verify_evidence(
+                "run-001",
+                "gates/sealed",
+            ),
+            "receipt-backed observation": lambda store: (
+                store.observe_sealed_evidence_result(
+                    "run-001",
+                    "gates/sealed",
+                )
+            ),
+        }
+        for index, (name, action) in enumerate(actions.items(), start=1):
+            with self.subTest(api=name):
+                root = self.state_home / f"afk-identity-{index}"
+                store = RunStore(root)
+                store.create_run(
+                    bead_id="central-bhap.8.6",
+                    repository="https://example.invalid/acme/beads-webui.git",
+                    base_branch="main",
+                    base_sha=BASE_SHA,
+                    start_request={},
+                    run_id="run-001",
+                )
+                store.write_evidence_value(
+                    "run-001",
+                    "gates/sealed/result.json",
+                    {"status": "external"},
+                )
+                store.seal_evidence("run-001", "gates/sealed")
+                identity_path = root / "runs" / "run-001" / "run.json"
+                identity = json.loads(identity_path.read_text(encoding="utf-8"))
+                identity["run_id"] = "other-run"
+                identity_path.write_text(
+                    json.dumps(identity, sort_keys=True, separators=(",", ":")) + "\n",
+                    encoding="utf-8",
+                )
+
+                with self.assertRaisesRegex(
+                    EventHistoryCorrupt,
+                    "Run identity is invalid: run-001",
+                ):
+                    action(store)
+
+    def test_evidence_apis_hold_the_open_unit_across_a_directory_swap(self):
+        cases = {
+            "write": (
+                False,
+                lambda store: store.write_evidence_value(
+                    "run-001", "attempts/open/output.json", {"source": "selected"}
+                ),
+                {"source": "selected"},
+            ),
+            "verify": (
+                True,
+                lambda store: store.verify_evidence("run-001", "attempts/open"),
+                True,
+            ),
+            "seal": (
+                False,
+                lambda store: store.seal_evidence("run-001", "attempts/open"),
+                None,
+            ),
+            "partial value": (
+                False,
+                lambda store: store.partial_evidence_value(
+                    "run-001", "attempts/open/input.json"
+                ),
+                {"source": "selected"},
+            ),
+            "partial files": (
+                False,
+                lambda store: store.partial_evidence_files("run-001", "attempts/open"),
+                ("input.json",),
+            ),
+            "reconcile": (
+                False,
+                lambda store: store.reconcile_evidence_value(
+                    "run-001",
+                    "attempts/open/input.json",
+                    {"source": "selected"},
+                ),
+                {"source": "selected"},
+            ),
+        }
+        for index, (name, (sealed, action, expected)) in enumerate(
+            cases.items(), start=1
+        ):
+            with self.subTest(api=name):
+                root = self.state_home / f"afk-swap-{index}"
+                store = RunStore(root)
+                store.create_run(
+                    bead_id="central-bhap.8.6",
+                    repository="https://example.invalid/acme/beads-webui.git",
+                    base_branch="main",
+                    base_sha=BASE_SHA,
+                    start_request={},
+                    run_id="run-001",
+                )
+                store.write_evidence_value(
+                    "run-001",
+                    "attempts/open/input.json",
+                    {"source": "selected"},
+                )
+                if sealed:
+                    store.seal_evidence("run-001", "attempts/open")
+                selected = root / "runs" / "run-001" / "attempts" / "open"
+                detached = selected.parent / f"detached-{index}"
+                external = self.state_home / f"external-{index}"
+                external.mkdir()
+                (external / "input.json").write_text(
+                    '{"source":"external"}\n',
+                    encoding="utf-8",
+                )
+                before = {
+                    path.relative_to(external).as_posix()
+                    or ".": (
+                        path.read_bytes() if path.is_file() else None,
+                        stat.S_IMODE(path.stat().st_mode),
+                    )
+                    for path in [external, *external.rglob("*")]
+                }
+                original_open = store._open_observation_evidence
+                swapped = False
+
+                @contextmanager
+                def swap_after_open(*args, **kwargs):
+                    nonlocal swapped
+                    with original_open(*args, **kwargs) as descriptors:
+                        if not swapped and args[1] == "attempts/open":
+                            swapped = True
+                            selected.rename(detached)
+                            selected.symlink_to(external, target_is_directory=True)
+                        yield descriptors
+
+                with patch.object(
+                    store,
+                    "_open_observation_evidence",
+                    new=swap_after_open,
+                ):
+                    observed = action(store)
+
+                if expected is not None:
+                    self.assertEqual(observed, expected)
+                self.assertTrue(swapped)
+                after = {
+                    path.relative_to(external).as_posix()
+                    or ".": (
+                        path.read_bytes() if path.is_file() else None,
+                        stat.S_IMODE(path.stat().st_mode),
+                    )
+                    for path in [external, *external.rglob("*")]
+                }
+                self.assertEqual(after, before)
+
+    def test_recursive_evidence_operations_hold_nested_entries_after_discovery(self):
+        cases = {
+            "seal": (
+                False,
+                lambda store: store.seal_evidence("run-001", "attempts/open"),
+                EvidenceTampered,
+            ),
+            "verify": (
+                True,
+                lambda store: store.verify_evidence("run-001", "attempts/open"),
+                EvidenceTampered,
+            ),
+            "sealed payloads": (
+                True,
+                lambda store: store.sealed_evidence_payloads(
+                    "run-001", "attempts/open"
+                ),
+                EvidenceTampered,
+            ),
+            "partial files": (
+                False,
+                lambda store: store.partial_evidence_files("run-001", "attempts/open"),
+                ("nested/input.txt",),
+            ),
+        }
+        for index, (name, (sealed, action, expected)) in enumerate(
+            cases.items(), start=1
+        ):
+            with self.subTest(api=name):
+                root = self.state_home / f"afk-nested-swap-{index}"
+                store = RunStore(root)
+                store.create_run(
+                    bead_id="central-bhap.8.6",
+                    repository="https://example.invalid/acme/beads-webui.git",
+                    base_branch="main",
+                    base_sha=BASE_SHA,
+                    start_request={},
+                    run_id="run-001",
+                )
+                store.write_evidence_text(
+                    "run-001",
+                    "attempts/open/nested/input.txt",
+                    "selected\n",
+                )
+                if sealed:
+                    store.seal_evidence("run-001", "attempts/open")
+                unit = root / "runs" / "run-001" / "attempts" / "open"
+                if sealed:
+                    unit.chmod(0o700)
+                nested = unit / "nested"
+                detached = unit / "detached"
+                external = self.state_home / f"nested-external-{index}"
+                external.mkdir()
+                (external / "input.txt").write_text("external\n", encoding="utf-8")
+                before = {
+                    path.relative_to(external).as_posix()
+                    or ".": (
+                        path.read_bytes() if path.is_file() else None,
+                        stat.S_IMODE(path.stat().st_mode),
+                    )
+                    for path in [external, *external.rglob("*")]
+                }
+                original_listdir = os.listdir
+                nested_inode = nested.stat().st_ino
+                swapped = False
+
+                def swap_after_nested_open(descriptor):
+                    nonlocal swapped
+                    if not swapped and os.fstat(descriptor).st_ino == nested_inode:
+                        swapped = True
+                        nested.rename(detached)
+                        nested.symlink_to(external, target_is_directory=True)
+                    return original_listdir(descriptor)
+
+                with patch(
+                    "afk.run_store.os.listdir",
+                    new=swap_after_nested_open,
+                ):
+                    if isinstance(expected, type) and issubclass(expected, Exception):
+                        with self.assertRaises(expected):
+                            action(store)
+                    else:
+                        self.assertEqual(action(store), expected)
+
+                self.assertTrue(swapped)
+                after = {
+                    path.relative_to(external).as_posix()
+                    or ".": (
+                        path.read_bytes() if path.is_file() else None,
+                        stat.S_IMODE(path.stat().st_mode),
+                    )
+                    for path in [external, *external.rglob("*")]
+                }
+                self.assertEqual(after, before)
+
+    def test_many_evidence_files_seal_and_verify_with_a_low_descriptor_limit(self):
+        script = """
+import resource
+import sys
+from pathlib import Path
+
+from afk.run_store import EvidenceError, RunStore
+
+root = Path(sys.argv[1])
+store = RunStore(root)
+deep_store = RunStore(root.parent / "deep")
+store.create_run(
+    bead_id="central-bhap.8.6",
+    repository="https://example.invalid/acme/beads-webui.git",
+    base_branch="main",
+    base_sha="a" * 40,
+    start_request={},
+    run_id="run-001",
+)
+for index in range(80):
+    store.write_evidence_text(
+        "run-001",
+        f"attempts/open/files/{index:03}.txt",
+        "",
+    )
+deep_store.create_run(
+    bead_id="central-bhap.8.6",
+    repository="https://example.invalid/acme/beads-webui.git",
+    base_branch="main",
+    base_sha="a" * 40,
+    start_request={},
+    run_id="run-002",
+)
+deep_path = "attempts/open/" + "/".join(f"d{index:02}" for index in range(80))
+deep_store.write_evidence_text("run-002", f"{deep_path}/input.txt", "")
+_, hard_limit = resource.getrlimit(resource.RLIMIT_NOFILE)
+resource.setrlimit(resource.RLIMIT_NOFILE, (64, hard_limit))
+store.seal_evidence("run-001", "attempts/open")
+store.verify_evidence("run-001", "attempts/open")
+try:
+    deep_store.seal_evidence("run-002", "attempts/open")
+except EvidenceError as exc:
+    message = str(exc)
+    if "Too many open files" not in message or "symlink" in message:
+        raise AssertionError(message) from exc
+else:
+    raise AssertionError("deep traversal unexpectedly succeeded")
+"""
+        result = subprocess.run(
+            [sys.executable, "-c", script, str(self.state_home / "limited")],
+            cwd=ROOT,
+            env={**os.environ, "PYTHONPATH": str(ROOT / "src")},
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_sealed_evidence_result_does_not_repair_changed_published_evidence(self):
         self.create_run()
@@ -951,6 +1973,124 @@ class RunStoreTest(unittest.TestCase):
         self.assertEqual(readable.returncode, 0, readable.stderr)
         self.assertIn("run-001", readable.stdout)
         self.assertIn("created", readable.stdout)
+
+    def test_retrospective_status_rejects_a_symlinked_run_without_episodes(self):
+        self.create_run()
+        selected_run = self.root / "runs" / "run-001"
+        external_run = self.state_home / "external-run"
+        selected_run.rename(external_run)
+        selected_run.symlink_to(external_run, target_is_directory=True)
+        before = {
+            path.relative_to(external_run).as_posix()
+            or ".": (
+                path.read_bytes() if path.is_file() else None,
+                stat.S_IMODE(path.stat().st_mode),
+            )
+            for path in [external_run, *external_run.rglob("*")]
+        }
+
+        with self.assertRaisesRegex(EvidenceError, "evidence path is invalid"):
+            build_retrospective_status(self.store, "run-001")
+
+        after = {
+            path.relative_to(external_run).as_posix()
+            or ".": (
+                path.read_bytes() if path.is_file() else None,
+                stat.S_IMODE(path.stat().st_mode),
+            )
+            for path in [external_run, *external_run.rglob("*")]
+        }
+        self.assertEqual(after, before)
+
+    def test_event_history_rejects_a_symlinked_selected_run(self):
+        self.create_run()
+        selected_run = self.root / "runs" / "run-001"
+        external_run = self.state_home / "external-run"
+        selected_run.rename(external_run)
+        selected_run.symlink_to(external_run, target_is_directory=True)
+
+        with self.assertRaisesRegex(EvidenceError, "evidence path is invalid"):
+            self.store.event_history("run-001")
+
+    def test_retrospective_status_keeps_one_run_open_across_events_and_evidence(self):
+        self.create_run()
+        projection = self.store.record_attention_episode(
+            "run-001",
+            checkpoint="created",
+            attention={
+                "scope": "worker_launch",
+                "kind": "unavailable",
+                "summary": "worker launch unavailable",
+            },
+        )
+        episode = projection["attention_episode"]
+        outcome = {
+            "schema_version": 1,
+            "run_id": "run-001",
+            "episode_sequence": episode["episode_sequence"],
+            "status": "unavailable",
+            "warning": True,
+            "process_findings_count": 0,
+            "improvement_proposals_count": 0,
+            "warning_summary": "analysis unavailable",
+        }
+        self.store.reconcile_evidence_result(
+            "run-001",
+            episode["evidence"],
+            outcome,
+        )
+        selected_run = self.root / "runs" / "run-001"
+        replacement_run = self.root / "runs" / "replacement"
+        detached_run = self.root / "runs" / "detached"
+        shutil.copytree(selected_run, replacement_run)
+        replacement_evidence = replacement_run / episode["evidence"]
+        replacement_evidence.chmod(0o700)
+        shutil.rmtree(replacement_evidence)
+        original_read_events_at = self.store._read_events_at
+        after_swap = {}
+
+        def swap_after_events(run_descriptor, run_id, *, require_complete=False):
+            observed = original_read_events_at(
+                run_descriptor,
+                run_id,
+                require_complete=require_complete,
+            )
+            selected_run.rename(detached_run)
+            replacement_run.rename(selected_run)
+            after_swap.update(
+                {
+                    f"{root.name}/{path.relative_to(root).as_posix() or '.'}": (
+                        path.read_bytes() if path.is_file() else None,
+                        stat.S_IMODE(path.stat().st_mode),
+                    )
+                    for root in (selected_run, detached_run)
+                    for path in (root, *root.rglob("*"))
+                }
+            )
+            return observed
+
+        with patch.object(
+            self.store,
+            "_read_events_at",
+            side_effect=swap_after_events,
+        ):
+            retrospective = build_retrospective_status(self.store, "run-001")
+
+        self.assertEqual(retrospective["status"], "unavailable")
+        self.assertEqual(
+            retrospective["episode_counts"],
+            {"total": 1, "sealed": 1, "warning": 1, "absent": 0},
+        )
+        self.assertEqual(retrospective["evidence_paths"], [episode["evidence"]])
+        observed_after = {
+            f"{root.name}/{path.relative_to(root).as_posix() or '.'}": (
+                path.read_bytes() if path.is_file() else None,
+                stat.S_IMODE(path.stat().st_mode),
+            )
+            for root in (selected_run, detached_run)
+            for path in (root, *root.rglob("*"))
+        }
+        self.assertEqual(observed_after, after_swap)
 
 
 if __name__ == "__main__":
