@@ -1125,6 +1125,66 @@ class RunStoreTest(unittest.TestCase):
 
         self.assertEqual(observed, expected)
 
+    def test_observation_returns_the_result_snapshot_verified_by_the_manifest(self):
+        self.create_run()
+        unit = "gates/completion"
+        expected = {"status": "verified"}
+        substituted = {"status": "substituted"}
+        self.store.write_evidence_value("run-001", f"{unit}/result.json", expected)
+        self.store.seal_evidence("run-001", unit)
+        result_path = self.root / "runs" / "run-001" / unit / "result.json"
+        verify_evidence_directory = self.store._verify_evidence_directory
+
+        def substitute_result_after_verification(directory, relative_directory):
+            verified = verify_evidence_directory(directory, relative_directory)
+            result_path.chmod(0o600)
+            result_path.write_text(json.dumps(substituted) + "\n", encoding="utf-8")
+            result_path.chmod(0o400)
+            return verified
+
+        with patch.object(
+            self.store,
+            "_verify_evidence_directory",
+            side_effect=substitute_result_after_verification,
+        ):
+            observed = self.store.observe_sealed_evidence_result("run-001", unit)
+
+        self.assertEqual(observed, expected)
+        self.assertEqual(
+            json.loads(result_path.read_text(encoding="utf-8")),
+            substituted,
+        )
+
+    def test_recovery_returns_the_result_snapshot_verified_by_the_manifest(self):
+        self.create_run()
+        unit = "gates/completion"
+        expected = {"status": "verified"}
+        substituted = {"status": "substituted"}
+        self.store.write_evidence_value("run-001", f"{unit}/result.json", expected)
+        self.store.seal_evidence("run-001", unit)
+        result_path = self.root / "runs" / "run-001" / unit / "result.json"
+        verify_evidence_directory = self.store._verify_evidence_directory
+
+        def substitute_result_after_verification(directory, relative_directory):
+            verified = verify_evidence_directory(directory, relative_directory)
+            result_path.chmod(0o600)
+            result_path.write_text(json.dumps(substituted) + "\n", encoding="utf-8")
+            result_path.chmod(0o400)
+            return verified
+
+        with patch.object(
+            self.store,
+            "_verify_evidence_directory",
+            side_effect=substitute_result_after_verification,
+        ):
+            observed = self.store.sealed_evidence_result("run-001", unit)
+
+        self.assertEqual(observed, expected)
+        self.assertEqual(
+            json.loads(result_path.read_text(encoding="utf-8")),
+            substituted,
+        )
+
     def test_observation_rejects_a_symlinked_run_without_reading_external_evidence(
         self,
     ):

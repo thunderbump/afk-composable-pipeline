@@ -12,7 +12,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import get_ident
-from typing import Any, Iterator
+from typing import Any, Iterator, NamedTuple
 
 from afk.durable_id import is_durable_id
 from afk.jsonutil import canonical_json
@@ -83,6 +83,11 @@ class ProjectedEvidenceTampered(EvidenceTampered):
 
 class ResumePreflightInvalid(EventHistoryCorrupt):
     pass
+
+
+class _VerifiedEvidence(NamedTuple):
+    manifest_digest: str
+    result_bytes: bytes | None
 
 
 def default_state_root() -> Path:
@@ -741,11 +746,13 @@ class RunStore:
     def _verify_evidence_manifest(self, run_id: str, relative_directory: str) -> str:
         """Verify sealed evidence and return its canonical manifest digest."""
         directory = self._evidence_path(run_id, relative_directory)
-        return self._verify_evidence_directory(directory, relative_directory)
+        return self._verify_evidence_directory(
+            directory, relative_directory
+        ).manifest_digest
 
     def _verify_evidence_directory(
         self, directory: Path, relative_directory: str
-    ) -> str:
+    ) -> _VerifiedEvidence:
         manifest_path = directory / "manifest.json"
         try:
             if not stat.S_ISREG(manifest_path.lstat().st_mode):
@@ -758,7 +765,7 @@ class RunStore:
         expected = _validate_manifest(manifest)
         try:
             files = _evidence_files(directory)
-            observed = _manifest_entries(
+            observed, result_bytes = _manifest_snapshot(
                 directory, files, _tree_limit(relative_directory)
             )
         except EvidenceError as exc:
@@ -775,7 +782,7 @@ class RunStore:
         for path in [*files, manifest_path, *directories]:
             if stat.S_IMODE(path.stat().st_mode) & 0o222:
                 raise EvidenceTampered("sealed evidence is writable")
-        return _canonical_sha256(manifest)
+        return _VerifiedEvidence(_canonical_sha256(manifest), result_bytes)
 
     def reconcile_evidence_result(
         self, run_id: str, relative_directory: str, value: Any
@@ -787,8 +794,8 @@ class RunStore:
             result_path = directory / "result.json"
             expected = redact_artifact_value(value)
             if manifest_path.is_file():
-                self._verify_or_finish_seal(run_id, relative_directory)
-                stored = _read_evidence_result(result_path)
+                verified = self._verify_or_finish_seal(run_id, relative_directory)
+                stored = _read_evidence_result_bytes(verified.result_bytes)
                 if stored != expected:
                     raise EvidenceError("evidence result contradicts expected value")
                 return stored
@@ -831,13 +838,13 @@ class RunStore:
                         raise EvidenceTampered("evidence manifest is invalid")
                     if not manifest_path.is_file():
                         return None
-                    self._verify_or_finish_seal_at(
+                    verified = self._verify_or_finish_seal_at(
                         run_descriptor,
                         evidence_descriptor,
                         parent_descriptor,
                         relative_directory,
                     )
-                    return _read_evidence_result(directory / "result.json")
+                    return _read_evidence_result_bytes(verified.result_bytes)
 
     def observe_sealed_evidence_result(
         self, run_id: str, relative_directory: str
@@ -868,17 +875,17 @@ class RunStore:
                     if receipt is None:
                         return None
                     raise EvidenceTampered("evidence manifest is missing or invalid")
-                manifest_digest = self._verify_evidence_directory(
+                verified = self._verify_evidence_directory(
                     directory, relative_directory
                 )
                 if (
                     receipt is not None
-                    and receipt["manifest_sha256"] != manifest_digest
+                    and receipt["manifest_sha256"] != verified.manifest_digest
                 ):
                     raise EvidenceTampered(
                         "evidence receipt does not match its manifest"
                     )
-                return _read_evidence_result(directory / "result.json")
+                return _read_evidence_result_bytes(verified.result_bytes)
 
     def sealed_evidence_payloads(
         self, run_id: str, relative_directory: str
@@ -898,15 +905,19 @@ class RunStore:
                     ) from exc
             return payloads
 
-    def _verify_or_finish_seal(self, run_id: str, relative_directory: str) -> None:
+    def _verify_or_finish_seal(
+        self, run_id: str, relative_directory: str
+    ) -> _VerifiedEvidence:
         directory, relative_directory = self._evidence_directory_identity(
             run_id, relative_directory
         )
         receipt = self._read_evidence_receipt(run_id, relative_directory)
         try:
-            manifest_digest = self._verify_evidence_manifest(run_id, relative_directory)
-            self._publish_evidence_receipt(run_id, relative_directory, manifest_digest)
-            return
+            verified = self._verify_evidence_directory(directory, relative_directory)
+            self._publish_evidence_receipt(
+                run_id, relative_directory, verified.manifest_digest
+            )
+            return verified
         except EvidenceTampered as exc:
             if str(exc) != "sealed evidence is writable" or receipt is not None:
                 raise
@@ -920,8 +931,11 @@ class RunStore:
         directory.chmod(0o500)
         _fsync_directory(directory)
         _fsync_directory(directory.parent)
-        manifest_digest = self._verify_evidence_manifest(run_id, relative_directory)
-        self._publish_evidence_receipt(run_id, relative_directory, manifest_digest)
+        verified = self._verify_evidence_directory(directory, relative_directory)
+        self._publish_evidence_receipt(
+            run_id, relative_directory, verified.manifest_digest
+        )
+        return verified
 
     def _verify_or_finish_seal_at(
         self,
@@ -929,17 +943,17 @@ class RunStore:
         evidence_descriptor: int,
         parent_descriptor: int,
         relative_directory: str,
-    ) -> None:
+    ) -> _VerifiedEvidence:
         directory = Path(f"/proc/self/fd/{evidence_descriptor}")
         receipt = self._read_evidence_receipt_at(run_descriptor, relative_directory)
         try:
-            manifest_digest = self._verify_evidence_directory(
-                directory, relative_directory
-            )
+            verified = self._verify_evidence_directory(directory, relative_directory)
             self._publish_evidence_receipt_at(
-                run_descriptor, relative_directory, manifest_digest
+                run_descriptor,
+                relative_directory,
+                verified.manifest_digest,
             )
-            return
+            return verified
         except EvidenceTampered as exc:
             if str(exc) != "sealed evidence is writable" or receipt is not None:
                 raise
@@ -953,10 +967,13 @@ class RunStore:
         os.fchmod(evidence_descriptor, 0o500)
         os.fsync(evidence_descriptor)
         os.fsync(parent_descriptor)
-        manifest_digest = self._verify_evidence_directory(directory, relative_directory)
+        verified = self._verify_evidence_directory(directory, relative_directory)
         self._publish_evidence_receipt_at(
-            run_descriptor, relative_directory, manifest_digest
+            run_descriptor,
+            relative_directory,
+            verified.manifest_digest,
         )
+        return verified
 
     def _evidence_receipt_path(self, run_id: str, relative_directory: str) -> Path:
         digest = hashlib.sha256(relative_directory.encode("utf-8")).hexdigest()
@@ -2275,6 +2292,15 @@ def _read_evidence_result(path: Path) -> Any:
         raise EvidenceError("evidence result is missing or malformed") from exc
 
 
+def _read_evidence_result_bytes(value: bytes | None) -> Any:
+    try:
+        if value is None:
+            raise ValueError
+        return json.loads(value.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise EvidenceError("evidence result is missing or malformed") from exc
+
+
 def _write_new_bytes(
     path: Path, value: bytes, staging_root: Path, *, mode: int = 0o600
 ) -> None:
@@ -2367,8 +2393,16 @@ def _evidence_files(directory: Path) -> list[Path]:
 def _manifest_entries(
     directory: Path, files: list[Path], byte_limit: int
 ) -> list[dict[str, Any]]:
+    entries, _ = _manifest_snapshot(directory, files, byte_limit)
+    return entries
+
+
+def _manifest_snapshot(
+    directory: Path, files: list[Path], byte_limit: int
+) -> tuple[list[dict[str, Any]], bytes | None]:
     _validate_evidence_sizes(files, byte_limit)
     entries = []
+    result_bytes = None
     for path in files:
         size = path.stat().st_size
         try:
@@ -2380,14 +2414,17 @@ def _manifest_entries(
             raise EvidenceError(
                 "evidence must cross the redaction boundary before sealing"
             )
+        relative = path.relative_to(directory).as_posix()
+        if relative == "result.json":
+            result_bytes = payload
         entries.append(
             {
-                "path": path.relative_to(directory).as_posix(),
+                "path": relative,
                 "bytes": size,
                 "sha256": hashlib.sha256(payload).hexdigest(),
             }
         )
-    return entries
+    return entries, result_bytes
 
 
 def _validate_evidence_sizes(files: list[Path], byte_limit: int) -> None:
