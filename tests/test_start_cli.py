@@ -13,6 +13,7 @@ import time
 import unittest
 from io import StringIO
 from pathlib import Path
+from typing import NamedTuple
 from unittest.mock import patch
 
 
@@ -48,6 +49,13 @@ from afk.start import (  # noqa: E402
 BASE_SHA = "a" * 40
 RAW_ANALYSIS_SENTINEL = "RAW_RETROSPECTIVE_ANALYSIS_SENTINEL"
 SENSITIVE_RETROSPECTIVE_SENTINEL = "sensitive-retrospective-token"
+
+
+class _RetrospectiveOutcomeCase(NamedTuple):
+    mode: str
+    expected: dict[str, object]
+
+
 CRASH_INJECTION_OVERRIDES = (
     "AFK_TEST_KILL_BEFORE_EVENT",
     "AFK_TEST_KILL_AFTER_EVENT",
@@ -63,7 +71,7 @@ CRASH_INJECTION_OVERRIDES = (
     "AFK_TEST_KILL_AFTER_COMPLETION_FINALIZATION",
 )
 RETROSPECTIVE_OUTCOME_CASES = (
-    (
+    _RetrospectiveOutcomeCase(
         "populated",
         {
             "schema_version": 1,
@@ -73,7 +81,7 @@ RETROSPECTIVE_OUTCOME_CASES = (
             "improvement_proposals_count": 1,
         },
     ),
-    (
+    _RetrospectiveOutcomeCase(
         "empty",
         {
             "schema_version": 1,
@@ -83,7 +91,7 @@ RETROSPECTIVE_OUTCOME_CASES = (
             "improvement_proposals_count": 0,
         },
     ),
-    (
+    _RetrospectiveOutcomeCase(
         "invalid",
         {
             "schema_version": 1,
@@ -97,7 +105,7 @@ RETROSPECTIVE_OUTCOME_CASES = (
             ),
         },
     ),
-    (
+    _RetrospectiveOutcomeCase(
         "unavailable",
         {
             "schema_version": 1,
@@ -108,7 +116,7 @@ RETROSPECTIVE_OUTCOME_CASES = (
             "warning_summary": "analysis process exited 7",
         },
     ),
-    (
+    _RetrospectiveOutcomeCase(
         "interrupted",
         {
             "schema_version": 1,
@@ -364,6 +372,40 @@ class StartCliTest(unittest.TestCase):
         )
         self.assertTrue(store.verify_evidence(run_id, episode["evidence"]))
         return outcome
+
+    def assert_retrospective_public_proof(
+        self,
+        store,
+        run_id,
+        before,
+        episode,
+        expected,
+        observed,
+        manifest,
+    ):
+        self.assert_exact_retrospective_outcome(
+            store,
+            run_id,
+            episode,
+            expected=expected,
+        )
+        retrospective = observed["retrospective"]
+        self.assertEqual(
+            retrospective["latest"]["episode_sequence"],
+            episode["episode_sequence"],
+        )
+        self.assertEqual(
+            retrospective["latest"]["evidence_path"],
+            episode["evidence"],
+        )
+        self.assertEqual(retrospective["latest"]["status"], expected["status"])
+        self.assertEqual(store.status(run_id), before)
+        self.assertEqual(
+            (
+                store.root / "runs" / run_id / episode["evidence"] / "manifest.json"
+            ).read_bytes(),
+            manifest,
+        )
 
     def start_reviewed_run(self):
         started = self.run_afk("start", "central-bnkl.1.1")
@@ -5244,16 +5286,16 @@ class StartCliTest(unittest.TestCase):
 
     def test_completion_retrospective_outcomes_remain_advisory_and_exact(self):
         control = self.fake_bin / ".fake-retrospective-mode"
-        for mode, expected in RETROSPECTIVE_OUTCOME_CASES:
-            with self.subTest(mode=mode):
-                state_home = self.temp / f"completion-{mode}"
-                home = self.temp / f"completion-{mode}-home"
+        for case in RETROSPECTIVE_OUTCOME_CASES:
+            with self.subTest(mode=case.mode):
+                state_home = self.temp / f"completion-{case.mode}"
+                home = self.temp / f"completion-{case.mode}-home"
                 home.mkdir()
                 environment = {
                     "XDG_STATE_HOME": str(state_home),
                     "HOME": str(home),
                 }
-                control.write_text(mode, encoding="utf-8")
+                control.write_text(case.mode, encoding="utf-8")
                 started = self.run_afk(
                     "start",
                     "central-bnkl.1.1",
@@ -5273,12 +5315,6 @@ class StartCliTest(unittest.TestCase):
                 store = RunStore(state_home / "afk")
                 before = store.status(run_id)
                 episode = before["completion_episode"]
-                self.assert_exact_retrospective_outcome(
-                    store,
-                    run_id,
-                    episode,
-                    expected=expected,
-                )
                 run_dir = state_home / "afk" / "runs" / run_id
                 events = (run_dir / "events.jsonl").read_bytes()
                 manifest = (
@@ -5297,25 +5333,16 @@ class StartCliTest(unittest.TestCase):
 
                 self.assertEqual(repeated.returncode, 0, repeated.stderr)
                 self.assertEqual(observed.returncode, 0, observed.stderr)
-                retrospective = json.loads(observed.stdout)["retrospective"]
-                self.assertEqual(
-                    retrospective["latest"]["episode_sequence"],
-                    episode["episode_sequence"],
-                )
-                self.assertEqual(
-                    retrospective["latest"]["evidence_path"],
-                    episode["evidence"],
-                )
-                self.assertEqual(
-                    retrospective["latest"]["status"],
-                    expected["status"],
-                )
-                self.assertEqual(store.status(run_id), before)
-                self.assertEqual((run_dir / "events.jsonl").read_bytes(), events)
-                self.assertEqual(
-                    (run_dir / episode["evidence"] / "manifest.json").read_bytes(),
+                self.assert_retrospective_public_proof(
+                    store,
+                    run_id,
+                    before,
+                    episode,
+                    case.expected,
+                    json.loads(observed.stdout),
                     manifest,
                 )
+                self.assertEqual((run_dir / "events.jsonl").read_bytes(), events)
 
     def test_completion_retrospective_store_error_retains_single_completed_event(self):
         run_id = self.start_reviewed_run()
@@ -11443,15 +11470,15 @@ class StartCliTest(unittest.TestCase):
 
     def test_attention_retrospective_outcomes_remain_advisory_and_exact(self):
         control = self.fake_bin / ".fake-retrospective-mode"
-        for mode, expected in RETROSPECTIVE_OUTCOME_CASES:
-            with self.subTest(mode=mode):
-                state_home = self.temp / f"attention-{mode}"
+        for case in RETROSPECTIVE_OUTCOME_CASES:
+            with self.subTest(mode=case.mode):
+                state_home = self.temp / f"attention-{case.mode}"
                 project_before = {
                     path.relative_to(self.project): path.read_bytes()
                     for path in self.project.rglob("*")
                     if path.is_file()
                 }
-                control.write_text(mode, encoding="utf-8")
+                control.write_text(case.mode, encoding="utf-8")
 
                 completed = self.run_afk(
                     "start",
@@ -11464,12 +11491,6 @@ class StartCliTest(unittest.TestCase):
                 store = RunStore(state_home / "afk")
                 before = store.status()
                 episode = before["attention_episode"]
-                self.assert_exact_retrospective_outcome(
-                    store,
-                    before["run_id"],
-                    episode,
-                    expected=expected,
-                )
                 manifest = (
                     state_home
                     / "afk"
@@ -11489,29 +11510,13 @@ class StartCliTest(unittest.TestCase):
                 )
 
                 self.assertEqual(observed.returncode, 2, observed.stderr)
-                retrospective = json.loads(observed.stdout)["retrospective"]
-                self.assertEqual(
-                    retrospective["latest"]["episode_sequence"],
-                    episode["episode_sequence"],
-                )
-                self.assertEqual(
-                    retrospective["latest"]["evidence_path"],
-                    episode["evidence"],
-                )
-                self.assertEqual(
-                    retrospective["latest"]["status"],
-                    expected["status"],
-                )
-                self.assertEqual(store.status(before["run_id"]), before)
-                self.assertEqual(
-                    (
-                        state_home
-                        / "afk"
-                        / "runs"
-                        / before["run_id"]
-                        / episode["evidence"]
-                        / "manifest.json"
-                    ).read_bytes(),
+                self.assert_retrospective_public_proof(
+                    store,
+                    before["run_id"],
+                    before,
+                    episode,
+                    case.expected,
+                    json.loads(observed.stdout),
                     manifest,
                 )
                 self.assertEqual(
