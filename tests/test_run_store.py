@@ -1057,8 +1057,14 @@ class RunStoreTest(unittest.TestCase):
         replacement_manifest = {**verified_manifest, "total_bytes": 999}
         verify_evidence_directory = self.store._verify_evidence_directory
 
-        def replace_manifest_after_verification(directory, relative_directory):
-            verified = verify_evidence_directory(directory, relative_directory)
+        def replace_manifest_after_verification(
+            directory, relative_directory, *, payload_capture
+        ):
+            verified = verify_evidence_directory(
+                directory,
+                relative_directory,
+                payload_capture=payload_capture,
+            )
             manifest_path.chmod(0o600)
             manifest_path.write_text(
                 json.dumps(replacement_manifest),
@@ -1225,8 +1231,14 @@ class RunStoreTest(unittest.TestCase):
         result_path = self.root / "runs" / "run-001" / unit / "result.json"
         verify_evidence_directory = self.store._verify_evidence_directory
 
-        def substitute_result_after_verification(directory, relative_directory):
-            verified = verify_evidence_directory(directory, relative_directory)
+        def substitute_result_after_verification(
+            directory, relative_directory, *, payload_capture
+        ):
+            verified = verify_evidence_directory(
+                directory,
+                relative_directory,
+                payload_capture=payload_capture,
+            )
             result_path.chmod(0o600)
             result_path.write_text(json.dumps(substituted) + "\n", encoding="utf-8")
             result_path.chmod(0o400)
@@ -1245,6 +1257,45 @@ class RunStoreTest(unittest.TestCase):
             substituted,
         )
 
+    def test_verification_captures_only_the_requested_payload_snapshots(self):
+        self.create_run()
+        unit = "gates/completion"
+        self.store.write_evidence_value(
+            "run-001", f"{unit}/result.json", {"status": "verified"}
+        )
+        self.store.write_evidence_text("run-001", f"{unit}/extra.txt", "extra\n")
+        self.store.seal_evidence("run-001", unit)
+        directory = self.root / "runs" / "run-001" / unit
+
+        manifest_only = self.store._verify_evidence_directory(
+            directory,
+            unit,
+            payload_capture="none",
+        )
+        result_only = self.store._verify_evidence_directory(
+            directory,
+            unit,
+            payload_capture="result",
+        )
+        all_payloads = self.store._verify_evidence_directory(
+            directory,
+            unit,
+            payload_capture="all",
+        )
+
+        self.assertEqual(manifest_only.payload_bytes, {})
+        self.assertEqual(
+            result_only.payload_bytes,
+            {"result.json": b'{"status":"verified"}\n'},
+        )
+        self.assertEqual(
+            all_payloads.payload_bytes,
+            {
+                "extra.txt": b"extra\n",
+                "result.json": b'{"status":"verified"}\n',
+            },
+        )
+
     def test_recovery_returns_the_result_snapshot_verified_by_the_manifest(self):
         self.create_run()
         unit = "gates/completion"
@@ -1255,8 +1306,14 @@ class RunStoreTest(unittest.TestCase):
         result_path = self.root / "runs" / "run-001" / unit / "result.json"
         verify_evidence_directory = self.store._verify_evidence_directory
 
-        def substitute_result_after_verification(directory, relative_directory):
-            verified = verify_evidence_directory(directory, relative_directory)
+        def substitute_result_after_verification(
+            directory, relative_directory, *, payload_capture
+        ):
+            verified = verify_evidence_directory(
+                directory,
+                relative_directory,
+                payload_capture=payload_capture,
+            )
             result_path.chmod(0o600)
             result_path.write_text(json.dumps(substituted) + "\n", encoding="utf-8")
             result_path.chmod(0o400)
@@ -1288,8 +1345,14 @@ class RunStoreTest(unittest.TestCase):
         extra_path = self.root / "runs" / "run-001" / unit / "extra.txt"
         verify_or_finish_seal = self.store._verify_or_finish_seal
 
-        def substitute_auxiliary_after_verification(run_id, relative_directory):
-            verified = verify_or_finish_seal(run_id, relative_directory)
+        def substitute_auxiliary_after_verification(
+            run_id, relative_directory, *, payload_capture
+        ):
+            verified = verify_or_finish_seal(
+                run_id,
+                relative_directory,
+                payload_capture=payload_capture,
+            )
             extra_path.chmod(0o600)
             extra_path.write_text("substituted\n", encoding="utf-8")
             extra_path.chmod(0o400)

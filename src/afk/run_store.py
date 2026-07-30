@@ -12,7 +12,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import get_ident
-from typing import Any, Iterator, NamedTuple
+from typing import Any, Iterator, Literal, NamedTuple
 
 from afk.durable_id import is_durable_id
 from afk.jsonutil import canonical_json
@@ -753,7 +753,9 @@ class RunStore:
                 _fsync_directory(directory)
                 _fsync_directory(directory.parent)
                 verified = self._verify_evidence_directory(
-                    directory, relative_directory
+                    directory,
+                    relative_directory,
+                    payload_capture="none",
                 )
                 self._publish_evidence_receipt_at(
                     run_descriptor,
@@ -769,11 +771,19 @@ class RunStore:
             _,
             _,
         ):
-            self._verify_evidence_directory(directory, relative_directory)
+            self._verify_evidence_directory(
+                directory,
+                relative_directory,
+                payload_capture="none",
+            )
         return True
 
     def _verify_evidence_directory(
-        self, directory: Path, relative_directory: str
+        self,
+        directory: Path,
+        relative_directory: str,
+        *,
+        payload_capture: Literal["none", "result", "all"],
     ) -> _VerifiedEvidence:
         manifest_path = directory / "manifest.json"
         try:
@@ -788,7 +798,10 @@ class RunStore:
         try:
             files = _evidence_files(directory)
             observed, payload_bytes = _manifest_snapshot(
-                directory, files, _tree_limit(relative_directory)
+                directory,
+                files,
+                _tree_limit(relative_directory),
+                payload_capture=payload_capture,
             )
         except EvidenceError as exc:
             raise EvidenceTampered(str(exc)) from exc
@@ -842,6 +855,7 @@ class RunStore:
                             evidence_descriptor,
                             parent_descriptor,
                             relative_directory,
+                            payload_capture="result",
                         )
                         stored = _read_evidence_result_bytes(verified.result_bytes)
                         if stored != expected:
@@ -930,7 +944,11 @@ class RunStore:
         os.fchmod(evidence_descriptor, 0o500)
         os.fsync(evidence_descriptor)
         os.fsync(parent_descriptor)
-        verified = self._verify_evidence_directory(directory, relative_directory)
+        verified = self._verify_evidence_directory(
+            directory,
+            relative_directory,
+            payload_capture="result",
+        )
         self._publish_evidence_receipt_at(
             run_descriptor,
             relative_directory,
@@ -967,6 +985,7 @@ class RunStore:
                         evidence_descriptor,
                         parent_descriptor,
                         relative_directory,
+                        payload_capture="result",
                     )
                     return _read_evidence_result_bytes(verified.result_bytes)
 
@@ -1000,7 +1019,9 @@ class RunStore:
                         return None
                     raise EvidenceTampered("evidence manifest is missing or invalid")
                 verified = self._verify_evidence_directory(
-                    directory, relative_directory
+                    directory,
+                    relative_directory,
+                    payload_capture="result",
                 )
                 if (
                     receipt is not None
@@ -1016,7 +1037,11 @@ class RunStore:
     ) -> dict[str, str]:
         """Return every verified UTF-8 payload from one sealed evidence unit."""
         with self.lock():
-            verified = self._verify_or_finish_seal(run_id, relative_directory)
+            verified = self._verify_or_finish_seal(
+                run_id,
+                relative_directory,
+                payload_capture="all",
+            )
             payloads = {}
             for relative, payload in verified.payload_bytes.items():
                 try:
@@ -1028,7 +1053,11 @@ class RunStore:
             return payloads
 
     def _verify_or_finish_seal(
-        self, run_id: str, relative_directory: str
+        self,
+        run_id: str,
+        relative_directory: str,
+        *,
+        payload_capture: Literal["none", "result", "all"],
     ) -> _VerifiedEvidence:
         relative_directory = _canonical_evidence_relative(relative_directory)
         with self._open_observation_run(run_id) as run_descriptor:
@@ -1048,6 +1077,7 @@ class RunStore:
                     evidence_descriptor,
                     parent_descriptor,
                     relative_directory,
+                    payload_capture=payload_capture,
                 )
 
     def _verify_or_finish_seal_at(
@@ -1056,11 +1086,17 @@ class RunStore:
         evidence_descriptor: int,
         parent_descriptor: int,
         relative_directory: str,
+        *,
+        payload_capture: Literal["none", "result", "all"],
     ) -> _VerifiedEvidence:
         directory = Path(f"/proc/self/fd/{evidence_descriptor}")
         receipt = self._read_evidence_receipt_at(run_descriptor, relative_directory)
         try:
-            verified = self._verify_evidence_directory(directory, relative_directory)
+            verified = self._verify_evidence_directory(
+                directory,
+                relative_directory,
+                payload_capture=payload_capture,
+            )
             self._publish_evidence_receipt_at(
                 run_descriptor,
                 relative_directory,
@@ -1080,7 +1116,11 @@ class RunStore:
         os.fchmod(evidence_descriptor, 0o500)
         os.fsync(evidence_descriptor)
         os.fsync(parent_descriptor)
-        verified = self._verify_evidence_directory(directory, relative_directory)
+        verified = self._verify_evidence_directory(
+            directory,
+            relative_directory,
+            payload_capture=payload_capture,
+        )
         self._publish_evidence_receipt_at(
             run_descriptor,
             relative_directory,
@@ -1993,7 +2033,11 @@ class RunStore:
                 manifest = unit / "manifest.json"
                 if manifest.exists() or manifest.is_symlink():
                     try:
-                        self._verify_or_finish_seal(run_id, relative)
+                        self._verify_or_finish_seal(
+                            run_id,
+                            relative,
+                            payload_capture="none",
+                        )
                     except EvidenceTampered as exc:
                         if relative in projected_units:
                             raise ProjectedEvidenceTampered(str(exc)) from exc
@@ -2484,12 +2528,21 @@ def _evidence_files(directory: Path) -> list[Path]:
 def _manifest_entries(
     directory: Path, files: list[Path], byte_limit: int
 ) -> list[dict[str, Any]]:
-    entries, _ = _manifest_snapshot(directory, files, byte_limit)
+    entries, _ = _manifest_snapshot(
+        directory,
+        files,
+        byte_limit,
+        payload_capture="none",
+    )
     return entries
 
 
 def _manifest_snapshot(
-    directory: Path, files: list[Path], byte_limit: int
+    directory: Path,
+    files: list[Path],
+    byte_limit: int,
+    *,
+    payload_capture: Literal["none", "result", "all"],
 ) -> tuple[list[dict[str, Any]], dict[str, bytes]]:
     _validate_evidence_sizes(files, byte_limit)
     entries = []
@@ -2506,7 +2559,10 @@ def _manifest_snapshot(
                 "evidence must cross the redaction boundary before sealing"
             )
         relative = path.relative_to(directory).as_posix()
-        payload_bytes[relative] = payload
+        if payload_capture == "all" or (
+            payload_capture == "result" and relative == "result.json"
+        ):
+            payload_bytes[relative] = payload
         entries.append(
             {
                 "path": relative,
