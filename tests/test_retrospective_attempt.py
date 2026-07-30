@@ -940,9 +940,6 @@ class RetrospectiveAttemptTest(unittest.TestCase):
         self.assertTrue(self.store.verify_evidence("run-001", evidence))
 
     def test_crash_boundaries_never_relaunch_or_duplicate_an_attempt(self):
-        class SimulatedCrash(RuntimeError):
-            pass
-
         cases = (
             ("before-claim", "prepare", "before", "empty", 1),
             ("after-claim", "prepare", "after", "interrupted", 0),
@@ -980,7 +977,7 @@ class RetrospectiveAttemptTest(unittest.TestCase):
                     episode_sequence=sequence,
                 )
                 claim_id = f"retrospective-analysis-{sequence}"
-                crashed = False
+                crash_exit = 86
 
                 if boundary == "prepare":
                     original = store.prepare_effect
@@ -1021,39 +1018,48 @@ class RetrospectiveAttemptTest(unittest.TestCase):
                     target = patch.object(store, "confirm_effect")
 
                 def injected(*args, **kwargs):
-                    nonlocal crashed
                     matches = selected(args)
-                    if matches and not crashed and side == "before":
-                        crashed = True
-                        raise SimulatedCrash(label)
+                    if matches and side == "before":
+                        os._exit(crash_exit)
                     result = original(*args, **kwargs)
-                    if matches and not crashed and side == "after":
-                        crashed = True
-                        raise SimulatedCrash(label)
+                    if matches and side == "after":
+                        os._exit(crash_exit)
                     return result
 
-                with (
-                    target as injected_target,
-                    self.assertRaisesRegex(SimulatedCrash, label),
-                ):
-                    injected_target.side_effect = injected
-                    run_retrospective_attempt(
-                        store,
-                        "run-001",
-                        episode_sequence=sequence,
-                    )
+                child = os.fork()
+                if child == 0:
+                    tempfile.tempdir = str(self.root)
+                    try:
+                        with target as injected_target:
+                            injected_target.side_effect = injected
+                            run_retrospective_attempt(
+                                store,
+                                "run-001",
+                                episode_sequence=sequence,
+                            )
+                    except BaseException:
+                        os._exit(1)
+                    os._exit(0)
+                _, child_status = os.waitpid(child, 0)
+                self.assertTrue(os.WIFEXITED(child_status), child_status)
+                self.assertEqual(os.WEXITSTATUS(child_status), crash_exit)
 
+                recovered_store = RunStore(store.root)
                 outcome = run_retrospective_attempt(
-                    store,
+                    recovered_store,
                     "run-001",
                     episode_sequence=sequence,
                 )
                 manifest_path = (
-                    store.root / "runs" / "run-001" / evidence / "manifest.json"
+                    recovered_store.root
+                    / "runs"
+                    / "run-001"
+                    / evidence
+                    / "manifest.json"
                 )
                 manifest_before = manifest_path.read_bytes()
                 repeated = run_retrospective_attempt(
-                    store,
+                    recovered_store,
                     "run-001",
                     episode_sequence=sequence,
                 )
@@ -1069,11 +1075,11 @@ class RetrospectiveAttemptTest(unittest.TestCase):
                     ["started"] * expected_starts,
                 )
                 self.assertEqual(
-                    store.effect("run-001", claim_id)["status"],
+                    recovered_store.effect("run-001", claim_id)["status"],
                     "confirmed",
                 )
                 self.assertEqual(manifest_path.read_bytes(), manifest_before)
-                self.assertTrue(store.verify_evidence("run-001", evidence))
+                self.assertTrue(recovered_store.verify_evidence("run-001", evidence))
 
     def test_stale_claim_finishes_durable_result_without_relaunch(self):
         class SimulatedCrash(RuntimeError):
