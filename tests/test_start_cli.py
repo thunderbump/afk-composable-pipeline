@@ -11483,6 +11483,226 @@ class StartCliTest(unittest.TestCase):
                 )
                 self.assertFalse((state_home / "fake-mutations.jsonl").exists())
 
+    def test_one_run_retains_attention_and_completion_retrospectives_without_mutation(
+        self,
+    ):
+        control = self.fake_bin / ".fake-retrospective-mode"
+        observer = self.fake_bin / ".fake-retrospective-observer.json"
+        observer_log = self.temp / "retrospective-mutations.jsonl"
+        invocation_log = self.temp / "retrospective-invocations.jsonl"
+        canary_root = self.temp / "retrospective-external-state"
+        canary_root.mkdir()
+        canaries = {}
+        for mutation_class in (
+            "code",
+            "pr",
+            "bead",
+            "note",
+            "notification",
+            "task",
+            "analytics",
+            "network",
+        ):
+            canary = canary_root / f"{mutation_class}.json"
+            canary.write_text('{"revision":0}\n', encoding="utf-8")
+            canaries[mutation_class] = canary
+        observer.write_text(
+            json.dumps(
+                {
+                    "lifecycle_home": str(self.home),
+                    "mutation_log": str(observer_log),
+                    "invocation_log": str(invocation_log),
+                    "canaries": {
+                        mutation_class: str(canary)
+                        for mutation_class, canary in canaries.items()
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        canaries_before = {
+            mutation_class: canary.read_bytes()
+            for mutation_class, canary in canaries.items()
+        }
+        project_before = {
+            path.relative_to(self.project): path.read_bytes()
+            for path in self.project.rglob("*")
+            if path.is_file()
+        }
+
+        control.write_text("populated", encoding="utf-8")
+        started = self.run_afk(
+            "start",
+            "central-bnkl.1.1",
+            AFK_FAKE_SYSTEMD_FAILURE="1",
+        )
+
+        self.assertEqual(started.returncode, 2, started.stderr)
+        run_id = started.stdout.strip()
+        store = RunStore(self.state_home / "afk")
+        attention = store.status(run_id)
+        attention_episode = attention["attention_episode"]
+        attention_outcome = self.assert_exact_retrospective_outcome(
+            store,
+            run_id,
+            attention_episode,
+            expected_status="passed",
+            warning=False,
+            findings=1,
+            proposals=1,
+        )
+        run_dir = self.state_home / "afk" / "runs" / run_id
+        attention_manifest = (
+            run_dir / attention_episode["evidence"] / "manifest.json"
+        ).read_bytes()
+        self.assertEqual(attention["state"], "attention_required")
+
+        control.write_text("empty", encoding="utf-8")
+        retried = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="absent")
+
+        self.assertEqual(retried.returncode, 0, retried.stderr)
+        self.assertEqual(store.status(run_id)["state"], "attention_required")
+        worker = self.run_afk("_worker", run_id)
+        self.assertEqual(worker.returncode, 0, worker.stderr)
+        for _ in range(4):
+            continued = self.run_afk("resume")
+            self.assertEqual(continued.returncode, 0, continued.stderr)
+
+        completed = store.status(run_id)
+        completion_episode = completed["completion_episode"]
+        completion_outcome = self.assert_exact_retrospective_outcome(
+            store,
+            run_id,
+            completion_episode,
+            expected_status="empty",
+            warning=False,
+            findings=0,
+            proposals=0,
+        )
+        completion_manifest = (
+            run_dir / completion_episode["evidence"] / "manifest.json"
+        ).read_bytes()
+        self.assertEqual(completed["state"], "completed")
+        structured_completed = json.loads(
+            self.run_afk("status", run_id, "--json").stdout
+        )
+        self.assertEqual(
+            structured_completed["retrospective"],
+            {
+                "schema_version": 1,
+                "status": "empty",
+                "episode_counts": {
+                    "total": 2,
+                    "sealed": 2,
+                    "warning": 0,
+                    "absent": 0,
+                },
+                "process_findings_count": 1,
+                "improvement_proposals_count": 1,
+                "evidence_paths": [
+                    attention_episode["evidence"],
+                    completion_episode["evidence"],
+                ],
+                "latest": {
+                    "episode_sequence": completion_episode["episode_sequence"],
+                    "event": "run.completed",
+                    "state": "completed",
+                    "status": "empty",
+                    "warning": False,
+                    "process_findings_count": 0,
+                    "improvement_proposals_count": 0,
+                    "evidence_path": completion_episode["evidence"],
+                },
+            },
+        )
+        events_path = run_dir / "events.jsonl"
+        events_before_repeat = events_path.read_bytes()
+        self.assertEqual(
+            events_before_repeat.count(b'"event":"run.attention_required"'),
+            1,
+        )
+        self.assertEqual(events_before_repeat.count(b'"event":"run.completed"'), 1)
+        retrospective_effects = {
+            path.stem
+            for path in (run_dir / "effects").glob("retrospective-analysis-*.json")
+        }
+        self.assertEqual(
+            retrospective_effects,
+            {
+                attention_episode["effect_id"],
+                completion_episode["effect_id"],
+            },
+        )
+        for effect_id in retrospective_effects:
+            self.assertEqual(store.effect(run_id, effect_id)["status"], "confirmed")
+        self.assertEqual(
+            {
+                f"retrospective/{path.name}"
+                for path in (run_dir / "retrospective").iterdir()
+                if path.is_dir()
+            },
+            {
+                attention_episode["evidence"],
+                completion_episode["evidence"],
+                (
+                    "retrospective/run-summary-v2-"
+                    f"{attention_episode['episode_sequence']:020d}"
+                ),
+                (
+                    "retrospective/run-summary-v2-"
+                    f"{completion_episode['episode_sequence']:020d}"
+                ),
+            },
+        )
+        self.assertEqual(
+            [
+                json.loads(line)
+                for line in invocation_log.read_text(encoding="utf-8").splitlines()
+            ],
+            [
+                {"mode": "populated"},
+                {"mode": "empty"},
+            ],
+        )
+
+        repeated = self.run_afk("resume", run_id)
+
+        self.assertEqual(repeated.returncode, 0, repeated.stderr)
+        self.assertEqual(store.status(run_id), completed)
+        self.assertEqual(events_path.read_bytes(), events_before_repeat)
+        self.assertEqual(
+            store.sealed_evidence_result(run_id, attention_episode["evidence"]),
+            attention_outcome,
+        )
+        self.assertEqual(
+            store.sealed_evidence_result(run_id, completion_episode["evidence"]),
+            completion_outcome,
+        )
+        self.assertEqual(
+            (run_dir / attention_episode["evidence"] / "manifest.json").read_bytes(),
+            attention_manifest,
+        )
+        self.assertEqual(
+            (run_dir / completion_episode["evidence"] / "manifest.json").read_bytes(),
+            completion_manifest,
+        )
+        self.assertEqual(
+            {
+                mutation_class: canary.read_bytes()
+                for mutation_class, canary in canaries.items()
+            },
+            canaries_before,
+        )
+        self.assertFalse(observer_log.exists())
+        self.assertEqual(
+            {
+                path.relative_to(self.project): path.read_bytes()
+                for path in self.project.rglob("*")
+                if path.is_file()
+            },
+            project_before,
+        )
+
     def test_resume_reconciles_crashed_attention_before_lifecycle_mutation(self):
         interrupted = self.run_afk(
             "start",
@@ -11964,6 +12184,42 @@ class StartCliTest(unittest.TestCase):
 
                 command = Path(sys.argv[0]).name
                 args = sys.argv[1:]
+                observer_path = (
+                    Path(__file__).resolve().parent
+                    / ".fake-retrospective-observer.json"
+                )
+                if observer_path.exists():
+                    observer = json.loads(observer_path.read_text(encoding="utf-8"))
+                    if os.environ.get("HOME") != observer["lifecycle_home"]:
+                        mutation_class = {
+                            "git": "code",
+                            "gh": "pr",
+                            "bd": "bead",
+                            "note": "note",
+                            "notify": "notification",
+                            "task": "task",
+                            "systemd-run": "task",
+                            "curl": "network",
+                            "wget": "network",
+                            "nc": "network",
+                            "analytics": "analytics",
+                        }.get(command)
+                        if mutation_class is not None:
+                            canary = Path(observer["canaries"][mutation_class])
+                            state = json.loads(canary.read_text(encoding="utf-8"))
+                            state["revision"] += 1
+                            state["last_command"] = command
+                            canary.write_text(
+                                json.dumps(state, sort_keys=True) + "\\n",
+                                encoding="utf-8",
+                            )
+                            with Path(observer["mutation_log"]).open(
+                                "a", encoding="utf-8"
+                            ) as stream:
+                                stream.write(json.dumps({
+                                    "class": mutation_class,
+                                    "command": command,
+                                }, sort_keys=True) + "\\n")
                 log_path = Path(os.environ["AFK_FAKE_LOG"])
                 with log_path.open("a", encoding="utf-8") as log:
                     record = {"command": command, "args": args}
@@ -12934,7 +13190,21 @@ class StartCliTest(unittest.TestCase):
             encoding="utf-8",
         )
         script.chmod(script.stat().st_mode | stat.S_IXUSR)
-        for name in ("git", "gh", "bd", "systemd-run", "systemctl", "loginctl"):
+        for name in (
+            "git",
+            "gh",
+            "bd",
+            "systemd-run",
+            "systemctl",
+            "loginctl",
+            "note",
+            "notify",
+            "task",
+            "analytics",
+            "curl",
+            "wget",
+            "nc",
+        ):
             (self.fake_bin / name).symlink_to(script)
         codex = self.fake_bin / "codex"
         codex.write_text(
@@ -12952,6 +13222,10 @@ class StartCliTest(unittest.TestCase):
                 args = sys.argv[1:]
                 prompt = sys.stdin.read()
                 if "--skip-git-repo-check" in args:
+                    observer_path = (
+                        Path(__file__).resolve().parent
+                        / ".fake-retrospective-observer.json"
+                    )
                     control = (
                         Path(__file__).resolve().parent
                         / ".fake-retrospective-mode"
@@ -12961,6 +13235,17 @@ class StartCliTest(unittest.TestCase):
                         if control.exists()
                         else "empty"
                     )
+                    if observer_path.exists():
+                        observer = json.loads(
+                            observer_path.read_text(encoding="utf-8")
+                        )
+                        with Path(observer["invocation_log"]).open(
+                            "a", encoding="utf-8"
+                        ) as stream:
+                            stream.write(
+                                json.dumps({"mode": mode}, sort_keys=True)
+                                + "\\n"
+                            )
                     if mode == "unavailable":
                         raise SystemExit(7)
                     if mode == "interrupted":
