@@ -2546,7 +2546,7 @@ def _launch_worker(run_id: str, unit: str) -> None:
         f"--unit={unit}",
         "--property=Type=exec",
         "--property=Restart=no",
-        "--property=KillMode=control-group",
+        "--property=KillMode=mixed",
         "--property=TimeoutStopSec=30",
         "--property=UMask=0077",
         "--collect",

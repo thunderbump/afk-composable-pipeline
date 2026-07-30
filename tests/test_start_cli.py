@@ -6,14 +6,16 @@ import shutil
 import stat
 import subprocess
 import sys
-import tempfile
 import textwrap
 import threading
 import time
 import unittest
 from io import StringIO
 from pathlib import Path
+from typing import NamedTuple
 from unittest.mock import patch
+
+from tests.afk_cli_fixture import AfkCliFixture, BASE_SHA
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -23,13 +25,19 @@ import afk.run_store as run_store_module  # noqa: E402
 import afk.start as start_module  # noqa: E402
 from afk.bead_spec import bead_spec_identity, persist_bead_spec  # noqa: E402
 from afk.lifecycle_signals import record_lifecycle_interruption  # noqa: E402
+from afk.retrospective_attempt import (  # noqa: E402
+    RETROSPECTIVE_OUTPUT_BYTE_LIMIT,
+)
+from afk.retrospective_contract import TEXT_CHARACTER_LIMIT  # noqa: E402
 from afk.run_store import (  # noqa: E402
+    ATTEMPT_BYTE_LIMIT,
     ActiveRunExists,
     EventHistoryCorrupt,
     RunStore,
     RunStoreBusy,
     RunStoreError,
 )
+from afk.run_summary import MAX_RUN_SUMMARY_BYTES  # noqa: E402
 from afk.start import (  # noqa: E402
     StartError,
     _beads_password,
@@ -39,7 +47,15 @@ from afk.start import (  # noqa: E402
 )
 
 
-BASE_SHA = "a" * 40
+RAW_ANALYSIS_SENTINEL = "RAW_RETROSPECTIVE_ANALYSIS_SENTINEL"
+SENSITIVE_RETROSPECTIVE_SENTINEL = "sensitive-retrospective-token"
+
+
+class _RetrospectiveOutcomeCase(NamedTuple):
+    mode: str
+    expected: dict[str, object]
+
+
 CRASH_INJECTION_OVERRIDES = (
     "AFK_TEST_KILL_BEFORE_EVENT",
     "AFK_TEST_KILL_AFTER_EVENT",
@@ -54,83 +70,104 @@ CRASH_INJECTION_OVERRIDES = (
     "AFK_TEST_KILL_AFTER_SEAL",
     "AFK_TEST_KILL_AFTER_COMPLETION_FINALIZATION",
 )
+RETROSPECTIVE_OUTCOME_CASES = (
+    _RetrospectiveOutcomeCase(
+        "populated",
+        {
+            "schema_version": 1,
+            "status": "passed",
+            "warning": False,
+            "process_findings_count": 1,
+            "improvement_proposals_count": 1,
+        },
+    ),
+    _RetrospectiveOutcomeCase(
+        "empty",
+        {
+            "schema_version": 1,
+            "status": "empty",
+            "warning": False,
+            "process_findings_count": 0,
+            "improvement_proposals_count": 0,
+        },
+    ),
+    _RetrospectiveOutcomeCase(
+        "invalid",
+        {
+            "schema_version": 1,
+            "status": "invalid",
+            "warning": True,
+            "process_findings_count": 0,
+            "improvement_proposals_count": 0,
+            "warning_summary": (
+                "Expecting property name enclosed in double quotes: "
+                "line 1 column 2 (char 1)"
+            ),
+        },
+    ),
+    _RetrospectiveOutcomeCase(
+        "unavailable",
+        {
+            "schema_version": 1,
+            "status": "unavailable",
+            "warning": True,
+            "process_findings_count": 0,
+            "improvement_proposals_count": 0,
+            "warning_summary": "analysis process exited 7",
+        },
+    ),
+    _RetrospectiveOutcomeCase(
+        "interrupted",
+        {
+            "schema_version": 1,
+            "status": "interrupted",
+            "warning": True,
+            "process_findings_count": 0,
+            "improvement_proposals_count": 0,
+            "warning_summary": ("retrospective analysis exited after signal SIGKILL"),
+        },
+    ),
+)
 
 
 class StartCliTest(unittest.TestCase):
     def setUp(self):
-        self.temporary_directory = tempfile.TemporaryDirectory()
-        self.temp = Path(self.temporary_directory.name)
-        self.project = self.temp / "beads-webui"
-        self.project.mkdir()
-        (self.project / "afk.toml").write_text(
-            textwrap.dedent(
-                """
-                schema_version = 1
-
-                [validation]
-                command = ["./scripts/validation-worker.sh", "run"]
-                timeout_seconds = 2700
-                """
-            ).lstrip(),
-            encoding="utf-8",
-        )
-        self.state_home = self.temp / "state"
-        self.state_home.mkdir()
-        self.home = self.temp / "home"
-        self.home.mkdir()
-        self.secret_value = "dogfood-password-value"
-        self.secret_path = self.temp / "secrets" / "beads-password.txt"
-        self.secret_path.parent.mkdir(mode=0o700)
-        self.secret_path.write_text(self.secret_value + "\n", encoding="utf-8")
-        self.secret_path.chmod(0o600)
-        self.config_home = self.temp / "config"
-        config_dir = self.config_home / "afk"
-        config_dir.mkdir(parents=True)
-        config_path = config_dir / "config.toml"
-        config_path.write_text(
-            "schema_version = 1\n"
-            "[beads]\n"
-            f'password_file = "{self.secret_path}"\n',
-            encoding="utf-8",
-        )
-        config_path.chmod(0o600)
-        (self.temp / "beads").mkdir()
-        self.fake_bin = self.temp / "bin"
-        self.fake_bin.mkdir()
-        self.command_log = self.temp / "commands.jsonl"
+        self.cli_fixture = AfkCliFixture()
+        for name in (
+            "temp",
+            "project",
+            "state_home",
+            "home",
+            "secret_value",
+            "secret_path",
+            "config_home",
+            "fake_bin",
+            "command_log",
+        ):
+            setattr(self, name, getattr(self.cli_fixture, name))
         self._write_fake_commands()
 
     def tearDown(self):
-        self.temporary_directory.cleanup()
+        self.cli_fixture.close()
+
+    def install_retrospective_analyzer(self):
+        analyzer = self.fake_bin / "codex"
+        analyzer.replace(self.fake_bin / "codex-candidate-review")
+        shutil.copyfile(
+            ROOT / "tests" / "fixtures" / "fake-retrospective-analyzer.py",
+            analyzer,
+        )
+        analyzer.chmod(0o700)
 
     def afk_environment(self, **overrides):
-        env = os.environ.copy()
-        env.update(
-            {
-                "PYTHONPATH": str(ROOT / "src"),
-                "PATH": f"{self.fake_bin}:{env['PATH']}",
-                "XDG_STATE_HOME": str(self.state_home),
-                "XDG_CONFIG_HOME": str(self.config_home),
-                "AFK_BEADS_WORKSPACE": str(self.temp / "beads"),
-                "AFK_FAKE_LOG": str(self.command_log),
-                "AFK_FAKE_PROJECT": str(self.project),
-                "AFK_FAKE_SHA": BASE_SHA,
-                "AFK_FAKE_BEAD": "central-bnkl.1.1",
-                "AFK_FAKE_BEAD_STATUS": "open",
-                "AFK_FAKE_ASSIGNEE": "",
-                "AFK_FAKE_BEAD_DESCRIPTION": "Implement one candidate.",
-                "AFK_FAKE_BEAD_COMMENTS": "[]",
-                "AFK_FAKE_PINNED_CONTRACT": "present",
-                "AFK_FAKE_EXPECTED_PASSWORD": self.secret_value,
-                "HOME": str(self.home),
-                "USER": "bump",
-            }
-        )
-        env.update(overrides)
-        return env
+        return self.cli_fixture.environment(**overrides)
 
     def run_afk(self, *args, **overrides):
         short_cleanup_timeout = overrides.pop("AFK_TEST_SHORT_CLEANUP_TIMEOUT", None)
+        retrospective_output_byte_limit = overrides.pop(
+            "AFK_TEST_RETROSPECTIVE_OUTPUT_BYTE_LIMIT",
+            None,
+        )
         crash_injections = {
             key: target
             for key in CRASH_INJECTION_OVERRIDES
@@ -257,6 +294,19 @@ class StartCliTest(unittest.TestCase):
                 ),
                 *args,
             ]
+        elif retrospective_output_byte_limit is not None:
+            output_limit = int(retrospective_output_byte_limit)
+            command = [
+                sys.executable,
+                "-c",
+                (
+                    "import sys; "
+                    "import afk.retrospective_attempt as retrospective; "
+                    f"retrospective.RETROSPECTIVE_OUTPUT_BYTE_LIMIT={output_limit}; "
+                    "from afk.cli import main; raise SystemExit(main(sys.argv[1:]))"
+                ),
+                *args,
+            ]
         elif short_cleanup_timeout:
             command = [
                 sys.executable,
@@ -277,6 +327,60 @@ class StartCliTest(unittest.TestCase):
             text=True,
             capture_output=True,
             check=False,
+        )
+
+    def assert_exact_retrospective_outcome(
+        self,
+        store,
+        run_id,
+        episode,
+        *,
+        expected,
+    ):
+        outcome = store.sealed_evidence_result(run_id, episode["evidence"])
+        self.assertEqual(
+            outcome,
+            {
+                **expected,
+                "run_id": run_id,
+                "episode_sequence": episode["episode_sequence"],
+            },
+        )
+        self.assertTrue(store.verify_evidence(run_id, episode["evidence"]))
+        return outcome
+
+    def assert_retrospective_public_proof(
+        self,
+        store,
+        run_id,
+        before,
+        episode,
+        expected,
+        observed,
+        manifest,
+    ):
+        self.assert_exact_retrospective_outcome(
+            store,
+            run_id,
+            episode,
+            expected=expected,
+        )
+        retrospective = observed["retrospective"]
+        self.assertEqual(
+            retrospective["latest"]["episode_sequence"],
+            episode["episode_sequence"],
+        )
+        self.assertEqual(
+            retrospective["latest"]["evidence_path"],
+            episode["evidence"],
+        )
+        self.assertEqual(retrospective["latest"]["status"], expected["status"])
+        self.assertEqual(store.status(run_id), before)
+        self.assertEqual(
+            (
+                store.root / "runs" / run_id / episode["evidence"] / "manifest.json"
+            ).read_bytes(),
+            manifest,
         )
 
     def start_reviewed_run(self):
@@ -984,7 +1088,11 @@ class StartCliTest(unittest.TestCase):
         commands = self.command_log.read_text(encoding="utf-8")
         self.assertIn('"command":"systemd-run"', commands)
         self.assertIn('"--property=Restart=no"', commands)
+        self.assertIn('"--property=KillMode=mixed"', commands)
+        self.assertNotIn('"--property=KillSignal=', commands)
+        self.assertIn('"--property=TimeoutStopSec=30"', commands)
         self.assertIn('"--property=UMask=0077"', commands)
+        self.assertIn('"--collect"', commands)
 
     def test_start_forwards_only_approved_validation_execution_context(self):
         approved = {
@@ -5151,6 +5259,67 @@ class StartCliTest(unittest.TestCase):
         self.assertEqual(outcome["status"], "unavailable")
         self.assertTrue(outcome["warning"])
         self.assert_exact_terminal_completion(run_id)
+
+    def test_completion_retrospective_outcomes_remain_advisory_and_exact(self):
+        self.install_retrospective_analyzer()
+        control = self.fake_bin / ".fake-retrospective-mode"
+        for case in RETROSPECTIVE_OUTCOME_CASES:
+            with self.subTest(mode=case.mode):
+                state_home = self.temp / f"completion-{case.mode}"
+                home = self.temp / f"completion-{case.mode}-home"
+                home.mkdir()
+                environment = {
+                    "XDG_STATE_HOME": str(state_home),
+                    "HOME": str(home),
+                }
+                control.write_text(case.mode, encoding="utf-8")
+                started = self.run_afk(
+                    "start",
+                    "central-bnkl.1.1",
+                    **environment,
+                )
+                self.assertEqual(started.returncode, 0, started.stderr)
+                run_id = started.stdout.strip()
+                worker = self.run_afk("_worker", run_id, **environment)
+                self.assertEqual(worker.returncode, 0, worker.stderr)
+                for _ in range(3):
+                    resumed = self.run_afk("resume", **environment)
+                    self.assertEqual(resumed.returncode, 0, resumed.stderr)
+
+                completed = self.run_afk("resume", **environment)
+
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                store = RunStore(state_home / "afk")
+                before = store.status(run_id)
+                episode = before["completion_episode"]
+                run_dir = state_home / "afk" / "runs" / run_id
+                events = (run_dir / "events.jsonl").read_bytes()
+                manifest = (
+                    run_dir / episode["evidence"] / "manifest.json"
+                ).read_bytes()
+
+                self.assertEqual(before["state"], "completed")
+
+                repeated = self.run_afk("resume", run_id, **environment)
+                observed = self.run_afk(
+                    "status",
+                    run_id,
+                    "--json",
+                    **environment,
+                )
+
+                self.assertEqual(repeated.returncode, 0, repeated.stderr)
+                self.assertEqual(observed.returncode, 0, observed.stderr)
+                self.assert_retrospective_public_proof(
+                    store,
+                    run_id,
+                    before,
+                    episode,
+                    case.expected,
+                    json.loads(observed.stdout),
+                    manifest,
+                )
+                self.assertEqual((run_dir / "events.jsonl").read_bytes(), events)
 
     def test_completion_retrospective_store_error_retains_single_completed_event(self):
         run_id = self.start_reviewed_run()
@@ -11276,6 +11445,453 @@ class StartCliTest(unittest.TestCase):
             outcome,
         )
 
+    def test_attention_retrospective_outcomes_remain_advisory_and_exact(self):
+        self.install_retrospective_analyzer()
+        control = self.fake_bin / ".fake-retrospective-mode"
+        for case in RETROSPECTIVE_OUTCOME_CASES:
+            with self.subTest(mode=case.mode):
+                state_home = self.temp / f"attention-{case.mode}"
+                project_before = {
+                    path.relative_to(self.project): path.read_bytes()
+                    for path in self.project.rglob("*")
+                    if path.is_file()
+                }
+                control.write_text(case.mode, encoding="utf-8")
+
+                completed = self.run_afk(
+                    "start",
+                    "central-bnkl.1.1",
+                    XDG_STATE_HOME=str(state_home),
+                    AFK_FAKE_SYSTEMD_FAILURE="1",
+                )
+
+                self.assertEqual(completed.returncode, 2, completed.stderr)
+                store = RunStore(state_home / "afk")
+                before = store.status()
+                episode = before["attention_episode"]
+                manifest = (
+                    state_home
+                    / "afk"
+                    / "runs"
+                    / before["run_id"]
+                    / episode["evidence"]
+                    / "manifest.json"
+                ).read_bytes()
+
+                self.assertEqual(before["state"], "attention_required")
+
+                observed = self.run_afk(
+                    "status",
+                    before["run_id"],
+                    "--json",
+                    XDG_STATE_HOME=str(state_home),
+                )
+
+                self.assertEqual(observed.returncode, 2, observed.stderr)
+                self.assert_retrospective_public_proof(
+                    store,
+                    before["run_id"],
+                    before,
+                    episode,
+                    case.expected,
+                    json.loads(observed.stdout),
+                    manifest,
+                )
+                self.assertEqual(
+                    {
+                        path.relative_to(self.project): path.read_bytes()
+                        for path in self.project.rglob("*")
+                        if path.is_file()
+                    },
+                    project_before,
+                )
+                self.assertFalse((state_home / "fake-mutations.jsonl").exists())
+
+    def test_public_attention_retrospective_enforces_exact_byte_limits(self):
+        self.assertEqual(MAX_RUN_SUMMARY_BYTES, 65_536)
+        self.assertEqual(RETROSPECTIVE_OUTPUT_BYTE_LIMIT, 67_108_864)
+        self.assertEqual(ATTEMPT_BYTE_LIMIT, 268_435_456)
+        self.install_retrospective_analyzer()
+        control = self.fake_bin / ".fake-retrospective-mode"
+        output_limit = 2_048
+        cases = (
+            ("padded-2048", RETROSPECTIVE_OUTCOME_CASES[1].expected, output_limit),
+            (
+                "padded-2049",
+                {
+                    "schema_version": 1,
+                    "status": "invalid",
+                    "warning": True,
+                    "process_findings_count": 0,
+                    "improvement_proposals_count": 0,
+                    "warning_summary": (
+                        "retrospective analysis output exceeds the size limit"
+                    ),
+                },
+                0,
+            ),
+        )
+        for mode, expected, retained_output_bytes in cases:
+            with self.subTest(mode=mode):
+                state_home = self.temp / f"bounded-{mode}"
+                control.write_text(mode, encoding="utf-8")
+
+                started = self.run_afk(
+                    "start",
+                    "central-bnkl.1.1",
+                    XDG_STATE_HOME=str(state_home),
+                    AFK_FAKE_SYSTEMD_FAILURE="1",
+                    AFK_TEST_RETROSPECTIVE_OUTPUT_BYTE_LIMIT=str(output_limit),
+                )
+
+                self.assertEqual(started.returncode, 2, started.stderr)
+                store = RunStore(state_home / "afk")
+                status = store.status()
+                run_id = status["run_id"]
+                episode = status["attention_episode"]
+                self.assert_exact_retrospective_outcome(
+                    store,
+                    run_id,
+                    episode,
+                    expected=expected,
+                )
+                observed = self.run_afk(
+                    "status",
+                    run_id,
+                    "--json",
+                    XDG_STATE_HOME=str(state_home),
+                )
+                self.assertEqual(observed.returncode, 2, observed.stderr)
+                self.assertEqual(
+                    json.loads(observed.stdout)["retrospective"]["latest"]["status"],
+                    expected["status"],
+                )
+                evidence_dir = (
+                    state_home / "afk" / "runs" / run_id / episode["evidence"]
+                )
+                manifest = json.loads(
+                    (evidence_dir / "manifest.json").read_text(encoding="utf-8")
+                )
+                payload_bytes = {
+                    entry["path"]: (evidence_dir / entry["path"]).read_bytes()
+                    for entry in manifest["files"]
+                }
+                self.assertEqual(
+                    manifest["total_bytes"],
+                    sum(len(payload) for payload in payload_bytes.values()),
+                )
+                self.assertEqual(
+                    {entry["path"]: entry["bytes"] for entry in manifest["files"]},
+                    {path: len(payload) for path, payload in payload_bytes.items()},
+                )
+                self.assertEqual(
+                    len(payload_bytes["stdout.log"]) + len(payload_bytes["stderr.log"]),
+                    retained_output_bytes,
+                )
+                self.assertLessEqual(retained_output_bytes, output_limit)
+                self.assertEqual(status["state"], "attention_required")
+
+    def test_one_run_retains_advisory_retrospectives_without_command_mutations(self):
+        self.install_retrospective_analyzer()
+        control = self.fake_bin / ".fake-retrospective-mode"
+        observer = self.fake_bin / ".fake-retrospective-observer.json"
+        command_mutation_log = self.temp / "retrospective-command-mutations.jsonl"
+        invocation_log = self.temp / "retrospective-invocations.jsonl"
+        command_canary_root = self.temp / "retrospective-command-canaries"
+        command_canary_root.mkdir()
+        command_canaries = {}
+        for mutation_class in (
+            "code",
+            "pr",
+            "bead",
+            "note",
+            "notification",
+            "task",
+            "analytics",
+            "network",
+        ):
+            canary = command_canary_root / f"{mutation_class}.json"
+            canary.write_text('{"revision":0}\n', encoding="utf-8")
+            command_canaries[mutation_class] = canary
+        observer.write_text(
+            json.dumps(
+                {
+                    "lifecycle_home": str(self.home),
+                    "command_mutation_log": str(command_mutation_log),
+                    "invocation_log": str(invocation_log),
+                    "command_canaries": {
+                        mutation_class: str(canary)
+                        for mutation_class, canary in command_canaries.items()
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        command_canaries_before = {
+            mutation_class: canary.read_bytes()
+            for mutation_class, canary in command_canaries.items()
+        }
+        project_before = {
+            path.relative_to(self.project): path.read_bytes()
+            for path in self.project.rglob("*")
+            if path.is_file()
+        }
+
+        control.write_text("populated", encoding="utf-8")
+        started = self.run_afk(
+            "start",
+            "central-bnkl.1.1",
+            AFK_FAKE_SYSTEMD_FAILURE="1",
+        )
+
+        self.assertEqual(started.returncode, 2, started.stderr)
+        run_id = started.stdout.strip()
+        store = RunStore(self.state_home / "afk")
+        attention = store.status(run_id)
+        attention_episode = attention["attention_episode"]
+        attention_outcome = self.assert_exact_retrospective_outcome(
+            store,
+            run_id,
+            attention_episode,
+            expected=RETROSPECTIVE_OUTCOME_CASES[0].expected,
+        )
+        self.assertEqual(attention_outcome["run_id"], run_id)
+        run_dir = self.state_home / "afk" / "runs" / run_id
+        attention_manifest = (
+            run_dir / attention_episode["evidence"] / "manifest.json"
+        ).read_bytes()
+        attention_payloads = store.sealed_evidence_payloads(
+            run_id,
+            attention_episode["evidence"],
+        )
+        retained_attention = "".join(attention_payloads.values())
+        self.assertLessEqual(
+            len(attention_payloads["input.json"].encode("utf-8")),
+            MAX_RUN_SUMMARY_BYTES,
+        )
+        self.assertLessEqual(
+            len(attention_payloads["stdout.log"].encode("utf-8"))
+            + len(attention_payloads["stderr.log"].encode("utf-8")),
+            RETROSPECTIVE_OUTPUT_BYTE_LIMIT,
+        )
+        self.assertLessEqual(
+            sum(
+                len(payload.encode("utf-8")) for payload in attention_payloads.values()
+            ),
+            ATTEMPT_BYTE_LIMIT,
+        )
+        attention_analysis = json.loads(attention_payloads["analysis.json"])
+        self.assertGreaterEqual(
+            len(attention_analysis["summary"]),
+            TEXT_CHARACTER_LIMIT - 64,
+        )
+        self.assertLessEqual(len(attention_analysis["summary"]), TEXT_CHARACTER_LIMIT)
+        self.assertIn(RAW_ANALYSIS_SENTINEL, retained_attention)
+        self.assertNotIn(SENSITIVE_RETROSPECTIVE_SENTINEL, retained_attention)
+        self.assertIn("[REDACTED]", retained_attention)
+        self.assertEqual(
+            json.loads(attention_payloads["input.json"])["run"]["run_id"],
+            run_id,
+        )
+        self.assertEqual(attention_analysis["run_id"], run_id)
+        self.assertEqual(attention["state"], "attention_required")
+
+        control.write_text("empty", encoding="utf-8")
+        retried = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="absent")
+
+        self.assertEqual(retried.returncode, 0, retried.stderr)
+        self.assertEqual(store.status(run_id)["state"], "attention_required")
+        worker = self.run_afk("_worker", run_id)
+        self.assertEqual(worker.returncode, 0, worker.stderr)
+        for _ in range(4):
+            continued = self.run_afk("resume")
+            self.assertEqual(continued.returncode, 0, continued.stderr)
+
+        completed = store.status(run_id)
+        completion_episode = completed["completion_episode"]
+        completion_outcome = self.assert_exact_retrospective_outcome(
+            store,
+            run_id,
+            completion_episode,
+            expected=RETROSPECTIVE_OUTCOME_CASES[1].expected,
+        )
+        self.assertEqual(completion_outcome["run_id"], run_id)
+        completion_manifest = (
+            run_dir / completion_episode["evidence"] / "manifest.json"
+        ).read_bytes()
+        expected_command_policy = {
+            "control_plane_network": "model-api-only",
+            "filesystem": "minimal-read",
+            "interactive": False,
+            "network": "disabled",
+            "permission_profile": "retrospective-analysis",
+            "runtime_home": "isolated",
+            "session": "fresh",
+        }
+        for episode in (attention_episode, completion_episode):
+            command = json.loads(
+                store.sealed_evidence_payloads(
+                    run_id,
+                    episode["evidence"],
+                )["command.json"]
+            )
+            self.assertEqual(command["policy"], expected_command_policy)
+        self.assertEqual(completed["state"], "completed")
+        structured_completed = json.loads(
+            self.run_afk("status", run_id, "--json").stdout
+        )
+        public_status = json.dumps(structured_completed, sort_keys=True)
+        human_status = self.run_afk("status", run_id)
+        report_result = self.run_afk("report", run_id)
+        self.assertEqual(human_status.returncode, 0, human_status.stderr)
+        self.assertEqual(report_result.returncode, 0, report_result.stderr)
+        report = json.loads(report_result.stdout)
+        self.assertEqual(structured_completed["run_id"], run_id)
+        self.assertEqual(report["run_id"], run_id)
+        self.assertEqual(
+            report["retrospective"],
+            structured_completed["retrospective"],
+        )
+        self.assertNotIn(RAW_ANALYSIS_SENTINEL, public_status)
+        self.assertNotIn(SENSITIVE_RETROSPECTIVE_SENTINEL, public_status)
+        self.assertNotIn(RAW_ANALYSIS_SENTINEL, human_status.stdout)
+        self.assertNotIn(SENSITIVE_RETROSPECTIVE_SENTINEL, human_status.stdout)
+        self.assertNotIn(RAW_ANALYSIS_SENTINEL, report_result.stdout)
+        self.assertNotIn(SENSITIVE_RETROSPECTIVE_SENTINEL, report_result.stdout)
+        self.assertEqual(
+            structured_completed["retrospective"],
+            {
+                "schema_version": 1,
+                "status": "empty",
+                "episode_counts": {
+                    "total": 2,
+                    "sealed": 2,
+                    "warning": 0,
+                    "absent": 0,
+                },
+                "process_findings_count": 1,
+                "improvement_proposals_count": 1,
+                "evidence_paths": [
+                    attention_episode["evidence"],
+                    completion_episode["evidence"],
+                ],
+                "latest": {
+                    "episode_sequence": completion_episode["episode_sequence"],
+                    "event": "run.completed",
+                    "state": "completed",
+                    "status": "empty",
+                    "warning": False,
+                    "process_findings_count": 0,
+                    "improvement_proposals_count": 0,
+                    "evidence_path": completion_episode["evidence"],
+                },
+            },
+        )
+        for evidence_path in structured_completed["retrospective"]["evidence_paths"]:
+            identity = Path(evidence_path)
+            self.assertFalse(identity.is_absolute())
+            self.assertNotIn("..", identity.parts)
+            self.assertEqual(identity.parts[0], "retrospective")
+            self.assertTrue((run_dir / identity / "manifest.json").is_file())
+        for evidence_directory in (run_dir / "retrospective").iterdir():
+            if not evidence_directory.is_dir():
+                continue
+            manifest = json.loads(
+                (evidence_directory / "manifest.json").read_text(encoding="utf-8")
+            )
+            for retained in manifest["files"]:
+                identity = Path(retained["path"])
+                self.assertFalse(identity.is_absolute())
+                self.assertNotIn("..", identity.parts)
+                self.assertTrue((evidence_directory / identity).is_file())
+        events_path = run_dir / "events.jsonl"
+        events_before_repeat = events_path.read_bytes()
+        self.assertEqual(
+            events_before_repeat.count(b'"event":"run.attention_required"'),
+            1,
+        )
+        self.assertEqual(events_before_repeat.count(b'"event":"run.completed"'), 1)
+        retrospective_effects = {
+            path.stem
+            for path in (run_dir / "effects").glob("retrospective-analysis-*.json")
+        }
+        self.assertEqual(
+            retrospective_effects,
+            {
+                attention_episode["effect_id"],
+                completion_episode["effect_id"],
+            },
+        )
+        for effect_id in retrospective_effects:
+            self.assertEqual(store.effect(run_id, effect_id)["status"], "confirmed")
+        self.assertEqual(
+            {
+                f"retrospective/{path.name}"
+                for path in (run_dir / "retrospective").iterdir()
+                if path.is_dir()
+            },
+            {
+                attention_episode["evidence"],
+                completion_episode["evidence"],
+                (
+                    "retrospective/run-summary-v2-"
+                    f"{attention_episode['episode_sequence']:020d}"
+                ),
+                (
+                    "retrospective/run-summary-v2-"
+                    f"{completion_episode['episode_sequence']:020d}"
+                ),
+            },
+        )
+        self.assertEqual(
+            [
+                json.loads(line)
+                for line in invocation_log.read_text(encoding="utf-8").splitlines()
+            ],
+            [
+                {"mode": "populated"},
+                {"mode": "empty"},
+            ],
+        )
+
+        repeated = self.run_afk("resume", run_id)
+
+        self.assertEqual(repeated.returncode, 0, repeated.stderr)
+        self.assertEqual(store.status(run_id), completed)
+        self.assertEqual(events_path.read_bytes(), events_before_repeat)
+        self.assertEqual(
+            store.sealed_evidence_result(run_id, attention_episode["evidence"]),
+            attention_outcome,
+        )
+        self.assertEqual(
+            store.sealed_evidence_result(run_id, completion_episode["evidence"]),
+            completion_outcome,
+        )
+        self.assertEqual(
+            (run_dir / attention_episode["evidence"] / "manifest.json").read_bytes(),
+            attention_manifest,
+        )
+        self.assertEqual(
+            (run_dir / completion_episode["evidence"] / "manifest.json").read_bytes(),
+            completion_manifest,
+        )
+        self.assertEqual(
+            {
+                mutation_class: canary.read_bytes()
+                for mutation_class, canary in command_canaries.items()
+            },
+            command_canaries_before,
+        )
+        self.assertFalse(command_mutation_log.exists())
+        self.assertEqual(
+            {
+                path.relative_to(self.project): path.read_bytes()
+                for path in self.project.rglob("*")
+                if path.is_file()
+            },
+            project_before,
+        )
+
     def test_resume_reconciles_crashed_attention_before_lifecycle_mutation(self):
         interrupted = self.run_afk(
             "start",
@@ -11757,6 +12373,44 @@ class StartCliTest(unittest.TestCase):
 
                 command = Path(sys.argv[0]).name
                 args = sys.argv[1:]
+                observer_path = (
+                    Path(__file__).resolve().parent
+                    / ".fake-retrospective-observer.json"
+                )
+                if observer_path.exists():
+                    observer = json.loads(observer_path.read_text(encoding="utf-8"))
+                    if os.environ.get("HOME") != observer["lifecycle_home"]:
+                        mutation_class = {
+                            "git": "code",
+                            "gh": "pr",
+                            "bd": "bead",
+                            "note": "note",
+                            "notify": "notification",
+                            "task": "task",
+                            "systemd-run": "task",
+                            "curl": "network",
+                            "wget": "network",
+                            "nc": "network",
+                            "analytics": "analytics",
+                        }.get(command)
+                        if mutation_class is not None:
+                            canary = Path(
+                                observer["command_canaries"][mutation_class]
+                            )
+                            state = json.loads(canary.read_text(encoding="utf-8"))
+                            state["revision"] += 1
+                            state["last_command"] = command
+                            canary.write_text(
+                                json.dumps(state, sort_keys=True) + "\\n",
+                                encoding="utf-8",
+                            )
+                            with Path(observer["command_mutation_log"]).open(
+                                "a", encoding="utf-8"
+                            ) as stream:
+                                stream.write(json.dumps({
+                                    "class": mutation_class,
+                                    "command": command,
+                                }, sort_keys=True) + "\\n")
                 log_path = Path(os.environ["AFK_FAKE_LOG"])
                 with log_path.open("a", encoding="utf-8") as log:
                     record = {"command": command, "args": args}
@@ -12727,7 +13381,21 @@ class StartCliTest(unittest.TestCase):
             encoding="utf-8",
         )
         script.chmod(script.stat().st_mode | stat.S_IXUSR)
-        for name in ("git", "gh", "bd", "systemd-run", "systemctl", "loginctl"):
+        for name in (
+            "git",
+            "gh",
+            "bd",
+            "systemd-run",
+            "systemctl",
+            "loginctl",
+            "note",
+            "notify",
+            "task",
+            "analytics",
+            "curl",
+            "wget",
+            "nc",
+        ):
             (self.fake_bin / name).symlink_to(script)
         codex = self.fake_bin / "codex"
         codex.write_text(
