@@ -902,12 +902,14 @@ class RunStoreTest(unittest.TestCase):
         link = os.link
 
         def interrupt_receipt_publication(source, target, *args, **kwargs):
-            if Path(target).parent.name == ".evidence-receipts":
+            if kwargs.get("dst_dir_fd") is not None:
                 raise OSError("simulated interruption")
             return link(source, target, *args, **kwargs)
 
         with patch("afk.run_store.os.link", side_effect=interrupt_receipt_publication):
-            with self.assertRaises(OSError):
+            with self.assertRaisesRegex(
+                EvidenceTampered, "evidence receipt is invalid"
+            ):
                 self.store.seal_evidence("run-001", unit)
 
         evidence = self.root / "runs" / "run-001" / unit
@@ -938,6 +940,37 @@ class RunStoreTest(unittest.TestCase):
             self.store.observe_sealed_evidence_result("run-001", unit),
             expected,
         )
+
+    def test_receipt_publication_rejects_a_directory_symlink_swap(self):
+        self.create_run()
+        unit = "gates/completion"
+        self.store.write_evidence_value(
+            "run-001", f"{unit}/result.json", {"status": "complete"}
+        )
+        receipt_directory = self.root / "runs" / "run-001" / ".evidence-receipts"
+        external = self.state_home / "external-receipts"
+        external.mkdir(mode=0o755)
+        original_read = self.store._read_evidence_receipt
+
+        def swap_after_absence(run_id, relative_directory):
+            observed = original_read(run_id, relative_directory)
+            if observed is None and not receipt_directory.exists():
+                receipt_directory.symlink_to(external, target_is_directory=True)
+            return observed
+
+        with patch.object(
+            self.store,
+            "_read_evidence_receipt",
+            side_effect=swap_after_absence,
+        ):
+            with self.assertRaisesRegex(
+                EvidenceTampered, "evidence receipt is invalid"
+            ):
+                self.store.seal_evidence("run-001", unit)
+
+        self.assertTrue(receipt_directory.is_symlink())
+        self.assertEqual(stat.S_IMODE(external.stat().st_mode), 0o755)
+        self.assertEqual(list(external.iterdir()), [])
 
     def test_observation_rejects_a_forged_locked_receipt_for_writable_evidence(self):
         self.create_run()

@@ -991,8 +991,64 @@ class RunStore:
             if observed != expected:
                 raise EvidenceTampered("evidence receipt does not match its manifest")
             return
-        _secure_directory(receipt_path.parent)
-        _write_new_json(receipt_path, expected, self.root, mode=0o400)
+        try:
+            directory_descriptor = self._open_evidence_receipt_directory(run_id)
+        except OSError as exc:
+            raise EvidenceTampered("evidence receipt is invalid") from exc
+        try:
+            _write_new_json_at(
+                directory_descriptor,
+                receipt_path.name,
+                expected,
+                self.root,
+                mode=0o400,
+            )
+        except OSError as exc:
+            raise EvidenceTampered("evidence receipt is invalid") from exc
+        finally:
+            os.close(directory_descriptor)
+
+    def _open_evidence_receipt_directory(self, run_id: str) -> int:
+        directory_flags = (
+            os.O_RDONLY
+            | os.O_DIRECTORY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        descriptors = []
+        receipt_descriptor = None
+        try:
+            descriptor = os.open(self.root, directory_flags)
+            descriptors.append(descriptor)
+            descriptor = os.open("runs", directory_flags, dir_fd=descriptor)
+            descriptors.append(descriptor)
+            descriptor = os.open(run_id, directory_flags, dir_fd=descriptor)
+            descriptors.append(descriptor)
+            try:
+                os.mkdir(".evidence-receipts", mode=0o700, dir_fd=descriptor)
+                created = True
+            except FileExistsError:
+                created = False
+            receipt_descriptor = os.open(
+                ".evidence-receipts",
+                directory_flags,
+                dir_fd=descriptor,
+            )
+            metadata = os.fstat(receipt_descriptor)
+            if created:
+                os.fchmod(receipt_descriptor, 0o700)
+                os.fsync(receipt_descriptor)
+                os.fsync(descriptor)
+            elif stat.S_IMODE(metadata.st_mode) != 0o700:
+                raise EvidenceTampered("evidence receipt is invalid")
+            result = receipt_descriptor
+            receipt_descriptor = None
+            return result
+        finally:
+            if receipt_descriptor is not None:
+                os.close(receipt_descriptor)
+            for descriptor in reversed(descriptors):
+                os.close(descriptor)
 
     def unsealed_evidence_result(
         self, run_id: str, relative_directory: str
@@ -1931,6 +1987,43 @@ def _write_new_json(
         staging_directory,
         mode=mode,
     )
+
+
+def _write_new_json_at(
+    directory_descriptor: int,
+    name: str,
+    value: Any,
+    staging_root: Path,
+    *,
+    mode: int = 0o600,
+) -> None:
+    staging_directory = staging_root / ".unpublished"
+    _secure_directory(staging_directory)
+    target_id = hashlib.sha256(name.encode("utf-8")).hexdigest()
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f"{target_id}.", suffix=".tmp", dir=staging_directory
+    )
+    temporary = Path(temporary_name)
+    try:
+        payload = (f"{canonical_json(redact_artifact_value(value))}\n").encode("utf-8")
+        os.fchmod(descriptor, mode)
+        written = os.write(descriptor, payload)
+        if written != len(payload):
+            raise RunStoreError(f"write was incomplete: {name}")
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = -1
+        os.link(
+            temporary,
+            name,
+            dst_dir_fd=directory_descriptor,
+            follow_symlinks=False,
+        )
+        os.fsync(directory_descriptor)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        temporary.unlink(missing_ok=True)
 
 
 def _read_evidence_result(path: Path) -> Any:
