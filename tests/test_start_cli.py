@@ -177,6 +177,15 @@ class StartCliTest(unittest.TestCase):
     def tearDown(self):
         self.temporary_directory.cleanup()
 
+    def install_retrospective_analyzer(self):
+        analyzer = self.fake_bin / "codex"
+        analyzer.replace(self.fake_bin / "codex-candidate-review")
+        shutil.copyfile(
+            ROOT / "tests" / "fixtures" / "fake-retrospective-analyzer.py",
+            analyzer,
+        )
+        analyzer.chmod(0o700)
+
     def afk_environment(self, **overrides):
         env = os.environ.copy()
         env.update(
@@ -5285,6 +5294,7 @@ class StartCliTest(unittest.TestCase):
         self.assert_exact_terminal_completion(run_id)
 
     def test_completion_retrospective_outcomes_remain_advisory_and_exact(self):
+        self.install_retrospective_analyzer()
         control = self.fake_bin / ".fake-retrospective-mode"
         for case in RETROSPECTIVE_OUTCOME_CASES:
             with self.subTest(mode=case.mode):
@@ -11469,6 +11479,7 @@ class StartCliTest(unittest.TestCase):
         )
 
     def test_attention_retrospective_outcomes_remain_advisory_and_exact(self):
+        self.install_retrospective_analyzer()
         control = self.fake_bin / ".fake-retrospective-mode"
         for case in RETROSPECTIVE_OUTCOME_CASES:
             with self.subTest(mode=case.mode):
@@ -11532,6 +11543,7 @@ class StartCliTest(unittest.TestCase):
     def test_one_run_retains_attention_and_completion_retrospectives_without_mutation(
         self,
     ):
+        self.install_retrospective_analyzer()
         control = self.fake_bin / ".fake-retrospective-mode"
         observer = self.fake_bin / ".fake-retrospective-observer.json"
         observer_log = self.temp / "retrospective-mutations.jsonl"
@@ -11592,10 +11604,7 @@ class StartCliTest(unittest.TestCase):
             store,
             run_id,
             attention_episode,
-            expected_status="passed",
-            warning=False,
-            findings=1,
-            proposals=1,
+            expected=RETROSPECTIVE_OUTCOME_CASES[0].expected,
         )
         self.assertEqual(attention_outcome["run_id"], run_id)
         run_dir = self.state_home / "afk" / "runs" / run_id
@@ -11655,10 +11664,7 @@ class StartCliTest(unittest.TestCase):
             store,
             run_id,
             completion_episode,
-            expected_status="empty",
-            warning=False,
-            findings=0,
-            proposals=0,
+            expected=RETROSPECTIVE_OUTCOME_CASES[1].expected,
         )
         self.assertEqual(completion_outcome["run_id"], run_id)
         completion_manifest = (
@@ -13339,75 +13345,15 @@ class StartCliTest(unittest.TestCase):
                 args = sys.argv[1:]
                 prompt = sys.stdin.read()
                 if "--skip-git-repo-check" in args:
-                    observer_path = (
-                        Path(__file__).resolve().parent
-                        / ".fake-retrospective-observer.json"
-                    )
-                    control = (
-                        Path(__file__).resolve().parent
-                        / ".fake-retrospective-mode"
-                    )
-                    mode = (
-                        control.read_text(encoding="utf-8").strip()
-                        if control.exists()
-                        else "empty"
-                    )
-                    if observer_path.exists():
-                        observer = json.loads(
-                            observer_path.read_text(encoding="utf-8")
-                        )
-                        with Path(observer["invocation_log"]).open(
-                            "a", encoding="utf-8"
-                        ) as stream:
-                            stream.write(
-                                json.dumps({"mode": mode}, sort_keys=True)
-                                + "\\n"
-                            )
-                    if mode == "unavailable":
-                        raise SystemExit(7)
-                    if mode == "interrupted":
-                        os.kill(os.getpid(), signal.SIGKILL)
-                    if mode == "invalid":
-                        print("{not-json")
-                        raise SystemExit(0)
                     summary = json.loads(prompt)
-                    result = {
+                    print(json.dumps({
                         "schema_version": 1,
                         "run_id": summary["run"]["run_id"],
                         "terminal_outcome": summary["episode"]["state"],
                         "summary": "No actionable findings.",
                         "process_findings": [],
                         "improvement_proposals": [],
-                    }
-                    if mode == "populated":
-                        result["summary"] = (
-                            "RAW_RETROSPECTIVE_ANALYSIS_SENTINEL "
-                            "token=sensitive-retrospective-token "
-                            + ("x" * 512)
-                        )[:512]
-                        result["process_findings"] = [{
-                            "id": "finding-1",
-                            "category": "orchestration",
-                            "title": "The Run required attention",
-                            "evidence": [{
-                                "artifact": "episode-checkpoint.txt",
-                                "line_start": 1,
-                                "line_end": 1,
-                            }],
-                            "impact": "The Run stopped for an operator.",
-                            "confidence": "high",
-                        }]
-                        result["improvement_proposals"] = [{
-                            "id": "proposal-1",
-                            "addresses": ["finding-1"],
-                            "scope": "afk",
-                            "priority": "P1",
-                            "title": "Reduce attention interruptions",
-                            "rationale": "Fewer stops shorten the Run.",
-                            "suggested_change": "Improve interruption recovery.",
-                            "requires_human_decision": True,
-                        }]
-                    print(json.dumps(result))
+                    }))
                     raise SystemExit(0)
                 base_sha = "a" * 40
                 candidate_sha = "d" * 40
