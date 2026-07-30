@@ -10,6 +10,7 @@ import unittest
 from pathlib import Path
 
 import tests.test_start_cli as start_cli_tests
+from afk.durable_id import is_durable_id
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -38,7 +39,24 @@ class SystemdIsolationTest(unittest.TestCase):
         )
         fixture.setUp()
         unit = None
+        run_id = None
         child_identity = None
+
+        def published_child_identity():
+            try:
+                identity = json.loads(ready.read_text(encoding="utf-8"))
+            except (FileNotFoundError, json.JSONDecodeError, UnicodeDecodeError):
+                return None
+            if (
+                not isinstance(identity, dict)
+                or set(identity) != {"pid", "start_time"}
+                or type(identity["pid"]) is not int
+                or identity["pid"] <= 0
+                or not isinstance(identity["start_time"], str)
+                or not identity["start_time"].isdigit()
+            ):
+                return None
+            return identity
 
         def exact_child_identity_exists():
             if child_identity is None:
@@ -79,8 +97,11 @@ class SystemdIsolationTest(unittest.TestCase):
                         "signal.signal(signal.SIGTERM,signal.SIG_IGN);"
                         "start_time=Path('/proc/self/stat').read_text()"
                         ".rsplit(')',1)[1].split()[19];"
-                        "Path(sys.argv[1]).write_text(json.dumps({{"
+                        "ready=Path(sys.argv[1]);"
+                        "temporary=ready.with_suffix('.tmp');"
+                        "temporary.write_text(json.dumps({{"
                         "'pid':os.getpid(),'start_time':start_time}}));"
+                        "os.replace(temporary,ready);"
                         "time.sleep(2);"
                         "Path(sys.argv[2]).write_text('mutated')"
                     )
@@ -122,14 +143,29 @@ class SystemdIsolationTest(unittest.TestCase):
                 PYTHONPATH=pythonpath,
             )
 
+            run_id = next(
+                (
+                    candidate
+                    for candidate in started.stdout.split()
+                    if is_durable_id(candidate)
+                    and (
+                        fixture.state_home / "afk" / "runs" / candidate / "run.json"
+                    ).is_file()
+                ),
+                None,
+            )
+            if run_id is not None:
+                unit = f"afk-{run_id}-worker-1"
             self.assertEqual(started.returncode, 0, started.stderr)
-            run_id = started.stdout.strip()
-            unit = f"afk-{run_id}-worker-1"
+            self.assertIsNotNone(run_id, started.stdout)
             deadline = time.monotonic() + 10
-            while not ready.exists() and time.monotonic() < deadline:
+            while child_identity is None and time.monotonic() < deadline:
+                child_identity = published_child_identity()
                 time.sleep(0.02)
-            self.assertTrue(ready.exists(), "retrospective descendant did not start")
-            child_identity = json.loads(ready.read_text(encoding="utf-8"))
+            self.assertIsNotNone(
+                child_identity,
+                "retrospective descendant did not publish a valid identity",
+            )
 
             stopped = subprocess.run(
                 [systemctl, "--user", "stop", unit],
