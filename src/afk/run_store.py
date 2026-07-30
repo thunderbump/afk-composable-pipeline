@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import fcntl
 import hashlib
 import json
@@ -98,11 +99,14 @@ class _VerifiedEvidence(NamedTuple):
 class _OpenEvidenceEntry(NamedTuple):
     path: str
     descriptor: int
+    is_directory: bool
 
 
-class _OpenEvidenceTree(NamedTuple):
-    files: tuple[_OpenEvidenceEntry, ...]
-    directories: tuple[_OpenEvidenceEntry, ...]
+class _EvidenceTreeSnapshot(NamedTuple):
+    entries: list[dict[str, Any]]
+    payload_bytes: dict[str, bytes]
+    file_modes: list[int]
+    directory_modes: list[int]
 
 
 def default_state_root() -> Path:
@@ -764,27 +768,23 @@ class RunStore:
                 manifest_path = directory / "manifest.json"
                 if manifest_path.exists() or manifest_path.is_symlink():
                     raise EvidenceError("evidence is already sealed")
-                with _open_evidence_tree(directory) as tree:
-                    limit = _tree_limit(relative_directory)
-                    _validate_evidence_sizes(tree.files, limit)
-                    entries = _manifest_entries(tree.files, limit)
-                    manifest = {
-                        "schema_version": SCHEMA_VERSION,
-                        "files": entries,
-                        "total_bytes": sum(entry["bytes"] for entry in entries),
-                    }
-                    for entry in tree.files:
-                        os.fchmod(entry.descriptor, 0o400)
-                        os.fsync(entry.descriptor)
-                    for entry in reversed(tree.directories):
-                        os.fchmod(entry.descriptor, 0o500)
-                        os.fsync(entry.descriptor)
-                    _write_new_json(
-                        manifest_path,
-                        manifest,
-                        self.root,
-                        mode=0o400,
-                    )
+                snapshot = _manifest_snapshot(
+                    directory,
+                    _tree_limit(relative_directory),
+                    payload_capture="none",
+                    seal=True,
+                )
+                manifest = {
+                    "schema_version": SCHEMA_VERSION,
+                    "files": snapshot.entries,
+                    "total_bytes": sum(entry["bytes"] for entry in snapshot.entries),
+                }
+                _write_new_json(
+                    manifest_path,
+                    manifest,
+                    self.root,
+                    mode=0o400,
+                )
                 os.fchmod(evidence_descriptor, 0o500)
                 os.fsync(evidence_descriptor)
                 os.fsync(parent_descriptor)
@@ -852,36 +852,30 @@ class RunStore:
                 os.close(manifest_descriptor)
         expected = _validate_manifest(manifest)
         try:
-            with _open_evidence_tree(directory) as tree:
-                observed, payload_bytes = _manifest_snapshot(
-                    tree.files,
-                    _tree_limit(relative_directory),
-                    payload_capture=payload_capture,
-                )
-                file_modes = [
-                    stat.S_IMODE(os.fstat(entry.descriptor).st_mode)
-                    for entry in tree.files
-                ]
-                directory_modes = [
-                    stat.S_IMODE(os.fstat(entry.descriptor).st_mode)
-                    for entry in tree.directories
-                ]
+            snapshot = _manifest_snapshot(
+                directory,
+                _tree_limit(relative_directory),
+                payload_capture=payload_capture,
+            )
         except EvidenceError as exc:
             raise EvidenceTampered(str(exc)) from exc
-        if observed != expected:
+        if snapshot.entries != expected:
             raise EvidenceTampered("evidence does not match its manifest")
         total_bytes = manifest.get("total_bytes")
-        if total_bytes != sum(entry["bytes"] for entry in observed):
+        if total_bytes != sum(entry["bytes"] for entry in snapshot.entries):
             raise EvidenceTampered("evidence manifest total is invalid")
         modes = [
-            *file_modes,
+            *snapshot.file_modes,
             manifest_mode,
             stat.S_IMODE(directory.stat().st_mode),
-            *directory_modes,
+            *snapshot.directory_modes,
         ]
         if any(mode & 0o222 for mode in modes):
             raise EvidenceTampered("sealed evidence is writable")
-        return _VerifiedEvidence(_canonical_sha256(manifest), payload_bytes)
+        return _VerifiedEvidence(
+            _canonical_sha256(manifest),
+            snapshot.payload_bytes,
+        )
 
     def reconcile_evidence_result(
         self, run_id: str, relative_directory: str, value: Any
@@ -967,12 +961,14 @@ class RunStore:
         relative_directory: str,
     ) -> _VerifiedEvidence:
         directory = Path(f"/proc/self/fd/{evidence_descriptor}")
-        with _open_evidence_tree(directory) as tree:
-            if [entry.path for entry in tree.files] != ["result.json"]:
-                raise EvidenceError("unsealed evidence result is ambiguous")
-            limit = _tree_limit(relative_directory)
-            _validate_evidence_sizes(tree.files, limit)
-            entries = _manifest_entries(tree.files, limit)
+        snapshot = _manifest_snapshot(
+            directory,
+            _tree_limit(relative_directory),
+            payload_capture="none",
+        )
+        if [entry["path"] for entry in snapshot.entries] != ["result.json"]:
+            raise EvidenceError("unsealed evidence result is ambiguous")
+        entries = snapshot.entries
         manifest = {
             "schema_version": SCHEMA_VERSION,
             "files": entries,
@@ -1199,26 +1195,21 @@ class RunStore:
             if str(exc) != "sealed evidence is writable" or receipt is not None:
                 raise
 
-        with _open_evidence_tree(directory) as tree:
-            modes = [
-                *(
-                    stat.S_IMODE(os.fstat(entry.descriptor).st_mode)
-                    for entry in tree.files
-                ),
-                *(
-                    stat.S_IMODE(os.fstat(entry.descriptor).st_mode)
-                    for entry in tree.directories
-                ),
-                stat.S_IMODE(
-                    os.stat(
-                        "manifest.json",
-                        dir_fd=evidence_descriptor,
-                        follow_symlinks=False,
-                    ).st_mode
-                ),
-            ]
-            if any(mode & 0o222 for mode in modes):
-                raise EvidenceTampered("sealed evidence is writable")
+        modes = [
+            *(
+                stat.S_IMODE(os.fstat(entry.descriptor).st_mode)
+                for entry in _walk_evidence_tree(directory)
+            ),
+            stat.S_IMODE(
+                os.stat(
+                    "manifest.json",
+                    dir_fd=evidence_descriptor,
+                    follow_symlinks=False,
+                ).st_mode
+            ),
+        ]
+        if any(mode & 0o222 for mode in modes):
+            raise EvidenceTampered("sealed evidence is writable")
         os.fchmod(evidence_descriptor, 0o500)
         os.fsync(evidence_descriptor)
         os.fsync(parent_descriptor)
@@ -1601,12 +1592,10 @@ class RunStore:
                 if _entry_exists_at(evidence_descriptor, "manifest.json"):
                     raise EvidenceError("partial evidence contains an invalid manifest")
                 directory = Path(f"/proc/self/fd/{evidence_descriptor}")
-                with _open_evidence_tree(directory) as tree:
-                    _validate_evidence_sizes(
-                        tree.files,
-                        _tree_limit(relative_directory),
-                    )
-                    return tuple(entry.path for entry in tree.files)
+                return _evidence_file_inventory(
+                    directory,
+                    _tree_limit(relative_directory),
+                )
 
     def partial_evidence_value(self, run_id: str, relative_path: str) -> Any:
         """Read one structured value from unsealed evidence."""
@@ -2756,8 +2745,7 @@ def _atomic_bytes(path: Path, payload: bytes) -> None:
         temporary.unlink(missing_ok=True)
 
 
-@contextmanager
-def _open_evidence_tree(directory: Path) -> Iterator[_OpenEvidenceTree]:
+def _walk_evidence_tree(directory: Path) -> Iterator[_OpenEvidenceEntry]:
     directory_flags = (
         os.O_RDONLY
         | os.O_DIRECTORY
@@ -2767,86 +2755,111 @@ def _open_evidence_tree(directory: Path) -> Iterator[_OpenEvidenceTree]:
     file_flags = (
         os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     )
-    root_descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
-    descriptors = [root_descriptor]
-    files = []
-    directories = []
+    try:
+        root_descriptor = os.open(
+            directory,
+            os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0),
+        )
+    except OSError as exc:
+        raise _evidence_tree_os_error(exc) from exc
 
-    def walk(parent_descriptor: int, prefix: str) -> None:
-        for name in sorted(os.listdir(parent_descriptor)):
+    def walk(parent_descriptor: int, prefix: str) -> Iterator[_OpenEvidenceEntry]:
+        try:
+            names = sorted(os.listdir(parent_descriptor))
+        except OSError as exc:
+            raise _evidence_tree_os_error(exc) from exc
+        for name in names:
             relative = f"{prefix}/{name}" if prefix else name
             if relative == "manifest.json":
                 continue
+            descriptor = -1
             try:
                 metadata = os.stat(
                     name,
                     dir_fd=parent_descriptor,
                     follow_symlinks=False,
                 )
+                if stat.S_ISLNK(metadata.st_mode):
+                    raise EvidenceError("evidence must not contain symlinks")
                 if stat.S_ISDIR(metadata.st_mode):
                     descriptor = os.open(
                         name,
                         directory_flags,
                         dir_fd=parent_descriptor,
                     )
-                    descriptors.append(descriptor)
                     if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
                         raise EvidenceError("evidence must contain only regular files")
-                    directories.append(_OpenEvidenceEntry(relative, descriptor))
-                    walk(descriptor, relative)
+                    yield from walk(descriptor, relative)
+                    yield _OpenEvidenceEntry(relative, descriptor, True)
                 elif stat.S_ISREG(metadata.st_mode):
                     descriptor = os.open(
                         name,
                         file_flags,
                         dir_fd=parent_descriptor,
                     )
-                    descriptors.append(descriptor)
                     if not stat.S_ISREG(os.fstat(descriptor).st_mode):
                         raise EvidenceError("evidence must contain only regular files")
-                    files.append(_OpenEvidenceEntry(relative, descriptor))
+                    yield _OpenEvidenceEntry(relative, descriptor, False)
                 else:
                     raise EvidenceError("evidence must contain only regular files")
             except OSError as exc:
-                raise EvidenceError("evidence must not contain symlinks") from exc
+                raise _evidence_tree_os_error(exc) from exc
+            finally:
+                if descriptor >= 0:
+                    os.close(descriptor)
 
     try:
-        walk(root_descriptor, "")
-        yield _OpenEvidenceTree(
-            tuple(sorted(files, key=lambda entry: entry.path)),
-            tuple(sorted(directories, key=lambda entry: entry.path)),
-        )
+        yield from walk(root_descriptor, "")
     finally:
-        for descriptor in reversed(descriptors):
-            os.close(descriptor)
+        os.close(root_descriptor)
 
 
-def _manifest_entries(
-    files: tuple[_OpenEvidenceEntry, ...], byte_limit: int
-) -> list[dict[str, Any]]:
-    entries, _ = _manifest_snapshot(
-        files,
-        byte_limit,
-        payload_capture="none",
-    )
-    return entries
+def _evidence_tree_os_error(exc: OSError) -> EvidenceError:
+    if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+        return EvidenceError("evidence must not contain symlinks")
+    detail = exc.strerror or type(exc).__name__
+    return EvidenceError(f"evidence tree could not be read: {detail}")
 
 
 def _manifest_snapshot(
-    files: tuple[_OpenEvidenceEntry, ...],
+    directory: Path,
     byte_limit: int,
     *,
     payload_capture: Literal["none", "result", "all"],
-) -> tuple[list[dict[str, Any]], dict[str, bytes]]:
-    _validate_evidence_sizes(files, byte_limit)
+    seal: bool = False,
+) -> _EvidenceTreeSnapshot:
     entries = []
     payload_bytes = {}
-    for entry in files:
-        size = os.fstat(entry.descriptor).st_size
+    file_modes = []
+    directory_modes = []
+    total = 0
+    for entry in _walk_evidence_tree(directory):
+        try:
+            metadata = os.fstat(entry.descriptor)
+        except OSError as exc:
+            raise _evidence_tree_os_error(exc) from exc
+        if entry.is_directory:
+            directory_modes.append(stat.S_IMODE(metadata.st_mode))
+            if seal:
+                try:
+                    os.fchmod(entry.descriptor, 0o500)
+                    os.fsync(entry.descriptor)
+                except OSError as exc:
+                    raise _evidence_tree_os_error(exc) from exc
+            continue
+        size = metadata.st_size
+        if _is_stream(Path(entry.path)) and size > STREAM_BYTE_LIMIT:
+            raise EvidenceTooLarge(f"evidence stream exceeds {STREAM_BYTE_LIMIT} bytes")
+        total += size
+        if total > byte_limit:
+            raise EvidenceTooLarge(f"evidence tree exceeds {byte_limit} bytes")
         try:
             with os.fdopen(os.dup(entry.descriptor), "rb") as stream:
                 payload = stream.read()
             text = payload.decode("utf-8")
-        except (OSError, UnicodeDecodeError) as exc:
+        except OSError as exc:
+            raise _evidence_tree_os_error(exc) from exc
+        except UnicodeDecodeError as exc:
             raise EvidenceError("evidence must be regular UTF-8 text") from exc
         if redact_text(text) != text:
             raise EvidenceError(
@@ -2864,20 +2877,40 @@ def _manifest_snapshot(
                 "sha256": hashlib.sha256(payload).hexdigest(),
             }
         )
-    return entries, payload_bytes
+        file_modes.append(stat.S_IMODE(metadata.st_mode))
+        if seal:
+            try:
+                os.fchmod(entry.descriptor, 0o400)
+                os.fsync(entry.descriptor)
+            except OSError as exc:
+                raise _evidence_tree_os_error(exc) from exc
+    entries.sort(key=lambda entry: entry["path"])
+    payload_bytes = {path: payload_bytes[path] for path in sorted(payload_bytes)}
+    return _EvidenceTreeSnapshot(
+        entries,
+        payload_bytes,
+        file_modes,
+        directory_modes,
+    )
 
 
-def _validate_evidence_sizes(
-    files: tuple[_OpenEvidenceEntry, ...], byte_limit: int
-) -> None:
+def _evidence_file_inventory(directory: Path, byte_limit: int) -> tuple[str, ...]:
+    files = []
     total = 0
-    for entry in files:
-        size = os.fstat(entry.descriptor).st_size
+    for entry in _walk_evidence_tree(directory):
+        if entry.is_directory:
+            continue
+        try:
+            size = os.fstat(entry.descriptor).st_size
+        except OSError as exc:
+            raise _evidence_tree_os_error(exc) from exc
         if _is_stream(Path(entry.path)) and size > STREAM_BYTE_LIMIT:
             raise EvidenceTooLarge(f"evidence stream exceeds {STREAM_BYTE_LIMIT} bytes")
         total += size
         if total > byte_limit:
             raise EvidenceTooLarge(f"evidence tree exceeds {byte_limit} bytes")
+        files.append(entry.path)
+    return tuple(sorted(files))
 
 
 def _is_stream(path: Path) -> bool:

@@ -16,7 +16,6 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-import afk.run_store as run_store_module  # noqa: E402
 from afk.bead_spec import (  # noqa: E402
     BEAD_SPEC_ARTIFACT,
     BEAD_SPEC_EVIDENCE,
@@ -1819,22 +1818,21 @@ class RunStoreTest(unittest.TestCase):
                     )
                     for path in [external, *external.rglob("*")]
                 }
-                original_open_tree = run_store_module._open_evidence_tree
+                original_listdir = os.listdir
+                nested_inode = nested.stat().st_ino
                 swapped = False
 
-                @contextmanager
-                def swap_after_discovery(directory):
+                def swap_after_nested_open(descriptor):
                     nonlocal swapped
-                    with original_open_tree(directory) as tree:
-                        if not swapped:
-                            swapped = True
-                            nested.rename(detached)
-                            nested.symlink_to(external, target_is_directory=True)
-                        yield tree
+                    if not swapped and os.fstat(descriptor).st_ino == nested_inode:
+                        swapped = True
+                        nested.rename(detached)
+                        nested.symlink_to(external, target_is_directory=True)
+                    return original_listdir(descriptor)
 
                 with patch(
-                    "afk.run_store._open_evidence_tree",
-                    new=swap_after_discovery,
+                    "afk.run_store.os.listdir",
+                    new=swap_after_nested_open,
                 ):
                     if isinstance(expected, type) and issubclass(expected, Exception):
                         with self.assertRaises(expected):
@@ -1852,6 +1850,65 @@ class RunStoreTest(unittest.TestCase):
                     for path in [external, *external.rglob("*")]
                 }
                 self.assertEqual(after, before)
+
+    def test_many_evidence_files_seal_and_verify_with_a_low_descriptor_limit(self):
+        script = """
+import resource
+import sys
+from pathlib import Path
+
+from afk.run_store import EvidenceError, RunStore
+
+root = Path(sys.argv[1])
+store = RunStore(root)
+deep_store = RunStore(root.parent / "deep")
+store.create_run(
+    bead_id="central-bhap.8.6",
+    repository="https://example.invalid/acme/beads-webui.git",
+    base_branch="main",
+    base_sha="a" * 40,
+    start_request={},
+    run_id="run-001",
+)
+for index in range(80):
+    store.write_evidence_text(
+        "run-001",
+        f"attempts/open/files/{index:03}.txt",
+        "",
+    )
+deep_store.create_run(
+    bead_id="central-bhap.8.6",
+    repository="https://example.invalid/acme/beads-webui.git",
+    base_branch="main",
+    base_sha="a" * 40,
+    start_request={},
+    run_id="run-002",
+)
+deep_path = "attempts/open/" + "/".join(f"d{index:02}" for index in range(80))
+deep_store.write_evidence_text("run-002", f"{deep_path}/input.txt", "")
+_, hard_limit = resource.getrlimit(resource.RLIMIT_NOFILE)
+resource.setrlimit(resource.RLIMIT_NOFILE, (64, hard_limit))
+store.seal_evidence("run-001", "attempts/open")
+store.verify_evidence("run-001", "attempts/open")
+try:
+    deep_store.seal_evidence("run-002", "attempts/open")
+except EvidenceError as exc:
+    message = str(exc)
+    if "Too many open files" not in message or "symlink" in message:
+        raise AssertionError(message) from exc
+else:
+    raise AssertionError("deep traversal unexpectedly succeeded")
+"""
+        result = subprocess.run(
+            [sys.executable, "-c", script, str(self.state_home / "limited")],
+            cwd=ROOT,
+            env={**os.environ, "PYTHONPATH": str(ROOT / "src")},
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_sealed_evidence_result_does_not_repair_changed_published_evidence(self):
         self.create_run()
