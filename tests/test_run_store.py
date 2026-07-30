@@ -1,4 +1,5 @@
 import fcntl
+import hashlib
 import json
 import os
 import stat
@@ -941,6 +942,61 @@ class RunStoreTest(unittest.TestCase):
             self.store.observe_sealed_evidence_result("run-001", unit),
             expected,
         )
+
+    def test_recovery_receipts_the_exact_manifest_snapshot_that_was_verified(self):
+        self.create_run()
+        unit = "gates/completion"
+        self.store.write_evidence_value(
+            "run-001", f"{unit}/result.json", {"status": "complete"}
+        )
+        link = os.link
+
+        def interrupt_receipt_publication(source, target, *args, **kwargs):
+            if kwargs.get("dst_dir_fd") is not None:
+                raise OSError("simulated interruption")
+            return link(source, target, *args, **kwargs)
+
+        with patch("afk.run_store.os.link", side_effect=interrupt_receipt_publication):
+            with self.assertRaisesRegex(
+                EvidenceTampered, "evidence receipt is invalid"
+            ):
+                self.store.seal_evidence("run-001", unit)
+
+        manifest_path = self.root / "runs" / "run-001" / unit / "manifest.json"
+        verified_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        replacement_manifest = {**verified_manifest, "total_bytes": 999}
+        verify_evidence_manifest = self.store._verify_evidence_manifest
+
+        def replace_manifest_after_verification(run_id, relative_directory):
+            verified = verify_evidence_manifest(run_id, relative_directory)
+            manifest_path.chmod(0o600)
+            manifest_path.write_text(
+                json.dumps(replacement_manifest),
+                encoding="utf-8",
+            )
+            manifest_path.chmod(0o400)
+            return verified
+
+        with patch.object(
+            self.store,
+            "_verify_evidence_manifest",
+            side_effect=replace_manifest_after_verification,
+        ):
+            self.store.sealed_evidence_result("run-001", unit)
+
+        receipt_path = next(
+            (self.root / "runs" / "run-001" / ".evidence-receipts").iterdir()
+        )
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        verified_digest = hashlib.sha256(
+            json.dumps(
+                verified_manifest,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
+        self.assertEqual(receipt["manifest_sha256"], verified_digest)
 
     def test_receipt_publication_rejects_a_directory_symlink_swap(self):
         self.create_run()

@@ -730,11 +730,16 @@ class RunStore:
             directory.chmod(0o500)
             _fsync_directory(directory)
             _fsync_directory(directory.parent)
-            self.verify_evidence(run_id, relative_directory)
-            self._publish_evidence_receipt(run_id, relative_directory, manifest)
+            manifest_digest = self._verify_evidence_manifest(run_id, relative_directory)
+            self._publish_evidence_receipt(run_id, relative_directory, manifest_digest)
             return manifest
 
     def verify_evidence(self, run_id: str, relative_directory: str) -> bool:
+        self._verify_evidence_manifest(run_id, relative_directory)
+        return True
+
+    def _verify_evidence_manifest(self, run_id: str, relative_directory: str) -> str:
+        """Verify sealed evidence and return its canonical manifest digest."""
         directory = self._evidence_path(run_id, relative_directory)
         manifest_path = directory / "manifest.json"
         try:
@@ -765,7 +770,7 @@ class RunStore:
         for path in [*files, manifest_path, *directories]:
             if stat.S_IMODE(path.stat().st_mode) & 0o222:
                 raise EvidenceTampered("sealed evidence is writable")
-        return True
+        return _canonical_sha256(manifest)
 
     def reconcile_evidence_result(
         self, run_id: str, relative_directory: str, value: Any
@@ -832,9 +837,9 @@ class RunStore:
                 raise EvidenceTampered("evidence manifest is invalid")
             if not manifest_path.is_file():
                 return None
-        self.verify_evidence(run_id, relative_directory)
+        manifest_digest = self._verify_evidence_manifest(run_id, relative_directory)
         if receipt is not None:
-            self._verify_evidence_receipt(run_id, relative_directory)
+            self._verify_evidence_receipt(run_id, relative_directory, manifest_digest)
         return _read_evidence_result(directory / "result.json")
 
     def sealed_evidence_payloads(
@@ -861,8 +866,8 @@ class RunStore:
         )
         receipt = self._read_evidence_receipt(run_id, relative_directory)
         try:
-            self.verify_evidence(run_id, relative_directory)
-            self._publish_evidence_receipt_for_manifest(run_id, relative_directory)
+            manifest_digest = self._verify_evidence_manifest(run_id, relative_directory)
+            self._publish_evidence_receipt(run_id, relative_directory, manifest_digest)
             return
         except EvidenceTampered as exc:
             if str(exc) != "sealed evidence is writable" or receipt is not None:
@@ -877,8 +882,8 @@ class RunStore:
         directory.chmod(0o500)
         _fsync_directory(directory)
         _fsync_directory(directory.parent)
-        self.verify_evidence(run_id, relative_directory)
-        self._publish_evidence_receipt_for_manifest(run_id, relative_directory)
+        manifest_digest = self._verify_evidence_manifest(run_id, relative_directory)
+        self._publish_evidence_receipt(run_id, relative_directory, manifest_digest)
 
     def _evidence_receipt_path(self, run_id: str, relative_directory: str) -> Path:
         digest = hashlib.sha256(relative_directory.encode("utf-8")).hexdigest()
@@ -952,44 +957,28 @@ class RunStore:
             raise EvidenceTampered("evidence receipt is invalid")
         return value
 
-    def _verify_evidence_receipt(self, run_id: str, relative_directory: str) -> None:
+    def _verify_evidence_receipt(
+        self,
+        run_id: str,
+        relative_directory: str,
+        manifest_digest: str,
+    ) -> None:
         receipt = self._read_evidence_receipt(run_id, relative_directory)
         if receipt is None:
             raise EvidenceTampered("evidence receipt is missing")
-        try:
-            manifest = json.loads(
-                (
-                    self._evidence_path(run_id, relative_directory) / "manifest.json"
-                ).read_text(encoding="utf-8")
-            )
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise EvidenceTampered("evidence manifest is missing or invalid") from exc
-        if receipt["manifest_sha256"] != _canonical_sha256(manifest):
+        if receipt["manifest_sha256"] != manifest_digest:
             raise EvidenceTampered("evidence receipt does not match its manifest")
-
-    def _publish_evidence_receipt_for_manifest(
-        self, run_id: str, relative_directory: str
-    ) -> None:
-        try:
-            manifest = json.loads(
-                (
-                    self._evidence_path(run_id, relative_directory) / "manifest.json"
-                ).read_text(encoding="utf-8")
-            )
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise EvidenceTampered("evidence manifest is missing or invalid") from exc
-        self._publish_evidence_receipt(run_id, relative_directory, manifest)
 
     def _publish_evidence_receipt(
         self,
         run_id: str,
         relative_directory: str,
-        manifest: dict[str, Any],
+        manifest_digest: str,
     ) -> None:
         expected = {
             "schema_version": SCHEMA_VERSION,
             "evidence": relative_directory,
-            "manifest_sha256": _canonical_sha256(manifest),
+            "manifest_sha256": manifest_digest,
         }
         receipt_path = self._evidence_receipt_path(run_id, relative_directory)
         observed = self._read_evidence_receipt(run_id, relative_directory)
