@@ -32,6 +32,7 @@ from afk.resume_preflight import validate_open_attempts
 
 
 SCHEMA_VERSION = 1
+RUN_IDENTITY_SCHEMA_VERSION = 2
 EVIDENCE_RECEIPT_VERSION = 1
 STREAM_BYTE_LIMIT = 64 * 1024 * 1024
 ATTEMPT_BYTE_LIMIT = 256 * 1024 * 1024
@@ -242,7 +243,7 @@ class RunStore:
 
             identity = redact_artifact_value(
                 {
-                    "schema_version": SCHEMA_VERSION,
+                    "schema_version": RUN_IDENTITY_SCHEMA_VERSION,
                     "run_id": run_id,
                     "bead_id": bead_id,
                     "repository": repository,
@@ -855,7 +856,7 @@ class RunStore:
             receipt = self._read_evidence_receipt_at(run_descriptor, relative_directory)
             if receipt is None:
                 identity = self._identity_at(run_descriptor, run_id)
-                if identity.get("evidence_receipt_version") == EVIDENCE_RECEIPT_VERSION:
+                if identity["schema_version"] == RUN_IDENTITY_SCHEMA_VERSION:
                     return None
             with self._open_observation_evidence(
                 run_descriptor,
@@ -1669,19 +1670,20 @@ class RunStore:
             "created_at",
             "start_request",
         }
+        receipt_keys = legacy_keys | {"evidence_receipt_version"}
+        schema_version = (
+            identity.get("schema_version") if isinstance(identity, dict) else None
+        )
+        valid_format = (
+            schema_version == SCHEMA_VERSION and set(identity) == legacy_keys
+        ) or (
+            schema_version == RUN_IDENTITY_SCHEMA_VERSION
+            and set(identity) == receipt_keys
+            and type(identity.get("evidence_receipt_version")) is int
+            and identity["evidence_receipt_version"] == EVIDENCE_RECEIPT_VERSION
+        )
         if (
-            not isinstance(identity, dict)
-            or set(identity)
-            not in (legacy_keys, legacy_keys | {"evidence_receipt_version"})
-            or type(identity.get("schema_version")) is not int
-            or identity["schema_version"] != SCHEMA_VERSION
-            or (
-                "evidence_receipt_version" in identity
-                and (
-                    type(identity["evidence_receipt_version"]) is not int
-                    or identity["evidence_receipt_version"] != EVIDENCE_RECEIPT_VERSION
-                )
-            )
+            not valid_format
             or identity.get("run_id") != run_id
             or any(
                 not isinstance(identity.get(field), str) or not identity[field].strip()

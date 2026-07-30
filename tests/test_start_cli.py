@@ -8311,7 +8311,7 @@ class StartCliTest(unittest.TestCase):
         _, run_dir = self.create_resume_preflight_run()
         identity_path = run_dir / "run.json"
         identity = json.loads(identity_path.read_text(encoding="utf-8"))
-        identity["schema_version"] = 2
+        identity["schema_version"] = 3
         identity_path.write_text(json.dumps(identity) + "\n", encoding="utf-8")
 
         self.assert_resume_preflight_rejected("Run identity is invalid: crashed-run")
@@ -8843,7 +8843,10 @@ class StartCliTest(unittest.TestCase):
         }
         identity_path.write_text(
             json.dumps(
-                {key: identity[key] for key in base_identity_keys},
+                {
+                    **{key: identity[key] for key in base_identity_keys},
+                    "schema_version": 1,
+                },
                 sort_keys=True,
                 separators=(",", ":"),
             )

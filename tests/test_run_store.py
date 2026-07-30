@@ -85,6 +85,7 @@ class RunStoreTest(unittest.TestCase):
         active = json.loads((self.root / "active.json").read_text(encoding="utf-8"))
 
         self.assertEqual(projection["state"], "created")
+        self.assertEqual(identity["schema_version"], 2)
         self.assertEqual(identity["bead_id"], "central-bnkl.1.1")
         self.assertEqual(identity["start_request"]["note"], "token=[REDACTED]")
         self.assertEqual(identity["evidence_receipt_version"], 1)
@@ -98,6 +99,29 @@ class RunStoreTest(unittest.TestCase):
             run_dir / "state.json",
         ):
             self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+
+    def test_schema_two_run_identity_requires_receipt_protocol_version(self):
+        self.create_run()
+        identity_path = self.root / "runs" / "run-001" / "run.json"
+        original = json.loads(identity_path.read_text(encoding="utf-8"))
+
+        for replacement in (None, 0):
+            with self.subTest(evidence_receipt_version=replacement):
+                identity = dict(original)
+                if replacement is None:
+                    identity.pop("evidence_receipt_version")
+                else:
+                    identity["evidence_receipt_version"] = replacement
+                identity_path.write_text(
+                    json.dumps(identity, sort_keys=True, separators=(",", ":")) + "\n",
+                    encoding="utf-8",
+                )
+
+                with self.assertRaisesRegex(
+                    EventHistoryCorrupt,
+                    "Run identity is invalid: run-001",
+                ):
+                    self.store.identity("run-001")
 
     def test_status_replays_stale_projection_and_ignores_torn_event_tail(self):
         self.create_run()
