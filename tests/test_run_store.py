@@ -1125,6 +1125,40 @@ class RunStoreTest(unittest.TestCase):
 
         self.assertEqual(observed, expected)
 
+    def test_observation_rejects_a_symlinked_run_without_reading_external_evidence(
+        self,
+    ):
+        self.create_run()
+        unit = "gates/completion"
+        expected = {"status": "external"}
+        self.store.write_evidence_value("run-001", f"{unit}/result.json", expected)
+        self.store.seal_evidence("run-001", unit)
+        selected_run = self.root / "runs" / "run-001"
+        external_run = self.state_home / "external-run"
+        selected_run.rename(external_run)
+        selected_run.symlink_to(external_run, target_is_directory=True)
+        before = {
+            path.relative_to(external_run).as_posix()
+            or ".": (
+                path.read_bytes() if path.is_file() else None,
+                stat.S_IMODE(path.stat().st_mode),
+            )
+            for path in [external_run, *external_run.rglob("*")]
+        }
+
+        with self.assertRaisesRegex(EvidenceError, "evidence path is invalid"):
+            self.store.observe_sealed_evidence_result("run-001", unit)
+
+        after = {
+            path.relative_to(external_run).as_posix()
+            or ".": (
+                path.read_bytes() if path.is_file() else None,
+                stat.S_IMODE(path.stat().st_mode),
+            )
+            for path in [external_run, *external_run.rglob("*")]
+        }
+        self.assertEqual(after, before)
+
     def test_sealed_evidence_result_does_not_repair_changed_published_evidence(self):
         self.create_run()
         expected = {"status": "complete"}
