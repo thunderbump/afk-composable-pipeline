@@ -71,4 +71,12 @@ if mode == "populated":
             "requires_human_decision": True,
         }
     ]
-print(json.dumps(result))
+payload = json.dumps(result)
+if mode.startswith("padded-"):
+    target_bytes = int(mode.removeprefix("padded-"))
+    if len(payload.encode("utf-8")) > target_bytes:
+        raise SystemExit("padded output target is too small")
+    payload += " " * (target_bytes - len(payload.encode("utf-8")))
+    sys.stdout.write(payload)
+else:
+    print(payload)

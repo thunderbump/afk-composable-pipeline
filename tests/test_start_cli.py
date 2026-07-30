@@ -214,6 +214,10 @@ class StartCliTest(unittest.TestCase):
 
     def run_afk(self, *args, **overrides):
         short_cleanup_timeout = overrides.pop("AFK_TEST_SHORT_CLEANUP_TIMEOUT", None)
+        retrospective_output_byte_limit = overrides.pop(
+            "AFK_TEST_RETROSPECTIVE_OUTPUT_BYTE_LIMIT",
+            None,
+        )
         crash_injections = {
             key: target
             for key in CRASH_INJECTION_OVERRIDES
@@ -337,6 +341,19 @@ class StartCliTest(unittest.TestCase):
                     "injected_completion_finalization\n"
                     "from afk.cli import main\n"
                     "raise SystemExit(main(sys.argv[1:]))\n"
+                ),
+                *args,
+            ]
+        elif retrospective_output_byte_limit is not None:
+            output_limit = int(retrospective_output_byte_limit)
+            command = [
+                sys.executable,
+                "-c",
+                (
+                    "import sys; "
+                    "import afk.retrospective_attempt as retrospective; "
+                    f"retrospective.RETROSPECTIVE_OUTPUT_BYTE_LIMIT={output_limit}; "
+                    "from afk.cli import main; raise SystemExit(main(sys.argv[1:]))"
                 ),
                 *args,
             ]
@@ -11539,6 +11556,90 @@ class StartCliTest(unittest.TestCase):
                     project_before,
                 )
                 self.assertFalse((state_home / "fake-mutations.jsonl").exists())
+
+    def test_public_attention_retrospective_enforces_exact_byte_limits(self):
+        self.assertEqual(MAX_RUN_SUMMARY_BYTES, 65_536)
+        self.assertEqual(RETROSPECTIVE_OUTPUT_BYTE_LIMIT, 67_108_864)
+        self.assertEqual(ATTEMPT_BYTE_LIMIT, 268_435_456)
+        self.install_retrospective_analyzer()
+        control = self.fake_bin / ".fake-retrospective-mode"
+        output_limit = 2_048
+        cases = (
+            ("padded-2048", RETROSPECTIVE_OUTCOME_CASES[1].expected, output_limit),
+            (
+                "padded-2049",
+                {
+                    "schema_version": 1,
+                    "status": "invalid",
+                    "warning": True,
+                    "process_findings_count": 0,
+                    "improvement_proposals_count": 0,
+                    "warning_summary": (
+                        "retrospective analysis output exceeds the size limit"
+                    ),
+                },
+                0,
+            ),
+        )
+        for mode, expected, retained_output_bytes in cases:
+            with self.subTest(mode=mode):
+                state_home = self.temp / f"bounded-{mode}"
+                control.write_text(mode, encoding="utf-8")
+
+                started = self.run_afk(
+                    "start",
+                    "central-bnkl.1.1",
+                    XDG_STATE_HOME=str(state_home),
+                    AFK_FAKE_SYSTEMD_FAILURE="1",
+                    AFK_TEST_RETROSPECTIVE_OUTPUT_BYTE_LIMIT=str(output_limit),
+                )
+
+                self.assertEqual(started.returncode, 2, started.stderr)
+                store = RunStore(state_home / "afk")
+                status = store.status()
+                run_id = status["run_id"]
+                episode = status["attention_episode"]
+                self.assert_exact_retrospective_outcome(
+                    store,
+                    run_id,
+                    episode,
+                    expected=expected,
+                )
+                observed = self.run_afk(
+                    "status",
+                    run_id,
+                    "--json",
+                    XDG_STATE_HOME=str(state_home),
+                )
+                self.assertEqual(observed.returncode, 2, observed.stderr)
+                self.assertEqual(
+                    json.loads(observed.stdout)["retrospective"]["latest"]["status"],
+                    expected["status"],
+                )
+                evidence_dir = (
+                    state_home / "afk" / "runs" / run_id / episode["evidence"]
+                )
+                manifest = json.loads(
+                    (evidence_dir / "manifest.json").read_text(encoding="utf-8")
+                )
+                payload_bytes = {
+                    entry["path"]: (evidence_dir / entry["path"]).read_bytes()
+                    for entry in manifest["files"]
+                }
+                self.assertEqual(
+                    manifest["total_bytes"],
+                    sum(len(payload) for payload in payload_bytes.values()),
+                )
+                self.assertEqual(
+                    {entry["path"]: entry["bytes"] for entry in manifest["files"]},
+                    {path: len(payload) for path, payload in payload_bytes.items()},
+                )
+                self.assertEqual(
+                    len(payload_bytes["stdout.log"]) + len(payload_bytes["stderr.log"]),
+                    retained_output_bytes,
+                )
+                self.assertLessEqual(retained_output_bytes, output_limit)
+                self.assertEqual(status["state"], "attention_required")
 
     def test_one_run_retains_advisory_retrospectives_without_command_mutations(self):
         self.install_retrospective_analyzer()
