@@ -1,5 +1,6 @@
 import json
 import os
+import select
 import signal
 import shutil
 import subprocess
@@ -41,6 +42,7 @@ class SystemdIsolationTest(unittest.TestCase):
         unit = None
         run_id = None
         child_identity = None
+        child_pidfd = None
 
         def published_child_identity():
             try:
@@ -58,19 +60,39 @@ class SystemdIsolationTest(unittest.TestCase):
                 return None
             return identity
 
-        def exact_child_identity_exists():
-            if child_identity is None:
-                return False
+        def process_start_time(pid):
             try:
                 stat_fields = (
-                    Path(f"/proc/{child_identity['pid']}/stat")
+                    Path(f"/proc/{pid}/stat")
                     .read_text(encoding="utf-8")
                     .rsplit(")", 1)[1]
                     .split()
                 )
-            except FileNotFoundError:
-                return False
-            return stat_fields[19] == child_identity["start_time"]
+            except (FileNotFoundError, IndexError):
+                return None
+            return stat_fields[19]
+
+        def pidfd_exited(descriptor):
+            poller = select.poll()
+            poller.register(descriptor, select.POLLIN)
+            return bool(poller.poll(0))
+
+        def retain_published_child(identity):
+            try:
+                descriptor = os.pidfd_open(identity["pid"])
+            except ProcessLookupError:
+                return None
+            try:
+                matches = process_start_time(identity["pid"]) == identity[
+                    "start_time"
+                ] and not pidfd_exited(descriptor)
+            except BaseException:
+                os.close(descriptor)
+                raise
+            if matches:
+                return descriptor
+            os.close(descriptor)
+            return None
 
         try:
             fake_systemd_run = fixture.fake_bin / "systemd-run"
@@ -166,6 +188,11 @@ class SystemdIsolationTest(unittest.TestCase):
                 child_identity,
                 "retrospective descendant did not publish a valid identity",
             )
+            child_pidfd = retain_published_child(child_identity)
+            self.assertIsNotNone(
+                child_pidfd,
+                "retrospective descendant did not retain a pidfd",
+            )
 
             stopped = subprocess.run(
                 [systemctl, "--user", "stop", unit],
@@ -176,10 +203,10 @@ class SystemdIsolationTest(unittest.TestCase):
 
             self.assertEqual(stopped.returncode, 0, stopped.stderr)
             deadline = time.monotonic() + 10
-            while exact_child_identity_exists() and time.monotonic() < deadline:
+            while not pidfd_exited(child_pidfd) and time.monotonic() < deadline:
                 time.sleep(0.02)
-            self.assertFalse(
-                exact_child_identity_exists(),
+            self.assertTrue(
+                pidfd_exited(child_pidfd),
                 "detached retrospective descendant survived the AFK unit stop",
             )
             status = start_cli_tests.RunStore(fixture.state_home / "afk").status(run_id)
@@ -201,19 +228,27 @@ class SystemdIsolationTest(unittest.TestCase):
             )
             self.assertFalse(mutation.exists())
         finally:
-            if unit is not None:
-                subprocess.run(
-                    [systemctl, "--user", "stop", unit],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    check=False,
-                )
-            if exact_child_identity_exists():
+            try:
+                if unit is not None:
+                    subprocess.run(
+                        [systemctl, "--user", "stop", unit],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        check=False,
+                    )
+            finally:
                 try:
-                    os.kill(child_identity["pid"], signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-            fixture.tearDown()
+                    if child_pidfd is not None and not pidfd_exited(child_pidfd):
+                        try:
+                            signal.pidfd_send_signal(child_pidfd, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                finally:
+                    try:
+                        if child_pidfd is not None:
+                            os.close(child_pidfd)
+                    finally:
+                        fixture.tearDown()
 
 
 if __name__ == "__main__":
