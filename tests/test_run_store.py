@@ -1,4 +1,4 @@
-import hashlib
+import fcntl
 import json
 import os
 import stat
@@ -888,40 +888,57 @@ class RunStoreTest(unittest.TestCase):
             expected,
         )
         self.assertTrue(self.store.verify_evidence("run-001", "gates/completion"))
-        self.assertFalse(
-            (self.root / "runs" / "run-001" / ".evidence-publication").exists()
+        self.assertEqual(
+            self.store.observe_sealed_evidence_result("run-001", "gates/completion"),
+            expected,
         )
 
-    def test_observation_rejects_writable_evidence_with_a_stale_publication_marker(
-        self,
-    ):
+    def test_observation_ignores_an_immutable_seal_until_recovery_publishes_it(self):
         self.create_run()
         expected = {"status": "complete"}
         unit = "gates/completion"
         self.store.write_evidence_value("run-001", f"{unit}/result.json", expected)
-        marker_directory = self.root / "runs" / "run-001" / ".evidence-publication"
-        unlink = Path.unlink
+        link = os.link
 
-        def interrupt_marker_removal(path, *args, **kwargs):
-            if path.parent == marker_directory:
+        def interrupt_receipt_publication(source, target, *args, **kwargs):
+            if Path(target).parent.name == ".evidence-receipts":
                 raise OSError("simulated interruption")
-            return unlink(path, *args, **kwargs)
+            return link(source, target, *args, **kwargs)
 
-        with patch.object(Path, "unlink", new=interrupt_marker_removal):
+        with patch("afk.run_store.os.link", side_effect=interrupt_receipt_publication):
             with self.assertRaises(OSError):
                 self.store.seal_evidence("run-001", unit)
 
+        evidence = self.root / "runs" / "run-001" / unit
+        before = {
+            path.relative_to(evidence).as_posix()
+            or ".": (
+                path.read_bytes() if path.is_file() else None,
+                stat.S_IMODE(path.stat().st_mode),
+            )
+            for path in [evidence, *evidence.rglob("*")]
+        }
+        self.assertIsNone(self.store.observe_sealed_evidence_result("run-001", unit))
+        after = {
+            path.relative_to(evidence).as_posix()
+            or ".": (
+                path.read_bytes() if path.is_file() else None,
+                stat.S_IMODE(path.stat().st_mode),
+            )
+            for path in [evidence, *evidence.rglob("*")]
+        }
+        self.assertEqual(after, before)
+
+        self.assertEqual(
+            self.store.sealed_evidence_result("run-001", unit),
+            expected,
+        )
         self.assertEqual(
             self.store.observe_sealed_evidence_result("run-001", unit),
             expected,
         )
-        evidence = self.root / "runs" / "run-001" / unit
-        evidence.chmod(0o700)
 
-        with self.assertRaisesRegex(EvidenceTampered, "sealed evidence is writable"):
-            self.store.observe_sealed_evidence_result("run-001", unit)
-
-    def test_observation_rejects_a_forged_publication_marker(self):
+    def test_observation_rejects_a_forged_locked_receipt_for_writable_evidence(self):
         self.create_run()
         unit = "gates/completion"
         self.store.write_evidence_value(
@@ -930,19 +947,41 @@ class RunStoreTest(unittest.TestCase):
         self.store.seal_evidence("run-001", unit)
         evidence = self.root / "runs" / "run-001" / unit
         evidence.chmod(0o700)
-        marker_directory = self.root / "runs" / "run-001" / ".evidence-publication"
-        marker_directory.mkdir(mode=0o700)
-        marker = marker_directory / (
-            hashlib.sha256(unit.encode("utf-8")).hexdigest() + ".json"
+        receipt = next(
+            (self.root / "runs" / "run-001" / ".evidence-receipts").iterdir()
         )
-        marker.write_text(
-            json.dumps({"schema_version": 1, "evidence": unit}),
-            encoding="utf-8",
-        )
-        marker.chmod(0o600)
+        forged = receipt.read_bytes()
+        receipt.unlink()
+        receipt.write_bytes(forged)
+        receipt.chmod(0o400)
+        descriptor = os.open(receipt, os.O_RDONLY)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            with self.assertRaisesRegex(
+                EvidenceTampered, "sealed evidence is writable"
+            ):
+                self.store.observe_sealed_evidence_result("run-001", unit)
+            with self.assertRaisesRegex(
+                EvidenceTampered, "sealed evidence is writable"
+            ):
+                self.store.sealed_evidence_result("run-001", unit)
+        finally:
+            os.close(descriptor)
 
-        with self.assertRaisesRegex(EvidenceTampered, "sealed evidence is writable"):
-            self.store.observe_sealed_evidence_result("run-001", unit)
+    def test_observation_does_not_depend_on_filesystem_locks(self):
+        self.create_run()
+        unit = "gates/completion"
+        expected = {"status": "complete"}
+        self.store.write_evidence_value("run-001", f"{unit}/result.json", expected)
+        self.store.seal_evidence("run-001", unit)
+
+        with patch(
+            "afk.run_store.fcntl.flock",
+            side_effect=OSError("filesystem locks unavailable"),
+        ):
+            observed = self.store.observe_sealed_evidence_result("run-001", unit)
+
+        self.assertEqual(observed, expected)
 
     def test_sealed_evidence_result_does_not_repair_changed_published_evidence(self):
         self.create_run()

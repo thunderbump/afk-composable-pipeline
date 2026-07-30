@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import errno
 import fcntl
 import hashlib
 import json
@@ -713,23 +712,22 @@ class RunStore:
                 "files": entries,
                 "total_bytes": sum(entry["bytes"] for entry in entries),
             }
-            publisher = self._begin_evidence_publication(run_id, relative_directory)
-            try:
-                for path in files:
-                    path.chmod(0o400)
-                for path in sorted(
-                    [entry for entry in directory.rglob("*") if entry.is_dir()],
-                    key=lambda item: len(item.parts),
-                    reverse=True,
-                ):
-                    path.chmod(0o500)
-                _write_new_json(manifest_path, manifest, self.root, mode=0o400)
-                directory.chmod(0o500)
-                _fsync_directory(directory)
-                _fsync_directory(directory.parent)
-                self._finish_evidence_publication(run_id, relative_directory)
-            finally:
-                os.close(publisher)
+            for path in files:
+                path.chmod(0o400)
+                _fsync_file(path)
+            for path in sorted(
+                [entry for entry in directory.rglob("*") if entry.is_dir()],
+                key=lambda item: len(item.parts),
+                reverse=True,
+            ):
+                path.chmod(0o500)
+                _fsync_directory(path)
+            _write_new_json(manifest_path, manifest, self.root, mode=0o400)
+            directory.chmod(0o500)
+            _fsync_directory(directory)
+            _fsync_directory(directory.parent)
+            self.verify_evidence(run_id, relative_directory)
+            self._publish_evidence_receipt(run_id, relative_directory, manifest)
             return manifest
 
     def verify_evidence(self, run_id: str, relative_directory: str) -> bool:
@@ -816,23 +814,10 @@ class RunStore:
     ) -> Any | None:
         """Read a fully sealed result without completing or repairing its seal."""
         directory = self._evidence_path(run_id, relative_directory)
-        publishing = self._evidence_publisher_is_active(run_id, relative_directory)
-        manifest_path = directory / "manifest.json"
-        if manifest_path.is_symlink() or (
-            manifest_path.exists() and not manifest_path.is_file()
-        ):
-            raise EvidenceTampered("evidence manifest is invalid")
-        if not manifest_path.is_file():
+        if self._read_evidence_receipt(run_id, relative_directory) is None:
             return None
-        try:
-            self.verify_evidence(run_id, relative_directory)
-        except EvidenceTampered as exc:
-            if str(exc) == "sealed evidence is writable" and (
-                publishing
-                or self._evidence_publisher_is_active(run_id, relative_directory)
-            ):
-                return None
-            raise
+        self.verify_evidence(run_id, relative_directory)
+        self._verify_evidence_receipt(run_id, relative_directory)
         return _read_evidence_result(directory / "result.json")
 
     def sealed_evidence_payloads(
@@ -854,12 +839,13 @@ class RunStore:
             return payloads
 
     def _verify_or_finish_seal(self, run_id: str, relative_directory: str) -> None:
+        receipt = self._read_evidence_receipt(run_id, relative_directory)
         try:
             self.verify_evidence(run_id, relative_directory)
-            self._finish_evidence_publication(run_id, relative_directory)
+            self._publish_evidence_receipt_for_manifest(run_id, relative_directory)
             return
         except EvidenceTampered as exc:
-            if str(exc) != "sealed evidence is writable":
+            if str(exc) != "sealed evidence is writable" or receipt is not None:
                 raise
 
         directory = self._evidence_path(run_id, relative_directory)
@@ -873,126 +859,127 @@ class RunStore:
         _fsync_directory(directory)
         _fsync_directory(directory.parent)
         self.verify_evidence(run_id, relative_directory)
-        self._finish_evidence_publication(run_id, relative_directory)
+        self._publish_evidence_receipt_for_manifest(run_id, relative_directory)
 
-    def _evidence_publication_path(self, run_id: str, relative_directory: str) -> Path:
+    def _evidence_receipt_path(self, run_id: str, relative_directory: str) -> Path:
         digest = hashlib.sha256(relative_directory.encode("utf-8")).hexdigest()
-        return self._run_dir(run_id) / ".evidence-publication" / f"{digest}.json"
+        return self._run_dir(run_id) / ".evidence-receipts" / f"{digest}.json"
 
-    def _evidence_publication_in_progress(
+    def _read_evidence_receipt(
         self, run_id: str, relative_directory: str
-    ) -> bool:
-        marker = self._evidence_publication_path(run_id, relative_directory)
-        marker_directory = marker.parent
+    ) -> dict[str, Any] | None:
+        receipt = self._evidence_receipt_path(run_id, relative_directory)
+        receipt_directory = receipt.parent
         try:
-            directory_metadata = marker_directory.lstat()
-        except FileNotFoundError:
-            return False
-        except OSError as exc:
-            raise EvidenceTampered("evidence publication marker is invalid") from exc
-        if (
-            not stat.S_ISDIR(directory_metadata.st_mode)
-            or stat.S_IMODE(directory_metadata.st_mode) != 0o700
-        ):
-            raise EvidenceTampered("evidence publication marker is invalid")
-        expected = {
-            "schema_version": 1,
-            "evidence": relative_directory,
-        }
-        try:
-            metadata = marker.lstat()
-        except FileNotFoundError:
-            return False
-        except OSError as exc:
-            raise EvidenceTampered("evidence publication marker is invalid") from exc
-        if (
-            not stat.S_ISREG(metadata.st_mode)
-            or stat.S_IMODE(metadata.st_mode) != 0o600
-        ):
-            raise EvidenceTampered("evidence publication marker is invalid")
-        try:
-            observed = json.loads(marker.read_text(encoding="utf-8"))
-        except FileNotFoundError:
-            return False
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise EvidenceTampered("evidence publication marker is invalid") from exc
-        if observed != expected:
-            raise EvidenceTampered("evidence publication marker is invalid")
-        return True
-
-    def _begin_evidence_publication(self, run_id: str, relative_directory: str) -> int:
-        marker = self._evidence_publication_path(run_id, relative_directory)
-        if not self._evidence_publication_in_progress(run_id, relative_directory):
-            _secure_directory(marker.parent)
-            _write_new_json(
-                marker,
-                {
-                    "schema_version": 1,
-                    "evidence": relative_directory,
-                },
-                self.root,
-            )
-        descriptor = os.open(
-            marker,
-            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
-        )
-        try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX)
-        except BaseException:
-            os.close(descriptor)
-            raise
-        return descriptor
-
-    def _evidence_publisher_is_active(
-        self, run_id: str, relative_directory: str
-    ) -> bool:
-        if not self._evidence_publication_in_progress(run_id, relative_directory):
-            return False
-        marker = self._evidence_publication_path(run_id, relative_directory)
-        try:
-            descriptor = os.open(
-                marker,
+            directory_descriptor = os.open(
+                receipt_directory,
                 os.O_RDONLY
+                | os.O_DIRECTORY
                 | getattr(os, "O_CLOEXEC", 0)
                 | getattr(os, "O_NOFOLLOW", 0),
             )
         except FileNotFoundError:
-            return False
+            return None
         except OSError as exc:
-            raise EvidenceTampered("evidence publication marker is invalid") from exc
+            raise EvidenceTampered("evidence receipt is invalid") from exc
         try:
-            metadata = os.fstat(descriptor)
+            directory_metadata = os.fstat(directory_descriptor)
             if (
-                not stat.S_ISREG(metadata.st_mode)
-                or stat.S_IMODE(metadata.st_mode) != 0o600
+                not stat.S_ISDIR(directory_metadata.st_mode)
+                or stat.S_IMODE(directory_metadata.st_mode) != 0o700
             ):
-                raise EvidenceTampered("evidence publication marker is invalid")
+                raise EvidenceTampered("evidence receipt is invalid")
             try:
-                fcntl.flock(
-                    descriptor,
-                    fcntl.LOCK_SH | fcntl.LOCK_NB,
+                descriptor = os.open(
+                    receipt.name,
+                    os.O_RDONLY
+                    | getattr(os, "O_CLOEXEC", 0)
+                    | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=directory_descriptor,
                 )
-            except BlockingIOError:
-                return True
-            fcntl.flock(descriptor, fcntl.LOCK_UN)
-            return False
+            except FileNotFoundError:
+                return None
+            except OSError as exc:
+                raise EvidenceTampered("evidence receipt is invalid") from exc
+            try:
+                metadata = os.fstat(descriptor)
+                if (
+                    not stat.S_ISREG(metadata.st_mode)
+                    or stat.S_IMODE(metadata.st_mode) != 0o400
+                ):
+                    raise EvidenceTampered("evidence receipt is invalid")
+                with os.fdopen(os.dup(descriptor), encoding="utf-8") as stream:
+                    value = json.load(stream)
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise EvidenceTampered("evidence receipt is invalid") from exc
+            finally:
+                os.close(descriptor)
         finally:
-            os.close(descriptor)
+            os.close(directory_descriptor)
+        if (
+            not isinstance(value, dict)
+            or set(value)
+            != {
+                "schema_version",
+                "evidence",
+                "manifest_sha256",
+            }
+            or type(value.get("schema_version")) is not int
+            or value["schema_version"] != SCHEMA_VERSION
+            or value.get("evidence") != relative_directory
+            or not isinstance(value.get("manifest_sha256"), str)
+            or SHA256_PATTERN.fullmatch(value["manifest_sha256"]) is None
+        ):
+            raise EvidenceTampered("evidence receipt is invalid")
+        return value
 
-    def _finish_evidence_publication(
+    def _verify_evidence_receipt(self, run_id: str, relative_directory: str) -> None:
+        receipt = self._read_evidence_receipt(run_id, relative_directory)
+        if receipt is None:
+            raise EvidenceTampered("evidence receipt is missing")
+        try:
+            manifest = json.loads(
+                (
+                    self._evidence_path(run_id, relative_directory) / "manifest.json"
+                ).read_text(encoding="utf-8")
+            )
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise EvidenceTampered("evidence manifest is missing or invalid") from exc
+        if receipt["manifest_sha256"] != _canonical_sha256(manifest):
+            raise EvidenceTampered("evidence receipt does not match its manifest")
+
+    def _publish_evidence_receipt_for_manifest(
         self, run_id: str, relative_directory: str
     ) -> None:
-        marker = self._evidence_publication_path(run_id, relative_directory)
-        if not self._evidence_publication_in_progress(run_id, relative_directory):
-            return
-        marker.unlink()
-        _fsync_directory(marker.parent)
         try:
-            marker.parent.rmdir()
-        except OSError as exc:
-            if exc.errno not in {errno.EEXIST, errno.ENOTEMPTY}:
-                raise
-        _fsync_directory(marker.parent.parent)
+            manifest = json.loads(
+                (
+                    self._evidence_path(run_id, relative_directory) / "manifest.json"
+                ).read_text(encoding="utf-8")
+            )
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise EvidenceTampered("evidence manifest is missing or invalid") from exc
+        self._publish_evidence_receipt(run_id, relative_directory, manifest)
+
+    def _publish_evidence_receipt(
+        self,
+        run_id: str,
+        relative_directory: str,
+        manifest: dict[str, Any],
+    ) -> None:
+        expected = {
+            "schema_version": SCHEMA_VERSION,
+            "evidence": relative_directory,
+            "manifest_sha256": _canonical_sha256(manifest),
+        }
+        receipt_path = self._evidence_receipt_path(run_id, relative_directory)
+        observed = self._read_evidence_receipt(run_id, relative_directory)
+        if observed is not None:
+            if observed != expected:
+                raise EvidenceTampered("evidence receipt does not match its manifest")
+            return
+        _secure_directory(receipt_path.parent)
+        _write_new_json(receipt_path, expected, self.root, mode=0o400)
 
     def unsealed_evidence_result(
         self, run_id: str, relative_directory: str
@@ -2061,6 +2048,17 @@ def _evidence_unit_root(path: Path, run_dir: Path) -> Path:
 
 def _fsync_directory(path: Path) -> None:
     descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _fsync_file(path: Path) -> None:
+    descriptor = os.open(
+        path,
+        os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+    )
     try:
         os.fsync(descriptor)
     finally:
