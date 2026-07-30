@@ -965,10 +965,10 @@ class RunStoreTest(unittest.TestCase):
         manifest_path = self.root / "runs" / "run-001" / unit / "manifest.json"
         verified_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         replacement_manifest = {**verified_manifest, "total_bytes": 999}
-        verify_evidence_manifest = self.store._verify_evidence_manifest
+        verify_evidence_directory = self.store._verify_evidence_directory
 
-        def replace_manifest_after_verification(run_id, relative_directory):
-            verified = verify_evidence_manifest(run_id, relative_directory)
+        def replace_manifest_after_verification(directory, relative_directory):
+            verified = verify_evidence_directory(directory, relative_directory)
             manifest_path.chmod(0o600)
             manifest_path.write_text(
                 json.dumps(replacement_manifest),
@@ -979,7 +979,7 @@ class RunStoreTest(unittest.TestCase):
 
         with patch.object(
             self.store,
-            "_verify_evidence_manifest",
+            "_verify_evidence_directory",
             side_effect=replace_manifest_after_verification,
         ):
             self.store.sealed_evidence_result("run-001", unit)
@@ -1148,6 +1148,40 @@ class RunStoreTest(unittest.TestCase):
 
         with self.assertRaisesRegex(EvidenceError, "evidence path is invalid"):
             self.store.observe_sealed_evidence_result("run-001", unit)
+
+        after = {
+            path.relative_to(external_run).as_posix()
+            or ".": (
+                path.read_bytes() if path.is_file() else None,
+                stat.S_IMODE(path.stat().st_mode),
+            )
+            for path in [external_run, *external_run.rglob("*")]
+        }
+        self.assertEqual(after, before)
+
+    def test_recovery_rejects_a_symlinked_run_without_rewriting_external_evidence(
+        self,
+    ):
+        self.create_run()
+        unit = "gates/completion"
+        expected = {"status": "external"}
+        self.store.write_evidence_value("run-001", f"{unit}/result.json", expected)
+        self.store.seal_evidence("run-001", unit)
+        selected_run = self.root / "runs" / "run-001"
+        external_run = self.state_home / "external-run"
+        selected_run.rename(external_run)
+        selected_run.symlink_to(external_run, target_is_directory=True)
+        before = {
+            path.relative_to(external_run).as_posix()
+            or ".": (
+                path.read_bytes() if path.is_file() else None,
+                stat.S_IMODE(path.stat().st_mode),
+            )
+            for path in [external_run, *external_run.rglob("*")]
+        }
+
+        with self.assertRaisesRegex(EvidenceError, "evidence path is invalid"):
+            self.store.sealed_evidence_result("run-001", unit)
 
         after = {
             path.relative_to(external_run).as_posix()

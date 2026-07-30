@@ -812,16 +812,32 @@ class RunStore:
     ) -> Any | None:
         """Return a verified sealed result, or None when it has not been sealed."""
         with self.lock():
-            directory = self._evidence_path(run_id, relative_directory)
-            manifest_path = directory / "manifest.json"
-            if manifest_path.is_symlink() or (
-                manifest_path.exists() and not manifest_path.is_file()
-            ):
-                raise EvidenceTampered("evidence manifest is invalid")
-            if not manifest_path.is_file():
-                return None
-            self._verify_or_finish_seal(run_id, relative_directory)
-            return _read_evidence_result(directory / "result.json")
+            relative_directory = _canonical_evidence_relative(relative_directory)
+            with self._open_observation_run(run_id) as run_descriptor:
+                self._identity_at(run_descriptor, run_id)
+                with self._open_observation_evidence(
+                    run_descriptor,
+                    relative_directory,
+                    missing_ok=True,
+                ) as evidence_descriptors:
+                    if evidence_descriptors is None:
+                        return None
+                    evidence_descriptor, parent_descriptor = evidence_descriptors
+                    directory = Path(f"/proc/self/fd/{evidence_descriptor}")
+                    manifest_path = directory / "manifest.json"
+                    if manifest_path.is_symlink() or (
+                        manifest_path.exists() and not manifest_path.is_file()
+                    ):
+                        raise EvidenceTampered("evidence manifest is invalid")
+                    if not manifest_path.is_file():
+                        return None
+                    self._verify_or_finish_seal_at(
+                        run_descriptor,
+                        evidence_descriptor,
+                        parent_descriptor,
+                        relative_directory,
+                    )
+                    return _read_evidence_result(directory / "result.json")
 
     def observe_sealed_evidence_result(
         self, run_id: str, relative_directory: str
@@ -838,9 +854,10 @@ class RunStore:
                 run_descriptor,
                 relative_directory,
                 missing_ok=receipt is None,
-            ) as evidence_descriptor:
-                if evidence_descriptor is None:
+            ) as evidence_descriptors:
+                if evidence_descriptors is None:
                     return None
+                evidence_descriptor, _ = evidence_descriptors
                 directory = Path(f"/proc/self/fd/{evidence_descriptor}")
                 manifest_path = directory / "manifest.json"
                 if manifest_path.is_symlink() or (
@@ -905,6 +922,41 @@ class RunStore:
         _fsync_directory(directory.parent)
         manifest_digest = self._verify_evidence_manifest(run_id, relative_directory)
         self._publish_evidence_receipt(run_id, relative_directory, manifest_digest)
+
+    def _verify_or_finish_seal_at(
+        self,
+        run_descriptor: int,
+        evidence_descriptor: int,
+        parent_descriptor: int,
+        relative_directory: str,
+    ) -> None:
+        directory = Path(f"/proc/self/fd/{evidence_descriptor}")
+        receipt = self._read_evidence_receipt_at(run_descriptor, relative_directory)
+        try:
+            manifest_digest = self._verify_evidence_directory(
+                directory, relative_directory
+            )
+            self._publish_evidence_receipt_at(
+                run_descriptor, relative_directory, manifest_digest
+            )
+            return
+        except EvidenceTampered as exc:
+            if str(exc) != "sealed evidence is writable" or receipt is not None:
+                raise
+
+        manifest_path = directory / "manifest.json"
+        files = _evidence_files(directory)
+        nested_directories = [path for path in directory.rglob("*") if path.is_dir()]
+        for path in [*files, manifest_path, *nested_directories]:
+            if stat.S_IMODE(path.stat().st_mode) & 0o222:
+                raise EvidenceTampered("sealed evidence is writable")
+        os.fchmod(evidence_descriptor, 0o500)
+        os.fsync(evidence_descriptor)
+        os.fsync(parent_descriptor)
+        manifest_digest = self._verify_evidence_directory(directory, relative_directory)
+        self._publish_evidence_receipt_at(
+            run_descriptor, relative_directory, manifest_digest
+        )
 
     def _evidence_receipt_path(self, run_id: str, relative_directory: str) -> Path:
         digest = hashlib.sha256(relative_directory.encode("utf-8")).hexdigest()
@@ -1060,6 +1112,44 @@ class RunStore:
         finally:
             os.close(directory_descriptor)
 
+    def _publish_evidence_receipt_at(
+        self,
+        run_descriptor: int,
+        relative_directory: str,
+        manifest_digest: str,
+    ) -> None:
+        expected = {
+            "schema_version": SCHEMA_VERSION,
+            "evidence": relative_directory,
+            "manifest_sha256": manifest_digest,
+        }
+        observed = self._read_evidence_receipt_at(run_descriptor, relative_directory)
+        if observed is not None:
+            if observed != expected:
+                raise EvidenceTampered("evidence receipt does not match its manifest")
+            return
+        try:
+            directory_descriptor = self._open_evidence_receipt_directory_at(
+                run_descriptor
+            )
+        except OSError as exc:
+            raise EvidenceTampered("evidence receipt is invalid") from exc
+        receipt_name = (
+            hashlib.sha256(relative_directory.encode("utf-8")).hexdigest() + ".json"
+        )
+        try:
+            _write_new_json_at(
+                directory_descriptor,
+                receipt_name,
+                expected,
+                self.root,
+                mode=0o400,
+            )
+        except OSError as exc:
+            raise EvidenceTampered("evidence receipt is invalid") from exc
+        finally:
+            os.close(directory_descriptor)
+
     def _open_evidence_receipt_directory(self, run_id: str) -> int:
         directory_flags = (
             os.O_RDONLY
@@ -1068,7 +1158,6 @@ class RunStore:
             | getattr(os, "O_NOFOLLOW", 0)
         )
         descriptors = []
-        receipt_descriptor = None
         try:
             descriptor = os.open(self.root, directory_flags)
             descriptors.append(descriptor)
@@ -1076,31 +1165,42 @@ class RunStore:
             descriptors.append(descriptor)
             descriptor = os.open(run_id, directory_flags, dir_fd=descriptor)
             descriptors.append(descriptor)
-            try:
-                os.mkdir(".evidence-receipts", mode=0o700, dir_fd=descriptor)
-                created = True
-            except FileExistsError:
-                created = False
-            receipt_descriptor = os.open(
-                ".evidence-receipts",
-                directory_flags,
-                dir_fd=descriptor,
-            )
+            return self._open_evidence_receipt_directory_at(descriptor)
+        finally:
+            for descriptor in reversed(descriptors):
+                os.close(descriptor)
+
+    def _open_evidence_receipt_directory_at(self, run_descriptor: int) -> int:
+        directory_flags = (
+            os.O_RDONLY
+            | os.O_DIRECTORY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        try:
+            os.mkdir(".evidence-receipts", mode=0o700, dir_fd=run_descriptor)
+            created = True
+        except FileExistsError:
+            created = False
+        receipt_descriptor = os.open(
+            ".evidence-receipts",
+            directory_flags,
+            dir_fd=run_descriptor,
+        )
+        try:
             metadata = os.fstat(receipt_descriptor)
             if created:
                 os.fchmod(receipt_descriptor, 0o700)
                 os.fsync(receipt_descriptor)
-                os.fsync(descriptor)
+                os.fsync(run_descriptor)
             elif stat.S_IMODE(metadata.st_mode) != 0o700:
                 raise EvidenceTampered("evidence receipt is invalid")
             result = receipt_descriptor
-            receipt_descriptor = None
+            receipt_descriptor = -1
             return result
         finally:
-            if receipt_descriptor is not None:
+            if receipt_descriptor >= 0:
                 os.close(receipt_descriptor)
-            for descriptor in reversed(descriptors):
-                os.close(descriptor)
 
     @contextmanager
     def _open_observation_run(self, run_id: str) -> Iterator[int]:
@@ -1136,7 +1236,7 @@ class RunStore:
         relative_directory: str,
         *,
         missing_ok: bool,
-    ) -> Iterator[int | None]:
+    ) -> Iterator[tuple[int, int] | None]:
         directory_flags = (
             os.O_RDONLY
             | os.O_DIRECTORY
@@ -1159,7 +1259,10 @@ class RunStore:
                 ) from exc
             except OSError as exc:
                 raise EvidenceError("evidence path must not contain symlinks") from exc
-            yield descriptor
+            parent_descriptor = (
+                descriptors[-2] if len(descriptors) > 1 else run_descriptor
+            )
+            yield descriptor, parent_descriptor
         finally:
             for descriptor in reversed(descriptors):
                 os.close(descriptor)
