@@ -1,3 +1,6 @@
+import json
+import os
+import signal
 import shutil
 import subprocess
 import sys
@@ -35,6 +38,22 @@ class SystemdIsolationTest(unittest.TestCase):
         )
         fixture.setUp()
         unit = None
+        child_identity = None
+
+        def exact_child_identity_exists():
+            if child_identity is None:
+                return False
+            try:
+                stat_fields = (
+                    Path(f"/proc/{child_identity['pid']}/stat")
+                    .read_text(encoding="utf-8")
+                    .rsplit(")", 1)[1]
+                    .split()
+                )
+            except FileNotFoundError:
+                return False
+            return stat_fields[19] == child_identity["start_time"]
+
         try:
             fake_systemd_run = fixture.fake_bin / "systemd-run"
             fake_systemd_run.unlink()
@@ -55,10 +74,13 @@ class SystemdIsolationTest(unittest.TestCase):
                     if "--skip-git-repo-check" not in sys.argv:
                         raise SystemExit(7)
                     child = (
-                        "import signal,sys,time;"
+                        "import json,os,signal,sys,time;"
                         "from pathlib import Path;"
                         "signal.signal(signal.SIGTERM,signal.SIG_IGN);"
-                        "Path(sys.argv[1]).write_text('ready');"
+                        "start_time=Path('/proc/self/stat').read_text()"
+                        ".rsplit(')',1)[1].split()[19];"
+                        "Path(sys.argv[1]).write_text(json.dumps({{"
+                        "'pid':os.getpid(),'start_time':start_time}}));"
                         "time.sleep(2);"
                         "Path(sys.argv[2]).write_text('mutated')"
                     )
@@ -107,6 +129,7 @@ class SystemdIsolationTest(unittest.TestCase):
             while not ready.exists() and time.monotonic() < deadline:
                 time.sleep(0.02)
             self.assertTrue(ready.exists(), "retrospective descendant did not start")
+            child_identity = json.loads(ready.read_text(encoding="utf-8"))
 
             stopped = subprocess.run(
                 [systemctl, "--user", "stop", unit],
@@ -116,7 +139,13 @@ class SystemdIsolationTest(unittest.TestCase):
             )
 
             self.assertEqual(stopped.returncode, 0, stopped.stderr)
-            time.sleep(2.1)
+            deadline = time.monotonic() + 10
+            while exact_child_identity_exists() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertFalse(
+                exact_child_identity_exists(),
+                "detached retrospective descendant survived the AFK unit stop",
+            )
             self.assertFalse(mutation.exists())
         finally:
             if unit is not None:
@@ -126,6 +155,11 @@ class SystemdIsolationTest(unittest.TestCase):
                     stderr=subprocess.DEVNULL,
                     check=False,
                 )
+            if exact_child_identity_exists():
+                try:
+                    os.kill(child_identity["pid"], signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
             fixture.tearDown()
 
 
