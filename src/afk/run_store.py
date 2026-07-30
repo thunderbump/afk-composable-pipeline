@@ -2148,22 +2148,14 @@ def _write_new_json_at(
     *,
     mode: int = 0o600,
 ) -> None:
-    staging_directory = staging_root / ".unpublished"
-    _secure_directory(staging_directory)
-    target_id = hashlib.sha256(name.encode("utf-8")).hexdigest()
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f"{target_id}.", suffix=".tmp", dir=staging_directory
-    )
-    temporary = Path(temporary_name)
-    try:
-        payload = (f"{canonical_json(redact_artifact_value(value))}\n").encode("utf-8")
-        os.fchmod(descriptor, mode)
-        written = os.write(descriptor, payload)
-        if written != len(payload):
-            raise RunStoreError(f"write was incomplete: {name}")
-        os.fsync(descriptor)
-        os.close(descriptor)
-        descriptor = -1
+    payload = (f"{canonical_json(redact_artifact_value(value))}\n").encode("utf-8")
+    with _staged_new_bytes(
+        payload,
+        staging_root,
+        target_id=name,
+        target_name=name,
+        mode=mode,
+    ) as temporary:
         os.link(
             temporary,
             name,
@@ -2171,10 +2163,6 @@ def _write_new_json_at(
             follow_symlinks=False,
         )
         os.fsync(directory_descriptor)
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
-        temporary.unlink(missing_ok=True)
 
 
 def _read_evidence_result(path: Path) -> Any:
@@ -2187,23 +2175,42 @@ def _read_evidence_result(path: Path) -> Any:
 def _write_new_bytes(
     path: Path, value: bytes, staging_root: Path, *, mode: int = 0o600
 ) -> None:
+    with _staged_new_bytes(
+        value,
+        staging_root,
+        target_id=str(path),
+        target_name=path.name,
+        mode=mode,
+    ) as temporary:
+        os.link(temporary, path)
+        _fsync_directory(path.parent)
+
+
+@contextmanager
+def _staged_new_bytes(
+    value: bytes,
+    staging_root: Path,
+    *,
+    target_id: str,
+    target_name: str,
+    mode: int,
+) -> Iterator[Path]:
     staging_directory = staging_root / ".unpublished"
     _secure_directory(staging_directory)
-    target_id = hashlib.sha256(str(path).encode("utf-8")).hexdigest()
+    digest = hashlib.sha256(target_id.encode("utf-8")).hexdigest()
     descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f"{target_id}.", suffix=".tmp", dir=staging_directory
+        prefix=f"{digest}.", suffix=".tmp", dir=staging_directory
     )
     temporary = Path(temporary_name)
     try:
         os.fchmod(descriptor, mode)
         written = os.write(descriptor, value)
         if written != len(value):
-            raise RunStoreError(f"write was incomplete: {path.name}")
+            raise RunStoreError(f"write was incomplete: {target_name}")
         os.fsync(descriptor)
         os.close(descriptor)
         descriptor = -1
-        os.link(temporary, path)
-        _fsync_directory(path.parent)
+        yield temporary
     finally:
         if descriptor >= 0:
             os.close(descriptor)
