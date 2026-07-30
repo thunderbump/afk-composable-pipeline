@@ -845,7 +845,11 @@ class RunStore:
                 manifest = json.load(stream)
         except EvidenceTampered:
             raise
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        except OSError as exc:
+            if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+                raise EvidenceTampered("evidence manifest is invalid") from exc
+            raise EvidenceTampered("evidence manifest is missing or invalid") from exc
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise EvidenceTampered("evidence manifest is missing or invalid") from exc
         finally:
             if manifest_descriptor >= 0:

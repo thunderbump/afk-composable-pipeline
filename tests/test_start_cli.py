@@ -193,7 +193,7 @@ class StartCliTest(unittest.TestCase):
                     " result = original_write_json(path, value, root, **kwargs)\n"
                     " target = injections.get('AFK_TEST_KILL_AFTER_MANIFEST')\n"
                     " if target and path.name == 'manifest.json' "
-                    "and target in str(path):\n"
+                    "and target in str(path.resolve()):\n"
                     "  os.kill(os.getpid(), signal.SIGKILL)\n"
                     " return result\n"
                     "def injected_run_contract(*args, **kwargs):\n"
@@ -7005,6 +7005,16 @@ class StartCliTest(unittest.TestCase):
         manifest.unlink()
         outcome.chmod(0o600)
         outcome.write_text("{}\n", encoding="utf-8")
+        receipt = (
+            self.state_home
+            / "afk"
+            / "runs"
+            / run_id
+            / ".evidence-receipts"
+            / f"{hashlib.sha256(evidence.encode('utf-8')).hexdigest()}.json"
+        )
+        receipt.chmod(0o600)
+        receipt.unlink()
         store.seal_evidence(run_id, evidence)
         self.assertTrue(store.verify_evidence(run_id, evidence))
 
@@ -10945,6 +10955,20 @@ class StartCliTest(unittest.TestCase):
         for path in [gate, *gate.rglob("*")]:
             path.chmod(0o700 if path.is_dir() else 0o600)
         (gate / "manifest.json").unlink()
+        receipt = (
+            store.root
+            / "runs"
+            / run_id
+            / ".evidence-receipts"
+            / (
+                hashlib.sha256(
+                    f"gates/{attempt['attempt_id']}".encode("utf-8")
+                ).hexdigest()
+                + ".json"
+            )
+        )
+        receipt.chmod(0o600)
+        receipt.unlink()
         outcome_path = gate / "afk/outcome.json"
         outcome = json.loads(outcome_path.read_text(encoding="utf-8"))
         outcome["candidate_sha"] = "e" * 40
