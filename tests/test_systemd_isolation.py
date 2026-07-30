@@ -10,11 +10,14 @@ import time
 import unittest
 from pathlib import Path
 
-import tests.test_start_cli as start_cli_tests
-from afk.durable_id import is_durable_id
+from tests.afk_cli_fixture import AfkCliFixture
 
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
+
+from afk.durable_id import is_durable_id  # noqa: E402
+from afk.run_store import RunStore  # noqa: E402
 
 
 class SystemdIsolationTest(unittest.TestCase):
@@ -32,13 +35,8 @@ class SystemdIsolationTest(unittest.TestCase):
         if available.returncode != 0:
             self.skipTest("a running user systemd manager is unavailable")
 
-        fixture = start_cli_tests.StartCliTest(
-            methodName=(
-                "test_start_launches_numbered_transient_worker_"
-                "and_reports_checkpoint"
-            )
-        )
-        fixture.setUp()
+        fixture = self.enterContext(AfkCliFixture())
+        fixture.install_public_start_fakes()
         unit = None
         run_id = None
         child_identity = None
@@ -95,9 +93,7 @@ class SystemdIsolationTest(unittest.TestCase):
             return None
 
         try:
-            fake_systemd_run = fixture.fake_bin / "systemd-run"
-            fake_systemd_run.unlink()
-            fake_systemd_run.symlink_to(systemd_run)
+            fixture.replace_fake_command("systemd-run", systemd_run)
             ready = fixture.temp / "detached-ready"
             mutation = fixture.temp / "late-mutation"
             analyzer = fixture.fake_bin / "codex"
@@ -209,7 +205,7 @@ class SystemdIsolationTest(unittest.TestCase):
                 pidfd_exited(child_pidfd),
                 "detached retrospective descendant survived the AFK unit stop",
             )
-            status = start_cli_tests.RunStore(fixture.state_home / "afk").status(run_id)
+            status = RunStore(fixture.state_home / "afk").status(run_id)
             self.assertEqual(status["state"], "attention_required")
             self.assertEqual(status["last_event"], "lifecycle.signal_interrupted")
             self.assertEqual(
@@ -244,11 +240,8 @@ class SystemdIsolationTest(unittest.TestCase):
                         except ProcessLookupError:
                             pass
                 finally:
-                    try:
-                        if child_pidfd is not None:
-                            os.close(child_pidfd)
-                    finally:
-                        fixture.tearDown()
+                    if child_pidfd is not None:
+                        os.close(child_pidfd)
 
 
 if __name__ == "__main__":

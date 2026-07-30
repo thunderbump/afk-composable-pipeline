@@ -6,7 +6,6 @@ import shutil
 import stat
 import subprocess
 import sys
-import tempfile
 import textwrap
 import threading
 import time
@@ -15,6 +14,8 @@ from io import StringIO
 from pathlib import Path
 from typing import NamedTuple
 from unittest.mock import patch
+
+from tests.afk_cli_fixture import AfkCliFixture, BASE_SHA
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -46,7 +47,6 @@ from afk.start import (  # noqa: E402
 )
 
 
-BASE_SHA = "a" * 40
 RAW_ANALYSIS_SENTINEL = "RAW_RETROSPECTIVE_ANALYSIS_SENTINEL"
 SENSITIVE_RETROSPECTIVE_SENTINEL = "sensitive-retrospective-token"
 
@@ -132,50 +132,23 @@ RETROSPECTIVE_OUTCOME_CASES = (
 
 class StartCliTest(unittest.TestCase):
     def setUp(self):
-        self.temporary_directory = tempfile.TemporaryDirectory()
-        self.temp = Path(self.temporary_directory.name)
-        self.project = self.temp / "beads-webui"
-        self.project.mkdir()
-        (self.project / "afk.toml").write_text(
-            textwrap.dedent(
-                """
-                schema_version = 1
-
-                [validation]
-                command = ["./scripts/validation-worker.sh", "run"]
-                timeout_seconds = 2700
-                """
-            ).lstrip(),
-            encoding="utf-8",
-        )
-        self.state_home = self.temp / "state"
-        self.state_home.mkdir()
-        self.home = self.temp / "home"
-        self.home.mkdir()
-        self.secret_value = "dogfood-password-value"
-        self.secret_path = self.temp / "secrets" / "beads-password.txt"
-        self.secret_path.parent.mkdir(mode=0o700)
-        self.secret_path.write_text(self.secret_value + "\n", encoding="utf-8")
-        self.secret_path.chmod(0o600)
-        self.config_home = self.temp / "config"
-        config_dir = self.config_home / "afk"
-        config_dir.mkdir(parents=True)
-        config_path = config_dir / "config.toml"
-        config_path.write_text(
-            "schema_version = 1\n"
-            "[beads]\n"
-            f'password_file = "{self.secret_path}"\n',
-            encoding="utf-8",
-        )
-        config_path.chmod(0o600)
-        (self.temp / "beads").mkdir()
-        self.fake_bin = self.temp / "bin"
-        self.fake_bin.mkdir()
-        self.command_log = self.temp / "commands.jsonl"
+        self.cli_fixture = AfkCliFixture()
+        for name in (
+            "temp",
+            "project",
+            "state_home",
+            "home",
+            "secret_value",
+            "secret_path",
+            "config_home",
+            "fake_bin",
+            "command_log",
+        ):
+            setattr(self, name, getattr(self.cli_fixture, name))
         self._write_fake_commands()
 
     def tearDown(self):
-        self.temporary_directory.cleanup()
+        self.cli_fixture.close()
 
     def install_retrospective_analyzer(self):
         analyzer = self.fake_bin / "codex"
@@ -187,30 +160,7 @@ class StartCliTest(unittest.TestCase):
         analyzer.chmod(0o700)
 
     def afk_environment(self, **overrides):
-        env = os.environ.copy()
-        env.update(
-            {
-                "PYTHONPATH": str(ROOT / "src"),
-                "PATH": f"{self.fake_bin}:{env['PATH']}",
-                "XDG_STATE_HOME": str(self.state_home),
-                "XDG_CONFIG_HOME": str(self.config_home),
-                "AFK_BEADS_WORKSPACE": str(self.temp / "beads"),
-                "AFK_FAKE_LOG": str(self.command_log),
-                "AFK_FAKE_PROJECT": str(self.project),
-                "AFK_FAKE_SHA": BASE_SHA,
-                "AFK_FAKE_BEAD": "central-bnkl.1.1",
-                "AFK_FAKE_BEAD_STATUS": "open",
-                "AFK_FAKE_ASSIGNEE": "",
-                "AFK_FAKE_BEAD_DESCRIPTION": "Implement one candidate.",
-                "AFK_FAKE_BEAD_COMMENTS": "[]",
-                "AFK_FAKE_PINNED_CONTRACT": "present",
-                "AFK_FAKE_EXPECTED_PASSWORD": self.secret_value,
-                "HOME": str(self.home),
-                "USER": "bump",
-            }
-        )
-        env.update(overrides)
-        return env
+        return self.cli_fixture.environment(**overrides)
 
     def run_afk(self, *args, **overrides):
         short_cleanup_timeout = overrides.pop("AFK_TEST_SHORT_CLEANUP_TIMEOUT", None)
