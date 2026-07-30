@@ -54,6 +54,13 @@ CRASH_INJECTION_OVERRIDES = (
     "AFK_TEST_KILL_AFTER_SEAL",
     "AFK_TEST_KILL_AFTER_COMPLETION_FINALIZATION",
 )
+RETROSPECTIVE_OUTCOME_CASES = (
+    ("populated", "passed", False, 1, 1),
+    ("empty", "empty", False, 0, 0),
+    ("invalid", "invalid", True, 0, 0),
+    ("unavailable", "unavailable", True, 0, 0),
+    ("interrupted", "interrupted", True, 0, 0),
+)
 
 
 class StartCliTest(unittest.TestCase):
@@ -278,6 +285,26 @@ class StartCliTest(unittest.TestCase):
             capture_output=True,
             check=False,
         )
+
+    def assert_exact_retrospective_outcome(
+        self,
+        store,
+        run_id,
+        episode,
+        *,
+        expected_status,
+        warning,
+        findings,
+        proposals,
+    ):
+        outcome = store.sealed_evidence_result(run_id, episode["evidence"])
+        self.assertEqual(outcome["status"], expected_status)
+        self.assertEqual(outcome["warning"], warning)
+        self.assertEqual(outcome["process_findings_count"], findings)
+        self.assertEqual(outcome["improvement_proposals_count"], proposals)
+        self.assertEqual(outcome["episode_sequence"], episode["episode_sequence"])
+        self.assertTrue(store.verify_evidence(run_id, episode["evidence"]))
+        return outcome
 
     def start_reviewed_run(self):
         started = self.run_afk("start", "central-bnkl.1.1")
@@ -984,7 +1011,11 @@ class StartCliTest(unittest.TestCase):
         commands = self.command_log.read_text(encoding="utf-8")
         self.assertIn('"command":"systemd-run"', commands)
         self.assertIn('"--property=Restart=no"', commands)
+        self.assertIn('"--property=KillMode=control-group"', commands)
+        self.assertIn('"--property=KillSignal=SIGKILL"', commands)
+        self.assertIn('"--property=TimeoutStopSec=30"', commands)
         self.assertIn('"--property=UMask=0077"', commands)
+        self.assertIn('"--collect"', commands)
 
     def test_start_forwards_only_approved_validation_execution_context(self):
         approved = {
@@ -5151,6 +5182,90 @@ class StartCliTest(unittest.TestCase):
         self.assertEqual(outcome["status"], "unavailable")
         self.assertTrue(outcome["warning"])
         self.assert_exact_terminal_completion(run_id)
+
+    def test_completion_retrospective_outcomes_remain_advisory_and_exact(self):
+        control = self.fake_bin / ".fake-retrospective-mode"
+        for (
+            mode,
+            expected_status,
+            warning,
+            findings,
+            proposals,
+        ) in RETROSPECTIVE_OUTCOME_CASES:
+            with self.subTest(mode=mode):
+                state_home = self.temp / f"completion-{mode}"
+                home = self.temp / f"completion-{mode}-home"
+                home.mkdir()
+                environment = {
+                    "XDG_STATE_HOME": str(state_home),
+                    "HOME": str(home),
+                }
+                control.write_text(mode, encoding="utf-8")
+                started = self.run_afk(
+                    "start",
+                    "central-bnkl.1.1",
+                    **environment,
+                )
+                self.assertEqual(started.returncode, 0, started.stderr)
+                run_id = started.stdout.strip()
+                worker = self.run_afk("_worker", run_id, **environment)
+                self.assertEqual(worker.returncode, 0, worker.stderr)
+                for _ in range(3):
+                    resumed = self.run_afk("resume", **environment)
+                    self.assertEqual(resumed.returncode, 0, resumed.stderr)
+
+                completed = self.run_afk("resume", **environment)
+
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                store = RunStore(state_home / "afk")
+                before = store.status(run_id)
+                episode = before["completion_episode"]
+                self.assert_exact_retrospective_outcome(
+                    store,
+                    run_id,
+                    episode,
+                    expected_status=expected_status,
+                    warning=warning,
+                    findings=findings,
+                    proposals=proposals,
+                )
+                run_dir = state_home / "afk" / "runs" / run_id
+                events = (run_dir / "events.jsonl").read_bytes()
+                manifest = (
+                    run_dir / episode["evidence"] / "manifest.json"
+                ).read_bytes()
+
+                self.assertEqual(before["state"], "completed")
+
+                repeated = self.run_afk("resume", run_id, **environment)
+                observed = self.run_afk(
+                    "status",
+                    run_id,
+                    "--json",
+                    **environment,
+                )
+
+                self.assertEqual(repeated.returncode, 0, repeated.stderr)
+                self.assertEqual(observed.returncode, 0, observed.stderr)
+                retrospective = json.loads(observed.stdout)["retrospective"]
+                self.assertEqual(
+                    retrospective["latest"]["episode_sequence"],
+                    episode["episode_sequence"],
+                )
+                self.assertEqual(
+                    retrospective["latest"]["evidence_path"],
+                    episode["evidence"],
+                )
+                self.assertEqual(
+                    retrospective["latest"]["status"],
+                    expected_status,
+                )
+                self.assertEqual(store.status(run_id), before)
+                self.assertEqual((run_dir / "events.jsonl").read_bytes(), events)
+                self.assertEqual(
+                    (run_dir / episode["evidence"] / "manifest.json").read_bytes(),
+                    manifest,
+                )
 
     def test_completion_retrospective_store_error_retains_single_completed_event(self):
         run_id = self.start_reviewed_run()
@@ -11276,6 +11391,98 @@ class StartCliTest(unittest.TestCase):
             outcome,
         )
 
+    def test_attention_retrospective_outcomes_remain_advisory_and_exact(self):
+        control = self.fake_bin / ".fake-retrospective-mode"
+        for (
+            mode,
+            expected_status,
+            warning,
+            findings,
+            proposals,
+        ) in RETROSPECTIVE_OUTCOME_CASES:
+            with self.subTest(mode=mode):
+                state_home = self.temp / f"attention-{mode}"
+                project_before = {
+                    path.relative_to(self.project): path.read_bytes()
+                    for path in self.project.rglob("*")
+                    if path.is_file()
+                }
+                control.write_text(mode, encoding="utf-8")
+
+                completed = self.run_afk(
+                    "start",
+                    "central-bnkl.1.1",
+                    XDG_STATE_HOME=str(state_home),
+                    AFK_FAKE_SYSTEMD_FAILURE="1",
+                )
+
+                self.assertEqual(completed.returncode, 2, completed.stderr)
+                store = RunStore(state_home / "afk")
+                before = store.status()
+                episode = before["attention_episode"]
+                self.assert_exact_retrospective_outcome(
+                    store,
+                    before["run_id"],
+                    episode,
+                    expected_status=expected_status,
+                    warning=warning,
+                    findings=findings,
+                    proposals=proposals,
+                )
+                manifest = (
+                    state_home
+                    / "afk"
+                    / "runs"
+                    / before["run_id"]
+                    / episode["evidence"]
+                    / "manifest.json"
+                ).read_bytes()
+
+                self.assertEqual(before["state"], "attention_required")
+
+                observed = self.run_afk(
+                    "status",
+                    before["run_id"],
+                    "--json",
+                    XDG_STATE_HOME=str(state_home),
+                )
+
+                self.assertEqual(observed.returncode, 2, observed.stderr)
+                retrospective = json.loads(observed.stdout)["retrospective"]
+                self.assertEqual(
+                    retrospective["latest"]["episode_sequence"],
+                    episode["episode_sequence"],
+                )
+                self.assertEqual(
+                    retrospective["latest"]["evidence_path"],
+                    episode["evidence"],
+                )
+                self.assertEqual(
+                    retrospective["latest"]["status"],
+                    expected_status,
+                )
+                self.assertEqual(store.status(before["run_id"]), before)
+                self.assertEqual(
+                    (
+                        state_home
+                        / "afk"
+                        / "runs"
+                        / before["run_id"]
+                        / episode["evidence"]
+                        / "manifest.json"
+                    ).read_bytes(),
+                    manifest,
+                )
+                self.assertEqual(
+                    {
+                        path.relative_to(self.project): path.read_bytes()
+                        for path in self.project.rglob("*")
+                        if path.is_file()
+                    },
+                    project_before,
+                )
+                self.assertFalse((state_home / "fake-mutations.jsonl").exists())
+
     def test_resume_reconciles_crashed_attention_before_lifecycle_mutation(self):
         interrupted = self.run_afk(
             "start",
@@ -12745,15 +12952,56 @@ class StartCliTest(unittest.TestCase):
                 args = sys.argv[1:]
                 prompt = sys.stdin.read()
                 if "--skip-git-repo-check" in args:
+                    control = (
+                        Path(__file__).resolve().parent
+                        / ".fake-retrospective-mode"
+                    )
+                    mode = (
+                        control.read_text(encoding="utf-8").strip()
+                        if control.exists()
+                        else "empty"
+                    )
+                    if mode == "unavailable":
+                        raise SystemExit(7)
+                    if mode == "interrupted":
+                        os.kill(os.getpid(), signal.SIGKILL)
+                    if mode == "invalid":
+                        print("{not-json")
+                        raise SystemExit(0)
                     summary = json.loads(prompt)
-                    print(json.dumps({
+                    result = {
                         "schema_version": 1,
                         "run_id": summary["run"]["run_id"],
                         "terminal_outcome": summary["episode"]["state"],
                         "summary": "No actionable findings.",
                         "process_findings": [],
                         "improvement_proposals": [],
-                    }))
+                    }
+                    if mode == "populated":
+                        result["summary"] = "One process issue was found."
+                        result["process_findings"] = [{
+                            "id": "finding-1",
+                            "category": "orchestration",
+                            "title": "The Run required attention",
+                            "evidence": [{
+                                "artifact": "episode-checkpoint.txt",
+                                "line_start": 1,
+                                "line_end": 1,
+                            }],
+                            "impact": "The Run stopped for an operator.",
+                            "confidence": "high",
+                        }]
+                        result["improvement_proposals"] = [{
+                            "id": "proposal-1",
+                            "addresses": ["finding-1"],
+                            "scope": "afk",
+                            "priority": "P1",
+                            "title": "Reduce attention interruptions",
+                            "rationale": "Fewer stops shorten the Run.",
+                            "suggested_change": "Improve interruption recovery.",
+                            "requires_human_decision": True,
+                        }]
+                    print(json.dumps(result))
                     raise SystemExit(0)
                 base_sha = "a" * 40
                 candidate_sha = "d" * 40
