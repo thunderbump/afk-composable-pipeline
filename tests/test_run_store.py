@@ -86,6 +86,7 @@ class RunStoreTest(unittest.TestCase):
         self.assertEqual(projection["state"], "created")
         self.assertEqual(identity["bead_id"], "central-bnkl.1.1")
         self.assertEqual(identity["start_request"]["note"], "token=[REDACTED]")
+        self.assertEqual(identity["evidence_receipt_version"], 1)
         self.assertEqual(json.loads(events[0])["sequence"], 1)
         self.assertEqual(active, {"run_id": "run-001"})
         self.assertEqual(stat.S_IMODE(self.root.stat().st_mode), 0o700)

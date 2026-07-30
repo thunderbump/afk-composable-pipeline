@@ -32,6 +32,7 @@ from afk.resume_preflight import validate_open_attempts
 
 
 SCHEMA_VERSION = 1
+EVIDENCE_RECEIPT_VERSION = 1
 STREAM_BYTE_LIMIT = 64 * 1024 * 1024
 ATTEMPT_BYTE_LIMIT = 256 * 1024 * 1024
 GATE_BYTE_LIMIT = 512 * 1024 * 1024
@@ -244,6 +245,7 @@ class RunStore:
                     "base_sha": base_sha,
                     "created_at": created_at,
                     "start_request": start_request or {},
+                    "evidence_receipt_version": EVIDENCE_RECEIPT_VERSION,
                 }
             )
             _write_new_json(run_dir / "run.json", identity, self.root)
@@ -814,10 +816,21 @@ class RunStore:
     ) -> Any | None:
         """Read a fully sealed result without completing or repairing its seal."""
         directory = self._evidence_path(run_id, relative_directory)
-        if self._read_evidence_receipt(run_id, relative_directory) is None:
-            return None
+        receipt = self._read_evidence_receipt(run_id, relative_directory)
+        if receipt is None:
+            identity = self._identity(run_id)
+            if identity.get("evidence_receipt_version") == EVIDENCE_RECEIPT_VERSION:
+                return None
+            manifest_path = directory / "manifest.json"
+            if manifest_path.is_symlink() or (
+                manifest_path.exists() and not manifest_path.is_file()
+            ):
+                raise EvidenceTampered("evidence manifest is invalid")
+            if not manifest_path.is_file():
+                return None
         self.verify_evidence(run_id, relative_directory)
-        self._verify_evidence_receipt(run_id, relative_directory)
+        if receipt is not None:
+            self._verify_evidence_receipt(run_id, relative_directory)
         return _read_evidence_result(directory / "result.json")
 
     def sealed_evidence_payloads(
@@ -1333,21 +1346,29 @@ class RunStore:
             raise RunNotFound(f"Run not found: {run_id}") from exc
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise EventHistoryCorrupt(f"Run identity is invalid: {run_id}") from exc
+        legacy_keys = {
+            "schema_version",
+            "run_id",
+            "bead_id",
+            "repository",
+            "base_branch",
+            "base_sha",
+            "created_at",
+            "start_request",
+        }
         if (
             not isinstance(identity, dict)
             or set(identity)
-            != {
-                "schema_version",
-                "run_id",
-                "bead_id",
-                "repository",
-                "base_branch",
-                "base_sha",
-                "created_at",
-                "start_request",
-            }
+            not in (legacy_keys, legacy_keys | {"evidence_receipt_version"})
             or type(identity.get("schema_version")) is not int
             or identity["schema_version"] != SCHEMA_VERSION
+            or (
+                "evidence_receipt_version" in identity
+                and (
+                    type(identity["evidence_receipt_version"]) is not int
+                    or identity["evidence_receipt_version"] != EVIDENCE_RECEIPT_VERSION
+                )
+            )
             or identity.get("run_id") != run_id
             or any(
                 not isinstance(identity.get(field), str) or not identity[field].strip()

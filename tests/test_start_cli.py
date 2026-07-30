@@ -8816,6 +8816,144 @@ class StartCliTest(unittest.TestCase):
         self.assertEqual(after, before)
         self.assertFalse(self.command_log.exists())
 
+    def test_status_and_report_observe_base_format_retrospective_evidence(self):
+        store_root = self.state_home / "afk"
+        store = RunStore(store_root)
+        run_id = "base-format-retrospective-run"
+        store.create_run(
+            bead_id="central-bhap.8.5",
+            repository="thunderbump/afk-composable-pipeline",
+            base_branch="main",
+            base_sha=BASE_SHA,
+            start_request={},
+            run_id=run_id,
+        )
+        run_path = store_root / "runs" / run_id
+        identity_path = run_path / "run.json"
+        identity = json.loads(identity_path.read_text(encoding="utf-8"))
+        base_identity_keys = {
+            "schema_version",
+            "run_id",
+            "bead_id",
+            "repository",
+            "base_branch",
+            "base_sha",
+            "created_at",
+            "start_request",
+        }
+        identity_path.write_text(
+            json.dumps(
+                {key: identity[key] for key in base_identity_keys},
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        projection = store.record_attention_episode(
+            run_id,
+            checkpoint="candidate_ready",
+            attention={
+                "scope": "validation",
+                "kind": "unavailable",
+                "summary": "validation unavailable",
+            },
+        )
+        episode = projection["attention_episode"]
+        store.reconcile_evidence_result(
+            run_id,
+            episode["evidence"],
+            {
+                "schema_version": 1,
+                "run_id": run_id,
+                "episode_sequence": episode["episode_sequence"],
+                "status": "unavailable",
+                "warning": True,
+                "process_findings_count": 0,
+                "improvement_proposals_count": 0,
+                "warning_summary": "analysis unavailable",
+            },
+        )
+        receipt = (
+            run_path
+            / ".evidence-receipts"
+            / f"{hashlib.sha256(episode['evidence'].encode('utf-8')).hexdigest()}.json"
+        )
+        receipt.unlink()
+        receipt.parent.rmdir()
+        store.append_event(
+            run_id,
+            "worker.terminal",
+            data={
+                "checkpoint": "candidate_ready",
+                "worker_exit_code": 2,
+                "worker_result": "attention_required",
+            },
+        )
+        before = {
+            path.relative_to(run_path).as_posix(): (
+                path.read_bytes() if path.is_file() else None,
+                stat.S_IMODE(path.stat().st_mode),
+            )
+            for path in run_path.rglob("*")
+        }
+
+        human = self.run_afk("status", run_id)
+        structured = self.run_afk("status", run_id, "--json")
+        report = self.run_afk("report", run_id)
+
+        self.assertEqual(human.returncode, 2, human.stderr)
+        self.assertEqual(structured.returncode, 2, structured.stderr)
+        self.assertEqual(report.returncode, 0, report.stderr)
+        expected = {
+            "schema_version": 1,
+            "status": "unavailable",
+            "episode_counts": {
+                "total": 1,
+                "sealed": 1,
+                "warning": 1,
+                "absent": 0,
+            },
+            "process_findings_count": 0,
+            "improvement_proposals_count": 0,
+            "evidence_paths": [episode["evidence"]],
+            "latest": {
+                "episode_sequence": episode["episode_sequence"],
+                "event": "run.attention_required",
+                "state": "attention_required",
+                "status": "unavailable",
+                "warning": True,
+                "process_findings_count": 0,
+                "improvement_proposals_count": 0,
+                "evidence_path": episode["evidence"],
+            },
+        }
+        self.assertEqual(json.loads(structured.stdout)["retrospective"], expected)
+        self.assertEqual(json.loads(report.stdout)["retrospective"], expected)
+        self.assertIn("retrospective_status=unavailable", human.stdout)
+        self.assertIn(
+            f"retrospective_latest_sequence={episode['episode_sequence']}",
+            human.stdout,
+        )
+        self.assertIn("retrospective_episodes=1", human.stdout)
+        self.assertIn("retrospective_sealed=1", human.stdout)
+        self.assertIn("retrospective_warnings=1", human.stdout)
+        self.assertIn(f"retrospective_path={episode['evidence']}", human.stdout)
+        after = {
+            path.relative_to(run_path).as_posix(): (
+                path.read_bytes() if path.is_file() else None,
+                stat.S_IMODE(path.stat().st_mode),
+            )
+            for path in run_path.rglob("*")
+        }
+        self.assertEqual(after, before)
+        self.assertFalse(self.command_log.exists())
+        evidence = run_path / episode["evidence"]
+        evidence.chmod(0o700)
+        tampered = self.run_afk("status", run_id, "--json")
+        self.assertEqual(tampered.returncode, 1)
+        self.assertIn("sealed evidence is writable", tampered.stderr)
+
     def test_status_explicitly_reports_absent_retrospective_episodes(self):
         store = RunStore(self.state_home / "afk")
         store.create_run(
