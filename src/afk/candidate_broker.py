@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from afk.checkouts import is_exact_clean_commit
 from afk.jsonutil import canonical_json
 
 
@@ -112,26 +113,7 @@ def _read_request(path: Path) -> dict[str, Any]:
 
 
 def _require_exact_candidate(candidate: Path, candidate_sha: str) -> None:
-    head = subprocess.run(
-        ["git", "rev-parse", "HEAD^{commit}"],
-        cwd=candidate,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    dirty = subprocess.run(
-        ["git", "status", "--porcelain"],
-        cwd=candidate,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    if (
-        head.returncode != 0
-        or head.stdout.strip() != candidate_sha
-        or dirty.returncode != 0
-        or dirty.stdout
-    ):
+    if not is_exact_clean_commit(candidate, candidate_sha):
         raise CandidateBrokerError("Candidate does not match its exact clean commit")
 
 

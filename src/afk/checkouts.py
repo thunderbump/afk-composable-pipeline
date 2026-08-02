@@ -310,6 +310,15 @@ def dirty_tree(path: Path) -> dict[str, Any]:
     return {"dirty": bool(status_lines), "status_lines": status_lines}
 
 
+def is_exact_clean_commit(path: Path, expected_commit: str) -> bool:
+    try:
+        head = git(["rev-parse", "HEAD"], cwd=path)
+        status = git(["status", "--porcelain"], cwd=path)
+    except GitCommandError:
+        return False
+    return head == expected_commit and not status
+
+
 def clean_reserved_checkout_artifacts(checkout_path: Path, status_lines: list[str]) -> bool:
     if status_lines != ["?? agent-result.json"]:
         return False

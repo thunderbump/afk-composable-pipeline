@@ -15,6 +15,7 @@ from contextlib import ExitStack
 from pathlib import Path
 from typing import Any
 
+from afk.checkouts import is_exact_clean_commit
 from afk.jsonutil import canonical_json
 from afk.process_io import BoundedProcessIO
 from afk.redaction import redact_text
@@ -742,26 +743,7 @@ def _require_original_evidence_directory(path: Path, descriptor: int) -> None:
 
 
 def _require_immutable_candidate(worktree: Path, candidate_sha: str) -> None:
-    head = subprocess.run(
-        ["git", "rev-parse", "HEAD"],
-        cwd=worktree,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    dirty = subprocess.run(
-        ["git", "status", "--porcelain"],
-        cwd=worktree,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    if (
-        head.returncode != 0
-        or head.stdout.strip() != candidate_sha
-        or dirty.returncode != 0
-        or dirty.stdout
-    ):
+    if not is_exact_clean_commit(worktree, candidate_sha):
         raise CandidateValidationError(
             "head_mismatch", "Candidate changed during validation"
         )
