@@ -100,6 +100,41 @@ base includes them. Normal Validation Gate integration with the capability-
 limited broker is still required before an omitted Candidate helper is
 enforceably isolated.
 
+### Supervision runtime prerequisites
+
+Brokered Candidate execution and pipeline commands that use process
+supervision require Linux with a mounted, readable `/proc`, child-subreaper
+support, and Python support for Linux pidfds. Bubblewrap is an OS dependency,
+not a Python package: `bwrap` must be on `PATH`, and the host must permit the
+user, PID, and mount namespaces it requests.
+
+From a source checkout, this safe smoke check verifies both Bubblewrap
+discovery and the public supervision path without running project work:
+
+```sh
+command -v bwrap
+PYTHONPATH=src python3 - <<'PY'
+import os
+import sys
+from pathlib import Path
+
+from afk.process_supervision import run_supervised_command
+
+run_supervised_command(
+    [sys.executable, "-c", "pass"],
+    cwd=Path.cwd(),
+    environment=os.environ.copy(),
+    timeout_seconds=5,
+    label="supervision smoke check",
+)
+PY
+```
+
+If `/proc`, pidfds, subreaper support, Bubblewrap, or namespace permissions are
+unavailable, supervision fails closed. AFK reports a supervision or broker
+failure instead of running the command unsupervised or publishing a successful
+Candidate result.
+
 Run one exact Candidate command through the capability-limited broker:
 
 ```sh
