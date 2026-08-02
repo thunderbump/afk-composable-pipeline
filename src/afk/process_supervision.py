@@ -156,6 +156,7 @@ class _LinuxDescendantSupervisor:
 
     def __enter__(self) -> _LinuxDescendantSupervisor:
         _SUPERVISOR_LOCK.acquire()
+        subreaper_enabled = False
         try:
             if (
                 self._libc.prctl(
@@ -168,10 +169,24 @@ class _LinuxDescendantSupervisor:
                     "supervision_unavailable",
                     f"Linux {self._subject} descendant supervision is unavailable",
                 )
+            subreaper_enabled = True
             self._baseline = set(_proc_children(os.getpid(), self._subject))
             return self
-        except BaseException:
-            _SUPERVISOR_LOCK.release()
+        except BaseException as exc:
+            try:
+                if (
+                    subreaper_enabled
+                    and self._libc.prctl(
+                        _PR_SET_CHILD_SUBREAPER, self._previous.value, 0, 0, 0
+                    )
+                    != 0
+                ):
+                    raise SupervisedCommandError(
+                        "supervision_failure",
+                        f"Linux {self._subject} descendant supervision was lost",
+                    ) from exc
+            finally:
+                _SUPERVISOR_LOCK.release()
             raise
 
     def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:

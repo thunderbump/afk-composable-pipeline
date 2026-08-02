@@ -21,6 +21,45 @@ from afk.process_supervision import (  # noqa: E402
 
 
 class SupervisedCommandTest(unittest.TestCase):
+    def test_baseline_failure_restores_subreaper_state_and_releases_lock(self):
+        libc = ctypes.CDLL(None, use_errno=True)
+        initial_subreaper = ctypes.c_int()
+        self.assertEqual(
+            libc.prctl(37, ctypes.byref(initial_subreaper), 0, 0, 0),
+            0,
+        )
+        with (
+            mock.patch.object(
+                process_supervision,
+                "_proc_children",
+                side_effect=SupervisedCommandError(
+                    "supervision_unavailable",
+                    "Linux Codex descendant supervision is unavailable",
+                ),
+            ),
+            self.assertRaises(SupervisedCommandError) as raised,
+        ):
+            run_supervised_command(
+                [sys.executable, "-c", "print('not launched')"],
+                cwd=Path.cwd(),
+                environment=os.environ.copy(),
+                timeout_seconds=1,
+                label="Codex",
+            )
+
+        self.assertEqual(raised.exception.classification, "supervision_unavailable")
+        restored_subreaper = ctypes.c_int()
+        self.assertEqual(libc.prctl(37, ctypes.byref(restored_subreaper), 0, 0, 0), 0)
+        self.assertEqual(restored_subreaper.value, initial_subreaper.value)
+        completed = run_supervised_command(
+            [sys.executable, "-c", "print('released')"],
+            cwd=Path.cwd(),
+            environment=os.environ.copy(),
+            timeout_seconds=1,
+            label="Codex",
+        )
+        self.assertEqual(completed.stdout, "released\n")
+
     def test_overlapping_calls_serialize_process_wide_supervision(self):
         class ObservedLock:
             def __init__(self):
