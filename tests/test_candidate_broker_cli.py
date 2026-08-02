@@ -403,6 +403,25 @@ class CandidateBrokerCliTest(unittest.TestCase):
 
         self.assertTrue(is_exact_clean_commit(self.candidate, self.candidate_sha))
 
+    def test_exact_candidate_rejects_ignored_symlink_replacing_tracked_directory(self):
+        from afk.checkouts import is_exact_clean_commit
+
+        tracked = self.candidate / "tracked"
+        tracked.mkdir()
+        (tracked / "input.txt").write_text("tracked content\n", encoding="utf-8")
+        self.git("add", "tracked/input.txt")
+        (self.candidate / ".gitignore").write_text("tracked\n", encoding="utf-8")
+        self.git("add", ".gitignore")
+        self.git("commit", "-m", "track ignored directory content")
+        self.candidate_sha = self.git("rev-parse", "HEAD")
+        external = self.temp / "external"
+        external.mkdir()
+        (external / "input.txt").write_text("tracked content\n", encoding="utf-8")
+        shutil.rmtree(tracked)
+        tracked.symlink_to(external, target_is_directory=True)
+
+        self.assertFalse(is_exact_clean_commit(self.candidate, self.candidate_sha))
+
     def test_exact_candidate_rejects_fifo_ignored_by_committed_gitignore(self):
         from afk.checkouts import is_exact_clean_commit
 

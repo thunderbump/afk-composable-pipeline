@@ -468,6 +468,8 @@ def _worktree_paths(
                     relative = name if not prefix else prefix + b"/" + name
                     if relative == b".git":
                         continue
+                    if child.is_symlink() and relative in tracked_directories:
+                        raise ValueError("tracked worktree directory is a symlink")
                     if relative in gitlinks or child.is_symlink():
                         record_untracked(relative)
                     elif child.is_dir(follow_symlinks=False):
