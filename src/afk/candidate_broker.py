@@ -6,6 +6,7 @@ import os
 import shutil
 import sys
 import tempfile
+import uuid
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -68,52 +69,39 @@ def _publish_result(path: Path, result: dict[str, Any]) -> None:
 def run_candidate(request: dict[str, Any]) -> dict[str, Any]:
     candidate = Path(request["candidate_path"])
     _require_exact_candidate(candidate, request["candidate_sha"])
-    bwrap = shutil.which("bwrap")
-    if bwrap is None:
+    execution = request.get("execution")
+    container_runtime = None
+    if execution is not None:
+        container_runtime = next(
+            filter(None, (shutil.which(runtime) for runtime in ("docker", "podman"))),
+            None,
+        )
+        if container_runtime is None:
+            return _failed_execution_result(
+                request["candidate_sha"],
+                "adapter_unavailable",
+                "Container execution adapter is unavailable",
+            )
+    bwrap = shutil.which("bwrap") if execution is None else None
+    if execution is None and bwrap is None:
         raise CandidateBrokerError("bubblewrap is unavailable")
     with tempfile.TemporaryDirectory(prefix="afk-candidate-") as temporary:
         snapshot = Path(temporary) / "snapshot"
         _materialize_candidate_snapshot(candidate, request["candidate_sha"], snapshot)
-        command = [
-            bwrap,
-            "--ro-bind",
-            "/usr",
-            "/usr",
-            "--symlink",
-            "usr/bin",
-            "/bin",
-            "--symlink",
-            "usr/lib",
-            "/lib",
-            "--symlink",
-            "usr/lib64",
-            "/lib64",
-            "--proc",
-            "/proc",
-            "--dev",
-            "/dev",
-            "--tmpfs",
-            "/tmp",
-            "--tmpfs",
-            "/work",
-            "--ro-bind",
-            str(snapshot),
-            "/candidate",
-            "--unshare-all",
-            "--die-with-parent",
-            "--new-session",
-            "--clearenv",
-            "--setenv",
-            "PATH",
-            "/usr/bin:/bin",
-            "--setenv",
-            "HOME",
-            "/work",
-            "--chdir",
-            "/work",
-            "--",
-            *request["command"],
-        ]
+        container_name = None
+        if execution is None:
+            command = _bubblewrap_command(bwrap, snapshot, request["command"])
+        else:
+            snapshot.chmod(0o755)
+            container_name = f"afk-candidate-{uuid.uuid4().hex}"
+            command = _container_command(
+                container_runtime,
+                container_name,
+                snapshot,
+                execution["image"],
+                request["command"],
+            )
+        cleanup_required = container_name is not None
         try:
             completed = run_supervised_command(
                 command,
@@ -129,9 +117,11 @@ def run_candidate(request: dict[str, Any]) -> dict[str, Any]:
                 input_text=None,
                 label="Candidate command",
                 decode_errors="replace",
-                _precontained_command=True,
+                _precontained_command=execution is None,
             )
+            cleanup_required = False
         except OSError:
+            cleanup_required = False
             return _failed_execution_result(
                 request["candidate_sha"],
                 "launch_failure",
@@ -154,6 +144,9 @@ def run_candidate(request: dict[str, Any]) -> dict[str, Any]:
                 stdout=exc.stdout or "",
                 stderr=exc.stderr or "",
             )
+        finally:
+            if container_name is not None and cleanup_required:
+                _remove_container(container_runtime, container_name)
     if completed.returncode != 0:
         return _failed_execution_result(
             request["candidate_sha"],
@@ -171,6 +164,107 @@ def run_candidate(request: dict[str, Any]) -> dict[str, Any]:
         "stdout": completed.stdout,
         "stderr": completed.stderr,
     }
+
+
+def _bubblewrap_command(
+    bwrap: str, snapshot: Path, candidate_command: list[str]
+) -> list[str]:
+    return [
+        bwrap,
+        "--ro-bind",
+        "/usr",
+        "/usr",
+        "--symlink",
+        "usr/bin",
+        "/bin",
+        "--symlink",
+        "usr/lib",
+        "/lib",
+        "--symlink",
+        "usr/lib64",
+        "/lib64",
+        "--proc",
+        "/proc",
+        "--dev",
+        "/dev",
+        "--tmpfs",
+        "/tmp",
+        "--tmpfs",
+        "/work",
+        "--ro-bind",
+        str(snapshot),
+        "/candidate",
+        "--unshare-all",
+        "--die-with-parent",
+        "--new-session",
+        "--clearenv",
+        "--setenv",
+        "PATH",
+        "/usr/bin:/bin",
+        "--setenv",
+        "HOME",
+        "/work",
+        "--chdir",
+        "/work",
+        "--",
+        *candidate_command,
+    ]
+
+
+def _container_command(
+    runtime: str,
+    name: str,
+    snapshot: Path,
+    image: str,
+    candidate_command: list[str],
+) -> list[str]:
+    return [
+        runtime,
+        "run",
+        "--rm",
+        "--name",
+        name,
+        "--network",
+        "none",
+        "--read-only",
+        "--cap-drop",
+        "ALL",
+        "--security-opt",
+        "no-new-privileges",
+        "--pids-limit",
+        "256",
+        "--user",
+        "65534:65534",
+        "--tmpfs",
+        "/tmp:rw,nosuid,nodev,noexec,mode=1777",
+        "--tmpfs",
+        "/work:rw,nosuid,nodev,mode=0700,uid=65534,gid=65534",
+        "--mount",
+        f"type=bind,src={snapshot},dst=/candidate,readonly",
+        "--workdir",
+        "/work",
+        image,
+        *candidate_command,
+    ]
+
+
+def _remove_container(runtime: str, name: str) -> None:
+    try:
+        completed = run_supervised_command(
+            [runtime, "rm", "--force", name],
+            cwd=Path.cwd(),
+            environment=os.environ.copy(),
+            timeout_seconds=10,
+            output_byte_limit=64 * 1024,
+            cleanup_seconds=CANDIDATE_CLEANUP_SECONDS,
+            input_text=None,
+            label="Candidate container cleanup",
+            decode_errors="replace",
+        )
+    except (OSError, SupervisedCommandError) as exc:
+        raise CandidateBrokerError("Candidate container cleanup failed") from exc
+    if completed.returncode != 0:
+        raise CandidateBrokerError("Candidate container cleanup failed")
 
 
 def _failed_execution_result(
@@ -214,6 +308,7 @@ def validate_candidate_request(value: object) -> dict[str, Any]:
             "command",
             "timeout_seconds",
             "output_byte_limit",
+            "execution",
         }
         or type(value.get("schema_version")) is not int
         or value["schema_version"] != SCHEMA_VERSION
@@ -229,6 +324,7 @@ def validate_candidate_request(value: object) -> dict[str, Any]:
         or not _is_output_byte_limit(
             value.get("output_byte_limit", CANDIDATE_OUTPUT_BYTE_LIMIT)
         )
+        or not _is_execution(value.get("execution"))
     ):
         raise CandidateBrokerError("candidate broker request is invalid")
     return value
@@ -334,6 +430,19 @@ def _is_timeout_seconds(value: Any) -> bool:
 
 def _is_output_byte_limit(value: Any) -> bool:
     return type(value) is int and 0 < value <= MAX_CANDIDATE_OUTPUT_BYTE_LIMIT
+
+
+def _is_execution(value: Any) -> bool:
+    return value is None or (
+        isinstance(value, dict)
+        and set(value) == {"type", "image"}
+        and value.get("type") == "container"
+        and _is_container_image(value.get("image"))
+    )
+
+
+def _is_container_image(value: Any) -> bool:
+    return _is_os_argument(value) and not value.startswith("-")
 
 
 if __name__ == "__main__":

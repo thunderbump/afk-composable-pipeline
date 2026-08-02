@@ -158,7 +158,31 @@ The version-1 request requires `schema_version`, the exact clean
 `candidate_sha`, an absolute `candidate_path`, and a non-empty `command` argv.
 It may also set `timeout_seconds` (greater than zero and at most 3600; default
 300) and `output_byte_limit` (a positive integer no larger than 64 MiB; default
-1 MiB). The output limit applies independently to stdout and stderr.
+1 MiB). The output limit applies independently to stdout and stderr. By
+default, the command uses the built-in Bubblewrap sandbox. A trusted harness
+may instead request the target-neutral container adapter with exactly:
+
+```json
+{"execution":{"type":"container","image":"locally-available-fixture:tag"}}
+```
+
+The adapter discovers Docker first and Podman second. It does not accept
+Compose files, service names, target profiles, volumes, environment variables,
+runtime flags, or repository-specific deployment semantics. An option-looking
+image name is invalid. If neither runtime executable is available, the broker
+returns a Candidate-bound `adapter_unavailable` result; the Bubblewrap path is
+unchanged.
+
+Container execution mounts only the materialized exact-commit snapshot,
+read-only at `/candidate`. `/work` and `/tmp` are private tmpfs mounts. The
+container runs as uid/gid 65534 with a read-only root, no network, no Linux
+capabilities, `no-new-privileges`, and a bounded PID count. The Docker/Podman
+socket, live broker capability, Candidate checkout, validation request, and
+evidence directory are not mounted into the container. AFK supervises the
+trusted runtime client and forcibly removes a randomly named container after a
+timeout or other interrupted run; failed forced cleanup fails the broker
+closed instead of publishing a successful or ordinary failure result.
+
 The broker materializes exact tree and blob objects from the Candidate commit
 without `.git` administrative metadata or archive-attribute rewrites. Gitlinks
 fail closed until recursive submodule semantics are defined. The command runs
@@ -173,6 +197,15 @@ nonzero exits instead publish `status: "failed"`, the exact Candidate SHA,
 bounded redacted diagnostics, a stable `failure_classification`, a summary, and
 an integer or null `exit_code`. The result path is not exposed inside the
 sandbox.
+
+The container fixture test is opt-in so routine validation never pulls an
+image. Point it at an image already present in the local runtime:
+
+```sh
+AFK_CONTAINER_TEST_IMAGE=your-local-fixture:tag \
+  python3 -m unittest -v \
+  tests.test_candidate_broker_cli.CandidateBrokerCliTest.test_container_execution_runs_a_fixture_on_the_local_runtime
+```
 
 The declared Candidate capability set is intentionally small: read the exact
 snapshot under `/candidate`; write scratch under `/work` and private temporary

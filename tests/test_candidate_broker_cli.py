@@ -466,6 +466,265 @@ class CandidateBrokerCliTest(unittest.TestCase):
             },
         )
 
+    def test_container_execution_classifies_a_missing_runtime_as_unavailable(self):
+        request = self.temp / "container-unavailable-request.json"
+        result = self.temp / "container-unavailable-result.json"
+        runtime_free_bin = self.temp / "container-unavailable-bin"
+        runtime_free_bin.mkdir()
+        (runtime_free_bin / "git").symlink_to(shutil.which("git"))
+        self.write_request(
+            request,
+            command=["/bin/true"],
+            execution={"type": "container", "image": "fixture:local"},
+        )
+
+        completed = self.run_broker(
+            request,
+            result,
+            env={"PATH": str(runtime_free_bin)},
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(
+            json.loads(result.read_text(encoding="utf-8")),
+            {
+                "schema_version": 1,
+                "candidate_sha": self.candidate_sha,
+                "status": "failed",
+                "failure_classification": "adapter_unavailable",
+                "summary": "Container execution adapter is unavailable",
+                "exit_code": None,
+                "stdout": "",
+                "stderr": "",
+            },
+        )
+
+    def test_container_execution_receives_only_the_exact_candidate_snapshot(self):
+        request = self.temp / "container-request.json"
+        result = self.temp / "container-result.json"
+        fake_bin = self.temp / "container-bin"
+        fake_bin.mkdir()
+        (fake_bin / "git").symlink_to(shutil.which("git"))
+        (fake_bin / "bwrap").symlink_to(shutil.which("bwrap"))
+        fake_docker = fake_bin / "docker"
+        fake_docker.write_text(
+            textwrap.dedent(
+                f"""
+                #!{sys.executable}
+                import sys
+                from pathlib import Path
+
+                arguments = sys.argv[1:]
+                if arguments[0] == "rm":
+                    raise SystemExit(0)
+                mount = next(
+                    arguments[index + 1]
+                    for index, value in enumerate(arguments)
+                    if value == "--mount"
+                )
+                source = next(
+                    item.removeprefix("src=")
+                    for item in mount.split(",")
+                    if item.startswith("src=")
+                )
+                Path({str(self.candidate / "input.txt")!r}).write_text(
+                    "drifted after snapshot\\n", encoding="utf-8"
+                )
+                print((Path(source) / "input.txt").read_text(encoding="utf-8").strip())
+                one_read_only_mount = (
+                    arguments.count("--mount") == 1 and "readonly" in mount
+                )
+                network_is_disabled = (
+                    arguments[arguments.index("--network") + 1] == "none"
+                )
+                socket_is_hidden = not any(
+                    "docker.sock" in value or "podman.sock" in value
+                    for value in arguments
+                )
+                print("ONE_READ_ONLY_MOUNT" if one_read_only_mount else "UNSAFE_MOUNTS")
+                print("NO_NETWORK" if network_is_disabled else "NETWORKED")
+                print("NO_SOCKET" if socket_is_hidden else "SOCKET_EXPOSED")
+                """
+            ).lstrip(),
+            encoding="utf-8",
+        )
+        fake_docker.chmod(0o755)
+        self.write_request(
+            request,
+            command=["/bin/fixture-check"],
+            execution={"type": "container", "image": "fixture:local"},
+        )
+
+        completed = self.run_broker(
+            request,
+            result,
+            env={"PATH": str(fake_bin)},
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        broker_result = json.loads(result.read_text(encoding="utf-8"))
+        self.assertEqual(broker_result["status"], "completed", broker_result)
+        self.assertEqual(broker_result["candidate_sha"], self.candidate_sha)
+        self.assertEqual(
+            broker_result["stdout"],
+            "exact candidate\nONE_READ_ONLY_MOUNT\nNO_NETWORK\nNO_SOCKET\n",
+        )
+        self.assertEqual(broker_result["stderr"], "")
+
+    @unittest.skipUnless(
+        shutil.which("docker") and os.environ.get("AFK_CONTAINER_TEST_IMAGE"),
+        "set AFK_CONTAINER_TEST_IMAGE to a locally available fixture image",
+    )
+    def test_container_execution_runs_a_fixture_on_the_local_runtime(self):
+        request = self.temp / "container-runtime-request.json"
+        result = self.temp / "container-runtime-result.json"
+        self.write_request(
+            request,
+            command=[
+                "/bin/sh",
+                "-c",
+                "cat /candidate/input.txt; "
+                "printf 'scratch works\\n' > /work/result; "
+                "cat /work/result",
+            ],
+            execution={
+                "type": "container",
+                "image": os.environ["AFK_CONTAINER_TEST_IMAGE"],
+            },
+        )
+
+        completed = self.run_broker(request, result)
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        broker_result = json.loads(result.read_text(encoding="utf-8"))
+        self.assertEqual(broker_result["status"], "completed", broker_result)
+        self.assertEqual(broker_result["candidate_sha"], self.candidate_sha)
+        self.assertEqual(broker_result["stdout"], "exact candidate\nscratch works\n")
+        self.assertEqual(broker_result["stderr"], "")
+
+    def test_container_execution_rejects_target_specific_configuration(self):
+        invalid_executions = (
+            {"type": "compose", "image": "fixture:local"},
+            {"type": "container", "image": "--privileged"},
+            {
+                "type": "container",
+                "image": "fixture:local",
+                "compose_file": "compose.yml",
+            },
+            {
+                "type": "container",
+                "image": "fixture:local",
+                "service": "database",
+            },
+        )
+        for index, execution in enumerate(invalid_executions):
+            with self.subTest(execution=execution):
+                request = self.temp / f"target-specific-{index}-request.json"
+                result = self.temp / f"target-specific-{index}-result.json"
+                self.write_request(
+                    request,
+                    command=["/bin/true"],
+                    execution=execution,
+                )
+
+                completed = self.run_broker(request, result)
+
+                self.assertEqual(completed.returncode, 2)
+                self.assertEqual(
+                    completed.stderr, "candidate broker request is invalid\n"
+                )
+                self.assertFalse(result.exists())
+
+    def test_container_timeout_fails_closed_when_forced_cleanup_fails(self):
+        request = self.temp / "container-cleanup-request.json"
+        result = self.temp / "container-cleanup-result.json"
+        fake_bin = self.temp / "container-cleanup-bin"
+        fake_bin.mkdir()
+        for executable in ("git", "bwrap"):
+            (fake_bin / executable).symlink_to(shutil.which(executable))
+        fake_docker = fake_bin / "docker"
+        fake_docker.write_text(
+            textwrap.dedent(
+                f"""
+                #!{sys.executable}
+                import sys
+                import time
+
+                if sys.argv[1] == "rm":
+                    raise SystemExit(7)
+                print("container started", flush=True)
+                time.sleep(30)
+                """
+            ).lstrip(),
+            encoding="utf-8",
+        )
+        fake_docker.chmod(0o755)
+        self.write_request(
+            request,
+            command=["/bin/sleep", "30"],
+            timeout_seconds=0.1,
+            execution={"type": "container", "image": "fixture:local"},
+        )
+
+        completed = self.run_broker(
+            request,
+            result,
+            env={"PATH": str(fake_bin)},
+        )
+
+        self.assertEqual(completed.returncode, 2)
+        self.assertEqual(completed.stderr, "Candidate container cleanup failed\n")
+        self.assertFalse(result.exists())
+
+    def test_container_timeout_forcibly_removes_the_runtime_container(self):
+        request = self.temp / "container-timeout-request.json"
+        result = self.temp / "container-timeout-result.json"
+        cleanup_marker = self.temp / "container-was-removed"
+        fake_bin = self.temp / "container-timeout-bin"
+        fake_bin.mkdir()
+        for executable in ("git", "bwrap"):
+            (fake_bin / executable).symlink_to(shutil.which(executable))
+        fake_docker = fake_bin / "docker"
+        fake_docker.write_text(
+            textwrap.dedent(
+                f"""
+                #!{sys.executable}
+                import sys
+                import time
+                from pathlib import Path
+
+                if sys.argv[1] == "rm":
+                    Path({str(cleanup_marker)!r}).write_text(
+                        sys.argv[-1], encoding="utf-8"
+                    )
+                    raise SystemExit(0)
+                print("container started", flush=True)
+                time.sleep(30)
+                """
+            ).lstrip(),
+            encoding="utf-8",
+        )
+        fake_docker.chmod(0o755)
+        self.write_request(
+            request,
+            command=["/bin/sleep", "30"],
+            timeout_seconds=0.1,
+            execution={"type": "container", "image": "fixture:local"},
+        )
+
+        completed = self.run_broker(
+            request,
+            result,
+            env={"PATH": str(fake_bin)},
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        broker_result = json.loads(result.read_text(encoding="utf-8"))
+        self.assertEqual(broker_result["failure_classification"], "timeout")
+        self.assertTrue(
+            cleanup_marker.read_text(encoding="utf-8").startswith("afk-candidate-")
+        )
+
     @unittest.skipUnless(shutil.which("bwrap"), "bubblewrap is unavailable")
     def test_timeout_reaps_detached_candidate_descendants_before_publication(self):
         request = self.temp / "detached-timeout-request.json"
@@ -1928,6 +2187,7 @@ class CandidateBrokerCliTest(unittest.TestCase):
         candidate_sha=None,
         timeout_seconds=None,
         output_byte_limit=None,
+        execution=None,
     ):
         request = {
             "schema_version": 1,
@@ -1943,6 +2203,8 @@ class CandidateBrokerCliTest(unittest.TestCase):
             request["timeout_seconds"] = timeout_seconds
         if output_byte_limit is not None:
             request["output_byte_limit"] = output_byte_limit
+        if execution is not None:
+            request["execution"] = execution
         path.write_text(
             json.dumps(request),
             encoding="utf-8",
