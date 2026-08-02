@@ -115,9 +115,10 @@ adapter behavior.
 
 Brokered Candidate execution and pipeline commands that use process
 supervision require Linux with a mounted, readable `/proc`, child-subreaper
-support, and Python support for Linux pidfds. Bubblewrap is an OS dependency,
-not a Python package: `bwrap` must be on `PATH`, and the host must permit the
-user, PID, and mount namespaces it requests.
+support, and Python support for Linux pidfds. The default Candidate sandbox
+and ordinary supervised commands also require Bubblewrap. Bubblewrap is an OS
+dependency, not a Python package: `bwrap` must be on `PATH`, and the host must
+permit the user, PID, and mount namespaces it requests.
 
 From a source checkout, this safe smoke check verifies both Bubblewrap
 discovery and the public supervision path without running project work:
@@ -141,7 +142,7 @@ run_supervised_command(
 PY
 ```
 
-If `/proc`, pidfds, subreaper support, Bubblewrap, or namespace permissions are
+If a required `/proc`, pidfd, subreaper, Bubblewrap, or namespace capability is
 unavailable, supervision fails closed. AFK reports a supervision or broker
 failure instead of running the command unsupervised or publishing a successful
 Candidate result.
@@ -167,7 +168,14 @@ may instead request the target-neutral container adapter with exactly:
 ```
 
 The adapter probes Docker first and Podman second with a bounded trusted
-runtime `info` command. It does not accept
+runtime `info` command. These fixed Docker/Podman client commands use the same
+per-call supervision helper, bounded protocol, descendant tracking, timeout,
+output limits, and fail-closed cleanup as other commands, but omit the outer
+Bubblewrap PID wrapper so rootless Podman can create its own namespaces. This
+narrow trusted-host mode applies only to runtime `info`, image inspection,
+container execution, and forced removal. The Candidate remains confined by
+the hardened container, and default Bubblewrap Candidate execution and all
+ordinary supervision paths are unchanged. The adapter does not accept
 Compose files, service names, target profiles, volumes, environment variables,
 runtime flags, or repository-specific deployment semantics. An option-looking
 image name is invalid. If neither runtime is usable, including when trusted
@@ -212,6 +220,15 @@ the local runtime:
 AFK_CONTAINER_TEST_IMAGE=your-local-fixture:tag \
   python3 -m unittest -v \
   tests.test_candidate_broker_cli.CandidateBrokerCliTest.test_container_execution_runs_a_fixture_on_the_local_runtime
+```
+
+To exercise the rootless Podman-only selection path, use an image already
+present in Podman's local storage:
+
+```sh
+AFK_PODMAN_TEST_IMAGE=localhost/afk-composable-pipeline:smoke \
+  python3 -m unittest -v \
+  tests.test_candidate_broker_cli.CandidateBrokerCliTest.test_container_execution_runs_a_fixture_on_rootless_podman
 ```
 
 The declared Candidate capability set is intentionally small: read the exact

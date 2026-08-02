@@ -60,7 +60,13 @@ def run_supervised_command(
     cleanup_seconds: float | None = None,
     decode_errors: str = "strict",
     _precontained_command: bool = False,
+    _trusted_host_command: bool = False,
 ) -> subprocess.CompletedProcess[str]:
+    if _precontained_command and _trusted_host_command:
+        raise SupervisedCommandError(
+            "supervision_failure",
+            "trusted host and pre-contained command modes are mutually exclusive",
+        )
     request = {
         "schema_version": 1,
         "command": command,
@@ -88,7 +94,9 @@ def run_supervised_command(
                 "0",
                 str(os.getpid()),
             ]
-            if _precontained_command:
+            if _trusted_host_command:
+                pass
+            elif _precontained_command:
                 if not _is_precontained_bwrap_command(command):
                     raise SupervisedCommandError(
                         "supervision_failure",

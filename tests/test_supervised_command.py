@@ -22,6 +22,44 @@ from afk.process_supervision import (  # noqa: E402
 
 
 class SupervisedCommandTest(unittest.TestCase):
+    def test_trusted_host_command_uses_helper_without_bubblewrap(self):
+        with mock.patch.object(
+            process_supervision.shutil,
+            "which",
+            side_effect=AssertionError("trusted mode must not discover bubblewrap"),
+        ):
+            completed = run_supervised_command(
+                [sys.executable, "-c", "print('trusted')"],
+                cwd=Path.cwd(),
+                environment=os.environ.copy(),
+                timeout_seconds=1,
+                label="Trusted runtime client",
+                _trusted_host_command=True,
+            )
+
+        self.assertEqual(completed.returncode, 0)
+        self.assertEqual(completed.stdout, "trusted\n")
+
+    def test_trusted_host_command_and_precontained_command_are_exclusive(self):
+        with (
+            mock.patch.object(process_supervision.subprocess, "Popen") as popen,
+            self.assertRaisesRegex(
+                SupervisedCommandError, "trusted host and pre-contained"
+            ) as raised,
+        ):
+            run_supervised_command(
+                [sys.executable, "-c", "pass"],
+                cwd=Path.cwd(),
+                environment=os.environ.copy(),
+                timeout_seconds=1,
+                label="Invalid supervision mode",
+                _trusted_host_command=True,
+                _precontained_command=True,
+            )
+
+        self.assertEqual(raised.exception.classification, "supervision_failure")
+        popen.assert_not_called()
+
     def test_precontained_bwrap_flags_must_precede_the_command_separator(self):
         bwrap = process_supervision.shutil.which("bwrap")
         self.assertIsNotNone(bwrap)
@@ -638,6 +676,38 @@ class SupervisedCommandTest(unittest.TestCase):
                     input_text="",
                     label="Codex",
                     cleanup_seconds=0.1,
+                )
+
+            time.sleep(0.7)
+            self.assertFalse(marker.exists())
+
+    def test_trusted_host_timeout_kills_detached_descendant_before_mutation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            marker = root / "trusted-late-mutation"
+            child = (
+                "import os,signal,time;"
+                "os.setsid();"
+                "signal.signal(signal.SIGTERM,signal.SIG_IGN);"
+                "time.sleep(0.5);"
+                f"open({str(marker)!r},'w').write('mutated')"
+            )
+            parent = (
+                "import signal,subprocess,sys,time;"
+                "signal.signal(signal.SIGTERM,signal.SIG_IGN);"
+                f"subprocess.Popen([sys.executable,'-c',{child!r}]);"
+                "time.sleep(30)"
+            )
+
+            with self.assertRaisesRegex(SupervisedCommandError, "timed out"):
+                run_supervised_command(
+                    [sys.executable, "-c", parent],
+                    cwd=root,
+                    environment=os.environ.copy(),
+                    timeout_seconds=0.1,
+                    label="Trusted runtime client",
+                    cleanup_seconds=0.1,
+                    _trusted_host_command=True,
                 )
 
             time.sleep(0.7)

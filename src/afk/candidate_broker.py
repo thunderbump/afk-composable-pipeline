@@ -130,6 +130,7 @@ def run_candidate(request: dict[str, Any]) -> dict[str, Any]:
                 label="Candidate command",
                 decode_errors="replace",
                 _precontained_command=execution is None,
+                _trusted_host_command=execution is not None,
             )
             container_started = (
                 container_id_path is not None and container_id_path.is_file()
@@ -207,6 +208,7 @@ def _find_container_runtime() -> str | None:
                 input_text=None,
                 label="Candidate container runtime probe",
                 decode_errors="replace",
+                _trusted_host_command=True,
             )
         except (OSError, SupervisedCommandError):
             continue
@@ -227,6 +229,7 @@ def _inspect_container_image(runtime: str, image: str) -> tuple[str | None, str]
             input_text=None,
             label="Candidate container image inspection",
             decode_errors="replace",
+            _trusted_host_command=True,
         )
     except (OSError, SupervisedCommandError):
         return None, ""
@@ -301,6 +304,9 @@ def _container_command(
     image: str,
     candidate_command: list[str],
 ) -> list[str]:
+    work_tmpfs = "/work:rw,nosuid,nodev,mode=0700,uid=65534,gid=65534"
+    if Path(runtime).name == "podman":
+        work_tmpfs = "/work:rw,nosuid,nodev,mode=1777"
     return [
         runtime,
         "run",
@@ -323,7 +329,7 @@ def _container_command(
         "--tmpfs",
         "/tmp:rw,nosuid,nodev,noexec,mode=1777",
         "--tmpfs",
-        "/work:rw,nosuid,nodev,mode=0700,uid=65534,gid=65534",
+        work_tmpfs,
         "--mount",
         f"type=bind,src={snapshot},dst=/candidate,readonly",
         "--workdir",
@@ -347,6 +353,7 @@ def _remove_container(runtime: str, name: str) -> None:
             input_text=None,
             label="Candidate container cleanup",
             decode_errors="replace",
+            _trusted_host_command=True,
         )
     except (OSError, SupervisedCommandError) as exc:
         raise CandidateBrokerError("Candidate container cleanup failed") from exc

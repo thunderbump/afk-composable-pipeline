@@ -17,6 +17,8 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+from afk.candidate_broker import _container_command  # noqa: E402
+
 
 class CandidateBrokerCliTest(unittest.TestCase):
     def setUp(self):
@@ -56,6 +58,25 @@ class CandidateBrokerCliTest(unittest.TestCase):
 
     def tearDown(self):
         self.temporary_directory.cleanup()
+
+    def test_container_command_uses_portable_podman_tmpfs_options(self):
+        common = (
+            "candidate-name",
+            self.temp / "container.cid",
+            self.candidate,
+            "sha256:fixture-image",
+            ["/bin/true"],
+        )
+        docker_command = _container_command("/usr/bin/docker", *common)
+        podman_command = _container_command("/usr/bin/podman", *common)
+
+        self.assertIn(
+            "/work:rw,nosuid,nodev,mode=0700,uid=65534,gid=65534",
+            docker_command,
+        )
+        self.assertIn("/work:rw,nosuid,nodev,mode=1777", podman_command)
+        self.assertFalse(any("uid=" in argument for argument in podman_command))
+        self.assertFalse(any("gid=" in argument for argument in podman_command))
 
     def test_rejects_invalid_utf8_request_without_a_traceback(self):
         request = self.temp / "invalid-utf8-request.json"
@@ -539,17 +560,34 @@ class CandidateBrokerCliTest(unittest.TestCase):
             },
         )
 
-    def test_container_execution_classifies_unavailable_supervision_as_unavailable(
-        self,
-    ):
-        request = self.temp / "container-supervision-unavailable-request.json"
-        result = self.temp / "container-supervision-unavailable-result.json"
-        fake_bin = self.temp / "container-supervision-unavailable-bin"
+    def test_container_execution_uses_trusted_supervision_without_bubblewrap(self):
+        request = self.temp / "container-trusted-supervision-request.json"
+        result = self.temp / "container-trusted-supervision-result.json"
+        fake_bin = self.temp / "container-trusted-supervision-bin"
         fake_bin.mkdir()
         (fake_bin / "git").symlink_to(shutil.which("git"))
         fake_docker = fake_bin / "docker"
         fake_docker.write_text(
-            f"#!{sys.executable}\nraise SystemExit(0)\n",
+            textwrap.dedent(
+                f"""
+                #!{sys.executable}
+                import sys
+                from pathlib import Path
+
+                arguments = sys.argv[1:]
+                if arguments[0] == "info":
+                    raise SystemExit(0)
+                if arguments[:2] == ["image", "inspect"]:
+                    print('[{{"Id":"sha256:fixture-image","Config":{{"Volumes":null}}}}]')
+                    raise SystemExit(0)
+                if arguments[0] == "rm":
+                    raise SystemExit(0)
+                Path(arguments[arguments.index("--cidfile") + 1]).write_text(
+                    "created-container-id\\n", encoding="utf-8"
+                )
+                print("container candidate ran")
+                """
+            ).lstrip(),
             encoding="utf-8",
         )
         fake_docker.chmod(0o755)
@@ -566,19 +604,10 @@ class CandidateBrokerCliTest(unittest.TestCase):
         )
 
         self.assertEqual(completed.returncode, 0, completed.stderr)
-        self.assertEqual(
-            json.loads(result.read_text(encoding="utf-8")),
-            {
-                "schema_version": 1,
-                "candidate_sha": self.candidate_sha,
-                "status": "failed",
-                "failure_classification": "adapter_unavailable",
-                "summary": "Container execution adapter is unavailable",
-                "exit_code": None,
-                "stdout": "",
-                "stderr": "",
-            },
-        )
+        broker_result = json.loads(result.read_text(encoding="utf-8"))
+        self.assertEqual(broker_result["status"], "completed", broker_result)
+        self.assertEqual(broker_result["stdout"], "container candidate ran\n")
+        self.assertFalse((fake_bin / "bwrap").exists())
 
     def test_container_execution_receives_only_the_exact_candidate_snapshot(self):
         request = self.temp / "container-request.json"
@@ -1183,6 +1212,47 @@ class CandidateBrokerCliTest(unittest.TestCase):
         broker_result = json.loads(result.read_text(encoding="utf-8"))
         self.assertEqual(broker_result["status"], "completed", broker_result)
         self.assertEqual(broker_result["candidate_sha"], self.candidate_sha)
+        self.assertEqual(broker_result["stdout"], "exact candidate\nscratch works\n")
+        self.assertEqual(broker_result["stderr"], "")
+
+    @unittest.skipUnless(
+        shutil.which("podman") and os.environ.get("AFK_PODMAN_TEST_IMAGE"),
+        "set AFK_PODMAN_TEST_IMAGE to a locally available Podman fixture image",
+    )
+    def test_container_execution_runs_a_fixture_on_rootless_podman(self):
+        request = self.temp / "podman-runtime-request.json"
+        result = self.temp / "podman-runtime-result.json"
+        runtime_bin = self.temp / "podman-only-bin"
+        runtime_bin.mkdir()
+        docker = runtime_bin / "docker"
+        docker.write_text(
+            f"#!{sys.executable}\nraise SystemExit(1)\n", encoding="utf-8"
+        )
+        docker.chmod(0o755)
+        self.write_request(
+            request,
+            command=[
+                "/bin/sh",
+                "-c",
+                "cat /candidate/input.txt; "
+                "printf 'scratch works\\n' > /work/result; "
+                "cat /work/result",
+            ],
+            execution={
+                "type": "container",
+                "image": os.environ["AFK_PODMAN_TEST_IMAGE"],
+            },
+        )
+
+        completed = self.run_broker(
+            request,
+            result,
+            env={"PATH": f"{runtime_bin}:{os.environ['PATH']}"},
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        broker_result = json.loads(result.read_text(encoding="utf-8"))
+        self.assertEqual(broker_result["status"], "completed", broker_result)
         self.assertEqual(broker_result["stdout"], "exact candidate\nscratch works\n")
         self.assertEqual(broker_result["stderr"], "")
 
