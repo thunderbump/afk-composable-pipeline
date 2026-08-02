@@ -655,7 +655,8 @@ class CandidateBrokerCliTest(unittest.TestCase):
         self.assertEqual(broker_result["stderr"], "")
 
     @unittest.skipUnless(
-        shutil.which("docker") and os.environ.get("AFK_CONTAINER_TEST_IMAGE"),
+        (shutil.which("docker") or shutil.which("podman"))
+        and os.environ.get("AFK_CONTAINER_TEST_IMAGE"),
         "set AFK_CONTAINER_TEST_IMAGE to a locally available fixture image",
     )
     def test_container_execution_runs_a_fixture_on_the_local_runtime(self):
