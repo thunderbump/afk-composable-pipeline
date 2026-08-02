@@ -134,6 +134,87 @@ class CandidateBrokerCliTest(unittest.TestCase):
                 self.assertNotIn("Traceback", completed.stderr)
                 self.assertFalse(result.exists())
 
+    def test_rejects_a_nested_candidate_path_before_execution(self):
+        nested = self.candidate / "nested"
+        nested.mkdir()
+        (nested / "input.txt").write_text("nested\n", encoding="utf-8")
+        self.git("add", ".")
+        self.git("commit", "-m", "add nested directory")
+        self.candidate_sha = self.git("rev-parse", "HEAD")
+        request = self.temp / "nested-path-request.json"
+        result = self.temp / "nested-path-result.json"
+        request.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "candidate_sha": self.candidate_sha,
+                    "candidate_path": str(nested),
+                    "command": ["/usr/bin/true"],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "afk.candidate_broker",
+                "--request",
+                str(request),
+                "--result",
+                str(result),
+            ],
+            cwd=ROOT,
+            env={**os.environ, "PYTHONPATH": str(ROOT / "src")},
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(completed.returncode, 2)
+        self.assertEqual(
+            completed.stderr, "Candidate path is not the repository root\n"
+        )
+        self.assertFalse(result.exists())
+
+    def test_accepts_a_symlink_alias_to_the_candidate_root(self):
+        alias = self.temp / "candidate-alias"
+        alias.symlink_to(self.candidate, target_is_directory=True)
+        request = self.temp / "candidate-alias-request.json"
+        result = self.temp / "candidate-alias-result.json"
+        request.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "candidate_sha": self.candidate_sha,
+                    "candidate_path": str(alias),
+                    "command": ["/usr/bin/true"],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "afk.candidate_broker",
+                "--request",
+                str(request),
+                "--result",
+                str(result),
+            ],
+            cwd=ROOT,
+            env={**os.environ, "PYTHONPATH": str(ROOT / "src")},
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(json.loads(result.read_text(encoding="utf-8"))["exit_code"], 0)
+
     def test_runs_against_read_only_exact_candidate_with_writable_scratch(self):
         probe = textwrap.dedent(
             """

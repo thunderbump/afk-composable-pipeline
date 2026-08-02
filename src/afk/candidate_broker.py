@@ -126,6 +126,27 @@ def _read_request(path: Path) -> dict[str, Any]:
 
 
 def _require_exact_candidate(candidate: Path, candidate_sha: str) -> None:
+    try:
+        top_level = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=candidate,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+    except OSError as exc:
+        raise CandidateBrokerError("Candidate repository root is unavailable") from exc
+    if top_level.returncode != 0 or not top_level.stdout.strip():
+        raise CandidateBrokerError("Candidate repository root is unavailable")
+    try:
+        candidate_root = candidate.resolve(strict=True)
+        repository_root = Path(top_level.stdout.strip()).resolve(strict=True)
+    except OSError as exc:
+        raise CandidateBrokerError(
+            "Candidate does not match its exact clean commit"
+        ) from exc
+    if candidate_root != repository_root:
+        raise CandidateBrokerError("Candidate path is not the repository root")
     if not is_exact_clean_commit(candidate, candidate_sha):
         raise CandidateBrokerError("Candidate does not match its exact clean commit")
 
