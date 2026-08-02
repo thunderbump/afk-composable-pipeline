@@ -173,6 +173,8 @@ runtime flags, or repository-specific deployment semantics. An option-looking
 image name is invalid. If neither runtime is usable, including when trusted
 runtime supervision is unavailable, the broker returns a Candidate-bound
 `adapter_unavailable` result; the Bubblewrap path is unchanged.
+Container runs use `--pull=never`, so the requested image must already exist
+in the selected local runtime and execution never triggers an implicit pull.
 
 Container execution mounts only the materialized exact-commit snapshot,
 read-only at `/candidate`. `/work` and `/tmp` are private tmpfs mounts. The
@@ -199,8 +201,8 @@ bounded redacted diagnostics, a stable `failure_classification`, a summary, and
 an integer or null `exit_code`. The result path is not exposed inside the
 sandbox.
 
-The container fixture test is opt-in so routine validation never pulls an
-image. Point it at an image already present in the local runtime:
+The container fixture test is opt-in. Point it at an image already present in
+the local runtime:
 
 ```sh
 AFK_CONTAINER_TEST_IMAGE=your-local-fixture:tag \

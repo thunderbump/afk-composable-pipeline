@@ -243,6 +243,7 @@ def _container_command(
     return [
         runtime,
         "run",
+        "--pull=never",
         "--rm",
         "--name",
         name,

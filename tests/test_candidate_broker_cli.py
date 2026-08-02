@@ -654,6 +654,52 @@ class CandidateBrokerCliTest(unittest.TestCase):
         )
         self.assertEqual(broker_result["stderr"], "")
 
+    def test_container_execution_never_pulls_the_requested_image(self):
+        for runtime_name in ("docker", "podman"):
+            with self.subTest(runtime=runtime_name):
+                request = self.temp / f"{runtime_name}-local-image-request.json"
+                result = self.temp / f"{runtime_name}-local-image-result.json"
+                fake_bin = self.temp / f"{runtime_name}-local-image-bin"
+                fake_bin.mkdir()
+                (fake_bin / "git").symlink_to(shutil.which("git"))
+                (fake_bin / "bwrap").symlink_to(shutil.which("bwrap"))
+                fake_runtime = fake_bin / runtime_name
+                fake_runtime.write_text(
+                    textwrap.dedent(
+                        f"""
+                        #!{sys.executable}
+                        import sys
+
+                        arguments = sys.argv[1:]
+                        if arguments[0] in {{"info", "rm"}}:
+                            raise SystemExit(0)
+                        print(
+                            "PULL_NEVER"
+                            if "--pull=never" in arguments
+                            else "IMPLICIT_PULL"
+                        )
+                        """
+                    ).lstrip(),
+                    encoding="utf-8",
+                )
+                fake_runtime.chmod(0o755)
+                self.write_request(
+                    request,
+                    command=["/bin/true"],
+                    execution={"type": "container", "image": "fixture:local"},
+                )
+
+                completed = self.run_broker(
+                    request,
+                    result,
+                    env={"PATH": str(fake_bin)},
+                )
+
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                broker_result = json.loads(result.read_text(encoding="utf-8"))
+                self.assertEqual(broker_result["status"], "completed", broker_result)
+                self.assertEqual(broker_result["stdout"], "PULL_NEVER\n")
+
     def test_container_execution_overrides_the_image_entrypoint(self):
         request = self.temp / "container-entrypoint-request.json"
         result = self.temp / "container-entrypoint-result.json"
