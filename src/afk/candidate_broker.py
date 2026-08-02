@@ -265,8 +265,10 @@ def _container_command(
         f"type=bind,src={snapshot},dst=/candidate,readonly",
         "--workdir",
         "/work",
+        "--entrypoint",
+        candidate_command[0],
         image,
-        *candidate_command,
+        *candidate_command[1:],
     ]
 
 

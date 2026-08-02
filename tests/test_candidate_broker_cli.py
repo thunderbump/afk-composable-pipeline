@@ -654,6 +654,57 @@ class CandidateBrokerCliTest(unittest.TestCase):
         )
         self.assertEqual(broker_result["stderr"], "")
 
+    def test_container_execution_overrides_the_image_entrypoint(self):
+        request = self.temp / "container-entrypoint-request.json"
+        result = self.temp / "container-entrypoint-result.json"
+        fake_bin = self.temp / "container-entrypoint-bin"
+        fake_bin.mkdir()
+        (fake_bin / "git").symlink_to(shutil.which("git"))
+        (fake_bin / "bwrap").symlink_to(shutil.which("bwrap"))
+        fake_docker = fake_bin / "docker"
+        fake_docker.write_text(
+            textwrap.dedent(
+                f"""
+                #!{sys.executable}
+                import sys
+
+                arguments = sys.argv[1:]
+                if arguments[0] == "info":
+                    raise SystemExit(0)
+                if arguments[0] == "rm":
+                    raise SystemExit(0)
+                if "--entrypoint" not in arguments:
+                    print("image entrypoint ran instead")
+                    raise SystemExit(0)
+                entrypoint = arguments[arguments.index("--entrypoint") + 1]
+                image = arguments.index("fixture:entrypoint")
+                if entrypoint != "/bin/false" or arguments[image + 1:] != ["arg"]:
+                    raise SystemExit(2)
+                raise SystemExit(19)
+                """
+            ).lstrip(),
+            encoding="utf-8",
+        )
+        fake_docker.chmod(0o755)
+        self.write_request(
+            request,
+            command=["/bin/false", "arg"],
+            execution={"type": "container", "image": "fixture:entrypoint"},
+        )
+
+        completed = self.run_broker(
+            request,
+            result,
+            env={"PATH": str(fake_bin)},
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        broker_result = json.loads(result.read_text(encoding="utf-8"))
+        self.assertEqual(broker_result["status"], "failed", broker_result)
+        self.assertEqual(broker_result["failure_classification"], "abnormal_exit")
+        self.assertEqual(broker_result["exit_code"], 19)
+        self.assertEqual(broker_result["stdout"], "")
+
     @unittest.skipUnless(
         (shutil.which("docker") or shutil.which("podman"))
         and os.environ.get("AFK_CONTAINER_TEST_IMAGE"),
