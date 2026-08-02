@@ -2442,67 +2442,23 @@ class CandidateValidationCliTest(unittest.TestCase):
                 self.assertNotIn(b"hunter2", path.read_bytes())
 
     def test_timeout_terminates_the_validation_process_group(self):
-        child_pid_path = self.temp / "child.pid"
+        child_ready_path = self.temp / "timeout-child.ready"
+        token = f"afk-timeout-child-{os.getpid()}-{time.monotonic_ns()}"
+        child_program = (
+            "import sys,time; from pathlib import Path; "
+            "Path(sys.argv[1]).write_text('ready', encoding='utf-8'); "
+            "time.sleep(60)"
+        )
         self.write_contract_worker(
             status="passed",
             exit_code=0,
             checks=[{"name": "tests", "status": "passed", "log_path": "tests.log"}],
             evidence_line=(
                 'sys.stdout.write("password=timeout-secret\\n"); '
-                'sys.stdout.flush(); child = subprocess.Popen(["sleep", "60"]); '
-                f"Path({str(child_pid_path)!r}).write_text("
-                'str(child.pid), encoding="utf-8"); '
-                "time.sleep(60)"
-            ),
-            timeout_seconds=1,
-        )
-        run_id, _ = self.candidate_ready_run()
-
-        completed = self.run_afk("resume")
-
-        self.assertEqual(completed.returncode, 2)
-        status = self.status(run_id)
-        self.assertEqual(status["attention"]["kind"], "interrupted")
-        self.assertIn("timed out", status["attention"]["summary"])
-        attempt = status["validation_attempt"]
-        self.assertEqual(attempt["status"], "interrupted")
-        evidence = self.state_home / "afk" / "runs" / run_id / attempt["evidence"]
-        self.assertTrue((evidence / "manifest.json").is_file())
-        self.assertEqual(
-            (evidence / "afk" / "stdout.log").read_text(encoding="utf-8"),
-            "password=[REDACTED]\n",
-        )
-        self.assertEqual(stat.S_IMODE(evidence.stat().st_mode), 0o500)
-        child_pid = int(child_pid_path.read_text(encoding="utf-8"))
-        deadline = time.monotonic() + 2
-        while Path(f"/proc/{child_pid}").exists() and time.monotonic() < deadline:
-            time.sleep(0.02)
-        self.assertFalse(Path(f"/proc/{child_pid}").exists())
-
-    def test_timeout_kills_term_resistant_validation_descendant(self):
-        child_pid_path = self.temp / "resistant-timeout-child.pid"
-        child_program = textwrap.dedent(
-            """
-            import os
-            import signal
-            import sys
-            import time
-            from pathlib import Path
-
-            pid_path = Path(sys.argv[1])
-            signal.signal(signal.SIGTERM, signal.SIG_IGN)
-            pid_path.write_text(str(os.getpid()), encoding="utf-8")
-            time.sleep(60)
-            """
-        ).lstrip()
-        self.write_contract_worker(
-            status="passed",
-            exit_code=0,
-            checks=[{"name": "tests", "status": "passed", "log_path": "tests.log"}],
-            evidence_line=(
-                f'child = subprocess.Popen([sys.executable, "-c", {child_program!r}, '
-                f"{str(child_pid_path)!r}]); "
-                f'exec("while not Path({str(child_pid_path)!r}).exists():\\n" '
+                "sys.stdout.flush(); "
+                f"subprocess.Popen([sys.executable, '-c', {child_program!r}, "
+                f"{str(child_ready_path)!r}, {token!r}]); "
+                f'exec("while not Path({str(child_ready_path)!r}).exists():\\n" '
                 '"    time.sleep(0.001)"); '
                 "time.sleep(60)"
             ),
@@ -2512,44 +2468,108 @@ class CandidateValidationCliTest(unittest.TestCase):
 
         completed = self.run_afk("resume")
 
-        child_pid = int(child_pid_path.read_text(encoding="utf-8"))
         try:
             self.assertEqual(completed.returncode, 2)
             status = self.status(run_id)
             self.assertEqual(status["attention"]["kind"], "interrupted")
             self.assertIn("timed out", status["attention"]["summary"])
-            deadline = time.monotonic() + 2
-            while Path(f"/proc/{child_pid}").exists() and time.monotonic() < deadline:
-                time.sleep(0.02)
-            self.assertFalse(Path(f"/proc/{child_pid}").exists())
+            attempt = status["validation_attempt"]
+            self.assertEqual(attempt["status"], "interrupted")
+            evidence = self.state_home / "afk" / "runs" / run_id / attempt["evidence"]
+            self.assertTrue((evidence / "manifest.json").is_file())
+            self.assertEqual(
+                (evidence / "afk" / "stdout.log").read_text(encoding="utf-8"),
+                "password=[REDACTED]\n",
+            )
+            self.assertEqual(stat.S_IMODE(evidence.stat().st_mode), 0o500)
+            self.assertTrue(child_ready_path.is_file())
+            self.assertEqual(self.processes_with_argument(token), [])
         finally:
-            try:
-                os.kill(child_pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+            for pid in self.processes_with_argument(token):
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
 
-    def test_successful_worker_cannot_leave_descendants_running(self):
-        child_pid_path = self.temp / "successful-child.pid"
+    def test_timeout_kills_term_resistant_validation_descendant(self):
+        child_ready_path = self.temp / "resistant-timeout-child.ready"
+        token = f"afk-resistant-timeout-{os.getpid()}-{time.monotonic_ns()}"
+        child_program = textwrap.dedent(
+            """
+            import signal
+            import sys
+            import time
+            from pathlib import Path
+
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            Path(sys.argv[1]).write_text("ready", encoding="utf-8")
+            time.sleep(60)
+            """
+        ).lstrip()
         self.write_contract_worker(
             status="passed",
             exit_code=0,
             checks=[{"name": "tests", "status": "passed", "log_path": "tests.log"}],
             evidence_line=(
-                'child = subprocess.Popen(["sleep", "60"]); '
-                f"Path({str(child_pid_path)!r}).write_text("
-                'str(child.pid), encoding="utf-8"); ' + WRITE_PASSED_LOG
+                f'child = subprocess.Popen([sys.executable, "-c", {child_program!r}, '
+                f"{str(child_ready_path)!r}, {token!r}]); "
+                f'exec("while not Path({str(child_ready_path)!r}).exists():\\n" '
+                '"    time.sleep(0.001)"); '
+                "time.sleep(60)"
+            ),
+            timeout_seconds=1,
+        )
+        run_id, _ = self.candidate_ready_run()
+
+        completed = self.run_afk("resume")
+
+        try:
+            self.assertEqual(completed.returncode, 2)
+            status = self.status(run_id)
+            self.assertEqual(status["attention"]["kind"], "interrupted")
+            self.assertIn("timed out", status["attention"]["summary"])
+            self.assertTrue(child_ready_path.is_file())
+            self.assertEqual(self.processes_with_argument(token), [])
+        finally:
+            for pid in self.processes_with_argument(token):
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+    def test_successful_worker_cannot_leave_descendants_running(self):
+        child_ready_path = self.temp / "successful-child.ready"
+        token = f"afk-successful-child-{os.getpid()}-{time.monotonic_ns()}"
+        child_program = (
+            "import sys,time; from pathlib import Path; "
+            "Path(sys.argv[1]).write_text('ready', encoding='utf-8'); "
+            "time.sleep(60)"
+        )
+        self.write_contract_worker(
+            status="passed",
+            exit_code=0,
+            checks=[{"name": "tests", "status": "passed", "log_path": "tests.log"}],
+            evidence_line=(
+                f"subprocess.Popen([sys.executable, '-c', {child_program!r}, "
+                f"{str(child_ready_path)!r}, {token!r}]); "
+                f'exec("while not Path({str(child_ready_path)!r}).exists():\\n" '
+                '"    time.sleep(0.001)"); ' + WRITE_PASSED_LOG
             ),
         )
         run_id, _ = self.candidate_ready_run()
 
         completed = self.run_afk("resume")
 
-        self.assertEqual(completed.returncode, 0, completed.stderr)
-        child_pid = int(child_pid_path.read_text(encoding="utf-8"))
-        deadline = time.monotonic() + 2
-        while Path(f"/proc/{child_pid}").exists() and time.monotonic() < deadline:
-            time.sleep(0.02)
-        self.assertFalse(Path(f"/proc/{child_pid}").exists())
+        try:
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertTrue(child_ready_path.is_file())
+            self.assertEqual(self.processes_with_argument(token), [])
+        finally:
+            for pid in self.processes_with_argument(token):
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
 
     def test_successful_worker_kills_detached_term_resistant_descendant(self):
         child_ready_path = self.temp / "detached-child.ready"
@@ -2598,9 +2618,9 @@ class CandidateValidationCliTest(unittest.TestCase):
                     pass
 
     def test_successful_worker_is_drained_before_evidence_is_ingested(self):
-        child_pid_path = self.temp / "resistant-child.pid"
         child_ready_path = self.temp / "resistant-child.ready"
         mutation_path = self.temp / "evidence-mutated"
+        token = f"afk-evidence-drain-{os.getpid()}-{time.monotonic_ns()}"
         child_program = textwrap.dedent(
             """
             import signal
@@ -2608,7 +2628,7 @@ class CandidateValidationCliTest(unittest.TestCase):
             import time
             from pathlib import Path
 
-            evidence, destination, mutation, ready = map(Path, sys.argv[1:])
+            evidence, destination, mutation, ready = map(Path, sys.argv[1:5])
             signal.signal(signal.SIGTERM, signal.SIG_IGN)
             ready.write_text("ready", encoding="utf-8")
             while not destination.exists():
@@ -2624,9 +2644,7 @@ class CandidateValidationCliTest(unittest.TestCase):
             '"afk/request.json"; '
             f'child = subprocess.Popen([sys.executable, "-c", {child_program!r}, '
             f"str(evidence), str(destination), {str(mutation_path)!r}, "
-            f"{str(child_ready_path)!r}]); "
-            f"Path({str(child_pid_path)!r}).write_text("
-            'str(child.pid), encoding="utf-8"); '
+            f"{str(child_ready_path)!r}, {token!r}]); "
             f'exec("while not Path({str(child_ready_path)!r}).exists():\\n" '
             '"    time.sleep(0.001)"); ' + WRITE_PASSED_LOG
         )
@@ -2640,7 +2658,6 @@ class CandidateValidationCliTest(unittest.TestCase):
 
         completed = self.run_afk("resume")
 
-        child_pid = int(child_pid_path.read_text(encoding="utf-8"))
         try:
             deadline = time.monotonic() + 2
             while not mutation_path.exists() and time.monotonic() < deadline:
@@ -2659,11 +2676,14 @@ class CandidateValidationCliTest(unittest.TestCase):
                 (evidence / "contract" / "tests.log").read_text(encoding="utf-8"),
                 "passed\n",
             )
+            self.assertTrue(child_ready_path.is_file())
+            self.assertEqual(self.processes_with_argument(token), [])
         finally:
-            try:
-                os.kill(child_pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+            for pid in self.processes_with_argument(token):
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
 
     def test_validation_signal_requires_interrupted_attention(self):
         self.write_contract_worker(
