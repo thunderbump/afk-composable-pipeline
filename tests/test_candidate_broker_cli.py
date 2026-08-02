@@ -451,6 +451,35 @@ class CandidateBrokerCliTest(unittest.TestCase):
         with mock.patch("afk.checkouts.os.scandir", side_effect=reject_ignored_scan):
             self.assertTrue(is_exact_clean_commit(self.candidate, self.candidate_sha))
 
+    def test_exact_candidate_bounds_flat_ignored_file_evaluation(self):
+        from afk import checkouts
+
+        (self.candidate / ".gitignore").write_text("*.log\n", encoding="utf-8")
+        self.git("add", ".gitignore")
+        self.git("commit", "-m", "ignore generated logs")
+        self.candidate_sha = self.git("rev-parse", "HEAD")
+        path_limit = checkouts.EXACT_CANDIDATE_UNTRACKED_PATH_LIMIT
+        for index in range(path_limit + 1):
+            (self.candidate / f"generated-{index}.log").write_bytes(b"")
+        real_run_trusted_read_git = checkouts.run_trusted_read_git
+        oversized_requests = []
+
+        def record_ignore_request(args, **kwargs):
+            input_data = kwargs.get("input_data") or b""
+            if args[:1] == ["check-ignore"] and input_data.count(b"\0") > path_limit:
+                oversized_requests.append(input_data.count(b"\0"))
+            return real_run_trusted_read_git(args, **kwargs)
+
+        with mock.patch(
+            "afk.checkouts.run_trusted_read_git",
+            side_effect=record_ignore_request,
+        ):
+            self.assertFalse(
+                checkouts.is_exact_clean_commit(self.candidate, self.candidate_sha)
+            )
+
+        self.assertEqual(oversized_requests, [])
+
     def test_exact_candidate_rejects_unignored_extra_file(self):
         from afk.checkouts import is_exact_clean_commit
 

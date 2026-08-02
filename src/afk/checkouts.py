@@ -15,6 +15,9 @@ from afk.redaction import redact_text, redact_url
 
 SCHEMA_VERSION = 1
 GIT_COMMIT_PATTERN = re.compile(r"^[0-9a-fA-F]{4,40}$")
+# Bound Candidate-controlled path framing retained during ignore evaluation.
+EXACT_CANDIDATE_UNTRACKED_PATH_LIMIT = 4096
+EXACT_CANDIDATE_UNTRACKED_BYTES_LIMIT = 1024 * 1024
 
 
 class GitCommandError(RuntimeError):
@@ -358,11 +361,8 @@ def _worktree_matches_commit(path: Path, commit: str) -> bool:
                 path, entries, blob_sizes, evaluation
             ):
                 return False
-            untracked_paths = (
-                _worktree_paths(
-                    path, gitlinks, expected_paths, evaluation
-                )
-                - expected_paths
+            untracked_paths = _worktree_paths(
+                path, gitlinks, expected_paths, evaluation
             )
             if _check_ignored(evaluation, untracked_paths) != untracked_paths:
                 return False
@@ -436,6 +436,21 @@ def _worktree_paths(
     ignore_evaluation: Path,
 ) -> set[bytes]:
     observed = set()
+    observed_bytes = 0
+
+    def record_untracked(relative: bytes) -> None:
+        nonlocal observed_bytes
+        if relative in expected_paths or relative in observed:
+            return
+        encoded_size = len(relative) + 1
+        if (
+            len(observed) >= EXACT_CANDIDATE_UNTRACKED_PATH_LIMIT
+            or observed_bytes + encoded_size > EXACT_CANDIDATE_UNTRACKED_BYTES_LIMIT
+        ):
+            raise ValueError("too many untracked worktree paths")
+        observed.add(relative)
+        observed_bytes += encoded_size
+
     tracked_directories = {
         b"/".join(item_path.split(b"/")[:depth])
         for item_path in expected_paths
@@ -444,6 +459,8 @@ def _worktree_paths(
     pending = [(path, b"")]
     while pending:
         child_directories = []
+        untracked_directory_count = 0
+        untracked_directory_bytes = 0
         for directory, prefix in pending:
             with os.scandir(directory) as children:
                 for child in children:
@@ -452,11 +469,23 @@ def _worktree_paths(
                     if relative == b".git":
                         continue
                     if relative in gitlinks or child.is_symlink():
-                        observed.add(relative)
+                        record_untracked(relative)
                     elif child.is_dir(follow_symlinks=False):
+                        if relative not in tracked_directories:
+                            untracked_directory_count += 1
+                            untracked_directory_bytes += len(relative) + 2
+                            if (
+                                untracked_directory_count
+                                > EXACT_CANDIDATE_UNTRACKED_PATH_LIMIT
+                                or untracked_directory_bytes
+                                > EXACT_CANDIDATE_UNTRACKED_BYTES_LIMIT
+                            ):
+                                raise ValueError(
+                                    "too many untracked worktree directories"
+                                )
                         child_directories.append((Path(child.path), relative))
                     elif child.is_file(follow_symlinks=False):
-                        observed.add(relative)
+                        record_untracked(relative)
                     else:
                         raise ValueError("unsupported worktree entry")
         prunable = {
@@ -509,6 +538,12 @@ def _materialize_committed_ignores(
 def _check_ignored(evaluation: Path, item_paths: set[bytes]) -> set[bytes]:
     if not item_paths:
         return set()
+    if (
+        len(item_paths) > EXACT_CANDIDATE_UNTRACKED_PATH_LIMIT
+        or sum(len(item_path) + 1 for item_path in item_paths)
+        > EXACT_CANDIDATE_UNTRACKED_BYTES_LIMIT
+    ):
+        raise ValueError("ignore evaluation input is too large")
     for item_path in item_paths:
         _require_git_path(item_path.rstrip(b"/"))
     checked = run_trusted_read_git(
