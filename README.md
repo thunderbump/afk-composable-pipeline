@@ -72,6 +72,183 @@ recorded at Run start. It includes at most the newest eight Bead comments in
 latest-first order under a 4,000-character section budget, after structured
 secret redaction. Live tracker changes cannot alter that context.
 
+For a normal Run, the pinned base `afk.toml` must declare the complete
+repository-owned validation control-flow closure:
+
+```toml
+schema_version = 1
+
+[validation]
+command = ["./scripts/validation-worker.sh"]
+trusted_files = [
+  "scripts/validation-worker.sh",
+  "scripts/validate.sh",
+  "scripts/lib/validation-routing.sh",
+]
+timeout_seconds = 2700
+```
+
+AFK verifies every declared file has the same tracked blob and regular-file
+mode in the Candidate as in the pinned base, then materializes those base
+blobs outside the Candidate checkout and runs the command from that trusted
+root. For normal pinned-base validation, the request supplies `candidate_sha`
+and an ephemeral `candidate_broker` capability instead of a raw Candidate
+checkout path. The trusted target-owned harness uses that capability to build
+and test exact-head Candidate inputs without giving Candidate code access to
+the validation request, evidence directory, broker endpoint, or host checkout.
+Contract authors must list every repository executable or sourced file used by
+validation. Candidate changes to the contract or any declared validator file
+remain proposals for a later Run whose base includes them.
+
+The capability object contains `schema_version`, `socket_path`, and an
+ephemeral `token`. One newline-delimited JSON request is accepted per Unix
+socket connection. The request repeats `schema_version` and `token`, supplies a
+non-empty `command` argv, and may use the broker's bounded `timeout_seconds`
+and `output_byte_limit` options. The response is the same Candidate-bound
+structured result returned by the broker CLI. A harness may open multiple
+connections while it runs; the capability expires when that harness finishes.
+Persisted Gate evidence records only the capability type, never the live token
+or socket path. Approved bootstrap validation retains its existing request and
+adapter behavior.
+
+### Supervision runtime prerequisites
+
+Brokered Candidate execution and pipeline commands that use process
+supervision require Linux with a mounted, readable `/proc`, child-subreaper
+support, and Python support for Linux pidfds. The default Candidate sandbox
+and ordinary supervised commands also require Bubblewrap. Bubblewrap is an OS
+dependency, not a Python package: `bwrap` must be on `PATH`, and the host must
+permit the user, PID, and mount namespaces it requests.
+
+From a source checkout, this safe smoke check verifies both Bubblewrap
+discovery and the public supervision path without running project work:
+
+```sh
+command -v bwrap
+PYTHONPATH=src python3 - <<'PY'
+import os
+import sys
+from pathlib import Path
+
+from afk.process_supervision import run_supervised_command
+
+run_supervised_command(
+    [sys.executable, "-c", "pass"],
+    cwd=Path.cwd(),
+    environment=os.environ.copy(),
+    timeout_seconds=5,
+    label="supervision smoke check",
+)
+PY
+```
+
+If a required `/proc`, pidfd, subreaper, Bubblewrap, or namespace capability is
+unavailable, supervision fails closed. AFK reports a supervision or broker
+failure instead of running the command unsupervised or publishing a successful
+Candidate result.
+
+Run one exact Candidate command through the capability-limited broker:
+
+```sh
+PYTHONPATH=src python3 -m afk.candidate_broker \
+  --request candidate-request.json \
+  --result candidate-result.json
+```
+
+The version-1 request requires `schema_version`, the exact clean
+`candidate_sha`, an absolute `candidate_path`, and a non-empty `command` argv.
+It may also set `timeout_seconds` (greater than zero and at most 3600; default
+300) and `output_byte_limit` (a positive integer no larger than 64 MiB; default
+1 MiB). The output limit applies independently to stdout and stderr. By
+default, the command uses the built-in Bubblewrap sandbox. A trusted harness
+may instead request the target-neutral container adapter with exactly:
+
+```json
+{"execution":{"type":"container","image":"locally-available-fixture:tag"}}
+```
+
+The adapter probes Docker first and Podman second with a bounded trusted
+runtime `info` command. These fixed Docker/Podman client commands use a
+per-call guardian and worker with the same bounded protocol, descendant
+tracking, timeout, output limits, and fail-closed cleanup as other commands,
+but omit the outer Bubblewrap PID wrapper so rootless Podman can create its own
+namespaces. The guardian retains descendant ownership if its worker is killed;
+the worker's parent-death cleanup covers abrupt guardian loss. This narrow
+trusted-host mode applies only to runtime `info`, image inspection, container
+execution, and forced removal. The Candidate remains confined by the hardened
+container, and default Bubblewrap Candidate execution and all ordinary
+supervision paths are unchanged. The adapter does not accept
+Compose files, service names, target profiles, volumes, environment variables,
+runtime flags, or repository-specific deployment semantics. An option-looking
+image name is invalid. If neither runtime is usable, including when trusted
+runtime supervision is unavailable, the broker returns a Candidate-bound
+`adapter_unavailable` result; the Bubblewrap path is unchanged.
+Container runs use `--pull=never`, so the requested image must already exist
+in the selected local runtime and execution never triggers an implicit pull.
+Before execution, AFK inspects the local image through the trusted runtime,
+rejects malformed metadata or any image-declared volumes, and runs the resolved
+immutable image ID instead of the mutable requested tag.
+
+Container execution mounts only the materialized exact-commit snapshot,
+read-only at `/candidate`. `/work` and `/tmp` are private tmpfs mounts. The
+container runs as uid/gid 65534 with a read-only root, no network, no Linux
+capabilities, `no-new-privileges`, and a bounded PID count. The Docker/Podman
+socket, live broker capability, Candidate checkout, validation request, and
+evidence directory are not mounted into the container. AFK supervises the
+trusted runtime client and forcibly removes every created, randomly named
+container after completion, timeout, or another interruption; failed forced
+cleanup fails the broker closed instead of publishing a successful or ordinary
+failure result. Before starting the runtime, the broker arms a minimal cleanup
+watchdog with only the absolute runtime path and random container name. Broker
+death or private-channel failure triggers bounded, supervised forced-removal
+retries across runtime shutdown and container-creation races. Normal cleanup
+disarms the watchdog only after removal is confirmed, or after the runtime has
+confirmed that no container started. Cleanup also removes anonymous volumes as
+defense in depth.
+
+The broker materializes exact tree and blob objects from the Candidate commit
+without `.git` administrative metadata or archive-attribute rewrites. Gitlinks
+fail closed until recursive submodule semantics are defined. The command runs
+with that snapshot mounted read-only at `/candidate`, writable scratch at
+`/work`, a private writable `/tmp`, the runtime mounted from `/usr`, a
+namespaced `/proc`, a distinct minimal `/dev`, a cleared environment, and no
+inherited network namespace. The broker supervises and reaps the complete
+Candidate process tree before atomically publishing a result. Successful
+results retain `status: "completed"`, the Candidate SHA, integer exit code,
+stdout, and stderr. Timeout, output overflow, launch failure, signal, and other
+nonzero exits instead publish `status: "failed"`, the exact Candidate SHA,
+bounded redacted diagnostics, a stable `failure_classification`, a summary, and
+an integer or null `exit_code`. The result path is not exposed inside the
+sandbox.
+
+The container fixture test is opt-in. Point it at an image already present in
+the local runtime:
+
+```sh
+AFK_CONTAINER_TEST_IMAGE=your-local-fixture:tag \
+  python3 -m unittest -v \
+  tests.test_candidate_broker_cli.CandidateBrokerCliTest.test_container_execution_runs_a_fixture_on_the_local_runtime
+```
+
+To exercise the rootless Podman-only selection path, use an image already
+present in Podman's local storage:
+
+```sh
+AFK_PODMAN_TEST_IMAGE=localhost/afk-composable-pipeline:smoke \
+  python3 -m unittest -v \
+  tests.test_candidate_broker_cli.CandidateBrokerCliTest.test_container_execution_runs_a_fixture_on_rootless_podman
+```
+
+The declared Candidate capability set is intentionally small: read the exact
+snapshot under `/candidate`; write scratch under `/work` and private temporary
+files under `/tmp`; use the mounted runtime under `/usr`, the sandbox PID view
+under `/proc`, and minimal devices such as `/dev/null` under `/dev`. Validation
+requests and results, evidence, the trusted harness, the AFK Run Store,
+credential files and environment variables, Docker and broker sockets,
+unrelated host paths, and host networking are omitted. Candidate commands
+receive ordinary OS denials for those authority surfaces, while their exit
+status and diagnostics remain in the broker-owned structured result.
+
 When `--ledger` is omitted, AFK resolves ledger output with this precedence:
 `--ledger` > `AFK_LEDGER_DIR` > `./ledgers`. Preview-only `run-next` does not
 create `./ledgers`; the directory is only created when execution actually writes

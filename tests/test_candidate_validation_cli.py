@@ -1,6 +1,7 @@
 import json
 import os
 import signal
+import socket
 import stat
 import subprocess
 import sys
@@ -44,10 +45,17 @@ class CandidateValidationCliTest(unittest.TestCase):
         self.temporary_directory.cleanup()
 
     def test_resume_advances_only_after_exact_candidate_validation_passes(self):
+        repository = str(self.repository)
         self.write_contract_worker(
             status="passed",
             exit_code=0,
             checks=[{"name": "tests", "status": "passed", "log_path": "tests.log"}],
+            evidence_line=(
+                f"candidate = Path({repository!r}).resolve(); "
+                'assert "candidate_path" not in request; '
+                'assert request["candidate_broker"]["schema_version"] == 1; '
+                "assert Path.cwd().resolve() != candidate; " + WRITE_SAFE_LOG
+            ),
         )
         run_id, candidate_sha = self.candidate_ready_run()
 
@@ -80,6 +88,507 @@ class CandidateValidationCliTest(unittest.TestCase):
             "afk/outcome.json", {entry["path"] for entry in manifest["files"]}
         )
         self.assertEqual(stat.S_IMODE(evidence.stat().st_mode), 0o500)
+
+    def test_normal_validation_exposes_only_a_candidate_broker_capability(self):
+        (self.repository / "README.md").write_text(
+            "exact Candidate input\n", encoding="utf-8"
+        )
+        broker_request = {
+            "schema_version": 1,
+            "command": [
+                "/usr/bin/python3",
+                "-c",
+                (
+                    "from pathlib import Path; "
+                    "print(Path('/candidate/README.md').read_text(), end='')"
+                ),
+            ],
+        }
+        self.write_contract_worker(
+            status="passed",
+            exit_code=0,
+            checks=[{"name": "tests", "status": "passed", "log_path": "tests.log"}],
+            evidence_line=(
+                'assert "candidate_path" not in request; '
+                'capability = request["candidate_broker"]; '
+                'client = __import__("socket").socket(__import__("socket").AF_UNIX); '
+                'client.connect(capability["socket_path"]); '
+                "client.sendall((json.dumps({**"
+                f"{broker_request!r}"
+                ', "token": capability["token"]}) + "\\n").encode("utf-8")); '
+                "response_stream = client.makefile('r', encoding='utf-8'); "
+                "response = json.loads(response_stream.readline()); "
+                'assert response["candidate_sha"] == request["candidate_sha"]; '
+                'assert response["status"] == "completed"; '
+                'assert response["stdout"] == "exact Candidate input\\n"; '
+                "client.close(); "
+                'client = __import__("socket").socket(__import__("socket").AF_UNIX); '
+                'client.connect(capability["socket_path"]); '
+                'client.sendall((json.dumps({"schema_version": 1, '
+                '"command": ["/usr/bin/true"], '
+                '"token": capability["token"]}) + "\\n").encode("utf-8")); '
+                "response_stream = client.makefile('r', encoding='utf-8'); "
+                "response = json.loads(response_stream.readline()); "
+                'assert response["status"] == "completed"; '
+                "client.close(); " + WRITE_SAFE_LOG
+            ),
+        )
+        run_id, _ = self.candidate_ready_run()
+
+        completed = self.run_afk("resume")
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        status = self.status(run_id)
+        self.assertEqual(status["checkpoint"], "validated")
+        gate = (
+            self.state_home / "afk" / "runs" / run_id / status["validation"]["evidence"]
+        )
+        persisted_request = json.loads(
+            (gate / "afk" / "request.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            persisted_request["candidate_broker"],
+            {
+                "schema_version": 1,
+                "transport": "ephemeral_unix_socket",
+            },
+        )
+        self.assertNotIn("token", json.dumps(persisted_request))
+        self.assertNotIn("socket_path", json.dumps(persisted_request))
+
+    def test_brokered_candidate_cannot_reach_host_validation_or_docker(self):
+        host_secret = self.temp / "host-secret"
+        host_secret.write_text("host only\n", encoding="utf-8")
+        docker_socket_path = self.temp / "docker.sock"
+        probe = textwrap.dedent(
+            """
+            import json
+            import socket
+            import sys
+            from pathlib import Path
+
+            checks = {}
+            for name, path in (
+                ("host_path", sys.argv[1]),
+                ("validation_evidence", sys.argv[2]),
+            ):
+                try:
+                    Path(path).read_bytes()
+                except OSError as exc:
+                    checks[name] = {"status": "denied", "error": type(exc).__name__}
+                else:
+                    checks[name] = {"status": "exposed"}
+            for name, family, address in (
+                ("docker", socket.AF_UNIX, sys.argv[3]),
+                ("broker", socket.AF_UNIX, sys.argv[4]),
+                ("default_docker", socket.AF_UNIX, "/var/run/docker.sock"),
+                ("network", socket.AF_INET, ("127.0.0.1", int(sys.argv[5]))),
+            ):
+                try:
+                    with socket.socket(family) as client:
+                        client.settimeout(0.2)
+                        client.connect(address)
+                except OSError as exc:
+                    checks[name] = {"status": "denied", "error": type(exc).__name__}
+                else:
+                    checks[name] = {"status": "exposed"}
+            print(json.dumps(checks, sort_keys=True))
+            """
+        ).strip()
+
+        with (
+            socket.socket(socket.AF_INET, socket.SOCK_STREAM) as host_network,
+            socket.socket(socket.AF_UNIX) as docker_socket,
+        ):
+            host_network.bind(("127.0.0.1", 0))
+            host_network.listen()
+            docker_socket.bind(str(docker_socket_path))
+            docker_socket.listen()
+            broker_request = {
+                "schema_version": 1,
+                "command": [
+                    "/usr/bin/python3",
+                    "-c",
+                    probe,
+                    str(host_secret),
+                    "__EVIDENCE_DIR__",
+                    str(docker_socket_path),
+                    "__BROKER_SOCKET__",
+                    str(host_network.getsockname()[1]),
+                ],
+            }
+            harness = textwrap.dedent(
+                f"""
+                import socket
+                capability = request["candidate_broker"]
+                broker_request = {broker_request!r}
+                broker_request["command"] = [
+                    request["evidence_dir"]
+                    if argument == "__EVIDENCE_DIR__"
+                    else capability["socket_path"]
+                    if argument == "__BROKER_SOCKET__"
+                    else argument
+                    for argument in broker_request["command"]
+                ]
+                broker_request["token"] = capability["token"]
+                with socket.socket(socket.AF_UNIX) as client:
+                    client.connect(capability["socket_path"])
+                    client.sendall((json.dumps(broker_request) + "\\n").encode())
+                    response = json.loads(
+                        client.makefile("r", encoding="utf-8").readline()
+                    )
+                assert response["status"] == "completed", response
+                checks = json.loads(response["stdout"])
+                assert all(check["status"] == "denied" for check in checks.values())
+                evidence.joinpath("tests.log").write_text(
+                    json.dumps(checks, sort_keys=True) + "\\n", encoding="utf-8"
+                )
+                """
+            ).strip()
+            self.write_contract_worker(
+                status="passed",
+                exit_code=0,
+                checks=[
+                    {"name": "boundary", "status": "passed", "log_path": "tests.log"}
+                ],
+                evidence_line=f"exec({harness!r})",
+            )
+            run_id, _ = self.candidate_ready_run()
+
+            completed = self.run_afk("resume")
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        status = self.status(run_id)
+        self.assertEqual(status["checkpoint"], "validated")
+        evidence = (
+            self.state_home / "afk" / "runs" / run_id / status["validation"]["evidence"]
+        )
+        checks = json.loads(
+            (evidence / "contract" / "tests.log").read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            set(checks),
+            {
+                "broker",
+                "default_docker",
+                "docker",
+                "host_path",
+                "network",
+                "validation_evidence",
+            },
+        )
+        self.assertTrue(all(check["status"] == "denied" for check in checks.values()))
+        self.assertEqual(stat.S_IMODE(evidence.stat().st_mode), 0o500)
+
+    def test_live_candidate_broker_capability_is_redacted_from_the_run_store(self):
+        worker = self.repository / "validate.py"
+        worker.write_text(
+            textwrap.dedent(
+                """
+                #!/usr/bin/env python3
+                import json
+                import sys
+                from pathlib import Path
+
+                request_path = Path(sys.argv[sys.argv.index("--request") + 1])
+                request = json.loads(request_path.read_text(encoding="utf-8"))
+                capability = request["candidate_broker"]
+                print(capability["token"])
+                print(capability["socket_path"], file=sys.stderr)
+                evidence = Path(request["evidence_dir"])
+                evidence.joinpath("tests.log").write_text(
+                    capability["token"] + "\\n"
+                    + capability["socket_path"] + "\\n",
+                    encoding="utf-8",
+                )
+                evidence.joinpath("result.json").write_text(json.dumps({
+                    "schema_version": 1,
+                    "candidate_sha": request["candidate_sha"],
+                    "status": "passed",
+                    "summary": (
+                        "summary " + capability["token"] + " "
+                        + capability["socket_path"]
+                    ),
+                    "checks": [{
+                        "name": "tests",
+                        "status": "passed",
+                        "log_path": "tests.log",
+                    }],
+                }), encoding="utf-8")
+                """
+            ).lstrip(),
+            encoding="utf-8",
+        )
+        worker.chmod(worker.stat().st_mode | stat.S_IXUSR)
+        (self.repository / "afk.toml").write_text(
+            'schema_version = 1\n\n[validation]\ncommand = ["./validate.py"]\n'
+            'trusted_files = ["validate.py"]\ntimeout_seconds = 5\n',
+            encoding="utf-8",
+        )
+        run_id, _ = self.candidate_ready_run()
+
+        completed = self.run_afk("resume")
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        status = self.status(run_id)
+        evidence = (
+            self.state_home / "afk" / "runs" / run_id / status["validation"]["evidence"]
+        )
+        self.assertEqual(
+            status["validation"]["summary"],
+            "summary [REDACTED] [REDACTED]",
+        )
+        self.assertEqual(
+            (evidence / "afk" / "stdout.log").read_text(encoding="utf-8"),
+            "[REDACTED]\n",
+        )
+        self.assertEqual(
+            (evidence / "afk" / "stderr.log").read_text(encoding="utf-8"),
+            "[REDACTED]\n",
+        )
+        self.assertEqual(
+            (evidence / "contract" / "tests.log").read_text(encoding="utf-8"),
+            "[REDACTED]\n[REDACTED]\n",
+        )
+        persisted_result = json.loads(
+            (evidence / "contract" / "result.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            persisted_result["summary"],
+            "summary [REDACTED] [REDACTED]",
+        )
+        persisted_request = json.loads(
+            (evidence / "afk" / "request.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            persisted_request["candidate_broker"],
+            {"schema_version": 1, "transport": "ephemeral_unix_socket"},
+        )
+        self.assertNotIn("token", json.dumps(persisted_request))
+        self.assertNotIn("socket_path", json.dumps(persisted_request))
+
+    def test_live_candidate_broker_secret_is_rejected_as_an_evidence_filename(self):
+        worker = self.repository / "validate.py"
+        worker.write_text(
+            textwrap.dedent(
+                """
+                #!/usr/bin/env python3
+                import json
+                import sys
+                from pathlib import Path
+
+                request_path = Path(sys.argv[sys.argv.index("--request") + 1])
+                request = json.loads(request_path.read_text(encoding="utf-8"))
+                evidence = Path(request["evidence_dir"])
+                log_path = request["candidate_broker"]["token"]
+                evidence.joinpath(log_path).write_text("passed\\n", encoding="utf-8")
+                evidence.joinpath("result.json").write_text(json.dumps({
+                    "schema_version": 1,
+                    "candidate_sha": request["candidate_sha"],
+                    "status": "passed",
+                    "summary": "validation passed",
+                    "checks": [{
+                        "name": "tests",
+                        "status": "passed",
+                        "log_path": log_path,
+                    }],
+                }), encoding="utf-8")
+                """
+            ).lstrip(),
+            encoding="utf-8",
+        )
+        worker.chmod(worker.stat().st_mode | stat.S_IXUSR)
+        (self.repository / "afk.toml").write_text(
+            'schema_version = 1\n\n[validation]\ncommand = ["./validate.py"]\n'
+            'trusted_files = ["validate.py"]\ntimeout_seconds = 5\n',
+            encoding="utf-8",
+        )
+        run_id, _ = self.candidate_ready_run()
+
+        completed = self.run_afk("resume")
+
+        self.assertEqual(completed.returncode, 2)
+        status = self.status(run_id)
+        self.assertEqual(status["attention"]["kind"], "invalid")
+        self.assertEqual(
+            status["attention"]["summary"],
+            "validation evidence path contains a live capability secret",
+        )
+        gate = (
+            self.state_home
+            / "afk"
+            / "runs"
+            / run_id
+            / "gates"
+            / status["validation_attempt"]["attempt_id"]
+        )
+        self.assertFalse((gate / "contract").exists())
+
+    def test_validation_timeout_stops_an_active_brokered_candidate_command(self):
+        token = f"afk-validation-broker-{os.getpid()}-{time.monotonic_ns()}"
+        broker_request = {
+            "schema_version": 1,
+            "command": [
+                "/usr/bin/python3",
+                "-c",
+                "import time; time.sleep(30)",
+                token,
+            ],
+            "timeout_seconds": 30,
+        }
+        self.write_contract_worker(
+            status="passed",
+            exit_code=0,
+            checks=[{"name": "tests", "status": "passed", "log_path": "tests.log"}],
+            evidence_line=(
+                'capability = request["candidate_broker"]; '
+                'client = __import__("socket").socket(__import__("socket").AF_UNIX); '
+                'client.connect(capability["socket_path"]); '
+                "client.sendall((json.dumps({**"
+                f"{broker_request!r}"
+                ', "token": capability["token"]}) + "\\n").encode("utf-8")); '
+                'client.makefile("r", encoding="utf-8").readline(); ' + WRITE_SAFE_LOG
+            ),
+            timeout_seconds=1,
+        )
+        run_id, _ = self.candidate_ready_run()
+
+        try:
+            completed = self.run_afk("resume")
+
+            self.assertEqual(completed.returncode, 2)
+            status = self.status(run_id)
+            self.assertEqual(status["attention"]["kind"], "interrupted")
+            self.assertEqual(self.processes_with_token(token), [])
+        finally:
+            for pid in self.processes_with_token(token):
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+    def test_brokered_candidate_cannot_leave_a_detached_descendant(self):
+        token = f"afk-broker-descendant-{os.getpid()}-{time.monotonic_ns()}"
+        parent_token = f"{token}-parent"
+        child_program = (
+            "import signal,time; "
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+            "print('ready', flush=True); "
+            "time.sleep(60)"
+        )
+        candidate_program = (
+            "import os,select,signal,subprocess,sys; "
+            "child = subprocess.Popen("
+            f"[sys.executable, '-c', {child_program!r}, {token!r}], "
+            "stdout=subprocess.PIPE, text=True, start_new_session=True); "
+            "assert select.select([child.stdout], [], [], 1)[0]; "
+            "assert child.stdout.readline() == 'ready\\n'; "
+            "os.kill(os.getpid(), signal.SIGSTOP); "
+            "print('candidate completed')"
+        )
+        broker_request = {
+            "schema_version": 1,
+            "command": [
+                "/usr/bin/python3",
+                "-c",
+                candidate_program,
+                parent_token,
+            ],
+        }
+        harness = textwrap.dedent(
+            f"""
+            import socket
+            capability = request["candidate_broker"]
+            broker_request = {broker_request!r}
+            broker_request["token"] = capability["token"]
+            with socket.socket(socket.AF_UNIX) as client:
+                client.connect(capability["socket_path"])
+                client.sendall((json.dumps(broker_request) + "\\n").encode())
+                response = json.loads(client.makefile("r", encoding="utf-8").readline())
+            assert response["status"] == "completed", response
+            assert response["stdout"] == "candidate completed\\n"
+            {WRITE_SAFE_LOG}
+            """
+        ).strip()
+        self.write_contract_worker(
+            status="passed",
+            exit_code=0,
+            checks=[{"name": "tests", "status": "passed", "log_path": "tests.log"}],
+            evidence_line=f"exec({harness!r})",
+        )
+        run_id, _ = self.candidate_ready_run()
+        environment = {
+            **os.environ,
+            "PYTHONPATH": str(ROOT / "src"),
+            "XDG_STATE_HOME": str(self.state_home),
+        }
+        afk_process = subprocess.Popen(
+            [sys.executable, "-m", "afk", "resume"],
+            cwd=self.repository,
+            env=environment,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        child_pid = None
+        parent_pid = None
+
+        try:
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline and afk_process.poll() is None:
+                children = self.processes_with_argument(token)
+                parents = self.processes_with_argument(parent_token)
+                if len(children) == 1:
+                    for observed_parent in parents:
+                        try:
+                            parent_status = Path(
+                                f"/proc/{observed_parent}/status"
+                            ).read_text(encoding="utf-8")
+                        except (FileNotFoundError, ProcessLookupError):
+                            continue
+                        if "\nState:\tT" in parent_status:
+                            child_pid = children[0]
+                            parent_pid = observed_parent
+                            break
+                    if parent_pid is not None:
+                        break
+                time.sleep(0.02)
+
+            self.assertIsNotNone(child_pid)
+            self.assertIsNotNone(parent_pid)
+            os.kill(parent_pid, signal.SIGCONT)
+            _, stderr = afk_process.communicate(timeout=20)
+
+            self.assertEqual(afk_process.returncode, 0, stderr)
+            status = self.status(run_id)
+            self.assertEqual(status["checkpoint"], "validated")
+            evidence = (
+                self.state_home
+                / "afk"
+                / "runs"
+                / run_id
+                / status["validation"]["evidence"]
+            )
+            self.assertEqual(stat.S_IMODE(evidence.stat().st_mode), 0o500)
+            deadline = time.monotonic() + 2
+            child_path = Path(f"/proc/{child_pid}")
+            while child_path.exists() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertFalse(child_path.exists())
+            self.assertEqual(self.processes_with_token(token), [])
+        finally:
+            cleanup_pids = {
+                *self.processes_with_argument(token),
+                *self.processes_with_argument(parent_token),
+            }
+            for pid in cleanup_pids:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            if afk_process.poll() is None:
+                afk_process.kill()
+                afk_process.communicate()
 
     def test_contract_evidence_names_do_not_collide_with_afk_metadata(self):
         formerly_reserved = ("request.json", "stdout.log", "stderr.log", "outcome.json")
@@ -559,6 +1068,105 @@ class CandidateValidationCliTest(unittest.TestCase):
         self.assertEqual(status["checkpoint"], "validated")
         self.assertEqual(status["validation"]["contract"]["blob_sha"], blob_sha)
 
+    def test_omitted_candidate_helper_cannot_forge_gate_evidence(self):
+        validator = self.repository / "validate.py"
+        validator.write_text(
+            textwrap.dedent(
+                """
+                #!/usr/bin/env python3
+                import json
+                import socket
+                import sys
+                from pathlib import Path
+
+                request_path = Path(sys.argv[sys.argv.index("--request") + 1])
+                request = json.loads(request_path.read_text(encoding="utf-8"))
+                capability = request["candidate_broker"]
+                broker_request = {
+                    "schema_version": 1,
+                    "token": capability["token"],
+                    "command": [
+                        "/usr/bin/python3",
+                        "/candidate/omitted-helper.py",
+                        "--request",
+                        str(request_path),
+                        "--evidence",
+                        request["evidence_dir"],
+                    ],
+                }
+                with socket.socket(socket.AF_UNIX) as client:
+                    client.connect(capability["socket_path"])
+                    client.sendall((json.dumps(broker_request) + "\\n").encode())
+                    client.makefile("r", encoding="utf-8").readline()
+                """
+            ).lstrip(),
+            encoding="utf-8",
+        )
+        validator.chmod(0o755)
+        helper = self.repository / "omitted-helper.py"
+        helper.write_text("raise SystemExit(1)\n", encoding="utf-8")
+        (self.repository / "afk.toml").write_text(
+            'schema_version = 1\n\n[validation]\ncommand = ["./validate.py"]\n'
+            'trusted_files = ["validate.py"]\n'
+            "timeout_seconds = 5\n",
+            encoding="utf-8",
+        )
+        self.git("add", ".")
+        self.git("commit", "-m", "trusted validator with omitted Candidate helper")
+        base_sha = self.git("rev-parse", "HEAD")
+        blob_sha = self.git("rev-parse", "HEAD:afk.toml")
+
+        marker = self.temp / "unconditional-helper-ran"
+        helper.write_text(
+            textwrap.dedent(
+                f"""
+                import json
+                import sys
+                from pathlib import Path
+
+                request_path = Path(sys.argv[sys.argv.index("--request") + 1])
+                evidence = Path(sys.argv[sys.argv.index("--evidence") + 1])
+                candidate_sha = json.loads(request_path.read_text())["candidate_sha"]
+                Path({str(marker)!r}).parent.mkdir(parents=True, exist_ok=True)
+                Path({str(marker)!r}).write_text("ran", encoding="utf-8")
+                evidence.mkdir(parents=True, exist_ok=True)
+                (evidence / "tests.log").write_text("passed\\n", encoding="utf-8")
+                (evidence / "result.json").write_text(json.dumps({{
+                    "schema_version": 1,
+                    "candidate_sha": candidate_sha,
+                    "status": "passed",
+                    "summary": "unconditional success",
+                    "checks": [{{
+                        "name": "tests",
+                        "status": "passed",
+                        "log_path": "tests.log",
+                    }}],
+                }}), encoding="utf-8")
+                """
+            ).lstrip(),
+            encoding="utf-8",
+        )
+        self.git("add", "omitted-helper.py")
+        self.git("commit", "-m", "replace omitted helper with unconditional success")
+        candidate_sha = self.git("rev-parse", "HEAD")
+        run_id = self.create_ready_run(
+            candidate_sha=candidate_sha,
+            base_sha=base_sha,
+            validation_contract={
+                "source": "pinned_base",
+                "base_sha": base_sha,
+                "blob_sha": blob_sha,
+            },
+        )
+
+        completed = self.run_afk("resume")
+
+        self.assertEqual(completed.returncode, 2)
+        status = self.status(run_id)
+        self.assertEqual(status["attention"]["kind"], "invalid")
+        self.assertIn("result", status["attention"]["summary"])
+        self.assertFalse(marker.exists())
+
     def test_pinned_candidate_harness_change_is_not_executed(self):
         self.write_contract_worker(
             status="passed",
@@ -600,6 +1208,89 @@ class CandidateValidationCliTest(unittest.TestCase):
         self.assertIn("harness", status["attention"]["summary"])
         self.assertFalse(marker.exists())
 
+    def test_pinned_transitive_validator_change_is_not_executed(self):
+        scripts = self.repository / "scripts"
+        scripts.mkdir()
+        wrapper = scripts / "validation-worker.sh"
+        wrapper.write_text(
+            '#!/bin/sh\nexec ./scripts/validate.sh "$@"\n', encoding="utf-8"
+        )
+        wrapper.chmod(0o755)
+        validator = scripts / "validate.sh"
+        validator.write_text('#!/bin/sh\nexec ./validate.py "$@"\n', encoding="utf-8")
+        validator.chmod(0o755)
+        self.write_contract_worker(
+            status="rejected",
+            exit_code=1,
+            checks=[{"name": "tests", "status": "rejected", "log_path": "tests.log"}],
+        )
+        (self.repository / "afk.toml").write_text(
+            "schema_version = 1\n\n[validation]\n"
+            'command = ["./scripts/validation-worker.sh"]\n'
+            "trusted_files = [\n"
+            '  "scripts/validation-worker.sh",\n'
+            '  "scripts/validate.sh",\n'
+            '  "validate.py",\n'
+            "]\n"
+            "timeout_seconds = 5\n",
+            encoding="utf-8",
+        )
+        self.git("add", ".")
+        self.git("commit", "-m", "trusted validator closure")
+        base_sha = self.git("rev-parse", "HEAD")
+        blob_sha = self.git("rev-parse", "HEAD:afk.toml")
+
+        marker = self.temp / "untrusted-validator-ran"
+        validator.write_text(
+            textwrap.dedent(
+                f"""
+                #!/usr/bin/env python3
+                import json
+                import sys
+                from pathlib import Path
+
+                request = json.loads(
+                    Path(sys.argv[sys.argv.index("--request") + 1]).read_text()
+                )
+                evidence = Path(request["evidence_dir"])
+                Path({str(marker)!r}).write_text("ran", encoding="utf-8")
+                (evidence / "tests.log").write_text("passed\\n", encoding="utf-8")
+                (evidence / "result.json").write_text(json.dumps({{
+                    "schema_version": 1,
+                    "candidate_sha": request["candidate_sha"],
+                    "status": "passed",
+                    "summary": "unconditional success",
+                    "checks": [{{
+                        "name": "tests",
+                        "status": "passed",
+                        "log_path": "tests.log",
+                    }}],
+                }}), encoding="utf-8")
+                """
+            ).lstrip(),
+            encoding="utf-8",
+        )
+        self.git("add", "scripts/validate.sh")
+        self.git("commit", "-m", "replace validator with unconditional success")
+        candidate_sha = self.git("rev-parse", "HEAD")
+        run_id = self.create_ready_run(
+            candidate_sha=candidate_sha,
+            base_sha=base_sha,
+            validation_contract={
+                "source": "pinned_base",
+                "base_sha": base_sha,
+                "blob_sha": blob_sha,
+            },
+        )
+
+        completed = self.run_afk("resume")
+
+        self.assertEqual(completed.returncode, 2)
+        status = self.status(run_id)
+        self.assertEqual(status["attention"]["kind"], "invalid")
+        self.assertIn("harness", status["attention"]["summary"])
+        self.assertFalse(marker.exists())
+
     def test_pinned_relative_candidate_harness_change_is_not_executed(self):
         self.write_contract_worker(
             status="passed",
@@ -612,6 +1303,7 @@ class CandidateValidationCliTest(unittest.TestCase):
         (self.repository / "afk.toml").write_text(
             "schema_version = 1\n\n[validation]\n"
             'command = ["python3", "scripts/validation.py"]\n'
+            'trusted_files = ["scripts/validation.py"]\n'
             "timeout_seconds = 5\n",
             encoding="utf-8",
         )
@@ -1746,56 +2438,66 @@ class CandidateValidationCliTest(unittest.TestCase):
                 self.assertNotIn(b"hunter2", path.read_bytes())
 
     def test_timeout_terminates_the_validation_process_group(self):
-        child_pid_path = self.temp / "child.pid"
+        child_ready_path = self.temp / "timeout-child.ready"
+        token = f"afk-timeout-child-{os.getpid()}-{time.monotonic_ns()}"
+        child_program = (
+            "import sys,time; from pathlib import Path; "
+            "Path(sys.argv[1]).write_text('ready', encoding='utf-8'); "
+            "time.sleep(60)"
+        )
         self.write_contract_worker(
             status="passed",
             exit_code=0,
             checks=[{"name": "tests", "status": "passed", "log_path": "tests.log"}],
             evidence_line=(
                 'sys.stdout.write("password=timeout-secret\\n"); '
-                'sys.stdout.flush(); child = subprocess.Popen(["sleep", "60"]); '
-                f"Path({str(child_pid_path)!r}).write_text("
-                'str(child.pid), encoding="utf-8"); '
+                "sys.stdout.flush(); "
+                f"subprocess.Popen([sys.executable, '-c', {child_program!r}, "
+                f"{str(child_ready_path)!r}, {token!r}]); "
+                f'exec("while not Path({str(child_ready_path)!r}).exists():\\n" '
+                '"    time.sleep(0.001)"); '
                 "time.sleep(60)"
             ),
             timeout_seconds=1,
         )
         run_id, _ = self.candidate_ready_run()
 
-        completed = self.run_afk("resume")
+        child_pid = None
 
-        self.assertEqual(completed.returncode, 2)
-        status = self.status(run_id)
-        self.assertEqual(status["attention"]["kind"], "interrupted")
-        self.assertIn("timed out", status["attention"]["summary"])
-        attempt = status["validation_attempt"]
-        self.assertEqual(attempt["status"], "interrupted")
-        evidence = self.state_home / "afk" / "runs" / run_id / attempt["evidence"]
-        self.assertTrue((evidence / "manifest.json").is_file())
-        self.assertEqual(
-            (evidence / "afk" / "stdout.log").read_text(encoding="utf-8"),
-            "password=[REDACTED]\n",
-        )
-        self.assertEqual(stat.S_IMODE(evidence.stat().st_mode), 0o500)
-        child_pid = int(child_pid_path.read_text(encoding="utf-8"))
-        deadline = time.monotonic() + 2
-        while Path(f"/proc/{child_pid}").exists() and time.monotonic() < deadline:
-            time.sleep(0.02)
-        self.assertFalse(Path(f"/proc/{child_pid}").exists())
+        try:
+            completed, child_pid = self.run_afk_observing_argument(token, "resume")
+            self.assertIsNotNone(child_pid)
+            self.assertEqual(completed.returncode, 2)
+            status = self.status(run_id)
+            self.assertEqual(status["attention"]["kind"], "interrupted")
+            self.assertIn("timed out", status["attention"]["summary"])
+            attempt = status["validation_attempt"]
+            self.assertEqual(attempt["status"], "interrupted")
+            evidence = self.state_home / "afk" / "runs" / run_id / attempt["evidence"]
+            self.assertTrue((evidence / "manifest.json").is_file())
+            self.assertEqual(
+                (evidence / "afk" / "stdout.log").read_text(encoding="utf-8"),
+                "password=[REDACTED]\n",
+            )
+            self.assertEqual(stat.S_IMODE(evidence.stat().st_mode), 0o500)
+            self.assertTrue(child_ready_path.is_file())
+            self.assert_host_process_reaped(child_pid)
+            self.assertEqual(self.processes_with_argument(token), [])
+        finally:
+            self.kill_processes_with_argument(token)
 
     def test_timeout_kills_term_resistant_validation_descendant(self):
-        child_pid_path = self.temp / "resistant-timeout-child.pid"
+        child_ready_path = self.temp / "resistant-timeout-child.ready"
+        token = f"afk-resistant-timeout-{os.getpid()}-{time.monotonic_ns()}"
         child_program = textwrap.dedent(
             """
-            import os
             import signal
             import sys
             import time
             from pathlib import Path
 
-            pid_path = Path(sys.argv[1])
             signal.signal(signal.SIGTERM, signal.SIG_IGN)
-            pid_path.write_text(str(os.getpid()), encoding="utf-8")
+            Path(sys.argv[1]).write_text("ready", encoding="utf-8")
             time.sleep(60)
             """
         ).lstrip()
@@ -1805,8 +2507,8 @@ class CandidateValidationCliTest(unittest.TestCase):
             checks=[{"name": "tests", "status": "passed", "log_path": "tests.log"}],
             evidence_line=(
                 f'child = subprocess.Popen([sys.executable, "-c", {child_program!r}, '
-                f"{str(child_pid_path)!r}]); "
-                f'exec("while not Path({str(child_pid_path)!r}).exists():\\n" '
+                f"{str(child_ready_path)!r}, {token!r}]); "
+                f'exec("while not Path({str(child_ready_path)!r}).exists():\\n" '
                 '"    time.sleep(0.001)"); '
                 "time.sleep(60)"
             ),
@@ -1814,59 +2516,74 @@ class CandidateValidationCliTest(unittest.TestCase):
         )
         run_id, _ = self.candidate_ready_run()
 
-        completed = self.run_afk("resume")
+        child_pid = None
 
-        child_pid = int(child_pid_path.read_text(encoding="utf-8"))
         try:
+            completed, child_pid = self.run_afk_observing_argument(token, "resume")
+            self.assertIsNotNone(child_pid)
             self.assertEqual(completed.returncode, 2)
             status = self.status(run_id)
             self.assertEqual(status["attention"]["kind"], "interrupted")
             self.assertIn("timed out", status["attention"]["summary"])
-            deadline = time.monotonic() + 2
-            while Path(f"/proc/{child_pid}").exists() and time.monotonic() < deadline:
-                time.sleep(0.02)
-            self.assertFalse(Path(f"/proc/{child_pid}").exists())
+            self.assertTrue(child_ready_path.is_file())
+            self.assert_host_process_reaped(child_pid)
+            self.assertEqual(self.processes_with_argument(token), [])
         finally:
-            try:
-                os.kill(child_pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+            self.kill_processes_with_argument(token)
 
     def test_successful_worker_cannot_leave_descendants_running(self):
-        child_pid_path = self.temp / "successful-child.pid"
+        child_ready_path = self.temp / "successful-child.ready"
+        observation_release_path = self.temp / "successful-child.release"
+        token = f"afk-successful-child-{os.getpid()}-{time.monotonic_ns()}"
+        child_program = (
+            "import sys,time; from pathlib import Path; "
+            "Path(sys.argv[1]).write_text('ready', encoding='utf-8'); "
+            "time.sleep(60)"
+        )
         self.write_contract_worker(
             status="passed",
             exit_code=0,
             checks=[{"name": "tests", "status": "passed", "log_path": "tests.log"}],
             evidence_line=(
-                'child = subprocess.Popen(["sleep", "60"]); '
-                f"Path({str(child_pid_path)!r}).write_text("
-                'str(child.pid), encoding="utf-8"); ' + WRITE_PASSED_LOG
+                f"subprocess.Popen([sys.executable, '-c', {child_program!r}, "
+                f"{str(child_ready_path)!r}, {token!r}]); "
+                f'exec("while not Path({str(child_ready_path)!r}).exists():\\n" '
+                '"    time.sleep(0.001)"); '
+                'exec("while not Path('
+                f"{str(observation_release_path)!r}"
+                ').exists():\\n" '
+                '"    time.sleep(0.001)"); ' + WRITE_PASSED_LOG
             ),
         )
         run_id, _ = self.candidate_ready_run()
 
-        completed = self.run_afk("resume")
+        child_pid = None
 
-        self.assertEqual(completed.returncode, 0, completed.stderr)
-        child_pid = int(child_pid_path.read_text(encoding="utf-8"))
-        deadline = time.monotonic() + 2
-        while Path(f"/proc/{child_pid}").exists() and time.monotonic() < deadline:
-            time.sleep(0.02)
-        self.assertFalse(Path(f"/proc/{child_pid}").exists())
+        try:
+            completed, child_pid = self.run_afk_observing_argument(
+                token, "resume", release_path=observation_release_path
+            )
+            self.assertIsNotNone(child_pid)
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertTrue(child_ready_path.is_file())
+            self.assert_host_process_reaped(child_pid)
+            self.assertEqual(self.processes_with_argument(token), [])
+        finally:
+            self.kill_processes_with_argument(token)
 
     def test_successful_worker_kills_detached_term_resistant_descendant(self):
-        child_pid_path = self.temp / "detached-child.pid"
+        child_ready_path = self.temp / "detached-child.ready"
+        observation_release_path = self.temp / "detached-child.release"
+        token = f"afk-validation-descendant-{os.getpid()}-{time.monotonic_ns()}"
         child_program = textwrap.dedent(
             """
-            import os
             import signal
             import sys
             import time
             from pathlib import Path
 
             signal.signal(signal.SIGTERM, signal.SIG_IGN)
-            Path(sys.argv[1]).write_text(str(os.getpid()), encoding="utf-8")
+            Path(sys.argv[1]).write_text("ready", encoding="utf-8")
             time.sleep(3)
             """
         ).lstrip()
@@ -1876,35 +2593,37 @@ class CandidateValidationCliTest(unittest.TestCase):
             checks=[{"name": "tests", "status": "passed", "log_path": "tests.log"}],
             evidence_line=(
                 f"subprocess.Popen([sys.executable, '-c', {child_program!r}, "
-                f"{str(child_pid_path)!r}], start_new_session=True); "
-                f'exec("while not Path({str(child_pid_path)!r}).exists():\\n" '
+                f"{str(child_ready_path)!r}, {token!r}], start_new_session=True); "
+                f'exec("while not Path({str(child_ready_path)!r}).exists():\\n" '
+                '"    time.sleep(0.001)"); '
+                'exec("while not Path('
+                f"{str(observation_release_path)!r}"
+                ').exists():\\n" '
                 '"    time.sleep(0.001)"); ' + WRITE_PASSED_LOG
             ),
         )
         run_id, _ = self.candidate_ready_run()
 
         started = time.monotonic()
-        completed = self.run_afk("resume")
-        elapsed = time.monotonic() - started
-
-        child_pid = int(child_pid_path.read_text(encoding="utf-8"))
+        child_pid = None
         try:
+            completed, child_pid = self.run_afk_observing_argument(
+                token, "resume", release_path=observation_release_path
+            )
+            elapsed = time.monotonic() - started
+            self.assertIsNotNone(child_pid)
             self.assertEqual(completed.returncode, 0, completed.stderr)
             self.assertLess(elapsed, 2)
-            deadline = time.monotonic() + 2
-            while Path(f"/proc/{child_pid}").exists() and time.monotonic() < deadline:
-                time.sleep(0.02)
-            self.assertFalse(Path(f"/proc/{child_pid}").exists())
+            self.assert_host_process_reaped(child_pid)
+            self.assertEqual(self.processes_with_argument(token), [])
         finally:
-            try:
-                os.kill(child_pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+            self.kill_processes_with_argument(token)
 
     def test_successful_worker_is_drained_before_evidence_is_ingested(self):
-        child_pid_path = self.temp / "resistant-child.pid"
         child_ready_path = self.temp / "resistant-child.ready"
+        observation_release_path = self.temp / "resistant-child.release"
         mutation_path = self.temp / "evidence-mutated"
+        token = f"afk-evidence-drain-{os.getpid()}-{time.monotonic_ns()}"
         child_program = textwrap.dedent(
             """
             import signal
@@ -1912,7 +2631,7 @@ class CandidateValidationCliTest(unittest.TestCase):
             import time
             from pathlib import Path
 
-            evidence, destination, mutation, ready = map(Path, sys.argv[1:])
+            evidence, destination, mutation, ready = map(Path, sys.argv[1:5])
             signal.signal(signal.SIGTERM, signal.SIG_IGN)
             ready.write_text("ready", encoding="utf-8")
             while not destination.exists():
@@ -1928,10 +2647,10 @@ class CandidateValidationCliTest(unittest.TestCase):
             '"afk/request.json"; '
             f'child = subprocess.Popen([sys.executable, "-c", {child_program!r}, '
             f"str(evidence), str(destination), {str(mutation_path)!r}, "
-            f"{str(child_ready_path)!r}]); "
-            f"Path({str(child_pid_path)!r}).write_text("
-            'str(child.pid), encoding="utf-8"); '
+            f"{str(child_ready_path)!r}, {token!r}]); "
             f'exec("while not Path({str(child_ready_path)!r}).exists():\\n" '
+            '"    time.sleep(0.001)"); '
+            f'exec("while not Path({str(observation_release_path)!r}).exists():\\n" '
             '"    time.sleep(0.001)"); ' + WRITE_PASSED_LOG
         )
         self.write_contract_worker(
@@ -1942,10 +2661,13 @@ class CandidateValidationCliTest(unittest.TestCase):
         )
         run_id, _ = self.candidate_ready_run()
 
-        completed = self.run_afk("resume")
+        child_pid = None
 
-        child_pid = int(child_pid_path.read_text(encoding="utf-8"))
         try:
+            completed, child_pid = self.run_afk_observing_argument(
+                token, "resume", release_path=observation_release_path
+            )
+            self.assertIsNotNone(child_pid)
             deadline = time.monotonic() + 2
             while not mutation_path.exists() and time.monotonic() < deadline:
                 time.sleep(0.02)
@@ -1963,11 +2685,11 @@ class CandidateValidationCliTest(unittest.TestCase):
                 (evidence / "contract" / "tests.log").read_text(encoding="utf-8"),
                 "passed\n",
             )
+            self.assertTrue(child_ready_path.is_file())
+            self.assert_host_process_reaped(child_pid)
+            self.assertEqual(self.processes_with_argument(token), [])
         finally:
-            try:
-                os.kill(child_pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+            self.kill_processes_with_argument(token)
 
     def test_validation_signal_requires_interrupted_attention(self):
         self.write_contract_worker(
@@ -2031,7 +2753,7 @@ class CandidateValidationCliTest(unittest.TestCase):
         self.assertEqual(outcome["status"], "invalid")
         self.assertEqual(stat.S_IMODE(evidence.stat().st_mode), 0o500)
 
-    def test_candidate_mutation_invalidates_validation(self):
+    def test_validation_harness_cannot_mutate_the_candidate_through_a_raw_path(self):
         (self.repository / "README.md").write_text("original\n", encoding="utf-8")
         self.write_contract_worker(
             status="passed",
@@ -2039,7 +2761,8 @@ class CandidateValidationCliTest(unittest.TestCase):
             checks=[{"name": "tests", "status": "passed", "log_path": "tests.log"}],
             evidence_line=(
                 WRITE_PASSED_LOG + "; "
-                'Path("README.md").write_text("mutated\\n", encoding="utf-8")'
+                'Path(request["candidate_path"], "README.md").write_text('
+                '"mutated\\n", encoding="utf-8")'
             ),
         )
         run_id, _ = self.candidate_ready_run()
@@ -2048,8 +2771,12 @@ class CandidateValidationCliTest(unittest.TestCase):
 
         self.assertEqual(completed.returncode, 2)
         status = self.status(run_id)
-        self.assertEqual(status["attention"]["kind"], "head_mismatch")
-        self.assertIn("changed", status["attention"]["summary"])
+        self.assertEqual(status["attention"]["kind"], "invalid")
+        self.assertIn("result", status["attention"]["summary"])
+        self.assertEqual(
+            (self.repository / "README.md").read_text(encoding="utf-8"),
+            "original\n",
+        )
 
     def test_validation_environment_is_allowlisted_and_evidence_is_redacted(self):
         approved = {
@@ -2155,9 +2882,107 @@ class CandidateValidationCliTest(unittest.TestCase):
         worker.chmod(worker.stat().st_mode | stat.S_IXUSR)
         (self.repository / "afk.toml").write_text(
             'schema_version = 1\n\n[validation]\ncommand = ["./validate.py"]\n'
+            'trusted_files = ["validate.py"]\n'
             f"timeout_seconds = {timeout_seconds}\n",
             encoding="utf-8",
         )
+
+    @staticmethod
+    def processes_with_token(token):
+        matches = []
+        for process in Path("/proc").iterdir():
+            if not process.name.isdigit():
+                continue
+            try:
+                command_line = (process / "cmdline").read_bytes()
+            except (FileNotFoundError, PermissionError, ProcessLookupError):
+                continue
+            if token.encode() in command_line:
+                matches.append(int(process.name))
+        return matches
+
+    @staticmethod
+    def processes_with_argument(argument):
+        matches = []
+        for process in Path("/proc").iterdir():
+            if not process.name.isdigit():
+                continue
+            if CandidateValidationCliTest.process_has_argument(
+                int(process.name), argument
+            ):
+                matches.append(int(process.name))
+        return matches
+
+    @staticmethod
+    def process_has_argument(pid, argument):
+        try:
+            arguments = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+        except (FileNotFoundError, PermissionError, ProcessLookupError):
+            return False
+        return argument.encode() in arguments
+
+    def run_afk_observing_argument(self, argument, *args, release_path=None):
+        environment = {
+            **os.environ,
+            "PYTHONPATH": str(ROOT / "src"),
+            "XDG_STATE_HOME": str(self.state_home),
+        }
+        process = subprocess.Popen(
+            [sys.executable, "-m", "afk", *args],
+            cwd=self.repository,
+            env=environment,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        observed_pid = None
+        try:
+            observation_deadline = time.monotonic() + 3
+            while (
+                observed_pid is None
+                and process.poll() is None
+                and time.monotonic() < observation_deadline
+            ):
+                matches = self.processes_with_argument(argument)
+                if len(matches) > 1:
+                    raise AssertionError(
+                        f"multiple processes have exact argument {argument!r}"
+                    )
+                if matches:
+                    observed_pid = matches[0]
+                    if release_path is not None:
+                        release_path.touch()
+                    break
+                time.sleep(0.01)
+            if observed_pid is None and release_path is not None:
+                release_path.touch()
+            stdout, stderr = process.communicate(timeout=60)
+            return (
+                subprocess.CompletedProcess(
+                    process.args, process.returncode, stdout, stderr
+                ),
+                observed_pid,
+            )
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.communicate()
+
+    def assert_host_process_reaped(self, pid):
+        path = Path(f"/proc/{pid}")
+        deadline = time.monotonic() + 2
+        while path.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        self.assertFalse(path.exists())
+
+    def kill_processes_with_argument(self, argument):
+        for pid in self.processes_with_argument(argument):
+            if not self.process_has_argument(pid, argument):
+                continue
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
 
     def assert_pinned_indirect_harness_is_rejected(self, command):
         self.write_contract_worker(
@@ -2207,6 +3032,7 @@ class CandidateValidationCliTest(unittest.TestCase):
         (self.repository / "afk.toml").write_text(
             "schema_version = 1\n\n[validation]\n"
             f"command = {json.dumps(command)}\n"
+            'trusted_files = ["validate.py"]\n'
             "timeout_seconds = 5\n",
             encoding="utf-8",
         )

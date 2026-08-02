@@ -1,22 +1,26 @@
 from __future__ import annotations
 
-import ctypes
 import hashlib
 import json
 import os
-import select
-import signal
 import stat
 import subprocess
 import sys
 import tempfile
-import time
 from contextlib import ExitStack
 from pathlib import Path
 from typing import Any
 
+from afk.candidate_capability import (
+    CandidateBrokerCapability,
+    CandidateCapabilityError,
+)
+from afk.checkouts import is_exact_clean_commit
 from afk.jsonutil import canonical_json
-from afk.process_io import BoundedProcessIO
+from afk.process_supervision import (
+    SupervisedCommandError,
+    run_supervised_command as _run_supervised_command,
+)
 from afk.redaction import redact_text
 from afk.run_store import GATE_BYTE_LIMIT, RunStore, RunStoreError
 from afk.validation_contract import (
@@ -31,8 +35,6 @@ BOOTSTRAP_RUNNER = Path(__file__).with_name("bootstrap_adapter.py")
 RESULT_BYTE_LIMIT = 1024 * 1024
 OUTPUT_BYTE_LIMIT = 64 * 1024 * 1024
 PROCESS_CLEANUP_SECONDS = 1
-PR_SET_CHILD_SUBREAPER = 36
-PR_GET_CHILD_SUBREAPER = 37
 TRUSTED_SCRIPT_INTERPRETERS = {"python", "python3"}
 AFK_EVIDENCE_NAMESPACE = "afk"
 CONTRACT_EVIDENCE_NAMESPACE = "contract"
@@ -45,12 +47,15 @@ VALIDATION_ENVIRONMENT_ALLOWLIST = (
     "LC_ALL",
     "TMPDIR",
     "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
     "XDG_RUNTIME_DIR",
     "DOCKER_HOST",
     "DOCKER_CONTEXT",
     "DOCKER_TLS_VERIFY",
     "DOCKER_CERT_PATH",
     "DOCKER_CONFIG",
+    "CONTAINER_HOST",
+    "CONTAINER_CONNECTION",
 )
 
 
@@ -91,14 +96,16 @@ def validate_candidate(
     evidence_relative = gate_evidence
 
     _require_immutable_candidate(worktree, candidate_sha)
-    _require_trusted_harness(
-        worktree, candidate_sha, contract_identity, contract["command"]
-    )
+    _require_trusted_harness(worktree, candidate_sha, contract_identity, contract)
     with (
         tempfile.TemporaryDirectory(prefix="afk-validation-") as temporary,
         ExitStack() as cleanup,
     ):
         staging = Path(temporary)
+        trusted_root = staging / "trusted-harness"
+        command = _materialize_trusted_harness(
+            worktree, contract_identity, contract, trusted_root
+        )
         evidence = staging / "evidence"
         evidence.mkdir(mode=0o700)
         evidence_descriptor = os.open(
@@ -114,9 +121,30 @@ def validate_candidate(
             "candidate_sha": candidate_sha,
             "evidence_dir": str(evidence.resolve()),
         }
+        exact_secrets: set[str] = set()
+        if "bootstrap_harness" not in contract:
+            try:
+                broker = cleanup.enter_context(
+                    CandidateBrokerCapability(
+                        candidate_path=worktree.resolve(),
+                        candidate_sha=candidate_sha,
+                        socket_path=staging / "candidate-broker.sock",
+                    )
+                )
+            except CandidateCapabilityError as exc:
+                raise CandidateValidationError(
+                    "interrupted", "Candidate broker capability is unavailable"
+                ) from exc
+            request["candidate_broker"] = broker.request_value()
+            exact_secrets = {
+                request["candidate_broker"]["token"],
+                request["candidate_broker"]["socket_path"],
+            }
+        evidence_request = dict(request)
+        if "candidate_broker" in evidence_request:
+            evidence_request["candidate_broker"] = broker.evidence_value()
         request_path.write_text(canonical_json(request) + "\n", encoding="utf-8")
         request_path.chmod(0o400)
-        command = list(contract["command"])
         if "bootstrap_harness" in contract:
             harness = staging / "approved-bootstrap-harness"
             _materialize_bootstrap_harness(
@@ -126,33 +154,61 @@ def validate_candidate(
         store.write_evidence_text(
             run_id,
             f"{attempt_evidence}/{AFK_EVIDENCE_NAMESPACE}/request.json",
-            canonical_json(request) + "\n",
+            canonical_json(evidence_request) + "\n",
+            exact_secrets=exact_secrets,
         )
         try:
             completed = _run_contract(
                 [*command, "--request", str(request_path.resolve())],
-                cwd=worktree,
+                cwd=trusted_root if "bootstrap_harness" not in contract else worktree,
                 environment=_validation_environment(staging),
                 timeout_seconds=contract["timeout_seconds"],
             )
+        except CandidateValidationError as exc:
+            raise CandidateValidationError(
+                exc.kind,
+                redact_text(exc.summary, exact_secrets=exact_secrets),
+                stdout=(
+                    None
+                    if exc.stdout is None
+                    else redact_text(exc.stdout, exact_secrets=exact_secrets)
+                ),
+                stderr=(
+                    None
+                    if exc.stderr is None
+                    else redact_text(exc.stderr, exact_secrets=exact_secrets)
+                ),
+            ) from exc
         except OSError as exc:
             raise CandidateValidationError(
                 "invalid", "validation command is unavailable or not executable"
             ) from exc
+        if "bootstrap_harness" not in contract:
+            try:
+                broker.require_healthy()
+            except CandidateCapabilityError as exc:
+                raise CandidateValidationError(
+                    "interrupted", "Candidate broker capability failed"
+                ) from exc
         store.write_evidence_text(
             run_id,
             f"{attempt_evidence}/{AFK_EVIDENCE_NAMESPACE}/stdout.log",
             completed.stdout,
+            exact_secrets=exact_secrets,
         )
         store.write_evidence_text(
             run_id,
             f"{attempt_evidence}/{AFK_EVIDENCE_NAMESPACE}/stderr.log",
             completed.stderr,
+            exact_secrets=exact_secrets,
         )
         _require_immutable_candidate(worktree, candidate_sha)
         _require_original_evidence_directory(evidence, evidence_descriptor)
         result = _read_result(evidence_view / "result.json", candidate_sha, completed)
-        evidence_files, contract_evidence_bytes = _require_evidence_tree(evidence_view)
+        result["summary"] = redact_text(result["summary"], exact_secrets=exact_secrets)
+        evidence_files, contract_evidence_bytes = _require_evidence_tree(
+            evidence_view, exact_secrets=exact_secrets
+        )
         _require_regular_logs(evidence_files, result["checks"])
         outcome = {
             "schema_version": 1,
@@ -163,13 +219,14 @@ def validate_candidate(
             "summary": result["summary"],
         }
         gate_metadata = (
-            canonical_json(request) + "\n",
+            canonical_json(evidence_request) + "\n",
             completed.stdout,
             completed.stderr,
             canonical_json(outcome) + "\n",
         )
         gate_bytes = contract_evidence_bytes + sum(
-            len(redact_text(value).encode("utf-8")) for value in gate_metadata
+            len(redact_text(value, exact_secrets=exact_secrets).encode("utf-8"))
+            for value in gate_metadata
         )
         if gate_bytes > GATE_BYTE_LIMIT:
             raise CandidateValidationError(
@@ -178,22 +235,26 @@ def validate_candidate(
         store.write_evidence_text(
             run_id,
             f"{evidence_relative}/{AFK_EVIDENCE_NAMESPACE}/request.json",
-            canonical_json(request) + "\n",
+            canonical_json(evidence_request) + "\n",
+            exact_secrets=exact_secrets,
         )
         store.write_evidence_text(
             run_id,
             f"{evidence_relative}/{AFK_EVIDENCE_NAMESPACE}/stdout.log",
             completed.stdout,
+            exact_secrets=exact_secrets,
         )
         store.write_evidence_text(
             run_id,
             f"{evidence_relative}/{AFK_EVIDENCE_NAMESPACE}/stderr.log",
             completed.stderr,
+            exact_secrets=exact_secrets,
         )
         store.write_evidence_text(
             run_id,
             f"{evidence_relative}/{AFK_EVIDENCE_NAMESPACE}/outcome.json",
             canonical_json(outcome) + "\n",
+            exact_secrets=exact_secrets,
         )
         _require_original_evidence_directory(evidence, evidence_descriptor)
         for path in sorted(evidence_view.rglob("*")):
@@ -203,6 +264,7 @@ def validate_candidate(
                     run_id,
                     f"{evidence_relative}/{CONTRACT_EVIDENCE_NAMESPACE}/{relative}",
                     path,
+                    exact_secrets=exact_secrets,
                 )
         _require_original_evidence_directory(evidence, evidence_descriptor)
     manifest = store.seal_evidence(run_id, evidence_relative)
@@ -342,7 +404,7 @@ def _require_trusted_harness(
     worktree: Path,
     candidate_sha: str,
     identity: dict[str, str],
-    command: list[str],
+    contract: dict[str, Any],
 ) -> None:
     if identity.get("source") == "approved_bootstrap":
         approval = _bootstrap_approval(identity)
@@ -359,6 +421,7 @@ def _require_trusted_harness(
                 "invalid", "approved bootstrap harness identity has drifted"
             )
         return
+    command = contract["command"]
     executable = command[0]
     if executable.startswith("./"):
         harness_start = 0
@@ -391,20 +454,67 @@ def _require_trusted_harness(
             raise CandidateValidationError(
                 "invalid", "pinned validation harness path is invalid"
             )
+        if relative not in contract["trusted_files"]:
+            raise CandidateValidationError(
+                "invalid", "pinned validation command path is absent from trusted_files"
+            )
+    for relative in contract["trusted_files"]:
         trusted = tracked_regular_file_identity(
             worktree, identity["base_sha"], relative
         )
         candidate = tracked_regular_file_identity(worktree, candidate_sha, relative)
         if trusted is None or candidate is None:
             raise CandidateValidationError(
-                "invalid",
-                "pinned validation harness must be a regular tracked file",
+                "invalid", "pinned validation harness must be a regular tracked file"
             )
         if trusted != candidate:
             raise CandidateValidationError(
                 "invalid",
                 "Candidate validation harness differs from the trusted pinned base",
             )
+
+
+def _materialize_trusted_harness(
+    worktree: Path,
+    identity: dict[str, Any],
+    contract: dict[str, Any],
+    trusted_root: Path,
+) -> list[str]:
+    if identity.get("source") == "approved_bootstrap":
+        return list(contract["command"])
+    trusted_root.mkdir(mode=0o700)
+    for relative in contract["trusted_files"]:
+        observed = tracked_regular_file_identity(
+            worktree, identity["base_sha"], relative
+        )
+        if observed is None:
+            raise CandidateValidationError(
+                "invalid", "pinned validation harness must be a regular tracked file"
+            )
+        mode, blob_sha = observed
+        content = subprocess.run(
+            ["git", "cat-file", "blob", blob_sha],
+            cwd=worktree,
+            capture_output=True,
+            check=False,
+        )
+        if content.returncode != 0:
+            raise CandidateValidationError(
+                "invalid", "pinned validation harness is unavailable"
+            )
+        destination = trusted_root / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(content.stdout)
+        destination.chmod(0o500 if mode == "100755" else 0o400)
+    command = list(contract["command"])
+    executable_index = 0 if command[0].startswith("./") else 1
+    relative = command[executable_index].removeprefix("./")
+    if relative not in contract["trusted_files"]:
+        raise CandidateValidationError(
+            "invalid", "pinned validation command is absent from trusted_files"
+        )
+    command[executable_index] = str(trusted_root / relative)
+    return command
 
 
 def tracked_regular_file_identity(
@@ -644,10 +754,13 @@ def _require_regular_logs(
             )
 
 
-def _require_evidence_tree(evidence: Path) -> tuple[set[str], int]:
+def _require_evidence_tree(
+    evidence: Path, *, exact_secrets: set[str] | None = None
+) -> tuple[set[str], int]:
     total = 0
     files: set[str] = set()
     for path in evidence.rglob("*"):
+        relative = path.relative_to(evidence).as_posix()
         if path.is_symlink():
             raise CandidateValidationError(
                 "invalid", "validation evidence must contain only regular files"
@@ -658,18 +771,24 @@ def _require_evidence_tree(evidence: Path) -> tuple[set[str], int]:
             raise CandidateValidationError(
                 "invalid", "validation evidence must contain only regular files"
             )
+        if exact_secrets and any(
+            secret and secret in relative for secret in exact_secrets
+        ):
+            raise CandidateValidationError(
+                "invalid", "validation evidence path contains a live capability secret"
+            )
         try:
             value = path.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError) as exc:
             raise CandidateValidationError(
                 "invalid", "validation evidence must be UTF-8 text"
             ) from exc
-        total += len(redact_text(value).encode("utf-8"))
+        total += len(redact_text(value, exact_secrets=exact_secrets).encode("utf-8"))
         if total > GATE_BYTE_LIMIT:
             raise CandidateValidationError(
                 "invalid", "validation Gate evidence exceeds the size limit"
             )
-        files.add(path.relative_to(evidence).as_posix())
+        files.add(relative)
     return files, total
 
 
@@ -691,26 +810,7 @@ def _require_original_evidence_directory(path: Path, descriptor: int) -> None:
 
 
 def _require_immutable_candidate(worktree: Path, candidate_sha: str) -> None:
-    head = subprocess.run(
-        ["git", "rev-parse", "HEAD"],
-        cwd=worktree,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    dirty = subprocess.run(
-        ["git", "status", "--porcelain"],
-        cwd=worktree,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    if (
-        head.returncode != 0
-        or head.stdout.strip() != candidate_sha
-        or dirty.returncode != 0
-        or dirty.stdout
-    ):
+    if not is_exact_clean_commit(worktree, candidate_sha):
         raise CandidateValidationError(
             "head_mismatch", "Candidate changed during validation"
         )
@@ -760,281 +860,39 @@ def run_supervised_command(
     timeout_seconds: float,
     input_text: str | None = None,
     label: str,
+    output_byte_limit: int | None = None,
+    cleanup_seconds: float | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    subject = label.strip() or "command"
-    deadline = time.monotonic() + timeout_seconds
-    with _LinuxDescendantSupervisor() as descendants:
-        process = subprocess.Popen(
+    output_byte_limit = (
+        OUTPUT_BYTE_LIMIT if output_byte_limit is None else output_byte_limit
+    )
+    cleanup_seconds = (
+        PROCESS_CLEANUP_SECONDS if cleanup_seconds is None else cleanup_seconds
+    )
+    try:
+        return _run_supervised_command(
             command,
             cwd=cwd,
-            env=environment,
-            stdin=subprocess.PIPE if input_text is not None else None,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            start_new_session=True,
+            environment=environment,
+            timeout_seconds=timeout_seconds,
+            input_text=input_text,
+            label=label,
+            output_byte_limit=output_byte_limit,
+            cleanup_seconds=cleanup_seconds,
         )
-        try:
-            descendants.track(process.pid)
-        except CandidateValidationError:
-            descendants.terminate_untracked(process)
-            raise
-        process_io = BoundedProcessIO(
-            process,
-            input_bytes=None if input_text is None else input_text.encode("utf-8"),
-            output_byte_limit=OUTPUT_BYTE_LIMIT,
-            cleanup_seconds=PROCESS_CLEANUP_SECONDS,
+    except SupervisedCommandError as exc:
+        kind = (
+            "invalid"
+            if exc.classification
+            in {"invalid_utf8", "output_overflow", "supervision_unavailable"}
+            else "interrupted"
         )
-        while process.poll() is None:
-            descendants.discover(process.pid)
-            stop_reason = process_io.observe(deadline)
-            if stop_reason == "timeout":
-                process_io.close_input()
-                descendants.terminate(process.pid)
-                process.poll()
-                if not process_io.drain():
-                    raise CandidateValidationError(
-                        "interrupted",
-                        "validation output streams could not be drained",
-                    )
-                stdout, stderr = process_io.diagnostics()
-                raise CandidateValidationError(
-                    "interrupted",
-                    f"{subject} timed out and its process tree was terminated",
-                    stdout=stdout,
-                    stderr=stderr,
-                )
-            if stop_reason == "overflow":
-                break
-        process_io.close_input()
-        descendants.terminate(process.pid)
-        process.poll()
-        if not process_io.drain():
-            raise CandidateValidationError(
-                "interrupted", "validation output streams could not be drained"
-            )
-        if process_io.overflowed:
-            raise CandidateValidationError(
-                "invalid",
-                f"{subject} output exceeds the size limit",
-                stdout="",
-                stderr="",
-            )
-        if process.returncode < 0:
-            signal_number = -process.returncode
-            try:
-                signal_name = signal.Signals(signal_number).name
-            except ValueError:
-                signal_name = str(signal_number)
-            stdout, stderr = process_io.diagnostics()
-            raise CandidateValidationError(
-                "interrupted",
-                f"{subject} exited after signal {signal_name}",
-                stdout=stdout,
-                stderr=stderr,
-            )
-        try:
-            stdout, stderr = process_io.decoded_output()
-        except UnicodeDecodeError as exc:
-            diagnostic_stdout, diagnostic_stderr = process_io.diagnostics()
-            raise CandidateValidationError(
-                "invalid",
-                f"{subject} output must be UTF-8 text",
-                stdout=diagnostic_stdout,
-                stderr=diagnostic_stderr,
-            ) from exc
-        return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
-
-
-class _LinuxDescendantSupervisor:
-    def __init__(self) -> None:
-        self._libc = ctypes.CDLL(None, use_errno=True)
-        self._previous = ctypes.c_int()
-        self._baseline: set[int] = set()
-        self._pidfds: dict[int, int] = {}
-        self._root_pid: int | None = None
-
-    def __enter__(self) -> _LinuxDescendantSupervisor:
-        if (
-            self._libc.prctl(
-                PR_GET_CHILD_SUBREAPER, ctypes.byref(self._previous), 0, 0, 0
-            )
-            != 0
-            or self._libc.prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0
-        ):
-            raise CandidateValidationError(
-                "invalid", "Linux validation descendant supervision is unavailable"
-            )
-        self._baseline = set(_proc_children(os.getpid()))
-        return self
-
-    def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
-        try:
-            if self._root_pid is not None and self._pidfds:
-                self.terminate(self._root_pid)
-        finally:
-            for pidfd in self._pidfds.values():
-                os.close(pidfd)
-            self._pidfds.clear()
-            if (
-                self._libc.prctl(PR_SET_CHILD_SUBREAPER, self._previous.value, 0, 0, 0)
-                != 0
-            ):
-                raise CandidateValidationError(
-                    "interrupted", "Linux validation descendant supervision was lost"
-                )
-
-    def track(self, pid: int) -> None:
-        self._root_pid = pid
-        self._track(pid)
-
-    def discover(self, root_pid: int) -> None:
-        pending = [
-            root_pid,
-            *(pid for pid in _proc_children(os.getpid()) if pid not in self._baseline),
-        ]
-        seen: set[int] = set()
-        while pending:
-            pid = pending.pop()
-            if pid in seen or pid == os.getpid():
-                continue
-            seen.add(pid)
-            self._track(pid)
-            pending.extend(_proc_children(pid))
-
-    def terminate(self, root_pid: int) -> None:
-        if self._wait_for_exit(root_pid, signal.SIGTERM):
-            return
-        if self._wait_for_exit(root_pid, signal.SIGKILL):
-            return
         raise CandidateValidationError(
-            "interrupted", "validation process tree could not be terminated"
-        )
-
-    def terminate_untracked(self, process: subprocess.Popen[bytes]) -> None:
-        failure: OSError | None = None
-        deadline = time.monotonic() + PROCESS_CLEANUP_SECONDS
-        try:
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            except OSError as exc:
-                failure = exc
-            while time.monotonic() < deadline:
-                process.poll()
-                children = [
-                    pid
-                    for pid in _proc_children(os.getpid())
-                    if pid not in self._baseline
-                ]
-                for pid in children:
-                    try:
-                        os.kill(pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
-                    except OSError as exc:
-                        failure = failure or exc
-                for pid in children:
-                    if pid == process.pid:
-                        continue
-                    try:
-                        os.waitpid(pid, os.WNOHANG)
-                    except ChildProcessError:
-                        pass
-                    except OSError as exc:
-                        failure = failure or exc
-                process.poll()
-                remaining = [
-                    pid
-                    for pid in _proc_children(os.getpid())
-                    if pid not in self._baseline
-                ]
-                if process.returncode is not None and not remaining:
-                    if failure is None:
-                        return
-                    break
-                time.sleep(0.01)
-        finally:
-            for stream in (process.stdin, process.stdout, process.stderr):
-                if stream is not None:
-                    stream.close()
-        raise CandidateValidationError(
-            "interrupted", "untracked process tree could not be terminated"
-        ) from failure
-
-    def _wait_for_exit(self, root_pid: int, requested_signal: signal.Signals) -> bool:
-        deadline = time.monotonic() + PROCESS_CLEANUP_SECONDS
-        while time.monotonic() < deadline:
-            self.discover(root_pid)
-            self._discard_exited()
-            if not self._pidfds:
-                self.discover(root_pid)
-                self._discard_exited()
-                if not self._pidfds:
-                    return True
-            for pidfd in tuple(self._pidfds.values()):
-                try:
-                    signal.pidfd_send_signal(pidfd, requested_signal)
-                except ProcessLookupError:
-                    pass
-                except OSError as exc:
-                    raise CandidateValidationError(
-                        "interrupted", "validation process tree could not be signalled"
-                    ) from exc
-            time.sleep(0.01)
-        return False
-
-    def _track(self, pid: int) -> None:
-        if pid in self._pidfds:
-            return
-        try:
-            self._pidfds[pid] = os.pidfd_open(pid)
-        except ProcessLookupError:
-            pass
-        except OSError as exc:
-            raise CandidateValidationError(
-                "invalid", "Linux validation descendant supervision is unavailable"
-            ) from exc
-
-    def _discard_exited(self) -> None:
-        if not self._pidfds:
-            return
-        poller = select.poll()
-        for pidfd in self._pidfds.values():
-            poller.register(pidfd, select.POLLIN)
-        readable = {pidfd for pidfd, _ in poller.poll(0)}
-        for pid, pidfd in tuple(self._pidfds.items()):
-            if pidfd not in readable:
-                continue
-            try:
-                os.waitpid(pid, os.WNOHANG)
-            except ChildProcessError:
-                pass
-            os.close(pidfd)
-            del self._pidfds[pid]
-
-
-def _proc_children(pid: int) -> list[int]:
-    children: set[int] = set()
-    try:
-        tasks = list(Path(f"/proc/{pid}/task").iterdir())
-    except FileNotFoundError:
-        return []
-    except OSError as exc:
-        raise CandidateValidationError(
-            "invalid", "Linux validation descendant supervision is unavailable"
+            kind,
+            exc.summary,
+            stdout=exc.stdout,
+            stderr=exc.stderr,
         ) from exc
-    for task in tasks:
-        try:
-            values = (task / "children").read_text(encoding="utf-8").split()
-        except FileNotFoundError:
-            continue
-        except OSError as exc:
-            raise CandidateValidationError(
-                "invalid", "Linux validation descendant supervision is unavailable"
-            ) from exc
-        children.update(int(value) for value in values if value.isdigit())
-    return sorted(children)
 
 
 def _manifest_digest(manifest: dict[str, Any]) -> str:

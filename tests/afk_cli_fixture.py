@@ -25,6 +25,7 @@ class AfkCliFixture:
 
                 [validation]
                 command = ["./scripts/validation-worker.sh", "run"]
+                trusted_files = ["scripts/validation-worker.sh"]
                 timeout_seconds = 2700
                 """
             ).lstrip(),
@@ -166,6 +167,7 @@ class AfkCliFixture:
                         print(
                             'command = ["./scripts/validation-worker.sh", "run"]'
                         )
+                        print('trusted_files = ["scripts/validation-worker.sh"]')
                         print("timeout_seconds = 2700")
                     else:
                         raise SystemExit(f"unexpected git args: {{args}}")

@@ -9,6 +9,13 @@ from typing import Any
 from afk.redaction import redact_text
 
 
+def _bounded_redacted_text(
+    value: bytes, byte_limit: int, *, errors: str = "strict"
+) -> str:
+    encoded = redact_text(value.decode("utf-8", errors=errors)).encode("utf-8")
+    return encoded[:byte_limit].decode("utf-8", errors="ignore")
+
+
 class BoundedProcessIO:
     def __init__(
         self,
@@ -30,6 +37,7 @@ class BoundedProcessIO:
         self.captured_bytes = 0
         self.capture_lock = threading.Lock()
         self.overflow = threading.Event()
+        self._reader_failed = False
         if process.stdin is not None:
             os.set_blocking(process.stdin.fileno(), False)
         self.readers = [
@@ -50,15 +58,24 @@ class BoundedProcessIO:
     def overflowed(self) -> bool:
         return self.overflow.is_set()
 
+    @property
+    def reader_failed(self) -> bool:
+        with self.capture_lock:
+            return self._reader_failed
+
     def observe(self, deadline: float) -> str | None:
         if self.overflowed:
             return "overflow"
+        if self.reader_failed:
+            return "reader_failure"
         if time.monotonic() >= deadline:
             return "timeout"
         self._feed_input()
         self.overflow.wait(min(0.01, max(deadline - time.monotonic(), 0)))
         if self.overflowed:
             return "overflow"
+        if self.reader_failed:
+            return "reader_failure"
         if time.monotonic() >= deadline:
             return "timeout"
         return None
@@ -76,13 +93,19 @@ class BoundedProcessIO:
 
     def diagnostics(self) -> tuple[str, str]:
         return tuple(
-            redact_text(bytes(self.captured[name]).decode("utf-8", errors="replace"))
+            _bounded_redacted_text(
+                bytes(self.captured[name]),
+                self.output_byte_limit,
+                errors="replace",
+            )
             for name in ("stdout", "stderr")
         )
 
-    def decoded_output(self) -> tuple[str, str]:
+    def decoded_output(self, *, errors: str = "strict") -> tuple[str, str]:
         return tuple(
-            redact_text(bytes(self.captured[name]).decode("utf-8"))
+            _bounded_redacted_text(
+                bytes(self.captured[name]), self.output_byte_limit, errors=errors
+            )
             for name in ("stdout", "stderr")
         )
 
@@ -108,7 +131,7 @@ class BoundedProcessIO:
 
     def _capture_output(self, stream: Any, captured: bytearray) -> None:
         try:
-            while chunk := stream.read(64 * 1024):
+            while chunk := os.read(stream.fileno(), 64 * 1024):
                 with self.capture_lock:
                     if self.combined_output_limit:
                         self.captured_bytes += len(chunk)
@@ -119,5 +142,8 @@ class BoundedProcessIO:
                         self.overflow.set()
                     elif not self.overflowed:
                         captured.extend(chunk)
+        except OSError:
+            with self.capture_lock:
+                self._reader_failed = True
         finally:
             stream.close()

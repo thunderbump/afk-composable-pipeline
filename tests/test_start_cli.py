@@ -12578,10 +12578,17 @@ class StartCliTest(unittest.TestCase):
                         elif os.environ["AFK_FAKE_PINNED_CONTRACT"] == "present":
                             print("100644 blob " + "c" * 40 + "\\tafk.toml")
                     elif args[:2] == ["cat-file", "blob"]:
-                        print("schema_version = 1")
-                        print("[validation]")
-                        print('command = ["./scripts/validation-worker.sh", "run"]')
-                        print("timeout_seconds = 2700")
+                        if args[-1] == "b" * 40 and worktree_created.exists():
+                            checkout = Path(worktree_created.read_text())
+                            sys.stdout.buffer.write(
+                                (checkout / "scripts" / "validation-worker.sh").read_bytes()
+                            )
+                        else:
+                            print("schema_version = 1")
+                            print("[validation]")
+                            print('command = ["./scripts/validation-worker.sh", "run"]')
+                            print('trusted_files = ["scripts/validation-worker.sh"]')
+                            print("timeout_seconds = 2700")
                     elif args[:1] == ["rev-parse"] and args[-1].endswith(":afk.toml"):
                         print("c" * 40)
                     elif args[:2] == ["rev-parse", "--git-dir"]:

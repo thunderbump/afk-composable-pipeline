@@ -670,7 +670,14 @@ class RunStore:
             )
             return confirmed
 
-    def write_evidence_text(self, run_id: str, relative_path: str, value: str) -> Path:
+    def write_evidence_text(
+        self,
+        run_id: str,
+        relative_path: str,
+        value: str,
+        *,
+        exact_secrets: set[str] | None = None,
+    ) -> Path:
         durable_path = self._run_dir(run_id) / _canonical_evidence_relative(
             relative_path
         )
@@ -688,7 +695,9 @@ class RunStore:
                     raise EvidenceError("manifest.json is reserved")
                 if _entry_exists_at(unit_descriptor, "manifest.json"):
                     raise EvidenceError("completed evidence is read-only")
-                encoded = redact_text(value).encode("utf-8")
+                encoded = redact_text(value, exact_secrets=exact_secrets).encode(
+                    "utf-8"
+                )
                 if _is_stream(Path(relative_path)) and len(encoded) > STREAM_BYTE_LIMIT:
                     raise EvidenceTooLarge(
                         f"evidence stream exceeds {STREAM_BYTE_LIMIT} bytes"
@@ -701,7 +710,14 @@ class RunStore:
                 )
                 return durable_path
 
-    def write_evidence_value(self, run_id: str, relative_path: str, value: Any) -> Any:
+    def write_evidence_value(
+        self,
+        run_id: str,
+        relative_path: str,
+        value: Any,
+        *,
+        exact_secrets: set[str] | None = None,
+    ) -> Any:
         """Redact and persist one canonical structured evidence value."""
         with self.lock():
             with self._open_evidence_file(
@@ -717,7 +733,7 @@ class RunStore:
                     raise EvidenceError("manifest.json is reserved")
                 if _entry_exists_at(unit_descriptor, "manifest.json"):
                     raise EvidenceError("completed evidence is read-only")
-                redacted = redact_artifact_value(value)
+                redacted = redact_artifact_value(value, exact_secrets=exact_secrets)
                 encoded = (canonical_json(redacted) + "\n").encode("utf-8")
                 _write_new_bytes_at(
                     parent_descriptor,
@@ -728,7 +744,12 @@ class RunStore:
                 return redacted
 
     def ingest_evidence_file(
-        self, run_id: str, relative_path: str, source_path: Path
+        self,
+        run_id: str,
+        relative_path: str,
+        source_path: Path,
+        *,
+        exact_secrets: set[str] | None = None,
     ) -> Path:
         if source_path.is_symlink() or not source_path.is_file():
             raise EvidenceError("evidence source must be a regular file")
@@ -744,7 +765,9 @@ class RunStore:
             value = source_path.read_text(encoding="utf-8")
         except UnicodeDecodeError as exc:
             raise EvidenceError("evidence must be regular UTF-8 text") from exc
-        return self.write_evidence_text(run_id, relative_path, value)
+        return self.write_evidence_text(
+            run_id, relative_path, value, exact_secrets=exact_secrets
+        )
 
     def seal_evidence(self, run_id: str, relative_directory: str) -> dict[str, Any]:
         with self.lock():
