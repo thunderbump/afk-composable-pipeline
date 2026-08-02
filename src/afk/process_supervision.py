@@ -281,12 +281,12 @@ def _run_supervised_command_local(
                 f"{subject} output streams could not be read",
             )
         if process_io.overflowed:
-            stdout, stderr = process_io.diagnostics()
+            # Do not make the helper redact and transport an attacker-sized prefix.
             raise SupervisedCommandError(
                 "output_overflow",
                 f"{subject} output exceeds the size limit",
-                stdout=stdout,
-                stderr=stderr,
+                stdout="",
+                stderr="",
             )
         if process.returncode < 0:
             signal_number = -process.returncode

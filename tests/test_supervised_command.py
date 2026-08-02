@@ -644,6 +644,8 @@ class SupervisedCommandTest(unittest.TestCase):
                     raised.exception.classification,
                     "output_overflow",
                 )
+                self.assertEqual(raised.exception.stdout, "")
+                self.assertEqual(raised.exception.stderr, "")
                 self.assertIsNone(raised.exception.exit_code)
 
     def test_signal_exit_keeps_redacted_diagnostics(self):
