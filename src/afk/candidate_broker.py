@@ -87,14 +87,17 @@ def run_candidate(request: dict[str, Any]) -> dict[str, Any]:
         snapshot = Path(temporary) / "snapshot"
         _materialize_candidate_snapshot(candidate, request["candidate_sha"], snapshot)
         container_name = None
+        container_id_path = None
         if execution is None:
             command = _bubblewrap_command(bwrap, snapshot, request["command"])
         else:
             snapshot.chmod(0o755)
             container_name = f"afk-candidate-{uuid.uuid4().hex}"
+            container_id_path = Path(temporary) / "container.cid"
             command = _container_command(
                 container_runtime,
                 container_name,
+                container_id_path,
                 snapshot,
                 execution["image"],
                 request["command"],
@@ -145,7 +148,20 @@ def run_candidate(request: dict[str, Any]) -> dict[str, Any]:
         finally:
             if container_name is not None and cleanup_required:
                 _remove_container(container_runtime, container_name)
+        container_started = (
+            container_id_path is not None and container_id_path.is_file()
+        )
     if completed.returncode != 0:
+        if execution is not None and (
+            completed.returncode in {126, 127} or not container_started
+        ):
+            return _failed_execution_result(
+                request["candidate_sha"],
+                "launch_failure",
+                "Candidate command could not be launched",
+                stdout=completed.stdout,
+                stderr=completed.stderr,
+            )
         return _failed_execution_result(
             request["candidate_sha"],
             "abnormal_exit",
@@ -236,6 +252,7 @@ def _bubblewrap_command(
 def _container_command(
     runtime: str,
     name: str,
+    container_id_path: Path,
     snapshot: Path,
     image: str,
     candidate_command: list[str],
@@ -245,6 +262,8 @@ def _container_command(
         "run",
         "--pull=never",
         "--rm",
+        "--cidfile",
+        str(container_id_path),
         "--name",
         name,
         "--network",

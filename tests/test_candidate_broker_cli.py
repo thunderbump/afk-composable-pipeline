@@ -700,10 +700,10 @@ class CandidateBrokerCliTest(unittest.TestCase):
                 self.assertEqual(broker_result["status"], "completed", broker_result)
                 self.assertEqual(broker_result["stdout"], "PULL_NEVER\n")
 
-    def test_container_execution_overrides_the_image_entrypoint(self):
-        request = self.temp / "container-entrypoint-request.json"
-        result = self.temp / "container-entrypoint-result.json"
-        fake_bin = self.temp / "container-entrypoint-bin"
+    def test_missing_local_container_image_is_a_launch_failure(self):
+        request = self.temp / "container-missing-image-request.json"
+        result = self.temp / "container-missing-image-result.json"
+        fake_bin = self.temp / "container-missing-image-bin"
         fake_bin.mkdir()
         (fake_bin / "git").symlink_to(shutil.which("git"))
         (fake_bin / "bwrap").symlink_to(shutil.which("bwrap"))
@@ -719,6 +719,109 @@ class CandidateBrokerCliTest(unittest.TestCase):
                     raise SystemExit(0)
                 if arguments[0] == "rm":
                     raise SystemExit(0)
+                assert "--pull=never" in arguments
+                print("local image is unavailable", file=sys.stderr)
+                raise SystemExit(125)
+                """
+            ).lstrip(),
+            encoding="utf-8",
+        )
+        fake_docker.chmod(0o755)
+        self.write_request(
+            request,
+            command=["/bin/true"],
+            execution={"type": "container", "image": "missing:local"},
+        )
+
+        completed = self.run_broker(
+            request,
+            result,
+            env={"PATH": str(fake_bin)},
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(
+            json.loads(result.read_text(encoding="utf-8")),
+            {
+                "schema_version": 1,
+                "candidate_sha": self.candidate_sha,
+                "status": "failed",
+                "failure_classification": "launch_failure",
+                "summary": "Candidate command could not be launched",
+                "exit_code": None,
+                "stdout": "",
+                "stderr": "local image is unavailable\n",
+            },
+        )
+
+    def test_container_candidate_exit_125_is_preserved_after_creation(self):
+        request = self.temp / "container-exit-125-request.json"
+        result = self.temp / "container-exit-125-result.json"
+        fake_bin = self.temp / "container-exit-125-bin"
+        fake_bin.mkdir()
+        (fake_bin / "git").symlink_to(shutil.which("git"))
+        (fake_bin / "bwrap").symlink_to(shutil.which("bwrap"))
+        fake_docker = fake_bin / "docker"
+        fake_docker.write_text(
+            textwrap.dedent(
+                f"""
+                #!{sys.executable}
+                import sys
+                from pathlib import Path
+
+                arguments = sys.argv[1:]
+                if arguments[0] == "info":
+                    raise SystemExit(0)
+                if arguments[0] == "rm":
+                    raise SystemExit(0)
+                cidfile = Path(arguments[arguments.index("--cidfile") + 1])
+                cidfile.write_text("created-container-id\\n", encoding="utf-8")
+                print("Candidate exited 125", file=sys.stderr)
+                raise SystemExit(125)
+                """
+            ).lstrip(),
+            encoding="utf-8",
+        )
+        fake_docker.chmod(0o755)
+        self.write_request(
+            request,
+            command=["/bin/sh", "-c", "exit 125"],
+            execution={"type": "container", "image": "fixture:local"},
+        )
+
+        completed = self.run_broker(
+            request,
+            result,
+            env={"PATH": str(fake_bin)},
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        broker_result = json.loads(result.read_text(encoding="utf-8"))
+        self.assertEqual(broker_result["status"], "failed", broker_result)
+        self.assertEqual(broker_result["failure_classification"], "abnormal_exit")
+        self.assertEqual(broker_result["exit_code"], 125)
+        self.assertEqual(broker_result["stderr"], "Candidate exited 125\n")
+
+    def test_container_execution_overrides_the_image_entrypoint(self):
+        request = self.temp / "container-entrypoint-request.json"
+        result = self.temp / "container-entrypoint-result.json"
+        fake_bin = self.temp / "container-entrypoint-bin"
+        fake_bin.mkdir()
+        (fake_bin / "git").symlink_to(shutil.which("git"))
+        (fake_bin / "bwrap").symlink_to(shutil.which("bwrap"))
+        fake_docker = fake_bin / "docker"
+        fake_docker.write_text(
+            textwrap.dedent(
+                f"""
+                #!{sys.executable}
+                import sys
+                from pathlib import Path
+
+                arguments = sys.argv[1:]
+                if arguments[0] == "info":
+                    raise SystemExit(0)
+                if arguments[0] == "rm":
+                    raise SystemExit(0)
                 if "--entrypoint" not in arguments:
                     print("image entrypoint ran instead")
                     raise SystemExit(0)
@@ -726,6 +829,8 @@ class CandidateBrokerCliTest(unittest.TestCase):
                 image = arguments.index("fixture:entrypoint")
                 if entrypoint != "/bin/false" or arguments[image + 1:] != ["arg"]:
                     raise SystemExit(2)
+                cidfile = Path(arguments[arguments.index("--cidfile") + 1])
+                cidfile.write_text("created-container-id\\n", encoding="utf-8")
                 raise SystemExit(19)
                 """
             ).lstrip(),
