@@ -8,6 +8,7 @@ import subprocess
 import tempfile
 import time
 from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.parse import unquote, urlsplit
@@ -340,28 +341,34 @@ def _is_exact_clean_commit(
         return False
     repositories_remaining[0] -= 1
     try:
-        head = run_trusted_read_git(["rev-parse", "HEAD"], cwd=path)
-    except OSError:
+        with _pinned_repository(path) as repository:
+            head = _run_repository_git(repository, ["rev-parse", "HEAD"])
+            return (
+                head.returncode == 0
+                and head.stdout.strip() == expected_commit
+                and _worktree_matches_commit(
+                    repository, expected_commit, repositories_remaining
+                )
+            )
+    except (OSError, UnicodeError, ValueError):
         return False
-    return (
-        head.returncode == 0
-        and head.stdout.strip() == expected_commit
-        and _worktree_matches_commit(path, expected_commit, repositories_remaining)
-    )
 
 
 def _worktree_matches_commit(
-    path: Path, commit: str, repositories_remaining: list[int]
+    repository: tuple[Path, Path],
+    commit: str,
+    repositories_remaining: list[int],
 ) -> bool:
-    tree = run_trusted_read_git(
+    path, _git_directory = repository
+    tree = _run_repository_git(
+        repository,
         ["ls-tree", "-rz", "--full-tree", commit],
-        cwd=path,
         text=False,
         output_byte_limit=_tracked_git_output_limit(),
     )
-    index = run_trusted_read_git(
+    index = _run_repository_git(
+        repository,
         ["ls-files", "--stage", "-z"],
-        cwd=path,
         text=False,
         output_byte_limit=_tracked_git_output_limit(),
     )
@@ -386,11 +393,11 @@ def _worktree_matches_commit(
             if (mode, object_type)
             in {(b"100644", b"blob"), (b"100755", b"blob")}
         }
-        blob_sizes = _git_blob_sizes(path, regular_blob_ids)
+        blob_sizes = _git_blob_sizes(repository, regular_blob_ids)
         with tempfile.TemporaryDirectory(prefix="afk-ignore-") as temporary:
             evaluation = Path(temporary)
             if not _materialize_committed_ignores(
-                path, entries, blob_sizes, evaluation
+                repository, entries, blob_sizes, evaluation
             ):
                 return False
             untracked_paths = _collect_untracked_worktree_paths(
@@ -436,18 +443,10 @@ def _worktree_matches_commit(
                         dir_fd=parent_descriptor,
                     )
                     try:
-                        target_identity = os.fstat(target_descriptor)
-                        target = Path(os.readlink(f"/proc/self/fd/{target_descriptor}"))
                         if not _is_exact_clean_commit(
-                            target,
+                            Path(f"/proc/self/fd/{target_descriptor}"),
                             object_id.decode("ascii"),
                             repositories_remaining,
-                        ):
-                            return False
-                        observed_identity = os.stat(target, follow_symlinks=False)
-                        if (observed_identity.st_dev, observed_identity.st_ino) != (
-                            target_identity.st_dev,
-                            target_identity.st_ino,
                         ):
                             return False
                     finally:
@@ -541,6 +540,66 @@ def _open_parent_descriptor(path: Path, item_path: bytes) -> tuple[int, bytes]:
         raise
 
 
+@contextmanager
+def _pinned_repository(path: Path) -> Iterator[tuple[Path, Path]]:
+    root_descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY)
+    git_descriptor = None
+    try:
+        git_descriptor = _open_git_directory(root_descriptor)
+        process = os.getpid()
+        yield (
+            Path(f"/proc/{process}/fd/{root_descriptor}"),
+            Path(f"/proc/{process}/fd/{git_descriptor}"),
+        )
+    finally:
+        if git_descriptor is not None:
+            os.close(git_descriptor)
+        os.close(root_descriptor)
+
+
+def _open_git_directory(root_descriptor: int) -> int:
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+    try:
+        return os.open(
+            b".git", flags | os.O_DIRECTORY, dir_fd=root_descriptor
+        )
+    except NotADirectoryError:
+        git_file = os.open(b".git", flags, dir_fd=root_descriptor)
+        try:
+            if not stat.S_ISREG(os.fstat(git_file).st_mode):
+                raise ValueError("invalid Git directory file")
+            content = os.read(git_file, 4097)
+        finally:
+            os.close(git_file)
+        if len(content) > 4096 or b"\0" in content:
+            raise ValueError("invalid Git directory file")
+        line = content.rstrip(b"\r\n")
+        if not line.startswith(b"gitdir: ") or not line.removeprefix(b"gitdir: "):
+            raise ValueError("invalid Git directory file")
+        git_directory = Path(os.fsdecode(line.removeprefix(b"gitdir: ")))
+        if not git_directory.is_absolute():
+            root = Path(os.readlink(f"/proc/self/fd/{root_descriptor}"))
+            git_directory = root / git_directory
+        return os.open(
+            git_directory, flags | os.O_DIRECTORY
+        )
+
+
+def _run_repository_git(
+    repository: tuple[Path, Path],
+    args: list[str],
+    **kwargs: Any,
+) -> subprocess.CompletedProcess[Any]:
+    work_tree, git_directory = repository
+    return run_trusted_read_git(
+        args,
+        cwd=work_tree,
+        git_directory=git_directory,
+        work_tree=work_tree,
+        **kwargs,
+    )
+
+
 def _ignored_path_is_supported(path: Path, item_path: bytes) -> bool:
     parent_descriptor, name = _open_parent_descriptor(path, item_path)
     try:
@@ -629,7 +688,7 @@ def _collect_untracked_worktree_paths(
 
 
 def _materialize_committed_ignores(
-    candidate: Path,
+    repository: tuple[Path, Path],
     entries: dict[bytes, tuple[bytes, bytes, bytes]],
     blob_sizes: dict[bytes, int],
     evaluation: Path,
@@ -654,9 +713,9 @@ def _materialize_committed_ignores(
         target = evaluation.joinpath(*PurePosixPath(os.fsdecode(item_path)).parts)
         target.parent.mkdir(parents=True, exist_ok=True)
         with target.open("wb") as output:
-            blob = run_trusted_read_git(
+            blob = _run_repository_git(
+                repository,
                 ["cat-file", "blob", object_id.decode("ascii")],
-                cwd=candidate,
                 text=False,
                 stdout=output,
             )
@@ -701,12 +760,14 @@ def _git_blob_id(content: bytes) -> bytes:
     )
 
 
-def _git_blob_sizes(path: Path, object_ids: set[bytes]) -> dict[bytes, int]:
+def _git_blob_sizes(
+    repository: tuple[Path, Path], object_ids: set[bytes]
+) -> dict[bytes, int]:
     if not object_ids:
         return {}
-    result = run_trusted_read_git(
+    result = _run_repository_git(
+        repository,
         ["cat-file", "--batch-check=%(objectname) %(objecttype) %(objectsize)"],
-        cwd=path,
         text=False,
         input_data=b"\n".join(sorted(object_ids)) + b"\n",
     )
@@ -784,6 +845,8 @@ def run_trusted_read_git(
     input_data: str | bytes | None = None,
     stdout: Any = subprocess.PIPE,
     output_byte_limit: int | None = None,
+    git_directory: Path | None = None,
+    work_tree: Path | None = None,
 ) -> subprocess.CompletedProcess[Any]:
     environment = {
         name: value for name, value in os.environ.items() if not name.startswith("GIT_")
@@ -802,7 +865,12 @@ def run_trusted_read_git(
             "GIT_OPTIONAL_LOCKS": "0",
         }
     )
-    command = ["git", *args]
+    repository_args = []
+    if git_directory is not None:
+        repository_args.append(f"--git-dir={git_directory}")
+    if work_tree is not None:
+        repository_args.append(f"--work-tree={work_tree}")
+    command = ["git", *repository_args, *args]
     if output_byte_limit is not None:
         if text or stdout != subprocess.PIPE:
             raise ValueError("bounded Git output requires captured bytes")

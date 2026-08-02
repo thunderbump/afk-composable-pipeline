@@ -173,6 +173,48 @@ class CandidateBrokerCliTest(unittest.TestCase):
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertEqual(json.loads(result.read_text(encoding="utf-8"))["exit_code"], 0)
 
+    def test_exact_candidate_pins_supplied_root_alias_for_whole_check(self):
+        from afk import checkouts
+
+        alias = self.temp / "candidate-alias"
+        alias.symlink_to(self.candidate, target_is_directory=True)
+        plain = self.temp / "plain-tree"
+        plain.mkdir()
+        (plain / "input.txt").write_text("exact candidate\n", encoding="utf-8")
+        real_collect = checkouts._collect_untracked_worktree_paths
+        real_open = os.open
+        retargeted = False
+        reopened_aliases = []
+
+        def retarget_after_traversal(*args, **kwargs):
+            nonlocal retargeted
+            paths = real_collect(*args, **kwargs)
+            alias.unlink()
+            alias.symlink_to(plain, target_is_directory=True)
+            retargeted = True
+            return paths
+
+        def record_open(path, flags, *args, **kwargs):
+            if (
+                retargeted
+                and not isinstance(path, (bytes, int))
+                and Path(path) == alias
+            ):
+                reopened_aliases.append(Path(path))
+            return real_open(path, flags, *args, **kwargs)
+
+        with (
+            mock.patch(
+                "afk.checkouts._collect_untracked_worktree_paths",
+                side_effect=retarget_after_traversal,
+            ),
+            mock.patch("afk.checkouts.os.open", side_effect=record_open),
+        ):
+            self.assertTrue(checkouts.is_exact_clean_commit(alias, self.candidate_sha))
+
+        self.assertEqual(alias.resolve(), plain)
+        self.assertEqual(reopened_aliases, [])
+
     @unittest.skipUnless(shutil.which("bwrap"), "bubblewrap is unavailable")
     def test_candidate_stdin_is_closed_instead_of_inherited_from_the_broker(self):
         request = self.temp / "stdin-request.json"
@@ -791,8 +833,8 @@ class CandidateBrokerCliTest(unittest.TestCase):
         attempted = []
 
         def deny_hidden_scan(path):
-            if not isinstance(path, int) and Path(path) == hidden:
-                attempted.append(Path(path))
+            if not isinstance(path, int) and Path(path).resolve() == hidden:
+                attempted.append(hidden)
                 raise PermissionError("hidden directory is unreadable")
             return real_scandir(path)
 
@@ -1205,7 +1247,7 @@ class CandidateBrokerCliTest(unittest.TestCase):
                 import sys
                 from pathlib import Path
 
-                if sys.argv[1:2] == ["ls-tree"]:
+                if "ls-tree" in sys.argv[1:]:
                     marker = Path({str(listing_seen)!r})
                     if marker.exists():
                         raise SystemExit(1)
