@@ -31,6 +31,19 @@ MAX_CANDIDATE_OUTPUT_BYTE_LIMIT = 64 * 1024 * 1024
 CONTAINER_RUNTIME_PROBE_SECONDS = 5
 CONTAINER_WATCHDOG_SECONDS = 5
 _CONTAINER_WATCHDOG_PATH = Path(__file__).with_name("container_cleanup_watchdog.py")
+_WATCHDOG_ENVIRONMENT_ALLOWLIST = {
+    "HOME",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_RUNTIME_DIR",
+    "DOCKER_HOST",
+    "DOCKER_CONTEXT",
+    "DOCKER_TLS_VERIFY",
+    "DOCKER_CERT_PATH",
+    "DOCKER_CONFIG",
+    "CONTAINER_HOST",
+    "CONTAINER_CONNECTION",
+}
 
 
 class CandidateBrokerError(ValueError):
@@ -384,8 +397,11 @@ def _remove_container(runtime: str, name: str) -> None:
 
 
 def _watchdog_environment() -> dict[str, str]:
-    allowed = {"HOME", "XDG_RUNTIME_DIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME"}
-    environment = {name: value for name, value in os.environ.items() if name in allowed}
+    environment = {
+        name: value
+        for name, value in os.environ.items()
+        if name in _WATCHDOG_ENVIRONMENT_ALLOWLIST
+    }
     environment.update({"LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "PATH": os.defpath})
     return environment
 

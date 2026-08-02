@@ -610,94 +610,103 @@ class CandidateBrokerCliTest(unittest.TestCase):
         self.assertFalse((fake_bin / "bwrap").exists())
 
     def test_container_watchdog_cleans_up_after_broker_parent_death(self):
-        request = self.temp / "container-watchdog-request.json"
-        result = self.temp / "container-watchdog-result.json"
-        marker = self.temp / "watchdog-container"
-        cleanup_attempts = self.temp / "watchdog-cleanup-attempts"
-        fake_bin = self.temp / "container-watchdog-bin"
-        fake_bin.mkdir()
-        (fake_bin / "git").symlink_to(shutil.which("git"))
-        docker = fake_bin / "docker"
-        docker.write_text(
-            textwrap.dedent(
-                f"""
-                #!{sys.executable}
-                import sys
-                import time
-                from pathlib import Path
+        selectors = (("docker", "DOCKER_HOST"), ("podman", "CONTAINER_HOST"))
+        for runtime_name, selector in selectors:
+            with self.subTest(runtime=runtime_name, selector=selector):
+                request = self.temp / f"{runtime_name}-watchdog-request.json"
+                result = self.temp / f"{runtime_name}-watchdog-result.json"
+                marker = self.temp / f"{runtime_name}-watchdog-container"
+                cleanup_attempts = self.temp / f"{runtime_name}-cleanup-attempts"
+                endpoint = f"unix://{self.temp}/{runtime_name}.sock"
+                fake_bin = self.temp / f"{runtime_name}-watchdog-bin"
+                fake_bin.mkdir()
+                (fake_bin / "git").symlink_to(shutil.which("git"))
+                runtime = fake_bin / runtime_name
+                runtime.write_text(
+                    textwrap.dedent(
+                        f"""
+                        #!{sys.executable}
+                        import os
+                        import sys
+                        import time
+                        from pathlib import Path
 
-                arguments = sys.argv[1:]
-                if arguments[0] == "info":
-                    raise SystemExit(0)
-                if arguments[:2] == ["image", "inspect"]:
-                    print('[{{"Id":"sha256:fixture-image","Config":{{"Volumes":null}}}}]')
-                    raise SystemExit(0)
-                if arguments[0] == "rm":
-                    attempts = Path({str(cleanup_attempts)!r})
-                    count = (
-                        len(attempts.read_text().splitlines()) + 1
-                        if attempts.exists()
-                        else 1
+                        if os.environ.get({selector!r}) != {endpoint!r}:
+                            raise SystemExit(2)
+                        arguments = sys.argv[1:]
+                        if arguments[0] == "info":
+                            raise SystemExit(0)
+                        if arguments[:2] == ["image", "inspect"]:
+                            print('[{{"Id":"sha256:fixture-image","Config":{{"Volumes":null}}}}]')
+                            raise SystemExit(0)
+                        if arguments[0] == "rm":
+                            attempts = Path({str(cleanup_attempts)!r})
+                            count = (
+                                len(attempts.read_text().splitlines()) + 1
+                                if attempts.exists()
+                                else 1
+                            )
+                            attempts.write_text("attempt\\n" * count)
+                            target = Path({str(marker)!r})
+                            if count >= 3 and target.exists():
+                                target.unlink()
+                                raise SystemExit(0)
+                            raise SystemExit(1)
+                        cidfile = Path(arguments[arguments.index("--cidfile") + 1])
+                        cidfile.write_text("id\\n")
+                        Path({str(marker)!r}).write_text("running\\n")
+                        time.sleep(30)
+                        """
+                    ).lstrip(),
+                    encoding="utf-8",
+                )
+                runtime.chmod(0o755)
+                self.write_request(
+                    request,
+                    command=["/bin/sh", "-c", "sleep 30"],
+                    execution={"type": "container", "image": "fixture:local"},
+                )
+                broker_env = {
+                    **os.environ,
+                    "PYTHONPATH": str(ROOT / "src"),
+                    "PATH": str(fake_bin),
+                    selector: endpoint,
+                }
+                broker = subprocess.Popen(
+                    [
+                        sys.executable,
+                        "-m",
+                        "afk.candidate_broker",
+                        "--request",
+                        str(request),
+                        "--result",
+                        str(result),
+                    ],
+                    cwd=ROOT,
+                    env=broker_env,
+                )
+                try:
+                    deadline = time.monotonic() + 5
+                    while not marker.exists() and time.monotonic() < deadline:
+                        time.sleep(0.02)
+                    self.assertTrue(marker.exists())
+                    broker.kill()
+                    broker.wait(timeout=2)
+                    deadline = time.monotonic() + 7
+                    while marker.exists() and time.monotonic() < deadline:
+                        time.sleep(0.02)
+                    self.assertFalse(marker.exists())
+                    self.assertTrue(cleanup_attempts.exists())
+                    attempt_count = len(cleanup_attempts.read_text().splitlines())
+                    self.assertGreaterEqual(attempt_count, 3)
+                    time.sleep(0.2)
+                    self.assertEqual(
+                        len(cleanup_attempts.read_text().splitlines()), attempt_count
                     )
-                    attempts.write_text("attempt\\n" * count)
-                    target = Path({str(marker)!r})
-                    if count >= 3 and target.exists():
-                        target.unlink()
-                        raise SystemExit(0)
-                    raise SystemExit(1)
-                Path(arguments[arguments.index("--cidfile") + 1]).write_text("id\\n")
-                Path({str(marker)!r}).write_text("running\\n")
-                time.sleep(30)
-                """
-            ).lstrip(),
-            encoding="utf-8",
-        )
-        docker.chmod(0o755)
-        self.write_request(
-            request,
-            command=["/bin/sh", "-c", "sleep 30"],
-            execution={"type": "container", "image": "fixture:local"},
-        )
-        broker_env = {
-            **os.environ,
-            "PYTHONPATH": str(ROOT / "src"),
-            "PATH": str(fake_bin),
-        }
-        broker = subprocess.Popen(
-            [
-                sys.executable,
-                "-m",
-                "afk.candidate_broker",
-                "--request",
-                str(request),
-                "--result",
-                str(result),
-            ],
-            cwd=ROOT,
-            env=broker_env,
-        )
-        try:
-            deadline = time.monotonic() + 5
-            while not marker.exists() and time.monotonic() < deadline:
-                time.sleep(0.02)
-            self.assertTrue(marker.exists())
-            broker.kill()
-            broker.wait(timeout=2)
-            deadline = time.monotonic() + 5
-            while marker.exists() and time.monotonic() < deadline:
-                time.sleep(0.02)
-            self.assertFalse(marker.exists())
-            self.assertTrue(cleanup_attempts.exists())
-            attempt_count = len(cleanup_attempts.read_text().splitlines())
-            self.assertGreaterEqual(attempt_count, 3)
-            time.sleep(0.2)
-            self.assertEqual(
-                len(cleanup_attempts.read_text().splitlines()), attempt_count
-            )
-        finally:
-            if broker.poll() is None:
-                broker.kill()
-                broker.wait()
+                finally:
+                    if broker.poll() is None:
+                        broker.kill()
+                        broker.wait()
 
     def test_container_execution_receives_only_the_exact_candidate_snapshot(self):
         request = self.temp / "container-request.json"
