@@ -26,14 +26,38 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--request", required=True)
     parser.add_argument("--result", required=True)
     args = parser.parse_args(argv)
+    result_path = Path(args.result)
     try:
+        result_path.unlink(missing_ok=True)
         request = _read_request(Path(args.request))
         result = run_candidate(request)
-        Path(args.result).write_text(canonical_json(result) + "\n", encoding="utf-8")
+        _publish_result(result_path, result)
     except (CandidateBrokerError, OSError, json.JSONDecodeError) as exc:
         print(str(exc), file=sys.stderr)
         return 2
     return 0
+
+
+def _publish_result(path: Path, result: dict[str, Any]) -> None:
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temporary:
+            temporary_path = Path(temporary.name)
+            temporary.write(canonical_json(result) + "\n")
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        os.replace(temporary_path, path)
+        temporary_path = None
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
 
 
 def run_candidate(request: dict[str, Any]) -> dict[str, Any]:

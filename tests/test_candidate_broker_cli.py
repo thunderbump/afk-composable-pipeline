@@ -73,6 +73,21 @@ class CandidateBrokerCliTest(unittest.TestCase):
         self.assertNotIn("Traceback", completed.stderr)
         self.assertFalse(result.exists())
 
+    def test_invalid_request_removes_stale_result_symlink_without_following_it(self):
+        request = self.temp / "stale-invalid-request.json"
+        result = self.temp / "stale-invalid-result.json"
+        prior_result = self.temp / "prior-result.json"
+        request.write_bytes(b"\xff")
+        prior_result.write_text("prior success\n", encoding="utf-8")
+        result.symlink_to(prior_result)
+
+        completed = self.run_broker(request, result)
+
+        self.assertEqual(completed.returncode, 2)
+        self.assertEqual(completed.stderr, "candidate broker request is invalid\n")
+        self.assertFalse(result.exists())
+        self.assertEqual(prior_result.read_text(encoding="utf-8"), "prior success\n")
+
     def test_rejects_nul_in_request_paths_and_commands(self):
         invalid_values = (
             (f"{self.candidate}\0escaped", ["/usr/bin/true"]),
@@ -127,6 +142,7 @@ class CandidateBrokerCliTest(unittest.TestCase):
         self.candidate_sha = self.git("rev-parse", "HEAD")
         request = self.temp / "nested-path-request.json"
         result = self.temp / "nested-path-result.json"
+        result.write_text("prior success\n", encoding="utf-8")
         self.write_request(
             request, candidate_path=str(nested), command=["/usr/bin/true"]
         )
@@ -152,6 +168,76 @@ class CandidateBrokerCliTest(unittest.TestCase):
 
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertEqual(json.loads(result.read_text(encoding="utf-8"))["exit_code"], 0)
+
+    def test_success_atomically_replaces_a_result_symlink_without_following_it(self):
+        request = self.temp / "atomic-request.json"
+        result = self.temp / "atomic-result.json"
+        prior_result = self.temp / "atomic-prior-result.json"
+        prior_result.write_text("prior success\n", encoding="utf-8")
+        self.write_request(request, command=["/usr/bin/true"])
+        fake_bin = self.temp / "atomic-bin"
+        fake_bin.mkdir()
+        real_bwrap = shutil.which("bwrap")
+        launcher = fake_bin / "bwrap"
+        launcher.write_text(
+            textwrap.dedent(
+                f"""
+                #!{sys.executable}
+                import os
+                import subprocess
+                import sys
+                from pathlib import Path
+
+                completed = subprocess.run([{real_bwrap!r}, *sys.argv[1:]])
+                Path({str(result)!r}).symlink_to({str(prior_result)!r})
+                raise SystemExit(completed.returncode)
+                """
+            ).lstrip(),
+            encoding="utf-8",
+        )
+        launcher.chmod(0o755)
+
+        completed = self.run_broker(
+            request,
+            result,
+            env={"PATH": f"{fake_bin}:{os.environ['PATH']}"},
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertFalse(result.is_symlink())
+        self.assertEqual(json.loads(result.read_text(encoding="utf-8"))["exit_code"], 0)
+        self.assertEqual(prior_result.read_text(encoding="utf-8"), "prior success\n")
+
+    def test_failed_atomic_publication_cleans_its_temporary_result(self):
+        request = self.temp / "failed-publication-request.json"
+        result = self.temp / "failed-publication-result.json"
+        self.write_request(request, command=["/usr/bin/true"])
+        fake_bin = self.temp / "failed-publication-bin"
+        fake_bin.mkdir()
+        launcher = fake_bin / "bwrap"
+        launcher.write_text(
+            textwrap.dedent(
+                f"""
+                #!{sys.executable}
+                from pathlib import Path
+
+                Path({str(result)!r}).mkdir()
+                """
+            ).lstrip(),
+            encoding="utf-8",
+        )
+        launcher.chmod(0o755)
+
+        completed = self.run_broker(
+            request,
+            result,
+            env={"PATH": f"{fake_bin}:{os.environ['PATH']}"},
+        )
+
+        self.assertEqual(completed.returncode, 2)
+        self.assertNotIn("Traceback", completed.stderr)
+        self.assertTrue(result.is_dir())
+        self.assertEqual(list(self.temp.glob(f".{result.name}.*.tmp")), [])
 
     def test_does_not_run_repository_fsmonitor_on_the_host(self):
         marker = self.temp / "fsmonitor-ran"
@@ -310,6 +396,7 @@ class CandidateBrokerCliTest(unittest.TestCase):
     def test_fails_closed_when_exact_candidate_snapshot_is_unavailable(self):
         request = self.temp / "snapshot-failure-request.json"
         result = self.temp / "snapshot-failure-result.json"
+        result.write_text("prior success\n", encoding="utf-8")
         self.write_request(request, command=["/usr/bin/true"])
         fake_bin = self.temp / "snapshot-failure-bin"
         fake_bin.mkdir()
