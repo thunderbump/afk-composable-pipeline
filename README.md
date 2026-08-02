@@ -198,7 +198,13 @@ evidence directory are not mounted into the container. AFK supervises the
 trusted runtime client and forcibly removes every created, randomly named
 container after completion, timeout, or another interruption; failed forced
 cleanup fails the broker closed instead of publishing a successful or ordinary
-failure result. Cleanup also removes anonymous volumes as defense in depth.
+failure result. Before starting the runtime, the broker arms a minimal cleanup
+watchdog with only the absolute runtime path and random container name. Broker
+death or private-channel failure triggers bounded, supervised forced-removal
+retries across runtime shutdown and container-creation races. Normal cleanup
+disarms the watchdog only after removal is confirmed, or after the runtime has
+confirmed that no container started. Cleanup also removes anonymous volumes as
+defense in depth.
 
 The broker materializes exact tree and blob objects from the Candidate commit
 without `.git` administrative metadata or archive-attribute rewrites. Gitlinks

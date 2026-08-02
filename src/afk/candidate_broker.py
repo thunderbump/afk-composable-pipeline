@@ -4,6 +4,8 @@ import argparse
 import json
 import os
 import shutil
+import socket
+import subprocess
 import sys
 import tempfile
 import uuid
@@ -12,7 +14,12 @@ from typing import Any
 
 from afk.checkouts import is_exact_clean_commit, run_trusted_read_git
 from afk.jsonutil import canonical_json
-from afk.process_supervision import SupervisedCommandError, run_supervised_command
+from afk.process_supervision import (
+    SupervisedCommandError,
+    _receive_protocol_message,
+    _send_protocol_message,
+    run_supervised_command,
+)
 
 
 SCHEMA_VERSION = 1
@@ -22,6 +29,8 @@ CANDIDATE_CLEANUP_SECONDS = 1
 MAX_CANDIDATE_TIMEOUT_SECONDS = 3600
 MAX_CANDIDATE_OUTPUT_BYTE_LIMIT = 64 * 1024 * 1024
 CONTAINER_RUNTIME_PROBE_SECONDS = 5
+CONTAINER_WATCHDOG_SECONDS = 5
+_CONTAINER_WATCHDOG_PATH = Path(__file__).with_name("container_cleanup_watchdog.py")
 
 
 class CandidateBrokerError(ValueError):
@@ -112,6 +121,11 @@ def run_candidate(request: dict[str, Any]) -> dict[str, Any]:
                 container_image,
                 request["command"],
             )
+        cleanup_watchdog = None
+        if container_name is not None:
+            cleanup_watchdog = _start_container_cleanup_watchdog(
+                container_runtime, container_name
+            )
         interrupted_cleanup = container_name is not None
         container_started = False
         try:
@@ -161,10 +175,18 @@ def run_candidate(request: dict[str, Any]) -> dict[str, Any]:
                 stderr=exc.stderr or "",
             )
         finally:
-            if container_name is not None and (
-                interrupted_cleanup or container_started
-            ):
-                _remove_container(container_runtime, container_name)
+            if cleanup_watchdog is not None:
+                if interrupted_cleanup or container_started:
+                    try:
+                        _remove_container(container_runtime, container_name)
+                    except BaseException:
+                        _trigger_container_cleanup_watchdog(cleanup_watchdog)
+                        raise
+                try:
+                    _disarm_container_cleanup_watchdog(cleanup_watchdog)
+                except BaseException:
+                    _trigger_container_cleanup_watchdog(cleanup_watchdog)
+                    raise
     if execution is not None and not container_started:
         return _failed_execution_result(
             request["candidate_sha"],
@@ -359,6 +381,96 @@ def _remove_container(runtime: str, name: str) -> None:
         raise CandidateBrokerError("Candidate container cleanup failed") from exc
     if completed.returncode != 0:
         raise CandidateBrokerError("Candidate container cleanup failed")
+
+
+def _watchdog_environment() -> dict[str, str]:
+    allowed = {"HOME", "XDG_RUNTIME_DIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME"}
+    environment = {name: value for name, value in os.environ.items() if name in allowed}
+    environment.update({"LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "PATH": os.defpath})
+    return environment
+
+
+def _start_container_cleanup_watchdog(
+    runtime: str, name: str
+) -> tuple[subprocess.Popen[bytes], socket.socket]:
+    parent_channel, child_channel = socket.socketpair()
+    watchdog = None
+    try:
+        try:
+            watchdog = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-I",
+                    str(_CONTAINER_WATCHDOG_PATH),
+                    "0",
+                    str(os.getpid()),
+                ],
+                stdin=child_channel,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                env=_watchdog_environment(),
+                start_new_session=True,
+            )
+        except BaseException:
+            parent_channel.close()
+            raise
+    finally:
+        child_channel.close()
+    try:
+        parent_channel.settimeout(CONTAINER_WATCHDOG_SECONDS)
+        _send_protocol_message(
+            parent_channel,
+            {"schema_version": 1, "runtime": runtime, "container_name": name},
+        )
+        if _receive_protocol_message(parent_channel) != {
+            "schema_version": 1,
+            "status": "armed",
+        }:
+            raise ValueError("invalid watchdog response")
+        if watchdog is None:
+            raise ValueError("watchdog failed to start")
+        return watchdog, parent_channel
+    except BaseException as exc:
+        parent_channel.close()
+        if watchdog is not None:
+            watchdog.kill()
+            watchdog.wait()
+        raise CandidateBrokerError(
+            "Candidate container cleanup watchdog failed"
+        ) from exc
+
+
+def _disarm_container_cleanup_watchdog(
+    watchdog: tuple[subprocess.Popen[bytes], socket.socket],
+) -> None:
+    process, channel = watchdog
+    try:
+        _send_protocol_message(channel, {"schema_version": 1, "action": "disarm"})
+        if _receive_protocol_message(channel) != {
+            "schema_version": 1,
+            "status": "disarmed",
+        }:
+            raise ValueError("invalid watchdog response")
+        if process.wait(timeout=CONTAINER_WATCHDOG_SECONDS) != 0:
+            raise ValueError("watchdog failed")
+    except BaseException as exc:
+        raise CandidateBrokerError(
+            "Candidate container cleanup watchdog failed"
+        ) from exc
+    finally:
+        channel.close()
+
+
+def _trigger_container_cleanup_watchdog(
+    watchdog: tuple[subprocess.Popen[bytes], socket.socket],
+) -> None:
+    process, channel = watchdog
+    channel.close()
+    try:
+        process.wait(timeout=4 * CONTAINER_WATCHDOG_SECONDS)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
 
 
 def _failed_execution_result(

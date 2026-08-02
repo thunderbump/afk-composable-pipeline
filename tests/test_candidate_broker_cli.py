@@ -609,6 +609,96 @@ class CandidateBrokerCliTest(unittest.TestCase):
         self.assertEqual(broker_result["stdout"], "container candidate ran\n")
         self.assertFalse((fake_bin / "bwrap").exists())
 
+    def test_container_watchdog_cleans_up_after_broker_parent_death(self):
+        request = self.temp / "container-watchdog-request.json"
+        result = self.temp / "container-watchdog-result.json"
+        marker = self.temp / "watchdog-container"
+        cleanup_attempts = self.temp / "watchdog-cleanup-attempts"
+        fake_bin = self.temp / "container-watchdog-bin"
+        fake_bin.mkdir()
+        (fake_bin / "git").symlink_to(shutil.which("git"))
+        docker = fake_bin / "docker"
+        docker.write_text(
+            textwrap.dedent(
+                f"""
+                #!{sys.executable}
+                import sys
+                import time
+                from pathlib import Path
+
+                arguments = sys.argv[1:]
+                if arguments[0] == "info":
+                    raise SystemExit(0)
+                if arguments[:2] == ["image", "inspect"]:
+                    print('[{{"Id":"sha256:fixture-image","Config":{{"Volumes":null}}}}]')
+                    raise SystemExit(0)
+                if arguments[0] == "rm":
+                    attempts = Path({str(cleanup_attempts)!r})
+                    count = (
+                        len(attempts.read_text().splitlines()) + 1
+                        if attempts.exists()
+                        else 1
+                    )
+                    attempts.write_text("attempt\\n" * count)
+                    target = Path({str(marker)!r})
+                    if count >= 3 and target.exists():
+                        target.unlink()
+                        raise SystemExit(0)
+                    raise SystemExit(1)
+                Path(arguments[arguments.index("--cidfile") + 1]).write_text("id\\n")
+                Path({str(marker)!r}).write_text("running\\n")
+                time.sleep(30)
+                """
+            ).lstrip(),
+            encoding="utf-8",
+        )
+        docker.chmod(0o755)
+        self.write_request(
+            request,
+            command=["/bin/sh", "-c", "sleep 30"],
+            execution={"type": "container", "image": "fixture:local"},
+        )
+        broker_env = {
+            **os.environ,
+            "PYTHONPATH": str(ROOT / "src"),
+            "PATH": str(fake_bin),
+        }
+        broker = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "afk.candidate_broker",
+                "--request",
+                str(request),
+                "--result",
+                str(result),
+            ],
+            cwd=ROOT,
+            env=broker_env,
+        )
+        try:
+            deadline = time.monotonic() + 5
+            while not marker.exists() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertTrue(marker.exists())
+            broker.kill()
+            broker.wait(timeout=2)
+            deadline = time.monotonic() + 5
+            while marker.exists() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertFalse(marker.exists())
+            self.assertTrue(cleanup_attempts.exists())
+            attempt_count = len(cleanup_attempts.read_text().splitlines())
+            self.assertGreaterEqual(attempt_count, 3)
+            time.sleep(0.2)
+            self.assertEqual(
+                len(cleanup_attempts.read_text().splitlines()), attempt_count
+            )
+        finally:
+            if broker.poll() is None:
+                broker.kill()
+                broker.wait()
+
     def test_container_execution_receives_only_the_exact_candidate_snapshot(self):
         request = self.temp / "container-request.json"
         result = self.temp / "container-result.json"
@@ -1214,6 +1304,115 @@ class CandidateBrokerCliTest(unittest.TestCase):
         self.assertEqual(broker_result["candidate_sha"], self.candidate_sha)
         self.assertEqual(broker_result["stdout"], "exact candidate\nscratch works\n")
         self.assertEqual(broker_result["stderr"], "")
+
+    @unittest.skipUnless(
+        shutil.which("docker") and os.environ.get("AFK_DOCKER_TEST_IMAGE"),
+        "set AFK_DOCKER_TEST_IMAGE to a locally available Docker fixture image",
+    )
+    def test_container_watchdog_removes_real_docker_container_after_broker_sigkill(
+        self,
+    ):
+        request = self.temp / "docker-watchdog-request.json"
+        result = self.temp / "docker-watchdog-result.json"
+        before_volumes = set(
+            subprocess.check_output(
+                ["docker", "volume", "ls", "--quiet"], text=True
+            ).splitlines()
+        )
+        before_containers = set(
+            subprocess.check_output(
+                [
+                    "docker",
+                    "ps",
+                    "-a",
+                    "--filter",
+                    "name=afk-candidate-",
+                    "--format",
+                    "{{.Names}}",
+                ],
+                text=True,
+            ).splitlines()
+        )
+        self.write_request(
+            request,
+            command=["/bin/sh", "-c", "sleep 30"],
+            execution={
+                "type": "container",
+                "image": os.environ["AFK_DOCKER_TEST_IMAGE"],
+            },
+        )
+        broker_env = {**os.environ, "PYTHONPATH": str(ROOT / "src")}
+        broker = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "afk.candidate_broker",
+                "--request",
+                str(request),
+                "--result",
+                str(result),
+            ],
+            cwd=ROOT,
+            env=broker_env,
+        )
+        container_name = None
+        try:
+            deadline = time.monotonic() + 10
+            while container_name is None and time.monotonic() < deadline:
+                names = subprocess.check_output(
+                    [
+                        "docker",
+                        "ps",
+                        "--filter",
+                        "name=afk-candidate-",
+                        "--format",
+                        "{{.Names}}",
+                    ],
+                    text=True,
+                ).splitlines()
+                new_names = set(names) - before_containers
+                if new_names:
+                    container_name = new_names.pop()
+                else:
+                    time.sleep(0.05)
+            self.assertIsNotNone(container_name)
+            broker.kill()
+            broker.wait(timeout=2)
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                remaining = subprocess.check_output(
+                    [
+                        "docker",
+                        "ps",
+                        "-a",
+                        "--filter",
+                        f"name=^{container_name}$",
+                        "--format",
+                        "{{.Names}}",
+                    ],
+                    text=True,
+                ).strip()
+                if not remaining:
+                    break
+                time.sleep(0.05)
+            self.assertEqual(remaining, "")
+            after_volumes = set(
+                subprocess.check_output(
+                    ["docker", "volume", "ls", "--quiet"], text=True
+                ).splitlines()
+            )
+            self.assertEqual(after_volumes, before_volumes)
+        finally:
+            if broker.poll() is None:
+                broker.kill()
+                broker.wait()
+            if container_name is not None:
+                subprocess.run(
+                    ["docker", "rm", "--force", "--volumes", container_name],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                )
 
     @unittest.skipUnless(
         shutil.which("podman") and os.environ.get("AFK_PODMAN_TEST_IMAGE"),

@@ -46,7 +46,7 @@ def _failure_response() -> dict[str, object]:
     }
 
 
-def _proxy_request(channel: socket.socket, request: object) -> object:
+def _proxy_request(request: object) -> object:
     cleanup_seconds = _PROCESS_CLEANUP_SECONDS
     subject = "command"
     if isinstance(request, dict):
@@ -111,7 +111,7 @@ def main() -> int:
     try:
         try:
             request = _receive_protocol_message(channel)
-            response = _proxy_request(channel, request)
+            response = _proxy_request(request)
         except BaseException:
             response = _failure_response()
         _send_protocol_message(channel, response)
