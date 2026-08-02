@@ -175,7 +175,6 @@ def run_candidate(request: dict[str, Any]) -> dict[str, Any]:
             container_started = (
                 container_id_path is not None and container_id_path.is_file()
             )
-            interrupted_cleanup = False
         except OSError:
             interrupted_cleanup = False
             return _failed_execution_result(
@@ -405,8 +404,36 @@ def _remove_container(runtime: str, name: str) -> None:
         )
     except (OSError, SupervisedCommandError) as exc:
         raise CandidateBrokerError("Candidate container cleanup failed") from exc
-    if completed.returncode != 0:
+    if completed.returncode != 0 and not _container_name_is_absent(runtime, name):
         raise CandidateBrokerError("Candidate container cleanup failed")
+
+
+def _container_name_is_absent(runtime: str, name: str) -> bool:
+    try:
+        completed = run_supervised_command(
+            [
+                runtime,
+                "ps",
+                "--all",
+                "--format",
+                "{{.Names}}",
+                "--filter",
+                f"name={name}",
+            ],
+            cwd=Path.cwd(),
+            environment=trusted_runtime_environment(),
+            timeout_seconds=CONTAINER_RUNTIME_PROBE_SECONDS,
+            output_byte_limit=64 * 1024,
+            cleanup_seconds=CANDIDATE_CLEANUP_SECONDS,
+            input_text=None,
+            label="Candidate container absence confirmation",
+            decode_errors="replace",
+            _trusted_host_command=True,
+        )
+    except (OSError, SupervisedCommandError):
+        return False
+    observed_names = {line.strip() for line in completed.stdout.splitlines()}
+    return completed.returncode == 0 and name not in observed_names
 
 
 def trusted_runtime_environment() -> dict[str, str]:

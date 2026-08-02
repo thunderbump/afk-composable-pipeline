@@ -1187,7 +1187,9 @@ class CandidateBrokerCliTest(unittest.TestCase):
                     print('[{{"Id":"sha256:fixture-image","Config":{{"Volumes":null}}}}]')
                     raise SystemExit(0)
                 if arguments[0] == "rm":
-                    Path({str(cleanup)!r}).touch()
+                    Path({str(cleanup)!r}).write_text(arguments[-1])
+                    raise SystemExit(1)
+                if arguments[0] == "ps":
                     raise SystemExit(0)
                 assert "--pull=never" in arguments
                 print("local image is unavailable", file=sys.stderr)
@@ -1223,7 +1225,61 @@ class CandidateBrokerCliTest(unittest.TestCase):
                 "stderr": "local image is unavailable\n",
             },
         )
-        self.assertFalse(cleanup.exists())
+        self.assertTrue(cleanup.read_text().startswith("afk-candidate-"))
+
+    def test_container_prestart_failure_removes_reserved_name_without_cidfile(self):
+        request = self.temp / "container-prestart-request.json"
+        result = self.temp / "container-prestart-result.json"
+        reserved_name = self.temp / "container-prestart-reserved-name"
+        removed_name = self.temp / "container-prestart-removed-name"
+        fake_bin = self.temp / "container-prestart-bin"
+        fake_bin.mkdir()
+        (fake_bin / "git").symlink_to(shutil.which("git"))
+        fake_docker = fake_bin / "docker"
+        fake_docker.write_text(
+            textwrap.dedent(
+                f"""
+                #!{sys.executable}
+                import sys
+                from pathlib import Path
+
+                arguments = sys.argv[1:]
+                if arguments[0] == "info":
+                    raise SystemExit(0)
+                if arguments[:2] == ["image", "inspect"]:
+                    print('[{{"Id":"sha256:fixture-image","Config":{{"Volumes":null}}}}]')
+                    raise SystemExit(0)
+                if arguments[0] == "rm":
+                    Path({str(removed_name)!r}).write_text(arguments[-1])
+                    Path({str(reserved_name)!r}).unlink()
+                    raise SystemExit(0)
+                Path({str(reserved_name)!r}).write_text(
+                    arguments[arguments.index("--name") + 1]
+                )
+                print("container failed before cidfile", file=sys.stderr)
+                raise SystemExit(125)
+                """
+            ).lstrip(),
+            encoding="utf-8",
+        )
+        fake_docker.chmod(0o755)
+        self.write_request(
+            request,
+            command=["/bin/true"],
+            execution={"type": "container", "image": "fixture:local"},
+        )
+
+        completed = self.run_broker(
+            request,
+            result,
+            env={"PATH": str(fake_bin)},
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        broker_result = json.loads(result.read_text(encoding="utf-8"))
+        self.assertEqual(broker_result["failure_classification"], "launch_failure")
+        self.assertFalse(reserved_name.exists())
+        self.assertTrue(removed_name.read_text().startswith("afk-candidate-"))
 
     def test_container_candidate_exit_125_is_preserved_after_creation(self):
         request = self.temp / "container-exit-125-request.json"
