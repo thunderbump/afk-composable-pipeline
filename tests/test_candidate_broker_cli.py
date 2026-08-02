@@ -326,18 +326,19 @@ class CandidateBrokerCliTest(unittest.TestCase):
         inspected_descriptors = []
         required_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
 
-        def replace_with_fifo(path, flags):
-            if Path(path) == target:
+        def replace_with_fifo(path, flags, *args, **kwargs):
+            if not isinstance(path, int) and Path(path) == target:
                 self.assertEqual(flags & required_flags, required_flags)
                 target.unlink()
                 os.mkfifo(target)
-                descriptor = real_open(path, flags)
+                descriptor = real_open(path, flags, *args, **kwargs)
                 opened_descriptors.append(descriptor)
                 return descriptor
-            return real_open(path, flags)
+            return real_open(path, flags, *args, **kwargs)
 
         def record_fstat(descriptor):
-            inspected_descriptors.append(descriptor)
+            if descriptor in opened_descriptors:
+                inspected_descriptors.append(descriptor)
             return real_fstat(descriptor)
 
         with (
@@ -415,6 +416,29 @@ class CandidateBrokerCliTest(unittest.TestCase):
         (generated / "output.log").write_text("generated\n", encoding="utf-8")
 
         self.assertTrue(is_exact_clean_commit(self.candidate, self.candidate_sha))
+
+    def test_exact_candidate_prunes_committed_ignored_directory(self):
+        from afk.checkouts import is_exact_clean_commit
+
+        (self.candidate / ".gitignore").write_text("generated/\n", encoding="utf-8")
+        self.git("add", ".gitignore")
+        self.git("commit", "-m", "ignore generated directory")
+        self.candidate_sha = self.git("rev-parse", "HEAD")
+        generated = self.candidate / "generated"
+        generated.mkdir()
+        for index in range(64):
+            (generated / f"output-{index}.log").write_text(
+                "generated\n", encoding="utf-8"
+            )
+        real_scandir = os.scandir
+
+        def reject_ignored_scan(path):
+            if not isinstance(path, int) and Path(path) == generated:
+                raise AssertionError("ignored directory leaves must not be enumerated")
+            return real_scandir(path)
+
+        with mock.patch("afk.checkouts.os.scandir", side_effect=reject_ignored_scan):
+            self.assertTrue(is_exact_clean_commit(self.candidate, self.candidate_sha))
 
     def test_exact_candidate_rejects_unignored_extra_file(self):
         from afk.checkouts import is_exact_clean_commit

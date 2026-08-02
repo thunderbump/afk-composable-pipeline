@@ -352,11 +352,20 @@ def _worktree_matches_commit(path: Path, commit: str) -> bool:
             in {(b"100644", b"blob"), (b"100755", b"blob")}
         }
         blob_sizes = _git_blob_sizes(path, regular_blob_ids)
-        untracked_paths = _worktree_paths(path, gitlinks) - expected_paths
-        if not _committed_ignores_allow(
-            path, entries, blob_sizes, untracked_paths
-        ):
-            return False
+        with tempfile.TemporaryDirectory(prefix="afk-ignore-") as temporary:
+            evaluation = Path(temporary)
+            if not _materialize_committed_ignores(
+                path, entries, blob_sizes, evaluation
+            ):
+                return False
+            untracked_paths = (
+                _worktree_paths(
+                    path, gitlinks, expected_paths, evaluation
+                )
+                - expected_paths
+            )
+            if _check_ignored(evaluation, untracked_paths) != untracked_paths:
+                return False
         for item_path, (mode, object_type, object_id) in entries.items():
             target = path.joinpath(*PurePosixPath(os.fsdecode(item_path)).parts)
             if (mode, object_type) in {
@@ -420,92 +429,102 @@ def _require_git_path(item_path: bytes) -> None:
         raise ValueError("invalid Git path")
 
 
-def _worktree_paths(path: Path, gitlinks: set[bytes]) -> set[bytes]:
+def _worktree_paths(
+    path: Path,
+    gitlinks: set[bytes],
+    expected_paths: set[bytes],
+    ignore_evaluation: Path,
+) -> set[bytes]:
     observed = set()
-    for root, directories, files in os.walk(
-        path,
-        topdown=True,
-        onerror=_raise_walk_error,
-        followlinks=False,
-    ):
-        root_path = Path(root)
-        for name in list(directories):
-            target = root_path / name
-            relative = os.fsencode(target.relative_to(path).as_posix())
-            if relative == b".git":
-                directories.remove(name)
-            elif relative in gitlinks or target.is_symlink():
-                observed.add(relative)
-                directories.remove(name)
-        for name in files:
-            target = root_path / name
-            relative = os.fsencode(target.relative_to(path).as_posix())
-            if relative != b".git":
-                observed.add(relative)
+    tracked_directories = {
+        b"/".join(item_path.split(b"/")[:depth])
+        for item_path in expected_paths
+        for depth in range(1, len(item_path.split(b"/")))
+    }
+    pending = [(path, b"")]
+    while pending:
+        child_directories = []
+        for directory, prefix in pending:
+            with os.scandir(directory) as children:
+                for child in children:
+                    name = os.fsencode(child.name)
+                    relative = name if not prefix else prefix + b"/" + name
+                    if relative == b".git":
+                        continue
+                    if relative in gitlinks or child.is_symlink():
+                        observed.add(relative)
+                    elif child.is_dir(follow_symlinks=False):
+                        child_directories.append((Path(child.path), relative))
+                    else:
+                        observed.add(relative)
+        prunable = {
+            relative + b"/"
+            for _directory, relative in child_directories
+            if relative not in tracked_directories
+        }
+        ignored_directories = {
+            item_path.rstrip(b"/")
+            for item_path in _check_ignored(ignore_evaluation, prunable)
+        }
+        pending = [
+            (child_directory, relative)
+            for child_directory, relative in child_directories
+            if relative not in ignored_directories
+        ]
     return observed
 
 
-def _raise_walk_error(error: OSError) -> None:
-    raise error
-
-
-def _committed_ignores_allow(
+def _materialize_committed_ignores(
     candidate: Path,
     entries: dict[bytes, tuple[bytes, bytes, bytes]],
     blob_sizes: dict[bytes, int],
-    untracked_paths: set[bytes],
+    evaluation: Path,
 ) -> bool:
-    if not untracked_paths:
-        return True
-    with tempfile.TemporaryDirectory(prefix="afk-ignore-") as temporary:
-        evaluation = Path(temporary)
-        initialized = run_trusted_read_git(["init", "--quiet"], cwd=evaluation)
-        if initialized.returncode != 0:
-            return False
-        for item_path, (mode, object_type, object_id) in entries.items():
-            if (
-                PurePosixPath(os.fsdecode(item_path)).name != ".gitignore"
-                or (mode, object_type)
-                not in {(b"100644", b"blob"), (b"100755", b"blob")}
-            ):
-                continue
-            target = evaluation.joinpath(
-                *PurePosixPath(os.fsdecode(item_path)).parts
+    initialized = run_trusted_read_git(["init", "--quiet"], cwd=evaluation)
+    if initialized.returncode != 0:
+        return False
+    for item_path, (mode, object_type, object_id) in entries.items():
+        if (
+            PurePosixPath(os.fsdecode(item_path)).name != ".gitignore"
+            or (mode, object_type)
+            not in {(b"100644", b"blob"), (b"100755", b"blob")}
+        ):
+            continue
+        target = evaluation.joinpath(*PurePosixPath(os.fsdecode(item_path)).parts)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with target.open("wb") as output:
+            blob = run_trusted_read_git(
+                ["cat-file", "blob", object_id.decode("ascii")],
+                cwd=candidate,
+                text=False,
+                stdout=output,
             )
-            target.parent.mkdir(parents=True, exist_ok=True)
-            with target.open("wb") as output:
-                blob = run_trusted_read_git(
-                    ["cat-file", "blob", object_id.decode("ascii")],
-                    cwd=candidate,
-                    text=False,
-                    stdout=output,
-                )
-            if (
-                blob.returncode != 0
-                or target.stat().st_size != blob_sizes[object_id]
-            ):
-                return False
-        for item_path in untracked_paths:
-            _require_git_path(item_path)
-            target = evaluation.joinpath(
-                *PurePosixPath(os.fsdecode(item_path)).parts
-            )
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.touch()
-        checked = run_trusted_read_git(
-            ["check-ignore", "--no-index", "-z", "--stdin"],
-            cwd=evaluation,
-            text=False,
-            input_data=b"\0".join(sorted(untracked_paths)) + b"\0",
-        )
-        if checked.returncode not in {0, 1}:
+        if blob.returncode != 0 or target.stat().st_size != blob_sizes[object_id]:
             return False
-        ignored = {
-            item_path
-            for item_path in checked.stdout.rstrip(b"\0").split(b"\0")
-            if item_path
-        }
-        return ignored == untracked_paths
+    return True
+
+
+def _check_ignored(evaluation: Path, item_paths: set[bytes]) -> set[bytes]:
+    if not item_paths:
+        return set()
+    for item_path in item_paths:
+        _require_git_path(item_path.rstrip(b"/"))
+    checked = run_trusted_read_git(
+        ["check-ignore", "--no-index", "-z", "--stdin"],
+        cwd=evaluation,
+        text=False,
+        input_data=b"\0".join(sorted(item_paths)) + b"\0",
+    )
+    if checked.returncode not in {0, 1}:
+        raise ValueError("ignore evaluation failed")
+    ignored = {
+        item_path
+        for item_path in checked.stdout.rstrip(b"\0").split(b"\0")
+        if item_path
+    }
+    if not ignored.issubset(item_paths):
+        raise ValueError("invalid ignore evaluation")
+    return ignored
 
 
 def _git_blob_id(content: bytes) -> bytes:
