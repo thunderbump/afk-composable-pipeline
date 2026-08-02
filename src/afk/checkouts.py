@@ -934,43 +934,85 @@ def _run_bounded_trusted_git(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
-    process_io = BoundedProcessIO(
-        process,
-        input_bytes=input_bytes,
-        output_byte_limit=output_byte_limit,
-        cleanup_seconds=1,
-        combined_output_limit=True,
-    )
-    deadline = time.monotonic() + 120
-    stop_reason = None
-    while process.poll() is None:
-        stop_reason = process_io.observe(deadline)
-        if stop_reason is not None:
-            process.kill()
-            break
-    process_io.close_input()
+    process_io = None
     try:
-        returncode = process.wait(timeout=1)
-    except subprocess.TimeoutExpired:
-        process.kill()
-        returncode = process.wait()
-        stop_reason = stop_reason or "timeout"
-    if not process_io.drain():
-        stop_reason = stop_reason or "timeout"
-    if stop_reason == "overflow" or process_io.overflowed:
-        return subprocess.CompletedProcess(
-            command, 1, stdout=b"", stderr=b"trusted Git output is too large"
+        process_io = BoundedProcessIO(
+            process,
+            input_bytes=input_bytes,
+            output_byte_limit=output_byte_limit,
+            cleanup_seconds=1,
+            combined_output_limit=True,
         )
-    if stop_reason == "timeout":
+        deadline = time.monotonic() + 120
+        stop_reason = None
+        while process.poll() is None:
+            stop_reason = process_io.observe(deadline)
+            if stop_reason is not None:
+                process.kill()
+                break
+        process_io.close_input()
+        try:
+            returncode = process.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            returncode = process.wait()
+            stop_reason = stop_reason or "timeout"
+        if not process_io.drain():
+            stop_reason = stop_reason or "timeout"
+        if stop_reason == "overflow" or process_io.overflowed:
+            return subprocess.CompletedProcess(
+                command, 1, stdout=b"", stderr=b"trusted Git output is too large"
+            )
+        if stop_reason == "timeout":
+            return subprocess.CompletedProcess(
+                command, 124, stdout=b"", stderr=b"trusted Git command timed out"
+            )
         return subprocess.CompletedProcess(
-            command, 124, stdout=b"", stderr=b"trusted Git command timed out"
+            command,
+            returncode,
+            stdout=bytes(process_io.captured["stdout"]),
+            stderr=bytes(process_io.captured["stderr"]),
         )
-    return subprocess.CompletedProcess(
-        command,
-        returncode,
-        stdout=bytes(process_io.captured["stdout"]),
-        stderr=bytes(process_io.captured["stderr"]),
-    )
+    except BaseException:
+        _cleanup_bounded_git_process(process, process_io)
+        raise
+
+
+def _cleanup_bounded_git_process(
+    process: subprocess.Popen[bytes], process_io: BoundedProcessIO | None
+) -> None:
+    if process_io is not None:
+        try:
+            process_io.close_input()
+        except BaseException:
+            pass
+    if process.poll() is None:
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+    try:
+        process.wait(timeout=1)
+    except BaseException:
+        try:
+            process.kill()
+        except BaseException:
+            pass
+        try:
+            process.wait(timeout=1)
+        except BaseException:
+            pass
+    if process_io is not None:
+        try:
+            process_io.drain()
+        except BaseException:
+            pass
+    for stream in (process.stdin, process.stdout, process.stderr):
+        if stream is not None:
+            try:
+                stream.close()
+            except BaseException:
+                pass
 
 
 def clean_reserved_checkout_artifacts(checkout_path: Path, status_lines: list[str]) -> bool:

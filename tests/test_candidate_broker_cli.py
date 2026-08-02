@@ -391,6 +391,106 @@ class CandidateBrokerCliTest(unittest.TestCase):
 
         self.assertEqual(bounded_results, [(65, 1, b""), (65, 1, b"")])
 
+    def test_bounded_trusted_git_cleans_child_when_io_setup_raises(self):
+        from afk import checkouts
+
+        real_popen = subprocess.Popen
+        children = []
+
+        def start_long_lived_child(_command, **kwargs):
+            child = real_popen(
+                [sys.executable, "-c", "import time; time.sleep(60)"],
+                **kwargs,
+            )
+            children.append(child)
+            return child
+
+        try:
+            with (
+                mock.patch(
+                    "afk.checkouts.subprocess.Popen",
+                    side_effect=start_long_lived_child,
+                ),
+                mock.patch(
+                    "afk.checkouts.BoundedProcessIO",
+                    side_effect=RuntimeError("io setup failed"),
+                ),
+                self.assertRaisesRegex(RuntimeError, "io setup failed"),
+            ):
+                checkouts._run_bounded_trusted_git(
+                    ["git", "ls-tree"],
+                    cwd=self.candidate,
+                    environment=self.git_environment,
+                    input_data=None,
+                    output_byte_limit=64,
+                )
+
+            child = children[0]
+            self.assertIsNotNone(child.poll())
+            self.assertTrue(child.stdout.closed)
+            self.assertTrue(child.stderr.closed)
+        finally:
+            for child in children:
+                if child.poll() is None:
+                    child.kill()
+                child.wait()
+                for stream in (child.stdin, child.stdout, child.stderr):
+                    if stream is not None and not stream.closed:
+                        stream.close()
+
+    def test_bounded_trusted_git_cleans_child_and_reraises_interrupt(self):
+        from afk import checkouts
+
+        real_popen = subprocess.Popen
+        real_process_io = checkouts.BoundedProcessIO
+        children = []
+
+        def start_long_lived_child(_command, **kwargs):
+            child = real_popen(
+                [sys.executable, "-c", "import time; time.sleep(60)"],
+                **kwargs,
+            )
+            children.append(child)
+            return child
+
+        def interrupting_process_io(*args, **kwargs):
+            process_io = real_process_io(*args, **kwargs)
+            process_io.observe = mock.Mock(side_effect=KeyboardInterrupt())
+            return process_io
+
+        try:
+            with (
+                mock.patch(
+                    "afk.checkouts.subprocess.Popen",
+                    side_effect=start_long_lived_child,
+                ),
+                mock.patch(
+                    "afk.checkouts.BoundedProcessIO",
+                    side_effect=interrupting_process_io,
+                ),
+                self.assertRaises(KeyboardInterrupt),
+            ):
+                checkouts._run_bounded_trusted_git(
+                    ["git", "ls-tree"],
+                    cwd=self.candidate,
+                    environment=self.git_environment,
+                    input_data=None,
+                    output_byte_limit=64,
+                )
+
+            child = children[0]
+            self.assertIsNotNone(child.poll())
+            self.assertTrue(child.stdout.closed)
+            self.assertTrue(child.stderr.closed)
+        finally:
+            for child in children:
+                if child.poll() is None:
+                    child.kill()
+                child.wait()
+                for stream in (child.stdin, child.stdout, child.stderr):
+                    if stream is not None and not stream.closed:
+                        stream.close()
+
     def test_exact_candidate_accepts_normal_nested_tracked_tree(self):
         from afk.checkouts import is_exact_clean_commit
 
