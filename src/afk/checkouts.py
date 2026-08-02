@@ -381,30 +381,63 @@ def _worktree_matches_commit(path: Path, commit: str) -> bool:
             )
             if _check_ignored(evaluation, untracked_paths) != untracked_paths:
                 return False
-        for item_path, (mode, object_type, object_id) in entries.items():
-            target = path.joinpath(*PurePosixPath(os.fsdecode(item_path)).parts)
-            if (mode, object_type) in {
-                (b"100644", b"blob"),
-                (b"100755", b"blob"),
-            }:
-                if not _git_regular_file_matches(
-                    target, mode, object_id, blob_sizes[object_id]
-                ):
-                    return False
-            elif (mode, object_type) == (b"120000", b"blob"):
-                target_stat = target.lstat()
-                if not stat.S_ISLNK(target_stat.st_mode):
-                    return False
-                if _git_blob_id(os.fsencode(os.readlink(target))) != object_id:
-                    return False
-            elif (mode, object_type) == (b"160000", b"commit"):
-                target_stat = target.lstat()
-                if not stat.S_ISDIR(target_stat.st_mode) or not is_exact_clean_commit(
-                    target, object_id.decode("ascii")
-                ):
-                    return False
-            else:
+            if not all(
+                _ignored_path_is_supported(path, item_path)
+                for item_path in untracked_paths
+            ):
                 return False
+        for item_path, (mode, object_type, object_id) in entries.items():
+            parent_descriptor, name = _open_parent_descriptor(path, item_path)
+            try:
+                if (mode, object_type) in {
+                    (b"100644", b"blob"),
+                    (b"100755", b"blob"),
+                }:
+                    if not _git_regular_file_matches(
+                        name,
+                        mode,
+                        object_id,
+                        blob_sizes[object_id],
+                        dir_fd=parent_descriptor,
+                    ):
+                        return False
+                elif (mode, object_type) == (b"120000", b"blob"):
+                    target_stat = os.stat(
+                        name, dir_fd=parent_descriptor, follow_symlinks=False
+                    )
+                    if not stat.S_ISLNK(target_stat.st_mode):
+                        return False
+                    if (
+                        _git_blob_id(os.readlink(name, dir_fd=parent_descriptor))
+                        != object_id
+                    ):
+                        return False
+                elif (mode, object_type) == (b"160000", b"commit"):
+                    target_descriptor = os.open(
+                        name,
+                        os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_DIRECTORY,
+                        dir_fd=parent_descriptor,
+                    )
+                    try:
+                        target_identity = os.fstat(target_descriptor)
+                        target = Path(os.readlink(f"/proc/self/fd/{target_descriptor}"))
+                        if not is_exact_clean_commit(
+                            target,
+                            object_id.decode("ascii"),
+                        ):
+                            return False
+                        observed_identity = os.stat(target, follow_symlinks=False)
+                        if (observed_identity.st_dev, observed_identity.st_ino) != (
+                            target_identity.st_dev,
+                            target_identity.st_ino,
+                        ):
+                            return False
+                    finally:
+                        os.close(target_descriptor)
+                else:
+                    return False
+            finally:
+                os.close(parent_descriptor)
     except (OSError, UnicodeError, ValueError):
         return False
     return True
@@ -470,6 +503,33 @@ def _require_tracked_path_budget(
     ):
         raise ValueError("tracked Candidate metadata is too large")
     return next_encoded_bytes
+
+
+def _open_parent_descriptor(path: Path, item_path: bytes) -> tuple[int, bytes]:
+    parts = item_path.split(b"/")
+    descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY)
+    try:
+        for part in parts[:-1]:
+            child_descriptor = os.open(
+                part,
+                os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_DIRECTORY,
+                dir_fd=descriptor,
+            )
+            os.close(descriptor)
+            descriptor = child_descriptor
+        return descriptor, parts[-1]
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _ignored_path_is_supported(path: Path, item_path: bytes) -> bool:
+    parent_descriptor, name = _open_parent_descriptor(path, item_path)
+    try:
+        target_stat = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+        return stat.S_ISREG(target_stat.st_mode) or stat.S_ISLNK(target_stat.st_mode)
+    finally:
+        os.close(parent_descriptor)
 
 
 def _worktree_paths(
@@ -646,10 +706,15 @@ def _git_blob_sizes(path: Path, object_ids: set[bytes]) -> dict[bytes, int]:
 
 
 def _git_regular_file_matches(
-    path: Path, mode: bytes, object_id: bytes, expected_size: int
+    path: Path | bytes,
+    mode: bytes,
+    object_id: bytes,
+    expected_size: int,
+    *,
+    dir_fd: int | None = None,
 ) -> bool:
     flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
-    descriptor = os.open(path, flags)
+    descriptor = os.open(path, flags, dir_fd=dir_fd)
     try:
         target_stat = os.fstat(descriptor)
         if not stat.S_ISREG(target_stat.st_mode):

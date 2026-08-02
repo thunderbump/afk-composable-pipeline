@@ -372,7 +372,7 @@ class CandidateBrokerCliTest(unittest.TestCase):
         required_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
 
         def replace_with_fifo(path, flags, *args, **kwargs):
-            if not isinstance(path, int) and Path(path) == target:
+            if path == os.fsencode(target.name) and kwargs.get("dir_fd") is not None:
                 self.assertEqual(flags & required_flags, required_flags)
                 target.unlink()
                 os.mkfifo(target)
@@ -416,7 +416,7 @@ class CandidateBrokerCliTest(unittest.TestCase):
 
         def record_target_open(path, flags, *args, **kwargs):
             descriptor = real_open(path, flags, *args, **kwargs)
-            if not isinstance(path, int) and Path(path) == target:
+            if path == os.fsencode(target.name) and kwargs.get("dir_fd") is not None:
                 opened_descriptors.append(descriptor)
             return descriptor
 
@@ -548,6 +548,59 @@ class CandidateBrokerCliTest(unittest.TestCase):
         tracked.symlink_to(external, target_is_directory=True)
 
         self.assertFalse(is_exact_clean_commit(self.candidate, self.candidate_sha))
+
+    def test_exact_candidate_rejects_tracked_parent_replaced_after_scan(self):
+        from afk import checkouts
+
+        tracked = self.candidate / "tracked"
+        tracked.mkdir()
+        (tracked / "input.txt").write_text("tracked content\n", encoding="utf-8")
+        self.git("add", "tracked/input.txt")
+        self.git("commit", "-m", "add tracked directory")
+        self.candidate_sha = self.git("rev-parse", "HEAD")
+        external = self.temp / "external"
+        external.mkdir()
+        (external / "input.txt").write_text("tracked content\n", encoding="utf-8")
+        real_worktree_paths = checkouts._worktree_paths
+
+        def replace_parent_after_scan(*args, **kwargs):
+            paths = real_worktree_paths(*args, **kwargs)
+            shutil.rmtree(tracked)
+            tracked.symlink_to(external, target_is_directory=True)
+            return paths
+
+        with mock.patch(
+            "afk.checkouts._worktree_paths",
+            side_effect=replace_parent_after_scan,
+        ):
+            self.assertFalse(
+                checkouts.is_exact_clean_commit(self.candidate, self.candidate_sha)
+            )
+
+    def test_exact_candidate_rejects_ignored_file_replaced_after_scan(self):
+        from afk import checkouts
+
+        (self.candidate / ".gitignore").write_text("ignored.data\n", encoding="utf-8")
+        self.git("add", ".gitignore")
+        self.git("commit", "-m", "ignore generated data")
+        self.candidate_sha = self.git("rev-parse", "HEAD")
+        ignored = self.candidate / "ignored.data"
+        ignored.write_bytes(b"generated\n")
+        real_worktree_paths = checkouts._worktree_paths
+
+        def replace_ignored_after_scan(*args, **kwargs):
+            paths = real_worktree_paths(*args, **kwargs)
+            ignored.unlink()
+            os.mkfifo(ignored)
+            return paths
+
+        with mock.patch(
+            "afk.checkouts._worktree_paths",
+            side_effect=replace_ignored_after_scan,
+        ):
+            self.assertFalse(
+                checkouts.is_exact_clean_commit(self.candidate, self.candidate_sha)
+            )
 
     def test_exact_candidate_rejects_fifo_ignored_by_committed_gitignore(self):
         from afk.checkouts import is_exact_clean_commit
