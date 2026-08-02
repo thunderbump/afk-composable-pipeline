@@ -22,6 +22,90 @@ from afk.process_supervision import (  # noqa: E402
 
 
 class SupervisedCommandTest(unittest.TestCase):
+    def test_precontained_bwrap_flags_must_precede_the_command_separator(self):
+        bwrap = process_supervision.shutil.which("bwrap")
+        self.assertIsNotNone(bwrap)
+        with self.assertRaisesRegex(
+            SupervisedCommandError, "pre-contained command is invalid"
+        ):
+            run_supervised_command(
+                [
+                    bwrap,
+                    "--bind",
+                    "/",
+                    "/",
+                    "--",
+                    "--unshare-all",
+                    "--die-with-parent",
+                    "--proc",
+                    "/proc",
+                ],
+                cwd=Path.cwd(),
+                environment=os.environ.copy(),
+                timeout_seconds=1,
+                label="Codex",
+                _precontained_command=True,
+            )
+
+    def test_helper_sigkill_cannot_orphan_detached_descendants(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            ready = root / "helper-kill-ready"
+            late_mutation = root / "helper-kill-mutation"
+            token = f"afk-helper-kill-{os.getpid()}-{time.monotonic_ns()}"
+            child = (
+                "import signal,time;"
+                "signal.signal(signal.SIGTERM,signal.SIG_IGN);"
+                f"open({str(ready)!r},'w').write('ready');"
+                "time.sleep(0.5);"
+                f"open({str(late_mutation)!r},'w').write('mutated');"
+                "time.sleep(30)"
+            )
+            command = (
+                "import os,signal,subprocess,sys,time;"
+                f"subprocess.Popen([sys.executable,'-c',{child!r},{token!r}],"
+                "start_new_session=True);"
+                f"ready={str(ready)!r};"
+                "\nwhile not os.path.exists(ready): time.sleep(0.01);"
+                "\nos.kill(os.getppid(),signal.SIGKILL);"
+                "\ntime.sleep(30)"
+            )
+
+            def tokenized_processes():
+                matches = []
+                for process in Path("/proc").iterdir():
+                    if not process.name.isdigit():
+                        continue
+                    try:
+                        command_line = (process / "cmdline").read_bytes()
+                    except (FileNotFoundError, PermissionError, ProcessLookupError):
+                        continue
+                    if token.encode() in command_line:
+                        matches.append(int(process.name))
+                return matches
+
+            try:
+                with self.assertRaises(SupervisedCommandError) as raised:
+                    run_supervised_command(
+                        [sys.executable, "-c", command],
+                        cwd=root,
+                        environment=os.environ.copy(),
+                        timeout_seconds=2,
+                        label="Codex",
+                        cleanup_seconds=0.1,
+                    )
+
+                self.assertEqual(raised.exception.classification, "supervision_failure")
+                time.sleep(0.7)
+                self.assertFalse(late_mutation.exists())
+                self.assertEqual(tokenized_processes(), [])
+            finally:
+                for pid in tokenized_processes():
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+
     def test_helper_launch_failure_is_a_neutral_supervision_failure(self):
         with (
             mock.patch.object(

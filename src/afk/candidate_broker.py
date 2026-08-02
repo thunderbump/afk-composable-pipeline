@@ -129,6 +129,7 @@ def run_candidate(request: dict[str, Any]) -> dict[str, Any]:
                 input_text=None,
                 label="Candidate command",
                 decode_errors="replace",
+                _precontained_command=True,
             )
         except OSError:
             return _failed_execution_result(

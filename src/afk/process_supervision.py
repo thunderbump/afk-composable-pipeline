@@ -6,6 +6,7 @@ import json
 import os
 import select
 import signal
+import shutil
 import socket
 import struct
 import subprocess
@@ -58,6 +59,7 @@ def run_supervised_command(
     output_byte_limit: int | None = None,
     cleanup_seconds: float | None = None,
     decode_errors: str = "strict",
+    _precontained_command: bool = False,
 ) -> subprocess.CompletedProcess[str]:
     request = {
         "schema_version": 1,
@@ -79,15 +81,48 @@ def run_supervised_command(
         ) from exc
     try:
         try:
-            helper = subprocess.Popen(
-                [
+            helper_command = [
+                sys.executable,
+                "-I",
+                str(_HELPER_PATH),
+                "0",
+                str(os.getpid()),
+            ]
+            if _precontained_command:
+                if not _is_precontained_bwrap_command(command):
+                    raise SupervisedCommandError(
+                        "supervision_failure",
+                        "pre-contained command is invalid",
+                    )
+            else:
+                bwrap = shutil.which("bwrap")
+                if bwrap is None:
+                    raise SupervisedCommandError(
+                        "supervision_failure",
+                        "command supervision containment is unavailable",
+                    )
+                helper_command = [
+                    bwrap,
+                    "--bind",
+                    "/",
+                    "/",
+                    "--dev-bind",
+                    "/dev",
+                    "/dev",
+                    "--unshare-pid",
+                    "--proc",
+                    "/proc",
+                    "--die-with-parent",
+                    "--",
                     sys.executable,
                     "-I",
                     str(_HELPER_PATH),
-                    str(helper_socket.fileno()),
-                    str(os.getpid()),
-                ],
-                stdin=subprocess.DEVNULL,
+                    "0",
+                    "1",
+                ]
+            helper = subprocess.Popen(
+                helper_command,
+                stdin=helper_socket,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 env={
@@ -95,7 +130,6 @@ def run_supervised_command(
                     "LC_ALL": "C.UTF-8",
                     "PATH": os.defpath,
                 },
-                pass_fds=(helper_socket.fileno(),),
                 start_new_session=True,
             )
         except OSError as exc:
@@ -135,6 +169,26 @@ def run_supervised_command(
         raise SupervisedCommandError(
             "supervision_failure", "command supervision helper protocol failed"
         ) from exc
+
+
+def _is_precontained_bwrap_command(command: list[str]) -> bool:
+    bwrap = shutil.which("bwrap")
+    try:
+        separator = command.index("--")
+    except ValueError:
+        return False
+    options = command[:separator]
+    return (
+        bool(command)
+        and bwrap is not None
+        and command[0] == bwrap
+        and "--unshare-all" in options
+        and "--die-with-parent" in options
+        and any(
+            options[index : index + 2] == ["--proc", "/proc"]
+            for index in range(len(options) - 1)
+        )
+    )
 
 
 def _run_supervised_command_local(
