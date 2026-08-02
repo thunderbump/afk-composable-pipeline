@@ -399,20 +399,6 @@ def _require_trusted_harness(
             raise CandidateValidationError(
                 "invalid", "pinned validation command path is absent from trusted_files"
             )
-        trusted = tracked_regular_file_identity(
-            worktree, identity["base_sha"], relative
-        )
-        candidate = tracked_regular_file_identity(worktree, candidate_sha, relative)
-        if trusted is None or candidate is None:
-            raise CandidateValidationError(
-                "invalid",
-                "pinned validation harness must be a regular tracked file",
-            )
-        if trusted != candidate:
-            raise CandidateValidationError(
-                "invalid",
-                "Candidate validation harness differs from the trusted pinned base",
-            )
     for relative in contract["trusted_files"]:
         trusted = tracked_regular_file_identity(
             worktree, identity["base_sha"], relative
