@@ -2552,17 +2552,17 @@ class CandidateValidationCliTest(unittest.TestCase):
         self.assertFalse(Path(f"/proc/{child_pid}").exists())
 
     def test_successful_worker_kills_detached_term_resistant_descendant(self):
-        child_pid_path = self.temp / "detached-child.pid"
+        child_ready_path = self.temp / "detached-child.ready"
+        token = f"afk-validation-descendant-{os.getpid()}-{time.monotonic_ns()}"
         child_program = textwrap.dedent(
             """
-            import os
             import signal
             import sys
             import time
             from pathlib import Path
 
             signal.signal(signal.SIGTERM, signal.SIG_IGN)
-            Path(sys.argv[1]).write_text(str(os.getpid()), encoding="utf-8")
+            Path(sys.argv[1]).write_text("ready", encoding="utf-8")
             time.sleep(3)
             """
         ).lstrip()
@@ -2572,8 +2572,8 @@ class CandidateValidationCliTest(unittest.TestCase):
             checks=[{"name": "tests", "status": "passed", "log_path": "tests.log"}],
             evidence_line=(
                 f"subprocess.Popen([sys.executable, '-c', {child_program!r}, "
-                f"{str(child_pid_path)!r}], start_new_session=True); "
-                f'exec("while not Path({str(child_pid_path)!r}).exists():\\n" '
+                f"{str(child_ready_path)!r}, {token!r}], start_new_session=True); "
+                f'exec("while not Path({str(child_ready_path)!r}).exists():\\n" '
                 '"    time.sleep(0.001)"); ' + WRITE_PASSED_LOG
             ),
         )
@@ -2583,19 +2583,19 @@ class CandidateValidationCliTest(unittest.TestCase):
         completed = self.run_afk("resume")
         elapsed = time.monotonic() - started
 
-        child_pid = int(child_pid_path.read_text(encoding="utf-8"))
         try:
             self.assertEqual(completed.returncode, 0, completed.stderr)
             self.assertLess(elapsed, 2)
             deadline = time.monotonic() + 2
-            while Path(f"/proc/{child_pid}").exists() and time.monotonic() < deadline:
+            while self.processes_with_token(token) and time.monotonic() < deadline:
                 time.sleep(0.02)
-            self.assertFalse(Path(f"/proc/{child_pid}").exists())
+            self.assertEqual(self.processes_with_token(token), [])
         finally:
-            try:
-                os.kill(child_pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+            for pid in self.processes_with_token(token):
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
 
     def test_successful_worker_is_drained_before_evidence_is_ingested(self):
         child_pid_path = self.temp / "resistant-child.pid"
