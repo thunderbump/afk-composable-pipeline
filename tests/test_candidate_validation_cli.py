@@ -469,20 +469,31 @@ class CandidateValidationCliTest(unittest.TestCase):
 
     def test_brokered_candidate_cannot_leave_a_detached_descendant(self):
         token = f"afk-broker-descendant-{os.getpid()}-{time.monotonic_ns()}"
+        parent_token = f"{token}-parent"
         child_program = (
             "import signal,time; "
             "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+            "print('ready', flush=True); "
             "time.sleep(60)"
         )
         candidate_program = (
-            "import subprocess,sys; "
-            f"subprocess.Popen([sys.executable, '-c', {child_program!r}, {token!r}], "
-            "start_new_session=True); "
+            "import os,select,signal,subprocess,sys; "
+            "child = subprocess.Popen("
+            f"[sys.executable, '-c', {child_program!r}, {token!r}], "
+            "stdout=subprocess.PIPE, text=True, start_new_session=True); "
+            "assert select.select([child.stdout], [], [], 1)[0]; "
+            "assert child.stdout.readline() == 'ready\\n'; "
+            "os.kill(os.getpid(), signal.SIGSTOP); "
             "print('candidate completed')"
         )
         broker_request = {
             "schema_version": 1,
-            "command": ["/usr/bin/python3", "-c", candidate_program],
+            "command": [
+                "/usr/bin/python3",
+                "-c",
+                candidate_program,
+                parent_token,
+            ],
         }
         harness = textwrap.dedent(
             f"""
@@ -506,11 +517,49 @@ class CandidateValidationCliTest(unittest.TestCase):
             evidence_line=f"exec({harness!r})",
         )
         run_id, _ = self.candidate_ready_run()
+        environment = {
+            **os.environ,
+            "PYTHONPATH": str(ROOT / "src"),
+            "XDG_STATE_HOME": str(self.state_home),
+        }
+        afk_process = subprocess.Popen(
+            [sys.executable, "-m", "afk", "resume"],
+            cwd=self.repository,
+            env=environment,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        child_pid = None
+        parent_pid = None
 
         try:
-            completed = self.run_afk("resume")
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline and afk_process.poll() is None:
+                children = self.processes_with_argument(token)
+                parents = self.processes_with_argument(parent_token)
+                if len(children) == 1:
+                    for observed_parent in parents:
+                        try:
+                            parent_status = Path(
+                                f"/proc/{observed_parent}/status"
+                            ).read_text(encoding="utf-8")
+                        except (FileNotFoundError, ProcessLookupError):
+                            continue
+                        if "\nState:\tT" in parent_status:
+                            child_pid = children[0]
+                            parent_pid = observed_parent
+                            break
+                    if parent_pid is not None:
+                        break
+                time.sleep(0.02)
 
-            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertIsNotNone(child_pid)
+            self.assertIsNotNone(parent_pid)
+            os.kill(parent_pid, signal.SIGCONT)
+            _, stderr = afk_process.communicate(timeout=20)
+
+            self.assertEqual(afk_process.returncode, 0, stderr)
             status = self.status(run_id)
             self.assertEqual(status["checkpoint"], "validated")
             evidence = (
@@ -522,15 +571,28 @@ class CandidateValidationCliTest(unittest.TestCase):
             )
             self.assertEqual(stat.S_IMODE(evidence.stat().st_mode), 0o500)
             deadline = time.monotonic() + 2
-            while self.processes_with_token(token) and time.monotonic() < deadline:
+            child_path = Path(f"/proc/{child_pid}")
+            while child_path.exists() and time.monotonic() < deadline:
                 time.sleep(0.02)
+            self.assertFalse(child_path.exists())
             self.assertEqual(self.processes_with_token(token), [])
         finally:
-            for pid in self.processes_with_token(token):
+            cleanup_pids = {
+                *self.processes_with_token(token),
+                *self.processes_with_token(parent_token),
+            }
+            if child_pid is not None:
+                cleanup_pids.add(child_pid)
+            if parent_pid is not None:
+                cleanup_pids.add(parent_pid)
+            for pid in cleanup_pids:
                 try:
                     os.kill(pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
+            if afk_process.poll() is None:
+                afk_process.kill()
+                afk_process.communicate()
 
     def test_contract_evidence_names_do_not_collide_with_afk_metadata(self):
         formerly_reserved = ("request.json", "stdout.log", "stderr.log", "outcome.json")
@@ -2810,6 +2872,21 @@ class CandidateValidationCliTest(unittest.TestCase):
             except (FileNotFoundError, PermissionError, ProcessLookupError):
                 continue
             if token.encode() in command_line:
+                matches.append(int(process.name))
+        return matches
+
+    @staticmethod
+    def processes_with_argument(argument):
+        matches = []
+        expected = argument.encode()
+        for process in Path("/proc").iterdir():
+            if not process.name.isdigit():
+                continue
+            try:
+                arguments = (process / "cmdline").read_bytes().split(b"\0")
+            except (FileNotFoundError, PermissionError, ProcessLookupError):
+                continue
+            if expected in arguments:
                 matches.append(int(process.name))
         return matches
 
