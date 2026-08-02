@@ -551,6 +551,15 @@ class CandidateBrokerCliTest(unittest.TestCase):
         with mock.patch.object(
             checkouts,
             "EXACT_CANDIDATE_REPOSITORY_LIMIT",
+            3,
+        ):
+            self.assertTrue(
+                checkouts.is_exact_clean_commit(self.candidate, self.candidate_sha)
+            )
+
+        with mock.patch.object(
+            checkouts,
+            "EXACT_CANDIDATE_REPOSITORY_LIMIT",
             2,
         ):
             self.assertFalse(
