@@ -44,10 +44,16 @@ class CandidateValidationCliTest(unittest.TestCase):
         self.temporary_directory.cleanup()
 
     def test_resume_advances_only_after_exact_candidate_validation_passes(self):
+        repository = str(self.repository)
         self.write_contract_worker(
             status="passed",
             exit_code=0,
             checks=[{"name": "tests", "status": "passed", "log_path": "tests.log"}],
+            evidence_line=(
+                f"candidate = Path({repository!r}).resolve(); "
+                "assert Path(request['candidate_path']).resolve() == candidate; "
+                "assert Path.cwd().resolve() != candidate; " + WRITE_SAFE_LOG
+            ),
         )
         run_id, candidate_sha = self.candidate_ready_run()
 
@@ -600,6 +606,89 @@ class CandidateValidationCliTest(unittest.TestCase):
         self.assertIn("harness", status["attention"]["summary"])
         self.assertFalse(marker.exists())
 
+    def test_pinned_transitive_validator_change_is_not_executed(self):
+        scripts = self.repository / "scripts"
+        scripts.mkdir()
+        wrapper = scripts / "validation-worker.sh"
+        wrapper.write_text(
+            '#!/bin/sh\nexec ./scripts/validate.sh "$@"\n', encoding="utf-8"
+        )
+        wrapper.chmod(0o755)
+        validator = scripts / "validate.sh"
+        validator.write_text('#!/bin/sh\nexec ./validate.py "$@"\n', encoding="utf-8")
+        validator.chmod(0o755)
+        self.write_contract_worker(
+            status="rejected",
+            exit_code=1,
+            checks=[{"name": "tests", "status": "rejected", "log_path": "tests.log"}],
+        )
+        (self.repository / "afk.toml").write_text(
+            "schema_version = 1\n\n[validation]\n"
+            'command = ["./scripts/validation-worker.sh"]\n'
+            "trusted_files = [\n"
+            '  "scripts/validation-worker.sh",\n'
+            '  "scripts/validate.sh",\n'
+            '  "validate.py",\n'
+            "]\n"
+            "timeout_seconds = 5\n",
+            encoding="utf-8",
+        )
+        self.git("add", ".")
+        self.git("commit", "-m", "trusted validator closure")
+        base_sha = self.git("rev-parse", "HEAD")
+        blob_sha = self.git("rev-parse", "HEAD:afk.toml")
+
+        marker = self.temp / "untrusted-validator-ran"
+        validator.write_text(
+            textwrap.dedent(
+                f"""
+                #!/usr/bin/env python3
+                import json
+                import sys
+                from pathlib import Path
+
+                request = json.loads(
+                    Path(sys.argv[sys.argv.index("--request") + 1]).read_text()
+                )
+                evidence = Path(request["evidence_dir"])
+                Path({str(marker)!r}).write_text("ran", encoding="utf-8")
+                (evidence / "tests.log").write_text("passed\\n", encoding="utf-8")
+                (evidence / "result.json").write_text(json.dumps({{
+                    "schema_version": 1,
+                    "candidate_sha": request["candidate_sha"],
+                    "status": "passed",
+                    "summary": "unconditional success",
+                    "checks": [{{
+                        "name": "tests",
+                        "status": "passed",
+                        "log_path": "tests.log",
+                    }}],
+                }}), encoding="utf-8")
+                """
+            ).lstrip(),
+            encoding="utf-8",
+        )
+        self.git("add", "scripts/validate.sh")
+        self.git("commit", "-m", "replace validator with unconditional success")
+        candidate_sha = self.git("rev-parse", "HEAD")
+        run_id = self.create_ready_run(
+            candidate_sha=candidate_sha,
+            base_sha=base_sha,
+            validation_contract={
+                "source": "pinned_base",
+                "base_sha": base_sha,
+                "blob_sha": blob_sha,
+            },
+        )
+
+        completed = self.run_afk("resume")
+
+        self.assertEqual(completed.returncode, 2)
+        status = self.status(run_id)
+        self.assertEqual(status["attention"]["kind"], "invalid")
+        self.assertIn("harness", status["attention"]["summary"])
+        self.assertFalse(marker.exists())
+
     def test_pinned_relative_candidate_harness_change_is_not_executed(self):
         self.write_contract_worker(
             status="passed",
@@ -612,6 +701,7 @@ class CandidateValidationCliTest(unittest.TestCase):
         (self.repository / "afk.toml").write_text(
             "schema_version = 1\n\n[validation]\n"
             'command = ["python3", "scripts/validation.py"]\n'
+            'trusted_files = ["scripts/validation.py"]\n'
             "timeout_seconds = 5\n",
             encoding="utf-8",
         )
@@ -2039,7 +2129,8 @@ class CandidateValidationCliTest(unittest.TestCase):
             checks=[{"name": "tests", "status": "passed", "log_path": "tests.log"}],
             evidence_line=(
                 WRITE_PASSED_LOG + "; "
-                'Path("README.md").write_text("mutated\\n", encoding="utf-8")'
+                'Path(request["candidate_path"], "README.md").write_text('
+                '"mutated\\n", encoding="utf-8")'
             ),
         )
         run_id, _ = self.candidate_ready_run()
@@ -2155,6 +2246,7 @@ class CandidateValidationCliTest(unittest.TestCase):
         worker.chmod(worker.stat().st_mode | stat.S_IXUSR)
         (self.repository / "afk.toml").write_text(
             'schema_version = 1\n\n[validation]\ncommand = ["./validate.py"]\n'
+            'trusted_files = ["validate.py"]\n'
             f"timeout_seconds = {timeout_seconds}\n",
             encoding="utf-8",
         )
@@ -2207,6 +2299,7 @@ class CandidateValidationCliTest(unittest.TestCase):
         (self.repository / "afk.toml").write_text(
             "schema_version = 1\n\n[validation]\n"
             f"command = {json.dumps(command)}\n"
+            'trusted_files = ["validate.py"]\n'
             "timeout_seconds = 5\n",
             encoding="utf-8",
         )

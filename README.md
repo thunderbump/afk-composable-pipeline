@@ -72,6 +72,33 @@ recorded at Run start. It includes at most the newest eight Bead comments in
 latest-first order under a 4,000-character section budget, after structured
 secret redaction. Live tracker changes cannot alter that context.
 
+For a normal Run, the pinned base `afk.toml` must declare the complete
+repository-owned validation control-flow closure:
+
+```toml
+schema_version = 1
+
+[validation]
+command = ["./scripts/validation-worker.sh"]
+trusted_files = [
+  "scripts/validation-worker.sh",
+  "scripts/validate.sh",
+  "scripts/lib/validation-routing.sh",
+]
+timeout_seconds = 2700
+```
+
+AFK verifies every declared file has the same tracked blob and regular-file
+mode in the Candidate as in the pinned base, then materializes those base
+blobs outside the Candidate checkout and runs the command from that trusted
+root. The request supplies `candidate_sha` and `candidate_path` so the trusted
+target-owned harness can build and test the exact Candidate without executing
+Candidate-owned validation policy. An omitted dependency fails when the
+isolated harness tries to resolve it; contract authors must list every
+repository executable or sourced file used by validation. Candidate changes
+to the contract or any declared validator file remain proposals for a later
+Run whose base includes them.
+
 When `--ledger` is omitted, AFK resolves ledger output with this precedence:
 `--ledger` > `AFK_LEDGER_DIR` > `./ledgers`. Preview-only `run-next` does not
 create `./ledgers`; the directory is only created when execution actually writes

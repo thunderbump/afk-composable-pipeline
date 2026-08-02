@@ -91,14 +91,16 @@ def validate_candidate(
     evidence_relative = gate_evidence
 
     _require_immutable_candidate(worktree, candidate_sha)
-    _require_trusted_harness(
-        worktree, candidate_sha, contract_identity, contract["command"]
-    )
+    _require_trusted_harness(worktree, candidate_sha, contract_identity, contract)
     with (
         tempfile.TemporaryDirectory(prefix="afk-validation-") as temporary,
         ExitStack() as cleanup,
     ):
         staging = Path(temporary)
+        trusted_root = staging / "trusted-harness"
+        command = _materialize_trusted_harness(
+            worktree, contract_identity, contract, trusted_root
+        )
         evidence = staging / "evidence"
         evidence.mkdir(mode=0o700)
         evidence_descriptor = os.open(
@@ -114,9 +116,10 @@ def validate_candidate(
             "candidate_sha": candidate_sha,
             "evidence_dir": str(evidence.resolve()),
         }
+        if "bootstrap_harness" not in contract:
+            request["candidate_path"] = str(worktree.resolve())
         request_path.write_text(canonical_json(request) + "\n", encoding="utf-8")
         request_path.chmod(0o400)
-        command = list(contract["command"])
         if "bootstrap_harness" in contract:
             harness = staging / "approved-bootstrap-harness"
             _materialize_bootstrap_harness(
@@ -131,7 +134,7 @@ def validate_candidate(
         try:
             completed = _run_contract(
                 [*command, "--request", str(request_path.resolve())],
-                cwd=worktree,
+                cwd=trusted_root if "bootstrap_harness" not in contract else worktree,
                 environment=_validation_environment(staging),
                 timeout_seconds=contract["timeout_seconds"],
             )
@@ -342,7 +345,7 @@ def _require_trusted_harness(
     worktree: Path,
     candidate_sha: str,
     identity: dict[str, str],
-    command: list[str],
+    contract: dict[str, Any],
 ) -> None:
     if identity.get("source") == "approved_bootstrap":
         approval = _bootstrap_approval(identity)
@@ -359,6 +362,7 @@ def _require_trusted_harness(
                 "invalid", "approved bootstrap harness identity has drifted"
             )
         return
+    command = contract["command"]
     executable = command[0]
     if executable.startswith("./"):
         harness_start = 0
@@ -391,6 +395,10 @@ def _require_trusted_harness(
             raise CandidateValidationError(
                 "invalid", "pinned validation harness path is invalid"
             )
+        if relative not in contract["trusted_files"]:
+            raise CandidateValidationError(
+                "invalid", "pinned validation command path is absent from trusted_files"
+            )
         trusted = tracked_regular_file_identity(
             worktree, identity["base_sha"], relative
         )
@@ -405,6 +413,63 @@ def _require_trusted_harness(
                 "invalid",
                 "Candidate validation harness differs from the trusted pinned base",
             )
+    for relative in contract["trusted_files"]:
+        trusted = tracked_regular_file_identity(
+            worktree, identity["base_sha"], relative
+        )
+        candidate = tracked_regular_file_identity(worktree, candidate_sha, relative)
+        if trusted is None or candidate is None:
+            raise CandidateValidationError(
+                "invalid", "pinned validation harness must be a regular tracked file"
+            )
+        if trusted != candidate:
+            raise CandidateValidationError(
+                "invalid",
+                "Candidate validation harness differs from the trusted pinned base",
+            )
+
+
+def _materialize_trusted_harness(
+    worktree: Path,
+    identity: dict[str, Any],
+    contract: dict[str, Any],
+    trusted_root: Path,
+) -> list[str]:
+    if identity.get("source") == "approved_bootstrap":
+        return list(contract["command"])
+    trusted_root.mkdir(mode=0o700)
+    for relative in contract["trusted_files"]:
+        observed = tracked_regular_file_identity(
+            worktree, identity["base_sha"], relative
+        )
+        if observed is None:
+            raise CandidateValidationError(
+                "invalid", "pinned validation harness must be a regular tracked file"
+            )
+        mode, blob_sha = observed
+        content = subprocess.run(
+            ["git", "cat-file", "blob", blob_sha],
+            cwd=worktree,
+            capture_output=True,
+            check=False,
+        )
+        if content.returncode != 0:
+            raise CandidateValidationError(
+                "invalid", "pinned validation harness is unavailable"
+            )
+        destination = trusted_root / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(content.stdout)
+        destination.chmod(0o500 if mode == "100755" else 0o400)
+    command = list(contract["command"])
+    executable_index = 0 if command[0].startswith("./") else 1
+    relative = command[executable_index].removeprefix("./")
+    if relative not in contract["trusted_files"]:
+        raise CandidateValidationError(
+            "invalid", "pinned validation command is absent from trusted_files"
+        )
+    command[executable_index] = str(trusted_root / relative)
+    return command
 
 
 def tracked_regular_file_identity(
