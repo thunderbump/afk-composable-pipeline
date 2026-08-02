@@ -405,6 +405,38 @@ class CandidateBrokerCliTest(unittest.TestCase):
         ):
             self.assertFalse(is_exact_clean_commit(self.candidate, self.candidate_sha))
 
+    def test_exact_candidate_rejects_same_size_in_place_mutation_during_hashing(self):
+        from afk.checkouts import is_exact_clean_commit
+
+        target = self.candidate / "input.txt"
+        real_open = os.open
+        real_fstat = os.fstat
+        opened_descriptors = []
+        target_fstats = 0
+
+        def record_target_open(path, flags, *args, **kwargs):
+            descriptor = real_open(path, flags, *args, **kwargs)
+            if not isinstance(path, int) and Path(path) == target:
+                opened_descriptors.append(descriptor)
+            return descriptor
+
+        def mutate_before_final_fstat(descriptor):
+            nonlocal target_fstats
+            if descriptor in opened_descriptors:
+                target_fstats += 1
+                if target_fstats == 2:
+                    target.write_bytes(b"mutated content\n")
+            return real_fstat(descriptor)
+
+        with (
+            mock.patch("afk.checkouts.os.open", side_effect=record_target_open),
+            mock.patch("afk.checkouts.os.fstat", side_effect=mutate_before_final_fstat),
+        ):
+            self.assertFalse(is_exact_clean_commit(self.candidate, self.candidate_sha))
+
+        self.assertEqual(target_fstats, 2)
+        self.assertEqual(target.read_bytes(), b"mutated content\n")
+
     def test_exact_candidate_rejects_executable_without_owner_execute(self):
         from afk.checkouts import is_exact_clean_commit
 

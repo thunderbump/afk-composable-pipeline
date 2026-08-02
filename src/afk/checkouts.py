@@ -658,6 +658,14 @@ def _git_regular_file_matches(
             return False
         if bool(target_stat.st_mode & stat.S_IXUSR) != (mode == b"100755"):
             return False
+        initial_metadata = (
+            target_stat.st_dev,
+            target_stat.st_ino,
+            target_stat.st_mode,
+            target_stat.st_size,
+            target_stat.st_mtime_ns,
+            target_stat.st_ctime_ns,
+        )
         digest = hashlib.sha1(usedforsecurity=False)
         digest.update(f"blob {expected_size}\0".encode("ascii"))
         with os.fdopen(descriptor, "rb", buffering=0, closefd=False) as source:
@@ -670,7 +678,15 @@ def _git_regular_file_matches(
                 remaining -= len(chunk)
             if source.read(1):
                 return False
-        if os.fstat(descriptor).st_size != expected_size:
+        final_stat = os.fstat(descriptor)
+        if (
+            final_stat.st_dev,
+            final_stat.st_ino,
+            final_stat.st_mode,
+            final_stat.st_size,
+            final_stat.st_mtime_ns,
+            final_stat.st_ctime_ns,
+        ) != initial_metadata:
             return False
     finally:
         os.close(descriptor)
