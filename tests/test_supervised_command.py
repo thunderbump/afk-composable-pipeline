@@ -41,6 +41,20 @@ class SupervisedCommandTest(unittest.TestCase):
         self.assertEqual(completed.stdout, "out:prompt\n")
         self.assertEqual(completed.stderr, "err:prompt\n")
 
+    def test_redacted_success_output_stays_within_the_byte_limit(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            completed = run_supervised_command(
+                [sys.executable, "-c", "print('password=a')"],
+                cwd=Path(temporary),
+                environment=os.environ.copy(),
+                timeout_seconds=1,
+                label="Codex",
+                output_byte_limit=11,
+            )
+
+        self.assertLessEqual(len(completed.stdout.encode("utf-8")), 11)
+        self.assertNotIn("password=a", completed.stdout)
+
     def test_timeout_remains_live_while_child_does_not_read_large_stdin(self):
         with tempfile.TemporaryDirectory() as temporary:
             started = time.monotonic()
@@ -160,6 +174,30 @@ class SupervisedCommandTest(unittest.TestCase):
         self.assertEqual(raised.exception.exit_code, -signal.SIGKILL)
         self.assertIn("SIGKILL", raised.exception.summary)
         self.assertEqual(raised.exception.stdout, "password=[REDACTED]\n")
+
+    def test_invalid_utf8_signal_diagnostics_stay_within_the_byte_limit(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            command = [
+                sys.executable,
+                "-c",
+                (
+                    "import os,signal;"
+                    "os.write(1,b'\\xff'*4);"
+                    "os.kill(os.getpid(),signal.SIGKILL)"
+                ),
+            ]
+            with self.assertRaises(CandidateValidationError) as raised:
+                run_supervised_command(
+                    command,
+                    cwd=Path(temporary),
+                    environment=os.environ.copy(),
+                    timeout_seconds=1,
+                    label="Codex",
+                    output_byte_limit=4,
+                )
+
+        self.assertEqual(raised.exception.execution_classification, "abnormal_exit")
+        self.assertLessEqual(len(raised.exception.stdout.encode("utf-8")), 4)
 
     def test_timeout_kills_detached_term_resistant_descendants_before_mutation(self):
         with tempfile.TemporaryDirectory() as temporary:

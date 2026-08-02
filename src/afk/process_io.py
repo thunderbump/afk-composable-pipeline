@@ -9,6 +9,13 @@ from typing import Any
 from afk.redaction import redact_text
 
 
+def _bounded_redacted_text(
+    value: bytes, byte_limit: int, *, errors: str = "strict"
+) -> str:
+    encoded = redact_text(value.decode("utf-8", errors=errors)).encode("utf-8")
+    return encoded[:byte_limit].decode("utf-8", errors="ignore")
+
+
 class BoundedProcessIO:
     def __init__(
         self,
@@ -76,13 +83,17 @@ class BoundedProcessIO:
 
     def diagnostics(self) -> tuple[str, str]:
         return tuple(
-            redact_text(bytes(self.captured[name]).decode("utf-8", errors="replace"))
+            _bounded_redacted_text(
+                bytes(self.captured[name]),
+                self.output_byte_limit,
+                errors="replace",
+            )
             for name in ("stdout", "stderr")
         )
 
     def decoded_output(self) -> tuple[str, str]:
         return tuple(
-            redact_text(bytes(self.captured[name]).decode("utf-8"))
+            _bounded_redacted_text(bytes(self.captured[name]), self.output_byte_limit)
             for name in ("stdout", "stderr")
         )
 

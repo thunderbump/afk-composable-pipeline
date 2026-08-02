@@ -302,6 +302,29 @@ class CandidateBrokerCliTest(unittest.TestCase):
         )
 
     @unittest.skipUnless(shutil.which("bwrap"), "bubblewrap is unavailable")
+    def test_redacted_timeout_output_stays_within_the_requested_byte_limit(self):
+        request = self.temp / "redacted-timeout-request.json"
+        result = self.temp / "redacted-timeout-result.json"
+        self.write_request(
+            request,
+            command=[
+                "/usr/bin/python3",
+                "-c",
+                "import os,time; os.write(1,b'password=a\\n');time.sleep(30)",
+            ],
+            timeout_seconds=0.1,
+            output_byte_limit=11,
+        )
+
+        completed = self.run_broker(request, result)
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        broker_result = json.loads(result.read_text(encoding="utf-8"))
+        self.assertEqual(broker_result["failure_classification"], "timeout")
+        self.assertLessEqual(len(broker_result["stdout"].encode("utf-8")), 11)
+        self.assertNotIn("password=a", broker_result["stdout"])
+
+    @unittest.skipUnless(shutil.which("bwrap"), "bubblewrap is unavailable")
     def test_each_candidate_output_stream_has_an_independent_byte_limit(self):
         for stream, descriptor in (("stdout", 1), ("stderr", 2)):
             with self.subTest(stream=stream):
