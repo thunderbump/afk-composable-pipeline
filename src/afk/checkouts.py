@@ -455,8 +455,10 @@ def _worktree_paths(
                         observed.add(relative)
                     elif child.is_dir(follow_symlinks=False):
                         child_directories.append((Path(child.path), relative))
-                    else:
+                    elif child.is_file(follow_symlinks=False):
                         observed.add(relative)
+                    else:
+                        raise ValueError("unsupported worktree entry")
         prunable = {
             relative + b"/"
             for _directory, relative in child_directories
