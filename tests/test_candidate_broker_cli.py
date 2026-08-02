@@ -66,22 +66,7 @@ class CandidateBrokerCliTest(unittest.TestCase):
         result = self.temp / "invalid-utf8-result.json"
         request.write_bytes(b"\xff")
 
-        completed = subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "afk.candidate_broker",
-                "--request",
-                str(request),
-                "--result",
-                str(result),
-            ],
-            cwd=ROOT,
-            env={**os.environ, "PYTHONPATH": str(ROOT / "src")},
-            text=True,
-            capture_output=True,
-            check=False,
-        )
+        completed = self.run_broker(request, result)
 
         self.assertEqual(completed.returncode, 2)
         self.assertEqual(completed.stderr, "candidate broker request is invalid\n")
@@ -110,22 +95,7 @@ class CandidateBrokerCliTest(unittest.TestCase):
                     encoding="utf-8",
                 )
 
-                completed = subprocess.run(
-                    [
-                        sys.executable,
-                        "-m",
-                        "afk.candidate_broker",
-                        "--request",
-                        str(request),
-                        "--result",
-                        str(result),
-                    ],
-                    cwd=ROOT,
-                    env={**os.environ, "PYTHONPATH": str(ROOT / "src")},
-                    text=True,
-                    capture_output=True,
-                    check=False,
-                )
+                completed = self.run_broker(request, result)
 
                 self.assertEqual(completed.returncode, 2)
                 self.assertEqual(
@@ -155,22 +125,7 @@ class CandidateBrokerCliTest(unittest.TestCase):
             encoding="utf-8",
         )
 
-        completed = subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "afk.candidate_broker",
-                "--request",
-                str(request),
-                "--result",
-                str(result),
-            ],
-            cwd=ROOT,
-            env={**os.environ, "PYTHONPATH": str(ROOT / "src")},
-            text=True,
-            capture_output=True,
-            check=False,
-        )
+        completed = self.run_broker(request, result)
 
         self.assertEqual(completed.returncode, 2)
         self.assertEqual(
@@ -195,22 +150,7 @@ class CandidateBrokerCliTest(unittest.TestCase):
             encoding="utf-8",
         )
 
-        completed = subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "afk.candidate_broker",
-                "--request",
-                str(request),
-                "--result",
-                str(result),
-            ],
-            cwd=ROOT,
-            env={**os.environ, "PYTHONPATH": str(ROOT / "src")},
-            text=True,
-            capture_output=True,
-            check=False,
-        )
+        completed = self.run_broker(request, result)
 
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertEqual(json.loads(result.read_text(encoding="utf-8"))["exit_code"], 0)
@@ -288,27 +228,14 @@ class CandidateBrokerCliTest(unittest.TestCase):
             encoding="utf-8",
         )
 
-        completed = subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "afk.candidate_broker",
-                "--request",
-                str(request),
-                "--result",
-                str(result),
-            ],
-            cwd=ROOT,
+        completed = self.run_broker(
+            request,
+            result,
             env={
-                **os.environ,
-                "PYTHONPATH": str(ROOT / "src"),
                 "PATH": f"{fake_bin}:{os.environ['PATH']}",
                 "XDG_STATE_HOME": str(self.temp / "state"),
                 "AFK_EVIDENCE_DIR": str(self.temp / "evidence"),
             },
-            text=True,
-            capture_output=True,
-            check=False,
         )
 
         self.assertEqual(completed.returncode, 0, completed.stderr)
@@ -356,22 +283,7 @@ class CandidateBrokerCliTest(unittest.TestCase):
                     encoding="utf-8",
                 )
 
-                completed = subprocess.run(
-                    [
-                        sys.executable,
-                        "-m",
-                        "afk.candidate_broker",
-                        "--request",
-                        str(request),
-                        "--result",
-                        str(result),
-                    ],
-                    cwd=ROOT,
-                    env={**os.environ, "PYTHONPATH": str(ROOT / "src")},
-                    text=True,
-                    capture_output=True,
-                    check=False,
-                )
+                completed = self.run_broker(request, result)
 
                 self.assertEqual(completed.returncode, 0, completed.stderr)
                 broker_result = json.loads(result.read_text(encoding="utf-8"))
@@ -412,25 +324,10 @@ class CandidateBrokerCliTest(unittest.TestCase):
         )
         git.chmod(0o755)
 
-        completed = subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "afk.candidate_broker",
-                "--request",
-                str(request),
-                "--result",
-                str(result),
-            ],
-            cwd=ROOT,
-            env={
-                **os.environ,
-                "PYTHONPATH": str(ROOT / "src"),
-                "PATH": f"{fake_bin}:{os.environ['PATH']}",
-            },
-            text=True,
-            capture_output=True,
-            check=False,
+        completed = self.run_broker(
+            request,
+            result,
+            env={"PATH": f"{fake_bin}:{os.environ['PATH']}"},
         )
 
         self.assertEqual(completed.returncode, 2)
@@ -483,22 +380,7 @@ class CandidateBrokerCliTest(unittest.TestCase):
             encoding="utf-8",
         )
 
-        completed = subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "afk.candidate_broker",
-                "--request",
-                str(request),
-                "--result",
-                str(result),
-            ],
-            cwd=ROOT,
-            env={**os.environ, "PYTHONPATH": str(ROOT / "src")},
-            text=True,
-            capture_output=True,
-            check=False,
-        )
+        completed = self.run_broker(request, result)
 
         self.assertEqual(completed.returncode, 0, completed.stderr)
         broker_result = json.loads(result.read_text(encoding="utf-8"))
@@ -557,7 +439,19 @@ class CandidateBrokerCliTest(unittest.TestCase):
             encoding="utf-8",
         )
 
-        completed = subprocess.run(
+        completed = self.run_broker(request, result)
+
+        self.assertEqual(completed.returncode, 2)
+        self.assertEqual(
+            completed.stderr,
+            "exact Candidate snapshot contains an unsupported entry\n",
+        )
+        self.assertFalse(result.exists())
+
+    def run_broker(self, request, result, *, env=None):
+        broker_env = {**os.environ, "PYTHONPATH": str(ROOT / "src")}
+        broker_env.update(env or {})
+        return subprocess.run(
             [
                 sys.executable,
                 "-m",
@@ -568,18 +462,11 @@ class CandidateBrokerCliTest(unittest.TestCase):
                 str(result),
             ],
             cwd=ROOT,
-            env={**os.environ, "PYTHONPATH": str(ROOT / "src")},
+            env=broker_env,
             text=True,
             capture_output=True,
             check=False,
         )
-
-        self.assertEqual(completed.returncode, 2)
-        self.assertEqual(
-            completed.stderr,
-            "exact Candidate snapshot contains an unsupported entry\n",
-        )
-        self.assertFalse(result.exists())
 
     def git(self, *args):
         completed = subprocess.run(
