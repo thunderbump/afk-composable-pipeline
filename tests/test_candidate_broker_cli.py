@@ -169,6 +169,19 @@ class CandidateBrokerCliTest(unittest.TestCase):
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertEqual(json.loads(result.read_text(encoding="utf-8"))["exit_code"], 0)
 
+    def test_candidate_stdin_is_closed_instead_of_inherited_from_the_broker(self):
+        request = self.temp / "stdin-request.json"
+        result = self.temp / "stdin-result.json"
+        self.write_request(request, command=["/bin/cat"])
+
+        completed = self.run_broker(request, result, input_text="host sentinel\n")
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        broker_result = json.loads(result.read_text(encoding="utf-8"))
+        self.assertEqual(broker_result["status"], "completed")
+        self.assertEqual(broker_result["exit_code"], 0, broker_result["stderr"])
+        self.assertEqual(broker_result["stdout"], "")
+
     def test_success_atomically_replaces_a_result_symlink_without_following_it(self):
         request = self.temp / "atomic-request.json"
         result = self.temp / "atomic-result.json"
@@ -543,7 +556,7 @@ class CandidateBrokerCliTest(unittest.TestCase):
             encoding="utf-8",
         )
 
-    def run_broker(self, request, result, *, env=None):
+    def run_broker(self, request, result, *, env=None, input_text=None):
         broker_env = {**os.environ, "PYTHONPATH": str(ROOT / "src")}
         broker_env.update(env or {})
         return subprocess.run(
@@ -558,6 +571,7 @@ class CandidateBrokerCliTest(unittest.TestCase):
             ],
             cwd=ROOT,
             env=broker_env,
+            input=input_text,
             text=True,
             capture_output=True,
             check=False,

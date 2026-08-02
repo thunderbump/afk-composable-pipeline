@@ -112,6 +112,7 @@ def run_candidate(request: dict[str, Any]) -> dict[str, Any]:
             ],
             capture_output=True,
             check=False,
+            stdin=subprocess.DEVNULL,
         )
     return {
         "schema_version": SCHEMA_VERSION,
