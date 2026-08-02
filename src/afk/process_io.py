@@ -37,6 +37,7 @@ class BoundedProcessIO:
         self.captured_bytes = 0
         self.capture_lock = threading.Lock()
         self.overflow = threading.Event()
+        self._reader_failed = False
         if process.stdin is not None:
             os.set_blocking(process.stdin.fileno(), False)
         self.readers = [
@@ -56,6 +57,11 @@ class BoundedProcessIO:
     @property
     def overflowed(self) -> bool:
         return self.overflow.is_set()
+
+    @property
+    def reader_failed(self) -> bool:
+        with self.capture_lock:
+            return self._reader_failed
 
     def observe(self, deadline: float) -> str | None:
         if self.overflowed:
@@ -130,5 +136,8 @@ class BoundedProcessIO:
                         self.overflow.set()
                     elif not self.overflowed:
                         captured.extend(chunk)
+        except OSError:
+            with self.capture_lock:
+                self._reader_failed = True
         finally:
             stream.close()

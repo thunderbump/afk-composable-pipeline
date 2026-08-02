@@ -92,6 +92,11 @@ def run_supervised_command(
                         "supervision_failure",
                         f"{subject} output streams could not be drained",
                     )
+                if process_io.reader_failed:
+                    raise SupervisedCommandError(
+                        "supervision_failure",
+                        f"{subject} output streams could not be read",
+                    )
                 stdout, stderr = process_io.diagnostics()
                 raise SupervisedCommandError(
                     "timeout",
@@ -108,6 +113,11 @@ def run_supervised_command(
             raise SupervisedCommandError(
                 "supervision_failure",
                 f"{subject} output streams could not be drained",
+            )
+        if process_io.reader_failed:
+            raise SupervisedCommandError(
+                "supervision_failure",
+                f"{subject} output streams could not be read",
             )
         if process_io.overflowed:
             stdout, stderr = process_io.diagnostics()

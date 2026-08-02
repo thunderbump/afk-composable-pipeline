@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 import afk.process_supervision as process_supervision  # noqa: E402
+from afk import process_io  # noqa: E402
 from afk.process_supervision import (  # noqa: E402
     SupervisedCommandError,
     run_supervised_command,
@@ -21,6 +22,29 @@ from afk.process_supervision import (  # noqa: E402
 
 
 class SupervisedCommandTest(unittest.TestCase):
+    def test_output_read_failure_is_a_neutral_supervision_failure(self):
+        real_read = process_io.os.read
+
+        def fail_reader_read(descriptor, byte_count):
+            if threading.current_thread() is not threading.main_thread():
+                raise OSError("read failed")
+            return real_read(descriptor, byte_count)
+
+        with (
+            mock.patch.object(process_io.os, "read", side_effect=fail_reader_read),
+            self.assertRaises(SupervisedCommandError) as raised,
+        ):
+            run_supervised_command(
+                [sys.executable, "-c", "print('must not be truncated')"],
+                cwd=Path.cwd(),
+                environment=os.environ.copy(),
+                timeout_seconds=1,
+                label="Codex",
+            )
+
+        self.assertEqual(raised.exception.classification, "supervision_failure")
+        self.assertIn("output streams could not be read", raised.exception.summary)
+
     def test_baseline_failure_restores_subreaper_state_and_releases_lock(self):
         libc = ctypes.CDLL(None, use_errno=True)
         initial_subreaper = ctypes.c_int()
