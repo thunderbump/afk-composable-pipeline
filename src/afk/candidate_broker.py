@@ -141,7 +141,7 @@ def run_candidate(request: dict[str, Any]) -> dict[str, Any]:
             cleanup_watchdog = _start_container_cleanup_watchdog(
                 container_runtime, container_name
             )
-        interrupted_cleanup = container_name is not None
+        container_cleanup_required = container_name is not None
         container_started = False
         try:
             completed = run_supervised_command(
@@ -176,7 +176,7 @@ def run_candidate(request: dict[str, Any]) -> dict[str, Any]:
                 container_id_path is not None and container_id_path.is_file()
             )
         except OSError:
-            interrupted_cleanup = False
+            container_cleanup_required = False
             return _failed_execution_result(
                 request["candidate_sha"],
                 "launch_failure",
@@ -201,7 +201,7 @@ def run_candidate(request: dict[str, Any]) -> dict[str, Any]:
             )
         finally:
             if cleanup_watchdog is not None:
-                if interrupted_cleanup or container_started:
+                if container_cleanup_required:
                     try:
                         _remove_container(container_runtime, container_name)
                     except BaseException:
