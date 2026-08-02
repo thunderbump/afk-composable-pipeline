@@ -477,7 +477,8 @@ class CandidateBrokerCliTest(unittest.TestCase):
         self.git("add", ".gitignore")
         self.git("commit", "-m", "ignore generated logs")
         self.candidate_sha = self.git("rev-parse", "HEAD")
-        path_limit = checkouts.EXACT_CANDIDATE_UNTRACKED_PATH_LIMIT
+        path_limit = 4
+        byte_limit = 1024
         for index in range(path_limit + 1):
             (self.candidate / f"generated-{index}.log").write_bytes(b"")
         real_run_trusted_read_git = checkouts.run_trusted_read_git
@@ -489,9 +490,17 @@ class CandidateBrokerCliTest(unittest.TestCase):
                 oversized_requests.append(input_data.count(b"\0"))
             return real_run_trusted_read_git(args, **kwargs)
 
-        with mock.patch(
-            "afk.checkouts.run_trusted_read_git",
-            side_effect=record_ignore_request,
+        with (
+            mock.patch.object(
+                checkouts, "EXACT_CANDIDATE_UNTRACKED_PATH_LIMIT", path_limit
+            ),
+            mock.patch.object(
+                checkouts, "EXACT_CANDIDATE_UNTRACKED_BYTES_LIMIT", byte_limit
+            ),
+            mock.patch(
+                "afk.checkouts.run_trusted_read_git",
+                side_effect=record_ignore_request,
+            ),
         ):
             self.assertFalse(
                 checkouts.is_exact_clean_commit(self.candidate, self.candidate_sha)
