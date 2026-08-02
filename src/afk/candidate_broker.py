@@ -1,14 +1,13 @@
 from __future__ import annotations
 
 import argparse
-import io
 import json
+import os
 import shutil
 import subprocess
 import sys
-import tarfile
 import tempfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from afk.checkouts import is_exact_clean_commit
@@ -126,19 +125,51 @@ def _require_exact_candidate(candidate: Path, candidate_sha: str) -> None:
 def _materialize_candidate_snapshot(
     candidate: Path, candidate_sha: str, destination: Path
 ) -> None:
-    archive = subprocess.run(
-        ["git", "archive", "--format=tar", candidate_sha],
+    listing = subprocess.run(
+        ["git", "ls-tree", "-rz", "--full-tree", candidate_sha],
         cwd=candidate,
         capture_output=True,
         check=False,
     )
-    if archive.returncode != 0:
+    if listing.returncode != 0:
         raise CandidateBrokerError("exact Candidate snapshot is unavailable")
     destination.mkdir(mode=0o700)
     try:
-        with tarfile.open(fileobj=io.BytesIO(archive.stdout), mode="r:") as stream:
-            stream.extractall(destination, filter="data")
-    except (OSError, tarfile.TarError, ValueError) as exc:
+        records = listing.stdout.rstrip(b"\0").split(b"\0") if listing.stdout else []
+        for record in records:
+            metadata, path_bytes = record.split(b"\t", 1)
+            mode, object_type, object_id = metadata.split()
+            if (mode, object_type) not in {
+                (b"100644", b"blob"),
+                (b"100755", b"blob"),
+                (b"120000", b"blob"),
+            }:
+                raise CandidateBrokerError(
+                    "exact Candidate snapshot contains an unsupported entry"
+                )
+            relative = PurePosixPath(os.fsdecode(path_bytes))
+            if relative.is_absolute() or any(
+                part in {"", ".", ".."} for part in relative.parts
+            ):
+                raise CandidateBrokerError("exact Candidate snapshot path is invalid")
+            blob = subprocess.run(
+                ["git", "cat-file", "blob", object_id],
+                cwd=candidate,
+                capture_output=True,
+                check=False,
+            )
+            if blob.returncode != 0:
+                raise CandidateBrokerError("exact Candidate snapshot is unavailable")
+            target = destination.joinpath(*relative.parts)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if mode == b"120000":
+                os.symlink(os.fsdecode(blob.stdout), target)
+            else:
+                target.write_bytes(blob.stdout)
+                target.chmod(0o755 if mode == b"100755" else 0o644)
+    except CandidateBrokerError:
+        raise
+    except (OSError, ValueError) as exc:
         raise CandidateBrokerError("exact Candidate snapshot is invalid") from exc
 
 

@@ -206,7 +206,7 @@ class CandidateBrokerCliTest(unittest.TestCase):
                 import os
                 import sys
 
-                if sys.argv[1:2] == ["archive"]:
+                if sys.argv[1:2] == ["ls-tree"]:
                     raise SystemExit(1)
                 os.execv({real_git!r}, [{real_git!r}, *sys.argv[1:]])
                 """
@@ -238,6 +238,150 @@ class CandidateBrokerCliTest(unittest.TestCase):
 
         self.assertEqual(completed.returncode, 2)
         self.assertEqual(completed.stderr, "exact Candidate snapshot is unavailable\n")
+        self.assertFalse(result.exists())
+
+    def test_materializes_exact_blobs_without_archive_attribute_rewrites(self):
+        (self.candidate / ".gitattributes").write_text(
+            "ignored.txt export-ignore\nsubstituted.txt export-subst\n",
+            encoding="utf-8",
+        )
+        (self.candidate / "ignored.txt").write_text(
+            "committed but export-ignored\n", encoding="utf-8"
+        )
+        (self.candidate / "substituted.txt").write_text(
+            "$Format:%H$\n", encoding="utf-8"
+        )
+        executable = self.candidate / "executable.sh"
+        executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        executable.chmod(0o755)
+        (self.candidate / "executable-link").symlink_to("executable.sh")
+        self.git("add", ".")
+        self.git("commit", "-m", "add archive attributes")
+        self.candidate_sha = self.git("rev-parse", "HEAD")
+        request = self.temp / "attributes-request.json"
+        result = self.temp / "attributes-result.json"
+        request.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "candidate_sha": self.candidate_sha,
+                    "candidate_path": str(self.candidate),
+                    "command": [
+                        "/usr/bin/python3",
+                        "-c",
+                        (
+                            "from pathlib import Path; "
+                            'print(Path("/candidate/ignored.txt").read_text(), '
+                            'end=""); '
+                            'print(Path("/candidate/substituted.txt").read_text(), '
+                            'end=""); '
+                            "import os, stat; "
+                            "print(oct(stat.S_IMODE(os.lstat("
+                            '"/candidate/executable.sh").st_mode))); '
+                            'print(os.readlink("/candidate/executable-link"))'
+                        ),
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "afk.candidate_broker",
+                "--request",
+                str(request),
+                "--result",
+                str(result),
+            ],
+            cwd=ROOT,
+            env={**os.environ, "PYTHONPATH": str(ROOT / "src")},
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        broker_result = json.loads(result.read_text(encoding="utf-8"))
+        self.assertEqual(broker_result["exit_code"], 0, broker_result["stderr"])
+        self.assertEqual(
+            broker_result["stdout"],
+            "committed but export-ignored\n$Format:%H$\n0o755\nexecutable.sh\n",
+        )
+
+    def test_rejects_gitlinks_instead_of_materializing_an_incomplete_tree(self):
+        submodule = self.temp / "submodule"
+        submodule.mkdir()
+        subprocess.run(
+            ["git", "init", "-b", "main"],
+            cwd=submodule,
+            capture_output=True,
+            check=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.email", "afk@example.invalid"],
+            cwd=submodule,
+            check=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "AFK Test"], cwd=submodule, check=True
+        )
+        (submodule / "input.txt").write_text("submodule\n", encoding="utf-8")
+        subprocess.run(["git", "add", "."], cwd=submodule, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "submodule"],
+            cwd=submodule,
+            capture_output=True,
+            check=True,
+        )
+        self.git(
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            str(submodule),
+            "nested",
+        )
+        self.git("commit", "-m", "add gitlink")
+        self.candidate_sha = self.git("rev-parse", "HEAD")
+        request = self.temp / "gitlink-request.json"
+        result = self.temp / "gitlink-result.json"
+        request.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "candidate_sha": self.candidate_sha,
+                    "candidate_path": str(self.candidate),
+                    "command": ["/usr/bin/true"],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "afk.candidate_broker",
+                "--request",
+                str(request),
+                "--result",
+                str(result),
+            ],
+            cwd=ROOT,
+            env={**os.environ, "PYTHONPATH": str(ROOT / "src")},
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(completed.returncode, 2)
+        self.assertEqual(
+            completed.stderr,
+            "exact Candidate snapshot contains an unsupported entry\n",
+        )
         self.assertFalse(result.exists())
 
     def git(self, *args):
