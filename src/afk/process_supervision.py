@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import base64
 import ctypes
+import json
 import os
 import select
 import signal
+import socket
+import struct
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -20,6 +25,8 @@ _PROCESS_CLEANUP_SECONDS = 1
 _PR_SET_CHILD_SUBREAPER = 36
 _PR_GET_CHILD_SUBREAPER = 37
 _SUPERVISOR_LOCK = threading.Lock()
+_HELPER_PATH = Path(__file__).with_name("process_supervision_helper.py")
+_PROTOCOL_BYTE_LIMIT = 256 * 1024 * 1024
 
 
 class SupervisedCommandError(RuntimeError):
@@ -41,6 +48,96 @@ class SupervisedCommandError(RuntimeError):
 
 
 def run_supervised_command(
+    command: list[str],
+    *,
+    cwd: Path,
+    environment: dict[str, str],
+    timeout_seconds: float,
+    input_text: str | None = None,
+    label: str,
+    output_byte_limit: int | None = None,
+    cleanup_seconds: float | None = None,
+    decode_errors: str = "strict",
+) -> subprocess.CompletedProcess[str]:
+    request = {
+        "schema_version": 1,
+        "command": command,
+        "cwd": str(cwd),
+        "environment": environment,
+        "timeout_seconds": timeout_seconds,
+        "input_text": _encode_protocol_text(input_text),
+        "label": label,
+        "output_byte_limit": output_byte_limit,
+        "cleanup_seconds": cleanup_seconds,
+        "decode_errors": decode_errors,
+    }
+    try:
+        parent_socket, helper_socket = socket.socketpair()
+    except OSError as exc:
+        raise SupervisedCommandError(
+            "supervision_failure", "command supervision helper is unavailable"
+        ) from exc
+    try:
+        try:
+            helper = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-I",
+                    str(_HELPER_PATH),
+                    str(helper_socket.fileno()),
+                    str(os.getpid()),
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                env={
+                    "LANG": "C.UTF-8",
+                    "LC_ALL": "C.UTF-8",
+                    "PATH": os.defpath,
+                },
+                pass_fds=(helper_socket.fileno(),),
+                start_new_session=True,
+            )
+        except OSError as exc:
+            raise SupervisedCommandError(
+                "supervision_failure", "command supervision helper is unavailable"
+            ) from exc
+        finally:
+            helper_socket.close()
+        try:
+            effective_cleanup = (
+                _PROCESS_CLEANUP_SECONDS if cleanup_seconds is None else cleanup_seconds
+            )
+            parent_socket.settimeout(
+                max(float(timeout_seconds), 0) + 4 * effective_cleanup + 5
+            )
+            _send_protocol_message(parent_socket, request)
+            response = _receive_protocol_message(parent_socket)
+            returncode = helper.wait(timeout=5)
+        except BaseException as exc:
+            _terminate_helper(helper, cleanup_seconds)
+            if not isinstance(exc, Exception):
+                raise
+            raise SupervisedCommandError(
+                "supervision_failure", "command supervision helper protocol failed"
+            ) from exc
+        if returncode != 0:
+            raise SupervisedCommandError(
+                "supervision_failure", "command supervision helper failed"
+            )
+    finally:
+        parent_socket.close()
+    try:
+        return _decode_helper_response(command, response)
+    except (OSError, SupervisedCommandError):
+        raise
+    except Exception as exc:
+        raise SupervisedCommandError(
+            "supervision_failure", "command supervision helper protocol failed"
+        ) from exc
+
+
+def _run_supervised_command_local(
     command: list[str],
     *,
     cwd: Path,
@@ -153,6 +250,105 @@ def run_supervised_command(
                 stderr=diagnostic_stderr,
             ) from exc
         return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+
+
+def _encode_protocol_text(value: str | None) -> str | None:
+    if value is None:
+        return None
+    return base64.b64encode(value.encode("utf-8")).decode("ascii")
+
+
+def _decode_protocol_text(value: object) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError("invalid protocol text")
+    return base64.b64decode(value, validate=True).decode("utf-8")
+
+
+def _send_protocol_message(channel: socket.socket, value: object) -> None:
+    payload = json.dumps(
+        value, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    if len(payload) > _PROTOCOL_BYTE_LIMIT:
+        raise ValueError("supervision protocol message is too large")
+    channel.sendall(struct.pack("!Q", len(payload)) + payload)
+
+
+def _receive_protocol_message(channel: socket.socket) -> object:
+    header = _receive_protocol_bytes(channel, 8)
+    size = struct.unpack("!Q", header)[0]
+    if size > _PROTOCOL_BYTE_LIMIT:
+        raise ValueError("supervision protocol message is too large")
+    return json.loads(_receive_protocol_bytes(channel, size).decode("utf-8"))
+
+
+def _receive_protocol_bytes(channel: socket.socket, size: int) -> bytes:
+    chunks = bytearray()
+    while len(chunks) < size:
+        chunk = channel.recv(size - len(chunks))
+        if not chunk:
+            raise EOFError("supervision protocol message ended early")
+        chunks.extend(chunk)
+    return bytes(chunks)
+
+
+def _terminate_helper(
+    helper: subprocess.Popen[bytes], cleanup_seconds: float | None
+) -> None:
+    if helper.poll() is not None:
+        return
+    helper.terminate()
+    try:
+        helper.wait(timeout=4 * (cleanup_seconds or _PROCESS_CLEANUP_SECONDS) + 5)
+    except subprocess.TimeoutExpired:
+        helper.kill()
+        helper.wait()
+
+
+def _decode_helper_response(
+    command: list[str], response: object
+) -> subprocess.CompletedProcess[str]:
+    if not isinstance(response, dict) or response.get("schema_version") != 1:
+        raise SupervisedCommandError(
+            "supervision_failure", "command supervision helper protocol failed"
+        )
+    status = response.get("status")
+    if status == "completed":
+        returncode = response.get("returncode")
+        stdout = _decode_protocol_text(response.get("stdout"))
+        stderr = _decode_protocol_text(response.get("stderr"))
+        if type(returncode) is not int or stdout is None or stderr is None:
+            raise SupervisedCommandError(
+                "supervision_failure", "command supervision helper protocol failed"
+            )
+        return subprocess.CompletedProcess(command, returncode, stdout, stderr)
+    if status == "command_launch_error":
+        raise OSError("supervised command could not be launched")
+    if status != "supervised_error":
+        raise SupervisedCommandError(
+            "supervision_failure", "command supervision helper protocol failed"
+        )
+    classification = response.get("classification")
+    summary = response.get("summary")
+    exit_code = response.get("exit_code")
+    stdout = _decode_protocol_text(response.get("stdout"))
+    stderr = _decode_protocol_text(response.get("stderr"))
+    if (
+        not isinstance(classification, str)
+        or not isinstance(summary, str)
+        or (exit_code is not None and type(exit_code) is not int)
+    ):
+        raise SupervisedCommandError(
+            "supervision_failure", "command supervision helper protocol failed"
+        )
+    raise SupervisedCommandError(
+        classification,
+        summary,
+        stdout=stdout,
+        stderr=stderr,
+        exit_code=exit_code,
+    )
 
 
 class _LinuxDescendantSupervisor:

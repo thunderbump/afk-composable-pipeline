@@ -22,6 +22,192 @@ from afk.process_supervision import (  # noqa: E402
 
 
 class SupervisedCommandTest(unittest.TestCase):
+    def test_helper_launch_failure_is_a_neutral_supervision_failure(self):
+        with (
+            mock.patch.object(
+                process_supervision.subprocess,
+                "Popen",
+                side_effect=OSError("unavailable"),
+            ),
+            self.assertRaises(SupervisedCommandError) as raised,
+        ):
+            run_supervised_command(
+                [sys.executable, "-c", "print('not launched')"],
+                cwd=Path.cwd(),
+                environment=os.environ.copy(),
+                timeout_seconds=1,
+                label="Codex",
+            )
+
+        self.assertEqual(raised.exception.classification, "supervision_failure")
+        self.assertIn("helper is unavailable", raised.exception.summary)
+
+    def test_helper_protocol_failure_cleans_detached_descendants(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            ready = root / "detached-ready"
+            late_mutation = root / "late-mutation"
+            child = (
+                "import signal,time;"
+                "signal.signal(signal.SIGTERM,signal.SIG_IGN);"
+                f"open({str(ready)!r},'w').write('ready');"
+                "time.sleep(0.5);"
+                f"open({str(late_mutation)!r},'w').write('mutated')"
+            )
+            command = (
+                "import subprocess,sys,time;"
+                f"subprocess.Popen([sys.executable,'-c',{child!r}],"
+                "start_new_session=True);"
+                "time.sleep(30)"
+            )
+
+            def fail_after_detach(_channel):
+                deadline = time.monotonic() + 1
+                while not ready.exists() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                if not ready.exists():
+                    raise AssertionError("detached child was not launched")
+                raise ValueError("invalid protocol")
+
+            with (
+                mock.patch.object(
+                    process_supervision,
+                    "_receive_protocol_message",
+                    side_effect=fail_after_detach,
+                ),
+                self.assertRaises(SupervisedCommandError) as raised,
+            ):
+                run_supervised_command(
+                    [sys.executable, "-c", command],
+                    cwd=root,
+                    environment=os.environ.copy(),
+                    timeout_seconds=2,
+                    label="Codex",
+                    cleanup_seconds=0.1,
+                )
+
+            self.assertEqual(raised.exception.classification, "supervision_failure")
+            time.sleep(0.7)
+            self.assertFalse(late_mutation.exists())
+
+    def test_helper_cleans_detached_descendants_after_parent_death(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            ready = root / "parent-death-ready"
+            late_mutation = root / "parent-death-mutation"
+            child = (
+                "import signal,time;"
+                "signal.signal(signal.SIGTERM,signal.SIG_IGN);"
+                f"open({str(ready)!r},'w').write('ready');"
+                "time.sleep(0.5);"
+                f"open({str(late_mutation)!r},'w').write('mutated')"
+            )
+            command = (
+                "import subprocess,sys,time;"
+                f"subprocess.Popen([sys.executable,'-c',{child!r}],"
+                "start_new_session=True);"
+                "time.sleep(30)"
+            )
+            caller = (
+                "import os,sys; from pathlib import Path;"
+                "from afk.process_supervision import run_supervised_command;"
+                f"run_supervised_command([sys.executable,'-c',{command!r}],"
+                f"cwd=Path({str(root)!r}),environment=os.environ.copy(),"
+                "timeout_seconds=30,label='Codex',cleanup_seconds=0.1)"
+            )
+            environment = os.environ.copy()
+            environment["PYTHONPATH"] = str(ROOT / "src")
+            parent = process_supervision.subprocess.Popen(
+                [sys.executable, "-c", caller],
+                env=environment,
+                stdin=process_supervision.subprocess.DEVNULL,
+                stdout=process_supervision.subprocess.DEVNULL,
+                stderr=process_supervision.subprocess.DEVNULL,
+            )
+            try:
+                deadline = time.monotonic() + 2
+                while not ready.exists() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertTrue(ready.exists())
+                parent.kill()
+                parent.wait(timeout=2)
+                time.sleep(0.7)
+                self.assertFalse(late_mutation.exists())
+            finally:
+                if parent.poll() is None:
+                    parent.kill()
+                    parent.wait(timeout=2)
+
+    def test_protocol_round_trips_os_surrogate_arguments(self):
+        argument = os.fsdecode(b"\xff")
+        completed = run_supervised_command(
+            [
+                sys.executable,
+                "-c",
+                "import os,sys; print(os.fsencode(sys.argv[1]).hex())",
+                argument,
+            ],
+            cwd=Path.cwd(),
+            environment=os.environ.copy(),
+            timeout_seconds=1,
+            label="Codex",
+        )
+
+        self.assertEqual(completed.stdout, "ff\n")
+
+    def test_supervised_cleanup_does_not_terminate_an_unrelated_host_child(self):
+        result = []
+        failures = []
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            supervised_ready = root / "supervised-ready"
+            release_supervised = root / "release-supervised"
+            command = (
+                "import pathlib,time;"
+                f"ready=pathlib.Path({str(supervised_ready)!r});"
+                f"release=pathlib.Path({str(release_supervised)!r});"
+                "ready.write_text('ready');"
+                "\nwhile not release.exists(): time.sleep(0.01)"
+            )
+
+            def invoke_supervised():
+                try:
+                    result.append(
+                        run_supervised_command(
+                            [sys.executable, "-c", command],
+                            cwd=root,
+                            environment=os.environ.copy(),
+                            timeout_seconds=2,
+                            label="Codex",
+                        )
+                    )
+                except BaseException as exc:
+                    failures.append(exc)
+
+            supervised = threading.Thread(target=invoke_supervised)
+            supervised.start()
+            deadline = time.monotonic() + 1
+            while not supervised_ready.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(supervised_ready.exists())
+            unrelated = process_supervision.subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(30)"],
+                stdin=process_supervision.subprocess.DEVNULL,
+                stdout=process_supervision.subprocess.DEVNULL,
+                stderr=process_supervision.subprocess.DEVNULL,
+            )
+            try:
+                release_supervised.write_text("release\n", encoding="utf-8")
+                supervised.join(4)
+                self.assertFalse(supervised.is_alive())
+                self.assertEqual(failures, [])
+                self.assertEqual(result[0].returncode, 0)
+                self.assertIsNone(unrelated.poll())
+            finally:
+                if unrelated.poll() is None:
+                    unrelated.terminate()
+                unrelated.wait(timeout=2)
+
     def test_output_read_failure_is_a_neutral_supervision_failure(self):
         real_read = process_io.os.read
 
@@ -35,7 +221,7 @@ class SupervisedCommandTest(unittest.TestCase):
             mock.patch.object(process_io.os, "read", side_effect=fail_reader_read),
             self.assertRaises(SupervisedCommandError) as raised,
         ):
-            run_supervised_command(
+            process_supervision._run_supervised_command_local(
                 [sys.executable, "-c", "import time; time.sleep(30)"],
                 cwd=Path.cwd(),
                 environment=os.environ.copy(),
@@ -66,7 +252,7 @@ class SupervisedCommandTest(unittest.TestCase):
             ),
             self.assertRaises(SupervisedCommandError) as raised,
         ):
-            run_supervised_command(
+            process_supervision._run_supervised_command_local(
                 [sys.executable, "-c", "print('not launched')"],
                 cwd=Path.cwd(),
                 environment=os.environ.copy(),
@@ -87,115 +273,58 @@ class SupervisedCommandTest(unittest.TestCase):
         )
         self.assertEqual(completed.stdout, "released\n")
 
-    def test_lock_queue_time_does_not_consume_the_execution_timeout(self):
-        class ObservedLock:
-            def __init__(self):
-                self.lock = threading.Lock()
-                self.state_lock = threading.Lock()
-                self.held = False
-                self.waiting = threading.Event()
-
-            def acquire(self):
-                with self.state_lock:
-                    if self.held:
-                        self.waiting.set()
-                self.lock.acquire()
-                with self.state_lock:
-                    self.held = True
-
-            def release(self):
-                with self.state_lock:
-                    self.held = False
-                self.lock.release()
-
+    def test_concurrent_calls_have_isolated_process_ownership(self):
+        results = {}
+        failures = []
         libc = ctypes.CDLL(None, use_errno=True)
         initial_subreaper = ctypes.c_int()
         self.assertEqual(
             libc.prctl(37, ctypes.byref(initial_subreaper), 0, 0, 0),
             0,
         )
-        observed_lock = ObservedLock()
-        first_launched = threading.Event()
-        second_launched = threading.Event()
-        results = {}
-        failures = []
-        real_popen = process_supervision.subprocess.Popen
-
-        def observed_popen(*args, **kwargs):
-            if first_launched.is_set():
-                second_launched.set()
-            else:
-                first_launched.set()
-            return real_popen(*args, **kwargs)
-
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
+            first_ready = root / "first-ready"
             release_first = root / "release-first"
+            first_command = (
+                "import pathlib,time;"
+                f"ready=pathlib.Path({str(first_ready)!r});"
+                f"release=pathlib.Path({str(release_first)!r});"
+                "ready.write_text('ready');"
+                "\nwhile not release.exists(): time.sleep(0.01);"
+                "\nprint('first')"
+            )
 
-            def invoke(name, command, timeout_seconds):
+            def invoke_first():
                 try:
-                    results[name] = run_supervised_command(
-                        command,
+                    results["first"] = run_supervised_command(
+                        [sys.executable, "-c", first_command],
                         cwd=root,
                         environment=os.environ.copy(),
-                        timeout_seconds=timeout_seconds,
-                        label=name,
+                        timeout_seconds=3,
+                        label="first",
                     )
                 except BaseException as exc:
                     failures.append(exc)
 
-            first = threading.Thread(
-                target=invoke,
-                args=(
-                    "first",
-                    [
-                        sys.executable,
-                        "-c",
-                        (
-                            "import pathlib,time;"
-                            f"marker=pathlib.Path({str(release_first)!r});"
-                            "\nwhile not marker.exists(): time.sleep(0.01);"
-                            "\nprint('first')"
-                        ),
-                    ],
-                    3,
-                ),
+            first = threading.Thread(target=invoke_first)
+            first.start()
+            deadline = time.monotonic() + 1
+            while not first_ready.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(first_ready.exists())
+            results["second"] = run_supervised_command(
+                [sys.executable, "-c", "print('second')"],
+                cwd=root,
+                environment=os.environ.copy(),
+                timeout_seconds=1,
+                label="second",
             )
-            second = threading.Thread(
-                target=invoke,
-                args=(
-                    "second",
-                    [sys.executable, "-c", "print('second')"],
-                    0.05,
-                ),
-            )
-            with (
-                mock.patch.object(
-                    process_supervision,
-                    "_SUPERVISOR_LOCK",
-                    observed_lock,
-                    create=True,
-                ),
-                mock.patch.object(
-                    process_supervision.subprocess,
-                    "Popen",
-                    side_effect=observed_popen,
-                ),
-            ):
-                first.start()
-                self.assertTrue(first_launched.wait(1))
-                second.start()
-                overlap_was_serialized = observed_lock.waiting.wait(1)
-                second_was_held = not second_launched.is_set()
-                time.sleep(0.1)
-                release_first.write_text("release\n", encoding="utf-8")
-                first.join(4)
-                second.join(4)
+            self.assertTrue(first.is_alive())
+            release_first.write_text("release\n", encoding="utf-8")
+            first.join(4)
 
-        self.assertTrue(overlap_was_serialized)
-        self.assertTrue(second_was_held)
         self.assertFalse(first.is_alive())
-        self.assertFalse(second.is_alive())
         self.assertEqual(failures, [])
         self.assertEqual(results["first"].stdout, "first\n")
         self.assertEqual(results["second"].stdout, "second\n")
@@ -291,7 +420,7 @@ class SupervisedCommandTest(unittest.TestCase):
                     SupervisedCommandError, "supervision is unavailable"
                 ),
             ):
-                run_supervised_command(
+                process_supervision._run_supervised_command_local(
                     [sys.executable, "-c", command],
                     cwd=root,
                     environment=os.environ.copy(),
