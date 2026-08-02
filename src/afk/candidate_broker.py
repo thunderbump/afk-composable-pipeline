@@ -10,7 +10,7 @@ import tempfile
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from afk.checkouts import is_exact_clean_commit
+from afk.checkouts import is_exact_clean_commit, run_trusted_read_git
 from afk.jsonutil import canonical_json
 
 
@@ -123,12 +123,9 @@ def _read_request(path: Path) -> dict[str, Any]:
 
 def _require_exact_candidate(candidate: Path, candidate_sha: str) -> None:
     try:
-        top_level = subprocess.run(
-            ["git", "rev-parse", "--show-toplevel"],
+        top_level = run_trusted_read_git(
+            ["rev-parse", "--show-toplevel"],
             cwd=candidate,
-            text=True,
-            capture_output=True,
-            check=False,
         )
     except OSError as exc:
         raise CandidateBrokerError("Candidate repository root is unavailable") from exc
@@ -150,11 +147,10 @@ def _require_exact_candidate(candidate: Path, candidate_sha: str) -> None:
 def _materialize_candidate_snapshot(
     candidate: Path, candidate_sha: str, destination: Path
 ) -> None:
-    listing = subprocess.run(
-        ["git", "ls-tree", "-rz", "--full-tree", candidate_sha],
+    listing = run_trusted_read_git(
+        ["ls-tree", "-rz", "--full-tree", candidate_sha],
         cwd=candidate,
-        capture_output=True,
-        check=False,
+        text=False,
     )
     if listing.returncode != 0:
         raise CandidateBrokerError("exact Candidate snapshot is unavailable")
@@ -177,11 +173,10 @@ def _materialize_candidate_snapshot(
                 part in {"", ".", ".."} for part in relative.parts
             ):
                 raise CandidateBrokerError("exact Candidate snapshot path is invalid")
-            blob = subprocess.run(
-                ["git", "cat-file", "blob", object_id],
+            blob = run_trusted_read_git(
+                ["cat-file", "blob", object_id.decode("ascii")],
                 cwd=candidate,
-                capture_output=True,
-                check=False,
+                text=False,
             )
             if blob.returncode != 0:
                 raise CandidateBrokerError("exact Candidate snapshot is unavailable")

@@ -153,6 +153,45 @@ class CandidateBrokerCliTest(unittest.TestCase):
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertEqual(json.loads(result.read_text(encoding="utf-8"))["exit_code"], 0)
 
+    def test_does_not_run_repository_fsmonitor_on_the_host(self):
+        marker = self.temp / "fsmonitor-ran"
+        fsmonitor = self.temp / "fsmonitor"
+        fsmonitor.write_text(
+            f"#!/bin/sh\ntouch {marker}\nexit 1\n",
+            encoding="utf-8",
+        )
+        fsmonitor.chmod(0o755)
+        self.git("config", "core.fsmonitor", str(fsmonitor))
+        request = self.temp / "fsmonitor-request.json"
+        result = self.temp / "fsmonitor-result.json"
+        self.write_request(request, command=["/usr/bin/true"])
+
+        completed = self.run_broker(request, result)
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(json.loads(result.read_text(encoding="utf-8"))["exit_code"], 0)
+        self.assertFalse(marker.exists())
+
+    def test_ignores_replace_refs_for_the_approved_candidate(self):
+        (self.repository / "input.txt").write_text(
+            "evil replacement\n", encoding="utf-8"
+        )
+        self.git("-C", str(self.repository), "add", "input.txt")
+        self.git("-C", str(self.repository), "commit", "-m", "evil replacement")
+        replacement_sha = self.git("-C", str(self.repository), "rev-parse", "HEAD")
+        self.git("replace", self.candidate_sha, replacement_sha)
+        self.assertEqual(self.git("show", "HEAD:input.txt"), "evil replacement")
+        request = self.temp / "replace-request.json"
+        result = self.temp / "replace-result.json"
+        self.write_request(request, command=["/bin/cat", "/candidate/input.txt"])
+
+        completed = self.run_broker(request, result)
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        broker_result = json.loads(result.read_text(encoding="utf-8"))
+        self.assertEqual(broker_result["exit_code"], 0, broker_result["stderr"])
+        self.assertEqual(broker_result["stdout"], "exact candidate\n")
+
     def test_runs_against_read_only_exact_candidate_with_writable_scratch(self):
         probe = textwrap.dedent(
             """

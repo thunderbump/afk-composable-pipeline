@@ -312,11 +312,58 @@ def dirty_tree(path: Path) -> dict[str, Any]:
 
 def is_exact_clean_commit(path: Path, expected_commit: str) -> bool:
     try:
-        head = git(["rev-parse", "HEAD"], cwd=path)
-        status = git(["status", "--porcelain"], cwd=path)
-    except GitCommandError:
+        head = run_trusted_read_git(["rev-parse", "HEAD"], cwd=path)
+        status = run_trusted_read_git(["status", "--porcelain"], cwd=path)
+    except OSError:
         return False
-    return head == expected_commit and not status
+    return (
+        head.returncode == 0
+        and head.stdout.strip() == expected_commit
+        and status.returncode == 0
+        and not status.stdout.strip()
+    )
+
+
+def run_trusted_read_git(
+    args: list[str], *, cwd: Path, text: bool = True
+) -> subprocess.CompletedProcess[Any]:
+    environment = {
+        name: value for name, value in os.environ.items() if not name.startswith("GIT_")
+    }
+    environment.update(
+        {
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_COUNT": "2",
+            "GIT_CONFIG_KEY_0": "core.fsmonitor",
+            "GIT_CONFIG_VALUE_0": "false",
+            "GIT_CONFIG_KEY_1": "core.hooksPath",
+            "GIT_CONFIG_VALUE_1": os.devnull,
+            "GIT_NO_REPLACE_OBJECTS": "1",
+            "GIT_OPTIONAL_LOCKS": "0",
+        }
+    )
+    command = ["git", *args]
+    try:
+        return subprocess.run(
+            command,
+            cwd=cwd,
+            env=environment,
+            text=text,
+            capture_output=True,
+            check=False,
+            timeout=120,
+        )
+    except subprocess.TimeoutExpired:
+        empty = "" if text else b""
+        message = (
+            "trusted Git command timed out"
+            if text
+            else b"trusted Git command timed out"
+        )
+        return subprocess.CompletedProcess(
+            command, 124, stdout=empty, stderr=message
+        )
 
 
 def clean_reserved_checkout_artifacts(checkout_path: Path, status_lines: list[str]) -> bool:
