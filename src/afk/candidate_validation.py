@@ -63,12 +63,16 @@ class CandidateValidationError(RuntimeError):
         *,
         stdout: str | None = None,
         stderr: str | None = None,
+        execution_classification: str | None = None,
+        exit_code: int | None = None,
     ):
         super().__init__(summary)
         self.kind = kind
         self.summary = summary
         self.stdout = stdout
         self.stderr = stderr
+        self.execution_classification = execution_classification
+        self.exit_code = exit_code
 
 
 def validate_candidate(
@@ -793,15 +797,23 @@ def run_supervised_command(
     timeout_seconds: float,
     input_text: str | None = None,
     label: str,
+    output_byte_limit: int | None = None,
+    cleanup_seconds: float | None = None,
 ) -> subprocess.CompletedProcess[str]:
     subject = label.strip() or "command"
+    output_byte_limit = (
+        OUTPUT_BYTE_LIMIT if output_byte_limit is None else output_byte_limit
+    )
+    cleanup_seconds = (
+        PROCESS_CLEANUP_SECONDS if cleanup_seconds is None else cleanup_seconds
+    )
     deadline = time.monotonic() + timeout_seconds
-    with _LinuxDescendantSupervisor() as descendants:
+    with _LinuxDescendantSupervisor(cleanup_seconds) as descendants:
         process = subprocess.Popen(
             command,
             cwd=cwd,
             env=environment,
-            stdin=subprocess.PIPE if input_text is not None else None,
+            stdin=subprocess.PIPE if input_text is not None else subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             start_new_session=True,
@@ -814,8 +826,8 @@ def run_supervised_command(
         process_io = BoundedProcessIO(
             process,
             input_bytes=None if input_text is None else input_text.encode("utf-8"),
-            output_byte_limit=OUTPUT_BYTE_LIMIT,
-            cleanup_seconds=PROCESS_CLEANUP_SECONDS,
+            output_byte_limit=output_byte_limit,
+            cleanup_seconds=cleanup_seconds,
         )
         while process.poll() is None:
             descendants.discover(process.pid)
@@ -835,6 +847,7 @@ def run_supervised_command(
                     f"{subject} timed out and its process tree was terminated",
                     stdout=stdout,
                     stderr=stderr,
+                    execution_classification="timeout",
                 )
             if stop_reason == "overflow":
                 break
@@ -846,11 +859,13 @@ def run_supervised_command(
                 "interrupted", "validation output streams could not be drained"
             )
         if process_io.overflowed:
+            stdout, stderr = process_io.diagnostics()
             raise CandidateValidationError(
                 "invalid",
                 f"{subject} output exceeds the size limit",
-                stdout="",
-                stderr="",
+                stdout=stdout,
+                stderr=stderr,
+                execution_classification="output_overflow",
             )
         if process.returncode < 0:
             signal_number = -process.returncode
@@ -864,6 +879,8 @@ def run_supervised_command(
                 f"{subject} exited after signal {signal_name}",
                 stdout=stdout,
                 stderr=stderr,
+                execution_classification="abnormal_exit",
+                exit_code=process.returncode,
             )
         try:
             stdout, stderr = process_io.decoded_output()
@@ -879,12 +896,13 @@ def run_supervised_command(
 
 
 class _LinuxDescendantSupervisor:
-    def __init__(self) -> None:
+    def __init__(self, cleanup_seconds: float) -> None:
         self._libc = ctypes.CDLL(None, use_errno=True)
         self._previous = ctypes.c_int()
         self._baseline: set[int] = set()
         self._pidfds: dict[int, int] = {}
         self._root_pid: int | None = None
+        self._cleanup_seconds = cleanup_seconds
 
     def __enter__(self) -> _LinuxDescendantSupervisor:
         if (
@@ -945,7 +963,7 @@ class _LinuxDescendantSupervisor:
 
     def terminate_untracked(self, process: subprocess.Popen[bytes]) -> None:
         failure: OSError | None = None
-        deadline = time.monotonic() + PROCESS_CLEANUP_SECONDS
+        deadline = time.monotonic() + self._cleanup_seconds
         try:
             try:
                 os.killpg(process.pid, signal.SIGKILL)
@@ -996,7 +1014,7 @@ class _LinuxDescendantSupervisor:
         ) from failure
 
     def _wait_for_exit(self, root_pid: int, requested_signal: signal.Signals) -> bool:
-        deadline = time.monotonic() + PROCESS_CLEANUP_SECONDS
+        deadline = time.monotonic() + self._cleanup_seconds
         while time.monotonic() < deadline:
             self.discover(root_pid)
             self._discard_exited()

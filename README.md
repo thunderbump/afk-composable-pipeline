@@ -108,16 +108,24 @@ PYTHONPATH=src python3 -m afk.candidate_broker \
   --result candidate-result.json
 ```
 
-The version-1 request contains only `schema_version`, the exact clean
+The version-1 request requires `schema_version`, the exact clean
 `candidate_sha`, an absolute `candidate_path`, and a non-empty `command` argv.
+It may also set `timeout_seconds` (greater than zero and at most 3600; default
+300) and `output_byte_limit` (a positive integer no larger than 64 MiB; default
+1 MiB). The output limit applies independently to stdout and stderr.
 The broker materializes exact tree and blob objects from the Candidate commit
 without `.git` administrative metadata or archive-attribute rewrites. Gitlinks
 fail closed until recursive submodule semantics are defined. The command runs
 with that snapshot mounted read-only at `/candidate`, writable scratch at
 `/work`, a private writable `/tmp`, the runtime mounted from `/usr`, a
 namespaced `/proc`, a distinct minimal `/dev`, a cleared environment, and no
-inherited network namespace. The broker-owned result records the Candidate SHA,
-command exit status, stdout, and stderr; its path is not exposed inside the
+inherited network namespace. The broker supervises and reaps the complete
+Candidate process tree before atomically publishing a result. Successful
+results retain `status: "completed"`, the Candidate SHA, integer exit code,
+stdout, and stderr. Timeout, output overflow, launch failure, signal, and other
+nonzero exits instead publish `status: "failed"`, the exact Candidate SHA,
+bounded redacted diagnostics, a stable `failure_classification`, a summary, and
+an integer or null `exit_code`. The result path is not exposed inside the
 sandbox.
 
 The declared Candidate capability set is intentionally small: read the exact

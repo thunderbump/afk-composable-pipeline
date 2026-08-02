@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -130,6 +131,40 @@ class CandidateBrokerCliTest(unittest.TestCase):
                 self.assertNotIn("Traceback", completed.stderr)
                 self.assertFalse(result.exists())
 
+    def test_rejects_unsafe_candidate_execution_bounds(self):
+        invalid_values = (
+            ("timeout_seconds", 0),
+            ("timeout_seconds", -1),
+            ("timeout_seconds", True),
+            ("timeout_seconds", "1"),
+            ("timeout_seconds", 3601),
+            ("output_byte_limit", 0),
+            ("output_byte_limit", -1),
+            ("output_byte_limit", True),
+            ("output_byte_limit", 1.5),
+            ("output_byte_limit", 64 * 1024 * 1024 + 1),
+        )
+        for index, (field, value) in enumerate(invalid_values):
+            with self.subTest(field=field, value=value):
+                request = self.temp / f"invalid-bound-{index}-request.json"
+                result = self.temp / f"invalid-bound-{index}-result.json"
+                payload = {
+                    "schema_version": 1,
+                    "candidate_sha": self.candidate_sha,
+                    "candidate_path": str(self.candidate),
+                    "command": ["/usr/bin/true"],
+                    field: value,
+                }
+                request.write_text(json.dumps(payload), encoding="utf-8")
+
+                completed = self.run_broker(request, result)
+
+                self.assertEqual(completed.returncode, 2)
+                self.assertEqual(
+                    completed.stderr, "candidate broker request is invalid\n"
+                )
+                self.assertFalse(result.exists())
+
     def test_rejects_a_nested_candidate_path_before_execution(self):
         nested = self.candidate / "nested"
         nested.mkdir()
@@ -229,6 +264,193 @@ class CandidateBrokerCliTest(unittest.TestCase):
         self.assertEqual(broker_result["status"], "completed")
         self.assertEqual(broker_result["exit_code"], 0, broker_result["stderr"])
         self.assertEqual(broker_result["stdout"], "")
+
+    @unittest.skipUnless(shutil.which("bwrap"), "bubblewrap is unavailable")
+    def test_timeout_publishes_a_candidate_bound_failure_result(self):
+        request = self.temp / "timeout-request.json"
+        result = self.temp / "timeout-result.json"
+        self.write_request(
+            request,
+            command=[
+                "/usr/bin/python3",
+                "-c",
+                (
+                    "import sys,time; print('password=hunter2',flush=True);"
+                    "time.sleep(30)"
+                ),
+            ],
+            timeout_seconds=0.1,
+        )
+
+        completed = self.run_broker(request, result)
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(
+            json.loads(result.read_text(encoding="utf-8")),
+            {
+                "schema_version": 1,
+                "candidate_sha": self.candidate_sha,
+                "status": "failed",
+                "failure_classification": "timeout",
+                "summary": (
+                    "Candidate command timed out and its process tree was terminated"
+                ),
+                "exit_code": None,
+                "stdout": "password=[REDACTED]\n",
+                "stderr": "",
+            },
+        )
+
+    @unittest.skipUnless(shutil.which("bwrap"), "bubblewrap is unavailable")
+    def test_each_candidate_output_stream_has_an_independent_byte_limit(self):
+        for stream, descriptor in (("stdout", 1), ("stderr", 2)):
+            with self.subTest(stream=stream):
+                request = self.temp / f"{stream}-overflow-request.json"
+                result = self.temp / f"{stream}-overflow-result.json"
+                self.write_request(
+                    request,
+                    command=[
+                        "/usr/bin/python3",
+                        "-c",
+                        f"import os; os.write({descriptor}, b'x' * 17)",
+                    ],
+                    output_byte_limit=16,
+                )
+
+                completed = self.run_broker(request, result)
+
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                broker_result = json.loads(result.read_text(encoding="utf-8"))
+                self.assertEqual(broker_result["candidate_sha"], self.candidate_sha)
+                self.assertEqual(broker_result["status"], "failed")
+                self.assertEqual(
+                    broker_result["failure_classification"], "output_overflow"
+                )
+                self.assertIsNone(broker_result["exit_code"])
+                self.assertLessEqual(len(broker_result["stdout"].encode()), 16)
+                self.assertLessEqual(len(broker_result["stderr"].encode()), 16)
+
+        request = self.temp / "independent-output-request.json"
+        result = self.temp / "independent-output-result.json"
+        self.write_request(
+            request,
+            command=[
+                "/usr/bin/python3",
+                "-c",
+                "import os; os.write(1,b'o'*12); os.write(2,b'e'*12)",
+            ],
+            output_byte_limit=16,
+        )
+
+        completed = self.run_broker(request, result)
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        broker_result = json.loads(result.read_text(encoding="utf-8"))
+        self.assertEqual(broker_result["status"], "completed")
+        self.assertEqual(broker_result["stdout"], "o" * 12)
+        self.assertEqual(broker_result["stderr"], "e" * 12)
+
+    @unittest.skipUnless(shutil.which("bwrap"), "bubblewrap is unavailable")
+    def test_abnormal_candidate_exits_publish_stable_failure_results(self):
+        cases = (
+            ("nonzero", "import sys; sys.exit(7)", 7),
+            (
+                "signal",
+                "import os, signal; os.kill(os.getpid(), signal.SIGKILL)",
+                None,
+            ),
+        )
+        for name, program, expected_exit_code in cases:
+            with self.subTest(name=name):
+                request = self.temp / f"{name}-exit-request.json"
+                result = self.temp / f"{name}-exit-result.json"
+                self.write_request(
+                    request,
+                    command=["/usr/bin/python3", "-c", program],
+                )
+
+                completed = self.run_broker(request, result)
+
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                broker_result = json.loads(result.read_text(encoding="utf-8"))
+                self.assertEqual(broker_result["candidate_sha"], self.candidate_sha)
+                self.assertEqual(broker_result["status"], "failed")
+                self.assertEqual(
+                    broker_result["failure_classification"], "abnormal_exit"
+                )
+                self.assertIsInstance(broker_result["exit_code"], int)
+                self.assertNotEqual(broker_result["exit_code"], 0)
+                if expected_exit_code is not None:
+                    self.assertEqual(broker_result["exit_code"], expected_exit_code)
+
+    def test_bwrap_launch_failure_publishes_a_candidate_bound_result(self):
+        request = self.temp / "launch-failure-request.json"
+        result = self.temp / "launch-failure-result.json"
+        fake_bin = self.temp / "launch-failure-bin"
+        fake_bin.mkdir()
+        bwrap = fake_bin / "bwrap"
+        bwrap.write_text("#!/definitely/missing/interpreter\n", encoding="utf-8")
+        bwrap.chmod(0o755)
+        self.write_request(request, command=["/usr/bin/true"])
+
+        completed = self.run_broker(
+            request,
+            result,
+            env={"PATH": f"{fake_bin}:{os.environ['PATH']}"},
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(
+            json.loads(result.read_text(encoding="utf-8")),
+            {
+                "schema_version": 1,
+                "candidate_sha": self.candidate_sha,
+                "status": "failed",
+                "failure_classification": "launch_failure",
+                "summary": "Candidate command could not be launched",
+                "exit_code": None,
+                "stdout": "",
+                "stderr": "",
+            },
+        )
+
+    @unittest.skipUnless(shutil.which("bwrap"), "bubblewrap is unavailable")
+    def test_timeout_reaps_detached_candidate_descendants_before_publication(self):
+        request = self.temp / "detached-timeout-request.json"
+        result = self.temp / "detached-timeout-result.json"
+        token = f"afk-detached-{os.getpid()}-{time.monotonic_ns()}"
+        child = "import time; time.sleep(30)"
+        parent = (
+            "import subprocess,sys,time;"
+            f"subprocess.Popen([sys.executable,'-c',{child!r},{token!r}],"
+            "start_new_session=True);"
+            "print('detached-ready',flush=True);"
+            "time.sleep(30)"
+        )
+        self.write_request(
+            request,
+            command=["/usr/bin/python3", "-c", parent],
+            timeout_seconds=0.2,
+        )
+
+        completed = self.run_broker(request, result)
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        broker_result = json.loads(result.read_text(encoding="utf-8"))
+        self.assertEqual(broker_result["candidate_sha"], self.candidate_sha)
+        self.assertEqual(broker_result["failure_classification"], "timeout")
+        self.assertIn("detached-ready", broker_result["stdout"])
+        survivors = []
+        for process in Path("/proc").iterdir():
+            if not process.name.isdigit():
+                continue
+            try:
+                command_line = (process / "cmdline").read_bytes()
+            except (FileNotFoundError, PermissionError, ProcessLookupError):
+                continue
+            if token.encode() in command_line:
+                survivors.append(int(process.name))
+        self.assertEqual(survivors, [])
 
     def test_success_atomically_replaces_a_result_symlink_without_following_it(self):
         request = self.temp / "atomic-request.json"
@@ -1136,7 +1358,9 @@ class CandidateBrokerCliTest(unittest.TestCase):
             {
                 "schema_version": 1,
                 "candidate_sha": self.candidate_sha,
-                "status": "completed",
+                "status": "failed",
+                "failure_classification": "abnormal_exit",
+                "summary": "Candidate command exited with status 7",
                 "exit_code": 7,
                 "stdout": (
                     "exact candidate\n"
@@ -1643,22 +1867,32 @@ class CandidateBrokerCliTest(unittest.TestCase):
         )
         self.assertFalse(result.exists())
 
-    def write_request(self, path, *, command, candidate_path=None, candidate_sha=None):
-        path.write_text(
-            json.dumps(
-                {
-                    "schema_version": 1,
-                    "candidate_sha": (
-                        self.candidate_sha if candidate_sha is None else candidate_sha
-                    ),
-                    "candidate_path": (
-                        str(self.candidate)
-                        if candidate_path is None
-                        else candidate_path
-                    ),
-                    "command": command,
-                }
+    def write_request(
+        self,
+        path,
+        *,
+        command,
+        candidate_path=None,
+        candidate_sha=None,
+        timeout_seconds=None,
+        output_byte_limit=None,
+    ):
+        request = {
+            "schema_version": 1,
+            "candidate_sha": (
+                self.candidate_sha if candidate_sha is None else candidate_sha
             ),
+            "candidate_path": (
+                str(self.candidate) if candidate_path is None else candidate_path
+            ),
+            "command": command,
+        }
+        if timeout_seconds is not None:
+            request["timeout_seconds"] = timeout_seconds
+        if output_byte_limit is not None:
+            request["output_byte_limit"] = output_byte_limit
+        path.write_text(
+            json.dumps(request),
             encoding="utf-8",
         )
 

@@ -4,17 +4,25 @@ import argparse
 import json
 import os
 import shutil
-import subprocess
 import sys
 import tempfile
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from afk.candidate_validation import (
+    CandidateValidationError,
+    run_supervised_command,
+)
 from afk.checkouts import is_exact_clean_commit, run_trusted_read_git
 from afk.jsonutil import canonical_json
 
 
 SCHEMA_VERSION = 1
+CANDIDATE_TIMEOUT_SECONDS = 300
+CANDIDATE_OUTPUT_BYTE_LIMIT = 1024 * 1024
+CANDIDATE_CLEANUP_SECONDS = 1
+MAX_CANDIDATE_TIMEOUT_SECONDS = 3600
+MAX_CANDIDATE_OUTPUT_BYTE_LIMIT = 64 * 1024 * 1024
 
 
 class CandidateBrokerError(ValueError):
@@ -69,58 +77,117 @@ def run_candidate(request: dict[str, Any]) -> dict[str, Any]:
     with tempfile.TemporaryDirectory(prefix="afk-candidate-") as temporary:
         snapshot = Path(temporary) / "snapshot"
         _materialize_candidate_snapshot(candidate, request["candidate_sha"], snapshot)
-        completed = subprocess.run(
-            [
-                bwrap,
-                "--ro-bind",
-                "/usr",
-                "/usr",
-                "--symlink",
-                "usr/bin",
-                "/bin",
-                "--symlink",
-                "usr/lib",
-                "/lib",
-                "--symlink",
-                "usr/lib64",
-                "/lib64",
-                "--proc",
-                "/proc",
-                "--dev",
-                "/dev",
-                "--tmpfs",
-                "/tmp",
-                "--tmpfs",
-                "/work",
-                "--ro-bind",
-                str(snapshot),
-                "/candidate",
-                "--unshare-all",
-                "--die-with-parent",
-                "--new-session",
-                "--clearenv",
-                "--setenv",
-                "PATH",
-                "/usr/bin:/bin",
-                "--setenv",
-                "HOME",
-                "/work",
-                "--chdir",
-                "/work",
-                "--",
-                *request["command"],
-            ],
-            capture_output=True,
-            check=False,
-            stdin=subprocess.DEVNULL,
+        command = [
+            bwrap,
+            "--ro-bind",
+            "/usr",
+            "/usr",
+            "--symlink",
+            "usr/bin",
+            "/bin",
+            "--symlink",
+            "usr/lib",
+            "/lib",
+            "--symlink",
+            "usr/lib64",
+            "/lib64",
+            "--proc",
+            "/proc",
+            "--dev",
+            "/dev",
+            "--tmpfs",
+            "/tmp",
+            "--tmpfs",
+            "/work",
+            "--ro-bind",
+            str(snapshot),
+            "/candidate",
+            "--unshare-all",
+            "--die-with-parent",
+            "--new-session",
+            "--clearenv",
+            "--setenv",
+            "PATH",
+            "/usr/bin:/bin",
+            "--setenv",
+            "HOME",
+            "/work",
+            "--chdir",
+            "/work",
+            "--",
+            *request["command"],
+        ]
+        try:
+            completed = run_supervised_command(
+                command,
+                cwd=Path.cwd(),
+                environment=os.environ.copy(),
+                timeout_seconds=request.get(
+                    "timeout_seconds", CANDIDATE_TIMEOUT_SECONDS
+                ),
+                output_byte_limit=request.get(
+                    "output_byte_limit", CANDIDATE_OUTPUT_BYTE_LIMIT
+                ),
+                cleanup_seconds=CANDIDATE_CLEANUP_SECONDS,
+                input_text=None,
+                label="Candidate command",
+            )
+        except OSError:
+            return _failed_execution_result(
+                request["candidate_sha"],
+                "launch_failure",
+                "Candidate command could not be launched",
+            )
+        except CandidateValidationError as exc:
+            if exc.execution_classification is None:
+                raise CandidateBrokerError(
+                    "Candidate command supervision failed"
+                ) from exc
+            return _failed_execution_result(
+                request["candidate_sha"],
+                exc.execution_classification,
+                exc.summary,
+                exit_code=exc.exit_code,
+                stdout=exc.stdout or "",
+                stderr=exc.stderr or "",
+            )
+    if completed.returncode != 0:
+        return _failed_execution_result(
+            request["candidate_sha"],
+            "abnormal_exit",
+            f"Candidate command exited with status {completed.returncode}",
+            exit_code=completed.returncode,
+            stdout=completed.stdout,
+            stderr=completed.stderr,
         )
     return {
         "schema_version": SCHEMA_VERSION,
         "candidate_sha": request["candidate_sha"],
         "status": "completed",
         "exit_code": completed.returncode,
-        "stdout": completed.stdout.decode("utf-8", errors="replace"),
-        "stderr": completed.stderr.decode("utf-8", errors="replace"),
+        "stdout": completed.stdout,
+        "stderr": completed.stderr,
+    }
+
+
+def _failed_execution_result(
+    candidate_sha: str,
+    classification: str,
+    summary: str,
+    *,
+    exit_code: int | None = None,
+    stdout: str = "",
+    stderr: str = "",
+) -> dict[str, Any]:
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "candidate_sha": candidate_sha,
+        "status": "failed",
+        "failure_classification": classification,
+        "summary": summary,
+        "exit_code": exit_code,
+        "stdout": stdout,
+        "stderr": stderr,
     }
 
 
@@ -131,8 +198,16 @@ def _read_request(path: Path) -> dict[str, Any]:
         raise CandidateBrokerError("candidate broker request is invalid") from exc
     if (
         not isinstance(value, dict)
-        or set(value)
-        != {"schema_version", "candidate_sha", "candidate_path", "command"}
+        or not {"schema_version", "candidate_sha", "candidate_path", "command"}
+        <= set(value)
+        <= {
+            "schema_version",
+            "candidate_sha",
+            "candidate_path",
+            "command",
+            "timeout_seconds",
+            "output_byte_limit",
+        }
         or type(value.get("schema_version")) is not int
         or value["schema_version"] != SCHEMA_VERSION
         or not _is_sha(value.get("candidate_sha"))
@@ -141,6 +216,12 @@ def _read_request(path: Path) -> dict[str, Any]:
         or not isinstance(value.get("command"), list)
         or not value["command"]
         or not all(_is_os_argument(item) for item in value["command"])
+        or not _is_timeout_seconds(
+            value.get("timeout_seconds", CANDIDATE_TIMEOUT_SECONDS)
+        )
+        or not _is_output_byte_limit(
+            value.get("output_byte_limit", CANDIDATE_OUTPUT_BYTE_LIMIT)
+        )
     ):
         raise CandidateBrokerError("candidate broker request is invalid")
     return value
@@ -234,6 +315,18 @@ def _is_os_argument(value: Any) -> bool:
     except UnicodeEncodeError:
         return False
     return True
+
+
+def _is_timeout_seconds(value: Any) -> bool:
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and 0 < value <= MAX_CANDIDATE_TIMEOUT_SECONDS
+    )
+
+
+def _is_output_byte_limit(value: Any) -> bool:
+    return type(value) is int and 0 < value <= MAX_CANDIDATE_OUTPUT_BYTE_LIMIT
 
 
 if __name__ == "__main__":

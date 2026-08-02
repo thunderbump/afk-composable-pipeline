@@ -1,4 +1,5 @@
 import os
+import signal
 import sys
 import tempfile
 import time
@@ -43,7 +44,9 @@ class SupervisedCommandTest(unittest.TestCase):
     def test_timeout_remains_live_while_child_does_not_read_large_stdin(self):
         with tempfile.TemporaryDirectory() as temporary:
             started = time.monotonic()
-            with self.assertRaisesRegex(CandidateValidationError, "timed out"):
+            with self.assertRaisesRegex(
+                CandidateValidationError, "timed out"
+            ) as raised:
                 run_supervised_command(
                     [sys.executable, "-c", "import time; time.sleep(1)"],
                     cwd=Path(temporary),
@@ -54,6 +57,8 @@ class SupervisedCommandTest(unittest.TestCase):
                 )
 
         self.assertLess(time.monotonic() - started, 0.8)
+        self.assertEqual(raised.exception.execution_classification, "timeout")
+        self.assertIsNone(raised.exception.exit_code)
 
     def test_initial_tracking_failure_terminates_detached_child_before_mutation(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -113,17 +118,22 @@ class SupervisedCommandTest(unittest.TestCase):
                     "-c",
                     f"import sys; {target}.write('x'*17); {target}.flush()",
                 ]
-                with (
-                    mock.patch.object(candidate_validation, "OUTPUT_BYTE_LIMIT", 16),
-                    self.assertRaisesRegex(CandidateValidationError, "output exceeds"),
-                ):
+                with self.assertRaisesRegex(
+                    CandidateValidationError, "output exceeds"
+                ) as raised:
                     run_supervised_command(
                         command,
                         cwd=Path(temporary),
                         environment=os.environ.copy(),
                         timeout_seconds=1,
                         label="Codex",
+                        output_byte_limit=16,
                     )
+                self.assertEqual(
+                    raised.exception.execution_classification,
+                    "output_overflow",
+                )
+                self.assertIsNone(raised.exception.exit_code)
 
     def test_signal_exit_keeps_redacted_diagnostics(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -146,6 +156,8 @@ class SupervisedCommandTest(unittest.TestCase):
                 )
 
         self.assertEqual(raised.exception.kind, "interrupted")
+        self.assertEqual(raised.exception.execution_classification, "abnormal_exit")
+        self.assertEqual(raised.exception.exit_code, -signal.SIGKILL)
         self.assertIn("SIGKILL", raised.exception.summary)
         self.assertEqual(raised.exception.stdout, "password=[REDACTED]\n")
 
@@ -167,10 +179,7 @@ class SupervisedCommandTest(unittest.TestCase):
                 "time.sleep(30)"
             )
 
-            with (
-                mock.patch.object(candidate_validation, "PROCESS_CLEANUP_SECONDS", 0.1),
-                self.assertRaisesRegex(CandidateValidationError, "timed out"),
-            ):
+            with self.assertRaisesRegex(CandidateValidationError, "timed out"):
                 run_supervised_command(
                     [sys.executable, "-c", parent],
                     cwd=root,
@@ -178,6 +187,7 @@ class SupervisedCommandTest(unittest.TestCase):
                     timeout_seconds=0.1,
                     input_text="",
                     label="Codex",
+                    cleanup_seconds=0.1,
                 )
 
             time.sleep(0.7)
