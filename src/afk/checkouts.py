@@ -329,6 +329,9 @@ def _worktree_matches_commit(path: Path, commit: str) -> bool:
         ["ls-tree", "-rz", "--full-tree", commit], cwd=path, text=False
     )
     index = run_trusted_read_git(["ls-files", "--stage", "-z"], cwd=path, text=False)
+    all_untracked = run_trusted_read_git(
+        ["ls-files", "--others", "-z"], cwd=path, text=False
+    )
     untracked = run_trusted_read_git(
         ["ls-files", "--others", "-z", "--exclude-per-directory=.gitignore"],
         cwd=path,
@@ -337,6 +340,8 @@ def _worktree_matches_commit(path: Path, commit: str) -> bool:
     if (
         tree.returncode != 0
         or index.returncode != 0
+        or all_untracked.returncode != 0
+        or _contains_untracked_gitignore(all_untracked.stdout)
         or untracked.returncode != 0
         or untracked.stdout
     ):
@@ -410,6 +415,14 @@ def _require_git_path(item_path: bytes) -> None:
         part in {"", ".", ".."} for part in relative.parts
     ):
         raise ValueError("invalid Git path")
+
+
+def _contains_untracked_gitignore(output: bytes) -> bool:
+    return any(
+        b".gitignore" in item_path.split(b"/")
+        for item_path in output.rstrip(b"\0").split(b"\0")
+        if item_path
+    )
 
 
 def _git_blob_id(content: bytes) -> bytes:

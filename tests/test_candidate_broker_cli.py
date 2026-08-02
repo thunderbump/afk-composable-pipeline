@@ -375,6 +375,24 @@ class CandidateBrokerCliTest(unittest.TestCase):
 
         self.assertFalse(is_exact_clean_commit(self.candidate, self.candidate_sha))
 
+    def test_exact_candidate_rejects_untracked_root_gitignore(self):
+        from afk.checkouts import is_exact_clean_commit
+
+        (self.candidate / ".gitignore").write_text("*\n", encoding="utf-8")
+        (self.candidate / "unexpected.log").write_text("unexpected\n", encoding="utf-8")
+
+        self.assertFalse(is_exact_clean_commit(self.candidate, self.candidate_sha))
+
+    def test_exact_candidate_rejects_untracked_nested_gitignore(self):
+        from afk.checkouts import is_exact_clean_commit
+
+        generated = self.candidate / "generated"
+        generated.mkdir()
+        (generated / ".gitignore").write_text("*\n", encoding="utf-8")
+        (generated / "unexpected.log").write_text("unexpected\n", encoding="utf-8")
+
+        self.assertFalse(is_exact_clean_commit(self.candidate, self.candidate_sha))
+
     @unittest.skipUnless(shutil.which("bwrap"), "bubblewrap is unavailable")
     def test_ignores_replace_refs_for_the_approved_candidate(self):
         (self.repository / "input.txt").write_text(
