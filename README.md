@@ -93,11 +93,27 @@ mode in the Candidate as in the pinned base, then materializes those base
 blobs outside the Candidate checkout and runs the command from that trusted
 root. The request supplies `candidate_sha` and `candidate_path` so the trusted
 target-owned harness can build and test the exact Candidate without executing
-Candidate-owned validation policy. An omitted dependency fails when the
-isolated harness tries to resolve it; contract authors must list every
-repository executable or sourced file used by validation. Candidate changes
-to the contract or any declared validator file remain proposals for a later
-Run whose base includes them.
+Candidate-owned validation policy. Contract authors must list every repository
+executable or sourced file used by validation. Candidate changes to the
+contract or any declared validator file remain proposals for a later Run whose
+base includes them. Normal Validation Gate integration with the capability-
+limited broker is still required before an omitted Candidate helper is
+enforceably isolated.
+
+Run one exact Candidate command through the capability-limited broker:
+
+```sh
+PYTHONPATH=src python3 -m afk.candidate_broker \
+  --request candidate-request.json \
+  --result candidate-result.json
+```
+
+The version-1 request contains only `schema_version`, the exact clean
+`candidate_sha`, an absolute `candidate_path`, and a non-empty `command` argv.
+The command runs with the Candidate mounted read-only at `/candidate`, empty
+writable scratch at `/work`, a cleared environment, and no inherited network
+namespace. The broker-owned result records the Candidate SHA, command exit
+status, stdout, and stderr; its path is not exposed inside the sandbox.
 
 When `--ledger` is omitted, AFK resolves ledger output with this precedence:
 `--ledger` > `AFK_LEDGER_DIR` > `./ledgers`. Preview-only `run-next` does not
