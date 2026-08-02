@@ -5,6 +5,7 @@ import os
 import select
 import signal
 import subprocess
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -18,6 +19,7 @@ _OUTPUT_BYTE_LIMIT = 64 * 1024 * 1024
 _PROCESS_CLEANUP_SECONDS = 1
 _PR_SET_CHILD_SUBREAPER = 36
 _PR_GET_CHILD_SUBREAPER = 37
+_SUPERVISOR_LOCK = threading.Lock()
 
 
 class SupervisedCommandError(RuntimeError):
@@ -153,36 +155,46 @@ class _LinuxDescendantSupervisor:
         self._subject = subject
 
     def __enter__(self) -> _LinuxDescendantSupervisor:
-        if (
-            self._libc.prctl(
-                _PR_GET_CHILD_SUBREAPER, ctypes.byref(self._previous), 0, 0, 0
-            )
-            != 0
-            or self._libc.prctl(_PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0
-        ):
-            raise SupervisedCommandError(
-                "supervision_unavailable",
-                f"Linux {self._subject} descendant supervision is unavailable",
-            )
-        self._baseline = set(_proc_children(os.getpid(), self._subject))
-        return self
+        _SUPERVISOR_LOCK.acquire()
+        try:
+            if (
+                self._libc.prctl(
+                    _PR_GET_CHILD_SUBREAPER, ctypes.byref(self._previous), 0, 0, 0
+                )
+                != 0
+                or self._libc.prctl(_PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0
+            ):
+                raise SupervisedCommandError(
+                    "supervision_unavailable",
+                    f"Linux {self._subject} descendant supervision is unavailable",
+                )
+            self._baseline = set(_proc_children(os.getpid(), self._subject))
+            return self
+        except BaseException:
+            _SUPERVISOR_LOCK.release()
+            raise
 
     def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
         try:
-            if self._root_pid is not None and self._pidfds:
-                self.terminate(self._root_pid)
+            try:
+                if self._root_pid is not None and self._pidfds:
+                    self.terminate(self._root_pid)
+            finally:
+                for pidfd in self._pidfds.values():
+                    os.close(pidfd)
+                self._pidfds.clear()
+                if (
+                    self._libc.prctl(
+                        _PR_SET_CHILD_SUBREAPER, self._previous.value, 0, 0, 0
+                    )
+                    != 0
+                ):
+                    raise SupervisedCommandError(
+                        "supervision_failure",
+                        f"Linux {self._subject} descendant supervision was lost",
+                    )
         finally:
-            for pidfd in self._pidfds.values():
-                os.close(pidfd)
-            self._pidfds.clear()
-            if (
-                self._libc.prctl(_PR_SET_CHILD_SUBREAPER, self._previous.value, 0, 0, 0)
-                != 0
-            ):
-                raise SupervisedCommandError(
-                    "supervision_failure",
-                    f"Linux {self._subject} descendant supervision was lost",
-                )
+            _SUPERVISOR_LOCK.release()
 
     def track(self, pid: int) -> None:
         self._root_pid = pid

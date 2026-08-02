@@ -1,7 +1,9 @@
+import ctypes
 import os
 import signal
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -19,6 +21,116 @@ from afk.process_supervision import (  # noqa: E402
 
 
 class SupervisedCommandTest(unittest.TestCase):
+    def test_overlapping_calls_serialize_process_wide_supervision(self):
+        class ObservedLock:
+            def __init__(self):
+                self.lock = threading.Lock()
+                self.state_lock = threading.Lock()
+                self.held = False
+                self.waiting = threading.Event()
+
+            def acquire(self):
+                with self.state_lock:
+                    if self.held:
+                        self.waiting.set()
+                self.lock.acquire()
+                with self.state_lock:
+                    self.held = True
+
+            def release(self):
+                with self.state_lock:
+                    self.held = False
+                self.lock.release()
+
+        libc = ctypes.CDLL(None, use_errno=True)
+        initial_subreaper = ctypes.c_int()
+        self.assertEqual(
+            libc.prctl(37, ctypes.byref(initial_subreaper), 0, 0, 0),
+            0,
+        )
+        observed_lock = ObservedLock()
+        first_launched = threading.Event()
+        second_launched = threading.Event()
+        results = {}
+        failures = []
+        real_popen = process_supervision.subprocess.Popen
+
+        def observed_popen(*args, **kwargs):
+            if first_launched.is_set():
+                second_launched.set()
+            else:
+                first_launched.set()
+            return real_popen(*args, **kwargs)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            release_first = root / "release-first"
+
+            def invoke(name, command):
+                try:
+                    results[name] = run_supervised_command(
+                        command,
+                        cwd=root,
+                        environment=os.environ.copy(),
+                        timeout_seconds=3,
+                        label=name,
+                    )
+                except BaseException as exc:
+                    failures.append(exc)
+
+            first = threading.Thread(
+                target=invoke,
+                args=(
+                    "first",
+                    [
+                        sys.executable,
+                        "-c",
+                        (
+                            "import pathlib,time;"
+                            f"marker=pathlib.Path({str(release_first)!r});"
+                            "\nwhile not marker.exists(): time.sleep(0.01);"
+                            "\nprint('first')"
+                        ),
+                    ],
+                ),
+            )
+            second = threading.Thread(
+                target=invoke,
+                args=("second", [sys.executable, "-c", "print('second')"]),
+            )
+            with (
+                mock.patch.object(
+                    process_supervision,
+                    "_SUPERVISOR_LOCK",
+                    observed_lock,
+                    create=True,
+                ),
+                mock.patch.object(
+                    process_supervision.subprocess,
+                    "Popen",
+                    side_effect=observed_popen,
+                ),
+            ):
+                first.start()
+                self.assertTrue(first_launched.wait(1))
+                second.start()
+                overlap_was_serialized = observed_lock.waiting.wait(1)
+                second_was_held = not second_launched.is_set()
+                release_first.write_text("release\n", encoding="utf-8")
+                first.join(4)
+                second.join(4)
+
+        self.assertTrue(overlap_was_serialized)
+        self.assertTrue(second_was_held)
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(failures, [])
+        self.assertEqual(results["first"].stdout, "first\n")
+        self.assertEqual(results["second"].stdout, "second\n")
+        final_subreaper = ctypes.c_int()
+        self.assertEqual(libc.prctl(37, ctypes.byref(final_subreaper), 0, 0, 0), 0)
+        self.assertEqual(final_subreaper.value, initial_subreaper.value)
+
     def test_normal_success_accepts_stdin_and_captures_both_streams(self):
         with tempfile.TemporaryDirectory() as temporary:
             completed = run_supervised_command(
