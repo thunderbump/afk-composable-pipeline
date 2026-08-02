@@ -83,6 +83,7 @@ def run_candidate(request: dict[str, Any]) -> dict[str, Any]:
                 "/work",
                 "--chdir",
                 "/work",
+                "--",
                 *request["command"],
             ],
             capture_output=True,

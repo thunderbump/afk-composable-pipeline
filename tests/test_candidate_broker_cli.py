@@ -181,6 +181,49 @@ class CandidateBrokerCliTest(unittest.TestCase):
             "drifted after verification\n",
         )
 
+    def test_treats_option_looking_commands_as_executable_argv(self):
+        commands = [
+            ["--ro-bind", "/etc", "/work/etc", "/usr/bin/true"],
+            ["--share-net", "/usr/bin/true"],
+        ]
+        for index, command in enumerate(commands):
+            with self.subTest(command=command):
+                request = self.temp / f"option-command-{index}-request.json"
+                result = self.temp / f"option-command-{index}-result.json"
+                request.write_text(
+                    json.dumps(
+                        {
+                            "schema_version": 1,
+                            "candidate_sha": self.candidate_sha,
+                            "candidate_path": str(self.candidate),
+                            "command": command,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+
+                completed = subprocess.run(
+                    [
+                        sys.executable,
+                        "-m",
+                        "afk.candidate_broker",
+                        "--request",
+                        str(request),
+                        "--result",
+                        str(result),
+                    ],
+                    cwd=ROOT,
+                    env={**os.environ, "PYTHONPATH": str(ROOT / "src")},
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                broker_result = json.loads(result.read_text(encoding="utf-8"))
+                self.assertNotEqual(broker_result["exit_code"], 0)
+                self.assertIn(f"execvp {command[0]}", broker_result["stderr"])
+
     def test_fails_closed_when_exact_candidate_snapshot_is_unavailable(self):
         request = self.temp / "snapshot-failure-request.json"
         result = self.temp / "snapshot-failure-result.json"
