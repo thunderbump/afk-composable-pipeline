@@ -31,8 +31,9 @@ MAX_CANDIDATE_OUTPUT_BYTE_LIMIT = 64 * 1024 * 1024
 CONTAINER_RUNTIME_PROBE_SECONDS = 5
 CONTAINER_WATCHDOG_SECONDS = 5
 _CONTAINER_WATCHDOG_PATH = Path(__file__).with_name("container_cleanup_watchdog.py")
-_WATCHDOG_ENVIRONMENT_ALLOWLIST = {
+_TRUSTED_RUNTIME_ENVIRONMENT_ALLOWLIST = {
     "HOME",
+    "PATH",
     "XDG_CONFIG_HOME",
     "XDG_DATA_HOME",
     "XDG_RUNTIME_DIR",
@@ -145,7 +146,11 @@ def run_candidate(request: dict[str, Any]) -> dict[str, Any]:
             completed = run_supervised_command(
                 command,
                 cwd=Path.cwd(),
-                environment=os.environ.copy(),
+                environment=(
+                    os.environ.copy()
+                    if execution is None
+                    else trusted_runtime_environment()
+                ),
                 timeout_seconds=request.get(
                     "timeout_seconds", CANDIDATE_TIMEOUT_SECONDS
                 ),
@@ -236,7 +241,7 @@ def _find_container_runtime() -> str | None:
             completed = run_supervised_command(
                 [runtime, "info"],
                 cwd=Path.cwd(),
-                environment=os.environ.copy(),
+                environment=trusted_runtime_environment(),
                 timeout_seconds=CONTAINER_RUNTIME_PROBE_SECONDS,
                 output_byte_limit=64 * 1024,
                 cleanup_seconds=CANDIDATE_CLEANUP_SECONDS,
@@ -257,7 +262,7 @@ def _inspect_container_image(runtime: str, image: str) -> tuple[str | None, str]
         completed = run_supervised_command(
             [runtime, "image", "inspect", image],
             cwd=Path.cwd(),
-            environment=os.environ.copy(),
+            environment=trusted_runtime_environment(),
             timeout_seconds=CONTAINER_RUNTIME_PROBE_SECONDS,
             output_byte_limit=CANDIDATE_OUTPUT_BYTE_LIMIT,
             cleanup_seconds=CANDIDATE_CLEANUP_SECONDS,
@@ -381,7 +386,7 @@ def _remove_container(runtime: str, name: str) -> None:
         completed = run_supervised_command(
             [runtime, "rm", "--force", "--volumes", name],
             cwd=Path.cwd(),
-            environment=os.environ.copy(),
+            environment=trusted_runtime_environment(),
             timeout_seconds=10,
             output_byte_limit=64 * 1024,
             cleanup_seconds=CANDIDATE_CLEANUP_SECONDS,
@@ -396,13 +401,14 @@ def _remove_container(runtime: str, name: str) -> None:
         raise CandidateBrokerError("Candidate container cleanup failed")
 
 
-def _watchdog_environment() -> dict[str, str]:
+def trusted_runtime_environment() -> dict[str, str]:
     environment = {
         name: value
         for name, value in os.environ.items()
-        if name in _WATCHDOG_ENVIRONMENT_ALLOWLIST
+        if name in _TRUSTED_RUNTIME_ENVIRONMENT_ALLOWLIST
     }
-    environment.update({"LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "PATH": os.defpath})
+    environment.update({"LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"})
+    environment.setdefault("PATH", os.defpath)
     return environment
 
 
@@ -424,7 +430,7 @@ def _start_container_cleanup_watchdog(
                 stdin=child_channel,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                env=_watchdog_environment(),
+                env=trusted_runtime_environment(),
                 start_new_session=True,
             )
         except BaseException:

@@ -17,8 +17,9 @@ if __package__ in {None, ""}:
 
 from afk.candidate_broker import (
     CandidateBrokerError,
-    validate_candidate_request,
     run_candidate,
+    trusted_runtime_environment,
+    validate_candidate_request,
 )
 from afk.jsonutil import canonical_json
 
@@ -66,11 +67,7 @@ class CandidateBrokerCapability:
                 stdin=server_channel,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                env={
-                    "LANG": "C.UTF-8",
-                    "LC_ALL": "C.UTF-8",
-                    "PATH": os.defpath,
-                },
+                env=trusted_runtime_environment(),
                 start_new_session=True,
             )
         except OSError as exc:

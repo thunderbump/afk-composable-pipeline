@@ -18,6 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from afk.candidate_broker import _container_command  # noqa: E402
+from afk.candidate_capability import CandidateBrokerCapability  # noqa: E402
 
 
 class CandidateBrokerCliTest(unittest.TestCase):
@@ -608,6 +609,104 @@ class CandidateBrokerCliTest(unittest.TestCase):
         self.assertEqual(broker_result["status"], "completed", broker_result)
         self.assertEqual(broker_result["stdout"], "container candidate ran\n")
         self.assertFalse((fake_bin / "bwrap").exists())
+
+    def test_candidate_capability_preserves_trusted_container_endpoint_identity(self):
+        selectors = (("docker", "DOCKER_HOST"), ("podman", "CONTAINER_HOST"))
+        for runtime_name, selector in selectors:
+            with self.subTest(runtime=runtime_name, selector=selector):
+                fake_bin = self.temp / f"{runtime_name}-capability-bin"
+                fake_bin.mkdir()
+                (fake_bin / "git").symlink_to(shutil.which("git"))
+                if runtime_name == "podman":
+                    docker = fake_bin / "docker"
+                    docker.write_text(
+                        f"#!{sys.executable}\nraise SystemExit(1)\n",
+                        encoding="utf-8",
+                    )
+                    docker.chmod(0o755)
+                endpoint = f"unix://{self.temp}/{runtime_name}-capability.sock"
+                runtime = fake_bin / runtime_name
+                runtime.write_text(
+                    textwrap.dedent(
+                        f"""
+                        #!{sys.executable}
+                        import json
+                        import os
+                        import sys
+                        from pathlib import Path
+
+                        if os.environ.get({selector!r}) != {endpoint!r}:
+                            raise SystemExit(41)
+                        if "UNRELATED_SECRET" in os.environ:
+                            raise SystemExit(42)
+                        arguments = sys.argv[1:]
+                        if {endpoint!r} in json.dumps(arguments):
+                            raise SystemExit(43)
+                        if arguments[0] == "info":
+                            raise SystemExit(0)
+                        if arguments[:2] == ["image", "inspect"]:
+                            print('[{{"Id":"sha256:fixture-image","Config":{{"Volumes":null}}}}]')
+                            raise SystemExit(0)
+                        if arguments[0] == "rm":
+                            raise SystemExit(0)
+                        Path(arguments[arguments.index("--cidfile") + 1]).write_text(
+                            "created-container-id\\n", encoding="utf-8"
+                        )
+                        mount = arguments[arguments.index("--mount") + 1]
+                        source = next(
+                            value.removeprefix("src=")
+                            for value in mount.split(",")
+                            if value.startswith("src=")
+                        )
+                        print((Path(source) / "input.txt").read_text(), end="")
+                        """
+                    ).lstrip(),
+                    encoding="utf-8",
+                )
+                runtime.chmod(0o755)
+                socket_path = self.temp / f"{runtime_name}-candidate-broker.sock"
+                environment = {
+                    "PATH": str(fake_bin),
+                    selector: endpoint,
+                    "UNRELATED_SECRET": "must-not-cross",
+                }
+
+                with (
+                    mock.patch.dict(os.environ, environment, clear=False),
+                    CandidateBrokerCapability(
+                        candidate_path=self.candidate,
+                        candidate_sha=self.candidate_sha,
+                        socket_path=socket_path,
+                    ) as capability,
+                    socket.socket(socket.AF_UNIX) as client,
+                ):
+                    live_capability = capability.request_value()
+                    client.connect(live_capability["socket_path"])
+                    client.sendall(
+                        (
+                            json.dumps(
+                                {
+                                    "schema_version": 1,
+                                    "token": live_capability["token"],
+                                    "command": ["/bin/cat", "/candidate/input.txt"],
+                                    "execution": {
+                                        "type": "container",
+                                        "image": "fixture:local",
+                                    },
+                                }
+                            )
+                            + "\n"
+                        ).encode("utf-8")
+                    )
+                    response = json.loads(
+                        client.makefile("r", encoding="utf-8").readline()
+                    )
+
+                self.assertEqual(response["status"], "completed", response)
+                self.assertEqual(response["candidate_sha"], self.candidate_sha)
+                self.assertEqual(response["stdout"], "exact candidate\n")
+                self.assertNotIn(endpoint, json.dumps(response))
+                self.assertNotIn(selector, json.dumps(response))
 
     def test_container_watchdog_cleans_up_after_broker_parent_death(self):
         selectors = (("docker", "DOCKER_HOST"), ("podman", "CONTAINER_HOST"))
