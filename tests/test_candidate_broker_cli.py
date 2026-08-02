@@ -480,6 +480,35 @@ class CandidateBrokerCliTest(unittest.TestCase):
 
         self.assertEqual(oversized_requests, [])
 
+    def test_exact_candidate_bounds_directories_across_breadth_frontiers(self):
+        from afk import checkouts
+
+        directory = self.candidate
+        for depth in range(5):
+            directory /= f"d{depth}"
+            directory.mkdir()
+        real_run_trusted_read_git = checkouts.run_trusted_read_git
+        ignore_requests = []
+
+        def record_ignore_request(args, **kwargs):
+            if args[:1] == ["check-ignore"]:
+                ignore_requests.append(kwargs.get("input_data"))
+            return real_run_trusted_read_git(args, **kwargs)
+
+        with (
+            mock.patch.object(checkouts, "EXACT_CANDIDATE_UNTRACKED_PATH_LIMIT", 4),
+            mock.patch.object(checkouts, "EXACT_CANDIDATE_UNTRACKED_BYTES_LIMIT", 1024),
+            mock.patch(
+                "afk.checkouts.run_trusted_read_git",
+                side_effect=record_ignore_request,
+            ),
+        ):
+            self.assertFalse(
+                checkouts.is_exact_clean_commit(self.candidate, self.candidate_sha)
+            )
+
+        self.assertEqual(len(ignore_requests), 4)
+
     def test_exact_candidate_rejects_unignored_extra_file(self):
         from afk.checkouts import is_exact_clean_commit
 

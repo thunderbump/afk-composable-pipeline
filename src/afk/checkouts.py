@@ -457,10 +457,10 @@ def _worktree_paths(
         for depth in range(1, len(item_path.split(b"/")))
     }
     pending = [(path, b"")]
+    untracked_directory_count = 0
+    untracked_directory_bytes = 0
     while pending:
         child_directories = []
-        untracked_directory_count = 0
-        untracked_directory_bytes = 0
         for directory, prefix in pending:
             with os.scandir(directory) as children:
                 for child in children:
