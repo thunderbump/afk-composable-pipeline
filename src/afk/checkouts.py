@@ -28,6 +28,10 @@ EXACT_CANDIDATE_TRACKED_DEPTH_LIMIT = 64
 EXACT_CANDIDATE_IGNORE_FILE_LIMIT = 256
 EXACT_CANDIDATE_IGNORE_BYTES_LIMIT = 1024 * 1024
 EXACT_CANDIDATE_REPOSITORY_LIMIT = 64
+_REGULAR_BLOB_KINDS = (
+    (b"100644", b"blob"),
+    (b"100755", b"blob"),
+)
 
 
 class GitCommandError(RuntimeError):
@@ -400,8 +404,7 @@ def _worktree_matches_commit(
         regular_blob_ids = {
             object_id
             for mode, object_type, object_id in entries.values()
-            if (mode, object_type)
-            in {(b"100644", b"blob"), (b"100755", b"blob")}
+            if (mode, object_type) in _REGULAR_BLOB_KINDS
         }
         blob_sizes = _git_blob_sizes(repository, regular_blob_ids)
         with tempfile.TemporaryDirectory(prefix="afk-ignore-") as temporary:
@@ -423,10 +426,7 @@ def _worktree_matches_commit(
         for item_path, (mode, object_type, object_id) in entries.items():
             parent_descriptor, name = _open_parent_descriptor(path, item_path)
             try:
-                if (mode, object_type) in {
-                    (b"100644", b"blob"),
-                    (b"100755", b"blob"),
-                }:
+                if (mode, object_type) in _REGULAR_BLOB_KINDS:
                     if not _git_regular_file_matches(
                         name,
                         mode,
@@ -707,8 +707,7 @@ def _materialize_committed_ignores(
         (item_path, object_id)
         for item_path, (mode, object_type, object_id) in entries.items()
         if PurePosixPath(os.fsdecode(item_path)).name == ".gitignore"
-        and (mode, object_type)
-        in {(b"100644", b"blob"), (b"100755", b"blob")}
+        and (mode, object_type) in _REGULAR_BLOB_KINDS
     ]
     if (
         len(ignore_entries) > EXACT_CANDIDATE_IGNORE_FILE_LIMIT
