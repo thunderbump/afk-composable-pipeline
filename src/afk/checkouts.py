@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import re
+import stat
 import subprocess
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.parse import unquote, urlsplit
 
@@ -313,15 +315,124 @@ def dirty_tree(path: Path) -> dict[str, Any]:
 def is_exact_clean_commit(path: Path, expected_commit: str) -> bool:
     try:
         head = run_trusted_read_git(["rev-parse", "HEAD"], cwd=path)
-        status = run_trusted_read_git(["status", "--porcelain"], cwd=path)
     except OSError:
         return False
     return (
         head.returncode == 0
         and head.stdout.strip() == expected_commit
-        and status.returncode == 0
-        and not status.stdout.strip()
+        and _worktree_matches_commit(path, expected_commit)
     )
+
+
+def _worktree_matches_commit(path: Path, commit: str) -> bool:
+    tree = run_trusted_read_git(
+        ["ls-tree", "-rz", "--full-tree", commit], cwd=path, text=False
+    )
+    index = run_trusted_read_git(["ls-files", "--stage", "-z"], cwd=path, text=False)
+    if tree.returncode != 0 or index.returncode != 0:
+        return False
+    try:
+        entries = _parse_tree_entries(tree.stdout)
+        if _parse_index_entries(index.stdout) != {
+            item_path: (mode, object_id)
+            for item_path, (mode, _object_type, object_id) in entries.items()
+        }:
+            return False
+        expected_paths = set(entries)
+        gitlinks = {
+            item_path
+            for item_path, (mode, object_type, _object_id) in entries.items()
+            if (mode, object_type) == (b"160000", b"commit")
+        }
+        if _worktree_paths(path, gitlinks) != expected_paths:
+            return False
+        for item_path, (mode, object_type, object_id) in entries.items():
+            target = path.joinpath(*PurePosixPath(os.fsdecode(item_path)).parts)
+            target_stat = target.lstat()
+            if (mode, object_type) in {
+                (b"100644", b"blob"),
+                (b"100755", b"blob"),
+            }:
+                if not stat.S_ISREG(target_stat.st_mode):
+                    return False
+                if bool(target_stat.st_mode & 0o111) != (mode == b"100755"):
+                    return False
+                if _git_blob_id(target.read_bytes()) != object_id:
+                    return False
+            elif (mode, object_type) == (b"120000", b"blob"):
+                if not stat.S_ISLNK(target_stat.st_mode):
+                    return False
+                if _git_blob_id(os.fsencode(os.readlink(target))) != object_id:
+                    return False
+            elif (mode, object_type) == (b"160000", b"commit"):
+                if not stat.S_ISDIR(target_stat.st_mode) or not is_exact_clean_commit(
+                    target, object_id.decode("ascii")
+                ):
+                    return False
+            else:
+                return False
+    except (OSError, UnicodeError, ValueError):
+        return False
+    return True
+
+
+def _parse_tree_entries(
+    output: bytes,
+) -> dict[bytes, tuple[bytes, bytes, bytes]]:
+    entries = {}
+    for record in output.rstrip(b"\0").split(b"\0") if output else []:
+        metadata, item_path = record.split(b"\t", 1)
+        mode, object_type, object_id = metadata.split()
+        _require_git_path(item_path)
+        if item_path in entries:
+            raise ValueError("duplicate tree path")
+        entries[item_path] = (mode, object_type, object_id)
+    return entries
+
+
+def _parse_index_entries(output: bytes) -> dict[bytes, tuple[bytes, bytes]]:
+    entries = {}
+    for record in output.rstrip(b"\0").split(b"\0") if output else []:
+        metadata, item_path = record.split(b"\t", 1)
+        mode, object_id, stage = metadata.split()
+        _require_git_path(item_path)
+        if stage != b"0" or item_path in entries:
+            raise ValueError("unmerged index")
+        entries[item_path] = (mode, object_id)
+    return entries
+
+
+def _require_git_path(item_path: bytes) -> None:
+    relative = PurePosixPath(os.fsdecode(item_path))
+    if relative.is_absolute() or any(
+        part in {"", ".", ".."} for part in relative.parts
+    ):
+        raise ValueError("invalid Git path")
+
+
+def _worktree_paths(path: Path, gitlinks: set[bytes]) -> set[bytes]:
+    observed = set()
+    for root, directories, files in os.walk(path, topdown=True, followlinks=False):
+        root_path = Path(root)
+        for name in list(directories):
+            target = root_path / name
+            relative = os.fsencode(target.relative_to(path).as_posix())
+            if relative == b".git":
+                directories.remove(name)
+            elif relative in gitlinks or target.is_symlink():
+                observed.add(relative)
+                directories.remove(name)
+        for name in files:
+            target = root_path / name
+            relative = os.fsencode(target.relative_to(path).as_posix())
+            if relative != b".git":
+                observed.add(relative)
+    return observed
+
+
+def _git_blob_id(content: bytes) -> bytes:
+    header = f"blob {len(content)}\0".encode("ascii")
+    return hashlib.sha1(header + content).hexdigest().encode("ascii")
 
 
 def run_trusted_read_git(

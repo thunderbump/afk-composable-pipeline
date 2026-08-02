@@ -272,6 +272,37 @@ class CandidateBrokerCliTest(unittest.TestCase):
         self.assertEqual(json.loads(result.read_text(encoding="utf-8"))["exit_code"], 0)
         self.assertFalse(marker.exists())
 
+    def test_does_not_run_clean_filters_when_checking_the_candidate(self):
+        (self.candidate / ".gitattributes").write_text(
+            "input.txt filter=evil\n", encoding="utf-8"
+        )
+        self.git("add", ".gitattributes")
+        self.git("commit", "-m", "add candidate filter")
+        self.candidate_sha = self.git("rev-parse", "HEAD")
+        marker = self.temp / "clean-filter-ran"
+        clean_filter = self.temp / "clean-filter"
+        clean_filter.write_text(
+            f"#!/bin/sh\ntouch {marker}\n/bin/cat\n",
+            encoding="utf-8",
+        )
+        clean_filter.chmod(0o755)
+        self.git("config", "filter.evil.clean", str(clean_filter))
+        os.utime(self.candidate / "input.txt")
+        request = self.temp / "clean-filter-request.json"
+        result = self.temp / "clean-filter-result.json"
+        fake_bin = self.temp / "clean-filter-bin"
+        fake_bin.mkdir()
+        (fake_bin / "bwrap").symlink_to(shutil.which("true"))
+        self.write_request(request, command=["/usr/bin/true"])
+
+        completed = self.run_broker(
+            request, result, env={"PATH": f"{fake_bin}:{os.environ['PATH']}"}
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(json.loads(result.read_text(encoding="utf-8"))["exit_code"], 0)
+        self.assertFalse(marker.exists())
+
     @unittest.skipUnless(shutil.which("bwrap"), "bubblewrap is unavailable")
     def test_ignores_replace_refs_for_the_approved_candidate(self):
         (self.repository / "input.txt").write_text(
@@ -627,6 +658,7 @@ class CandidateBrokerCliTest(unittest.TestCase):
         fake_bin.mkdir()
         (fake_bin / "bwrap").symlink_to(shutil.which("true"))
         real_git = shutil.which("git")
+        listing_seen = self.temp / "snapshot-listing-seen"
         git = fake_bin / "git"
         git.write_text(
             textwrap.dedent(
@@ -634,9 +666,13 @@ class CandidateBrokerCliTest(unittest.TestCase):
                 #!{sys.executable}
                 import os
                 import sys
+                from pathlib import Path
 
                 if sys.argv[1:2] == ["ls-tree"]:
-                    raise SystemExit(1)
+                    marker = Path({str(listing_seen)!r})
+                    if marker.exists():
+                        raise SystemExit(1)
+                    marker.touch()
                 os.execv({real_git!r}, [{real_git!r}, *sys.argv[1:]])
                 """
             ).lstrip(),
