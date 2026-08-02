@@ -58,8 +58,8 @@ def run_supervised_command(
     cleanup_seconds = (
         _PROCESS_CLEANUP_SECONDS if cleanup_seconds is None else cleanup_seconds
     )
-    deadline = time.monotonic() + timeout_seconds
     with _LinuxDescendantSupervisor(cleanup_seconds, subject) as descendants:
+        deadline = time.monotonic() + timeout_seconds
         process = subprocess.Popen(
             command,
             cwd=cwd,

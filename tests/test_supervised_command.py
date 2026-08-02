@@ -60,7 +60,7 @@ class SupervisedCommandTest(unittest.TestCase):
         )
         self.assertEqual(completed.stdout, "released\n")
 
-    def test_overlapping_calls_serialize_process_wide_supervision(self):
+    def test_lock_queue_time_does_not_consume_the_execution_timeout(self):
         class ObservedLock:
             def __init__(self):
                 self.lock = threading.Lock()
@@ -105,13 +105,13 @@ class SupervisedCommandTest(unittest.TestCase):
             root = Path(temporary)
             release_first = root / "release-first"
 
-            def invoke(name, command):
+            def invoke(name, command, timeout_seconds):
                 try:
                     results[name] = run_supervised_command(
                         command,
                         cwd=root,
                         environment=os.environ.copy(),
-                        timeout_seconds=3,
+                        timeout_seconds=timeout_seconds,
                         label=name,
                     )
                 except BaseException as exc:
@@ -131,11 +131,16 @@ class SupervisedCommandTest(unittest.TestCase):
                             "\nprint('first')"
                         ),
                     ],
+                    3,
                 ),
             )
             second = threading.Thread(
                 target=invoke,
-                args=("second", [sys.executable, "-c", "print('second')"]),
+                args=(
+                    "second",
+                    [sys.executable, "-c", "print('second')"],
+                    0.05,
+                ),
             )
             with (
                 mock.patch.object(
@@ -155,6 +160,7 @@ class SupervisedCommandTest(unittest.TestCase):
                 second.start()
                 overlap_was_serialized = observed_lock.waiting.wait(1)
                 second_was_held = not second_launched.is_set()
+                time.sleep(0.1)
                 release_first.write_text("release\n", encoding="utf-8")
                 first.join(4)
                 second.join(4)
