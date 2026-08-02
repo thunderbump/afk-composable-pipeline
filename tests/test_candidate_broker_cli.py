@@ -1185,6 +1185,7 @@ class CandidateBrokerCliTest(unittest.TestCase):
             import json
             import os
             import socket
+            import stat
             import sys
             from pathlib import Path
 
@@ -1259,20 +1260,58 @@ class CandidateBrokerCliTest(unittest.TestCase):
 
             dev_stat = os.stat("/dev")
             sandbox_dev_identity = [dev_stat.st_dev, dev_stat.st_ino]
+            safe_dev_entries = {{
+                "core": "symlink",
+                "fd": "symlink",
+                "full": "character",
+                "mqueue": "directory",
+                "null": "character",
+                "ptmx": "symlink",
+                "pts": "directory",
+                "random": "character",
+                "shm": "directory",
+                "stderr": "symlink",
+                "stdin": "symlink",
+                "stdout": "symlink",
+                "tty": "character",
+                "urandom": "character",
+                "zero": "character",
+            }}
+
+            def dev_entry_type(path):
+                mode = os.lstat(path).st_mode
+                if path.is_symlink():
+                    return "symlink"
+                if path.is_dir():
+                    return "directory"
+                if stat.S_ISCHR(mode):
+                    return "character"
+                return "unexpected"
+
             with Path("/dev/null").open("wb", buffering=0) as null_output:
                 null_written = null_output.write(b"discard")
             with Path("/dev/null").open("rb", buffering=0) as null_input:
                 null_read = null_input.read(1)
-            dev_entries = sorted(path.name for path in Path("/dev").iterdir())
+            dev_entries = {{
+                path.name: dev_entry_type(path)
+                for path in Path("/dev").iterdir()
+            }}
+            unexpected_dev_entries = {{
+                name: entry_type
+                for name, entry_type in dev_entries.items()
+                if safe_dev_entries.get(name) != entry_type
+            }}
             checks["dev_namespace"] = {{
                 "classification": "permitted"
                 if sandbox_dev_identity != {host_dev_identity!r}
                 and null_written == 7
                 and null_read == b""
+                and not unexpected_dev_entries
                 else "exposed",
                 "host_identity": {host_dev_identity!r},
                 "sandbox_identity": sandbox_dev_identity,
                 "entries": dev_entries,
+                "unexpected_entries": unexpected_dev_entries,
                 "null_read_empty": null_read == b"",
                 "null_written": null_written,
             }}
@@ -1442,7 +1481,8 @@ class CandidateBrokerCliTest(unittest.TestCase):
             checks["dev_namespace"]["sandbox_identity"],
             checks["dev_namespace"]["host_identity"],
         )
-        self.assertIn("null", checks["dev_namespace"]["entries"])
+        self.assertEqual(checks["dev_namespace"]["entries"]["null"], "character")
+        self.assertEqual(checks["dev_namespace"]["unexpected_entries"], {})
         self.assertTrue(checks["dev_namespace"]["null_read_empty"])
         self.assertEqual(checks["dev_namespace"]["null_written"], 7)
 
