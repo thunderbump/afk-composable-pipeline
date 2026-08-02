@@ -339,6 +339,7 @@ def run_trusted_read_git(
             "GIT_CONFIG_VALUE_0": "false",
             "GIT_CONFIG_KEY_1": "core.hooksPath",
             "GIT_CONFIG_VALUE_1": os.devnull,
+            "GIT_NO_LAZY_FETCH": "1",
             "GIT_NO_REPLACE_OBJECTS": "1",
             "GIT_OPTIONAL_LOCKS": "0",
         }

@@ -300,6 +300,48 @@ class CandidateBrokerCliTest(unittest.TestCase):
         self.assertEqual(broker_result["exit_code"], 0, broker_result["stderr"])
         self.assertEqual(broker_result["stdout"], "exact candidate\n")
 
+    def test_does_not_fetch_a_missing_promised_blob_on_the_host(self):
+        remote = self.temp / "promisor.git"
+        subprocess.run(
+            ["git", "clone", "--bare", str(self.repository), str(remote)],
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+        marker = self.temp / "promisor-fetch-ran"
+        upload_pack = self.temp / "upload-pack"
+        upload_pack.write_text(
+            f"#!/bin/sh\ntouch {marker}\nexit 1\n",
+            encoding="utf-8",
+        )
+        upload_pack.chmod(0o755)
+        self.git("remote", "add", "origin", str(remote))
+        self.git("config", "core.repositoryFormatVersion", "1")
+        self.git("config", "extensions.partialClone", "origin")
+        self.git("config", "remote.origin.promisor", "true")
+        self.git("config", "remote.origin.partialCloneFilter", "blob:none")
+        self.git("config", "remote.origin.uploadpack", str(upload_pack))
+        blob_sha = self.git("rev-parse", "HEAD:input.txt")
+        common_dir = Path(self.git("rev-parse", "--git-common-dir"))
+        if not common_dir.is_absolute():
+            common_dir = self.candidate / common_dir
+        (common_dir / "objects" / blob_sha[:2] / blob_sha[2:]).unlink()
+        request = self.temp / "promisor-request.json"
+        result = self.temp / "promisor-result.json"
+        fake_bin = self.temp / "promisor-bin"
+        fake_bin.mkdir()
+        (fake_bin / "bwrap").symlink_to(shutil.which("true"))
+        self.write_request(request, command=["/usr/bin/true"])
+
+        completed = self.run_broker(
+            request, result, env={"PATH": f"{fake_bin}:{os.environ['PATH']}"}
+        )
+
+        self.assertEqual(completed.returncode, 2)
+        self.assertEqual(completed.stderr, "exact Candidate snapshot is unavailable\n")
+        self.assertFalse(result.exists())
+        self.assertFalse(marker.exists())
+
     @unittest.skipUnless(shutil.which("bwrap"), "bubblewrap is unavailable")
     def test_runs_against_read_only_exact_candidate_with_writable_scratch(self):
         probe = textwrap.dedent(
