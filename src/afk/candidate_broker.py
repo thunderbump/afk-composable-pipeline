@@ -415,6 +415,12 @@ def _materialize_candidate_snapshot(
                 raise CandidateBrokerError("exact Candidate snapshot is unavailable")
             target = destination.joinpath(*relative.parts)
             target.parent.mkdir(parents=True, exist_ok=True)
+            parent = target.parent
+            while parent != destination:
+                if parent.is_symlink():
+                    raise CandidateBrokerError("exact Candidate snapshot is invalid")
+                parent.chmod(0o755)
+                parent = parent.parent
             if mode == b"120000":
                 os.symlink(os.fsdecode(blob.stdout), target)
             else:

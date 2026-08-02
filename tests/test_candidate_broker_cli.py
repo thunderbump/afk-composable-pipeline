@@ -705,6 +705,72 @@ class CandidateBrokerCliTest(unittest.TestCase):
         self.assertEqual(broker_result["exit_code"], 19)
         self.assertEqual(broker_result["stdout"], "")
 
+    def test_container_snapshot_directories_ignore_a_restrictive_host_umask(self):
+        nested = self.candidate / "nested" / "deeper"
+        nested.mkdir(parents=True)
+        (nested / "input.txt").write_text("nested input\n", encoding="utf-8")
+        (self.candidate / "nested-link").symlink_to("nested", target_is_directory=True)
+        self.git("add", ".")
+        self.git("commit", "-m", "add nested container input")
+        self.candidate_sha = self.git("rev-parse", "HEAD")
+        request = self.temp / "container-umask-request.json"
+        result = self.temp / "container-umask-result.json"
+        fake_bin = self.temp / "container-umask-bin"
+        fake_bin.mkdir()
+        (fake_bin / "git").symlink_to(shutil.which("git"))
+        (fake_bin / "bwrap").symlink_to(shutil.which("bwrap"))
+        fake_docker = fake_bin / "docker"
+        fake_docker.write_text(
+            textwrap.dedent(
+                f"""
+                #!{sys.executable}
+                import stat
+                import sys
+                from pathlib import Path
+
+                arguments = sys.argv[1:]
+                if arguments[0] in {{"info", "rm"}}:
+                    raise SystemExit(0)
+                mount = arguments[arguments.index("--mount") + 1]
+                source = Path(next(
+                    item.removeprefix("src=")
+                    for item in mount.split(",")
+                    if item.startswith("src=")
+                ))
+                print(oct(stat.S_IMODE((source / "nested").stat().st_mode)))
+                print(oct(stat.S_IMODE((source / "nested/deeper").stat().st_mode)))
+                input_file = source / "nested/deeper/input.txt"
+                print(oct(stat.S_IMODE(input_file.stat().st_mode)))
+                print((source / "nested-link").is_symlink())
+                """
+            ).lstrip(),
+            encoding="utf-8",
+        )
+        fake_docker.chmod(0o755)
+        self.write_request(
+            request,
+            command=["/bin/cat", "/candidate/nested/deeper/input.txt"],
+            execution={"type": "container", "image": "fixture:local"},
+        )
+
+        previous_umask = os.umask(0o077)
+        try:
+            completed = self.run_broker(
+                request,
+                result,
+                env={"PATH": str(fake_bin)},
+            )
+        finally:
+            os.umask(previous_umask)
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        broker_result = json.loads(result.read_text(encoding="utf-8"))
+        self.assertEqual(broker_result["status"], "completed", broker_result)
+        self.assertEqual(
+            broker_result["stdout"],
+            "0o755\n0o755\n0o644\nTrue\n",
+        )
+
     @unittest.skipUnless(
         (shutil.which("docker") or shutil.which("podman"))
         and os.environ.get("AFK_CONTAINER_TEST_IMAGE"),
