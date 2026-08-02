@@ -11,9 +11,9 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-import afk.candidate_validation as candidate_validation  # noqa: E402
-from afk.candidate_validation import (  # noqa: E402
-    CandidateValidationError,
+import afk.process_supervision as process_supervision  # noqa: E402
+from afk.process_supervision import (  # noqa: E402
+    SupervisedCommandError,
     run_supervised_command,
 )
 
@@ -58,9 +58,7 @@ class SupervisedCommandTest(unittest.TestCase):
     def test_timeout_remains_live_while_child_does_not_read_large_stdin(self):
         with tempfile.TemporaryDirectory() as temporary:
             started = time.monotonic()
-            with self.assertRaisesRegex(
-                CandidateValidationError, "timed out"
-            ) as raised:
+            with self.assertRaisesRegex(SupervisedCommandError, "timed out") as raised:
                 run_supervised_command(
                     [sys.executable, "-c", "import time; time.sleep(1)"],
                     cwd=Path(temporary),
@@ -71,7 +69,7 @@ class SupervisedCommandTest(unittest.TestCase):
                 )
 
         self.assertLess(time.monotonic() - started, 0.8)
-        self.assertEqual(raised.exception.execution_classification, "timeout")
+        self.assertEqual(raised.exception.classification, "timeout")
         self.assertIsNone(raised.exception.exit_code)
 
     def test_initial_tracking_failure_terminates_detached_child_before_mutation(self):
@@ -101,12 +99,12 @@ class SupervisedCommandTest(unittest.TestCase):
 
             with (
                 mock.patch.object(
-                    candidate_validation.os,
+                    process_supervision.os,
                     "pidfd_open",
                     side_effect=fail_after_detach,
                 ),
                 self.assertRaisesRegex(
-                    CandidateValidationError, "supervision is unavailable"
+                    SupervisedCommandError, "supervision is unavailable"
                 ),
             ):
                 run_supervised_command(
@@ -133,7 +131,7 @@ class SupervisedCommandTest(unittest.TestCase):
                     f"import sys; {target}.write('x'*17); {target}.flush()",
                 ]
                 with self.assertRaisesRegex(
-                    CandidateValidationError, "output exceeds"
+                    SupervisedCommandError, "output exceeds"
                 ) as raised:
                     run_supervised_command(
                         command,
@@ -144,7 +142,7 @@ class SupervisedCommandTest(unittest.TestCase):
                         output_byte_limit=16,
                     )
                 self.assertEqual(
-                    raised.exception.execution_classification,
+                    raised.exception.classification,
                     "output_overflow",
                 )
                 self.assertIsNone(raised.exception.exit_code)
@@ -160,7 +158,7 @@ class SupervisedCommandTest(unittest.TestCase):
                     "os.kill(os.getpid(),signal.SIGKILL)"
                 ),
             ]
-            with self.assertRaises(CandidateValidationError) as raised:
+            with self.assertRaises(SupervisedCommandError) as raised:
                 run_supervised_command(
                     command,
                     cwd=Path(temporary),
@@ -169,11 +167,24 @@ class SupervisedCommandTest(unittest.TestCase):
                     label="Codex",
                 )
 
-        self.assertEqual(raised.exception.kind, "interrupted")
-        self.assertEqual(raised.exception.execution_classification, "abnormal_exit")
+        self.assertEqual(raised.exception.classification, "abnormal_exit")
         self.assertEqual(raised.exception.exit_code, -signal.SIGKILL)
         self.assertIn("SIGKILL", raised.exception.summary)
         self.assertEqual(raised.exception.stdout, "password=[REDACTED]\n")
+
+    def test_invalid_utf8_has_a_neutral_failure_classification(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            with self.assertRaises(SupervisedCommandError) as raised:
+                run_supervised_command(
+                    [sys.executable, "-c", "import os; os.write(1, b'\\xff')"],
+                    cwd=Path(temporary),
+                    environment=os.environ.copy(),
+                    timeout_seconds=1,
+                    label="Codex",
+                )
+
+        self.assertEqual(raised.exception.classification, "invalid_utf8")
+        self.assertIn("UTF-8", raised.exception.summary)
 
     def test_invalid_utf8_signal_diagnostics_stay_within_the_byte_limit(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -186,7 +197,7 @@ class SupervisedCommandTest(unittest.TestCase):
                     "os.kill(os.getpid(),signal.SIGKILL)"
                 ),
             ]
-            with self.assertRaises(CandidateValidationError) as raised:
+            with self.assertRaises(SupervisedCommandError) as raised:
                 run_supervised_command(
                     command,
                     cwd=Path(temporary),
@@ -196,7 +207,7 @@ class SupervisedCommandTest(unittest.TestCase):
                     output_byte_limit=4,
                 )
 
-        self.assertEqual(raised.exception.execution_classification, "abnormal_exit")
+        self.assertEqual(raised.exception.classification, "abnormal_exit")
         self.assertLessEqual(len(raised.exception.stdout.encode("utf-8")), 4)
 
     def test_timeout_kills_detached_term_resistant_descendants_before_mutation(self):
@@ -217,7 +228,7 @@ class SupervisedCommandTest(unittest.TestCase):
                 "time.sleep(30)"
             )
 
-            with self.assertRaisesRegex(CandidateValidationError, "timed out"):
+            with self.assertRaisesRegex(SupervisedCommandError, "timed out"):
                 run_supervised_command(
                     [sys.executable, "-c", parent],
                     cwd=root,

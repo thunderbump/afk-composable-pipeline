@@ -1,23 +1,22 @@
 from __future__ import annotations
 
-import ctypes
 import hashlib
 import json
 import os
-import select
-import signal
 import stat
 import subprocess
 import sys
 import tempfile
-import time
 from contextlib import ExitStack
 from pathlib import Path
 from typing import Any
 
 from afk.checkouts import is_exact_clean_commit
 from afk.jsonutil import canonical_json
-from afk.process_io import BoundedProcessIO
+from afk.process_supervision import (
+    SupervisedCommandError,
+    run_supervised_command as _run_supervised_command,
+)
 from afk.redaction import redact_text
 from afk.run_store import GATE_BYTE_LIMIT, RunStore, RunStoreError
 from afk.validation_contract import (
@@ -32,8 +31,6 @@ BOOTSTRAP_RUNNER = Path(__file__).with_name("bootstrap_adapter.py")
 RESULT_BYTE_LIMIT = 1024 * 1024
 OUTPUT_BYTE_LIMIT = 64 * 1024 * 1024
 PROCESS_CLEANUP_SECONDS = 1
-PR_SET_CHILD_SUBREAPER = 36
-PR_GET_CHILD_SUBREAPER = 37
 TRUSTED_SCRIPT_INTERPRETERS = {"python", "python3"}
 AFK_EVIDENCE_NAMESPACE = "afk"
 CONTRACT_EVIDENCE_NAMESPACE = "contract"
@@ -63,16 +60,12 @@ class CandidateValidationError(RuntimeError):
         *,
         stdout: str | None = None,
         stderr: str | None = None,
-        execution_classification: str | None = None,
-        exit_code: int | None = None,
     ):
         super().__init__(summary)
         self.kind = kind
         self.summary = summary
         self.stdout = stdout
         self.stderr = stderr
-        self.execution_classification = execution_classification
-        self.exit_code = exit_code
 
 
 def validate_candidate(
@@ -800,292 +793,36 @@ def run_supervised_command(
     output_byte_limit: int | None = None,
     cleanup_seconds: float | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    subject = label.strip() or "command"
     output_byte_limit = (
         OUTPUT_BYTE_LIMIT if output_byte_limit is None else output_byte_limit
     )
     cleanup_seconds = (
         PROCESS_CLEANUP_SECONDS if cleanup_seconds is None else cleanup_seconds
     )
-    deadline = time.monotonic() + timeout_seconds
-    with _LinuxDescendantSupervisor(cleanup_seconds) as descendants:
-        process = subprocess.Popen(
+    try:
+        return _run_supervised_command(
             command,
             cwd=cwd,
-            env=environment,
-            stdin=subprocess.PIPE if input_text is not None else subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            start_new_session=True,
-        )
-        try:
-            descendants.track(process.pid)
-        except CandidateValidationError:
-            descendants.terminate_untracked(process)
-            raise
-        process_io = BoundedProcessIO(
-            process,
-            input_bytes=None if input_text is None else input_text.encode("utf-8"),
+            environment=environment,
+            timeout_seconds=timeout_seconds,
+            input_text=input_text,
+            label=label,
             output_byte_limit=output_byte_limit,
             cleanup_seconds=cleanup_seconds,
         )
-        while process.poll() is None:
-            descendants.discover(process.pid)
-            stop_reason = process_io.observe(deadline)
-            if stop_reason == "timeout":
-                process_io.close_input()
-                descendants.terminate(process.pid)
-                process.poll()
-                if not process_io.drain():
-                    raise CandidateValidationError(
-                        "interrupted",
-                        "validation output streams could not be drained",
-                    )
-                stdout, stderr = process_io.diagnostics()
-                raise CandidateValidationError(
-                    "interrupted",
-                    f"{subject} timed out and its process tree was terminated",
-                    stdout=stdout,
-                    stderr=stderr,
-                    execution_classification="timeout",
-                )
-            if stop_reason == "overflow":
-                break
-        process_io.close_input()
-        descendants.terminate(process.pid)
-        process.poll()
-        if not process_io.drain():
-            raise CandidateValidationError(
-                "interrupted", "validation output streams could not be drained"
-            )
-        if process_io.overflowed:
-            stdout, stderr = process_io.diagnostics()
-            raise CandidateValidationError(
-                "invalid",
-                f"{subject} output exceeds the size limit",
-                stdout=stdout,
-                stderr=stderr,
-                execution_classification="output_overflow",
-            )
-        if process.returncode < 0:
-            signal_number = -process.returncode
-            try:
-                signal_name = signal.Signals(signal_number).name
-            except ValueError:
-                signal_name = str(signal_number)
-            stdout, stderr = process_io.diagnostics()
-            raise CandidateValidationError(
-                "interrupted",
-                f"{subject} exited after signal {signal_name}",
-                stdout=stdout,
-                stderr=stderr,
-                execution_classification="abnormal_exit",
-                exit_code=process.returncode,
-            )
-        try:
-            stdout, stderr = process_io.decoded_output()
-        except UnicodeDecodeError as exc:
-            diagnostic_stdout, diagnostic_stderr = process_io.diagnostics()
-            raise CandidateValidationError(
-                "invalid",
-                f"{subject} output must be UTF-8 text",
-                stdout=diagnostic_stdout,
-                stderr=diagnostic_stderr,
-            ) from exc
-        return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
-
-
-class _LinuxDescendantSupervisor:
-    def __init__(self, cleanup_seconds: float) -> None:
-        self._libc = ctypes.CDLL(None, use_errno=True)
-        self._previous = ctypes.c_int()
-        self._baseline: set[int] = set()
-        self._pidfds: dict[int, int] = {}
-        self._root_pid: int | None = None
-        self._cleanup_seconds = cleanup_seconds
-
-    def __enter__(self) -> _LinuxDescendantSupervisor:
-        if (
-            self._libc.prctl(
-                PR_GET_CHILD_SUBREAPER, ctypes.byref(self._previous), 0, 0, 0
-            )
-            != 0
-            or self._libc.prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0
-        ):
-            raise CandidateValidationError(
-                "invalid", "Linux validation descendant supervision is unavailable"
-            )
-        self._baseline = set(_proc_children(os.getpid()))
-        return self
-
-    def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
-        try:
-            if self._root_pid is not None and self._pidfds:
-                self.terminate(self._root_pid)
-        finally:
-            for pidfd in self._pidfds.values():
-                os.close(pidfd)
-            self._pidfds.clear()
-            if (
-                self._libc.prctl(PR_SET_CHILD_SUBREAPER, self._previous.value, 0, 0, 0)
-                != 0
-            ):
-                raise CandidateValidationError(
-                    "interrupted", "Linux validation descendant supervision was lost"
-                )
-
-    def track(self, pid: int) -> None:
-        self._root_pid = pid
-        self._track(pid)
-
-    def discover(self, root_pid: int) -> None:
-        pending = [
-            root_pid,
-            *(pid for pid in _proc_children(os.getpid()) if pid not in self._baseline),
-        ]
-        seen: set[int] = set()
-        while pending:
-            pid = pending.pop()
-            if pid in seen or pid == os.getpid():
-                continue
-            seen.add(pid)
-            self._track(pid)
-            pending.extend(_proc_children(pid))
-
-    def terminate(self, root_pid: int) -> None:
-        if self._wait_for_exit(root_pid, signal.SIGTERM):
-            return
-        if self._wait_for_exit(root_pid, signal.SIGKILL):
-            return
-        raise CandidateValidationError(
-            "interrupted", "validation process tree could not be terminated"
+    except SupervisedCommandError as exc:
+        kind = (
+            "invalid"
+            if exc.classification
+            in {"invalid_utf8", "output_overflow", "supervision_unavailable"}
+            else "interrupted"
         )
-
-    def terminate_untracked(self, process: subprocess.Popen[bytes]) -> None:
-        failure: OSError | None = None
-        deadline = time.monotonic() + self._cleanup_seconds
-        try:
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            except OSError as exc:
-                failure = exc
-            while time.monotonic() < deadline:
-                process.poll()
-                children = [
-                    pid
-                    for pid in _proc_children(os.getpid())
-                    if pid not in self._baseline
-                ]
-                for pid in children:
-                    try:
-                        os.kill(pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
-                    except OSError as exc:
-                        failure = failure or exc
-                for pid in children:
-                    if pid == process.pid:
-                        continue
-                    try:
-                        os.waitpid(pid, os.WNOHANG)
-                    except ChildProcessError:
-                        pass
-                    except OSError as exc:
-                        failure = failure or exc
-                process.poll()
-                remaining = [
-                    pid
-                    for pid in _proc_children(os.getpid())
-                    if pid not in self._baseline
-                ]
-                if process.returncode is not None and not remaining:
-                    if failure is None:
-                        return
-                    break
-                time.sleep(0.01)
-        finally:
-            for stream in (process.stdin, process.stdout, process.stderr):
-                if stream is not None:
-                    stream.close()
         raise CandidateValidationError(
-            "interrupted", "untracked process tree could not be terminated"
-        ) from failure
-
-    def _wait_for_exit(self, root_pid: int, requested_signal: signal.Signals) -> bool:
-        deadline = time.monotonic() + self._cleanup_seconds
-        while time.monotonic() < deadline:
-            self.discover(root_pid)
-            self._discard_exited()
-            if not self._pidfds:
-                self.discover(root_pid)
-                self._discard_exited()
-                if not self._pidfds:
-                    return True
-            for pidfd in tuple(self._pidfds.values()):
-                try:
-                    signal.pidfd_send_signal(pidfd, requested_signal)
-                except ProcessLookupError:
-                    pass
-                except OSError as exc:
-                    raise CandidateValidationError(
-                        "interrupted", "validation process tree could not be signalled"
-                    ) from exc
-            time.sleep(0.01)
-        return False
-
-    def _track(self, pid: int) -> None:
-        if pid in self._pidfds:
-            return
-        try:
-            self._pidfds[pid] = os.pidfd_open(pid)
-        except ProcessLookupError:
-            pass
-        except OSError as exc:
-            raise CandidateValidationError(
-                "invalid", "Linux validation descendant supervision is unavailable"
-            ) from exc
-
-    def _discard_exited(self) -> None:
-        if not self._pidfds:
-            return
-        poller = select.poll()
-        for pidfd in self._pidfds.values():
-            poller.register(pidfd, select.POLLIN)
-        readable = {pidfd for pidfd, _ in poller.poll(0)}
-        for pid, pidfd in tuple(self._pidfds.items()):
-            if pidfd not in readable:
-                continue
-            try:
-                os.waitpid(pid, os.WNOHANG)
-            except ChildProcessError:
-                pass
-            os.close(pidfd)
-            del self._pidfds[pid]
-
-
-def _proc_children(pid: int) -> list[int]:
-    children: set[int] = set()
-    try:
-        tasks = list(Path(f"/proc/{pid}/task").iterdir())
-    except FileNotFoundError:
-        return []
-    except OSError as exc:
-        raise CandidateValidationError(
-            "invalid", "Linux validation descendant supervision is unavailable"
+            kind,
+            exc.summary,
+            stdout=exc.stdout,
+            stderr=exc.stderr,
         ) from exc
-    for task in tasks:
-        try:
-            values = (task / "children").read_text(encoding="utf-8").split()
-        except FileNotFoundError:
-            continue
-        except OSError as exc:
-            raise CandidateValidationError(
-                "invalid", "Linux validation descendant supervision is unavailable"
-            ) from exc
-        children.update(int(value) for value in values if value.isdigit())
-    return sorted(children)
 
 
 def _manifest_digest(manifest: dict[str, Any]) -> str:

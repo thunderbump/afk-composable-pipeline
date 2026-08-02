@@ -9,12 +9,9 @@ import tempfile
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from afk.candidate_validation import (
-    CandidateValidationError,
-    run_supervised_command,
-)
 from afk.checkouts import is_exact_clean_commit, run_trusted_read_git
 from afk.jsonutil import canonical_json
+from afk.process_supervision import SupervisedCommandError, run_supervised_command
 
 
 SCHEMA_VERSION = 1
@@ -138,14 +135,18 @@ def run_candidate(request: dict[str, Any]) -> dict[str, Any]:
                 "launch_failure",
                 "Candidate command could not be launched",
             )
-        except CandidateValidationError as exc:
-            if exc.execution_classification is None:
+        except SupervisedCommandError as exc:
+            if exc.classification not in {
+                "timeout",
+                "output_overflow",
+                "abnormal_exit",
+            }:
                 raise CandidateBrokerError(
                     "Candidate command supervision failed"
                 ) from exc
             return _failed_execution_result(
                 request["candidate_sha"],
-                exc.execution_classification,
+                exc.classification,
                 exc.summary,
                 exit_code=exc.exit_code,
                 stdout=exc.stdout or "",
