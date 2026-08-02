@@ -2462,9 +2462,11 @@ class CandidateValidationCliTest(unittest.TestCase):
         )
         run_id, _ = self.candidate_ready_run()
 
-        completed = self.run_afk("resume")
+        child_pid = None
 
         try:
+            completed, child_pid = self.run_afk_observing_argument(token, "resume")
+            self.assertIsNotNone(child_pid)
             self.assertEqual(completed.returncode, 2)
             status = self.status(run_id)
             self.assertEqual(status["attention"]["kind"], "interrupted")
@@ -2479,13 +2481,10 @@ class CandidateValidationCliTest(unittest.TestCase):
             )
             self.assertEqual(stat.S_IMODE(evidence.stat().st_mode), 0o500)
             self.assertTrue(child_ready_path.is_file())
+            self.assert_host_process_reaped(child_pid)
             self.assertEqual(self.processes_with_argument(token), [])
         finally:
-            for pid in self.processes_with_argument(token):
-                try:
-                    os.kill(pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
+            self.kill_processes_with_argument(token)
 
     def test_timeout_kills_term_resistant_validation_descendant(self):
         child_ready_path = self.temp / "resistant-timeout-child.ready"
@@ -2517,24 +2516,24 @@ class CandidateValidationCliTest(unittest.TestCase):
         )
         run_id, _ = self.candidate_ready_run()
 
-        completed = self.run_afk("resume")
+        child_pid = None
 
         try:
+            completed, child_pid = self.run_afk_observing_argument(token, "resume")
+            self.assertIsNotNone(child_pid)
             self.assertEqual(completed.returncode, 2)
             status = self.status(run_id)
             self.assertEqual(status["attention"]["kind"], "interrupted")
             self.assertIn("timed out", status["attention"]["summary"])
             self.assertTrue(child_ready_path.is_file())
+            self.assert_host_process_reaped(child_pid)
             self.assertEqual(self.processes_with_argument(token), [])
         finally:
-            for pid in self.processes_with_argument(token):
-                try:
-                    os.kill(pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
+            self.kill_processes_with_argument(token)
 
     def test_successful_worker_cannot_leave_descendants_running(self):
         child_ready_path = self.temp / "successful-child.ready"
+        observation_release_path = self.temp / "successful-child.release"
         token = f"afk-successful-child-{os.getpid()}-{time.monotonic_ns()}"
         child_program = (
             "import sys,time; from pathlib import Path; "
@@ -2549,26 +2548,32 @@ class CandidateValidationCliTest(unittest.TestCase):
                 f"subprocess.Popen([sys.executable, '-c', {child_program!r}, "
                 f"{str(child_ready_path)!r}, {token!r}]); "
                 f'exec("while not Path({str(child_ready_path)!r}).exists():\\n" '
+                '"    time.sleep(0.001)"); '
+                'exec("while not Path('
+                f"{str(observation_release_path)!r}"
+                ').exists():\\n" '
                 '"    time.sleep(0.001)"); ' + WRITE_PASSED_LOG
             ),
         )
         run_id, _ = self.candidate_ready_run()
 
-        completed = self.run_afk("resume")
+        child_pid = None
 
         try:
+            completed, child_pid = self.run_afk_observing_argument(
+                token, "resume", release_path=observation_release_path
+            )
+            self.assertIsNotNone(child_pid)
             self.assertEqual(completed.returncode, 0, completed.stderr)
             self.assertTrue(child_ready_path.is_file())
+            self.assert_host_process_reaped(child_pid)
             self.assertEqual(self.processes_with_argument(token), [])
         finally:
-            for pid in self.processes_with_argument(token):
-                try:
-                    os.kill(pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
+            self.kill_processes_with_argument(token)
 
     def test_successful_worker_kills_detached_term_resistant_descendant(self):
         child_ready_path = self.temp / "detached-child.ready"
+        observation_release_path = self.temp / "detached-child.release"
         token = f"afk-validation-descendant-{os.getpid()}-{time.monotonic_ns()}"
         child_program = textwrap.dedent(
             """
@@ -2590,31 +2595,33 @@ class CandidateValidationCliTest(unittest.TestCase):
                 f"subprocess.Popen([sys.executable, '-c', {child_program!r}, "
                 f"{str(child_ready_path)!r}, {token!r}], start_new_session=True); "
                 f'exec("while not Path({str(child_ready_path)!r}).exists():\\n" '
+                '"    time.sleep(0.001)"); '
+                'exec("while not Path('
+                f"{str(observation_release_path)!r}"
+                ').exists():\\n" '
                 '"    time.sleep(0.001)"); ' + WRITE_PASSED_LOG
             ),
         )
         run_id, _ = self.candidate_ready_run()
 
         started = time.monotonic()
-        completed = self.run_afk("resume")
-        elapsed = time.monotonic() - started
-
+        child_pid = None
         try:
+            completed, child_pid = self.run_afk_observing_argument(
+                token, "resume", release_path=observation_release_path
+            )
+            elapsed = time.monotonic() - started
+            self.assertIsNotNone(child_pid)
             self.assertEqual(completed.returncode, 0, completed.stderr)
             self.assertLess(elapsed, 2)
-            deadline = time.monotonic() + 2
-            while self.processes_with_token(token) and time.monotonic() < deadline:
-                time.sleep(0.02)
-            self.assertEqual(self.processes_with_token(token), [])
+            self.assert_host_process_reaped(child_pid)
+            self.assertEqual(self.processes_with_argument(token), [])
         finally:
-            for pid in self.processes_with_token(token):
-                try:
-                    os.kill(pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
+            self.kill_processes_with_argument(token)
 
     def test_successful_worker_is_drained_before_evidence_is_ingested(self):
         child_ready_path = self.temp / "resistant-child.ready"
+        observation_release_path = self.temp / "resistant-child.release"
         mutation_path = self.temp / "evidence-mutated"
         token = f"afk-evidence-drain-{os.getpid()}-{time.monotonic_ns()}"
         child_program = textwrap.dedent(
@@ -2642,6 +2649,8 @@ class CandidateValidationCliTest(unittest.TestCase):
             f"str(evidence), str(destination), {str(mutation_path)!r}, "
             f"{str(child_ready_path)!r}, {token!r}]); "
             f'exec("while not Path({str(child_ready_path)!r}).exists():\\n" '
+            '"    time.sleep(0.001)"); '
+            f'exec("while not Path({str(observation_release_path)!r}).exists():\\n" '
             '"    time.sleep(0.001)"); ' + WRITE_PASSED_LOG
         )
         self.write_contract_worker(
@@ -2652,9 +2661,13 @@ class CandidateValidationCliTest(unittest.TestCase):
         )
         run_id, _ = self.candidate_ready_run()
 
-        completed = self.run_afk("resume")
+        child_pid = None
 
         try:
+            completed, child_pid = self.run_afk_observing_argument(
+                token, "resume", release_path=observation_release_path
+            )
+            self.assertIsNotNone(child_pid)
             deadline = time.monotonic() + 2
             while not mutation_path.exists() and time.monotonic() < deadline:
                 time.sleep(0.02)
@@ -2673,13 +2686,10 @@ class CandidateValidationCliTest(unittest.TestCase):
                 "passed\n",
             )
             self.assertTrue(child_ready_path.is_file())
+            self.assert_host_process_reaped(child_pid)
             self.assertEqual(self.processes_with_argument(token), [])
         finally:
-            for pid in self.processes_with_argument(token):
-                try:
-                    os.kill(pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
+            self.kill_processes_with_argument(token)
 
     def test_validation_signal_requires_interrupted_attention(self):
         self.write_contract_worker(
@@ -2894,17 +2904,85 @@ class CandidateValidationCliTest(unittest.TestCase):
     @staticmethod
     def processes_with_argument(argument):
         matches = []
-        expected = argument.encode()
         for process in Path("/proc").iterdir():
             if not process.name.isdigit():
                 continue
-            try:
-                arguments = (process / "cmdline").read_bytes().split(b"\0")
-            except (FileNotFoundError, PermissionError, ProcessLookupError):
-                continue
-            if expected in arguments:
+            if CandidateValidationCliTest.process_has_argument(
+                int(process.name), argument
+            ):
                 matches.append(int(process.name))
         return matches
+
+    @staticmethod
+    def process_has_argument(pid, argument):
+        try:
+            arguments = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+        except (FileNotFoundError, PermissionError, ProcessLookupError):
+            return False
+        return argument.encode() in arguments
+
+    def run_afk_observing_argument(self, argument, *args, release_path=None):
+        environment = {
+            **os.environ,
+            "PYTHONPATH": str(ROOT / "src"),
+            "XDG_STATE_HOME": str(self.state_home),
+        }
+        process = subprocess.Popen(
+            [sys.executable, "-m", "afk", *args],
+            cwd=self.repository,
+            env=environment,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        observed_pid = None
+        try:
+            observation_deadline = time.monotonic() + 3
+            while (
+                observed_pid is None
+                and process.poll() is None
+                and time.monotonic() < observation_deadline
+            ):
+                matches = self.processes_with_argument(argument)
+                if len(matches) > 1:
+                    raise AssertionError(
+                        f"multiple processes have exact argument {argument!r}"
+                    )
+                if matches:
+                    observed_pid = matches[0]
+                    if release_path is not None:
+                        release_path.touch()
+                    break
+                time.sleep(0.01)
+            if observed_pid is None and release_path is not None:
+                release_path.touch()
+            stdout, stderr = process.communicate(timeout=60)
+            return (
+                subprocess.CompletedProcess(
+                    process.args, process.returncode, stdout, stderr
+                ),
+                observed_pid,
+            )
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.communicate()
+
+    def assert_host_process_reaped(self, pid):
+        path = Path(f"/proc/{pid}")
+        deadline = time.monotonic() + 2
+        while path.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        self.assertFalse(path.exists())
+
+    def kill_processes_with_argument(self, argument):
+        for pid in self.processes_with_argument(argument):
+            if not self.process_has_argument(pid, argument):
+                continue
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
 
     def assert_pinned_indirect_harness_is_rejected(self, command):
         self.write_contract_worker(
