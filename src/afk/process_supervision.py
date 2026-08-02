@@ -50,6 +50,7 @@ def run_supervised_command(
     label: str,
     output_byte_limit: int | None = None,
     cleanup_seconds: float | None = None,
+    decode_errors: str = "strict",
 ) -> subprocess.CompletedProcess[str]:
     subject = label.strip() or "command"
     output_byte_limit = (
@@ -142,7 +143,7 @@ def run_supervised_command(
                 exit_code=process.returncode,
             )
         try:
-            stdout, stderr = process_io.decoded_output()
+            stdout, stderr = process_io.decoded_output(errors=decode_errors)
         except UnicodeDecodeError as exc:
             diagnostic_stdout, diagnostic_stderr = process_io.diagnostics()
             raise SupervisedCommandError(

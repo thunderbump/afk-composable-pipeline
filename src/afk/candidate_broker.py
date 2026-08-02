@@ -128,6 +128,7 @@ def run_candidate(request: dict[str, Any]) -> dict[str, Any]:
                 cleanup_seconds=CANDIDATE_CLEANUP_SECONDS,
                 input_text=None,
                 label="Candidate command",
+                decode_errors="replace",
             )
         except OSError:
             return _failed_execution_result(

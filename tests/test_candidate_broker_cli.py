@@ -266,6 +266,35 @@ class CandidateBrokerCliTest(unittest.TestCase):
         self.assertEqual(broker_result["stdout"], "")
 
     @unittest.skipUnless(shutil.which("bwrap"), "bubblewrap is unavailable")
+    def test_invalid_utf8_candidate_output_publishes_a_bounded_result(self):
+        request = self.temp / "invalid-output-request.json"
+        result = self.temp / "invalid-output-result.json"
+        self.write_request(
+            request,
+            command=[
+                "/usr/bin/python3",
+                "-c",
+                "import os; os.write(1, b'\\xff')",
+            ],
+            output_byte_limit=3,
+        )
+
+        completed = self.run_broker(request, result)
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(
+            json.loads(result.read_text(encoding="utf-8")),
+            {
+                "schema_version": 1,
+                "candidate_sha": self.candidate_sha,
+                "status": "completed",
+                "exit_code": 0,
+                "stdout": "\ufffd",
+                "stderr": "",
+            },
+        )
+
+    @unittest.skipUnless(shutil.which("bwrap"), "bubblewrap is unavailable")
     def test_timeout_publishes_a_candidate_bound_failure_result(self):
         request = self.temp / "timeout-request.json"
         result = self.temp / "timeout-result.json"

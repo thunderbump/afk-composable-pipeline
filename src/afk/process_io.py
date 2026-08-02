@@ -101,9 +101,11 @@ class BoundedProcessIO:
             for name in ("stdout", "stderr")
         )
 
-    def decoded_output(self) -> tuple[str, str]:
+    def decoded_output(self, *, errors: str = "strict") -> tuple[str, str]:
         return tuple(
-            _bounded_redacted_text(bytes(self.captured[name]), self.output_byte_limit)
+            _bounded_redacted_text(
+                bytes(self.captured[name]), self.output_byte_limit, errors=errors
+            )
             for name in ("stdout", "stderr")
         )
 
