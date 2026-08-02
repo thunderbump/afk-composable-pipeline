@@ -14,45 +14,37 @@ ROOT = Path(__file__).resolve().parents[1]
 
 class CandidateBrokerCliTest(unittest.TestCase):
     def setUp(self):
+        self.git_environment = {
+            name: value
+            for name, value in os.environ.items()
+            if not name.startswith("GIT_")
+        }
+        self.git_environment.update(
+            {
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_CONFIG_GLOBAL": os.devnull,
+            }
+        )
         self.temporary_directory = tempfile.TemporaryDirectory()
         self.temp = Path(self.temporary_directory.name)
         self.repository = self.temp / "repository"
         self.repository.mkdir()
         self.candidate = self.temp / "candidate"
-        subprocess.run(
-            ["git", "init", "-b", "main"],
-            cwd=self.repository,
-            text=True,
-            capture_output=True,
-            check=True,
-        )
-        subprocess.run(
-            ["git", "config", "user.email", "afk@example.invalid"],
-            cwd=self.repository,
-            check=True,
-        )
-        subprocess.run(
-            ["git", "config", "user.name", "AFK Test"],
-            cwd=self.repository,
-            check=True,
-        )
+        self.git("init", "-b", "main", cwd=self.repository)
+        self.git("config", "user.email", "afk@example.invalid", cwd=self.repository)
+        self.git("config", "user.name", "AFK Test", cwd=self.repository)
         (self.repository / "input.txt").write_text(
             "exact candidate\n", encoding="utf-8"
         )
-        subprocess.run(["git", "add", "."], cwd=self.repository, check=True)
-        subprocess.run(
-            ["git", "commit", "-m", "candidate"],
+        self.git("add", ".", cwd=self.repository)
+        self.git("commit", "-m", "candidate", cwd=self.repository)
+        self.git(
+            "worktree",
+            "add",
+            "--detach",
+            str(self.candidate),
+            "HEAD",
             cwd=self.repository,
-            text=True,
-            capture_output=True,
-            check=True,
-        )
-        subprocess.run(
-            ["git", "worktree", "add", "--detach", str(self.candidate), "HEAD"],
-            cwd=self.repository,
-            text=True,
-            capture_output=True,
-            check=True,
         )
         self.candidate_sha = self.git("rev-parse", "HEAD")
 
@@ -302,11 +294,12 @@ class CandidateBrokerCliTest(unittest.TestCase):
 
     def test_does_not_fetch_a_missing_promised_blob_on_the_host(self):
         remote = self.temp / "promisor.git"
-        subprocess.run(
-            ["git", "clone", "--bare", str(self.repository), str(remote)],
-            text=True,
-            capture_output=True,
-            check=True,
+        self.git(
+            "clone",
+            "--bare",
+            str(self.repository),
+            str(remote),
+            cwd=self.temp,
         )
         marker = self.temp / "promisor-fetch-ran"
         upload_pack = self.temp / "upload-pack"
@@ -547,28 +540,12 @@ class CandidateBrokerCliTest(unittest.TestCase):
     def test_rejects_gitlinks_instead_of_materializing_an_incomplete_tree(self):
         submodule = self.temp / "submodule"
         submodule.mkdir()
-        subprocess.run(
-            ["git", "init", "-b", "main"],
-            cwd=submodule,
-            capture_output=True,
-            check=True,
-        )
-        subprocess.run(
-            ["git", "config", "user.email", "afk@example.invalid"],
-            cwd=submodule,
-            check=True,
-        )
-        subprocess.run(
-            ["git", "config", "user.name", "AFK Test"], cwd=submodule, check=True
-        )
+        self.git("init", "-b", "main", cwd=submodule)
+        self.git("config", "user.email", "afk@example.invalid", cwd=submodule)
+        self.git("config", "user.name", "AFK Test", cwd=submodule)
         (submodule / "input.txt").write_text("submodule\n", encoding="utf-8")
-        subprocess.run(["git", "add", "."], cwd=submodule, check=True)
-        subprocess.run(
-            ["git", "commit", "-m", "submodule"],
-            cwd=submodule,
-            capture_output=True,
-            check=True,
-        )
+        self.git("add", ".", cwd=submodule)
+        self.git("commit", "-m", "submodule", cwd=submodule)
         self.git(
             "-c",
             "protocol.file.allow=always",
@@ -637,10 +614,11 @@ class CandidateBrokerCliTest(unittest.TestCase):
             check=False,
         )
 
-    def git(self, *args):
+    def git(self, *args, cwd=None):
         completed = subprocess.run(
             ["git", *args],
-            cwd=self.candidate,
+            cwd=self.candidate if cwd is None else cwd,
+            env=self.git_environment,
             text=True,
             capture_output=True,
             check=True,
