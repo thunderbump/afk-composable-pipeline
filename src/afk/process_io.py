@@ -119,7 +119,7 @@ class BoundedProcessIO:
 
     def _capture_output(self, stream: Any, captured: bytearray) -> None:
         try:
-            while chunk := stream.read(64 * 1024):
+            while chunk := os.read(stream.fileno(), 64 * 1024):
                 with self.capture_lock:
                     if self.combined_output_limit:
                         self.captured_bytes += len(chunk)

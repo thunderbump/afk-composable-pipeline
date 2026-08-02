@@ -270,17 +270,20 @@ class SupervisedCommandTest(unittest.TestCase):
             self.assertFalse(marker.exists())
 
     def test_each_output_stream_is_independently_size_limited(self):
-        for stream in ("stdout", "stderr"):
+        for stream, descriptor in (("stdout", 1), ("stderr", 2)):
             with (
                 self.subTest(stream=stream),
                 tempfile.TemporaryDirectory() as temporary,
             ):
-                target = "sys.stdout" if stream == "stdout" else "sys.stderr"
                 command = [
                     sys.executable,
                     "-c",
-                    f"import sys; {target}.write('x'*17); {target}.flush()",
+                    (
+                        f"import os,time; os.write({descriptor},b'x'*17);"
+                        "time.sleep(30)"
+                    ),
                 ]
+                started = time.monotonic()
                 with self.assertRaisesRegex(
                     SupervisedCommandError, "output exceeds"
                 ) as raised:
@@ -292,6 +295,7 @@ class SupervisedCommandTest(unittest.TestCase):
                         label="Codex",
                         output_byte_limit=16,
                     )
+                self.assertLess(time.monotonic() - started, 0.8)
                 self.assertEqual(
                     raised.exception.classification,
                     "output_overflow",
