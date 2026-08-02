@@ -422,7 +422,12 @@ def _require_git_path(item_path: bytes) -> None:
 
 def _worktree_paths(path: Path, gitlinks: set[bytes]) -> set[bytes]:
     observed = set()
-    for root, directories, files in os.walk(path, topdown=True, followlinks=False):
+    for root, directories, files in os.walk(
+        path,
+        topdown=True,
+        onerror=_raise_walk_error,
+        followlinks=False,
+    ):
         root_path = Path(root)
         for name in list(directories):
             target = root_path / name
@@ -438,6 +443,10 @@ def _worktree_paths(path: Path, gitlinks: set[bytes]) -> set[bytes]:
             if relative != b".git":
                 observed.add(relative)
     return observed
+
+
+def _raise_walk_error(error: OSError) -> None:
+    raise error
 
 
 def _committed_ignores_allow(

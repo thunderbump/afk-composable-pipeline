@@ -423,6 +423,20 @@ class CandidateBrokerCliTest(unittest.TestCase):
 
         self.assertFalse(is_exact_clean_commit(self.candidate, self.candidate_sha))
 
+    def test_exact_candidate_rejects_unreadable_untracked_directory(self):
+        from afk.checkouts import is_exact_clean_commit
+
+        hidden = self.candidate / "hidden"
+        hidden.mkdir()
+        payload = hidden / "payload"
+        payload.write_text("known payload\n", encoding="utf-8")
+        hidden.chmod(0o111)
+        try:
+            self.assertEqual(payload.read_text(encoding="utf-8"), "known payload\n")
+            self.assertFalse(is_exact_clean_commit(self.candidate, self.candidate_sha))
+        finally:
+            hidden.chmod(0o700)
+
     def test_exact_candidate_does_not_trust_repo_info_exclude(self):
         from afk.checkouts import is_exact_clean_commit
 
