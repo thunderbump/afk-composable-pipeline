@@ -25,6 +25,7 @@ EXACT_CANDIDATE_TRACKED_BYTES_LIMIT = 1024 * 1024
 EXACT_CANDIDATE_TRACKED_DEPTH_LIMIT = 64
 EXACT_CANDIDATE_IGNORE_FILE_LIMIT = 256
 EXACT_CANDIDATE_IGNORE_BYTES_LIMIT = 1024 * 1024
+EXACT_CANDIDATE_REPOSITORY_LIMIT = 64
 
 
 class GitCommandError(RuntimeError):
@@ -324,6 +325,19 @@ def dirty_tree(path: Path) -> dict[str, Any]:
 
 
 def is_exact_clean_commit(path: Path, expected_commit: str) -> bool:
+    return _is_exact_clean_commit(
+        path,
+        expected_commit,
+        [EXACT_CANDIDATE_REPOSITORY_LIMIT],
+    )
+
+
+def _is_exact_clean_commit(
+    path: Path, expected_commit: str, repositories_remaining: list[int]
+) -> bool:
+    if repositories_remaining[0] <= 0:
+        return False
+    repositories_remaining[0] -= 1
     try:
         head = run_trusted_read_git(["rev-parse", "HEAD"], cwd=path)
     except OSError:
@@ -331,11 +345,13 @@ def is_exact_clean_commit(path: Path, expected_commit: str) -> bool:
     return (
         head.returncode == 0
         and head.stdout.strip() == expected_commit
-        and _worktree_matches_commit(path, expected_commit)
+        and _worktree_matches_commit(path, expected_commit, repositories_remaining)
     )
 
 
-def _worktree_matches_commit(path: Path, commit: str) -> bool:
+def _worktree_matches_commit(
+    path: Path, commit: str, repositories_remaining: list[int]
+) -> bool:
     tree = run_trusted_read_git(
         ["ls-tree", "-rz", "--full-tree", commit],
         cwd=path,
@@ -421,9 +437,10 @@ def _worktree_matches_commit(path: Path, commit: str) -> bool:
                     try:
                         target_identity = os.fstat(target_descriptor)
                         target = Path(os.readlink(f"/proc/self/fd/{target_descriptor}"))
-                        if not is_exact_clean_commit(
+                        if not _is_exact_clean_commit(
                             target,
                             object_id.decode("ascii"),
+                            repositories_remaining,
                         ):
                             return False
                         observed_identity = os.stat(target, follow_symlinks=False)

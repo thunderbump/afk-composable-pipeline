@@ -361,6 +361,60 @@ class CandidateBrokerCliTest(unittest.TestCase):
 
         self.assertTrue(is_exact_clean_commit(self.candidate, self.candidate_sha))
 
+    def test_exact_candidate_bounds_nested_gitlink_repositories(self):
+        from afk import checkouts
+
+        leaf = self.temp / "gitlink-leaf"
+        leaf.mkdir()
+        self.git("init", "-b", "main", cwd=leaf)
+        self.git("config", "user.email", "afk@example.invalid", cwd=leaf)
+        self.git("config", "user.name", "AFK Test", cwd=leaf)
+        (leaf / "input.txt").write_text("leaf\n", encoding="utf-8")
+        self.git("add", ".", cwd=leaf)
+        self.git("commit", "-m", "leaf", cwd=leaf)
+        middle = self.temp / "gitlink-middle"
+        middle.mkdir()
+        self.git("init", "-b", "main", cwd=middle)
+        self.git("config", "user.email", "afk@example.invalid", cwd=middle)
+        self.git("config", "user.name", "AFK Test", cwd=middle)
+        self.git(
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            str(leaf),
+            "nested",
+            cwd=middle,
+        )
+        self.git("commit", "-m", "middle", cwd=middle)
+        self.git(
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            str(middle),
+            "nested",
+        )
+        self.git("commit", "-m", "nested gitlinks")
+        self.candidate_sha = self.git("rev-parse", "HEAD")
+        self.git(
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "update",
+            "--init",
+            "--recursive",
+        )
+
+        with mock.patch.object(
+            checkouts,
+            "EXACT_CANDIDATE_REPOSITORY_LIMIT",
+            2,
+        ):
+            self.assertFalse(
+                checkouts.is_exact_clean_commit(self.candidate, self.candidate_sha)
+            )
+
     def test_exact_candidate_fails_closed_when_regular_file_becomes_fifo_at_open(self):
         from afk.checkouts import is_exact_clean_commit
 
