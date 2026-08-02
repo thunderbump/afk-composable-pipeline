@@ -1179,7 +1179,11 @@ class CandidateBrokerCliTest(unittest.TestCase):
         }
         host_dev_stat = os.stat("/dev")
         host_dev_identity = [host_dev_stat.st_dev, host_dev_stat.st_ino]
-        host_pid = os.getpid()
+        host_pid_namespace_stat = os.stat("/proc/self/ns/pid")
+        host_pid_namespace_identity = [
+            host_pid_namespace_stat.st_dev,
+            host_pid_namespace_stat.st_ino,
+        ]
         probe = textwrap.dedent(
             f"""
             import json
@@ -1245,17 +1249,21 @@ class CandidateBrokerCliTest(unittest.TestCase):
                 "value": private_tmp.read_text(encoding="utf-8"),
             }}
 
-            sandbox_pid = os.getpid()
-            host_pid_visible = Path("/proc/{host_pid}").exists()
-            self_pid_visible = Path(f"/proc/{{sandbox_pid}}").exists()
+            sandbox_pid_namespace_stat = os.stat("/proc/self/ns/pid")
+            sandbox_pid_namespace_identity = [
+                sandbox_pid_namespace_stat.st_dev,
+                sandbox_pid_namespace_stat.st_ino,
+            ]
+            self_proc_visible = Path("/proc/self").exists()
             checks["proc_namespace"] = {{
                 "classification": "permitted"
-                if self_pid_visible and not host_pid_visible
+                if self_proc_visible
+                and sandbox_pid_namespace_identity
+                != {host_pid_namespace_identity!r}
                 else "exposed",
-                "host_pid": {host_pid},
-                "host_pid_visible": host_pid_visible,
-                "self_pid": sandbox_pid,
-                "self_pid_visible": self_pid_visible,
+                "host_identity": {host_pid_namespace_identity!r},
+                "sandbox_identity": sandbox_pid_namespace_identity,
+                "self_visible": self_proc_visible,
             }}
 
             dev_stat = os.stat("/dev")
@@ -1474,8 +1482,11 @@ class CandidateBrokerCliTest(unittest.TestCase):
             {"classification": "denied", "present": []},
         )
         self.assertEqual(checks["proc_namespace"]["classification"], "permitted")
-        self.assertFalse(checks["proc_namespace"]["host_pid_visible"])
-        self.assertTrue(checks["proc_namespace"]["self_pid_visible"])
+        self.assertTrue(checks["proc_namespace"]["self_visible"])
+        self.assertNotEqual(
+            checks["proc_namespace"]["sandbox_identity"],
+            checks["proc_namespace"]["host_identity"],
+        )
         self.assertEqual(checks["dev_namespace"]["classification"], "permitted")
         self.assertNotEqual(
             checks["dev_namespace"]["sandbox_identity"],
