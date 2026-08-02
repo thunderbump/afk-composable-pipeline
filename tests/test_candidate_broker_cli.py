@@ -14,8 +14,6 @@ ROOT = Path(__file__).resolve().parents[1]
 
 class CandidateBrokerCliTest(unittest.TestCase):
     def setUp(self):
-        if shutil.which("bwrap") is None:
-            self.skipTest("bubblewrap is unavailable")
         self.temporary_directory = tempfile.TemporaryDirectory()
         self.temp = Path(self.temporary_directory.name)
         self.repository = self.temp / "repository"
@@ -65,8 +63,10 @@ class CandidateBrokerCliTest(unittest.TestCase):
         request = self.temp / "invalid-utf8-request.json"
         result = self.temp / "invalid-utf8-result.json"
         request.write_bytes(b"\xff")
+        no_bwrap_bin = self.temp / "invalid-utf8-bin"
+        no_bwrap_bin.mkdir()
 
-        completed = self.run_broker(request, result)
+        completed = self.run_broker(request, result, env={"PATH": str(no_bwrap_bin)})
 
         self.assertEqual(completed.returncode, 2)
         self.assertEqual(completed.stderr, "candidate broker request is invalid\n")
@@ -146,8 +146,11 @@ class CandidateBrokerCliTest(unittest.TestCase):
         self.write_request(
             request, candidate_path=str(nested), command=["/usr/bin/true"]
         )
+        no_bwrap_bin = self.temp / "nested-path-bin"
+        no_bwrap_bin.mkdir()
+        (no_bwrap_bin / "git").symlink_to(shutil.which("git"))
 
-        completed = self.run_broker(request, result)
+        completed = self.run_broker(request, result, env={"PATH": str(no_bwrap_bin)})
 
         self.assertEqual(completed.returncode, 2)
         self.assertEqual(
@@ -160,15 +163,21 @@ class CandidateBrokerCliTest(unittest.TestCase):
         alias.symlink_to(self.candidate, target_is_directory=True)
         request = self.temp / "candidate-alias-request.json"
         result = self.temp / "candidate-alias-result.json"
+        fake_bin = self.temp / "candidate-alias-bin"
+        fake_bin.mkdir()
+        (fake_bin / "bwrap").symlink_to(shutil.which("true"))
         self.write_request(
             request, candidate_path=str(alias), command=["/usr/bin/true"]
         )
 
-        completed = self.run_broker(request, result)
+        completed = self.run_broker(
+            request, result, env={"PATH": f"{fake_bin}:{os.environ['PATH']}"}
+        )
 
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertEqual(json.loads(result.read_text(encoding="utf-8"))["exit_code"], 0)
 
+    @unittest.skipUnless(shutil.which("bwrap"), "bubblewrap is unavailable")
     def test_candidate_stdin_is_closed_instead_of_inherited_from_the_broker(self):
         request = self.temp / "stdin-request.json"
         result = self.temp / "stdin-result.json"
@@ -190,20 +199,14 @@ class CandidateBrokerCliTest(unittest.TestCase):
         self.write_request(request, command=["/usr/bin/true"])
         fake_bin = self.temp / "atomic-bin"
         fake_bin.mkdir()
-        real_bwrap = shutil.which("bwrap")
         launcher = fake_bin / "bwrap"
         launcher.write_text(
             textwrap.dedent(
                 f"""
                 #!{sys.executable}
-                import os
-                import subprocess
-                import sys
                 from pathlib import Path
 
-                completed = subprocess.run([{real_bwrap!r}, *sys.argv[1:]])
                 Path({str(result)!r}).symlink_to({str(prior_result)!r})
-                raise SystemExit(completed.returncode)
                 """
             ).lstrip(),
             encoding="utf-8",
@@ -263,14 +266,20 @@ class CandidateBrokerCliTest(unittest.TestCase):
         self.git("config", "core.fsmonitor", str(fsmonitor))
         request = self.temp / "fsmonitor-request.json"
         result = self.temp / "fsmonitor-result.json"
+        fake_bin = self.temp / "fsmonitor-bin"
+        fake_bin.mkdir()
+        (fake_bin / "bwrap").symlink_to(shutil.which("true"))
         self.write_request(request, command=["/usr/bin/true"])
 
-        completed = self.run_broker(request, result)
+        completed = self.run_broker(
+            request, result, env={"PATH": f"{fake_bin}:{os.environ['PATH']}"}
+        )
 
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertEqual(json.loads(result.read_text(encoding="utf-8"))["exit_code"], 0)
         self.assertFalse(marker.exists())
 
+    @unittest.skipUnless(shutil.which("bwrap"), "bubblewrap is unavailable")
     def test_ignores_replace_refs_for_the_approved_candidate(self):
         (self.repository / "input.txt").write_text(
             "evil replacement\n", encoding="utf-8"
@@ -291,6 +300,7 @@ class CandidateBrokerCliTest(unittest.TestCase):
         self.assertEqual(broker_result["exit_code"], 0, broker_result["stderr"])
         self.assertEqual(broker_result["stdout"], "exact candidate\n")
 
+    @unittest.skipUnless(shutil.which("bwrap"), "bubblewrap is unavailable")
     def test_runs_against_read_only_exact_candidate_with_writable_scratch(self):
         probe = textwrap.dedent(
             """
@@ -388,6 +398,7 @@ class CandidateBrokerCliTest(unittest.TestCase):
             "drifted after verification\n",
         )
 
+    @unittest.skipUnless(shutil.which("bwrap"), "bubblewrap is unavailable")
     def test_treats_option_looking_commands_as_executable_argv(self):
         commands = [
             ["--ro-bind", "/etc", "/work/etc", "/usr/bin/true"],
@@ -413,6 +424,7 @@ class CandidateBrokerCliTest(unittest.TestCase):
         self.write_request(request, command=["/usr/bin/true"])
         fake_bin = self.temp / "snapshot-failure-bin"
         fake_bin.mkdir()
+        (fake_bin / "bwrap").symlink_to(shutil.which("true"))
         real_git = shutil.which("git")
         git = fake_bin / "git"
         git.write_text(
@@ -441,6 +453,7 @@ class CandidateBrokerCliTest(unittest.TestCase):
         self.assertEqual(completed.stderr, "exact Candidate snapshot is unavailable\n")
         self.assertFalse(result.exists())
 
+    @unittest.skipUnless(shutil.which("bwrap"), "bubblewrap is unavailable")
     def test_materializes_exact_blobs_without_archive_attribute_rewrites(self):
         (self.candidate / ".gitattributes").write_text(
             "ignored.txt export-ignore\nsubstituted.txt export-subst\n",
@@ -526,9 +539,14 @@ class CandidateBrokerCliTest(unittest.TestCase):
         self.candidate_sha = self.git("rev-parse", "HEAD")
         request = self.temp / "gitlink-request.json"
         result = self.temp / "gitlink-result.json"
+        fake_bin = self.temp / "gitlink-bin"
+        fake_bin.mkdir()
+        (fake_bin / "bwrap").symlink_to(shutil.which("true"))
         self.write_request(request, command=["/usr/bin/true"])
 
-        completed = self.run_broker(request, result)
+        completed = self.run_broker(
+            request, result, env={"PATH": f"{fake_bin}:{os.environ['PATH']}"}
+        )
 
         self.assertEqual(completed.returncode, 2)
         self.assertEqual(
