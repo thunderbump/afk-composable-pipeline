@@ -83,16 +83,8 @@ class CandidateBrokerCliTest(unittest.TestCase):
             with self.subTest(candidate_path=candidate_path, command=command):
                 request = self.temp / f"nul-request-{index}.json"
                 result = self.temp / f"nul-result-{index}.json"
-                request.write_text(
-                    json.dumps(
-                        {
-                            "schema_version": 1,
-                            "candidate_sha": self.candidate_sha,
-                            "candidate_path": candidate_path,
-                            "command": command,
-                        }
-                    ),
-                    encoding="utf-8",
+                self.write_request(
+                    request, candidate_path=candidate_path, command=command
                 )
 
                 completed = self.run_broker(request, result)
@@ -113,16 +105,8 @@ class CandidateBrokerCliTest(unittest.TestCase):
             with self.subTest(candidate_path=candidate_path, command=command):
                 request = self.temp / f"surrogate-request-{index}.json"
                 result = self.temp / f"surrogate-result-{index}.json"
-                request.write_text(
-                    json.dumps(
-                        {
-                            "schema_version": 1,
-                            "candidate_sha": self.candidate_sha,
-                            "candidate_path": candidate_path,
-                            "command": command,
-                        }
-                    ),
-                    encoding="utf-8",
+                self.write_request(
+                    request, candidate_path=candidate_path, command=command
                 )
 
                 completed = self.run_broker(request, result)
@@ -143,16 +127,8 @@ class CandidateBrokerCliTest(unittest.TestCase):
         self.candidate_sha = self.git("rev-parse", "HEAD")
         request = self.temp / "nested-path-request.json"
         result = self.temp / "nested-path-result.json"
-        request.write_text(
-            json.dumps(
-                {
-                    "schema_version": 1,
-                    "candidate_sha": self.candidate_sha,
-                    "candidate_path": str(nested),
-                    "command": ["/usr/bin/true"],
-                }
-            ),
-            encoding="utf-8",
+        self.write_request(
+            request, candidate_path=str(nested), command=["/usr/bin/true"]
         )
 
         completed = self.run_broker(request, result)
@@ -168,16 +144,8 @@ class CandidateBrokerCliTest(unittest.TestCase):
         alias.symlink_to(self.candidate, target_is_directory=True)
         request = self.temp / "candidate-alias-request.json"
         result = self.temp / "candidate-alias-result.json"
-        request.write_text(
-            json.dumps(
-                {
-                    "schema_version": 1,
-                    "candidate_sha": self.candidate_sha,
-                    "candidate_path": str(alias),
-                    "command": ["/usr/bin/true"],
-                }
-            ),
-            encoding="utf-8",
+        self.write_request(
+            request, candidate_path=str(alias), command=["/usr/bin/true"]
         )
 
         completed = self.run_broker(request, result)
@@ -246,17 +214,7 @@ class CandidateBrokerCliTest(unittest.TestCase):
             encoding="utf-8",
         )
         launcher.chmod(0o755)
-        request.write_text(
-            json.dumps(
-                {
-                    "schema_version": 1,
-                    "candidate_sha": self.candidate_sha,
-                    "candidate_path": str(self.candidate),
-                    "command": ["/usr/bin/python3", "-c", probe],
-                }
-            ),
-            encoding="utf-8",
-        )
+        self.write_request(request, command=["/usr/bin/python3", "-c", probe])
 
         completed = self.run_broker(
             request,
@@ -301,17 +259,7 @@ class CandidateBrokerCliTest(unittest.TestCase):
             with self.subTest(command=command):
                 request = self.temp / f"option-command-{index}-request.json"
                 result = self.temp / f"option-command-{index}-result.json"
-                request.write_text(
-                    json.dumps(
-                        {
-                            "schema_version": 1,
-                            "candidate_sha": self.candidate_sha,
-                            "candidate_path": str(self.candidate),
-                            "command": command,
-                        }
-                    ),
-                    encoding="utf-8",
-                )
+                self.write_request(request, command=command)
 
                 completed = self.run_broker(request, result)
 
@@ -323,17 +271,7 @@ class CandidateBrokerCliTest(unittest.TestCase):
     def test_fails_closed_when_exact_candidate_snapshot_is_unavailable(self):
         request = self.temp / "snapshot-failure-request.json"
         result = self.temp / "snapshot-failure-result.json"
-        request.write_text(
-            json.dumps(
-                {
-                    "schema_version": 1,
-                    "candidate_sha": self.candidate_sha,
-                    "candidate_path": str(self.candidate),
-                    "command": ["/usr/bin/true"],
-                }
-            ),
-            encoding="utf-8",
-        )
+        self.write_request(request, command=["/usr/bin/true"])
         fake_bin = self.temp / "snapshot-failure-bin"
         fake_bin.mkdir()
         real_git = shutil.which("git")
@@ -384,30 +322,22 @@ class CandidateBrokerCliTest(unittest.TestCase):
         self.candidate_sha = self.git("rev-parse", "HEAD")
         request = self.temp / "attributes-request.json"
         result = self.temp / "attributes-result.json"
-        request.write_text(
-            json.dumps(
-                {
-                    "schema_version": 1,
-                    "candidate_sha": self.candidate_sha,
-                    "candidate_path": str(self.candidate),
-                    "command": [
-                        "/usr/bin/python3",
-                        "-c",
-                        (
-                            "from pathlib import Path; "
-                            'print(Path("/candidate/ignored.txt").read_text(), '
-                            'end=""); '
-                            'print(Path("/candidate/substituted.txt").read_text(), '
-                            'end=""); '
-                            "import os, stat; "
-                            "print(oct(stat.S_IMODE(os.lstat("
-                            '"/candidate/executable.sh").st_mode))); '
-                            'print(os.readlink("/candidate/executable-link"))'
-                        ),
-                    ],
-                }
-            ),
-            encoding="utf-8",
+        self.write_request(
+            request,
+            command=[
+                "/usr/bin/python3",
+                "-c",
+                (
+                    "from pathlib import Path; "
+                    'print(Path("/candidate/ignored.txt").read_text(), end=""); '
+                    'print(Path("/candidate/substituted.txt").read_text(), '
+                    'end=""); '
+                    "import os, stat; "
+                    "print(oct(stat.S_IMODE(os.lstat("
+                    '"/candidate/executable.sh").st_mode))); '
+                    'print(os.readlink("/candidate/executable-link"))'
+                ),
+            ],
         )
 
         completed = self.run_broker(request, result)
@@ -457,17 +387,7 @@ class CandidateBrokerCliTest(unittest.TestCase):
         self.candidate_sha = self.git("rev-parse", "HEAD")
         request = self.temp / "gitlink-request.json"
         result = self.temp / "gitlink-result.json"
-        request.write_text(
-            json.dumps(
-                {
-                    "schema_version": 1,
-                    "candidate_sha": self.candidate_sha,
-                    "candidate_path": str(self.candidate),
-                    "command": ["/usr/bin/true"],
-                }
-            ),
-            encoding="utf-8",
-        )
+        self.write_request(request, command=["/usr/bin/true"])
 
         completed = self.run_broker(request, result)
 
@@ -477,6 +397,25 @@ class CandidateBrokerCliTest(unittest.TestCase):
             "exact Candidate snapshot contains an unsupported entry\n",
         )
         self.assertFalse(result.exists())
+
+    def write_request(self, path, *, command, candidate_path=None, candidate_sha=None):
+        path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "candidate_sha": (
+                        self.candidate_sha if candidate_sha is None else candidate_sha
+                    ),
+                    "candidate_path": (
+                        str(self.candidate)
+                        if candidate_path is None
+                        else candidate_path
+                    ),
+                    "command": command,
+                }
+            ),
+            encoding="utf-8",
+        )
 
     def run_broker(self, request, result, *, env=None):
         broker_env = {**os.environ, "PYTHONPATH": str(ROOT / "src")}
