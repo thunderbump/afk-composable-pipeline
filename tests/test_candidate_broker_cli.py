@@ -316,6 +316,51 @@ class CandidateBrokerCliTest(unittest.TestCase):
         ):
             self.assertTrue(is_exact_clean_commit(self.candidate, self.candidate_sha))
 
+    def test_exact_candidate_rejects_tracked_metadata_over_output_limit(self):
+        from afk import checkouts
+
+        (self.candidate / "second.txt").write_text("second\n", encoding="utf-8")
+        self.git("add", "second.txt")
+        self.git("commit", "-m", "add second tracked file")
+        self.candidate_sha = self.git("rev-parse", "HEAD")
+        real_run_trusted_read_git = checkouts.run_trusted_read_git
+        bounded_results = []
+
+        def record_tracked_read(args, **kwargs):
+            result = real_run_trusted_read_git(args, **kwargs)
+            if args[0] in {"ls-tree", "ls-files"}:
+                bounded_results.append(
+                    (kwargs.get("output_byte_limit"), result.returncode, result.stdout)
+                )
+            return result
+
+        with (
+            mock.patch.object(checkouts, "EXACT_CANDIDATE_TRACKED_PATH_LIMIT", 1),
+            mock.patch.object(checkouts, "EXACT_CANDIDATE_TRACKED_BYTES_LIMIT", 1),
+            mock.patch.object(checkouts, "EXACT_CANDIDATE_TRACKED_DEPTH_LIMIT", 8),
+            mock.patch(
+                "afk.checkouts.run_trusted_read_git",
+                side_effect=record_tracked_read,
+            ),
+        ):
+            self.assertFalse(
+                checkouts.is_exact_clean_commit(self.candidate, self.candidate_sha)
+            )
+
+        self.assertEqual(bounded_results, [(65, 1, b""), (65, 1, b"")])
+
+    def test_exact_candidate_accepts_normal_nested_tracked_tree(self):
+        from afk.checkouts import is_exact_clean_commit
+
+        nested = self.candidate / "one" / "two" / "three"
+        nested.mkdir(parents=True)
+        (nested / "input.txt").write_text("nested\n", encoding="utf-8")
+        self.git("add", "one/two/three/input.txt")
+        self.git("commit", "-m", "add nested tracked file")
+        self.candidate_sha = self.git("rev-parse", "HEAD")
+
+        self.assertTrue(is_exact_clean_commit(self.candidate, self.candidate_sha))
+
     def test_exact_candidate_fails_closed_when_regular_file_becomes_fifo_at_open(self):
         from afk.checkouts import is_exact_clean_commit
 

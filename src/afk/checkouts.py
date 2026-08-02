@@ -6,10 +6,12 @@ import re
 import stat
 import subprocess
 import tempfile
+import time
 from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.parse import unquote, urlsplit
 
+from afk.process_io import BoundedProcessIO
 from afk.redaction import redact_text, redact_url
 
 
@@ -18,6 +20,9 @@ GIT_COMMIT_PATTERN = re.compile(r"^[0-9a-fA-F]{4,40}$")
 # Bound Candidate-controlled path framing retained during ignore evaluation.
 EXACT_CANDIDATE_UNTRACKED_PATH_LIMIT = 4096
 EXACT_CANDIDATE_UNTRACKED_BYTES_LIMIT = 1024 * 1024
+EXACT_CANDIDATE_TRACKED_PATH_LIMIT = 4096
+EXACT_CANDIDATE_TRACKED_BYTES_LIMIT = 1024 * 1024
+EXACT_CANDIDATE_TRACKED_DEPTH_LIMIT = 64
 
 
 class GitCommandError(RuntimeError):
@@ -330,9 +335,17 @@ def is_exact_clean_commit(path: Path, expected_commit: str) -> bool:
 
 def _worktree_matches_commit(path: Path, commit: str) -> bool:
     tree = run_trusted_read_git(
-        ["ls-tree", "-rz", "--full-tree", commit], cwd=path, text=False
+        ["ls-tree", "-rz", "--full-tree", commit],
+        cwd=path,
+        text=False,
+        output_byte_limit=_tracked_git_output_limit(),
     )
-    index = run_trusted_read_git(["ls-files", "--stage", "-z"], cwd=path, text=False)
+    index = run_trusted_read_git(
+        ["ls-files", "--stage", "-z"],
+        cwd=path,
+        text=False,
+        output_byte_limit=_tracked_git_output_limit(),
+    )
     if tree.returncode != 0 or index.returncode != 0:
         return False
     try:
@@ -399,10 +412,14 @@ def _parse_tree_entries(
     output: bytes,
 ) -> dict[bytes, tuple[bytes, bytes, bytes]]:
     entries = {}
+    encoded_bytes = 0
     for record in output.rstrip(b"\0").split(b"\0") if output else []:
         metadata, item_path = record.split(b"\t", 1)
         mode, object_type, object_id = metadata.split()
         _require_git_path(item_path)
+        encoded_bytes = _require_tracked_path_budget(
+            item_path, len(entries), encoded_bytes
+        )
         if item_path in entries:
             raise ValueError("duplicate tree path")
         entries[item_path] = (mode, object_type, object_id)
@@ -411,10 +428,14 @@ def _parse_tree_entries(
 
 def _parse_index_entries(output: bytes) -> dict[bytes, tuple[bytes, bytes]]:
     entries = {}
+    encoded_bytes = 0
     for record in output.rstrip(b"\0").split(b"\0") if output else []:
         metadata, item_path = record.split(b"\t", 1)
         mode, object_id, stage = metadata.split()
         _require_git_path(item_path)
+        encoded_bytes = _require_tracked_path_budget(
+            item_path, len(entries), encoded_bytes
+        )
         if stage != b"0" or item_path in entries:
             raise ValueError("unmerged index")
         entries[item_path] = (mode, object_id)
@@ -427,6 +448,26 @@ def _require_git_path(item_path: bytes) -> None:
         part in {"", ".", ".."} for part in relative.parts
     ):
         raise ValueError("invalid Git path")
+
+
+def _tracked_git_output_limit() -> int:
+    return (
+        EXACT_CANDIDATE_TRACKED_BYTES_LIMIT
+        + EXACT_CANDIDATE_TRACKED_PATH_LIMIT * 64
+    )
+
+
+def _require_tracked_path_budget(
+    item_path: bytes, path_count: int, encoded_bytes: int
+) -> int:
+    next_encoded_bytes = encoded_bytes + len(item_path) + 1
+    if (
+        path_count >= EXACT_CANDIDATE_TRACKED_PATH_LIMIT
+        or next_encoded_bytes > EXACT_CANDIDATE_TRACKED_BYTES_LIMIT
+        or item_path.count(b"/") + 1 > EXACT_CANDIDATE_TRACKED_DEPTH_LIMIT
+    ):
+        raise ValueError("tracked Candidate metadata is too large")
+    return next_encoded_bytes
 
 
 def _worktree_paths(
@@ -634,6 +675,7 @@ def run_trusted_read_git(
     text: bool = True,
     input_data: str | bytes | None = None,
     stdout: Any = subprocess.PIPE,
+    output_byte_limit: int | None = None,
 ) -> subprocess.CompletedProcess[Any]:
     environment = {
         name: value for name, value in os.environ.items() if not name.startswith("GIT_")
@@ -653,6 +695,16 @@ def run_trusted_read_git(
         }
     )
     command = ["git", *args]
+    if output_byte_limit is not None:
+        if text or stdout != subprocess.PIPE:
+            raise ValueError("bounded Git output requires captured bytes")
+        return _run_bounded_trusted_git(
+            command,
+            cwd=cwd,
+            environment=environment,
+            input_data=input_data,
+            output_byte_limit=output_byte_limit,
+        )
     try:
         return subprocess.run(
             command,
@@ -675,6 +727,65 @@ def run_trusted_read_git(
         return subprocess.CompletedProcess(
             command, 124, stdout=empty, stderr=message
         )
+
+
+def _run_bounded_trusted_git(
+    command: list[str],
+    *,
+    cwd: Path,
+    environment: dict[str, str],
+    input_data: str | bytes | None,
+    output_byte_limit: int,
+) -> subprocess.CompletedProcess[bytes]:
+    if isinstance(input_data, str):
+        input_bytes = input_data.encode()
+    else:
+        input_bytes = input_data
+    process = subprocess.Popen(
+        command,
+        cwd=cwd,
+        env=environment,
+        stdin=subprocess.PIPE if input_bytes is not None else None,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    process_io = BoundedProcessIO(
+        process,
+        input_bytes=input_bytes,
+        output_byte_limit=output_byte_limit,
+        cleanup_seconds=1,
+        combined_output_limit=True,
+    )
+    deadline = time.monotonic() + 120
+    stop_reason = None
+    while process.poll() is None:
+        stop_reason = process_io.observe(deadline)
+        if stop_reason is not None:
+            process.kill()
+            break
+    process_io.close_input()
+    try:
+        returncode = process.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        returncode = process.wait()
+        stop_reason = stop_reason or "timeout"
+    if not process_io.drain():
+        stop_reason = stop_reason or "timeout"
+    if stop_reason == "overflow" or process_io.overflowed:
+        return subprocess.CompletedProcess(
+            command, 1, stdout=b"", stderr=b"trusted Git output is too large"
+        )
+    if stop_reason == "timeout":
+        return subprocess.CompletedProcess(
+            command, 124, stdout=b"", stderr=b"trusted Git command timed out"
+        )
+    return subprocess.CompletedProcess(
+        command,
+        returncode,
+        stdout=bytes(process_io.captured["stdout"]),
+        stderr=bytes(process_io.captured["stderr"]),
+    )
 
 
 def clean_reserved_checkout_artifacts(checkout_path: Path, status_lines: list[str]) -> bool:
