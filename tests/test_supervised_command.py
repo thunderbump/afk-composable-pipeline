@@ -30,18 +30,21 @@ class SupervisedCommandTest(unittest.TestCase):
                 raise OSError("read failed")
             return real_read(descriptor, byte_count)
 
+        started = time.monotonic()
         with (
             mock.patch.object(process_io.os, "read", side_effect=fail_reader_read),
             self.assertRaises(SupervisedCommandError) as raised,
         ):
             run_supervised_command(
-                [sys.executable, "-c", "print('must not be truncated')"],
+                [sys.executable, "-c", "import time; time.sleep(30)"],
                 cwd=Path.cwd(),
                 environment=os.environ.copy(),
-                timeout_seconds=1,
+                timeout_seconds=2,
                 label="Codex",
+                cleanup_seconds=0.1,
             )
 
+        self.assertLess(time.monotonic() - started, 0.8)
         self.assertEqual(raised.exception.classification, "supervision_failure")
         self.assertIn("output streams could not be read", raised.exception.summary)
 

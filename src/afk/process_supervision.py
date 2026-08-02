@@ -104,7 +104,7 @@ def run_supervised_command(
                     stdout=stdout,
                     stderr=stderr,
                 )
-            if stop_reason == "overflow":
+            if stop_reason in {"overflow", "reader_failure"}:
                 break
         process_io.close_input()
         descendants.terminate(process.pid)

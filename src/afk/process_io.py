@@ -66,12 +66,16 @@ class BoundedProcessIO:
     def observe(self, deadline: float) -> str | None:
         if self.overflowed:
             return "overflow"
+        if self.reader_failed:
+            return "reader_failure"
         if time.monotonic() >= deadline:
             return "timeout"
         self._feed_input()
         self.overflow.wait(min(0.01, max(deadline - time.monotonic(), 0)))
         if self.overflowed:
             return "overflow"
+        if self.reader_failed:
+            return "reader_failure"
         if time.monotonic() >= deadline:
             return "timeout"
         return None
