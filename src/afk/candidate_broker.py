@@ -102,7 +102,8 @@ def run_candidate(request: dict[str, Any]) -> dict[str, Any]:
                 execution["image"],
                 request["command"],
             )
-        cleanup_required = container_name is not None
+        interrupted_cleanup = container_name is not None
+        container_started = False
         try:
             completed = run_supervised_command(
                 command,
@@ -120,9 +121,12 @@ def run_candidate(request: dict[str, Any]) -> dict[str, Any]:
                 decode_errors="replace",
                 _precontained_command=execution is None,
             )
-            cleanup_required = False
+            container_started = (
+                container_id_path is not None and container_id_path.is_file()
+            )
+            interrupted_cleanup = False
         except OSError:
-            cleanup_required = False
+            interrupted_cleanup = False
             return _failed_execution_result(
                 request["candidate_sha"],
                 "launch_failure",
@@ -146,22 +150,19 @@ def run_candidate(request: dict[str, Any]) -> dict[str, Any]:
                 stderr=exc.stderr or "",
             )
         finally:
-            if container_name is not None and cleanup_required:
+            if container_name is not None and (
+                interrupted_cleanup or container_started
+            ):
                 _remove_container(container_runtime, container_name)
-        container_started = (
-            container_id_path is not None and container_id_path.is_file()
+    if execution is not None and not container_started:
+        return _failed_execution_result(
+            request["candidate_sha"],
+            "launch_failure",
+            "Candidate command could not be launched",
+            stdout=completed.stdout,
+            stderr=completed.stderr,
         )
     if completed.returncode != 0:
-        if execution is not None and (
-            completed.returncode in {126, 127} or not container_started
-        ):
-            return _failed_execution_result(
-                request["candidate_sha"],
-                "launch_failure",
-                "Candidate command could not be launched",
-                stdout=completed.stdout,
-                stderr=completed.stderr,
-            )
         return _failed_execution_result(
             request["candidate_sha"],
             "abnormal_exit",
@@ -261,7 +262,6 @@ def _container_command(
         runtime,
         "run",
         "--pull=never",
-        "--rm",
         "--cidfile",
         str(container_id_path),
         "--name",

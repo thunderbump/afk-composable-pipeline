@@ -182,9 +182,10 @@ container runs as uid/gid 65534 with a read-only root, no network, no Linux
 capabilities, `no-new-privileges`, and a bounded PID count. The Docker/Podman
 socket, live broker capability, Candidate checkout, validation request, and
 evidence directory are not mounted into the container. AFK supervises the
-trusted runtime client and forcibly removes a randomly named container after a
-timeout or other interrupted run; failed forced cleanup fails the broker
-closed instead of publishing a successful or ordinary failure result.
+trusted runtime client and forcibly removes every created, randomly named
+container after completion, timeout, or another interruption; failed forced
+cleanup fails the broker closed instead of publishing a successful or ordinary
+failure result.
 
 The broker materializes exact tree and blob objects from the Candidate commit
 without `.git` administrative metadata or archive-attribute rewrites. Gitlinks

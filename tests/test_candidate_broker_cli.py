@@ -600,6 +600,8 @@ class CandidateBrokerCliTest(unittest.TestCase):
                     raise SystemExit(0)
                 if arguments[0] == "rm":
                     raise SystemExit(0)
+                cidfile = Path(arguments[arguments.index("--cidfile") + 1])
+                cidfile.write_text("created-container-id\\n", encoding="utf-8")
                 mount = next(
                     arguments[index + 1]
                     for index, value in enumerate(arguments)
@@ -669,10 +671,15 @@ class CandidateBrokerCliTest(unittest.TestCase):
                         f"""
                         #!{sys.executable}
                         import sys
+                        from pathlib import Path
 
                         arguments = sys.argv[1:]
                         if arguments[0] in {{"info", "rm"}}:
                             raise SystemExit(0)
+                        cidfile = Path(arguments[arguments.index("--cidfile") + 1])
+                        cidfile.write_text(
+                            "created-container-id\\n", encoding="utf-8"
+                        )
                         print(
                             "PULL_NEVER"
                             if "--pull=never" in arguments
@@ -703,6 +710,7 @@ class CandidateBrokerCliTest(unittest.TestCase):
     def test_missing_local_container_image_is_a_launch_failure(self):
         request = self.temp / "container-missing-image-request.json"
         result = self.temp / "container-missing-image-result.json"
+        cleanup = self.temp / "container-missing-image-cleanup"
         fake_bin = self.temp / "container-missing-image-bin"
         fake_bin.mkdir()
         (fake_bin / "git").symlink_to(shutil.which("git"))
@@ -713,11 +721,13 @@ class CandidateBrokerCliTest(unittest.TestCase):
                 f"""
                 #!{sys.executable}
                 import sys
+                from pathlib import Path
 
                 arguments = sys.argv[1:]
                 if arguments[0] == "info":
                     raise SystemExit(0)
                 if arguments[0] == "rm":
+                    Path({str(cleanup)!r}).touch()
                     raise SystemExit(0)
                 assert "--pull=never" in arguments
                 print("local image is unavailable", file=sys.stderr)
@@ -753,6 +763,7 @@ class CandidateBrokerCliTest(unittest.TestCase):
                 "stderr": "local image is unavailable\n",
             },
         )
+        self.assertFalse(cleanup.exists())
 
     def test_container_candidate_exit_125_is_preserved_after_creation(self):
         request = self.temp / "container-exit-125-request.json"
@@ -801,6 +812,72 @@ class CandidateBrokerCliTest(unittest.TestCase):
         self.assertEqual(broker_result["failure_classification"], "abnormal_exit")
         self.assertEqual(broker_result["exit_code"], 125)
         self.assertEqual(broker_result["stderr"], "Candidate exited 125\n")
+
+    def test_started_container_exit_codes_are_preserved_and_cleaned_up(self):
+        for runtime_name in ("docker", "podman"):
+            for exit_code in (125, 126, 127):
+                with self.subTest(runtime=runtime_name, exit_code=exit_code):
+                    request = self.temp / f"{runtime_name}-{exit_code}-request.json"
+                    result = self.temp / f"{runtime_name}-{exit_code}-result.json"
+                    cleanup = self.temp / f"{runtime_name}-{exit_code}-cleanup"
+                    fake_bin = self.temp / f"{runtime_name}-{exit_code}-bin"
+                    fake_bin.mkdir()
+                    (fake_bin / "git").symlink_to(shutil.which("git"))
+                    (fake_bin / "bwrap").symlink_to(shutil.which("bwrap"))
+                    fake_runtime = fake_bin / runtime_name
+                    fake_runtime.write_text(
+                        textwrap.dedent(
+                            f"""
+                            #!{sys.executable}
+                            import sys
+                            from pathlib import Path
+
+                            arguments = sys.argv[1:]
+                            if arguments[0] == "info":
+                                raise SystemExit(0)
+                            if arguments[0] == "rm":
+                                Path({str(cleanup)!r}).write_text(
+                                    arguments[-1], encoding="utf-8"
+                                )
+                                raise SystemExit(0)
+                            cidfile = Path(
+                                arguments[arguments.index("--cidfile") + 1]
+                            )
+                            cidfile.write_text(
+                                "created-container-id\\n", encoding="utf-8"
+                            )
+                            if {runtime_name!r} == "podman" and "--rm" in arguments:
+                                cidfile.unlink()
+                            print("Candidate exited {exit_code}", file=sys.stderr)
+                            raise SystemExit({exit_code})
+                            """
+                        ).lstrip(),
+                        encoding="utf-8",
+                    )
+                    fake_runtime.chmod(0o755)
+                    self.write_request(
+                        request,
+                        command=["/bin/sh", "-c", f"exit {exit_code}"],
+                        execution={"type": "container", "image": "fixture:local"},
+                    )
+
+                    completed = self.run_broker(
+                        request,
+                        result,
+                        env={"PATH": str(fake_bin)},
+                    )
+
+                    self.assertEqual(completed.returncode, 0, completed.stderr)
+                    broker_result = json.loads(result.read_text(encoding="utf-8"))
+                    self.assertEqual(broker_result["status"], "failed", broker_result)
+                    self.assertEqual(
+                        broker_result["failure_classification"], "abnormal_exit"
+                    )
+                    self.assertEqual(broker_result["exit_code"], exit_code)
+                    self.assertEqual(
+                        broker_result["stderr"], f"Candidate exited {exit_code}\n"
+                    )
+                    self.assertTrue(cleanup.is_file())
 
     def test_container_execution_overrides_the_image_entrypoint(self):
         request = self.temp / "container-entrypoint-request.json"
@@ -882,6 +959,8 @@ class CandidateBrokerCliTest(unittest.TestCase):
                 arguments = sys.argv[1:]
                 if arguments[0] in {{"info", "rm"}}:
                     raise SystemExit(0)
+                cidfile = Path(arguments[arguments.index("--cidfile") + 1])
+                cidfile.write_text("created-container-id\\n", encoding="utf-8")
                 mount = arguments[arguments.index("--mount") + 1]
                 source = Path(next(
                     item.removeprefix("src=")
