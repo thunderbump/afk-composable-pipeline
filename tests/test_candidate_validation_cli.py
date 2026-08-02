@@ -1,6 +1,7 @@
 import json
 import os
 import signal
+import socket
 import stat
 import subprocess
 import sys
@@ -154,6 +155,124 @@ class CandidateValidationCliTest(unittest.TestCase):
         )
         self.assertNotIn("token", json.dumps(persisted_request))
         self.assertNotIn("socket_path", json.dumps(persisted_request))
+
+    def test_brokered_candidate_cannot_reach_host_validation_or_docker(self):
+        host_secret = self.temp / "host-secret"
+        host_secret.write_text("host only\n", encoding="utf-8")
+        docker_socket_path = self.temp / "docker.sock"
+        probe = textwrap.dedent(
+            """
+            import json
+            import socket
+            import sys
+            from pathlib import Path
+
+            checks = {}
+            for name, path in (
+                ("host_path", sys.argv[1]),
+                ("validation_evidence", sys.argv[2]),
+            ):
+                try:
+                    Path(path).read_bytes()
+                except OSError as exc:
+                    checks[name] = {"status": "denied", "error": type(exc).__name__}
+                else:
+                    checks[name] = {"status": "exposed"}
+            for name, family, address in (
+                ("docker", socket.AF_UNIX, sys.argv[3]),
+                ("broker", socket.AF_UNIX, sys.argv[4]),
+                ("default_docker", socket.AF_UNIX, "/var/run/docker.sock"),
+                ("network", socket.AF_INET, ("127.0.0.1", int(sys.argv[5]))),
+            ):
+                try:
+                    with socket.socket(family) as client:
+                        client.settimeout(0.2)
+                        client.connect(address)
+                except OSError as exc:
+                    checks[name] = {"status": "denied", "error": type(exc).__name__}
+                else:
+                    checks[name] = {"status": "exposed"}
+            print(json.dumps(checks, sort_keys=True))
+            """
+        ).strip()
+
+        with (
+            socket.socket(socket.AF_INET, socket.SOCK_STREAM) as host_network,
+            socket.socket(socket.AF_UNIX) as docker_socket,
+        ):
+            host_network.bind(("127.0.0.1", 0))
+            host_network.listen()
+            docker_socket.bind(str(docker_socket_path))
+            docker_socket.listen()
+            broker_request = {
+                "schema_version": 1,
+                "command": [
+                    "/usr/bin/python3",
+                    "-c",
+                    probe,
+                    str(host_secret),
+                    "__EVIDENCE_DIR__",
+                    str(docker_socket_path),
+                    "__BROKER_SOCKET__",
+                    str(host_network.getsockname()[1]),
+                ],
+            }
+            harness = textwrap.dedent(
+                f"""
+                import socket
+                capability = request["candidate_broker"]
+                broker_request = {broker_request!r}
+                broker_request["command"][4] = request["evidence_dir"]
+                broker_request["command"][6] = capability["socket_path"]
+                broker_request["token"] = capability["token"]
+                with socket.socket(socket.AF_UNIX) as client:
+                    client.connect(capability["socket_path"])
+                    client.sendall((json.dumps(broker_request) + "\\n").encode())
+                    response = json.loads(
+                        client.makefile("r", encoding="utf-8").readline()
+                    )
+                assert response["status"] == "completed", response
+                checks = json.loads(response["stdout"])
+                assert all(check["status"] == "denied" for check in checks.values())
+                evidence.joinpath("tests.log").write_text(
+                    json.dumps(checks, sort_keys=True) + "\\n", encoding="utf-8"
+                )
+                """
+            ).strip()
+            self.write_contract_worker(
+                status="passed",
+                exit_code=0,
+                checks=[
+                    {"name": "boundary", "status": "passed", "log_path": "tests.log"}
+                ],
+                evidence_line=f"exec({harness!r})",
+            )
+            run_id, _ = self.candidate_ready_run()
+
+            completed = self.run_afk("resume")
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        status = self.status(run_id)
+        self.assertEqual(status["checkpoint"], "validated")
+        evidence = (
+            self.state_home / "afk" / "runs" / run_id / status["validation"]["evidence"]
+        )
+        checks = json.loads(
+            (evidence / "contract" / "tests.log").read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            set(checks),
+            {
+                "broker",
+                "default_docker",
+                "docker",
+                "host_path",
+                "network",
+                "validation_evidence",
+            },
+        )
+        self.assertTrue(all(check["status"] == "denied" for check in checks.values()))
+        self.assertEqual(stat.S_IMODE(evidence.stat().st_mode), 0o500)
 
     def test_live_candidate_broker_capability_is_redacted_from_the_run_store(self):
         worker = self.repository / "validate.py"
@@ -334,6 +453,71 @@ class CandidateValidationCliTest(unittest.TestCase):
             self.assertEqual(completed.returncode, 2)
             status = self.status(run_id)
             self.assertEqual(status["attention"]["kind"], "interrupted")
+            self.assertEqual(self.processes_with_token(token), [])
+        finally:
+            for pid in self.processes_with_token(token):
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+    def test_brokered_candidate_cannot_leave_a_detached_descendant(self):
+        token = f"afk-broker-descendant-{os.getpid()}-{time.monotonic_ns()}"
+        child_program = (
+            "import signal,time; "
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+            "time.sleep(60)"
+        )
+        candidate_program = (
+            "import subprocess,sys; "
+            f"subprocess.Popen([sys.executable, '-c', {child_program!r}, {token!r}], "
+            "start_new_session=True); "
+            "print('candidate completed')"
+        )
+        broker_request = {
+            "schema_version": 1,
+            "command": ["/usr/bin/python3", "-c", candidate_program],
+        }
+        harness = textwrap.dedent(
+            f"""
+            import socket
+            capability = request["candidate_broker"]
+            broker_request = {broker_request!r}
+            broker_request["token"] = capability["token"]
+            with socket.socket(socket.AF_UNIX) as client:
+                client.connect(capability["socket_path"])
+                client.sendall((json.dumps(broker_request) + "\\n").encode())
+                response = json.loads(client.makefile("r", encoding="utf-8").readline())
+            assert response["status"] == "completed", response
+            assert response["stdout"] == "candidate completed\\n"
+            {WRITE_SAFE_LOG}
+            """
+        ).strip()
+        self.write_contract_worker(
+            status="passed",
+            exit_code=0,
+            checks=[{"name": "tests", "status": "passed", "log_path": "tests.log"}],
+            evidence_line=f"exec({harness!r})",
+        )
+        run_id, _ = self.candidate_ready_run()
+
+        try:
+            completed = self.run_afk("resume")
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            status = self.status(run_id)
+            self.assertEqual(status["checkpoint"], "validated")
+            evidence = (
+                self.state_home
+                / "afk"
+                / "runs"
+                / run_id
+                / status["validation"]["evidence"]
+            )
+            self.assertEqual(stat.S_IMODE(evidence.stat().st_mode), 0o500)
+            deadline = time.monotonic() + 2
+            while self.processes_with_token(token) and time.monotonic() < deadline:
+                time.sleep(0.02)
             self.assertEqual(self.processes_with_token(token), [])
         finally:
             for pid in self.processes_with_token(token):
