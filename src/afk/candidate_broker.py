@@ -20,6 +20,7 @@ from afk.process_supervision import (
     _send_protocol_message,
     run_supervised_command,
 )
+from afk.redaction import redact_text
 
 
 SCHEMA_VERSION = 1
@@ -164,6 +165,13 @@ def run_candidate(request: dict[str, Any]) -> dict[str, Any]:
                 _precontained_command=execution is None,
                 _trusted_host_command=execution is not None,
             )
+            if execution is not None:
+                completed = subprocess.CompletedProcess(
+                    completed.args,
+                    completed.returncode,
+                    _redact_trusted_runtime_diagnostic(completed.stdout),
+                    _redact_trusted_runtime_diagnostic(completed.stderr),
+                )
             container_started = (
                 container_id_path is not None and container_id_path.is_file()
             )
@@ -187,10 +195,10 @@ def run_candidate(request: dict[str, Any]) -> dict[str, Any]:
             return _failed_execution_result(
                 request["candidate_sha"],
                 exc.classification,
-                exc.summary,
+                _redact_container_diagnostic(execution, exc.summary),
                 exit_code=exc.exit_code,
-                stdout=exc.stdout or "",
-                stderr=exc.stderr or "",
+                stdout=_redact_container_diagnostic(execution, exc.stdout or ""),
+                stderr=_redact_container_diagnostic(execution, exc.stderr or ""),
             )
         finally:
             if cleanup_watchdog is not None:
@@ -274,7 +282,7 @@ def _inspect_container_image(runtime: str, image: str) -> tuple[str | None, str]
     except (OSError, SupervisedCommandError):
         return None, ""
     if completed.returncode != 0:
-        return None, completed.stderr
+        return None, _redact_trusted_runtime_diagnostic(completed.stderr)
     try:
         metadata = json.loads(completed.stdout)
     except json.JSONDecodeError:
@@ -410,6 +418,25 @@ def trusted_runtime_environment() -> dict[str, str]:
     environment.update({"LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"})
     environment.setdefault("PATH", os.defpath)
     return environment
+
+
+def _trusted_runtime_exact_secrets() -> set[str]:
+    values = {
+        value
+        for name, value in trusted_runtime_environment().items()
+        if name not in {"PATH", "LANG", "LC_ALL"} and len(value.strip()) >= 4
+    }
+    return values | {redact_text(value) for value in values}
+
+
+def _redact_trusted_runtime_diagnostic(value: str) -> str:
+    return redact_text(value, exact_secrets=_trusted_runtime_exact_secrets())
+
+
+def _redact_container_diagnostic(execution: object, value: str) -> str:
+    if execution is None:
+        return value
+    return _redact_trusted_runtime_diagnostic(value)
 
 
 def _start_container_cleanup_watchdog(

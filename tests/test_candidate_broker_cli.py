@@ -708,6 +708,98 @@ class CandidateBrokerCliTest(unittest.TestCase):
                 self.assertNotIn(endpoint, json.dumps(response))
                 self.assertNotIn(selector, json.dumps(response))
 
+    def test_candidate_capability_redacts_trusted_runtime_failure_diagnostics(self):
+        fake_bin = self.temp / "diagnostic-redaction-bin"
+        fake_bin.mkdir()
+        (fake_bin / "git").symlink_to(shutil.which("git"))
+        endpoint = "tcp://docker-user:docker-password@example.invalid:2376"
+        docker_config = str(self.temp / "private-docker-config")
+        docker = fake_bin / "docker"
+        docker.write_text(
+            textwrap.dedent(
+                f"""
+                #!{sys.executable}
+                import os
+                import sys
+
+                arguments = sys.argv[1:]
+                if arguments[0] == "info":
+                    raise SystemExit(0)
+                if arguments[:2] == ["image", "inspect"]:
+                    if arguments[2] == "inspect-failure:local":
+                        print(
+                            "useful inspect detail "
+                            + os.environ["DOCKER_HOST"]
+                            + " "
+                            + os.environ["DOCKER_CONFIG"],
+                            file=sys.stderr,
+                        )
+                        raise SystemExit(1)
+                    print('[{{"Id":"sha256:fixture-image","Config":{{"Volumes":null}}}}]')
+                    raise SystemExit(0)
+                if arguments[0] == "rm":
+                    raise SystemExit(0)
+                print("useful run stdout " + os.environ["DOCKER_HOST"])
+                print(
+                    "useful run stderr " + os.environ["DOCKER_CONFIG"],
+                    file=sys.stderr,
+                )
+                raise SystemExit(1)
+                """
+            ).lstrip(),
+            encoding="utf-8",
+        )
+        docker.chmod(0o755)
+        socket_path = self.temp / "diagnostic-redaction-broker.sock"
+
+        def request(capability, image):
+            with socket.socket(socket.AF_UNIX) as client:
+                client.connect(capability["socket_path"])
+                client.sendall(
+                    (
+                        json.dumps(
+                            {
+                                "schema_version": 1,
+                                "token": capability["token"],
+                                "command": ["/bin/true"],
+                                "execution": {"type": "container", "image": image},
+                            }
+                        )
+                        + "\n"
+                    ).encode("utf-8")
+                )
+                return json.loads(client.makefile("r", encoding="utf-8").readline())
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {
+                    "PATH": str(fake_bin),
+                    "DOCKER_HOST": endpoint,
+                    "DOCKER_CONFIG": docker_config,
+                },
+                clear=False,
+            ),
+            CandidateBrokerCapability(
+                candidate_path=self.candidate,
+                candidate_sha=self.candidate_sha,
+                socket_path=socket_path,
+            ) as capability,
+        ):
+            live_capability = capability.request_value()
+            inspect_response = request(live_capability, "inspect-failure:local")
+            run_response = request(live_capability, "run-failure:local")
+
+        for response in (inspect_response, run_response):
+            encoded = json.dumps(response)
+            self.assertNotIn(endpoint, encoded)
+            self.assertNotIn("example.invalid:2376", encoded)
+            self.assertNotIn(docker_config, encoded)
+            self.assertIn("[REDACTED]", encoded)
+        self.assertIn("useful inspect detail", inspect_response["stderr"])
+        self.assertIn("useful run stdout", run_response["stdout"])
+        self.assertIn("useful run stderr", run_response["stderr"])
+
     def test_container_watchdog_cleans_up_after_broker_parent_death(self):
         selectors = (("docker", "DOCKER_HOST"), ("podman", "CONTAINER_HOST"))
         for runtime_name, selector in selectors:
