@@ -118,6 +118,7 @@ def validate_candidate(
             "candidate_sha": candidate_sha,
             "evidence_dir": str(evidence.resolve()),
         }
+        exact_secrets: set[str] = set()
         if "bootstrap_harness" not in contract:
             try:
                 broker = cleanup.enter_context(
@@ -132,6 +133,10 @@ def validate_candidate(
                     "interrupted", "Candidate broker capability is unavailable"
                 ) from exc
             request["candidate_broker"] = broker.request_value()
+            exact_secrets = {
+                request["candidate_broker"]["token"],
+                request["candidate_broker"]["socket_path"],
+            }
         evidence_request = dict(request)
         if "candidate_broker" in evidence_request:
             evidence_request["candidate_broker"] = broker.evidence_value()
@@ -147,6 +152,7 @@ def validate_candidate(
             run_id,
             f"{attempt_evidence}/{AFK_EVIDENCE_NAMESPACE}/request.json",
             canonical_json(evidence_request) + "\n",
+            exact_secrets=exact_secrets,
         )
         try:
             completed = _run_contract(
@@ -155,6 +161,21 @@ def validate_candidate(
                 environment=_validation_environment(staging),
                 timeout_seconds=contract["timeout_seconds"],
             )
+        except CandidateValidationError as exc:
+            raise CandidateValidationError(
+                exc.kind,
+                redact_text(exc.summary, exact_secrets=exact_secrets),
+                stdout=(
+                    None
+                    if exc.stdout is None
+                    else redact_text(exc.stdout, exact_secrets=exact_secrets)
+                ),
+                stderr=(
+                    None
+                    if exc.stderr is None
+                    else redact_text(exc.stderr, exact_secrets=exact_secrets)
+                ),
+            ) from exc
         except OSError as exc:
             raise CandidateValidationError(
                 "invalid", "validation command is unavailable or not executable"
@@ -170,16 +191,21 @@ def validate_candidate(
             run_id,
             f"{attempt_evidence}/{AFK_EVIDENCE_NAMESPACE}/stdout.log",
             completed.stdout,
+            exact_secrets=exact_secrets,
         )
         store.write_evidence_text(
             run_id,
             f"{attempt_evidence}/{AFK_EVIDENCE_NAMESPACE}/stderr.log",
             completed.stderr,
+            exact_secrets=exact_secrets,
         )
         _require_immutable_candidate(worktree, candidate_sha)
         _require_original_evidence_directory(evidence, evidence_descriptor)
         result = _read_result(evidence_view / "result.json", candidate_sha, completed)
-        evidence_files, contract_evidence_bytes = _require_evidence_tree(evidence_view)
+        result["summary"] = redact_text(result["summary"], exact_secrets=exact_secrets)
+        evidence_files, contract_evidence_bytes = _require_evidence_tree(
+            evidence_view, exact_secrets=exact_secrets
+        )
         _require_regular_logs(evidence_files, result["checks"])
         outcome = {
             "schema_version": 1,
@@ -196,7 +222,8 @@ def validate_candidate(
             canonical_json(outcome) + "\n",
         )
         gate_bytes = contract_evidence_bytes + sum(
-            len(redact_text(value).encode("utf-8")) for value in gate_metadata
+            len(redact_text(value, exact_secrets=exact_secrets).encode("utf-8"))
+            for value in gate_metadata
         )
         if gate_bytes > GATE_BYTE_LIMIT:
             raise CandidateValidationError(
@@ -206,21 +233,25 @@ def validate_candidate(
             run_id,
             f"{evidence_relative}/{AFK_EVIDENCE_NAMESPACE}/request.json",
             canonical_json(evidence_request) + "\n",
+            exact_secrets=exact_secrets,
         )
         store.write_evidence_text(
             run_id,
             f"{evidence_relative}/{AFK_EVIDENCE_NAMESPACE}/stdout.log",
             completed.stdout,
+            exact_secrets=exact_secrets,
         )
         store.write_evidence_text(
             run_id,
             f"{evidence_relative}/{AFK_EVIDENCE_NAMESPACE}/stderr.log",
             completed.stderr,
+            exact_secrets=exact_secrets,
         )
         store.write_evidence_text(
             run_id,
             f"{evidence_relative}/{AFK_EVIDENCE_NAMESPACE}/outcome.json",
             canonical_json(outcome) + "\n",
+            exact_secrets=exact_secrets,
         )
         _require_original_evidence_directory(evidence, evidence_descriptor)
         for path in sorted(evidence_view.rglob("*")):
@@ -230,6 +261,7 @@ def validate_candidate(
                     run_id,
                     f"{evidence_relative}/{CONTRACT_EVIDENCE_NAMESPACE}/{relative}",
                     path,
+                    exact_secrets=exact_secrets,
                 )
         _require_original_evidence_directory(evidence, evidence_descriptor)
     manifest = store.seal_evidence(run_id, evidence_relative)
@@ -719,10 +751,13 @@ def _require_regular_logs(
             )
 
 
-def _require_evidence_tree(evidence: Path) -> tuple[set[str], int]:
+def _require_evidence_tree(
+    evidence: Path, *, exact_secrets: set[str] | None = None
+) -> tuple[set[str], int]:
     total = 0
     files: set[str] = set()
     for path in evidence.rglob("*"):
+        relative = path.relative_to(evidence).as_posix()
         if path.is_symlink():
             raise CandidateValidationError(
                 "invalid", "validation evidence must contain only regular files"
@@ -733,18 +768,24 @@ def _require_evidence_tree(evidence: Path) -> tuple[set[str], int]:
             raise CandidateValidationError(
                 "invalid", "validation evidence must contain only regular files"
             )
+        if exact_secrets and any(
+            secret and secret in relative for secret in exact_secrets
+        ):
+            raise CandidateValidationError(
+                "invalid", "validation evidence path contains a live capability secret"
+            )
         try:
             value = path.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError) as exc:
             raise CandidateValidationError(
                 "invalid", "validation evidence must be UTF-8 text"
             ) from exc
-        total += len(redact_text(value).encode("utf-8"))
+        total += len(redact_text(value, exact_secrets=exact_secrets).encode("utf-8"))
         if total > GATE_BYTE_LIMIT:
             raise CandidateValidationError(
                 "invalid", "validation Gate evidence exceeds the size limit"
             )
-        files.add(path.relative_to(evidence).as_posix())
+        files.add(relative)
     return files, total
 
 

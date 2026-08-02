@@ -155,6 +155,150 @@ class CandidateValidationCliTest(unittest.TestCase):
         self.assertNotIn("token", json.dumps(persisted_request))
         self.assertNotIn("socket_path", json.dumps(persisted_request))
 
+    def test_live_candidate_broker_capability_is_redacted_from_the_run_store(self):
+        worker = self.repository / "validate.py"
+        worker.write_text(
+            textwrap.dedent(
+                """
+                #!/usr/bin/env python3
+                import json
+                import sys
+                from pathlib import Path
+
+                request_path = Path(sys.argv[sys.argv.index("--request") + 1])
+                request = json.loads(request_path.read_text(encoding="utf-8"))
+                capability = request["candidate_broker"]
+                print(capability["token"])
+                print(capability["socket_path"], file=sys.stderr)
+                evidence = Path(request["evidence_dir"])
+                evidence.joinpath("tests.log").write_text(
+                    capability["token"] + "\\n"
+                    + capability["socket_path"] + "\\n",
+                    encoding="utf-8",
+                )
+                evidence.joinpath("result.json").write_text(json.dumps({
+                    "schema_version": 1,
+                    "candidate_sha": request["candidate_sha"],
+                    "status": "passed",
+                    "summary": (
+                        "summary " + capability["token"] + " "
+                        + capability["socket_path"]
+                    ),
+                    "checks": [{
+                        "name": "tests",
+                        "status": "passed",
+                        "log_path": "tests.log",
+                    }],
+                }), encoding="utf-8")
+                """
+            ).lstrip(),
+            encoding="utf-8",
+        )
+        worker.chmod(worker.stat().st_mode | stat.S_IXUSR)
+        (self.repository / "afk.toml").write_text(
+            'schema_version = 1\n\n[validation]\ncommand = ["./validate.py"]\n'
+            'trusted_files = ["validate.py"]\ntimeout_seconds = 5\n',
+            encoding="utf-8",
+        )
+        run_id, _ = self.candidate_ready_run()
+
+        completed = self.run_afk("resume")
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        status = self.status(run_id)
+        evidence = (
+            self.state_home / "afk" / "runs" / run_id / status["validation"]["evidence"]
+        )
+        self.assertEqual(
+            status["validation"]["summary"],
+            "summary [REDACTED] [REDACTED]",
+        )
+        self.assertEqual(
+            (evidence / "afk" / "stdout.log").read_text(encoding="utf-8"),
+            "[REDACTED]\n",
+        )
+        self.assertEqual(
+            (evidence / "afk" / "stderr.log").read_text(encoding="utf-8"),
+            "[REDACTED]\n",
+        )
+        self.assertEqual(
+            (evidence / "contract" / "tests.log").read_text(encoding="utf-8"),
+            "[REDACTED]\n[REDACTED]\n",
+        )
+        persisted_result = json.loads(
+            (evidence / "contract" / "result.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            persisted_result["summary"],
+            "summary [REDACTED] [REDACTED]",
+        )
+        persisted_request = json.loads(
+            (evidence / "afk" / "request.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            persisted_request["candidate_broker"],
+            {"schema_version": 1, "transport": "ephemeral_unix_socket"},
+        )
+        self.assertNotIn("token", json.dumps(persisted_request))
+        self.assertNotIn("socket_path", json.dumps(persisted_request))
+
+    def test_live_candidate_broker_secret_is_rejected_as_an_evidence_filename(self):
+        worker = self.repository / "validate.py"
+        worker.write_text(
+            textwrap.dedent(
+                """
+                #!/usr/bin/env python3
+                import json
+                import sys
+                from pathlib import Path
+
+                request_path = Path(sys.argv[sys.argv.index("--request") + 1])
+                request = json.loads(request_path.read_text(encoding="utf-8"))
+                evidence = Path(request["evidence_dir"])
+                log_path = request["candidate_broker"]["token"]
+                evidence.joinpath(log_path).write_text("passed\\n", encoding="utf-8")
+                evidence.joinpath("result.json").write_text(json.dumps({
+                    "schema_version": 1,
+                    "candidate_sha": request["candidate_sha"],
+                    "status": "passed",
+                    "summary": "validation passed",
+                    "checks": [{
+                        "name": "tests",
+                        "status": "passed",
+                        "log_path": log_path,
+                    }],
+                }), encoding="utf-8")
+                """
+            ).lstrip(),
+            encoding="utf-8",
+        )
+        worker.chmod(worker.stat().st_mode | stat.S_IXUSR)
+        (self.repository / "afk.toml").write_text(
+            'schema_version = 1\n\n[validation]\ncommand = ["./validate.py"]\n'
+            'trusted_files = ["validate.py"]\ntimeout_seconds = 5\n',
+            encoding="utf-8",
+        )
+        run_id, _ = self.candidate_ready_run()
+
+        completed = self.run_afk("resume")
+
+        self.assertEqual(completed.returncode, 2)
+        status = self.status(run_id)
+        self.assertEqual(status["attention"]["kind"], "invalid")
+        self.assertEqual(
+            status["attention"]["summary"],
+            "validation evidence path contains a live capability secret",
+        )
+        gate = (
+            self.state_home
+            / "afk"
+            / "runs"
+            / run_id
+            / "gates"
+            / status["validation_attempt"]["attempt_id"]
+        )
+        self.assertFalse((gate / "contract").exists())
+
     def test_validation_timeout_stops_an_active_brokered_candidate_command(self):
         token = f"afk-validation-broker-{os.getpid()}-{time.monotonic_ns()}"
         broker_request = {
