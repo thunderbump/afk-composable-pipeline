@@ -452,14 +452,19 @@ class CandidateBrokerCliTest(unittest.TestCase):
 
         hidden = self.candidate / "hidden"
         hidden.mkdir()
-        payload = hidden / "payload"
-        payload.write_text("known payload\n", encoding="utf-8")
-        hidden.chmod(0o111)
-        try:
-            self.assertEqual(payload.read_text(encoding="utf-8"), "known payload\n")
+        real_scandir = os.scandir
+        attempted = []
+
+        def deny_hidden_scan(path):
+            if not isinstance(path, int) and Path(path) == hidden:
+                attempted.append(Path(path))
+                raise PermissionError("hidden directory is unreadable")
+            return real_scandir(path)
+
+        with mock.patch("afk.checkouts.os.scandir", side_effect=deny_hidden_scan):
             self.assertFalse(is_exact_clean_commit(self.candidate, self.candidate_sha))
-        finally:
-            hidden.chmod(0o700)
+
+        self.assertEqual(attempted, [hidden])
 
     def test_exact_candidate_does_not_trust_repo_info_exclude(self):
         from afk.checkouts import is_exact_clean_commit
