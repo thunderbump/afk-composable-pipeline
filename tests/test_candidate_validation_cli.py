@@ -51,7 +51,8 @@ class CandidateValidationCliTest(unittest.TestCase):
             checks=[{"name": "tests", "status": "passed", "log_path": "tests.log"}],
             evidence_line=(
                 f"candidate = Path({repository!r}).resolve(); "
-                "assert Path(request['candidate_path']).resolve() == candidate; "
+                'assert "candidate_path" not in request; '
+                'assert request["candidate_broker"]["schema_version"] == 1; '
                 "assert Path.cwd().resolve() != candidate; " + WRITE_SAFE_LOG
             ),
         )
@@ -86,6 +87,116 @@ class CandidateValidationCliTest(unittest.TestCase):
             "afk/outcome.json", {entry["path"] for entry in manifest["files"]}
         )
         self.assertEqual(stat.S_IMODE(evidence.stat().st_mode), 0o500)
+
+    def test_normal_validation_exposes_only_a_candidate_broker_capability(self):
+        (self.repository / "README.md").write_text(
+            "exact Candidate input\n", encoding="utf-8"
+        )
+        broker_request = {
+            "schema_version": 1,
+            "command": [
+                "/usr/bin/python3",
+                "-c",
+                (
+                    "from pathlib import Path; "
+                    "print(Path('/candidate/README.md').read_text(), end='')"
+                ),
+            ],
+        }
+        self.write_contract_worker(
+            status="passed",
+            exit_code=0,
+            checks=[{"name": "tests", "status": "passed", "log_path": "tests.log"}],
+            evidence_line=(
+                'assert "candidate_path" not in request; '
+                'capability = request["candidate_broker"]; '
+                'client = __import__("socket").socket(__import__("socket").AF_UNIX); '
+                'client.connect(capability["socket_path"]); '
+                "client.sendall((json.dumps({**"
+                f"{broker_request!r}"
+                ', "token": capability["token"]}) + "\\n").encode("utf-8")); '
+                "response_stream = client.makefile('r', encoding='utf-8'); "
+                "response = json.loads(response_stream.readline()); "
+                'assert response["candidate_sha"] == request["candidate_sha"]; '
+                'assert response["status"] == "completed"; '
+                'assert response["stdout"] == "exact Candidate input\\n"; '
+                "client.close(); "
+                'client = __import__("socket").socket(__import__("socket").AF_UNIX); '
+                'client.connect(capability["socket_path"]); '
+                'client.sendall((json.dumps({"schema_version": 1, '
+                '"command": ["/usr/bin/true"], '
+                '"token": capability["token"]}) + "\\n").encode("utf-8")); '
+                "response_stream = client.makefile('r', encoding='utf-8'); "
+                "response = json.loads(response_stream.readline()); "
+                'assert response["status"] == "completed"; '
+                "client.close(); " + WRITE_SAFE_LOG
+            ),
+        )
+        run_id, _ = self.candidate_ready_run()
+
+        completed = self.run_afk("resume")
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        status = self.status(run_id)
+        self.assertEqual(status["checkpoint"], "validated")
+        gate = (
+            self.state_home / "afk" / "runs" / run_id / status["validation"]["evidence"]
+        )
+        persisted_request = json.loads(
+            (gate / "afk" / "request.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            persisted_request["candidate_broker"],
+            {
+                "schema_version": 1,
+                "transport": "ephemeral_unix_socket",
+            },
+        )
+        self.assertNotIn("token", json.dumps(persisted_request))
+        self.assertNotIn("socket_path", json.dumps(persisted_request))
+
+    def test_validation_timeout_stops_an_active_brokered_candidate_command(self):
+        token = f"afk-validation-broker-{os.getpid()}-{time.monotonic_ns()}"
+        broker_request = {
+            "schema_version": 1,
+            "command": [
+                "/usr/bin/python3",
+                "-c",
+                "import time; time.sleep(30)",
+                token,
+            ],
+            "timeout_seconds": 30,
+        }
+        self.write_contract_worker(
+            status="passed",
+            exit_code=0,
+            checks=[{"name": "tests", "status": "passed", "log_path": "tests.log"}],
+            evidence_line=(
+                'capability = request["candidate_broker"]; '
+                'client = __import__("socket").socket(__import__("socket").AF_UNIX); '
+                'client.connect(capability["socket_path"]); '
+                "client.sendall((json.dumps({**"
+                f"{broker_request!r}"
+                ', "token": capability["token"]}) + "\\n").encode("utf-8")); '
+                'client.makefile("r", encoding="utf-8").readline(); ' + WRITE_SAFE_LOG
+            ),
+            timeout_seconds=1,
+        )
+        run_id, _ = self.candidate_ready_run()
+
+        try:
+            completed = self.run_afk("resume")
+
+            self.assertEqual(completed.returncode, 2)
+            status = self.status(run_id)
+            self.assertEqual(status["attention"]["kind"], "interrupted")
+            self.assertEqual(self.processes_with_token(token), [])
+        finally:
+            for pid in self.processes_with_token(token):
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
 
     def test_contract_evidence_names_do_not_collide_with_afk_metadata(self):
         formerly_reserved = ("request.json", "stdout.log", "stderr.log", "outcome.json")
@@ -564,6 +675,105 @@ class CandidateValidationCliTest(unittest.TestCase):
         status = self.status(run_id)
         self.assertEqual(status["checkpoint"], "validated")
         self.assertEqual(status["validation"]["contract"]["blob_sha"], blob_sha)
+
+    def test_omitted_candidate_helper_cannot_forge_gate_evidence(self):
+        validator = self.repository / "validate.py"
+        validator.write_text(
+            textwrap.dedent(
+                """
+                #!/usr/bin/env python3
+                import json
+                import socket
+                import sys
+                from pathlib import Path
+
+                request_path = Path(sys.argv[sys.argv.index("--request") + 1])
+                request = json.loads(request_path.read_text(encoding="utf-8"))
+                capability = request["candidate_broker"]
+                broker_request = {
+                    "schema_version": 1,
+                    "token": capability["token"],
+                    "command": [
+                        "/usr/bin/python3",
+                        "/candidate/omitted-helper.py",
+                        "--request",
+                        str(request_path),
+                        "--evidence",
+                        request["evidence_dir"],
+                    ],
+                }
+                with socket.socket(socket.AF_UNIX) as client:
+                    client.connect(capability["socket_path"])
+                    client.sendall((json.dumps(broker_request) + "\\n").encode())
+                    client.makefile("r", encoding="utf-8").readline()
+                """
+            ).lstrip(),
+            encoding="utf-8",
+        )
+        validator.chmod(0o755)
+        helper = self.repository / "omitted-helper.py"
+        helper.write_text("raise SystemExit(1)\n", encoding="utf-8")
+        (self.repository / "afk.toml").write_text(
+            'schema_version = 1\n\n[validation]\ncommand = ["./validate.py"]\n'
+            'trusted_files = ["validate.py"]\n'
+            "timeout_seconds = 5\n",
+            encoding="utf-8",
+        )
+        self.git("add", ".")
+        self.git("commit", "-m", "trusted validator with omitted Candidate helper")
+        base_sha = self.git("rev-parse", "HEAD")
+        blob_sha = self.git("rev-parse", "HEAD:afk.toml")
+
+        marker = self.temp / "unconditional-helper-ran"
+        helper.write_text(
+            textwrap.dedent(
+                f"""
+                import json
+                import sys
+                from pathlib import Path
+
+                request_path = Path(sys.argv[sys.argv.index("--request") + 1])
+                evidence = Path(sys.argv[sys.argv.index("--evidence") + 1])
+                candidate_sha = json.loads(request_path.read_text())["candidate_sha"]
+                Path({str(marker)!r}).parent.mkdir(parents=True, exist_ok=True)
+                Path({str(marker)!r}).write_text("ran", encoding="utf-8")
+                evidence.mkdir(parents=True, exist_ok=True)
+                (evidence / "tests.log").write_text("passed\\n", encoding="utf-8")
+                (evidence / "result.json").write_text(json.dumps({{
+                    "schema_version": 1,
+                    "candidate_sha": candidate_sha,
+                    "status": "passed",
+                    "summary": "unconditional success",
+                    "checks": [{{
+                        "name": "tests",
+                        "status": "passed",
+                        "log_path": "tests.log",
+                    }}],
+                }}), encoding="utf-8")
+                """
+            ).lstrip(),
+            encoding="utf-8",
+        )
+        self.git("add", "omitted-helper.py")
+        self.git("commit", "-m", "replace omitted helper with unconditional success")
+        candidate_sha = self.git("rev-parse", "HEAD")
+        run_id = self.create_ready_run(
+            candidate_sha=candidate_sha,
+            base_sha=base_sha,
+            validation_contract={
+                "source": "pinned_base",
+                "base_sha": base_sha,
+                "blob_sha": blob_sha,
+            },
+        )
+
+        completed = self.run_afk("resume")
+
+        self.assertEqual(completed.returncode, 2)
+        status = self.status(run_id)
+        self.assertEqual(status["attention"]["kind"], "invalid")
+        self.assertIn("result", status["attention"]["summary"])
+        self.assertFalse(marker.exists())
 
     def test_pinned_candidate_harness_change_is_not_executed(self):
         self.write_contract_worker(
@@ -2121,7 +2331,7 @@ class CandidateValidationCliTest(unittest.TestCase):
         self.assertEqual(outcome["status"], "invalid")
         self.assertEqual(stat.S_IMODE(evidence.stat().st_mode), 0o500)
 
-    def test_candidate_mutation_invalidates_validation(self):
+    def test_validation_harness_cannot_mutate_the_candidate_through_a_raw_path(self):
         (self.repository / "README.md").write_text("original\n", encoding="utf-8")
         self.write_contract_worker(
             status="passed",
@@ -2139,8 +2349,12 @@ class CandidateValidationCliTest(unittest.TestCase):
 
         self.assertEqual(completed.returncode, 2)
         status = self.status(run_id)
-        self.assertEqual(status["attention"]["kind"], "head_mismatch")
-        self.assertIn("changed", status["attention"]["summary"])
+        self.assertEqual(status["attention"]["kind"], "invalid")
+        self.assertIn("result", status["attention"]["summary"])
+        self.assertEqual(
+            (self.repository / "README.md").read_text(encoding="utf-8"),
+            "original\n",
+        )
 
     def test_validation_environment_is_allowlisted_and_evidence_is_redacted(self):
         approved = {
@@ -2250,6 +2464,20 @@ class CandidateValidationCliTest(unittest.TestCase):
             f"timeout_seconds = {timeout_seconds}\n",
             encoding="utf-8",
         )
+
+    @staticmethod
+    def processes_with_token(token):
+        matches = []
+        for process in Path("/proc").iterdir():
+            if not process.name.isdigit():
+                continue
+            try:
+                command_line = (process / "cmdline").read_bytes()
+            except (FileNotFoundError, PermissionError, ProcessLookupError):
+                continue
+            if token.encode() in command_line:
+                matches.append(int(process.name))
+        return matches
 
     def assert_pinned_indirect_harness_is_rejected(self, command):
         self.write_contract_worker(

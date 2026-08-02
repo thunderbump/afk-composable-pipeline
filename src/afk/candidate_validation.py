@@ -11,6 +11,10 @@ from contextlib import ExitStack
 from pathlib import Path
 from typing import Any
 
+from afk.candidate_capability import (
+    CandidateBrokerCapability,
+    CandidateCapabilityError,
+)
 from afk.checkouts import is_exact_clean_commit
 from afk.jsonutil import canonical_json
 from afk.process_supervision import (
@@ -115,7 +119,22 @@ def validate_candidate(
             "evidence_dir": str(evidence.resolve()),
         }
         if "bootstrap_harness" not in contract:
-            request["candidate_path"] = str(worktree.resolve())
+            try:
+                broker = cleanup.enter_context(
+                    CandidateBrokerCapability(
+                        candidate_path=worktree.resolve(),
+                        candidate_sha=candidate_sha,
+                        socket_path=staging / "candidate-broker.sock",
+                    )
+                )
+            except CandidateCapabilityError as exc:
+                raise CandidateValidationError(
+                    "interrupted", "Candidate broker capability is unavailable"
+                ) from exc
+            request["candidate_broker"] = broker.request_value()
+        evidence_request = dict(request)
+        if "candidate_broker" in evidence_request:
+            evidence_request["candidate_broker"] = broker.evidence_value()
         request_path.write_text(canonical_json(request) + "\n", encoding="utf-8")
         request_path.chmod(0o400)
         if "bootstrap_harness" in contract:
@@ -127,7 +146,7 @@ def validate_candidate(
         store.write_evidence_text(
             run_id,
             f"{attempt_evidence}/{AFK_EVIDENCE_NAMESPACE}/request.json",
-            canonical_json(request) + "\n",
+            canonical_json(evidence_request) + "\n",
         )
         try:
             completed = _run_contract(
@@ -140,6 +159,13 @@ def validate_candidate(
             raise CandidateValidationError(
                 "invalid", "validation command is unavailable or not executable"
             ) from exc
+        if "bootstrap_harness" not in contract:
+            try:
+                broker.require_healthy()
+            except CandidateCapabilityError as exc:
+                raise CandidateValidationError(
+                    "interrupted", "Candidate broker capability failed"
+                ) from exc
         store.write_evidence_text(
             run_id,
             f"{attempt_evidence}/{AFK_EVIDENCE_NAMESPACE}/stdout.log",
@@ -164,7 +190,7 @@ def validate_candidate(
             "summary": result["summary"],
         }
         gate_metadata = (
-            canonical_json(request) + "\n",
+            canonical_json(evidence_request) + "\n",
             completed.stdout,
             completed.stderr,
             canonical_json(outcome) + "\n",
@@ -179,7 +205,7 @@ def validate_candidate(
         store.write_evidence_text(
             run_id,
             f"{evidence_relative}/{AFK_EVIDENCE_NAMESPACE}/request.json",
-            canonical_json(request) + "\n",
+            canonical_json(evidence_request) + "\n",
         )
         store.write_evidence_text(
             run_id,

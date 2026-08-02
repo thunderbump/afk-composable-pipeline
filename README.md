@@ -91,14 +91,25 @@ timeout_seconds = 2700
 AFK verifies every declared file has the same tracked blob and regular-file
 mode in the Candidate as in the pinned base, then materializes those base
 blobs outside the Candidate checkout and runs the command from that trusted
-root. The request supplies `candidate_sha` and `candidate_path` so the trusted
-target-owned harness can build and test the exact Candidate without executing
-Candidate-owned validation policy. Contract authors must list every repository
-executable or sourced file used by validation. Candidate changes to the
-contract or any declared validator file remain proposals for a later Run whose
-base includes them. Normal Validation Gate integration with the capability-
-limited broker is still required before an omitted Candidate helper is
-enforceably isolated.
+root. For normal pinned-base validation, the request supplies `candidate_sha`
+and an ephemeral `candidate_broker` capability instead of a raw Candidate
+checkout path. The trusted target-owned harness uses that capability to build
+and test exact-head Candidate inputs without giving Candidate code access to
+the validation request, evidence directory, broker endpoint, or host checkout.
+Contract authors must list every repository executable or sourced file used by
+validation. Candidate changes to the contract or any declared validator file
+remain proposals for a later Run whose base includes them.
+
+The capability object contains `schema_version`, `socket_path`, and an
+ephemeral `token`. One newline-delimited JSON request is accepted per Unix
+socket connection. The request repeats `schema_version` and `token`, supplies a
+non-empty `command` argv, and may use the broker's bounded `timeout_seconds`
+and `output_byte_limit` options. The response is the same Candidate-bound
+structured result returned by the broker CLI. A harness may open multiple
+connections while it runs; the capability expires when that harness finishes.
+Persisted Gate evidence records only the capability type, never the live token
+or socket path. Approved bootstrap validation retains its existing request and
+adapter behavior.
 
 ### Supervision runtime prerequisites
 

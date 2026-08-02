@@ -199,6 +199,10 @@ def _read_request(path: Path) -> dict[str, Any]:
         value = json.loads(path.read_text(encoding="utf-8"))
     except UnicodeDecodeError as exc:
         raise CandidateBrokerError("candidate broker request is invalid") from exc
+    return validate_candidate_request(value)
+
+
+def validate_candidate_request(value: object) -> dict[str, Any]:
     if (
         not isinstance(value, dict)
         or not {"schema_version", "candidate_sha", "candidate_path", "command"}
