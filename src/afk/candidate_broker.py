@@ -111,15 +111,11 @@ def _read_request(path: Path) -> dict[str, Any]:
         or type(value.get("schema_version")) is not int
         or value["schema_version"] != SCHEMA_VERSION
         or not _is_sha(value.get("candidate_sha"))
-        or not isinstance(value.get("candidate_path"), str)
-        or "\0" in value["candidate_path"]
+        or not _is_os_argument(value.get("candidate_path"))
         or not Path(value["candidate_path"]).is_absolute()
         or not isinstance(value.get("command"), list)
         or not value["command"]
-        or not all(
-            isinstance(item, str) and item and "\0" not in item
-            for item in value["command"]
-        )
+        or not all(_is_os_argument(item) for item in value["command"])
     ):
         raise CandidateBrokerError("candidate broker request is invalid")
     return value
@@ -208,6 +204,16 @@ def _is_sha(value: Any) -> bool:
         and len(value) == 40
         and all(character in "0123456789abcdef" for character in value)
     )
+
+
+def _is_os_argument(value: Any) -> bool:
+    if not isinstance(value, str) or not value or "\0" in value:
+        return False
+    try:
+        os.fsencode(value)
+    except UnicodeEncodeError:
+        return False
+    return True
 
 
 if __name__ == "__main__":

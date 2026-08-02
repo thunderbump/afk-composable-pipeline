@@ -104,6 +104,36 @@ class CandidateBrokerCliTest(unittest.TestCase):
                 self.assertNotIn("Traceback", completed.stderr)
                 self.assertFalse(result.exists())
 
+    def test_rejects_unencodable_request_paths_and_commands(self):
+        invalid_values = (
+            (f"{self.candidate}/\ud800", ["/usr/bin/true"]),
+            (str(self.candidate), ["/usr/bin/true", "\ud800"]),
+        )
+        for index, (candidate_path, command) in enumerate(invalid_values):
+            with self.subTest(candidate_path=candidate_path, command=command):
+                request = self.temp / f"surrogate-request-{index}.json"
+                result = self.temp / f"surrogate-result-{index}.json"
+                request.write_text(
+                    json.dumps(
+                        {
+                            "schema_version": 1,
+                            "candidate_sha": self.candidate_sha,
+                            "candidate_path": candidate_path,
+                            "command": command,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+
+                completed = self.run_broker(request, result)
+
+                self.assertEqual(completed.returncode, 2)
+                self.assertEqual(
+                    completed.stderr, "candidate broker request is invalid\n"
+                )
+                self.assertNotIn("Traceback", completed.stderr)
+                self.assertFalse(result.exists())
+
     def test_rejects_a_nested_candidate_path_before_execution(self):
         nested = self.candidate / "nested"
         nested.mkdir()
