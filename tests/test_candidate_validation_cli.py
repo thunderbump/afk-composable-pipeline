@@ -222,8 +222,14 @@ class CandidateValidationCliTest(unittest.TestCase):
                 import socket
                 capability = request["candidate_broker"]
                 broker_request = {broker_request!r}
-                broker_request["command"][4] = request["evidence_dir"]
-                broker_request["command"][6] = capability["socket_path"]
+                broker_request["command"] = [
+                    request["evidence_dir"]
+                    if argument == "__EVIDENCE_DIR__"
+                    else capability["socket_path"]
+                    if argument == "__BROKER_SOCKET__"
+                    else argument
+                    for argument in broker_request["command"]
+                ]
                 broker_request["token"] = capability["token"]
                 with socket.socket(socket.AF_UNIX) as client:
                     client.connect(capability["socket_path"])
