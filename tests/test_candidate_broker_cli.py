@@ -1,6 +1,7 @@
 import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -431,6 +432,171 @@ class CandidateBrokerCliTest(unittest.TestCase):
         self.assertEqual(
             (self.candidate / "input.txt").read_text(encoding="utf-8"),
             "drifted after verification\n",
+        )
+
+    @unittest.skipUnless(shutil.which("bwrap"), "bubblewrap is unavailable")
+    def test_denies_validation_and_host_capabilities_but_keeps_declared_access(self):
+        request = self.temp / "capability-request.json"
+        result = self.temp / "capability-result.json"
+        evidence = self.temp / "evidence" / "validation.log"
+        run_store = self.temp / "run-store" / "run.json"
+        harness = self.temp / "trusted-harness.py"
+        credential = self.temp / "credentials" / "token"
+        unrelated = self.temp / "unrelated-host-file"
+        for path in (evidence, run_store, harness, credential, unrelated):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(f"host-only:{path.name}\n", encoding="utf-8")
+        docker_socket_path = self.temp / "docker.sock"
+        broker_socket_path = self.temp / "broker.sock"
+        host_paths = {
+            "validation_request": str(request),
+            "broker_result": str(result),
+            "validation_evidence": str(evidence),
+            "run_store": str(run_store),
+            "trusted_harness": str(harness),
+            "credential_file": str(credential),
+            "unrelated_host_file": str(unrelated),
+        }
+        probe = textwrap.dedent(
+            f"""
+            import json
+            import os
+            import socket
+            import sys
+            from pathlib import Path
+
+            checks = {{}}
+
+            def denied(name, operation):
+                try:
+                    operation()
+                except OSError as exc:
+                    checks[name] = {{
+                        "classification": "denied",
+                        "error": type(exc).__name__,
+                        "errno": exc.errno,
+                    }}
+                else:
+                    checks[name] = {{"classification": "exposed"}}
+
+            host_paths = {host_paths!r}
+            for name, value in host_paths.items():
+                denied(name, lambda value=value: Path(value).read_bytes())
+            denied(
+                "host_write",
+                lambda: Path(host_paths["unrelated_host_file"]).write_text(
+                    "candidate write", encoding="utf-8"
+                ),
+            )
+            denied(
+                "candidate_write",
+                lambda: Path("/candidate/candidate-write").write_text(
+                    "candidate write", encoding="utf-8"
+                ),
+            )
+
+            scratch = Path("/work/scratch")
+            scratch.write_text("scratch works", encoding="utf-8")
+            checks["candidate_read"] = {{
+                "classification": "permitted"
+                if Path("/candidate/input.txt").read_text(encoding="utf-8")
+                == "exact candidate\\n"
+                else "wrong_value"
+            }}
+            checks["scratch_write"] = {{
+                "classification": "permitted"
+                if scratch.read_text(encoding="utf-8") == "scratch works"
+                else "wrong_value"
+            }}
+
+            secret_names = (
+                "AFK_RUN_STORE",
+                "AWS_SECRET_ACCESS_KEY",
+                "DOCKER_HOST",
+                "GH_TOKEN",
+                "XDG_STATE_HOME",
+            )
+            checks["credential_environment"] = {{
+                "classification": "denied"
+                if all(name not in os.environ for name in secret_names)
+                else "exposed"
+            }}
+
+            def connect_unix(path):
+                with socket.socket(socket.AF_UNIX) as client:
+                    client.settimeout(0.2)
+                    client.connect(path)
+
+            denied("docker_socket", lambda: connect_unix({str(docker_socket_path)!r}))
+            denied("broker_socket", lambda: connect_unix({str(broker_socket_path)!r}))
+            denied(
+                "default_docker_socket",
+                lambda: connect_unix("/var/run/docker.sock"),
+            )
+            denied(
+                "host_network",
+                lambda: socket.create_connection(
+                    ("127.0.0.1", __HOST_NETWORK_PORT__), timeout=0.2
+                ).close(),
+            )
+
+            unexpected = {{
+                name: check
+                for name, check in checks.items()
+                if check["classification"]
+                not in {{"denied", "permitted"}}
+            }}
+            print(json.dumps(checks, sort_keys=True))
+            if unexpected:
+                print(
+                    "capability boundary exposed: "
+                    + json.dumps(unexpected, sort_keys=True),
+                    file=sys.stderr,
+                )
+                raise SystemExit(97)
+            """
+        )
+
+        with (
+            socket.socket(socket.AF_INET, socket.SOCK_STREAM) as host_network,
+            socket.socket(socket.AF_UNIX) as docker_socket,
+            socket.socket(socket.AF_UNIX) as broker_socket,
+        ):
+            host_network.bind(("127.0.0.1", 0))
+            host_network.listen()
+            docker_socket.bind(str(docker_socket_path))
+            docker_socket.listen()
+            broker_socket.bind(str(broker_socket_path))
+            broker_socket.listen()
+            host_network_port = host_network.getsockname()[1]
+            probe = probe.replace("__HOST_NETWORK_PORT__", str(host_network_port))
+            self.write_request(
+                request,
+                command=["/usr/bin/python3", "-c", probe],
+            )
+            completed = self.run_broker(
+                request,
+                result,
+                env={
+                    "AFK_RUN_STORE": str(self.temp / "run-store"),
+                    "AWS_SECRET_ACCESS_KEY": "host-secret",
+                    "DOCKER_HOST": f"unix://{docker_socket_path}",
+                    "GH_TOKEN": "host-secret",
+                    "XDG_STATE_HOME": str(self.temp / "state"),
+                },
+            )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        broker_result = json.loads(result.read_text(encoding="utf-8"))
+        self.assertEqual(broker_result["exit_code"], 0, broker_result["stderr"])
+        checks = json.loads(broker_result["stdout"])
+        self.assertEqual(checks["candidate_read"]["classification"], "permitted")
+        self.assertEqual(checks["scratch_write"]["classification"], "permitted")
+        denied_checks = set(checks) - {"candidate_read", "scratch_write"}
+        self.assertTrue(denied_checks)
+        self.assertEqual(
+            {checks[name]["classification"] for name in denied_checks},
+            {"denied"},
         )
 
     @unittest.skipUnless(shutil.which("bwrap"), "bubblewrap is unavailable")

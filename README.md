@@ -118,6 +118,15 @@ with that snapshot mounted read-only at `/candidate`, empty writable scratch at
 broker-owned result records the Candidate SHA, command exit status, stdout, and
 stderr; its path is not exposed inside the sandbox.
 
+The declared Candidate capability set is intentionally small: read the exact
+snapshot under `/candidate`, write scratch under `/work`, and use the mounted
+runtime under `/usr`. Public boundary tests keep validation requests and
+results, evidence, the trusted harness, the AFK Run Store, credential files and
+environment variables, Docker and broker sockets, unrelated host paths, and
+host networking outside the sandbox. Candidate commands receive ordinary OS
+denials for those surfaces, while their exit status and diagnostics remain in
+the broker-owned structured result.
+
 When `--ledger` is omitted, AFK resolves ledger output with this precedence:
 `--ledger` > `AFK_LEDGER_DIR` > `./ledgers`. Preview-only `run-next` does not
 create `./ledgers`; the directory is only created when execution actually writes
