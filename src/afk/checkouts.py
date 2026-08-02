@@ -7,6 +7,7 @@ import stat
 import subprocess
 import tempfile
 import time
+from collections.abc import Iterator
 from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.parse import unquote, urlsplit
@@ -464,14 +465,8 @@ def _parse_tree_entries(
     output: bytes,
 ) -> dict[bytes, tuple[bytes, bytes, bytes]]:
     entries = {}
-    encoded_bytes = 0
-    for record in output.rstrip(b"\0").split(b"\0") if output else []:
-        metadata, item_path = record.split(b"\t", 1)
+    for metadata, item_path in _bounded_tracked_records(output):
         mode, object_type, object_id = metadata.split()
-        _require_git_path(item_path)
-        encoded_bytes = _require_tracked_path_budget(
-            item_path, len(entries), encoded_bytes
-        )
         if item_path in entries:
             raise ValueError("duplicate tree path")
         entries[item_path] = (mode, object_type, object_id)
@@ -480,18 +475,24 @@ def _parse_tree_entries(
 
 def _parse_index_entries(output: bytes) -> dict[bytes, tuple[bytes, bytes]]:
     entries = {}
-    encoded_bytes = 0
-    for record in output.rstrip(b"\0").split(b"\0") if output else []:
-        metadata, item_path = record.split(b"\t", 1)
+    for metadata, item_path in _bounded_tracked_records(output):
         mode, object_id, stage = metadata.split()
-        _require_git_path(item_path)
-        encoded_bytes = _require_tracked_path_budget(
-            item_path, len(entries), encoded_bytes
-        )
         if stage != b"0" or item_path in entries:
             raise ValueError("unmerged index")
         entries[item_path] = (mode, object_id)
     return entries
+
+
+def _bounded_tracked_records(output: bytes) -> Iterator[tuple[bytes, bytes]]:
+    encoded_bytes = 0
+    records = output.rstrip(b"\0").split(b"\0") if output else []
+    for path_count, record in enumerate(records):
+        metadata, item_path = record.split(b"\t", 1)
+        _require_git_path(item_path)
+        encoded_bytes = _require_tracked_path_budget(
+            item_path, path_count, encoded_bytes
+        )
+        yield metadata, item_path
 
 
 def _require_git_path(item_path: bytes) -> None:
