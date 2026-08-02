@@ -46,6 +46,17 @@ class GitCommandError(RuntimeError):
         self.stderr = stderr
 
 
+class _RepositoryBudget:
+    def __init__(self, remaining: int) -> None:
+        self._remaining = remaining
+
+    def consume(self) -> bool:
+        if self._remaining <= 0:
+            return False
+        self._remaining -= 1
+        return True
+
+
 def prepare_checkout_step(context: Any) -> dict[str, Any]:
     return prepare_checkout(
         context.input_data,
@@ -330,16 +341,15 @@ def is_exact_clean_commit(path: Path, expected_commit: str) -> bool:
     return _is_exact_clean_commit(
         path,
         expected_commit,
-        [EXACT_CANDIDATE_REPOSITORY_LIMIT],
+        _RepositoryBudget(EXACT_CANDIDATE_REPOSITORY_LIMIT),
     )
 
 
 def _is_exact_clean_commit(
-    path: Path, expected_commit: str, repositories_remaining: list[int]
+    path: Path, expected_commit: str, repository_budget: _RepositoryBudget
 ) -> bool:
-    if repositories_remaining[0] <= 0:
+    if not repository_budget.consume():
         return False
-    repositories_remaining[0] -= 1
     try:
         with _pinned_repository(path) as repository:
             head = _run_repository_git(repository, ["rev-parse", "HEAD"])
@@ -347,7 +357,7 @@ def _is_exact_clean_commit(
                 head.returncode == 0
                 and head.stdout.strip() == expected_commit
                 and _worktree_matches_commit(
-                    repository, expected_commit, repositories_remaining
+                    repository, expected_commit, repository_budget
                 )
             )
     except (OSError, UnicodeError, ValueError):
@@ -357,7 +367,7 @@ def _is_exact_clean_commit(
 def _worktree_matches_commit(
     repository: tuple[Path, Path],
     commit: str,
-    repositories_remaining: list[int],
+    repository_budget: _RepositoryBudget,
 ) -> bool:
     path, _git_directory = repository
     tree = _run_repository_git(
@@ -446,7 +456,7 @@ def _worktree_matches_commit(
                         if not _is_exact_clean_commit(
                             Path(f"/proc/self/fd/{target_descriptor}"),
                             object_id.decode("ascii"),
-                            repositories_remaining,
+                            repository_budget,
                         ):
                             return False
                     finally:
