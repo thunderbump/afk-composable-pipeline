@@ -23,6 +23,8 @@ EXACT_CANDIDATE_UNTRACKED_BYTES_LIMIT = 1024 * 1024
 EXACT_CANDIDATE_TRACKED_PATH_LIMIT = 4096
 EXACT_CANDIDATE_TRACKED_BYTES_LIMIT = 1024 * 1024
 EXACT_CANDIDATE_TRACKED_DEPTH_LIMIT = 64
+EXACT_CANDIDATE_IGNORE_FILE_LIMIT = 256
+EXACT_CANDIDATE_IGNORE_BYTES_LIMIT = 1024 * 1024
 
 
 class GitCommandError(RuntimeError):
@@ -554,16 +556,23 @@ def _materialize_committed_ignores(
     blob_sizes: dict[bytes, int],
     evaluation: Path,
 ) -> bool:
+    ignore_entries = [
+        (item_path, object_id)
+        for item_path, (mode, object_type, object_id) in entries.items()
+        if PurePosixPath(os.fsdecode(item_path)).name == ".gitignore"
+        and (mode, object_type)
+        in {(b"100644", b"blob"), (b"100755", b"blob")}
+    ]
+    if (
+        len(ignore_entries) > EXACT_CANDIDATE_IGNORE_FILE_LIMIT
+        or sum(blob_sizes[object_id] for _item_path, object_id in ignore_entries)
+        > EXACT_CANDIDATE_IGNORE_BYTES_LIMIT
+    ):
+        return False
     initialized = run_trusted_read_git(["init", "--quiet"], cwd=evaluation)
     if initialized.returncode != 0:
         return False
-    for item_path, (mode, object_type, object_id) in entries.items():
-        if (
-            PurePosixPath(os.fsdecode(item_path)).name != ".gitignore"
-            or (mode, object_type)
-            not in {(b"100644", b"blob"), (b"100755", b"blob")}
-        ):
-            continue
+    for item_path, object_id in ignore_entries:
         target = evaluation.joinpath(*PurePosixPath(os.fsdecode(item_path)).parts)
         target.parent.mkdir(parents=True, exist_ok=True)
         with target.open("wb") as output:

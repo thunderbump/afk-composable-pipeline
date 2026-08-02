@@ -448,6 +448,56 @@ class CandidateBrokerCliTest(unittest.TestCase):
 
         self.assertTrue(is_exact_clean_commit(self.candidate, self.candidate_sha))
 
+    def test_exact_candidate_bounds_committed_ignore_materialization(self):
+        from afk import checkouts
+
+        (self.candidate / ".gitignore").write_text("ignored.log\n", encoding="utf-8")
+        self.git("add", ".gitignore")
+        self.git("commit", "-m", "add ignore policy")
+        self.candidate_sha = self.git("rev-parse", "HEAD")
+        real_run_trusted_read_git = checkouts.run_trusted_read_git
+        blob_reads = []
+
+        def record_blob_read(args, **kwargs):
+            if args[:2] == ["cat-file", "blob"]:
+                blob_reads.append(args)
+            return real_run_trusted_read_git(args, **kwargs)
+
+        with mock.patch(
+            "afk.checkouts.run_trusted_read_git",
+            side_effect=record_blob_read,
+        ):
+            for file_limit, byte_limit in ((0, 1024), (1, 4)):
+                with mock.patch.multiple(
+                    checkouts,
+                    EXACT_CANDIDATE_IGNORE_FILE_LIMIT=file_limit,
+                    EXACT_CANDIDATE_IGNORE_BYTES_LIMIT=byte_limit,
+                ):
+                    self.assertFalse(
+                        checkouts.is_exact_clean_commit(
+                            self.candidate, self.candidate_sha
+                        )
+                    )
+
+        self.assertEqual(blob_reads, [])
+
+    def test_exact_candidate_preserves_nested_committed_ignore_negation(self):
+        from afk.checkouts import is_exact_clean_commit
+
+        generated = self.candidate / "generated"
+        generated.mkdir()
+        (self.candidate / ".gitignore").write_text(
+            "generated/*.log\n", encoding="utf-8"
+        )
+        (generated / ".gitignore").write_text("!keep.log\n", encoding="utf-8")
+        self.git("add", ".gitignore", "generated/.gitignore")
+        self.git("commit", "-m", "add nested ignore negation")
+        self.candidate_sha = self.git("rev-parse", "HEAD")
+        (generated / "drop.log").write_bytes(b"")
+        (generated / "keep.log").write_bytes(b"")
+
+        self.assertFalse(is_exact_clean_commit(self.candidate, self.candidate_sha))
+
     def test_exact_candidate_rejects_ignored_symlink_replacing_tracked_directory(self):
         from afk.checkouts import is_exact_clean_commit
 
