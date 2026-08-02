@@ -316,6 +316,38 @@ class CandidateBrokerCliTest(unittest.TestCase):
         ):
             self.assertTrue(is_exact_clean_commit(self.candidate, self.candidate_sha))
 
+    def test_exact_candidate_fails_closed_when_regular_file_becomes_fifo_at_open(self):
+        from afk.checkouts import is_exact_clean_commit
+
+        target = self.candidate / "input.txt"
+        real_open = os.open
+        real_fstat = os.fstat
+        opened_descriptors = []
+        inspected_descriptors = []
+        required_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+
+        def replace_with_fifo(path, flags):
+            if Path(path) == target:
+                self.assertEqual(flags & required_flags, required_flags)
+                target.unlink()
+                os.mkfifo(target)
+                descriptor = real_open(path, flags)
+                opened_descriptors.append(descriptor)
+                return descriptor
+            return real_open(path, flags)
+
+        def record_fstat(descriptor):
+            inspected_descriptors.append(descriptor)
+            return real_fstat(descriptor)
+
+        with (
+            mock.patch("afk.checkouts.os.open", side_effect=replace_with_fifo),
+            mock.patch("afk.checkouts.os.fstat", side_effect=record_fstat),
+        ):
+            self.assertFalse(is_exact_clean_commit(self.candidate, self.candidate_sha))
+
+        self.assertEqual(inspected_descriptors, opened_descriptors)
+
     def test_exact_candidate_rejects_executable_without_owner_execute(self):
         from afk.checkouts import is_exact_clean_commit
 

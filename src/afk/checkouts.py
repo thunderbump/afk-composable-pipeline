@@ -355,23 +355,20 @@ def _worktree_matches_commit(path: Path, commit: str) -> bool:
             return False
         for item_path, (mode, object_type, object_id) in entries.items():
             target = path.joinpath(*PurePosixPath(os.fsdecode(item_path)).parts)
-            target_stat = target.lstat()
             if (mode, object_type) in {
                 (b"100644", b"blob"),
                 (b"100755", b"blob"),
             }:
-                if not stat.S_ISREG(target_stat.st_mode):
-                    return False
-                if bool(target_stat.st_mode & stat.S_IXUSR) != (mode == b"100755"):
-                    return False
-                if _git_file_blob_id(target) != object_id:
+                if not _git_regular_file_matches(target, mode, object_id):
                     return False
             elif (mode, object_type) == (b"120000", b"blob"):
+                target_stat = target.lstat()
                 if not stat.S_ISLNK(target_stat.st_mode):
                     return False
                 if _git_blob_id(os.fsencode(os.readlink(target))) != object_id:
                     return False
             elif (mode, object_type) == (b"160000", b"commit"):
+                target_stat = target.lstat()
                 if not stat.S_ISDIR(target_stat.st_mode) or not is_exact_clean_commit(
                     target, object_id.decode("ascii")
                 ):
@@ -432,14 +429,19 @@ def _git_blob_id(content: bytes) -> bytes:
     )
 
 
-def _git_file_blob_id(path: Path) -> bytes:
-    with path.open("rb") as source:
-        size = os.fstat(source.fileno()).st_size
+def _git_regular_file_matches(path: Path, mode: bytes, object_id: bytes) -> bool:
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+    with os.fdopen(os.open(path, flags), "rb") as source:
+        target_stat = os.fstat(source.fileno())
+        if not stat.S_ISREG(target_stat.st_mode):
+            return False
+        if bool(target_stat.st_mode & stat.S_IXUSR) != (mode == b"100755"):
+            return False
         digest = hashlib.sha1(usedforsecurity=False)
-        digest.update(f"blob {size}\0".encode("ascii"))
+        digest.update(f"blob {target_stat.st_size}\0".encode("ascii"))
         while chunk := source.read(1024 * 1024):
             digest.update(chunk)
-    return digest.hexdigest().encode("ascii")
+    return digest.hexdigest().encode("ascii") == object_id
 
 
 def run_trusted_read_git(
