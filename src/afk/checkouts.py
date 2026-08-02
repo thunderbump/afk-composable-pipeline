@@ -353,13 +353,22 @@ def _worktree_matches_commit(path: Path, commit: str) -> bool:
             for item_path, (mode, _object_type, object_id) in entries.items()
         }:
             return False
+        regular_blob_ids = {
+            object_id
+            for mode, object_type, object_id in entries.values()
+            if (mode, object_type)
+            in {(b"100644", b"blob"), (b"100755", b"blob")}
+        }
+        blob_sizes = _git_blob_sizes(path, regular_blob_ids)
         for item_path, (mode, object_type, object_id) in entries.items():
             target = path.joinpath(*PurePosixPath(os.fsdecode(item_path)).parts)
             if (mode, object_type) in {
                 (b"100644", b"blob"),
                 (b"100755", b"blob"),
             }:
-                if not _git_regular_file_matches(target, mode, object_id):
+                if not _git_regular_file_matches(
+                    target, mode, object_id, blob_sizes[object_id]
+                ):
                     return False
             elif (mode, object_type) == (b"120000", b"blob"):
                 target_stat = target.lstat()
@@ -429,23 +438,66 @@ def _git_blob_id(content: bytes) -> bytes:
     )
 
 
-def _git_regular_file_matches(path: Path, mode: bytes, object_id: bytes) -> bool:
+def _git_blob_sizes(path: Path, object_ids: set[bytes]) -> dict[bytes, int]:
+    if not object_ids:
+        return {}
+    result = run_trusted_read_git(
+        ["cat-file", "--batch-check=%(objectname) %(objecttype) %(objectsize)"],
+        cwd=path,
+        text=False,
+        input_data=b"\n".join(sorted(object_ids)) + b"\n",
+    )
+    if result.returncode != 0:
+        raise ValueError("blob sizes unavailable")
+    sizes = {}
+    for record in result.stdout.splitlines():
+        object_id, object_type, size = record.split()
+        if object_id not in object_ids or object_type != b"blob" or object_id in sizes:
+            raise ValueError("invalid blob size response")
+        sizes[object_id] = int(size)
+    if sizes.keys() != object_ids:
+        raise ValueError("incomplete blob size response")
+    return sizes
+
+
+def _git_regular_file_matches(
+    path: Path, mode: bytes, object_id: bytes, expected_size: int
+) -> bool:
     flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
-    with os.fdopen(os.open(path, flags), "rb") as source:
-        target_stat = os.fstat(source.fileno())
+    descriptor = os.open(path, flags)
+    try:
+        target_stat = os.fstat(descriptor)
         if not stat.S_ISREG(target_stat.st_mode):
+            return False
+        if target_stat.st_size != expected_size:
             return False
         if bool(target_stat.st_mode & stat.S_IXUSR) != (mode == b"100755"):
             return False
         digest = hashlib.sha1(usedforsecurity=False)
-        digest.update(f"blob {target_stat.st_size}\0".encode("ascii"))
-        while chunk := source.read(1024 * 1024):
-            digest.update(chunk)
+        digest.update(f"blob {expected_size}\0".encode("ascii"))
+        with os.fdopen(descriptor, "rb", buffering=0, closefd=False) as source:
+            remaining = expected_size
+            while remaining:
+                chunk = source.read(min(1024 * 1024, remaining))
+                if not chunk:
+                    return False
+                digest.update(chunk)
+                remaining -= len(chunk)
+            if source.read(1):
+                return False
+        if os.fstat(descriptor).st_size != expected_size:
+            return False
+    finally:
+        os.close(descriptor)
     return digest.hexdigest().encode("ascii") == object_id
 
 
 def run_trusted_read_git(
-    args: list[str], *, cwd: Path, text: bool = True
+    args: list[str],
+    *,
+    cwd: Path,
+    text: bool = True,
+    input_data: str | bytes | None = None,
 ) -> subprocess.CompletedProcess[Any]:
     environment = {
         name: value for name, value in os.environ.items() if not name.startswith("GIT_")
@@ -471,6 +523,7 @@ def run_trusted_read_git(
             cwd=cwd,
             env=environment,
             text=text,
+            input=input_data,
             capture_output=True,
             check=False,
             timeout=120,

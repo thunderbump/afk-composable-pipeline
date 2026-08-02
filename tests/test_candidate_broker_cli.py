@@ -348,6 +348,17 @@ class CandidateBrokerCliTest(unittest.TestCase):
 
         self.assertEqual(inspected_descriptors, opened_descriptors)
 
+    def test_exact_candidate_rejects_oversized_sparse_file_before_reading(self):
+        from afk.checkouts import is_exact_clean_commit
+
+        os.truncate(self.candidate / "input.txt", 1024**4)
+
+        with mock.patch(
+            "afk.checkouts.os.fdopen",
+            side_effect=AssertionError("oversized file payload must not be read"),
+        ):
+            self.assertFalse(is_exact_clean_commit(self.candidate, self.candidate_sha))
+
     def test_exact_candidate_rejects_executable_without_owner_execute(self):
         from afk.checkouts import is_exact_clean_commit
 
@@ -485,7 +496,9 @@ class CandidateBrokerCliTest(unittest.TestCase):
         )
 
         self.assertEqual(completed.returncode, 2)
-        self.assertEqual(completed.stderr, "exact Candidate snapshot is unavailable\n")
+        self.assertEqual(
+            completed.stderr, "Candidate does not match its exact clean commit\n"
+        )
         self.assertFalse(result.exists())
         self.assertFalse(marker.exists())
 
