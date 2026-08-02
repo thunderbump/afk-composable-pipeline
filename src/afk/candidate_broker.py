@@ -80,6 +80,16 @@ def run_candidate(request: dict[str, Any]) -> dict[str, Any]:
                 "adapter_unavailable",
                 "Container execution adapter is unavailable",
             )
+        container_image, inspect_stderr = _inspect_container_image(
+            container_runtime, execution["image"]
+        )
+        if container_image is None:
+            return _failed_execution_result(
+                request["candidate_sha"],
+                "launch_failure",
+                "Candidate command could not be launched",
+                stderr=inspect_stderr,
+            )
     bwrap = shutil.which("bwrap") if execution is None else None
     if execution is None and bwrap is None:
         raise CandidateBrokerError("bubblewrap is unavailable")
@@ -99,7 +109,7 @@ def run_candidate(request: dict[str, Any]) -> dict[str, Any]:
                 container_name,
                 container_id_path,
                 snapshot,
-                execution["image"],
+                container_image,
                 request["command"],
             )
         interrupted_cleanup = container_name is not None
@@ -205,6 +215,39 @@ def _find_container_runtime() -> str | None:
     return None
 
 
+def _inspect_container_image(runtime: str, image: str) -> tuple[str | None, str]:
+    try:
+        completed = run_supervised_command(
+            [runtime, "image", "inspect", image],
+            cwd=Path.cwd(),
+            environment=os.environ.copy(),
+            timeout_seconds=CONTAINER_RUNTIME_PROBE_SECONDS,
+            output_byte_limit=CANDIDATE_OUTPUT_BYTE_LIMIT,
+            cleanup_seconds=CANDIDATE_CLEANUP_SECONDS,
+            input_text=None,
+            label="Candidate container image inspection",
+            decode_errors="replace",
+        )
+    except (OSError, SupervisedCommandError):
+        return None, ""
+    if completed.returncode != 0:
+        return None, completed.stderr
+    try:
+        metadata = json.loads(completed.stdout)
+    except json.JSONDecodeError:
+        return None, ""
+    if not isinstance(metadata, list) or len(metadata) != 1:
+        return None, ""
+    record = metadata[0]
+    if not isinstance(record, dict) or not isinstance(record.get("Config"), dict):
+        return None, ""
+    image_id = record.get("Id")
+    volumes = record["Config"].get("Volumes")
+    if not _is_container_image(image_id) or volumes is not None and volumes != {}:
+        return None, ""
+    return image_id, ""
+
+
 def _bubblewrap_command(
     bwrap: str, snapshot: Path, candidate_command: list[str]
 ) -> list[str]:
@@ -295,7 +338,7 @@ def _container_command(
 def _remove_container(runtime: str, name: str) -> None:
     try:
         completed = run_supervised_command(
-            [runtime, "rm", "--force", name],
+            [runtime, "rm", "--force", "--volumes", name],
             cwd=Path.cwd(),
             environment=os.environ.copy(),
             timeout_seconds=10,

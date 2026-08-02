@@ -175,6 +175,9 @@ runtime supervision is unavailable, the broker returns a Candidate-bound
 `adapter_unavailable` result; the Bubblewrap path is unchanged.
 Container runs use `--pull=never`, so the requested image must already exist
 in the selected local runtime and execution never triggers an implicit pull.
+Before execution, AFK inspects the local image through the trusted runtime,
+rejects malformed metadata or any image-declared volumes, and runs the resolved
+immutable image ID instead of the mutable requested tag.
 
 Container execution mounts only the materialized exact-commit snapshot,
 read-only at `/candidate`. `/work` and `/tmp` are private tmpfs mounts. The
@@ -185,7 +188,7 @@ evidence directory are not mounted into the container. AFK supervises the
 trusted runtime client and forcibly removes every created, randomly named
 container after completion, timeout, or another interruption; failed forced
 cleanup fails the broker closed instead of publishing a successful or ordinary
-failure result.
+failure result. Cleanup also removes anonymous volumes as defense in depth.
 
 The broker materializes exact tree and blob objects from the Candidate commit
 without `.git` administrative metadata or archive-attribute rewrites. Gitlinks

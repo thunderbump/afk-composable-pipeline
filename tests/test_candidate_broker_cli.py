@@ -598,6 +598,9 @@ class CandidateBrokerCliTest(unittest.TestCase):
                 arguments = sys.argv[1:]
                 if arguments[0] == "info":
                     raise SystemExit(0)
+                if arguments[:2] == ["image", "inspect"]:
+                    print('[{{"Id":"sha256:fixture-image","Config":{{"Volumes":null}}}}]')
+                    raise SystemExit(0)
                 if arguments[0] == "rm":
                     raise SystemExit(0)
                 cidfile = Path(arguments[arguments.index("--cidfile") + 1])
@@ -656,6 +659,138 @@ class CandidateBrokerCliTest(unittest.TestCase):
         )
         self.assertEqual(broker_result["stderr"], "")
 
+    def test_container_execution_uses_inspected_immutable_image_and_cleans_volumes(
+        self,
+    ):
+        for runtime_name in ("docker", "podman"):
+            with self.subTest(runtime=runtime_name):
+                request = self.temp / f"{runtime_name}-inspect-request.json"
+                result = self.temp / f"{runtime_name}-inspect-result.json"
+                run_arguments = self.temp / f"{runtime_name}-run-arguments.json"
+                cleanup_arguments = self.temp / f"{runtime_name}-cleanup-arguments.json"
+                fake_bin = self.temp / f"{runtime_name}-inspect-bin"
+                fake_bin.mkdir()
+                (fake_bin / "git").symlink_to(shutil.which("git"))
+                (fake_bin / "bwrap").symlink_to(shutil.which("bwrap"))
+                image_id = f"sha256:{runtime_name}-immutable-image"
+                fake_runtime = fake_bin / runtime_name
+                fake_runtime.write_text(
+                    textwrap.dedent(
+                        f"""
+                        #!{sys.executable}
+                        import json
+                        import sys
+                        from pathlib import Path
+
+                        arguments = sys.argv[1:]
+                        if arguments[0] == "info":
+                            raise SystemExit(0)
+                        if arguments[:2] == ["image", "inspect"]:
+                            print(json.dumps([{{
+                                "Id": {image_id!r},
+                                "Config": {{"Volumes": None}},
+                            }}]))
+                            raise SystemExit(0)
+                        if arguments[0] == "rm":
+                            Path({str(cleanup_arguments)!r}).write_text(
+                                json.dumps(arguments), encoding="utf-8"
+                            )
+                            raise SystemExit(0)
+                        Path({str(run_arguments)!r}).write_text(
+                            json.dumps(arguments), encoding="utf-8"
+                        )
+                        cidfile = Path(arguments[arguments.index("--cidfile") + 1])
+                        cidfile.write_text("created-container-id\\n", encoding="utf-8")
+                        """
+                    ).lstrip(),
+                    encoding="utf-8",
+                )
+                fake_runtime.chmod(0o755)
+                self.write_request(
+                    request,
+                    command=["/bin/true"],
+                    execution={"type": "container", "image": "fixture:mutable"},
+                )
+
+                completed = self.run_broker(
+                    request,
+                    result,
+                    env={"PATH": str(fake_bin)},
+                )
+
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                self.assertEqual(
+                    json.loads(result.read_text(encoding="utf-8"))["status"],
+                    "completed",
+                )
+                run = json.loads(run_arguments.read_text(encoding="utf-8"))
+                self.assertIn(image_id, run)
+                self.assertNotIn("fixture:mutable", run)
+                self.assertIn("--pull=never", run)
+                cleanup = json.loads(cleanup_arguments.read_text(encoding="utf-8"))
+                self.assertIn("--force", cleanup)
+                self.assertIn("--volumes", cleanup)
+
+    def test_container_execution_rejects_unsafe_or_missing_image_metadata(self):
+        metadata_cases = {
+            "missing": None,
+            "malformed": "not-json",
+            "volumes": json.dumps(
+                [{"Id": "sha256:volume-image", "Config": {"Volumes": {"/data": {}}}}]
+            ),
+        }
+        for runtime_name in ("docker", "podman"):
+            for case_name, metadata in metadata_cases.items():
+                with self.subTest(runtime=runtime_name, metadata=case_name):
+                    request = self.temp / f"{runtime_name}-{case_name}-request.json"
+                    result = self.temp / f"{runtime_name}-{case_name}-result.json"
+                    run_marker = self.temp / f"{runtime_name}-{case_name}-ran"
+                    fake_bin = self.temp / f"{runtime_name}-{case_name}-bin"
+                    fake_bin.mkdir()
+                    (fake_bin / "git").symlink_to(shutil.which("git"))
+                    (fake_bin / "bwrap").symlink_to(shutil.which("bwrap"))
+                    fake_runtime = fake_bin / runtime_name
+                    fake_runtime.write_text(
+                        textwrap.dedent(
+                            f"""
+                            #!{sys.executable}
+                            import sys
+                            from pathlib import Path
+
+                            arguments = sys.argv[1:]
+                            if arguments[0] == "info":
+                                raise SystemExit(0)
+                            if arguments[:2] == ["image", "inspect"]:
+                                metadata = {metadata!r}
+                                if metadata is None:
+                                    raise SystemExit(1)
+                                print(metadata)
+                                raise SystemExit(0)
+                            Path({str(run_marker)!r}).touch()
+                            """
+                        ).lstrip(),
+                        encoding="utf-8",
+                    )
+                    fake_runtime.chmod(0o755)
+                    self.write_request(
+                        request,
+                        command=["/bin/true"],
+                        execution={"type": "container", "image": "fixture:unsafe"},
+                    )
+
+                    completed = self.run_broker(
+                        request,
+                        result,
+                        env={"PATH": str(fake_bin)},
+                    )
+
+                    self.assertEqual(completed.returncode, 0, completed.stderr)
+                    broker_result = json.loads(result.read_text(encoding="utf-8"))
+                    self.assertEqual(
+                        broker_result["failure_classification"], "launch_failure"
+                    )
+                    self.assertFalse(run_marker.exists())
+
     def test_container_execution_never_pulls_the_requested_image(self):
         for runtime_name in ("docker", "podman"):
             with self.subTest(runtime=runtime_name):
@@ -675,6 +810,9 @@ class CandidateBrokerCliTest(unittest.TestCase):
 
                         arguments = sys.argv[1:]
                         if arguments[0] in {{"info", "rm"}}:
+                            raise SystemExit(0)
+                        if arguments[:2] == ["image", "inspect"]:
+                            print('[{{"Id":"sha256:fixture-image","Config":{{"Volumes":null}}}}]')
                             raise SystemExit(0)
                         cidfile = Path(arguments[arguments.index("--cidfile") + 1])
                         cidfile.write_text(
@@ -725,6 +863,9 @@ class CandidateBrokerCliTest(unittest.TestCase):
 
                 arguments = sys.argv[1:]
                 if arguments[0] == "info":
+                    raise SystemExit(0)
+                if arguments[:2] == ["image", "inspect"]:
+                    print('[{{"Id":"sha256:fixture-image","Config":{{"Volumes":null}}}}]')
                     raise SystemExit(0)
                 if arguments[0] == "rm":
                     Path({str(cleanup)!r}).touch()
@@ -783,6 +924,9 @@ class CandidateBrokerCliTest(unittest.TestCase):
                 arguments = sys.argv[1:]
                 if arguments[0] == "info":
                     raise SystemExit(0)
+                if arguments[:2] == ["image", "inspect"]:
+                    print('[{{"Id":"sha256:fixture-image","Config":{{"Volumes":null}}}}]')
+                    raise SystemExit(0)
                 if arguments[0] == "rm":
                     raise SystemExit(0)
                 cidfile = Path(arguments[arguments.index("--cidfile") + 1])
@@ -834,6 +978,9 @@ class CandidateBrokerCliTest(unittest.TestCase):
 
                             arguments = sys.argv[1:]
                             if arguments[0] == "info":
+                                raise SystemExit(0)
+                            if arguments[:2] == ["image", "inspect"]:
+                                print('[{{"Id":"sha256:fixture-image","Config":{{"Volumes":null}}}}]')
                                 raise SystemExit(0)
                             if arguments[0] == "rm":
                                 Path({str(cleanup)!r}).write_text(
@@ -897,13 +1044,16 @@ class CandidateBrokerCliTest(unittest.TestCase):
                 arguments = sys.argv[1:]
                 if arguments[0] == "info":
                     raise SystemExit(0)
+                if arguments[:2] == ["image", "inspect"]:
+                    print('[{{"Id":"sha256:fixture-image","Config":{{"Volumes":null}}}}]')
+                    raise SystemExit(0)
                 if arguments[0] == "rm":
                     raise SystemExit(0)
                 if "--entrypoint" not in arguments:
                     print("image entrypoint ran instead")
                     raise SystemExit(0)
                 entrypoint = arguments[arguments.index("--entrypoint") + 1]
-                image = arguments.index("fixture:entrypoint")
+                image = arguments.index("sha256:fixture-image")
                 if entrypoint != "/bin/false" or arguments[image + 1:] != ["arg"]:
                     raise SystemExit(2)
                 cidfile = Path(arguments[arguments.index("--cidfile") + 1])
@@ -958,6 +1108,9 @@ class CandidateBrokerCliTest(unittest.TestCase):
 
                 arguments = sys.argv[1:]
                 if arguments[0] in {{"info", "rm"}}:
+                    raise SystemExit(0)
+                if arguments[:2] == ["image", "inspect"]:
+                    print('[{{"Id":"sha256:fixture-image","Config":{{"Volumes":null}}}}]')
                     raise SystemExit(0)
                 cidfile = Path(arguments[arguments.index("--cidfile") + 1])
                 cidfile.write_text("created-container-id\\n", encoding="utf-8")
@@ -1083,6 +1236,9 @@ class CandidateBrokerCliTest(unittest.TestCase):
 
                 if sys.argv[1] == "info":
                     raise SystemExit(0)
+                if sys.argv[1:3] == ["image", "inspect"]:
+                    print('[{{"Id":"sha256:fixture-image","Config":{{"Volumes":null}}}}]')
+                    raise SystemExit(0)
                 if sys.argv[1] == "rm":
                     raise SystemExit(7)
                 print("container started", flush=True)
@@ -1127,6 +1283,9 @@ class CandidateBrokerCliTest(unittest.TestCase):
                 from pathlib import Path
 
                 if sys.argv[1] == "info":
+                    raise SystemExit(0)
+                if sys.argv[1:3] == ["image", "inspect"]:
+                    print('[{{"Id":"sha256:fixture-image","Config":{{"Volumes":null}}}}]')
                     raise SystemExit(0)
                 if sys.argv[1] == "rm":
                     Path({str(cleanup_marker)!r}).write_text(
