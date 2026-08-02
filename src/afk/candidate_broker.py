@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import shutil
 import subprocess
 import sys
+import tarfile
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -40,49 +43,52 @@ def run_candidate(request: dict[str, Any]) -> dict[str, Any]:
     bwrap = shutil.which("bwrap")
     if bwrap is None:
         raise CandidateBrokerError("bubblewrap is unavailable")
-    completed = subprocess.run(
-        [
-            bwrap,
-            "--ro-bind",
-            "/usr",
-            "/usr",
-            "--symlink",
-            "usr/bin",
-            "/bin",
-            "--symlink",
-            "usr/lib",
-            "/lib",
-            "--symlink",
-            "usr/lib64",
-            "/lib64",
-            "--proc",
-            "/proc",
-            "--dev",
-            "/dev",
-            "--tmpfs",
-            "/tmp",
-            "--tmpfs",
-            "/work",
-            "--ro-bind",
-            str(candidate),
-            "/candidate",
-            "--unshare-all",
-            "--die-with-parent",
-            "--new-session",
-            "--clearenv",
-            "--setenv",
-            "PATH",
-            "/usr/bin:/bin",
-            "--setenv",
-            "HOME",
-            "/work",
-            "--chdir",
-            "/work",
-            *request["command"],
-        ],
-        capture_output=True,
-        check=False,
-    )
+    with tempfile.TemporaryDirectory(prefix="afk-candidate-") as temporary:
+        snapshot = Path(temporary) / "snapshot"
+        _materialize_candidate_snapshot(candidate, request["candidate_sha"], snapshot)
+        completed = subprocess.run(
+            [
+                bwrap,
+                "--ro-bind",
+                "/usr",
+                "/usr",
+                "--symlink",
+                "usr/bin",
+                "/bin",
+                "--symlink",
+                "usr/lib",
+                "/lib",
+                "--symlink",
+                "usr/lib64",
+                "/lib64",
+                "--proc",
+                "/proc",
+                "--dev",
+                "/dev",
+                "--tmpfs",
+                "/tmp",
+                "--tmpfs",
+                "/work",
+                "--ro-bind",
+                str(snapshot),
+                "/candidate",
+                "--unshare-all",
+                "--die-with-parent",
+                "--new-session",
+                "--clearenv",
+                "--setenv",
+                "PATH",
+                "/usr/bin:/bin",
+                "--setenv",
+                "HOME",
+                "/work",
+                "--chdir",
+                "/work",
+                *request["command"],
+            ],
+            capture_output=True,
+            check=False,
+        )
     return {
         "schema_version": SCHEMA_VERSION,
         "candidate_sha": request["candidate_sha"],
@@ -115,6 +121,25 @@ def _read_request(path: Path) -> dict[str, Any]:
 def _require_exact_candidate(candidate: Path, candidate_sha: str) -> None:
     if not is_exact_clean_commit(candidate, candidate_sha):
         raise CandidateBrokerError("Candidate does not match its exact clean commit")
+
+
+def _materialize_candidate_snapshot(
+    candidate: Path, candidate_sha: str, destination: Path
+) -> None:
+    archive = subprocess.run(
+        ["git", "archive", "--format=tar", candidate_sha],
+        cwd=candidate,
+        capture_output=True,
+        check=False,
+    )
+    if archive.returncode != 0:
+        raise CandidateBrokerError("exact Candidate snapshot is unavailable")
+    destination.mkdir(mode=0o700)
+    try:
+        with tarfile.open(fileobj=io.BytesIO(archive.stdout), mode="r:") as stream:
+            stream.extractall(destination, filter="data")
+    except (OSError, tarfile.TarError, ValueError) as exc:
+        raise CandidateBrokerError("exact Candidate snapshot is invalid") from exc
 
 
 def _is_sha(value: Any) -> bool:

@@ -110,10 +110,12 @@ PYTHONPATH=src python3 -m afk.candidate_broker \
 
 The version-1 request contains only `schema_version`, the exact clean
 `candidate_sha`, an absolute `candidate_path`, and a non-empty `command` argv.
-The command runs with the Candidate mounted read-only at `/candidate`, empty
-writable scratch at `/work`, a cleared environment, and no inherited network
-namespace. The broker-owned result records the Candidate SHA, command exit
-status, stdout, and stderr; its path is not exposed inside the sandbox.
+The broker materializes the exact Candidate commit from Git without `.git`
+administrative metadata. The command runs with that snapshot mounted read-only
+at `/candidate`, empty writable scratch at `/work`, a cleared environment, and
+no inherited network namespace. The broker-owned result records the Candidate
+SHA, command exit status, stdout, and stderr; its path is not exposed inside the
+sandbox.
 
 When `--ledger` is omitted, AFK resolves ledger output with this precedence:
 `--ledger` > `AFK_LEDGER_DIR` > `./ledgers`. Preview-only `run-next` does not
