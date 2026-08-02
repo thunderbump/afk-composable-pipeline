@@ -168,14 +168,16 @@ may instead request the target-neutral container adapter with exactly:
 ```
 
 The adapter probes Docker first and Podman second with a bounded trusted
-runtime `info` command. These fixed Docker/Podman client commands use the same
-per-call supervision helper, bounded protocol, descendant tracking, timeout,
-output limits, and fail-closed cleanup as other commands, but omit the outer
-Bubblewrap PID wrapper so rootless Podman can create its own namespaces. This
-narrow trusted-host mode applies only to runtime `info`, image inspection,
-container execution, and forced removal. The Candidate remains confined by
-the hardened container, and default Bubblewrap Candidate execution and all
-ordinary supervision paths are unchanged. The adapter does not accept
+runtime `info` command. These fixed Docker/Podman client commands use a
+per-call guardian and worker with the same bounded protocol, descendant
+tracking, timeout, output limits, and fail-closed cleanup as other commands,
+but omit the outer Bubblewrap PID wrapper so rootless Podman can create its own
+namespaces. The guardian retains descendant ownership if its worker is killed;
+the worker's parent-death cleanup covers abrupt guardian loss. This narrow
+trusted-host mode applies only to runtime `info`, image inspection, container
+execution, and forced removal. The Candidate remains confined by the hardened
+container, and default Bubblewrap Candidate execution and all ordinary
+supervision paths are unchanged. The adapter does not accept
 Compose files, service names, target profiles, volumes, environment variables,
 runtime flags, or repository-specific deployment semantics. An option-looking
 image name is invalid. If neither runtime is usable, including when trusted

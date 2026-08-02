@@ -27,6 +27,7 @@ _PR_SET_CHILD_SUBREAPER = 36
 _PR_GET_CHILD_SUBREAPER = 37
 _SUPERVISOR_LOCK = threading.Lock()
 _HELPER_PATH = Path(__file__).with_name("process_supervision_helper.py")
+_GUARDIAN_PATH = Path(__file__).with_name("process_supervision_guardian.py")
 _PROTOCOL_BYTE_LIMIT = 256 * 1024 * 1024
 
 
@@ -95,7 +96,7 @@ def run_supervised_command(
                 str(os.getpid()),
             ]
             if _trusted_host_command:
-                pass
+                helper_command[2] = str(_GUARDIAN_PATH)
             elif _precontained_command:
                 if not _is_precontained_bwrap_command(command):
                     raise SupervisedCommandError(
