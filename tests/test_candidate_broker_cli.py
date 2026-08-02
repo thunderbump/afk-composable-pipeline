@@ -499,6 +499,87 @@ class CandidateBrokerCliTest(unittest.TestCase):
             },
         )
 
+    def test_container_execution_classifies_an_unusable_runtime_as_unavailable(self):
+        request = self.temp / "container-unusable-request.json"
+        result = self.temp / "container-unusable-result.json"
+        fake_bin = self.temp / "container-unusable-bin"
+        fake_bin.mkdir()
+        (fake_bin / "git").symlink_to(shutil.which("git"))
+        (fake_bin / "bwrap").symlink_to(shutil.which("bwrap"))
+        fake_docker = fake_bin / "docker"
+        fake_docker.write_text(
+            f"#!{sys.executable}\nraise SystemExit(1)\n",
+            encoding="utf-8",
+        )
+        fake_docker.chmod(0o755)
+        self.write_request(
+            request,
+            command=["/bin/true"],
+            execution={"type": "container", "image": "fixture:local"},
+        )
+
+        completed = self.run_broker(
+            request,
+            result,
+            env={"PATH": str(fake_bin)},
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(
+            json.loads(result.read_text(encoding="utf-8")),
+            {
+                "schema_version": 1,
+                "candidate_sha": self.candidate_sha,
+                "status": "failed",
+                "failure_classification": "adapter_unavailable",
+                "summary": "Container execution adapter is unavailable",
+                "exit_code": None,
+                "stdout": "",
+                "stderr": "",
+            },
+        )
+
+    def test_container_execution_classifies_unavailable_supervision_as_unavailable(
+        self,
+    ):
+        request = self.temp / "container-supervision-unavailable-request.json"
+        result = self.temp / "container-supervision-unavailable-result.json"
+        fake_bin = self.temp / "container-supervision-unavailable-bin"
+        fake_bin.mkdir()
+        (fake_bin / "git").symlink_to(shutil.which("git"))
+        fake_docker = fake_bin / "docker"
+        fake_docker.write_text(
+            f"#!{sys.executable}\nraise SystemExit(0)\n",
+            encoding="utf-8",
+        )
+        fake_docker.chmod(0o755)
+        self.write_request(
+            request,
+            command=["/bin/true"],
+            execution={"type": "container", "image": "fixture:local"},
+        )
+
+        completed = self.run_broker(
+            request,
+            result,
+            env={"PATH": str(fake_bin)},
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(
+            json.loads(result.read_text(encoding="utf-8")),
+            {
+                "schema_version": 1,
+                "candidate_sha": self.candidate_sha,
+                "status": "failed",
+                "failure_classification": "adapter_unavailable",
+                "summary": "Container execution adapter is unavailable",
+                "exit_code": None,
+                "stdout": "",
+                "stderr": "",
+            },
+        )
+
     def test_container_execution_receives_only_the_exact_candidate_snapshot(self):
         request = self.temp / "container-request.json"
         result = self.temp / "container-result.json"
@@ -515,6 +596,8 @@ class CandidateBrokerCliTest(unittest.TestCase):
                 from pathlib import Path
 
                 arguments = sys.argv[1:]
+                if arguments[0] == "info":
+                    raise SystemExit(0)
                 if arguments[0] == "rm":
                     raise SystemExit(0)
                 mount = next(
@@ -650,6 +733,8 @@ class CandidateBrokerCliTest(unittest.TestCase):
                 import sys
                 import time
 
+                if sys.argv[1] == "info":
+                    raise SystemExit(0)
                 if sys.argv[1] == "rm":
                     raise SystemExit(7)
                 print("container started", flush=True)
@@ -693,6 +778,8 @@ class CandidateBrokerCliTest(unittest.TestCase):
                 import time
                 from pathlib import Path
 
+                if sys.argv[1] == "info":
+                    raise SystemExit(0)
                 if sys.argv[1] == "rm":
                     Path({str(cleanup_marker)!r}).write_text(
                         sys.argv[-1], encoding="utf-8"

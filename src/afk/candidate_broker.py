@@ -21,6 +21,7 @@ CANDIDATE_OUTPUT_BYTE_LIMIT = 1024 * 1024
 CANDIDATE_CLEANUP_SECONDS = 1
 MAX_CANDIDATE_TIMEOUT_SECONDS = 3600
 MAX_CANDIDATE_OUTPUT_BYTE_LIMIT = 64 * 1024 * 1024
+CONTAINER_RUNTIME_PROBE_SECONDS = 5
 
 
 class CandidateBrokerError(ValueError):
@@ -72,10 +73,7 @@ def run_candidate(request: dict[str, Any]) -> dict[str, Any]:
     execution = request.get("execution")
     container_runtime = None
     if execution is not None:
-        container_runtime = next(
-            filter(None, (shutil.which(runtime) for runtime in ("docker", "podman"))),
-            None,
-        )
+        container_runtime = _find_container_runtime()
         if container_runtime is None:
             return _failed_execution_result(
                 request["candidate_sha"],
@@ -164,6 +162,30 @@ def run_candidate(request: dict[str, Any]) -> dict[str, Any]:
         "stdout": completed.stdout,
         "stderr": completed.stderr,
     }
+
+
+def _find_container_runtime() -> str | None:
+    for name in ("docker", "podman"):
+        runtime = shutil.which(name)
+        if runtime is None:
+            continue
+        try:
+            completed = run_supervised_command(
+                [runtime, "info"],
+                cwd=Path.cwd(),
+                environment=os.environ.copy(),
+                timeout_seconds=CONTAINER_RUNTIME_PROBE_SECONDS,
+                output_byte_limit=64 * 1024,
+                cleanup_seconds=CANDIDATE_CLEANUP_SECONDS,
+                input_text=None,
+                label="Candidate container runtime probe",
+                decode_errors="replace",
+            )
+        except (OSError, SupervisedCommandError):
+            continue
+        if completed.returncode == 0:
+            return runtime
+    return None
 
 
 def _bubblewrap_command(

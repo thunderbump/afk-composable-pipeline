@@ -166,12 +166,13 @@ may instead request the target-neutral container adapter with exactly:
 {"execution":{"type":"container","image":"locally-available-fixture:tag"}}
 ```
 
-The adapter discovers Docker first and Podman second. It does not accept
+The adapter probes Docker first and Podman second with a bounded trusted
+runtime `info` command. It does not accept
 Compose files, service names, target profiles, volumes, environment variables,
 runtime flags, or repository-specific deployment semantics. An option-looking
-image name is invalid. If neither runtime executable is available, the broker
-returns a Candidate-bound `adapter_unavailable` result; the Bubblewrap path is
-unchanged.
+image name is invalid. If neither runtime is usable, including when trusted
+runtime supervision is unavailable, the broker returns a Candidate-bound
+`adapter_unavailable` result; the Bubblewrap path is unchanged.
 
 Container execution mounts only the materialized exact-commit snapshot,
 read-only at `/candidate`. `/work` and `/tmp` are private tmpfs mounts. The
