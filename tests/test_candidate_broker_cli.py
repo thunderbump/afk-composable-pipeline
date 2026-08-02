@@ -1,3 +1,4 @@
+import errno
 import json
 import os
 import shutil
@@ -1176,6 +1177,9 @@ class CandidateBrokerCliTest(unittest.TestCase):
             "credential_file": str(credential),
             "unrelated_host_file": str(unrelated),
         }
+        host_dev_stat = os.stat("/dev")
+        host_dev_identity = [host_dev_stat.st_dev, host_dev_stat.st_ino]
+        host_pid = os.getpid()
         probe = textwrap.dedent(
             f"""
             import json
@@ -1186,7 +1190,7 @@ class CandidateBrokerCliTest(unittest.TestCase):
 
             checks = {{}}
 
-            def denied(name, operation):
+            def attempt(name, operation):
                 try:
                     operation()
                 except OSError as exc:
@@ -1200,14 +1204,17 @@ class CandidateBrokerCliTest(unittest.TestCase):
 
             host_paths = {host_paths!r}
             for name, value in host_paths.items():
-                denied(name, lambda value=value: Path(value).read_bytes())
-            denied(
-                "host_write",
-                lambda: Path(host_paths["unrelated_host_file"]).write_text(
-                    "candidate write", encoding="utf-8"
-                ),
-            )
-            denied(
+                attempt(
+                    name + "_read",
+                    lambda value=value: Path(value).read_bytes(),
+                )
+                attempt(
+                    name + "_write_create",
+                    lambda value=value: Path(value).write_text(
+                        "candidate write", encoding="utf-8"
+                    ),
+                )
+            attempt(
                 "candidate_write",
                 lambda: Path("/candidate/candidate-write").write_text(
                     "candidate write", encoding="utf-8"
@@ -1225,7 +1232,49 @@ class CandidateBrokerCliTest(unittest.TestCase):
             checks["scratch_write"] = {{
                 "classification": "permitted"
                 if scratch.read_text(encoding="utf-8") == "scratch works"
-                else "wrong_value"
+                else "wrong_value",
+                "value": scratch.read_text(encoding="utf-8"),
+            }}
+            private_tmp = Path("/tmp/private-scratch")
+            private_tmp.write_text("private tmp works", encoding="utf-8")
+            checks["private_tmp_write"] = {{
+                "classification": "permitted"
+                if private_tmp.read_text(encoding="utf-8") == "private tmp works"
+                else "wrong_value",
+                "value": private_tmp.read_text(encoding="utf-8"),
+            }}
+
+            sandbox_pid = os.getpid()
+            host_pid_visible = Path("/proc/{host_pid}").exists()
+            self_pid_visible = Path(f"/proc/{{sandbox_pid}}").exists()
+            checks["proc_namespace"] = {{
+                "classification": "permitted"
+                if self_pid_visible and not host_pid_visible
+                else "exposed",
+                "host_pid": {host_pid},
+                "host_pid_visible": host_pid_visible,
+                "self_pid": sandbox_pid,
+                "self_pid_visible": self_pid_visible,
+            }}
+
+            dev_stat = os.stat("/dev")
+            sandbox_dev_identity = [dev_stat.st_dev, dev_stat.st_ino]
+            with Path("/dev/null").open("wb", buffering=0) as null_output:
+                null_written = null_output.write(b"discard")
+            with Path("/dev/null").open("rb", buffering=0) as null_input:
+                null_read = null_input.read(1)
+            dev_entries = sorted(path.name for path in Path("/dev").iterdir())
+            checks["dev_namespace"] = {{
+                "classification": "permitted"
+                if sandbox_dev_identity != {host_dev_identity!r}
+                and null_written == 7
+                and null_read == b""
+                else "exposed",
+                "host_identity": {host_dev_identity!r},
+                "sandbox_identity": sandbox_dev_identity,
+                "entries": dev_entries,
+                "null_read_empty": null_read == b"",
+                "null_written": null_written,
             }}
 
             secret_names = (
@@ -1238,7 +1287,8 @@ class CandidateBrokerCliTest(unittest.TestCase):
             checks["credential_environment"] = {{
                 "classification": "denied"
                 if all(name not in os.environ for name in secret_names)
-                else "exposed"
+                else "exposed",
+                "present": [name for name in secret_names if name in os.environ],
             }}
 
             def connect_unix(path):
@@ -1246,13 +1296,13 @@ class CandidateBrokerCliTest(unittest.TestCase):
                     client.settimeout(0.2)
                     client.connect(path)
 
-            denied("docker_socket", lambda: connect_unix({str(docker_socket_path)!r}))
-            denied("broker_socket", lambda: connect_unix({str(broker_socket_path)!r}))
-            denied(
+            attempt("docker_socket", lambda: connect_unix({str(docker_socket_path)!r}))
+            attempt("broker_socket", lambda: connect_unix({str(broker_socket_path)!r}))
+            attempt(
                 "default_docker_socket",
                 lambda: connect_unix("/var/run/docker.sock"),
             )
-            denied(
+            attempt(
                 "host_network",
                 lambda: socket.create_connection(
                     ("127.0.0.1", __HOST_NETWORK_PORT__), timeout=0.2
@@ -1293,6 +1343,18 @@ class CandidateBrokerCliTest(unittest.TestCase):
                 request,
                 command=["/usr/bin/python3", "-c", probe],
             )
+            self.assertFalse(result.exists())
+            host_sentinels = {
+                path: path.read_bytes()
+                for path in (
+                    request,
+                    evidence,
+                    run_store,
+                    harness,
+                    credential,
+                    unrelated,
+                )
+            }
             completed = self.run_broker(
                 request,
                 result,
@@ -1306,17 +1368,83 @@ class CandidateBrokerCliTest(unittest.TestCase):
             )
 
         self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertTrue(result.is_file())
+        self.assertFalse(result.is_symlink())
         broker_result = json.loads(result.read_text(encoding="utf-8"))
-        self.assertEqual(broker_result["exit_code"], 0, broker_result["stderr"])
-        checks = json.loads(broker_result["stdout"])
-        self.assertEqual(checks["candidate_read"]["classification"], "permitted")
-        self.assertEqual(checks["scratch_write"]["classification"], "permitted")
-        denied_checks = set(checks) - {"candidate_read", "scratch_write"}
-        self.assertTrue(denied_checks)
         self.assertEqual(
-            {checks[name]["classification"] for name in denied_checks},
-            {"denied"},
+            set(broker_result),
+            {
+                "schema_version",
+                "candidate_sha",
+                "status",
+                "exit_code",
+                "stdout",
+                "stderr",
+            },
         )
+        self.assertEqual(broker_result["schema_version"], 1)
+        self.assertEqual(broker_result["exit_code"], 0, broker_result["stderr"])
+        self.assertEqual(broker_result["status"], "completed")
+        self.assertEqual(broker_result["candidate_sha"], self.candidate_sha)
+        checks = json.loads(broker_result["stdout"])
+        for path, sentinel in host_sentinels.items():
+            with self.subTest(host_sentinel=path):
+                self.assertEqual(path.read_bytes(), sentinel)
+
+        for name in host_paths:
+            for operation in ("read", "write_create"):
+                check_name = f"{name}_{operation}"
+                with self.subTest(protected_operation=check_name):
+                    self.assertEqual(
+                        checks[check_name],
+                        {
+                            "classification": "denied",
+                            "error": "FileNotFoundError",
+                            "errno": errno.ENOENT,
+                        },
+                    )
+
+        denial_checks = (
+            "candidate_write",
+            "docker_socket",
+            "broker_socket",
+            "default_docker_socket",
+            "host_network",
+        )
+        for check_name in denial_checks:
+            with self.subTest(denied_operation=check_name):
+                self.assertEqual(checks[check_name]["classification"], "denied")
+                self.assertTrue(checks[check_name]["error"])
+                self.assertIsInstance(checks[check_name]["errno"], int)
+        self.assertEqual(checks["candidate_write"]["errno"], errno.EROFS)
+
+        self.assertEqual(
+            checks["candidate_read"],
+            {"classification": "permitted"},
+        )
+        self.assertEqual(
+            checks["scratch_write"],
+            {"classification": "permitted", "value": "scratch works"},
+        )
+        self.assertEqual(
+            checks["private_tmp_write"],
+            {"classification": "permitted", "value": "private tmp works"},
+        )
+        self.assertEqual(
+            checks["credential_environment"],
+            {"classification": "denied", "present": []},
+        )
+        self.assertEqual(checks["proc_namespace"]["classification"], "permitted")
+        self.assertFalse(checks["proc_namespace"]["host_pid_visible"])
+        self.assertTrue(checks["proc_namespace"]["self_pid_visible"])
+        self.assertEqual(checks["dev_namespace"]["classification"], "permitted")
+        self.assertNotEqual(
+            checks["dev_namespace"]["sandbox_identity"],
+            checks["dev_namespace"]["host_identity"],
+        )
+        self.assertIn("null", checks["dev_namespace"]["entries"])
+        self.assertTrue(checks["dev_namespace"]["null_read_empty"])
+        self.assertEqual(checks["dev_namespace"]["null_written"], 7)
 
     @unittest.skipUnless(shutil.which("bwrap"), "bubblewrap is unavailable")
     def test_treats_option_looking_commands_as_executable_argv(self):

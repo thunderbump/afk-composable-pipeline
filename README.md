@@ -113,19 +113,22 @@ The version-1 request contains only `schema_version`, the exact clean
 The broker materializes exact tree and blob objects from the Candidate commit
 without `.git` administrative metadata or archive-attribute rewrites. Gitlinks
 fail closed until recursive submodule semantics are defined. The command runs
-with that snapshot mounted read-only at `/candidate`, empty writable scratch at
-`/work`, a cleared environment, and no inherited network namespace. The
-broker-owned result records the Candidate SHA, command exit status, stdout, and
-stderr; its path is not exposed inside the sandbox.
+with that snapshot mounted read-only at `/candidate`, writable scratch at
+`/work`, a private writable `/tmp`, the runtime mounted from `/usr`, a
+namespaced `/proc`, a distinct minimal `/dev`, a cleared environment, and no
+inherited network namespace. The broker-owned result records the Candidate SHA,
+command exit status, stdout, and stderr; its path is not exposed inside the
+sandbox.
 
 The declared Candidate capability set is intentionally small: read the exact
-snapshot under `/candidate`, write scratch under `/work`, and use the mounted
-runtime under `/usr`. Public boundary tests keep validation requests and
-results, evidence, the trusted harness, the AFK Run Store, credential files and
-environment variables, Docker and broker sockets, unrelated host paths, and
-host networking outside the sandbox. Candidate commands receive ordinary OS
-denials for those surfaces, while their exit status and diagnostics remain in
-the broker-owned structured result.
+snapshot under `/candidate`; write scratch under `/work` and private temporary
+files under `/tmp`; use the mounted runtime under `/usr`, the sandbox PID view
+under `/proc`, and minimal devices such as `/dev/null` under `/dev`. Validation
+requests and results, evidence, the trusted harness, the AFK Run Store,
+credential files and environment variables, Docker and broker sockets,
+unrelated host paths, and host networking are omitted. Candidate commands
+receive ordinary OS denials for those authority surfaces, while their exit
+status and diagnostics remain in the broker-owned structured result.
 
 When `--ledger` is omitted, AFK resolves ledger output with this precedence:
 `--ledger` > `AFK_LEDGER_DIR` > `./ledgers`. Preview-only `run-next` does not
