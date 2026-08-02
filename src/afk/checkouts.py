@@ -357,7 +357,7 @@ def _worktree_matches_commit(path: Path, commit: str) -> bool:
                     return False
                 if bool(target_stat.st_mode & 0o111) != (mode == b"100755"):
                     return False
-                if _git_blob_id(target.read_bytes()) != object_id:
+                if _git_file_blob_id(target) != object_id:
                     return False
             elif (mode, object_type) == (b"120000", b"blob"):
                 if not stat.S_ISLNK(target_stat.st_mode):
@@ -432,7 +432,19 @@ def _worktree_paths(path: Path, gitlinks: set[bytes]) -> set[bytes]:
 
 def _git_blob_id(content: bytes) -> bytes:
     header = f"blob {len(content)}\0".encode("ascii")
-    return hashlib.sha1(header + content).hexdigest().encode("ascii")
+    return hashlib.sha1(header + content, usedforsecurity=False).hexdigest().encode(
+        "ascii"
+    )
+
+
+def _git_file_blob_id(path: Path) -> bytes:
+    with path.open("rb") as source:
+        size = os.fstat(source.fileno()).st_size
+        digest = hashlib.sha1(usedforsecurity=False)
+        digest.update(f"blob {size}\0".encode("ascii"))
+        while chunk := source.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest().encode("ascii")
 
 
 def run_trusted_read_git(

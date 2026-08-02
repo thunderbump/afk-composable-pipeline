@@ -8,9 +8,11 @@ import tempfile
 import textwrap
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
 
 
 class CandidateBrokerCliTest(unittest.TestCase):
@@ -302,6 +304,16 @@ class CandidateBrokerCliTest(unittest.TestCase):
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertEqual(json.loads(result.read_text(encoding="utf-8"))["exit_code"], 0)
         self.assertFalse(marker.exists())
+
+    def test_exact_candidate_streams_regular_files_without_path_read_bytes(self):
+        from afk.checkouts import is_exact_clean_commit
+
+        with mock.patch.object(
+            Path,
+            "read_bytes",
+            side_effect=AssertionError("regular files must be streamed"),
+        ):
+            self.assertTrue(is_exact_clean_commit(self.candidate, self.candidate_sha))
 
     @unittest.skipUnless(shutil.which("bwrap"), "bubblewrap is unavailable")
     def test_ignores_replace_refs_for_the_approved_candidate(self):
