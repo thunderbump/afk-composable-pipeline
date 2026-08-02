@@ -392,7 +392,7 @@ def _worktree_matches_commit(
                 path, entries, blob_sizes, evaluation
             ):
                 return False
-            untracked_paths = _worktree_paths(
+            untracked_paths = _collect_untracked_worktree_paths(
                 path, gitlinks, expected_paths, evaluation
             )
             if _check_ignored(evaluation, untracked_paths) != untracked_paths:
@@ -549,7 +549,7 @@ def _ignored_path_is_supported(path: Path, item_path: bytes) -> bool:
         os.close(parent_descriptor)
 
 
-def _worktree_paths(
+def _collect_untracked_worktree_paths(
     path: Path,
     gitlinks: set[bytes],
     expected_paths: set[bytes],

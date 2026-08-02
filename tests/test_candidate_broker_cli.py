@@ -615,16 +615,18 @@ class CandidateBrokerCliTest(unittest.TestCase):
         external = self.temp / "external"
         external.mkdir()
         (external / "input.txt").write_text("tracked content\n", encoding="utf-8")
-        real_worktree_paths = checkouts._worktree_paths
+        real_collect_untracked_worktree_paths = (
+            checkouts._collect_untracked_worktree_paths
+        )
 
         def replace_parent_after_scan(*args, **kwargs):
-            paths = real_worktree_paths(*args, **kwargs)
+            paths = real_collect_untracked_worktree_paths(*args, **kwargs)
             shutil.rmtree(tracked)
             tracked.symlink_to(external, target_is_directory=True)
             return paths
 
         with mock.patch(
-            "afk.checkouts._worktree_paths",
+            "afk.checkouts._collect_untracked_worktree_paths",
             side_effect=replace_parent_after_scan,
         ):
             self.assertFalse(
@@ -640,16 +642,18 @@ class CandidateBrokerCliTest(unittest.TestCase):
         self.candidate_sha = self.git("rev-parse", "HEAD")
         ignored = self.candidate / "ignored.data"
         ignored.write_bytes(b"generated\n")
-        real_worktree_paths = checkouts._worktree_paths
+        real_collect_untracked_worktree_paths = (
+            checkouts._collect_untracked_worktree_paths
+        )
 
         def replace_ignored_after_scan(*args, **kwargs):
-            paths = real_worktree_paths(*args, **kwargs)
+            paths = real_collect_untracked_worktree_paths(*args, **kwargs)
             ignored.unlink()
             os.mkfifo(ignored)
             return paths
 
         with mock.patch(
-            "afk.checkouts._worktree_paths",
+            "afk.checkouts._collect_untracked_worktree_paths",
             side_effect=replace_ignored_after_scan,
         ):
             self.assertFalse(
