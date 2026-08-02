@@ -2,6 +2,7 @@ import json
 import os
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -314,6 +315,38 @@ class CandidateBrokerCliTest(unittest.TestCase):
             side_effect=AssertionError("regular files must be streamed"),
         ):
             self.assertTrue(is_exact_clean_commit(self.candidate, self.candidate_sha))
+
+    def test_exact_candidate_rejects_executable_without_owner_execute(self):
+        from afk.checkouts import is_exact_clean_commit
+
+        target = self.candidate / "input.txt"
+        target.chmod(0o755)
+        self.git("add", "input.txt")
+        self.git("commit", "-m", "make input executable")
+        self.candidate_sha = self.git("rev-parse", "HEAD")
+        self.assertTrue(is_exact_clean_commit(self.candidate, self.candidate_sha))
+
+        target.chmod(
+            stat.S_IRUSR
+            | stat.S_IWUSR
+            | stat.S_IRGRP
+            | stat.S_IXGRP
+            | stat.S_IROTH
+            | stat.S_IXOTH
+        )
+
+        self.assertFalse(is_exact_clean_commit(self.candidate, self.candidate_sha))
+
+    def test_exact_candidate_accepts_non_executable_with_other_execute(self):
+        from afk.checkouts import is_exact_clean_commit
+
+        target = self.candidate / "input.txt"
+        self.assertTrue(is_exact_clean_commit(self.candidate, self.candidate_sha))
+
+        target.chmod(target.stat().st_mode | stat.S_IXOTH)
+
+        self.assertEqual(self.git("status", "--porcelain"), "")
+        self.assertTrue(is_exact_clean_commit(self.candidate, self.candidate_sha))
 
     @unittest.skipUnless(shutil.which("bwrap"), "bubblewrap is unavailable")
     def test_ignores_replace_refs_for_the_approved_candidate(self):

@@ -355,7 +355,7 @@ def _worktree_matches_commit(path: Path, commit: str) -> bool:
             }:
                 if not stat.S_ISREG(target_stat.st_mode):
                     return False
-                if bool(target_stat.st_mode & 0o111) != (mode == b"100755"):
+                if bool(target_stat.st_mode & stat.S_IXUSR) != (mode == b"100755"):
                     return False
                 if _git_file_blob_id(target) != object_id:
                     return False
