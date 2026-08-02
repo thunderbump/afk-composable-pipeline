@@ -329,7 +329,17 @@ def _worktree_matches_commit(path: Path, commit: str) -> bool:
         ["ls-tree", "-rz", "--full-tree", commit], cwd=path, text=False
     )
     index = run_trusted_read_git(["ls-files", "--stage", "-z"], cwd=path, text=False)
-    if tree.returncode != 0 or index.returncode != 0:
+    untracked = run_trusted_read_git(
+        ["ls-files", "--others", "-z", "--exclude-per-directory=.gitignore"],
+        cwd=path,
+        text=False,
+    )
+    if (
+        tree.returncode != 0
+        or index.returncode != 0
+        or untracked.returncode != 0
+        or untracked.stdout
+    ):
         return False
     try:
         entries = _parse_tree_entries(tree.stdout)
@@ -337,14 +347,6 @@ def _worktree_matches_commit(path: Path, commit: str) -> bool:
             item_path: (mode, object_id)
             for item_path, (mode, _object_type, object_id) in entries.items()
         }:
-            return False
-        expected_paths = set(entries)
-        gitlinks = {
-            item_path
-            for item_path, (mode, object_type, _object_id) in entries.items()
-            if (mode, object_type) == (b"160000", b"commit")
-        }
-        if _worktree_paths(path, gitlinks) != expected_paths:
             return False
         for item_path, (mode, object_type, object_id) in entries.items():
             target = path.joinpath(*PurePosixPath(os.fsdecode(item_path)).parts)
@@ -408,26 +410,6 @@ def _require_git_path(item_path: bytes) -> None:
         part in {"", ".", ".."} for part in relative.parts
     ):
         raise ValueError("invalid Git path")
-
-
-def _worktree_paths(path: Path, gitlinks: set[bytes]) -> set[bytes]:
-    observed = set()
-    for root, directories, files in os.walk(path, topdown=True, followlinks=False):
-        root_path = Path(root)
-        for name in list(directories):
-            target = root_path / name
-            relative = os.fsencode(target.relative_to(path).as_posix())
-            if relative == b".git":
-                directories.remove(name)
-            elif relative in gitlinks or target.is_symlink():
-                observed.add(relative)
-                directories.remove(name)
-        for name in files:
-            target = root_path / name
-            relative = os.fsencode(target.relative_to(path).as_posix())
-            if relative != b".git":
-                observed.add(relative)
-    return observed
 
 
 def _git_blob_id(content: bytes) -> bytes:

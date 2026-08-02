@@ -348,6 +348,33 @@ class CandidateBrokerCliTest(unittest.TestCase):
         self.assertEqual(self.git("status", "--porcelain"), "")
         self.assertTrue(is_exact_clean_commit(self.candidate, self.candidate_sha))
 
+    def test_exact_candidate_allows_files_ignored_by_committed_gitignore(self):
+        from afk.checkouts import is_exact_clean_commit
+
+        (self.candidate / ".gitignore").write_text("ignored.log\n", encoding="utf-8")
+        self.git("add", ".gitignore")
+        self.git("commit", "-m", "ignore generated log")
+        self.candidate_sha = self.git("rev-parse", "HEAD")
+        (self.candidate / "ignored.log").write_text("generated\n", encoding="utf-8")
+
+        self.assertTrue(is_exact_clean_commit(self.candidate, self.candidate_sha))
+
+    def test_exact_candidate_rejects_unignored_extra_file(self):
+        from afk.checkouts import is_exact_clean_commit
+
+        (self.candidate / "unexpected.log").write_text("unexpected\n", encoding="utf-8")
+
+        self.assertFalse(is_exact_clean_commit(self.candidate, self.candidate_sha))
+
+    def test_exact_candidate_does_not_trust_repo_info_exclude(self):
+        from afk.checkouts import is_exact_clean_commit
+
+        exclude = Path(self.git("rev-parse", "--git-path", "info/exclude"))
+        exclude.write_text("unexpected.log\n", encoding="utf-8")
+        (self.candidate / "unexpected.log").write_text("unexpected\n", encoding="utf-8")
+
+        self.assertFalse(is_exact_clean_commit(self.candidate, self.candidate_sha))
+
     @unittest.skipUnless(shutil.which("bwrap"), "bubblewrap is unavailable")
     def test_ignores_replace_refs_for_the_approved_candidate(self):
         (self.repository / "input.txt").write_text(
