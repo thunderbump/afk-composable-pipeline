@@ -61,6 +61,79 @@ class CandidateBrokerCliTest(unittest.TestCase):
     def tearDown(self):
         self.temporary_directory.cleanup()
 
+    def test_rejects_invalid_utf8_request_without_a_traceback(self):
+        request = self.temp / "invalid-utf8-request.json"
+        result = self.temp / "invalid-utf8-result.json"
+        request.write_bytes(b"\xff")
+
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "afk.candidate_broker",
+                "--request",
+                str(request),
+                "--result",
+                str(result),
+            ],
+            cwd=ROOT,
+            env={**os.environ, "PYTHONPATH": str(ROOT / "src")},
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(completed.returncode, 2)
+        self.assertEqual(completed.stderr, "candidate broker request is invalid\n")
+        self.assertNotIn("Traceback", completed.stderr)
+        self.assertFalse(result.exists())
+
+    def test_rejects_nul_in_request_paths_and_commands(self):
+        invalid_values = (
+            (f"{self.candidate}\0escaped", ["/usr/bin/true"]),
+            (str(self.candidate), ["/usr/bin/true\0escaped"]),
+            (str(self.candidate), ["/usr/bin/true", "argument\0escaped"]),
+        )
+        for index, (candidate_path, command) in enumerate(invalid_values):
+            with self.subTest(candidate_path=candidate_path, command=command):
+                request = self.temp / f"nul-request-{index}.json"
+                result = self.temp / f"nul-result-{index}.json"
+                request.write_text(
+                    json.dumps(
+                        {
+                            "schema_version": 1,
+                            "candidate_sha": self.candidate_sha,
+                            "candidate_path": candidate_path,
+                            "command": command,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+
+                completed = subprocess.run(
+                    [
+                        sys.executable,
+                        "-m",
+                        "afk.candidate_broker",
+                        "--request",
+                        str(request),
+                        "--result",
+                        str(result),
+                    ],
+                    cwd=ROOT,
+                    env={**os.environ, "PYTHONPATH": str(ROOT / "src")},
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+
+                self.assertEqual(completed.returncode, 2)
+                self.assertEqual(
+                    completed.stderr, "candidate broker request is invalid\n"
+                )
+                self.assertNotIn("Traceback", completed.stderr)
+                self.assertFalse(result.exists())
+
     def test_runs_against_read_only_exact_candidate_with_writable_scratch(self):
         probe = textwrap.dedent(
             """

@@ -100,7 +100,10 @@ def run_candidate(request: dict[str, Any]) -> dict[str, Any]:
 
 
 def _read_request(path: Path) -> dict[str, Any]:
-    value = json.loads(path.read_text(encoding="utf-8"))
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except UnicodeDecodeError as exc:
+        raise CandidateBrokerError("candidate broker request is invalid") from exc
     if (
         not isinstance(value, dict)
         or set(value)
@@ -109,10 +112,14 @@ def _read_request(path: Path) -> dict[str, Any]:
         or value["schema_version"] != SCHEMA_VERSION
         or not _is_sha(value.get("candidate_sha"))
         or not isinstance(value.get("candidate_path"), str)
+        or "\0" in value["candidate_path"]
         or not Path(value["candidate_path"]).is_absolute()
         or not isinstance(value.get("command"), list)
         or not value["command"]
-        or not all(isinstance(item, str) and item for item in value["command"])
+        or not all(
+            isinstance(item, str) and item and "\0" not in item
+            for item in value["command"]
+        )
     ):
         raise CandidateBrokerError("candidate broker request is invalid")
     return value
