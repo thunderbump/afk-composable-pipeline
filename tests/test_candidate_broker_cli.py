@@ -800,6 +800,116 @@ class CandidateBrokerCliTest(unittest.TestCase):
         self.assertIn("useful run stdout", run_response["stdout"])
         self.assertIn("useful run stderr", run_response["stderr"])
 
+    def test_candidate_capability_bounds_container_diagnostics_after_exact_redaction(
+        self,
+    ):
+        fake_bin = self.temp / "bounded-diagnostic-bin"
+        fake_bin.mkdir()
+        (fake_bin / "git").symlink_to(shutil.which("git"))
+        docker_context = "abcd"
+        docker_config = "wxyzefgh"
+        docker = fake_bin / "docker"
+        docker.write_text(
+            textwrap.dedent(
+                f"""
+                #!{sys.executable}
+                import os
+                import sys
+                import time
+                from pathlib import Path
+
+                arguments = sys.argv[1:]
+                if arguments[0] == "info":
+                    raise SystemExit(0)
+                if arguments[:2] == ["image", "inspect"]:
+                    if arguments[2] == "inspect-failure:local":
+                        sys.stderr.write(os.environ["DOCKER_CONTEXT"])
+                        raise SystemExit(1)
+                    print('[{{"Id":"sha256:fixture-image","Config":{{"Volumes":null}}}}]')
+                    raise SystemExit(0)
+                if arguments[0] == "rm":
+                    raise SystemExit(0)
+                entrypoint = arguments[arguments.index("--entrypoint") + 1]
+                if entrypoint != "/no-cid":
+                    Path(arguments[arguments.index("--cidfile") + 1]).write_text(
+                        "created-container-id\\n", encoding="utf-8"
+                    )
+                if entrypoint == "/partial":
+                    sys.stdout.write(os.environ["DOCKER_CONFIG"][:4])
+                    sys.stdout.flush()
+                    time.sleep(0.05)
+                    sys.stdout.write(os.environ["DOCKER_CONFIG"][4:])
+                    sys.stdout.flush()
+                    raise SystemExit(1)
+                stream = sys.stderr if entrypoint == "/failed" else sys.stdout
+                stream.write(os.environ["DOCKER_CONTEXT"])
+                stream.flush()
+                if entrypoint == "/completed":
+                    raise SystemExit(0)
+                if entrypoint == "/timeout":
+                    time.sleep(30)
+                raise SystemExit(1)
+                """
+            ).lstrip(),
+            encoding="utf-8",
+        )
+        docker.chmod(0o755)
+        socket_path = self.temp / "bounded-diagnostic-broker.sock"
+
+        def request(capability, *, image="fixture:local", command="/completed"):
+            with socket.socket(socket.AF_UNIX) as client:
+                client.connect(capability["socket_path"])
+                client.sendall(
+                    (
+                        json.dumps(
+                            {
+                                "schema_version": 1,
+                                "token": capability["token"],
+                                "command": [command],
+                                "execution": {"type": "container", "image": image},
+                                "output_byte_limit": 4,
+                                "timeout_seconds": 0.1,
+                            }
+                        )
+                        + "\n"
+                    ).encode("utf-8")
+                )
+                return json.loads(client.makefile("r", encoding="utf-8").readline())
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {
+                    "PATH": str(fake_bin),
+                    "DOCKER_CONTEXT": docker_context,
+                    "DOCKER_CONFIG": docker_config,
+                },
+                clear=False,
+            ),
+            CandidateBrokerCapability(
+                candidate_path=self.candidate,
+                candidate_sha=self.candidate_sha,
+                socket_path=socket_path,
+            ) as capability,
+        ):
+            live_capability = capability.request_value()
+            responses = (
+                (request(live_capability, image="inspect-failure:local"), "stderr"),
+                (request(live_capability), "stdout"),
+                (request(live_capability, command="/no-cid"), "stdout"),
+                (request(live_capability, command="/failed"), "stderr"),
+                (request(live_capability, command="/timeout"), "stdout"),
+                (request(live_capability, command="/partial"), "stdout"),
+            )
+
+        for response, stream in responses:
+            with self.subTest(
+                classification=response.get("failure_classification"), stream=stream
+            ):
+                self.assertNotIn(docker_context, json.dumps(response))
+                self.assertNotIn(docker_config[:4], json.dumps(response))
+                self.assertLessEqual(len(response[stream].encode("utf-8")), 4)
+
     def test_container_watchdog_cleans_up_after_broker_parent_death(self):
         selectors = (("docker", "DOCKER_HOST"), ("podman", "CONTAINER_HOST"))
         for runtime_name, selector in selectors:
