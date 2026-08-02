@@ -578,13 +578,9 @@ class CandidateValidationCliTest(unittest.TestCase):
             self.assertEqual(self.processes_with_token(token), [])
         finally:
             cleanup_pids = {
-                *self.processes_with_token(token),
-                *self.processes_with_token(parent_token),
+                *self.processes_with_argument(token),
+                *self.processes_with_argument(parent_token),
             }
-            if child_pid is not None:
-                cleanup_pids.add(child_pid)
-            if parent_pid is not None:
-                cleanup_pids.add(parent_pid)
             for pid in cleanup_pids:
                 try:
                     os.kill(pid, signal.SIGKILL)
