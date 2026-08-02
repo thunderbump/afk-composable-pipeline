@@ -200,10 +200,16 @@ def run_candidate(request: dict[str, Any]) -> dict[str, Any]:
                 _redact_container_diagnostic(execution, exc.summary),
                 exit_code=exc.exit_code,
                 stdout=_bounded_container_diagnostic(
-                    execution, exc.stdout or "", output_byte_limit
+                    execution,
+                    exc.stdout or "",
+                    output_byte_limit,
+                    ambiguous_input_end=True,
                 ),
                 stderr=_bounded_container_diagnostic(
-                    execution, exc.stderr or "", output_byte_limit
+                    execution,
+                    exc.stderr or "",
+                    output_byte_limit,
+                    ambiguous_input_end=True,
                 ),
             )
         finally:
@@ -471,21 +477,31 @@ def _redact_trusted_runtime_diagnostic(value: str) -> str:
     return redact_text(value, exact_secrets=_trusted_runtime_exact_secrets())
 
 
-def _bounded_trusted_runtime_diagnostic(value: str, byte_limit: int) -> str:
-    redacted = _redact_trusted_runtime_diagnostic(value)
+def _protect_ambiguous_secret_prefix(value: str) -> str:
     longest_prefix = 0
-    # Bounded supervision can retain only a secret's prefix at the end. Treat
-    # ambiguous matching suffixes as secrets rather than publishing fragments.
     for secret in _trusted_runtime_exact_secrets():
         secret = secret.strip()
-        for length in range(min(len(redacted), len(secret) - 1), 0, -1):
-            if redacted.endswith(secret[:length]):
+        for length in range(min(len(value), len(secret) - 1), 0, -1):
+            if value.endswith(secret[:length]):
                 longest_prefix = max(longest_prefix, length)
                 break
     if longest_prefix:
-        redacted = redacted[:-longest_prefix] + "[REDACTED]"
+        return value[:-longest_prefix] + "[REDACTED]"
+    return value
+
+
+def _bounded_trusted_runtime_diagnostic(
+    value: str, byte_limit: int, *, ambiguous_input_end: bool = False
+) -> str:
+    redacted = _redact_trusted_runtime_diagnostic(value)
+    if ambiguous_input_end:
+        redacted = _protect_ambiguous_secret_prefix(redacted)
     encoded = redacted.encode("utf-8")
-    return encoded[:byte_limit].decode("utf-8", errors="ignore")
+    truncated = len(encoded) > byte_limit
+    bounded = encoded[:byte_limit].decode("utf-8", errors="ignore")
+    if truncated:
+        bounded = _protect_ambiguous_secret_prefix(bounded)
+    return bounded.encode("utf-8")[:byte_limit].decode("utf-8", errors="ignore")
 
 
 def _redact_container_diagnostic(execution: object, value: str) -> str:
@@ -495,11 +511,17 @@ def _redact_container_diagnostic(execution: object, value: str) -> str:
 
 
 def _bounded_container_diagnostic(
-    execution: object, value: str, byte_limit: int
+    execution: object,
+    value: str,
+    byte_limit: int,
+    *,
+    ambiguous_input_end: bool = False,
 ) -> str:
     if execution is None:
         return value
-    return _bounded_trusted_runtime_diagnostic(value, byte_limit)
+    return _bounded_trusted_runtime_diagnostic(
+        value, byte_limit, ambiguous_input_end=ambiguous_input_end
+    )
 
 
 def _start_container_cleanup_watchdog(

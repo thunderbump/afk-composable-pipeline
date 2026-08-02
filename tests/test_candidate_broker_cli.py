@@ -825,6 +825,9 @@ class CandidateBrokerCliTest(unittest.TestCase):
                     if arguments[2] == "inspect-failure:local":
                         sys.stderr.write(os.environ["DOCKER_CONTEXT"])
                         raise SystemExit(1)
+                    if arguments[2] == "bounded-prefix:local":
+                        sys.stderr.write("wxyz ordinary detail")
+                        raise SystemExit(1)
                     print('[{{"Id":"sha256:fixture-image","Config":{{"Volumes":null}}}}]')
                     raise SystemExit(0)
                 if arguments[0] == "rm":
@@ -841,6 +844,12 @@ class CandidateBrokerCliTest(unittest.TestCase):
                     sys.stdout.write(os.environ["DOCKER_CONFIG"][4:])
                     sys.stdout.flush()
                     raise SystemExit(1)
+                if entrypoint == "/ordinary":
+                    sys.stdout.write("help")
+                    raise SystemExit(0)
+                if entrypoint == "/bounded-prefix":
+                    sys.stdout.write("wxyz ordinary detail")
+                    raise SystemExit(0)
                 stream = sys.stderr if entrypoint == "/failed" else sys.stdout
                 stream.write(os.environ["DOCKER_CONTEXT"])
                 stream.flush()
@@ -856,7 +865,13 @@ class CandidateBrokerCliTest(unittest.TestCase):
         docker.chmod(0o755)
         socket_path = self.temp / "bounded-diagnostic-broker.sock"
 
-        def request(capability, *, image="fixture:local", command="/completed"):
+        def request(
+            capability,
+            *,
+            image="fixture:local",
+            command="/completed",
+            output_byte_limit=4,
+        ):
             with socket.socket(socket.AF_UNIX) as client:
                 client.connect(capability["socket_path"])
                 client.sendall(
@@ -867,7 +882,7 @@ class CandidateBrokerCliTest(unittest.TestCase):
                                 "token": capability["token"],
                                 "command": [command],
                                 "execution": {"type": "container", "image": image},
-                                "output_byte_limit": 4,
+                                "output_byte_limit": output_byte_limit,
                                 "timeout_seconds": 0.1,
                             }
                         )
@@ -883,6 +898,7 @@ class CandidateBrokerCliTest(unittest.TestCase):
                     "PATH": str(fake_bin),
                     "DOCKER_CONTEXT": docker_context,
                     "DOCKER_CONFIG": docker_config,
+                    "CONTAINER_CONNECTION": "prod",
                 },
                 clear=False,
             ),
@@ -895,11 +911,16 @@ class CandidateBrokerCliTest(unittest.TestCase):
             live_capability = capability.request_value()
             responses = (
                 (request(live_capability, image="inspect-failure:local"), "stderr"),
+                (request(live_capability, image="bounded-prefix:local"), "stderr"),
                 (request(live_capability), "stdout"),
+                (request(live_capability, command="/bounded-prefix"), "stdout"),
                 (request(live_capability, command="/no-cid"), "stdout"),
                 (request(live_capability, command="/failed"), "stderr"),
                 (request(live_capability, command="/timeout"), "stdout"),
                 (request(live_capability, command="/partial"), "stdout"),
+            )
+            ordinary_response = request(
+                live_capability, command="/ordinary", output_byte_limit=100
             )
 
         for response, stream in responses:
@@ -909,6 +930,7 @@ class CandidateBrokerCliTest(unittest.TestCase):
                 self.assertNotIn(docker_context, json.dumps(response))
                 self.assertNotIn(docker_config[:4], json.dumps(response))
                 self.assertLessEqual(len(response[stream].encode("utf-8")), 4)
+        self.assertEqual(ordinary_response["stdout"], "help")
 
     def test_container_watchdog_cleans_up_after_broker_parent_death(self):
         selectors = (("docker", "DOCKER_HOST"), ("podman", "CONTAINER_HOST"))
