@@ -402,6 +402,20 @@ class CandidateBrokerCliTest(unittest.TestCase):
 
         self.assertTrue(is_exact_clean_commit(self.candidate, self.candidate_sha))
 
+    def test_exact_candidate_allows_gitignore_below_committed_ignored_directory(self):
+        from afk.checkouts import is_exact_clean_commit
+
+        (self.candidate / ".gitignore").write_text("generated/\n", encoding="utf-8")
+        self.git("add", ".gitignore")
+        self.git("commit", "-m", "ignore generated directory")
+        self.candidate_sha = self.git("rev-parse", "HEAD")
+        generated = self.candidate / "generated"
+        generated.mkdir()
+        (generated / ".gitignore").write_text("*\n", encoding="utf-8")
+        (generated / "output.log").write_text("generated\n", encoding="utf-8")
+
+        self.assertTrue(is_exact_clean_commit(self.candidate, self.candidate_sha))
+
     def test_exact_candidate_rejects_unignored_extra_file(self):
         from afk.checkouts import is_exact_clean_commit
 
@@ -414,6 +428,16 @@ class CandidateBrokerCliTest(unittest.TestCase):
 
         exclude = Path(self.git("rev-parse", "--git-path", "info/exclude"))
         exclude.write_text("unexpected.log\n", encoding="utf-8")
+        (self.candidate / "unexpected.log").write_text("unexpected\n", encoding="utf-8")
+
+        self.assertFalse(is_exact_clean_commit(self.candidate, self.candidate_sha))
+
+    def test_exact_candidate_does_not_trust_configured_global_excludes(self):
+        from afk.checkouts import is_exact_clean_commit
+
+        excludes = self.temp / "global-excludes"
+        excludes.write_text("unexpected.log\n", encoding="utf-8")
+        self.git("config", "core.excludesFile", str(excludes))
         (self.candidate / "unexpected.log").write_text("unexpected\n", encoding="utf-8")
 
         self.assertFalse(is_exact_clean_commit(self.candidate, self.candidate_sha))

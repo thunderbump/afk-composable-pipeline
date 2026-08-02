@@ -5,6 +5,7 @@ import os
 import re
 import stat
 import subprocess
+import tempfile
 from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.parse import unquote, urlsplit
@@ -329,22 +330,7 @@ def _worktree_matches_commit(path: Path, commit: str) -> bool:
         ["ls-tree", "-rz", "--full-tree", commit], cwd=path, text=False
     )
     index = run_trusted_read_git(["ls-files", "--stage", "-z"], cwd=path, text=False)
-    all_untracked = run_trusted_read_git(
-        ["ls-files", "--others", "-z"], cwd=path, text=False
-    )
-    untracked = run_trusted_read_git(
-        ["ls-files", "--others", "-z", "--exclude-per-directory=.gitignore"],
-        cwd=path,
-        text=False,
-    )
-    if (
-        tree.returncode != 0
-        or index.returncode != 0
-        or all_untracked.returncode != 0
-        or _contains_untracked_gitignore(all_untracked.stdout)
-        or untracked.returncode != 0
-        or untracked.stdout
-    ):
+    if tree.returncode != 0 or index.returncode != 0:
         return False
     try:
         entries = _parse_tree_entries(tree.stdout)
@@ -353,6 +339,12 @@ def _worktree_matches_commit(path: Path, commit: str) -> bool:
             for item_path, (mode, _object_type, object_id) in entries.items()
         }:
             return False
+        expected_paths = set(entries)
+        gitlinks = {
+            item_path
+            for item_path, (mode, object_type, _object_id) in entries.items()
+            if (mode, object_type) == (b"160000", b"commit")
+        }
         regular_blob_ids = {
             object_id
             for mode, object_type, object_id in entries.values()
@@ -360,6 +352,11 @@ def _worktree_matches_commit(path: Path, commit: str) -> bool:
             in {(b"100644", b"blob"), (b"100755", b"blob")}
         }
         blob_sizes = _git_blob_sizes(path, regular_blob_ids)
+        untracked_paths = _worktree_paths(path, gitlinks) - expected_paths
+        if not _committed_ignores_allow(
+            path, entries, blob_sizes, untracked_paths
+        ):
+            return False
         for item_path, (mode, object_type, object_id) in entries.items():
             target = path.joinpath(*PurePosixPath(os.fsdecode(item_path)).parts)
             if (mode, object_type) in {
@@ -423,12 +420,83 @@ def _require_git_path(item_path: bytes) -> None:
         raise ValueError("invalid Git path")
 
 
-def _contains_untracked_gitignore(output: bytes) -> bool:
-    return any(
-        b".gitignore" in item_path.split(b"/")
-        for item_path in output.rstrip(b"\0").split(b"\0")
-        if item_path
-    )
+def _worktree_paths(path: Path, gitlinks: set[bytes]) -> set[bytes]:
+    observed = set()
+    for root, directories, files in os.walk(path, topdown=True, followlinks=False):
+        root_path = Path(root)
+        for name in list(directories):
+            target = root_path / name
+            relative = os.fsencode(target.relative_to(path).as_posix())
+            if relative == b".git":
+                directories.remove(name)
+            elif relative in gitlinks or target.is_symlink():
+                observed.add(relative)
+                directories.remove(name)
+        for name in files:
+            target = root_path / name
+            relative = os.fsencode(target.relative_to(path).as_posix())
+            if relative != b".git":
+                observed.add(relative)
+    return observed
+
+
+def _committed_ignores_allow(
+    candidate: Path,
+    entries: dict[bytes, tuple[bytes, bytes, bytes]],
+    blob_sizes: dict[bytes, int],
+    untracked_paths: set[bytes],
+) -> bool:
+    if not untracked_paths:
+        return True
+    with tempfile.TemporaryDirectory(prefix="afk-ignore-") as temporary:
+        evaluation = Path(temporary)
+        initialized = run_trusted_read_git(["init", "--quiet"], cwd=evaluation)
+        if initialized.returncode != 0:
+            return False
+        for item_path, (mode, object_type, object_id) in entries.items():
+            if (
+                PurePosixPath(os.fsdecode(item_path)).name != ".gitignore"
+                or (mode, object_type)
+                not in {(b"100644", b"blob"), (b"100755", b"blob")}
+            ):
+                continue
+            target = evaluation.joinpath(
+                *PurePosixPath(os.fsdecode(item_path)).parts
+            )
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with target.open("wb") as output:
+                blob = run_trusted_read_git(
+                    ["cat-file", "blob", object_id.decode("ascii")],
+                    cwd=candidate,
+                    text=False,
+                    stdout=output,
+                )
+            if (
+                blob.returncode != 0
+                or target.stat().st_size != blob_sizes[object_id]
+            ):
+                return False
+        for item_path in untracked_paths:
+            _require_git_path(item_path)
+            target = evaluation.joinpath(
+                *PurePosixPath(os.fsdecode(item_path)).parts
+            )
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.touch()
+        checked = run_trusted_read_git(
+            ["check-ignore", "--no-index", "-z", "--stdin"],
+            cwd=evaluation,
+            text=False,
+            input_data=b"\0".join(sorted(untracked_paths)) + b"\0",
+        )
+        if checked.returncode not in {0, 1}:
+            return False
+        ignored = {
+            item_path
+            for item_path in checked.stdout.rstrip(b"\0").split(b"\0")
+            if item_path
+        }
+        return ignored == untracked_paths
 
 
 def _git_blob_id(content: bytes) -> bytes:
@@ -498,6 +566,7 @@ def run_trusted_read_git(
     cwd: Path,
     text: bool = True,
     input_data: str | bytes | None = None,
+    stdout: Any = subprocess.PIPE,
 ) -> subprocess.CompletedProcess[Any]:
     environment = {
         name: value for name, value in os.environ.items() if not name.startswith("GIT_")
@@ -524,7 +593,8 @@ def run_trusted_read_git(
             env=environment,
             text=text,
             input=input_data,
-            capture_output=True,
+            stdout=stdout,
+            stderr=subprocess.PIPE,
             check=False,
             timeout=120,
         )
