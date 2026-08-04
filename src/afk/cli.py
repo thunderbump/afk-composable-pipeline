@@ -113,6 +113,15 @@ def main(
         print(run_id)
         return exit_code
 
+    if args.command == "supersede":
+        try:
+            projection = RunStore().supersede_active_run(args.reason)
+        except RunStoreError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        print(projection["run_id"])
+        return 0
+
     if args.command == "_worker":
         return run_worker(args.run_id)
 
@@ -126,10 +135,10 @@ def main(
             projection = store.status(args.run_id)
             observation = None
             observation_error = None
-            if (
-                "worker_exit_code" not in projection
-                and projection["state"] != "completed"
-            ):
+            if "worker_exit_code" not in projection and projection["state"] not in {
+                "completed",
+                "superseded",
+            }:
                 active_run_id = (
                     projection["run_id"]
                     if args.run_id is None
@@ -144,7 +153,7 @@ def main(
                 if (
                     observation_error is not None
                     and "worker_exit_code" not in projection
-                    and projection["state"] != "completed"
+                    and projection["state"] not in {"completed", "superseded"}
                 ):
                     raise observation_error
             output = dict(projection)
@@ -650,6 +659,11 @@ def build_parser() -> argparse.ArgumentParser:
     resume_parser.add_argument("run_id", nargs="?")
     resume_parser.add_argument("--note")
 
+    supersede_parser = subcommands.add_parser(
+        "supersede", help="Retire the Active Run after retained attention"
+    )
+    supersede_parser.add_argument("--reason", required=True)
+
     worker_parser = subcommands.add_parser("_worker", help=argparse.SUPPRESS)
     worker_parser.add_argument("run_id")
 
@@ -898,7 +912,7 @@ def _run_report(projection: dict[str, Any]) -> dict[str, Any]:
         "paused": projection["state"] == "attention_required",
         "updated_at": projection["updated_at"],
     }
-    for key in ("candidate_sha", "attention"):
+    for key in ("candidate_sha", "attention", "supersession"):
         if key in projection:
             report[key] = projection[key]
     report["retrospective"] = projection["retrospective"]

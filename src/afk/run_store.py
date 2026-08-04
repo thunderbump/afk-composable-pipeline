@@ -454,6 +454,58 @@ class RunStore:
     def active_run_id(self) -> str | None:
         return self._active_run_id()
 
+    def supersede_active_run(self, reason: str) -> dict[str, Any]:
+        reason = reason.strip()
+        if not reason:
+            raise RunStoreError("supersession reason must not be empty")
+        with self.lock(validate_root_permissions=True):
+            projection, active_run_id = self._validated_resume_context()
+            if active_run_id != projection["run_id"]:
+                raise EventHistoryCorrupt(
+                    "Active Run pointer does not match superseded Run"
+                )
+            episode = self._validated_attention_episode(
+                projection["run_id"], projection
+            )
+            if projection["state"] == "superseded":
+                supersession = projection.get("supersession")
+                event = self.event(projection["run_id"], projection["last_sequence"])
+                expected = {
+                    "reason": reason,
+                    "attention_episode_sequence": (
+                        episode["episode_sequence"] if episode is not None else None
+                    ),
+                }
+                if (
+                    supersession != expected
+                    or event.get("event") != "run.superseded"
+                    or event.get("state") != "superseded"
+                    or event.get("data", {}).get("supersession") != expected
+                ):
+                    raise EventHistoryCorrupt("supersession event is invalid")
+                self._clear_active_pointer(projection["run_id"])
+                return projection
+            if projection["state"] != "attention_required" or episode is None:
+                raise RunStoreError(
+                    "only an attention_required Active Run can be superseded"
+                )
+            projection = self._append_event_unlocked(
+                projection["run_id"],
+                "run.superseded",
+                state="superseded",
+                data={
+                    "checkpoint": "superseded",
+                    "attention": {},
+                    "supersession": {
+                        "reason": reason,
+                        "attention_episode_sequence": episode["episode_sequence"],
+                    },
+                },
+                recorded_at=None,
+            )
+            self._clear_active_pointer(projection["run_id"])
+            return projection
+
     def validated_attention_episode(
         self,
         run_id: str,
@@ -2044,6 +2096,8 @@ class RunStore:
             identity = self._identity(run_dir.name)
             events, _ = self._read_events(run_dir.name)
             projection = _project(identity, events)
+            if projection["state"] == "superseded":
+                continue
             if projection[
                 "state"
             ] != "completed" or not self._completion_episode_finalized(
@@ -2529,6 +2583,7 @@ def _project(identity: dict[str, Any], events: list[dict[str, Any]]) -> dict[str
         "bead_spec",
         "interrupted_repair",
         "lifecycle_interruption",
+        "supersession",
     ):
         if key in details:
             projection[key] = details[key]

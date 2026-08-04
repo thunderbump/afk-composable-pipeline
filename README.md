@@ -60,6 +60,17 @@ completes:
 PYTHONPATH=src python3 -m afk report [run-id]
 ```
 
+When an `attention_required` Run must remain as evidence but its pinned base is
+intentionally obsolete, retire only that Active Run with an operator reason:
+
+```sh
+PYTHONPATH=src python3 -m afk supersede --reason "target validator trust root was replaced"
+```
+
+Supersession appends a terminal audit event and clears the Active Run pointer;
+it does not rewrite or delete the retained Run, its attention episode, or its
+evidence. Other Run states and empty reasons fail closed.
+
 The report preserves the existing Run State and exposes `complete` and
 `paused` booleans. An initial bootstrap authorization report supplies a safe
 tracked-executable placeholder instead of inventing an artifact identity. A

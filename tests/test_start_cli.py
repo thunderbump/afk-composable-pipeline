@@ -330,6 +330,93 @@ class StartCliTest(unittest.TestCase):
             check=False,
         )
 
+    def test_supersede_retires_attention_run_and_allows_a_fresh_start(self):
+        started = self.run_afk(
+            "start",
+            "central-bnkl.1.1",
+            AFK_FAKE_SYSTEMD_FAILURE="1",
+        )
+        self.assertEqual(started.returncode, 2, started.stderr)
+        run_id = started.stdout.strip()
+
+        superseded = self.run_afk(
+            "supersede",
+            "--reason",
+            "target validator trust root was replaced",
+        )
+
+        self.assertEqual(superseded.returncode, 0, superseded.stderr)
+        self.assertEqual(superseded.stdout.strip(), run_id)
+        old_status = self.run_afk("status", run_id, "--json")
+        self.assertEqual(old_status.returncode, 0, old_status.stderr)
+        old_projection = json.loads(old_status.stdout)
+        self.assertEqual(old_projection["state"], "superseded")
+        self.assertEqual(
+            old_projection["supersession"]["reason"],
+            "target validator trust root was replaced",
+        )
+        old_report = self.run_afk("report", run_id)
+        self.assertEqual(old_report.returncode, 0, old_report.stderr)
+        self.assertEqual(
+            json.loads(old_report.stdout)["supersession"],
+            old_projection["supersession"],
+        )
+        no_active = self.run_afk("status", "--json")
+        self.assertEqual(no_active.returncode, 1)
+        self.assertIn("no Active Run", no_active.stderr)
+
+        restarted = self.run_afk(
+            "start",
+            "central-bnkl.1.1",
+            AFK_FAKE_SYSTEMD_FAILURE="1",
+        )
+        self.assertEqual(restarted.returncode, 2, restarted.stderr)
+        self.assertNotEqual(restarted.stdout.strip(), run_id)
+
+    def test_supersede_rejects_an_empty_reason_without_retiring_the_run(self):
+        started = self.run_afk(
+            "start",
+            "central-bnkl.1.1",
+            AFK_FAKE_SYSTEMD_FAILURE="1",
+        )
+        self.assertEqual(started.returncode, 2, started.stderr)
+        run_id = started.stdout.strip()
+
+        superseded = self.run_afk("supersede", "--reason", "   ")
+
+        self.assertEqual(superseded.returncode, 2)
+        self.assertIn("reason must not be empty", superseded.stderr)
+        active = self.run_afk("status", "--json")
+        self.assertEqual(active.returncode, 2, active.stderr)
+        self.assertEqual(json.loads(active.stdout)["run_id"], run_id)
+        self.assertEqual(json.loads(active.stdout)["state"], "attention_required")
+
+    def test_supersede_reconciles_a_crash_after_the_terminal_event(self):
+        started = self.run_afk(
+            "start",
+            "central-bnkl.1.1",
+            AFK_FAKE_SYSTEMD_FAILURE="1",
+        )
+        self.assertEqual(started.returncode, 2, started.stderr)
+        run_id = started.stdout.strip()
+        reason = "target validator trust root was replaced"
+
+        interrupted = self.run_afk(
+            "supersede",
+            "--reason",
+            reason,
+            AFK_TEST_KILL_AFTER_EVENT_WRITE="run.superseded",
+        )
+        self.assertEqual(interrupted.returncode, -signal.SIGKILL)
+
+        reconciled = self.run_afk("supersede", "--reason", reason)
+
+        self.assertEqual(reconciled.returncode, 0, reconciled.stderr)
+        self.assertEqual(reconciled.stdout.strip(), run_id)
+        no_active = self.run_afk("status", "--json")
+        self.assertEqual(no_active.returncode, 1)
+        self.assertIn("no Active Run", no_active.stderr)
+
     def assert_exact_retrospective_outcome(
         self,
         store,
