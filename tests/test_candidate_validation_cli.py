@@ -2441,6 +2441,53 @@ class CandidateValidationCliTest(unittest.TestCase):
         self.assertEqual(completed.stdout, "a" * 16)
         self.assertEqual(completed.stderr, "b" * 16)
 
+    def test_supervised_wrapper_forwards_trusted_host_mode_and_translates_errors(
+        self,
+    ):
+        failure = candidate_validation.SupervisedCommandError(
+            "output_overflow",
+            "review output exceeded its limit",
+            stdout="partial stdout",
+            stderr="partial stderr",
+        )
+
+        with (
+            patch.object(
+                candidate_validation,
+                "_run_supervised_command",
+                autospec=True,
+                side_effect=failure,
+            ) as supervised,
+            self.assertRaises(candidate_validation.CandidateValidationError) as raised,
+        ):
+            candidate_validation.run_supervised_command(
+                ["codex", "exec"],
+                cwd=self.repository,
+                environment={"PATH": "/usr/bin:/bin"},
+                timeout_seconds=12.5,
+                input_text="review request",
+                label="reviewer",
+                output_byte_limit=1234,
+                cleanup_seconds=0.25,
+                _trusted_host_command=True,
+            )
+
+        self.assertEqual(raised.exception.kind, "invalid")
+        self.assertEqual(raised.exception.summary, "review output exceeded its limit")
+        self.assertEqual(raised.exception.stdout, "partial stdout")
+        self.assertEqual(raised.exception.stderr, "partial stderr")
+        supervised.assert_called_once_with(
+            ["codex", "exec"],
+            cwd=self.repository,
+            environment={"PATH": "/usr/bin:/bin"},
+            timeout_seconds=12.5,
+            input_text="review request",
+            label="reviewer",
+            output_byte_limit=1234,
+            cleanup_seconds=0.25,
+            _trusted_host_command=True,
+        )
+
     def test_validation_output_size_is_bounded(self):
         completed_marker = self.temp / "oversized-output-completed"
         self.write_contract_worker(

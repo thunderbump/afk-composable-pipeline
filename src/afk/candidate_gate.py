@@ -948,6 +948,7 @@ def _execute_reviewer(
                 input_text=prompt,
                 timeout_seconds=3600,
                 label=f"{axis} reviewer",
+                _trusted_host_command=True,
             )
         except CandidateValidationError as exc:
             raise GateError(
