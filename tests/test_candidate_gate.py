@@ -216,6 +216,36 @@ class CandidateGateTest(unittest.TestCase):
             self.assertNotIn(f'"{home}" = "read"', config)
             self.assertNotIn(f'"{home}" = "write"', config)
 
+    def test_reviewer_avoids_outer_namespace_around_codex_sandbox(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            worktree = root / "worktree"
+            bundle = root / "bundle"
+            attempt = root / "attempt"
+            worktree.mkdir()
+            bundle.mkdir()
+            attempt.mkdir()
+            (bundle / "bundle.json").write_text(
+                json.dumps({"candidate_sha": "a" * 40}),
+                encoding="utf-8",
+            )
+
+            with mock.patch(
+                "afk.candidate_gate.run_supervised_command",
+                return_value=subprocess.CompletedProcess([], 1, "", ""),
+            ) as supervised:
+                candidate_gate_module._execute_reviewer(
+                    "standards", bundle, attempt, worktree
+                )
+
+            self.assertIs(
+                supervised.call_args.kwargs["_trusted_host_command"],
+                True,
+            )
+            command = supervised.call_args.args[0]
+            self.assertIn('default_permissions="afk_review"', command)
+            self.assertIn("network = { enabled = false }", " ".join(command))
+
     def test_normalized_review_redacts_summary_title_and_body(self):
         result = normalize_review_result(
             "standards",
