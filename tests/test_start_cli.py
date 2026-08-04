@@ -494,6 +494,51 @@ class StartCliTest(unittest.TestCase):
                 run_id="fresh-run",
             )
 
+    def test_later_state_does_not_resurrect_a_superseded_run(self):
+        started = self.run_afk(
+            "start",
+            "central-bnkl.1.1",
+            AFK_FAKE_SYSTEMD_FAILURE="1",
+        )
+        self.assertEqual(started.returncode, 2, started.stderr)
+        run_id = started.stdout.strip()
+        superseded = self.run_afk(
+            "supersede",
+            "--reason",
+            "retire obsolete run",
+        )
+        self.assertEqual(superseded.returncode, 0, superseded.stderr)
+        store = RunStore(self.state_home / "afk")
+        store.append_event(
+            run_id,
+            "worker.terminal",
+            state="claimed",
+            data={
+                "checkpoint": "claimed",
+                "worker_exit_code": 0,
+                "worker_result": "completed",
+            },
+        )
+
+        named_status = self.run_afk("status", run_id, "--json")
+        self.assertEqual(named_status.returncode, 1)
+        self.assertIn("supersession event is invalid", named_status.stderr)
+        self.assertEqual(named_status.stdout, "")
+        with self.assertRaisesRegex(
+            EventHistoryCorrupt, "supersession event is invalid"
+        ):
+            store.active_run_id()
+        with self.assertRaisesRegex(
+            EventHistoryCorrupt, "supersession event is invalid"
+        ):
+            store.create_run(
+                bead_id="central-bnkl.1.2",
+                repository="thunderbump/beads-webui",
+                base_branch="main",
+                base_sha="b" * 40,
+                run_id="fresh-run",
+            )
+
     def assert_exact_retrospective_outcome(
         self,
         store,

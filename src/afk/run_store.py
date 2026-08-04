@@ -450,8 +450,7 @@ class RunStore:
         identity = self._identity(selected)
         events, _ = self._read_events(selected)
         projection = _project(identity, events)
-        if projection["state"] == "superseded":
-            self._validated_supersession(selected, projection)
+        self._validated_supersession(selected, projection)
         return projection
 
     def active_run_id(self) -> str | None:
@@ -2094,8 +2093,8 @@ class RunStore:
             identity = self._identity(run_dir.name)
             events, _ = self._read_events(run_dir.name)
             projection = _project(identity, events)
-            if projection["state"] == "superseded":
-                self._validated_supersession(run_dir.name, projection)
+            supersession = self._validated_supersession(run_dir.name, projection)
+            if supersession is not None:
                 continue
             if projection[
                 "state"
