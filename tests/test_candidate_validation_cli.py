@@ -89,6 +89,72 @@ class CandidateValidationCliTest(unittest.TestCase):
         )
         self.assertEqual(stat.S_IMODE(evidence.stat().st_mode), 0o500)
 
+    def test_validation_accepts_an_uninitialized_pinned_gitlink(self):
+        self.write_contract_worker(
+            status="passed",
+            exit_code=0,
+            checks=[{"name": "tests", "status": "passed", "log_path": "tests.log"}],
+        )
+        submodule = self.temp / "submodule"
+        submodule.mkdir()
+
+        def submodule_git(*args):
+            return subprocess.run(
+                ["git", *args],
+                cwd=submodule,
+                text=True,
+                capture_output=True,
+                check=True,
+            ).stdout.strip()
+
+        submodule_git("init", "-b", "main")
+        submodule_git("config", "user.email", "afk@example.invalid")
+        submodule_git("config", "user.name", "AFK Test")
+        (submodule / "input.txt").write_text("submodule\n", encoding="utf-8")
+        submodule_git("add", ".")
+        submodule_git("commit", "-m", "submodule")
+        submodule_sha = submodule_git("rev-parse", "HEAD")
+        self.git(
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            str(submodule),
+            "nested",
+        )
+        run_id, candidate_sha = self.candidate_ready_run()
+        self.assertIn(
+            f"160000 commit {submodule_sha}",
+            self.git("ls-tree", candidate_sha, "--", "nested"),
+        )
+        self.git("submodule", "deinit", "-f", "nested")
+        self.assertEqual(list((self.repository / "nested").iterdir()), [])
+
+        completed = self.run_afk("resume")
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(self.status(run_id)["checkpoint"], "validated")
+
+    def test_resume_retries_head_mismatch_after_candidate_reconciliation(self):
+        self.write_contract_worker(
+            status="passed",
+            exit_code=0,
+            checks=[{"name": "tests", "status": "passed", "log_path": "tests.log"}],
+        )
+        run_id, _ = self.candidate_ready_run()
+        (self.repository / "validate.py").write_text("drift\n", encoding="utf-8")
+
+        mismatched = self.run_afk("resume")
+
+        self.assertEqual(mismatched.returncode, 2, mismatched.stderr)
+        self.assertEqual(self.status(run_id)["attention"]["kind"], "head_mismatch")
+        self.git("checkout", "--", "validate.py")
+
+        resumed = self.run_afk("resume")
+
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        self.assertEqual(self.status(run_id)["checkpoint"], "validated")
+
     def test_normal_validation_exposes_only_a_candidate_broker_capability(self):
         (self.repository / "README.md").write_text(
             "exact Candidate input\n", encoding="utf-8"
