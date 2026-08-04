@@ -176,7 +176,12 @@ def produce_candidate(
             branch=branch,
         )
         if legacy_blocked_retry_available(attempt_state):
-            _require_legacy_blocked_retry(store, run_id, attempt_state=attempt_state)
+            _require_legacy_blocked_retry(
+                store,
+                run_id,
+                attempt_state=attempt_state,
+                base_sha=base_sha,
+            )
         report, attempt_state = _run_implementation_attempt(
             store,
             run_id,
@@ -637,6 +642,8 @@ def _accept_implementation_report(
         retryable = (
             report is not None
             and report["status"] == "blocked"
+            and report["starting_sha"] == base_sha
+            and report["ending_sha"] == base_sha
             and interruption_is_retryable(attempt_state)
             and _implementation_checkout(worktree) == (base_sha, branch, "")
         )
@@ -660,6 +667,7 @@ def _require_legacy_blocked_retry(
     run_id: str,
     *,
     attempt_state: dict[str, Any],
+    base_sha: str,
 ) -> None:
     attempt = attempt_state["evidence"]
     attempt_path = store.root / "runs" / run_id / attempt
@@ -667,11 +675,17 @@ def _require_legacy_blocked_retry(
         raise CandidateError("implementation evidence could not be verified")
     report = _read_report(attempt_path / "report.json")
     recovery = _implementation_interruption(attempt_path / "recovery.json")
-    if report["status"] != "blocked" or recovery != {
-        "status": "interrupted",
-        "summary": attempt_state["summary"],
-        "retryable": False,
-    }:
+    if (
+        report["status"] != "blocked"
+        or report["starting_sha"] != base_sha
+        or report["ending_sha"] != base_sha
+        or recovery
+        != {
+            "status": "interrupted",
+            "summary": attempt_state["summary"],
+            "retryable": False,
+        }
+    ):
         raise CandidateError("legacy blocked implementation evidence is invalid")
 
 

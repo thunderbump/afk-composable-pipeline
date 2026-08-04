@@ -1324,6 +1324,16 @@ class CandidateTest(unittest.TestCase):
         self.assertEqual(implementation["attempt_id"], "implementation-2")
         self.assertEqual(implementation["status"], "completed")
 
+    def test_blocked_report_with_mismatched_shas_does_not_allow_another_attempt(self):
+        with self.assertRaisesRegex(CandidateError, "blocked"):
+            self.produce(CODEX_FAKE_OUTCOME="blocked_mismatched_shas")
+
+        implementation = self.store.status("run-1")["implementation_attempt"]
+        self.assertFalse(implementation["retryable"])
+        with self.assertRaises(CandidateError):
+            self.produce()
+        self.assertFalse((self.state / "runs/run-1/attempts/implementation-2").exists())
+
     def test_legacy_flat_candidate_branch_fails_closed(self):
         with self.assertRaisesRegex(CandidateError, "per-Run namespace"):
             candidate_module._codex_permission_args(
@@ -1423,7 +1433,7 @@ class CandidateTest(unittest.TestCase):
                     subprocess.Popen([sys.executable, "-c", child], cwd=cwd)
                     signal.signal(signal.SIGTERM, signal.SIG_IGN)
                     time.sleep(30)
-                if outcome not in {"no_change", "blocked", "nonzero", "malformed"}:
+                if outcome not in {"no_change", "blocked", "blocked_mismatched_shas", "nonzero", "malformed"}:
                     (cwd / changed).write_text("candidate\\n", encoding="utf-8")
                     subprocess.run(["git", "add", changed], cwd=cwd, check=True)
                     subprocess.run(["git", "commit", "-m", "repair" if repair else "candidate"], cwd=cwd, check=True, capture_output=True)  # noqa: E501
@@ -1439,13 +1449,16 @@ class CandidateTest(unittest.TestCase):
                     report.write_text("not json", encoding="utf-8")
                 else:
                     value = {{
-                        "status": outcome if outcome in {"no_change", "blocked"} else "completed",  # noqa: E501
+                        "status": outcome if outcome in {"no_change", "blocked"} else "blocked" if outcome == "blocked_mismatched_shas" else "completed",  # noqa: E501
                         "starting_sha": start,
                         "ending_sha": end,
                         "summary": "implemented",
                         "checks": [],
                         "changed_areas": [changed],
                     }}
+                    if outcome == "blocked_mismatched_shas":
+                        value["starting_sha"] = "c" * 40
+                        value["ending_sha"] = "d" * 40
                     if repair:
                         value["dispositions"] = [{{"finding_id": "validation-smoke", "disposition": "addressed"}}]
                     report.write_text(json.dumps(value), encoding="utf-8")
