@@ -357,11 +357,15 @@ def reconcile_gate_comment(
                 "Gate Cycle PR evidence comment URL drifted during posting",
                 kind="conflict",
             )
-    if effect["status"] == "confirmed" and effect.get("observed") != observed:
-        raise GateError(
-            "confirmed Gate Cycle comment contradicts GitHub",
-            kind="conflict",
-        )
+    if effect["status"] == "confirmed":
+        if _stable_gate_comment_observation(
+            effect.get("observed")
+        ) != _stable_gate_comment_observation(observed):
+            raise GateError(
+                "confirmed Gate Cycle comment contradicts GitHub",
+                kind="conflict",
+            )
+        return
     store.confirm_effect(run_id, effect_id, observed=observed)
 
 
@@ -440,6 +444,12 @@ def _observe_gate_comment(
 
 def _stable_gate_comment_url(url: str) -> str:
     return re.sub(r"#issuecomment-[0-9]+$", "", url)
+
+
+def _stable_gate_comment_observation(observed: Any) -> Any:
+    if not isinstance(observed, dict) or not isinstance(observed.get("url"), str):
+        return observed
+    return {**observed, "url": _stable_gate_comment_url(observed["url"])}
 
 
 def run_candidate_reviews(

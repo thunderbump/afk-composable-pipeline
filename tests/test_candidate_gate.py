@@ -2100,6 +2100,74 @@ class CandidateGateTest(unittest.TestCase):
                     store, run_id, pr_number=7, worktree=root, gate=gate
                 )
 
+    def test_gate_comment_reconciles_a_confirmed_full_permalink_effect(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store = RunStore(root / "state")
+            run_id = store.create_run(
+                bead_id="central-test.1",
+                repository="owner/project",
+                base_branch="main",
+                base_sha="a" * 40,
+                start_request={},
+                run_id="run-1",
+            )["run_id"]
+            gate = {
+                "cycle": 1,
+                "candidate_sha": "b" * 40,
+                "validation": {"status": "passed", "summary": "passed"},
+                "reviews": [],
+                "next_action": "attention",
+            }
+            intended = candidate_gate_module._gate_comment_identity(
+                store.identity(run_id),
+                run_id,
+                pr_number=7,
+                gate=gate,
+            )
+            body = candidate_gate_module._gate_comment_body(gate, intended["marker"])
+            full_permalink = "https://github.com/owner/project/pull/7#issuecomment-123"
+            confirmed_observation = {**intended, "url": full_permalink}
+            store.prepare_effect(
+                run_id,
+                "gate-comment-1",
+                kind="gate-comment",
+                intended=intended,
+            )
+            store.confirm_effect(
+                run_id,
+                "gate-comment-1",
+                observed=confirmed_observation,
+            )
+            effect_path = (
+                root / "state" / "runs" / run_id / "effects" / "gate-comment-1.json"
+            )
+            legacy_effect = json.loads(effect_path.read_text(encoding="utf-8"))
+            legacy_effect["observed"] = confirmed_observation
+            effect_path.write_text(
+                json.dumps(legacy_effect, sort_keys=True, separators=(",", ":")) + "\n",
+                encoding="utf-8",
+            )
+            legacy_bytes = effect_path.read_bytes()
+
+            with (
+                mock.patch(
+                    "afk.candidate_gate._github_comments",
+                    return_value=[{"body": body, "html_url": full_permalink}],
+                ),
+                mock.patch("afk.candidate_gate._post_gate_comment") as replacement,
+            ):
+                reconcile_gate_comment(
+                    store, run_id, pr_number=7, worktree=root, gate=gate
+                )
+
+            replacement.assert_not_called()
+            self.assertEqual(
+                store.effect(run_id, "gate-comment-1")["observed"],
+                confirmed_observation,
+            )
+            self.assertEqual(effect_path.read_bytes(), legacy_bytes)
+
     def test_gate_comment_reconciles_a_confirmed_pre_projection_effect(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
