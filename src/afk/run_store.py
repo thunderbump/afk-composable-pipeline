@@ -449,10 +449,59 @@ class RunStore:
         _validate_run_id(selected)
         identity = self._identity(selected)
         events, _ = self._read_events(selected)
-        return _project(identity, events)
+        projection = _project(identity, events)
+        self._validated_supersession(selected, projection)
+        return projection
 
     def active_run_id(self) -> str | None:
         return self._active_run_id()
+
+    def supersede_active_run(self, reason: str) -> dict[str, Any]:
+        reason = redact_text(reason.strip())
+        if not reason:
+            raise RunStoreError("supersession reason must not be empty")
+        with self.lock(validate_root_permissions=True):
+            projection, active_run_id = self._validated_resume_context()
+            if active_run_id != projection["run_id"]:
+                raise EventHistoryCorrupt(
+                    "Active Run pointer does not match superseded Run"
+                )
+            episode = self._validated_attention_episode(
+                projection["run_id"], projection
+            )
+            if projection["state"] == "superseded":
+                supersession = self._validated_supersession(
+                    projection["run_id"], projection
+                )
+                expected = {
+                    "reason": reason,
+                    "attention_episode_sequence": (
+                        episode["episode_sequence"] if episode is not None else None
+                    ),
+                }
+                if supersession != expected:
+                    raise EventHistoryCorrupt("supersession event is invalid")
+                self._clear_active_pointer(projection["run_id"])
+                return projection
+            if projection["state"] != "attention_required" or episode is None:
+                raise RunStoreError(
+                    "only an attention_required Active Run can be superseded"
+                )
+            projection = self._append_event_unlocked(
+                projection["run_id"],
+                "run.superseded",
+                state="superseded",
+                data={
+                    "checkpoint": "superseded",
+                    "supersession": {
+                        "reason": reason,
+                        "attention_episode_sequence": episode["episode_sequence"],
+                    },
+                },
+                recorded_at=None,
+            )
+            self._clear_active_pointer(projection["run_id"])
+            return projection
 
     def validated_attention_episode(
         self,
@@ -2044,6 +2093,9 @@ class RunStore:
             identity = self._identity(run_dir.name)
             events, _ = self._read_events(run_dir.name)
             projection = _project(identity, events)
+            supersession = self._validated_supersession(run_dir.name, projection)
+            if supersession is not None:
+                continue
             if projection[
                 "state"
             ] != "completed" or not self._completion_episode_finalized(
@@ -2185,6 +2237,44 @@ class RunStore:
         if latest != episode:
             raise EventHistoryCorrupt("attention episode marker is invalid")
         return episode
+
+    def _validated_supersession(
+        self,
+        run_id: str,
+        projection: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        supersession = projection.get("supersession")
+        if projection.get("state") != "superseded":
+            if supersession is not None:
+                raise EventHistoryCorrupt("supersession event is invalid")
+            return None
+        episode = self._validated_attention_episode(run_id, projection)
+        reason = supersession.get("reason") if isinstance(supersession, dict) else None
+        expected = {
+            "reason": reason,
+            "attention_episode_sequence": (
+                episode["episode_sequence"] if episode is not None else None
+            ),
+        }
+        event = self.event(run_id, projection["last_sequence"])
+        if (
+            episode is None
+            or not isinstance(reason, str)
+            or not reason.strip()
+            or reason.strip() != reason
+            or redact_text(reason) != reason
+            or supersession != expected
+            or event.get("event") != "run.superseded"
+            or event.get("state") != "superseded"
+            or event.get("data")
+            != {
+                "checkpoint": "superseded",
+                "supersession": expected,
+            }
+            or projection.get("checkpoint") != "superseded"
+        ):
+            raise EventHistoryCorrupt("supersession event is invalid")
+        return supersession
 
     def _validated_episode(
         self,
@@ -2529,6 +2619,7 @@ def _project(identity: dict[str, Any], events: list[dict[str, Any]]) -> dict[str
         "bead_spec",
         "interrupted_repair",
         "lifecycle_interruption",
+        "supersession",
     ):
         if key in details:
             projection[key] = details[key]

@@ -330,6 +330,215 @@ class StartCliTest(unittest.TestCase):
             check=False,
         )
 
+    def test_supersede_retires_attention_run_and_allows_a_fresh_start(self):
+        started = self.run_afk(
+            "start",
+            "central-bnkl.1.1",
+            AFK_FAKE_SYSTEMD_FAILURE="1",
+        )
+        self.assertEqual(started.returncode, 2, started.stderr)
+        run_id = started.stdout.strip()
+        attention_status = self.run_afk("status", run_id, "--json")
+        self.assertEqual(attention_status.returncode, 2, attention_status.stderr)
+        original_attention = {
+            key: json.loads(attention_status.stdout)["attention"][key]
+            for key in ("scope", "kind", "summary")
+        }
+
+        superseded = self.run_afk(
+            "supersede",
+            "--reason",
+            "target validator trust root was replaced",
+        )
+
+        self.assertEqual(superseded.returncode, 0, superseded.stderr)
+        self.assertEqual(superseded.stdout.strip(), run_id)
+        old_status = self.run_afk("status", run_id, "--json")
+        self.assertEqual(old_status.returncode, 0, old_status.stderr)
+        old_projection = json.loads(old_status.stdout)
+        self.assertEqual(old_projection["state"], "superseded")
+        self.assertEqual(
+            old_projection["supersession"]["reason"],
+            "target validator trust root was replaced",
+        )
+        self.assertEqual(
+            {key: old_projection["attention"][key] for key in original_attention},
+            original_attention,
+        )
+        for key in ("recommended_resume", "resume_precondition", "unit_observation"):
+            self.assertNotIn(key, old_projection)
+        old_report = self.run_afk("report", run_id)
+        self.assertEqual(old_report.returncode, 0, old_report.stderr)
+        report = json.loads(old_report.stdout)
+        self.assertEqual(
+            report["supersession"],
+            old_projection["supersession"],
+        )
+        self.assertEqual(
+            {key: report["attention"][key] for key in original_attention},
+            original_attention,
+        )
+        no_active = self.run_afk("status", "--json")
+        self.assertEqual(no_active.returncode, 1)
+        self.assertIn("no Active Run", no_active.stderr)
+
+        restarted = self.run_afk(
+            "start",
+            "central-bnkl.1.1",
+            AFK_FAKE_SYSTEMD_FAILURE="1",
+        )
+        self.assertEqual(restarted.returncode, 2, restarted.stderr)
+        self.assertNotEqual(restarted.stdout.strip(), run_id)
+
+    def test_supersede_rejects_an_empty_reason_without_retiring_the_run(self):
+        started = self.run_afk(
+            "start",
+            "central-bnkl.1.1",
+            AFK_FAKE_SYSTEMD_FAILURE="1",
+        )
+        self.assertEqual(started.returncode, 2, started.stderr)
+        run_id = started.stdout.strip()
+
+        superseded = self.run_afk("supersede", "--reason", "   ")
+
+        self.assertEqual(superseded.returncode, 2)
+        self.assertIn("reason must not be empty", superseded.stderr)
+        active = self.run_afk("status", "--json")
+        self.assertEqual(active.returncode, 2, active.stderr)
+        self.assertEqual(json.loads(active.stdout)["run_id"], run_id)
+        self.assertEqual(json.loads(active.stdout)["state"], "attention_required")
+
+    def test_supersede_reconciles_a_crash_after_the_terminal_event(self):
+        started = self.run_afk(
+            "start",
+            "central-bnkl.1.1",
+            AFK_FAKE_SYSTEMD_FAILURE="1",
+        )
+        self.assertEqual(started.returncode, 2, started.stderr)
+        run_id = started.stdout.strip()
+        reason = "target validator token=super-secret-value was replaced"
+        redacted_reason = "target validator token=[REDACTED] was replaced"
+
+        interrupted = self.run_afk(
+            "supersede",
+            "--reason",
+            reason,
+            AFK_TEST_KILL_AFTER_EVENT_WRITE="run.superseded",
+        )
+        self.assertEqual(interrupted.returncode, -signal.SIGKILL)
+
+        persisted = self.run_afk("status", run_id, "--json")
+        self.assertEqual(persisted.returncode, 0, persisted.stderr)
+        self.assertEqual(
+            json.loads(persisted.stdout)["supersession"]["reason"],
+            redacted_reason,
+        )
+        report = self.run_afk("report", run_id)
+        self.assertEqual(report.returncode, 0, report.stderr)
+        self.assertEqual(
+            json.loads(report.stdout)["supersession"]["reason"],
+            redacted_reason,
+        )
+
+        reconciled = self.run_afk("supersede", "--reason", reason)
+
+        self.assertEqual(reconciled.returncode, 0, reconciled.stderr)
+        self.assertEqual(reconciled.stdout.strip(), run_id)
+        no_active = self.run_afk("status", "--json")
+        self.assertEqual(no_active.returncode, 1)
+        self.assertIn("no Active Run", no_active.stderr)
+
+    def test_forged_superseded_state_does_not_release_active_run(self):
+        store = RunStore(self.state_home / "afk")
+        store.create_run(
+            bead_id="central-bnkl.1.1",
+            repository="thunderbump/beads-webui",
+            base_branch="main",
+            base_sha="a" * 40,
+            run_id="forged-supersession",
+        )
+        store.append_event(
+            "forged-supersession",
+            "run.superseded",
+            state="superseded",
+            data={
+                "checkpoint": "superseded",
+                "attention": {},
+                "supersession": {
+                    "reason": "retire obsolete run",
+                    "attention_episode_sequence": 1,
+                },
+            },
+        )
+
+        named_status = self.run_afk("status", "forged-supersession", "--json")
+        self.assertEqual(named_status.returncode, 1)
+        self.assertIn("supersession event is invalid", named_status.stderr)
+        self.assertEqual(named_status.stdout, "")
+        named_report = self.run_afk("report", "forged-supersession")
+        self.assertEqual(named_report.returncode, 2)
+        self.assertIn("supersession event is invalid", named_report.stderr)
+        self.assertEqual(named_report.stdout, "")
+        with self.assertRaisesRegex(
+            EventHistoryCorrupt, "supersession event is invalid"
+        ):
+            store.active_run_id()
+        with self.assertRaisesRegex(
+            EventHistoryCorrupt, "supersession event is invalid"
+        ):
+            store.create_run(
+                bead_id="central-bnkl.1.2",
+                repository="thunderbump/beads-webui",
+                base_branch="main",
+                base_sha="b" * 40,
+                run_id="fresh-run",
+            )
+
+    def test_later_state_does_not_resurrect_a_superseded_run(self):
+        started = self.run_afk(
+            "start",
+            "central-bnkl.1.1",
+            AFK_FAKE_SYSTEMD_FAILURE="1",
+        )
+        self.assertEqual(started.returncode, 2, started.stderr)
+        run_id = started.stdout.strip()
+        superseded = self.run_afk(
+            "supersede",
+            "--reason",
+            "retire obsolete run",
+        )
+        self.assertEqual(superseded.returncode, 0, superseded.stderr)
+        store = RunStore(self.state_home / "afk")
+        store.append_event(
+            run_id,
+            "worker.terminal",
+            state="claimed",
+            data={
+                "checkpoint": "claimed",
+                "worker_exit_code": 0,
+                "worker_result": "completed",
+            },
+        )
+
+        named_status = self.run_afk("status", run_id, "--json")
+        self.assertEqual(named_status.returncode, 1)
+        self.assertIn("supersession event is invalid", named_status.stderr)
+        self.assertEqual(named_status.stdout, "")
+        with self.assertRaisesRegex(
+            EventHistoryCorrupt, "supersession event is invalid"
+        ):
+            store.active_run_id()
+        with self.assertRaisesRegex(
+            EventHistoryCorrupt, "supersession event is invalid"
+        ):
+            store.create_run(
+                bead_id="central-bnkl.1.2",
+                repository="thunderbump/beads-webui",
+                base_branch="main",
+                base_sha="b" * 40,
+                run_id="fresh-run",
+            )
+
     def assert_exact_retrospective_outcome(
         self,
         store,
