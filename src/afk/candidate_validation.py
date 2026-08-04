@@ -862,6 +862,7 @@ def run_supervised_command(
     label: str,
     output_byte_limit: int | None = None,
     cleanup_seconds: float | None = None,
+    _trusted_host_command: bool = False,
 ) -> subprocess.CompletedProcess[str]:
     output_byte_limit = (
         OUTPUT_BYTE_LIMIT if output_byte_limit is None else output_byte_limit
@@ -879,6 +880,7 @@ def run_supervised_command(
             label=label,
             output_byte_limit=output_byte_limit,
             cleanup_seconds=cleanup_seconds,
+            _trusted_host_command=_trusted_host_command,
         )
     except SupervisedCommandError as exc:
         kind = (

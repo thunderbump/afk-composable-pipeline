@@ -232,6 +232,7 @@ class CandidateGateTest(unittest.TestCase):
 
             with mock.patch(
                 "afk.candidate_gate.run_supervised_command",
+                autospec=True,
                 return_value=subprocess.CompletedProcess([], 1, "", ""),
             ) as supervised:
                 candidate_gate_module._execute_reviewer(
