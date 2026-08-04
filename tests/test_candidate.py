@@ -221,6 +221,8 @@ class CandidateTest(unittest.TestCase):
         self.assertIn(
             "Do not report blocked solely because privileged validation", prompt
         )
+        self.assertIn("You are AFK's required implementation sub-agent", prompt)
+        self.assertIn("Do not require or spawn another sub-agent", prompt)
         captured_env = json.loads(self.codex_env.read_text(encoding="utf-8"))
         self.assertNotIn("GITHUB_TOKEN", captured_env)
         self.assertNotIn("BEADS_DOLT_PASSWORD", captured_env)
@@ -1305,7 +1307,7 @@ class CandidateTest(unittest.TestCase):
             self.assertFalse(implementation["retryable"])
             self.assertTrue((self.checkout / "dirty.txt").is_file())
 
-    def test_blocked_terminal_report_is_sealed_and_closed(self):
+    def test_clean_first_blocked_report_allows_one_more_attempt(self):
         with self.assertRaisesRegex(CandidateError, "blocked"):
             self.produce(CODEX_FAKE_OUTCOME="blocked")
 
@@ -1313,7 +1315,14 @@ class CandidateTest(unittest.TestCase):
         self.assertTrue((attempt / "manifest.json").is_file())
         implementation = self.store.status("run-1")["implementation_attempt"]
         self.assertEqual(implementation["status"], "interrupted")
-        self.assertFalse(implementation["retryable"])
+        self.assertTrue(implementation["retryable"])
+
+        result = self.produce()
+
+        self.assertEqual(result["state"], "candidate_ready")
+        implementation = self.store.status("run-1")["implementation_attempt"]
+        self.assertEqual(implementation["attempt_id"], "implementation-2")
+        self.assertEqual(implementation["status"], "completed")
 
     def test_legacy_flat_candidate_branch_fails_closed(self):
         with self.assertRaisesRegex(CandidateError, "per-Run namespace"):

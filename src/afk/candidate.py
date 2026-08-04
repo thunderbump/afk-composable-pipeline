@@ -35,6 +35,7 @@ from afk.implementation_attempt import (
     completed_attempt,
     interruption_is_retryable,
     interrupted_attempt,
+    legacy_blocked_retry_available,
     next_attempt_id,
     started_attempt,
 )
@@ -174,6 +175,8 @@ def produce_candidate(
             worktree=worktree,
             branch=branch,
         )
+        if legacy_blocked_retry_available(attempt_state):
+            _require_legacy_blocked_retry(store, run_id, attempt_state=attempt_state)
         report, attempt_state = _run_implementation_attempt(
             store,
             run_id,
@@ -622,6 +625,7 @@ def _accept_implementation_report(
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     attempt = attempt_state["evidence"]
     report_path = store.root / "runs" / run_id / attempt / "report.json"
+    report: dict[str, Any] | None = None
     try:
         report = _read_report(report_path)
         candidate_sha = _verify_candidate(
@@ -630,12 +634,18 @@ def _accept_implementation_report(
     except CandidateError as exc:
         if exc.kind == "unavailable":
             raise
+        retryable = (
+            report is not None
+            and report["status"] == "blocked"
+            and interruption_is_retryable(attempt_state)
+            and _implementation_checkout(worktree) == (base_sha, branch, "")
+        )
         _seal_implementation_interruption(
             store,
             run_id,
             attempt_state=attempt_state,
             summary=exc.summary,
-            retryable=False,
+            retryable=retryable,
         )
         raise
     store.seal_evidence(run_id, attempt)
@@ -643,6 +653,26 @@ def _accept_implementation_report(
         store, run_id, attempt_state=attempt_state, candidate_sha=candidate_sha
     )
     return report, finished
+
+
+def _require_legacy_blocked_retry(
+    store: RunStore,
+    run_id: str,
+    *,
+    attempt_state: dict[str, Any],
+) -> None:
+    attempt = attempt_state["evidence"]
+    attempt_path = store.root / "runs" / run_id / attempt
+    if not store.verify_evidence(run_id, attempt):
+        raise CandidateError("implementation evidence could not be verified")
+    report = _read_report(attempt_path / "report.json")
+    recovery = _implementation_interruption(attempt_path / "recovery.json")
+    if report["status"] != "blocked" or recovery != {
+        "status": "interrupted",
+        "summary": attempt_state["summary"],
+        "retryable": False,
+    }:
+        raise CandidateError("legacy blocked implementation evidence is invalid")
 
 
 def _implementation_checkout(worktree: Path) -> tuple[str, str, str]:
@@ -1052,6 +1082,8 @@ Acceptance criteria: {_acceptance_criteria(bead)}
 
 ## Contract
 
+You are AFK's required implementation sub-agent for this isolated Candidate.
+Do not require or spawn another sub-agent; perform the scoped work yourself.
 Work only in the dedicated worktree. Follow the repository's AGENTS.md files.
 Implement the exact Bead and run safe, unprivileged local checks.
 Commit after the safe checks available inside this sandbox pass.

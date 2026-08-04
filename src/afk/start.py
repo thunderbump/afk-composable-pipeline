@@ -47,6 +47,7 @@ from afk.candidate_validation import (
     validate_candidate,
 )
 from afk.jsonutil import canonical_json
+from afk.implementation_attempt import next_attempt_id
 from afk.redaction import redact_artifact_value
 from afk.retrospective_attempt import run_retrospective_attempt
 from afk.run_store import (
@@ -722,7 +723,7 @@ def _implementation_attempt_resume_ready(projection: dict[str, Any]) -> bool:
         or (
             projection["checkpoint"] == "worktree_ready"
             and attempt.get("status") == "interrupted"
-            and attempt.get("retryable") is True
+            and next_attempt_id(attempt) is not None
         )
     )
 
