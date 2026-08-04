@@ -221,6 +221,8 @@ class CandidateTest(unittest.TestCase):
         self.assertIn(
             "Do not report blocked solely because privileged validation", prompt
         )
+        self.assertIn("You are AFK's required implementation sub-agent", prompt)
+        self.assertIn("Do not require or spawn another sub-agent", prompt)
         captured_env = json.loads(self.codex_env.read_text(encoding="utf-8"))
         self.assertNotIn("GITHUB_TOKEN", captured_env)
         self.assertNotIn("BEADS_DOLT_PASSWORD", captured_env)
@@ -1305,7 +1307,7 @@ class CandidateTest(unittest.TestCase):
             self.assertFalse(implementation["retryable"])
             self.assertTrue((self.checkout / "dirty.txt").is_file())
 
-    def test_blocked_terminal_report_is_sealed_and_closed(self):
+    def test_clean_first_blocked_report_allows_one_more_attempt(self):
         with self.assertRaisesRegex(CandidateError, "blocked"):
             self.produce(CODEX_FAKE_OUTCOME="blocked")
 
@@ -1313,7 +1315,24 @@ class CandidateTest(unittest.TestCase):
         self.assertTrue((attempt / "manifest.json").is_file())
         implementation = self.store.status("run-1")["implementation_attempt"]
         self.assertEqual(implementation["status"], "interrupted")
+        self.assertTrue(implementation["retryable"])
+
+        result = self.produce()
+
+        self.assertEqual(result["state"], "candidate_ready")
+        implementation = self.store.status("run-1")["implementation_attempt"]
+        self.assertEqual(implementation["attempt_id"], "implementation-2")
+        self.assertEqual(implementation["status"], "completed")
+
+    def test_blocked_report_with_mismatched_shas_does_not_allow_another_attempt(self):
+        with self.assertRaisesRegex(CandidateError, "blocked"):
+            self.produce(CODEX_FAKE_OUTCOME="blocked_mismatched_shas")
+
+        implementation = self.store.status("run-1")["implementation_attempt"]
         self.assertFalse(implementation["retryable"])
+        with self.assertRaises(CandidateError):
+            self.produce()
+        self.assertFalse((self.state / "runs/run-1/attempts/implementation-2").exists())
 
     def test_legacy_flat_candidate_branch_fails_closed(self):
         with self.assertRaisesRegex(CandidateError, "per-Run namespace"):
@@ -1414,7 +1433,7 @@ class CandidateTest(unittest.TestCase):
                     subprocess.Popen([sys.executable, "-c", child], cwd=cwd)
                     signal.signal(signal.SIGTERM, signal.SIG_IGN)
                     time.sleep(30)
-                if outcome not in {"no_change", "blocked", "nonzero", "malformed"}:
+                if outcome not in {"no_change", "blocked", "blocked_mismatched_shas", "nonzero", "malformed"}:
                     (cwd / changed).write_text("candidate\\n", encoding="utf-8")
                     subprocess.run(["git", "add", changed], cwd=cwd, check=True)
                     subprocess.run(["git", "commit", "-m", "repair" if repair else "candidate"], cwd=cwd, check=True, capture_output=True)  # noqa: E501
@@ -1430,13 +1449,16 @@ class CandidateTest(unittest.TestCase):
                     report.write_text("not json", encoding="utf-8")
                 else:
                     value = {{
-                        "status": outcome if outcome in {"no_change", "blocked"} else "completed",  # noqa: E501
+                        "status": outcome if outcome in {"no_change", "blocked"} else "blocked" if outcome == "blocked_mismatched_shas" else "completed",  # noqa: E501
                         "starting_sha": start,
                         "ending_sha": end,
                         "summary": "implemented",
                         "checks": [],
                         "changed_areas": [changed],
                     }}
+                    if outcome == "blocked_mismatched_shas":
+                        value["starting_sha"] = "c" * 40
+                        value["ending_sha"] = "d" * 40
                     if repair:
                         value["dispositions"] = [{{"finding_id": "validation-smoke", "disposition": "addressed"}}]
                     report.write_text(json.dumps(value), encoding="utf-8")

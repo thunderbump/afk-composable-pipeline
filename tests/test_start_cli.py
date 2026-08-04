@@ -25,6 +25,7 @@ import afk.run_store as run_store_module  # noqa: E402
 import afk.start as start_module  # noqa: E402
 from afk.bead_spec import bead_spec_identity, persist_bead_spec  # noqa: E402
 from afk.lifecycle_signals import record_lifecycle_interruption  # noqa: E402
+from afk.implementation_attempt import interrupted_attempt  # noqa: E402
 from afk.retrospective_attempt import (  # noqa: E402
     RETROSPECTIVE_OUTPUT_BYTE_LIMIT,
 )
@@ -2449,6 +2450,73 @@ class StartCliTest(unittest.TestCase):
         self.assertEqual(
             len(self.launch_events(run_id, "implementation.attempt_finished")), 1
         )
+
+    def test_resume_retries_a_legacy_clean_blocked_implementation_attempt(self):
+        run_id = self.start_open_implementation_attempt()
+        store = RunStore(self.state_home / "afk")
+        started = store.status(run_id)["implementation_attempt"]
+        report = {
+            "status": "blocked",
+            "starting_sha": BASE_SHA,
+            "ending_sha": BASE_SHA,
+            "summary": "nested collaboration is unavailable",
+            "checks": [],
+            "changed_areas": [],
+        }
+        store.write_evidence_value(
+            run_id, "attempts/implementation-1/report.json", report
+        )
+        store.write_evidence_value(
+            run_id,
+            "attempts/implementation-1/recovery.json",
+            {
+                "status": "interrupted",
+                "summary": "implementation reported blocked",
+                "retryable": False,
+            },
+        )
+        store.seal_evidence(run_id, "attempts/implementation-1")
+        interrupted = interrupted_attempt(
+            started,
+            summary="implementation reported blocked",
+            retryable=False,
+        )
+        store.append_event(
+            run_id,
+            "implementation.attempt_interrupted",
+            data={
+                "checkpoint": "worktree_ready",
+                "implementation_attempt": interrupted,
+            },
+        )
+        store.record_attention_episode(
+            run_id,
+            checkpoint="worktree_ready",
+            attention={
+                "scope": "candidate",
+                "kind": "invalid",
+                "summary": "implementation reported blocked",
+            },
+        )
+
+        resumed = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="absent")
+
+        projection = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(resumed.returncode, 2, (resumed.stderr, projection))
+        self.assertEqual(projection["checkpoint"], "candidate_ready")
+        self.assertEqual(projection["attention"]["scope"], "validation")
+        self.assertEqual(
+            projection["implementation_attempt"]["attempt_id"], "implementation-2"
+        )
+        self.assertEqual(projection["implementation_attempt"]["status"], "completed")
+        first_recovery = (
+            self.state_home
+            / "afk"
+            / "runs"
+            / run_id
+            / "attempts/implementation-1/recovery.json"
+        )
+        self.assertFalse(json.loads(first_recovery.read_text())["retryable"])
 
     def test_resume_refuses_to_recover_an_attempt_from_a_different_origin(self):
         run_id = self.start_open_implementation_attempt()
