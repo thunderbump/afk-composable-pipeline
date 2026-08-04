@@ -12358,6 +12358,21 @@ class StartCliTest(unittest.TestCase):
         self.assertEqual(status["attention"]["kind"], "invalid")
         self.assertIn("does not belong", status["attention"]["summary"])
 
+    def test_start_normalizes_repository_case_for_project_ownership(self):
+        completed = self.run_afk(
+            "start",
+            "central-bnkl.1.1",
+            AFK_FAKE_REPOSITORY="thunderbump/Beads-WebUI",
+            AFK_FAKE_ORIGIN_REPOSITORY="thunderbump/Beads-WebUI",
+            AFK_FAKE_PROJECT_LABEL="project:beads-webui",
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        run_id = completed.stdout.strip()
+        status = json.loads(self.run_afk("status", run_id, "--json").stdout)
+        self.assertEqual(status["checkpoint"], "created")
+        self.assertNotIn("attention", status)
+
     def _write_fake_commands(self):
         script = self.fake_bin / "fake-command"
         script.write_text(
@@ -13147,7 +13162,10 @@ class StartCliTest(unittest.TestCase):
                         print("[]")
                     else:
                         print(json.dumps({
-                            "nameWithOwner": "thunderbump/beads-webui",
+                            "nameWithOwner": os.environ.get(
+                                "AFK_FAKE_REPOSITORY",
+                                "thunderbump/beads-webui",
+                            ),
                             "defaultBranchRef": {"name": "main"},
                         }))
                 elif command == "bd":
