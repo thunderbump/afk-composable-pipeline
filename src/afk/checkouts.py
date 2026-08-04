@@ -453,7 +453,9 @@ def _worktree_matches_commit(
                         dir_fd=parent_descriptor,
                     )
                     try:
-                        if not _is_exact_clean_commit(
+                        with os.scandir(target_descriptor) as children:
+                            uninitialized = next(children, None) is None
+                        if not uninitialized and not _is_exact_clean_commit(
                             Path(f"/proc/self/fd/{target_descriptor}"),
                             object_id.decode("ascii"),
                             repository_budget,

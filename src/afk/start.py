@@ -734,7 +734,8 @@ def _validation_resume_ready(projection: dict[str, Any]) -> bool:
         projection["checkpoint"] == "candidate_ready"
         and isinstance(attention, dict)
         and attention.get("scope") == "validation"
-        and attention.get("kind") in {"unavailable", "inconclusive", "interrupted"}
+        and attention.get("kind")
+        in {"unavailable", "inconclusive", "interrupted", "head_mismatch"}
     )
 
 
