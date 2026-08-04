@@ -281,11 +281,16 @@ class CandidateTest(unittest.TestCase):
                 ["codex", "exec"],
                 cwd=self.checkout,
                 input_text="implement",
+                label="implementation agent",
             )
 
         self.assertIs(
             supervised.call_args.kwargs["_trusted_host_command"],
             True,
+        )
+        self.assertEqual(
+            supervised.call_args.kwargs["label"],
+            "implementation agent",
         )
 
     def test_initial_candidate_selects_shared_codex_runner(self):
@@ -307,6 +312,10 @@ class CandidateTest(unittest.TestCase):
 
         codex_run.assert_called_once()
         self.assertEqual(codex_run.call_args.args[0][0], "codex")
+        self.assertEqual(
+            codex_run.call_args.kwargs["label"],
+            "implementation agent",
+        )
         generic_commands = [call.args[0][0] for call in generic_run.call_args_list]
         self.assertIn("git", generic_commands)
         self.assertIn("gh", generic_commands)
@@ -495,6 +504,7 @@ class CandidateTest(unittest.TestCase):
 
         codex_run.assert_called_once()
         self.assertEqual(codex_run.call_args.args[0][0], "codex")
+        self.assertEqual(codex_run.call_args.kwargs["label"], "repair agent")
         generic_commands = [call.args[0][0] for call in generic_run.call_args_list]
         self.assertIn("git", generic_commands)
         self.assertIn("gh", generic_commands)
@@ -820,7 +830,8 @@ class CandidateTest(unittest.TestCase):
         outside = self.temp / "outside-user-change.txt"
         outside.write_text("preserve me\n", encoding="utf-8")
 
-        def crash_after_codex_mutation(command, *, cwd, input_text):
+        def crash_after_codex_mutation(command, *, cwd, input_text, label):
+            self.assertEqual(label, "repair agent")
             if mode == "dirty":
                 (cwd / "candidate.txt").write_text(
                     "dirty interrupted repair\n", encoding="utf-8"

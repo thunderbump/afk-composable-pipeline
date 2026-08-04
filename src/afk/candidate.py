@@ -309,7 +309,12 @@ def _run_implementation_attempt(
             "--json",
             "-",
         ]
-        completed = _run_codex(command, cwd=worktree, input_text=prompt)
+        completed = _run_codex(
+            command,
+            cwd=worktree,
+            input_text=prompt,
+            label="implementation agent",
+        )
         report_text: str | None = None
         report_read_error: OSError | UnicodeDecodeError | None = None
         if completed.returncode == 0:
@@ -858,7 +863,12 @@ def produce_repair_candidate(
             "-",
         ]
         try:
-            completed = _run_codex(command, cwd=worktree, input_text=prompt)
+            completed = _run_codex(
+                command,
+                cwd=worktree,
+                input_text=prompt,
+                label="repair agent",
+            )
         except CandidateError as exc:
             execution_error = exc
         if execution_error is None and completed.returncode == 0:
@@ -2361,7 +2371,7 @@ def _git(worktree: Path, *args: str) -> str:
 
 
 def _run_codex(
-    command: list[str], *, cwd: Path, input_text: str
+    command: list[str], *, cwd: Path, input_text: str, label: str
 ) -> subprocess.CompletedProcess[str]:
     try:
         return run_supervised_command(
@@ -2370,7 +2380,7 @@ def _run_codex(
             environment=codex_environment(),
             input_text=input_text,
             timeout_seconds=COMMAND_TIMEOUT_SECONDS,
-            label="repair agent",
+            label=label,
             _trusted_host_command=True,
         )
     except CandidateValidationError as exc:
