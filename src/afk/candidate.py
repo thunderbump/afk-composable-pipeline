@@ -2377,6 +2377,7 @@ def _run_codex(
             input_text=input_text,
             timeout_seconds=COMMAND_TIMEOUT_SECONDS,
             label="repair agent",
+            _trusted_host_command=True,
         )
     except CandidateValidationError as exc:
         raise CandidateError(

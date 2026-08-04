@@ -271,6 +271,23 @@ class CandidateTest(unittest.TestCase):
         )
         self.assertEqual(self.store.effect("run-1", "pr-create")["status"], "confirmed")
 
+    def test_candidate_agent_avoids_outer_namespace_around_codex_sandbox(self):
+        with mock.patch(
+            "afk.candidate.run_supervised_command",
+            autospec=True,
+            return_value=subprocess.CompletedProcess([], 0, "", ""),
+        ) as supervised:
+            candidate_module._run_codex(
+                ["codex", "exec"],
+                cwd=self.checkout,
+                input_text="implement",
+            )
+
+        self.assertIs(
+            supervised.call_args.kwargs["_trusted_host_command"],
+            True,
+        )
+
     def test_implementation_prompt_uses_description_when_acceptance_is_not_separate(
         self,
     ):
