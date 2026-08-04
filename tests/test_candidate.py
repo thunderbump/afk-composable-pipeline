@@ -23,7 +23,7 @@ from afk.candidate import (  # noqa: E402
     produce_repair_candidate,
     reconcile_interrupted_repair_worktree,
 )
-from afk.run_store import EvidenceTampered, RunStore  # noqa: E402
+from afk.run_store import EvidenceTampered, RunStore, RunStoreError  # noqa: E402
 from afk.start import resume_run  # noqa: E402
 
 
@@ -215,6 +215,7 @@ class CandidateTest(unittest.TestCase):
         self.assertIn(
             "Commit after the safe checks available inside this sandbox", prompt
         )
+        self.assertIn("Acceptance criteria: The file exists.", prompt)
         self.assertIn("AFK runs the full Validation Contract afterward", prompt)
         self.assertIn("Do not access Docker, the Docker socket, or systemd", prompt)
         self.assertIn(
@@ -267,6 +268,55 @@ class CandidateTest(unittest.TestCase):
             "confirmed",
         )
         self.assertEqual(self.store.effect("run-1", "pr-create")["status"], "confirmed")
+
+    def test_implementation_prompt_uses_description_when_acceptance_is_not_separate(
+        self,
+    ):
+        persist_bead_spec(
+            self.store,
+            "run-1",
+            {
+                "id": "central-test.1",
+                "title": "Implement the thing",
+                "description": (
+                    "Change one file.\n\n## Acceptance criteria\n\n"
+                    "- The file exists."
+                ),
+                "status": "open",
+                "comments": [],
+            },
+        )
+
+        self.produce()
+
+        prompt = (
+            self.state / "runs/run-1/attempts/implementation-1/prompt.md"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            "Acceptance criteria: Not separately provided; "
+            "treat Description as authoritative.",
+            prompt,
+        )
+
+    def test_implementation_prompt_rejects_present_malformed_acceptance(self):
+        bead = {
+            "id": "central-test.1",
+            "title": "Implement the thing",
+            "description": "Change one file.",
+        }
+        for criteria in (None, ""):
+            with self.subTest(criteria=criteria):
+                with self.assertRaises(RunStoreError):
+                    candidate_module._implementation_prompt(
+                        {
+                            "run_id": "run-1",
+                            "repository": "owner/project",
+                            "base_sha": self.base_sha,
+                        },
+                        {**bead, "acceptance_criteria": criteria},
+                        self.checkout,
+                        self.branch,
+                    )
 
     def test_implementation_prompt_includes_bounded_redacted_immutable_comments(self):
         comments = [

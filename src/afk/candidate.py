@@ -1044,7 +1044,7 @@ Starting Candidate: {identity['base_sha']}
 ID: {_field(bead, 'id')}
 Title: {_field(bead, 'title')}
 Description: {_field(bead, 'description')}
-Acceptance criteria: {_field(bead, 'acceptance_criteria')}
+Acceptance criteria: {_acceptance_criteria(bead)}
 
 ## Immutable Bead comments (latest first)
 
@@ -1111,7 +1111,7 @@ Starting Candidate: {repair_brief['candidate_sha']}
 ID: {_field(bead, 'id')}
 Title: {_field(bead, 'title')}
 Description: {_field(bead, 'description')}
-Acceptance criteria: {_field(bead, 'acceptance_criteria')}
+Acceptance criteria: {_acceptance_criteria(bead)}
 
 ## Candidate-bound Repair Brief
 
@@ -2373,3 +2373,12 @@ def _field(value: dict[str, Any], key: str) -> str:
     if not isinstance(field, str) or not field:
         raise RunStoreError(f"required Candidate field is missing: {key}")
     return field
+
+
+def _acceptance_criteria(bead: dict[str, Any]) -> str:
+    if "acceptance_criteria" not in bead:
+        return "Not separately provided; treat Description as authoritative."
+    criteria = bead.get("acceptance_criteria")
+    if not isinstance(criteria, str) or not criteria:
+        raise RunStoreError("required Candidate field is invalid: acceptance_criteria")
+    return criteria
