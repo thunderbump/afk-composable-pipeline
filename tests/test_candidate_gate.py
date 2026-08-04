@@ -2028,6 +2028,78 @@ class CandidateGateTest(unittest.TestCase):
                         )
                     replacement.assert_not_called()
 
+    def test_gate_comment_reconciles_github_permalink_normalization(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store = RunStore(root / "state")
+            run_id = store.create_run(
+                bead_id="central-test.1",
+                repository="owner/project",
+                base_branch="main",
+                base_sha="a" * 40,
+                start_request={},
+                run_id="run-1",
+            )["run_id"]
+            gate = {
+                "cycle": 1,
+                "candidate_sha": "b" * 40,
+                "validation": {"status": "passed", "summary": "passed"},
+                "reviews": [],
+                "next_action": "attention",
+            }
+            initial_url = "https://github.com/owner/project/pull/7"
+            normalized_url = f"{initial_url}#issuecomment-123"
+            comments = []
+
+            def post(repository, pr_number, posted_body, worktree):
+                comments.append({"body": posted_body, "html_url": initial_url})
+                return initial_url
+
+            with (
+                mock.patch(
+                    "afk.candidate_gate._github_comments",
+                    side_effect=lambda *args: list(comments),
+                ),
+                mock.patch(
+                    "afk.candidate_gate._post_gate_comment", side_effect=post
+                ) as post_comment,
+            ):
+                reconcile_gate_comment(
+                    store, run_id, pr_number=7, worktree=root, gate=gate
+                )
+
+            post_comment.assert_called_once()
+            self.assertEqual(
+                store.effect(run_id, "gate-comment-1")["observed"]["url"],
+                initial_url,
+            )
+
+            comments[0]["html_url"] = normalized_url
+            with (
+                mock.patch(
+                    "afk.candidate_gate._github_comments",
+                    return_value=comments,
+                ),
+                mock.patch("afk.candidate_gate._post_gate_comment") as duplicate,
+            ):
+                reconcile_gate_comment(
+                    store, run_id, pr_number=7, worktree=root, gate=gate
+                )
+
+            duplicate.assert_not_called()
+
+            comments[0]["html_url"] = "https://github.com/owner/project/pull/8"
+            with (
+                mock.patch(
+                    "afk.candidate_gate._github_comments",
+                    return_value=comments,
+                ),
+                self.assertRaisesRegex(GateError, "contradicts GitHub"),
+            ):
+                reconcile_gate_comment(
+                    store, run_id, pr_number=7, worktree=root, gate=gate
+                )
+
     def test_gate_comment_reconciles_a_confirmed_pre_projection_effect(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
