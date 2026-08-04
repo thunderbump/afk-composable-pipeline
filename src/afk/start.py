@@ -1834,7 +1834,7 @@ def _validate_closable_bead(
         or bead.get("status") not in {"open", "in_progress", "closed"}
         or not isinstance(labels, list)
         or not all(isinstance(label, str) for label in labels)
-        or f"project:{repository.rsplit('/', 1)[-1]}" not in labels
+        or _project_label(repository) not in labels
     ):
         raise StartError("source Bead facts disagree with the merged Run")
 
@@ -2610,7 +2610,7 @@ def _reconcile_bead_claim(store: RunStore, run_id: str) -> dict[str, Any]:
     request = identity["start_request"]
     claimant = request["claimant"]
     workspace = Path(request["beads_workspace"])
-    project_label = f"project:{identity['repository'].rsplit('/', 1)[-1]}"
+    project_label = _project_label(identity["repository"])
     intended = {
         "bead_id": bead_id,
         "claimant": claimant,
@@ -2972,7 +2972,7 @@ def _validate_start_bead(bead: dict[str, Any], bead_id: str, repository: str) ->
         for comment in comments
     ):
         raise _malformed_beads_output()
-    project_label = f"project:{repository.rsplit('/', 1)[-1]}"
+    project_label = _project_label(repository)
     labels = bead.get("labels")
     if not isinstance(labels, list) or not all(
         isinstance(label, str) for label in labels
@@ -2980,6 +2980,10 @@ def _validate_start_bead(bead: dict[str, Any], bead_id: str, repository: str) ->
         raise StartError(f"Bead labels are invalid: {bead_id}")
     if project_label not in labels:
         raise StartError(f"Bead does not belong to {project_label}")
+
+
+def _project_label(repository: str) -> str:
+    return f"project:{repository.rsplit('/', 1)[-1].lower()}"
 
 
 def _pinned_validation_contract(
