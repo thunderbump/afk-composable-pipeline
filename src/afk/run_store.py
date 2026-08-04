@@ -468,20 +468,16 @@ class RunStore:
                 projection["run_id"], projection
             )
             if projection["state"] == "superseded":
-                supersession = projection.get("supersession")
-                event = self.event(projection["run_id"], projection["last_sequence"])
+                supersession = self._validated_supersession(
+                    projection["run_id"], projection
+                )
                 expected = {
                     "reason": reason,
                     "attention_episode_sequence": (
                         episode["episode_sequence"] if episode is not None else None
                     ),
                 }
-                if (
-                    supersession != expected
-                    or event.get("event") != "run.superseded"
-                    or event.get("state") != "superseded"
-                    or event.get("data", {}).get("supersession") != expected
-                ):
+                if supersession != expected:
                     raise EventHistoryCorrupt("supersession event is invalid")
                 self._clear_active_pointer(projection["run_id"])
                 return projection
@@ -2097,6 +2093,7 @@ class RunStore:
             events, _ = self._read_events(run_dir.name)
             projection = _project(identity, events)
             if projection["state"] == "superseded":
+                self._validated_supersession(run_dir.name, projection)
                 continue
             if projection[
                 "state"
@@ -2239,6 +2236,45 @@ class RunStore:
         if latest != episode:
             raise EventHistoryCorrupt("attention episode marker is invalid")
         return episode
+
+    def _validated_supersession(
+        self,
+        run_id: str,
+        projection: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        supersession = projection.get("supersession")
+        if projection.get("state") != "superseded":
+            if supersession is not None:
+                raise EventHistoryCorrupt("supersession event is invalid")
+            return None
+        episode = self._validated_attention_episode(run_id, projection)
+        reason = supersession.get("reason") if isinstance(supersession, dict) else None
+        expected = {
+            "reason": reason,
+            "attention_episode_sequence": (
+                episode["episode_sequence"] if episode is not None else None
+            ),
+        }
+        event = self.event(run_id, projection["last_sequence"])
+        if (
+            episode is None
+            or not isinstance(reason, str)
+            or not reason.strip()
+            or reason.strip() != reason
+            or redact_text(reason) != reason
+            or supersession != expected
+            or event.get("event") != "run.superseded"
+            or event.get("state") != "superseded"
+            or event.get("data")
+            != {
+                "checkpoint": "superseded",
+                "attention": {},
+                "supersession": expected,
+            }
+            or projection.get("checkpoint") != "superseded"
+        ):
+            raise EventHistoryCorrupt("supersession event is invalid")
+        return supersession
 
     def _validated_episode(
         self,

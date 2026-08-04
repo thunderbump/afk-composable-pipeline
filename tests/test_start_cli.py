@@ -431,6 +431,44 @@ class StartCliTest(unittest.TestCase):
         self.assertEqual(no_active.returncode, 1)
         self.assertIn("no Active Run", no_active.stderr)
 
+    def test_forged_superseded_state_does_not_release_active_run(self):
+        store = RunStore(self.state_home / "afk")
+        store.create_run(
+            bead_id="central-bnkl.1.1",
+            repository="thunderbump/beads-webui",
+            base_branch="main",
+            base_sha="a" * 40,
+            run_id="forged-supersession",
+        )
+        store.append_event(
+            "forged-supersession",
+            "run.superseded",
+            state="superseded",
+            data={
+                "checkpoint": "superseded",
+                "attention": {},
+                "supersession": {
+                    "reason": "retire obsolete run",
+                    "attention_episode_sequence": 1,
+                },
+            },
+        )
+
+        with self.assertRaisesRegex(
+            EventHistoryCorrupt, "supersession event is invalid"
+        ):
+            store.active_run_id()
+        with self.assertRaisesRegex(
+            EventHistoryCorrupt, "supersession event is invalid"
+        ):
+            store.create_run(
+                bead_id="central-bnkl.1.2",
+                repository="thunderbump/beads-webui",
+                base_branch="main",
+                base_sha="b" * 40,
+                run_id="fresh-run",
+            )
+
     def assert_exact_retrospective_outcome(
         self,
         store,
