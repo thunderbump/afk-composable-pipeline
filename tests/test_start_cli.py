@@ -399,7 +399,8 @@ class StartCliTest(unittest.TestCase):
         )
         self.assertEqual(started.returncode, 2, started.stderr)
         run_id = started.stdout.strip()
-        reason = "target validator trust root was replaced"
+        reason = "target validator token=super-secret-value was replaced"
+        redacted_reason = "target validator token=[REDACTED] was replaced"
 
         interrupted = self.run_afk(
             "supersede",
@@ -408,6 +409,19 @@ class StartCliTest(unittest.TestCase):
             AFK_TEST_KILL_AFTER_EVENT_WRITE="run.superseded",
         )
         self.assertEqual(interrupted.returncode, -signal.SIGKILL)
+
+        persisted = self.run_afk("status", run_id, "--json")
+        self.assertEqual(persisted.returncode, 0, persisted.stderr)
+        self.assertEqual(
+            json.loads(persisted.stdout)["supersession"]["reason"],
+            redacted_reason,
+        )
+        report = self.run_afk("report", run_id)
+        self.assertEqual(report.returncode, 0, report.stderr)
+        self.assertEqual(
+            json.loads(report.stdout)["supersession"]["reason"],
+            redacted_reason,
+        )
 
         reconciled = self.run_afk("supersede", "--reason", reason)
 

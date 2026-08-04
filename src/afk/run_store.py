@@ -455,7 +455,7 @@ class RunStore:
         return self._active_run_id()
 
     def supersede_active_run(self, reason: str) -> dict[str, Any]:
-        reason = reason.strip()
+        reason = redact_text(reason.strip())
         if not reason:
             raise RunStoreError("supersession reason must not be empty")
         with self.lock(validate_root_permissions=True):
