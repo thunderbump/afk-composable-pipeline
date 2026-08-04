@@ -449,7 +449,10 @@ class RunStore:
         _validate_run_id(selected)
         identity = self._identity(selected)
         events, _ = self._read_events(selected)
-        return _project(identity, events)
+        projection = _project(identity, events)
+        if projection["state"] == "superseded":
+            self._validated_supersession(selected, projection)
+        return projection
 
     def active_run_id(self) -> str | None:
         return self._active_run_id()

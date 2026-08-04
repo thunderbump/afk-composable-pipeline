@@ -471,6 +471,14 @@ class StartCliTest(unittest.TestCase):
             },
         )
 
+        named_status = self.run_afk("status", "forged-supersession", "--json")
+        self.assertEqual(named_status.returncode, 1)
+        self.assertIn("supersession event is invalid", named_status.stderr)
+        self.assertEqual(named_status.stdout, "")
+        named_report = self.run_afk("report", "forged-supersession")
+        self.assertEqual(named_report.returncode, 2)
+        self.assertIn("supersession event is invalid", named_report.stderr)
+        self.assertEqual(named_report.stdout, "")
         with self.assertRaisesRegex(
             EventHistoryCorrupt, "supersession event is invalid"
         ):
