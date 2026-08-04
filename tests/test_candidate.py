@@ -271,6 +271,56 @@ class CandidateTest(unittest.TestCase):
         )
         self.assertEqual(self.store.effect("run-1", "pr-create")["status"], "confirmed")
 
+    def test_candidate_agent_avoids_outer_namespace_around_codex_sandbox(self):
+        with mock.patch(
+            "afk.candidate.run_supervised_command",
+            autospec=True,
+            return_value=subprocess.CompletedProcess([], 0, "", ""),
+        ) as supervised:
+            candidate_module._run_codex(
+                ["codex", "exec"],
+                cwd=self.checkout,
+                input_text="implement",
+                label="implementation agent",
+            )
+
+        self.assertIs(
+            supervised.call_args.kwargs["_trusted_host_command"],
+            True,
+        )
+        self.assertEqual(
+            supervised.call_args.kwargs["label"],
+            "implementation agent",
+        )
+
+    def test_initial_candidate_selects_shared_codex_runner(self):
+        original_codex_run = candidate_module._run_codex
+        original_run = candidate_module._run
+        with (
+            mock.patch(
+                "afk.candidate._run_codex",
+                autospec=True,
+                side_effect=original_codex_run,
+            ) as codex_run,
+            mock.patch(
+                "afk.candidate._run",
+                autospec=True,
+                side_effect=original_run,
+            ) as generic_run,
+        ):
+            self.produce()
+
+        codex_run.assert_called_once()
+        self.assertEqual(codex_run.call_args.args[0][0], "codex")
+        self.assertEqual(
+            codex_run.call_args.kwargs["label"],
+            "implementation agent",
+        )
+        generic_commands = [call.args[0][0] for call in generic_run.call_args_list]
+        self.assertIn("git", generic_commands)
+        self.assertIn("gh", generic_commands)
+        self.assertNotIn("codex", generic_commands)
+
     def test_implementation_prompt_uses_description_when_acceptance_is_not_separate(
         self,
     ):
@@ -423,7 +473,21 @@ class CandidateTest(unittest.TestCase):
             ],
         }
 
-        with mock.patch.dict(os.environ, self._candidate_environment(), clear=True):
+        original_codex_run = candidate_module._run_codex
+        original_run = candidate_module._run
+        with (
+            mock.patch.dict(os.environ, self._candidate_environment(), clear=True),
+            mock.patch(
+                "afk.candidate._run_codex",
+                autospec=True,
+                side_effect=original_codex_run,
+            ) as codex_run,
+            mock.patch(
+                "afk.candidate._run",
+                autospec=True,
+                side_effect=original_run,
+            ) as generic_run,
+        ):
             result = produce_repair_candidate(
                 self.store,
                 "run-1",
@@ -437,6 +501,14 @@ class CandidateTest(unittest.TestCase):
                 },
                 repair_brief=brief,
             )
+
+        codex_run.assert_called_once()
+        self.assertEqual(codex_run.call_args.args[0][0], "codex")
+        self.assertEqual(codex_run.call_args.kwargs["label"], "repair agent")
+        generic_commands = [call.args[0][0] for call in generic_run.call_args_list]
+        self.assertIn("git", generic_commands)
+        self.assertIn("gh", generic_commands)
+        self.assertNotIn("codex", generic_commands)
 
         self.assertNotEqual(result["candidate_sha"], first["candidate_sha"])
         self.assertEqual(result["repair_attempts_used"], 1)
@@ -758,7 +830,8 @@ class CandidateTest(unittest.TestCase):
         outside = self.temp / "outside-user-change.txt"
         outside.write_text("preserve me\n", encoding="utf-8")
 
-        def crash_after_codex_mutation(command, *, cwd, input_text):
+        def crash_after_codex_mutation(command, *, cwd, input_text, label):
+            self.assertEqual(label, "repair agent")
             if mode == "dirty":
                 (cwd / "candidate.txt").write_text(
                     "dirty interrupted repair\n", encoding="utf-8"
