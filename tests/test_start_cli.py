@@ -1838,6 +1838,24 @@ class StartCliTest(unittest.TestCase):
                     self.mutation_count("bead-claim", state_home=state_home), 1
                 )
 
+    def test_worker_claims_an_open_bead_with_omitted_assignee(self):
+        run_id = self.run_afk("start", "central-bnkl.1.1").stdout.strip()
+
+        interrupted = self.run_afk(
+            "_worker",
+            run_id,
+            AFK_FAKE_BEAD_SCHEMA="missing-assignee",
+            AFK_TEST_KILL_AFTER_EVENT_WRITE="bead.claimed",
+        )
+
+        self.assertLess(interrupted.returncode, 0)
+        store = RunStore(self.state_home / "afk")
+        observed = self.assert_bead_claim(store, run_id)
+        projection = store.status(run_id)
+        self.assertEqual(projection["checkpoint"], "claimed")
+        self.assertEqual(projection["bead_claim"], observed)
+        self.assertEqual(self.mutation_count("bead-claim"), 1)
+
     def test_resume_pauses_on_conflicting_or_unavailable_bead_claim_state(self):
         cases = {
             "other-owner": {
@@ -1846,7 +1864,6 @@ class StartCliTest(unittest.TestCase):
             },
             "wrong-project": {"AFK_FAKE_PROJECT_LABEL": "project:another-repository"},
             "malformed-observation": {"AFK_FAKE_BEAD_SHOW_MALFORMED": "1"},
-            "missing-assignee": {"AFK_FAKE_BEAD_SCHEMA": "missing-assignee"},
             "wrong-status-type": {"AFK_FAKE_BEAD_SCHEMA": "status-number"},
             "wrong-assignee-type": {"AFK_FAKE_BEAD_SCHEMA": "assignee-list"},
             "unavailable-observation": {"AFK_FAKE_BEAD_SHOW_FAILURE": "1"},
@@ -1881,7 +1898,6 @@ class StartCliTest(unittest.TestCase):
                 self.assertEqual(status["checkpoint"], "created")
                 self.assertEqual(status["attention"]["scope"], "bead_claim")
                 if name in {
-                    "missing-assignee",
                     "wrong-status-type",
                     "wrong-assignee-type",
                 }:
@@ -13237,7 +13253,7 @@ class StartCliTest(unittest.TestCase):
                             "labels": labels,
                         }
                         malformed_schema = os.environ.get("AFK_FAKE_BEAD_SCHEMA")
-                        if malformed_schema == "missing-assignee":
+                        if malformed_schema == "missing-assignee" and not assignee:
                             del payload["assignee"]
                         elif malformed_schema == "status-number":
                             payload["status"] = 0

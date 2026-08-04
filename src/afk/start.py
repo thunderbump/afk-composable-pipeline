@@ -2636,7 +2636,7 @@ def _reconcile_bead_claim(store: RunStore, run_id: str) -> dict[str, Any]:
         )
     bead = _show_bead(bead_id, workspace)
     _validate_claim_identity(bead, bead_id, project_label)
-    if bead["status"] == "open" and bead["assignee"] == "":
+    if bead["status"] == "open" and _claim_assignee(bead) == "":
         result = _bd_json(
             ["bd", "update", bead_id, "--claim", "--json"],
             cwd=workspace,
@@ -2698,12 +2698,18 @@ def _validate_claim_identity(
     if (
         bead.get("id") != bead_id
         or not isinstance(bead.get("status"), str)
-        or not isinstance(bead.get("assignee"), str)
+        or not isinstance(_claim_assignee(bead), str)
         or not isinstance(labels, list)
         or not all(isinstance(label, str) for label in labels)
         or project_label not in labels
     ):
         raise StartError(f"Bead claim conflicts with project identity: {bead_id}")
+
+
+def _claim_assignee(bead: dict[str, Any]) -> Any:
+    if "assignee" not in bead and bead.get("status") == "open":
+        return ""
+    return bead.get("assignee")
 
 
 def _advance_worktree(store: RunStore, run_id: str) -> int:
