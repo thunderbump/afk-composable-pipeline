@@ -288,6 +288,30 @@ class CandidateTest(unittest.TestCase):
             True,
         )
 
+    def test_initial_candidate_selects_shared_codex_runner(self):
+        original_codex_run = candidate_module._run_codex
+        original_run = candidate_module._run
+        with (
+            mock.patch(
+                "afk.candidate._run_codex",
+                autospec=True,
+                side_effect=original_codex_run,
+            ) as codex_run,
+            mock.patch(
+                "afk.candidate._run",
+                autospec=True,
+                side_effect=original_run,
+            ) as generic_run,
+        ):
+            self.produce()
+
+        codex_run.assert_called_once()
+        self.assertEqual(codex_run.call_args.args[0][0], "codex")
+        generic_commands = [call.args[0][0] for call in generic_run.call_args_list]
+        self.assertIn("git", generic_commands)
+        self.assertIn("gh", generic_commands)
+        self.assertNotIn("codex", generic_commands)
+
     def test_implementation_prompt_uses_description_when_acceptance_is_not_separate(
         self,
     ):
@@ -440,7 +464,21 @@ class CandidateTest(unittest.TestCase):
             ],
         }
 
-        with mock.patch.dict(os.environ, self._candidate_environment(), clear=True):
+        original_codex_run = candidate_module._run_codex
+        original_run = candidate_module._run
+        with (
+            mock.patch.dict(os.environ, self._candidate_environment(), clear=True),
+            mock.patch(
+                "afk.candidate._run_codex",
+                autospec=True,
+                side_effect=original_codex_run,
+            ) as codex_run,
+            mock.patch(
+                "afk.candidate._run",
+                autospec=True,
+                side_effect=original_run,
+            ) as generic_run,
+        ):
             result = produce_repair_candidate(
                 self.store,
                 "run-1",
@@ -454,6 +492,13 @@ class CandidateTest(unittest.TestCase):
                 },
                 repair_brief=brief,
             )
+
+        codex_run.assert_called_once()
+        self.assertEqual(codex_run.call_args.args[0][0], "codex")
+        generic_commands = [call.args[0][0] for call in generic_run.call_args_list]
+        self.assertIn("git", generic_commands)
+        self.assertIn("gh", generic_commands)
+        self.assertNotIn("codex", generic_commands)
 
         self.assertNotEqual(result["candidate_sha"], first["candidate_sha"])
         self.assertEqual(result["repair_attempts_used"], 1)

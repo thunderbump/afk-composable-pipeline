@@ -309,13 +309,7 @@ def _run_implementation_attempt(
             "--json",
             "-",
         ]
-        completed = _run(
-            command,
-            cwd=worktree,
-            env=codex_environment(),
-            input_text=prompt,
-            timeout=COMMAND_TIMEOUT_SECONDS,
-        )
+        completed = _run_codex(command, cwd=worktree, input_text=prompt)
         report_text: str | None = None
         report_read_error: OSError | UnicodeDecodeError | None = None
         if completed.returncode == 0:
