@@ -163,7 +163,7 @@ def main(
             if projection["state"] == "attention_required":
                 output["recommended_resume"] = ["afk", "resume"]
                 exit_code = 2
-            if "worker_exit_code" in projection:
+            if projection["state"] != "superseded" and "worker_exit_code" in projection:
                 output["unit_observation"] = {
                     "status": "terminal",
                     "unit": projection.get("unit", worker_unit(projection["run_id"])),

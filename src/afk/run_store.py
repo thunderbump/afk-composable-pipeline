@@ -491,7 +491,6 @@ class RunStore:
                 state="superseded",
                 data={
                     "checkpoint": "superseded",
-                    "attention": {},
                     "supersession": {
                         "reason": reason,
                         "attention_episode_sequence": episode["episode_sequence"],
@@ -2268,7 +2267,6 @@ class RunStore:
             or event.get("data")
             != {
                 "checkpoint": "superseded",
-                "attention": {},
                 "supersession": expected,
             }
             or projection.get("checkpoint") != "superseded"

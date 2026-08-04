@@ -338,6 +338,12 @@ class StartCliTest(unittest.TestCase):
         )
         self.assertEqual(started.returncode, 2, started.stderr)
         run_id = started.stdout.strip()
+        attention_status = self.run_afk("status", run_id, "--json")
+        self.assertEqual(attention_status.returncode, 2, attention_status.stderr)
+        original_attention = {
+            key: json.loads(attention_status.stdout)["attention"][key]
+            for key in ("scope", "kind", "summary")
+        }
 
         superseded = self.run_afk(
             "supersede",
@@ -355,11 +361,22 @@ class StartCliTest(unittest.TestCase):
             old_projection["supersession"]["reason"],
             "target validator trust root was replaced",
         )
+        self.assertEqual(
+            {key: old_projection["attention"][key] for key in original_attention},
+            original_attention,
+        )
+        for key in ("recommended_resume", "resume_precondition", "unit_observation"):
+            self.assertNotIn(key, old_projection)
         old_report = self.run_afk("report", run_id)
         self.assertEqual(old_report.returncode, 0, old_report.stderr)
+        report = json.loads(old_report.stdout)
         self.assertEqual(
-            json.loads(old_report.stdout)["supersession"],
+            report["supersession"],
             old_projection["supersession"],
+        )
+        self.assertEqual(
+            {key: report["attention"][key] for key in original_attention},
+            original_attention,
         )
         no_active = self.run_afk("status", "--json")
         self.assertEqual(no_active.returncode, 1)
