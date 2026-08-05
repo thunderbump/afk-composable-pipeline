@@ -535,25 +535,18 @@ class RunStore:
             return projection
 
     def resume_completed_status(self, run_id: str) -> dict[str, Any]:
-        """Validate a named Completed Run and reconcile a stale legacy pointer."""
+        """Validate a named Completed Run and its pending retrospective."""
         with self.lock(validate_root_permissions=True):
             projection, active_run_id = self._validated_resume_context(run_id)
             if projection["state"] != "completed":
                 raise RunStoreError(
                     "named resume is only available for a completed Run"
                 )
-            episode = self._validated_completion_episode(run_id, projection)
             finalized = self._completion_episode_finalized(run_id, projection)
-            if (
-                episode is not None
-                and not finalized
-                and active_run_id not in {None, run_id}
-            ):
+            if not finalized and active_run_id not in {None, run_id}:
                 raise EventHistoryCorrupt(
                     "Active Run pointer does not match pending completion"
                 )
-            if projection.get("completion_episode") is None and active_run_id == run_id:
-                self._clear_active_pointer(run_id)
             return projection
 
     def finalize_completion_episode(self, run_id: str) -> dict[str, Any]:
@@ -2111,8 +2104,6 @@ class RunStore:
     ) -> bool:
         episode = self._validated_completion_episode(run_id, projection)
         finalization = self._read_completion_finalization(run_id, missing_ok=True)
-        if episode is None:
-            raise EventHistoryCorrupt("completion episode marker is invalid")
         if finalization is None:
             return False
         outcome = self.sealed_evidence_result(run_id, episode["evidence"])
