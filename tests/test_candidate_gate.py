@@ -22,7 +22,7 @@ from afk.candidate_gate import (  # noqa: E402
     run_candidate_reviews,
 )
 from afk.jsonutil import sha256_json  # noqa: E402
-from afk.run_store import EvidenceTampered, RunStore  # noqa: E402
+from afk.run_store import EvidenceTampered, RunStore, RunStoreError  # noqa: E402
 from afk.start import (  # noqa: E402
     _advance_candidate,
     _advance_completed_gate,
@@ -2199,7 +2199,7 @@ class CandidateGateTest(unittest.TestCase):
             )
             self.assertEqual(effect_path.read_bytes(), legacy_bytes)
 
-    def test_gate_comment_reconciles_a_confirmed_pre_projection_effect(self):
+    def test_gate_comment_rejects_a_markerless_effect(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             store = RunStore(root / "state")
@@ -2232,14 +2232,6 @@ class CandidateGateTest(unittest.TestCase):
                 kind="gate-comment",
                 intended=identity,
             )
-            store.confirm_effect(
-                run_id,
-                "gate-comment-1",
-                observed={
-                    "url": "https://example.test/comment/1",
-                    "marker": marker,
-                },
-            )
 
             with (
                 mock.patch(
@@ -2252,6 +2244,7 @@ class CandidateGateTest(unittest.TestCase):
                     ],
                 ),
                 mock.patch("afk.candidate_gate._post_gate_comment") as replacement,
+                self.assertRaisesRegex(RunStoreError, "Effect identity conflict"),
             ):
                 reconcile_gate_comment(
                     store,
@@ -2262,10 +2255,6 @@ class CandidateGateTest(unittest.TestCase):
                 )
 
             replacement.assert_not_called()
-            self.assertEqual(
-                store.effect(run_id, "gate-comment-1")["intended"],
-                identity,
-            )
 
     def test_gate_comment_reconciliation_reads_all_paginated_comment_pages(self):
         with tempfile.TemporaryDirectory() as temporary:

@@ -307,28 +307,19 @@ def reconcile_gate_comment(
     marker = intended["marker"]
     body = _gate_comment_body(gate, marker)
     effect_id = gate_comment_effect_id(cycle, retry)
-    existing = store.effect_if_present(run_id, effect_id)
-    legacy_intended = {key: value for key, value in intended.items() if key != "marker"}
-    legacy_effect = (
-        projected is None
-        and existing is not None
-        and existing.get("intended") == legacy_intended
-    )
-    effect_intended = legacy_intended if legacy_effect else intended
     effect = store.prepare_effect(
         run_id,
         effect_id,
         kind="gate-comment",
-        intended=effect_intended,
+        intended=intended,
     )
-    observed_identity = {"marker": marker} if legacy_effect else intended
     observed = _observe_gate_comment(
         identity["repository"],
         pr_number,
         worktree,
         marker=marker,
         body=body,
-        observed_identity=observed_identity,
+        observed_identity=intended,
     )
     if observed is None:
         if effect["status"] == "confirmed":
@@ -345,7 +336,7 @@ def reconcile_gate_comment(
             worktree,
             marker=marker,
             body=body,
-            observed_identity=observed_identity,
+            observed_identity=intended,
         )
         if observed is None:
             raise GateError(
