@@ -232,14 +232,14 @@ class CandidateBrokerCliTest(unittest.TestCase):
         self.assertEqual(json.loads(result.read_text(encoding="utf-8"))["exit_code"], 0)
 
     def test_exact_candidate_pins_supplied_root_alias_for_whole_check(self):
-        from afk import worktree as checkouts
+        from afk import worktree
 
         alias = self.temp / "candidate-alias"
         alias.symlink_to(self.candidate, target_is_directory=True)
         plain = self.temp / "plain-tree"
         plain.mkdir()
         (plain / "input.txt").write_text("exact candidate\n", encoding="utf-8")
-        real_collect = checkouts._collect_untracked_worktree_paths
+        real_collect = worktree._collect_untracked_worktree_paths
         real_open = os.open
         retargeted = False
         reopened_aliases = []
@@ -268,7 +268,7 @@ class CandidateBrokerCliTest(unittest.TestCase):
             ),
             mock.patch("afk.worktree.os.open", side_effect=record_open),
         ):
-            self.assertTrue(checkouts.is_exact_clean_commit(alias, self.candidate_sha))
+            self.assertTrue(worktree.is_exact_clean_commit(alias, self.candidate_sha))
 
         self.assertEqual(alias.resolve(), plain)
         self.assertEqual(reopened_aliases, [])
@@ -2144,13 +2144,13 @@ class CandidateBrokerCliTest(unittest.TestCase):
             self.assertTrue(is_exact_clean_commit(self.candidate, self.candidate_sha))
 
     def test_exact_candidate_rejects_tracked_metadata_over_output_limit(self):
-        from afk import worktree as checkouts
+        from afk import worktree
 
         (self.candidate / "second.txt").write_text("second\n", encoding="utf-8")
         self.git("add", "second.txt")
         self.git("commit", "-m", "add second tracked file")
         self.candidate_sha = self.git("rev-parse", "HEAD")
-        real_run_trusted_read_git = checkouts.run_trusted_read_git
+        real_run_trusted_read_git = worktree.run_trusted_read_git
         bounded_results = []
 
         def record_tracked_read(args, **kwargs):
@@ -2162,22 +2162,22 @@ class CandidateBrokerCliTest(unittest.TestCase):
             return result
 
         with (
-            mock.patch.object(checkouts, "EXACT_CANDIDATE_TRACKED_PATH_LIMIT", 1),
-            mock.patch.object(checkouts, "EXACT_CANDIDATE_TRACKED_BYTES_LIMIT", 1),
-            mock.patch.object(checkouts, "EXACT_CANDIDATE_TRACKED_DEPTH_LIMIT", 8),
+            mock.patch.object(worktree, "EXACT_CANDIDATE_TRACKED_PATH_LIMIT", 1),
+            mock.patch.object(worktree, "EXACT_CANDIDATE_TRACKED_BYTES_LIMIT", 1),
+            mock.patch.object(worktree, "EXACT_CANDIDATE_TRACKED_DEPTH_LIMIT", 8),
             mock.patch(
                 "afk.worktree.run_trusted_read_git",
                 side_effect=record_tracked_read,
             ),
         ):
             self.assertFalse(
-                checkouts.is_exact_clean_commit(self.candidate, self.candidate_sha)
+                worktree.is_exact_clean_commit(self.candidate, self.candidate_sha)
             )
 
         self.assertEqual(bounded_results, [(65, 1, b""), (65, 1, b"")])
 
     def test_bounded_trusted_git_cleans_child_when_io_setup_raises(self):
-        from afk import worktree as checkouts
+        from afk import worktree
 
         real_popen = subprocess.Popen
         children = []
@@ -2202,7 +2202,7 @@ class CandidateBrokerCliTest(unittest.TestCase):
                 ),
                 self.assertRaisesRegex(RuntimeError, "io setup failed"),
             ):
-                checkouts._run_bounded_trusted_git(
+                worktree._run_bounded_trusted_git(
                     ["git", "ls-tree"],
                     cwd=self.candidate,
                     environment=self.git_environment,
@@ -2224,10 +2224,10 @@ class CandidateBrokerCliTest(unittest.TestCase):
                         stream.close()
 
     def test_bounded_trusted_git_cleans_child_and_reraises_interrupt(self):
-        from afk import worktree as checkouts
+        from afk import worktree
 
         real_popen = subprocess.Popen
-        real_process_io = checkouts.BoundedProcessIO
+        real_process_io = worktree.BoundedProcessIO
         children = []
 
         def start_long_lived_child(_command, **kwargs):
@@ -2255,7 +2255,7 @@ class CandidateBrokerCliTest(unittest.TestCase):
                 ),
                 self.assertRaises(KeyboardInterrupt),
             ):
-                checkouts._run_bounded_trusted_git(
+                worktree._run_bounded_trusted_git(
                     ["git", "ls-tree"],
                     cwd=self.candidate,
                     environment=self.git_environment,
@@ -2289,7 +2289,7 @@ class CandidateBrokerCliTest(unittest.TestCase):
         self.assertTrue(is_exact_clean_commit(self.candidate, self.candidate_sha))
 
     def test_exact_candidate_bounds_nested_gitlink_repositories(self):
-        from afk import worktree as checkouts
+        from afk import worktree
 
         leaf = self.temp / "gitlink-leaf"
         leaf.mkdir()
@@ -2334,21 +2334,21 @@ class CandidateBrokerCliTest(unittest.TestCase):
         )
 
         with mock.patch.object(
-            checkouts,
+            worktree,
             "EXACT_CANDIDATE_REPOSITORY_LIMIT",
             3,
         ):
             self.assertTrue(
-                checkouts.is_exact_clean_commit(self.candidate, self.candidate_sha)
+                worktree.is_exact_clean_commit(self.candidate, self.candidate_sha)
             )
 
         with mock.patch.object(
-            checkouts,
+            worktree,
             "EXACT_CANDIDATE_REPOSITORY_LIMIT",
             2,
         ):
             self.assertFalse(
-                checkouts.is_exact_clean_commit(self.candidate, self.candidate_sha)
+                worktree.is_exact_clean_commit(self.candidate, self.candidate_sha)
             )
 
     def test_exact_candidate_fails_closed_when_regular_file_becomes_fifo_at_open(self):
@@ -2471,13 +2471,13 @@ class CandidateBrokerCliTest(unittest.TestCase):
         self.assertTrue(is_exact_clean_commit(self.candidate, self.candidate_sha))
 
     def test_exact_candidate_bounds_committed_ignore_materialization(self):
-        from afk import worktree as checkouts
+        from afk import worktree
 
         (self.candidate / ".gitignore").write_text("ignored.log\n", encoding="utf-8")
         self.git("add", ".gitignore")
         self.git("commit", "-m", "add ignore policy")
         self.candidate_sha = self.git("rev-parse", "HEAD")
-        real_run_trusted_read_git = checkouts.run_trusted_read_git
+        real_run_trusted_read_git = worktree.run_trusted_read_git
         blob_reads = []
 
         def record_blob_read(args, **kwargs):
@@ -2491,12 +2491,12 @@ class CandidateBrokerCliTest(unittest.TestCase):
         ):
             for file_limit, byte_limit in ((0, 1024), (1, 4)):
                 with mock.patch.multiple(
-                    checkouts,
+                    worktree,
                     EXACT_CANDIDATE_IGNORE_FILE_LIMIT=file_limit,
                     EXACT_CANDIDATE_IGNORE_BYTES_LIMIT=byte_limit,
                 ):
                     self.assertFalse(
-                        checkouts.is_exact_clean_commit(
+                        worktree.is_exact_clean_commit(
                             self.candidate, self.candidate_sha
                         )
                     )
@@ -2540,7 +2540,7 @@ class CandidateBrokerCliTest(unittest.TestCase):
         self.assertFalse(is_exact_clean_commit(self.candidate, self.candidate_sha))
 
     def test_exact_candidate_rejects_tracked_parent_replaced_after_scan(self):
-        from afk import worktree as checkouts
+        from afk import worktree
 
         tracked = self.candidate / "tracked"
         tracked.mkdir()
@@ -2552,7 +2552,7 @@ class CandidateBrokerCliTest(unittest.TestCase):
         external.mkdir()
         (external / "input.txt").write_text("tracked content\n", encoding="utf-8")
         real_collect_untracked_worktree_paths = (
-            checkouts._collect_untracked_worktree_paths
+            worktree._collect_untracked_worktree_paths
         )
 
         def replace_parent_after_scan(*args, **kwargs):
@@ -2566,11 +2566,11 @@ class CandidateBrokerCliTest(unittest.TestCase):
             side_effect=replace_parent_after_scan,
         ):
             self.assertFalse(
-                checkouts.is_exact_clean_commit(self.candidate, self.candidate_sha)
+                worktree.is_exact_clean_commit(self.candidate, self.candidate_sha)
             )
 
     def test_exact_candidate_rejects_ignored_file_replaced_after_scan(self):
-        from afk import worktree as checkouts
+        from afk import worktree
 
         (self.candidate / ".gitignore").write_text("ignored.data\n", encoding="utf-8")
         self.git("add", ".gitignore")
@@ -2579,7 +2579,7 @@ class CandidateBrokerCliTest(unittest.TestCase):
         ignored = self.candidate / "ignored.data"
         ignored.write_bytes(b"generated\n")
         real_collect_untracked_worktree_paths = (
-            checkouts._collect_untracked_worktree_paths
+            worktree._collect_untracked_worktree_paths
         )
 
         def replace_ignored_after_scan(*args, **kwargs):
@@ -2593,7 +2593,7 @@ class CandidateBrokerCliTest(unittest.TestCase):
             side_effect=replace_ignored_after_scan,
         ):
             self.assertFalse(
-                checkouts.is_exact_clean_commit(self.candidate, self.candidate_sha)
+                worktree.is_exact_clean_commit(self.candidate, self.candidate_sha)
             )
 
     def test_exact_candidate_rejects_fifo_ignored_by_committed_gitignore(self):
@@ -2645,7 +2645,7 @@ class CandidateBrokerCliTest(unittest.TestCase):
             self.assertTrue(is_exact_clean_commit(self.candidate, self.candidate_sha))
 
     def test_exact_candidate_bounds_flat_ignored_file_evaluation(self):
-        from afk import worktree as checkouts
+        from afk import worktree
 
         (self.candidate / ".gitignore").write_text("*.log\n", encoding="utf-8")
         self.git("add", ".gitignore")
@@ -2655,7 +2655,7 @@ class CandidateBrokerCliTest(unittest.TestCase):
         byte_limit = 1024
         for index in range(path_limit + 1):
             (self.candidate / f"generated-{index}.log").write_bytes(b"")
-        real_run_trusted_read_git = checkouts.run_trusted_read_git
+        real_run_trusted_read_git = worktree.run_trusted_read_git
         oversized_requests = []
 
         def record_ignore_request(args, **kwargs):
@@ -2666,10 +2666,10 @@ class CandidateBrokerCliTest(unittest.TestCase):
 
         with (
             mock.patch.object(
-                checkouts, "EXACT_CANDIDATE_UNTRACKED_PATH_LIMIT", path_limit
+                worktree, "EXACT_CANDIDATE_UNTRACKED_PATH_LIMIT", path_limit
             ),
             mock.patch.object(
-                checkouts, "EXACT_CANDIDATE_UNTRACKED_BYTES_LIMIT", byte_limit
+                worktree, "EXACT_CANDIDATE_UNTRACKED_BYTES_LIMIT", byte_limit
             ),
             mock.patch(
                 "afk.worktree.run_trusted_read_git",
@@ -2677,19 +2677,19 @@ class CandidateBrokerCliTest(unittest.TestCase):
             ),
         ):
             self.assertFalse(
-                checkouts.is_exact_clean_commit(self.candidate, self.candidate_sha)
+                worktree.is_exact_clean_commit(self.candidate, self.candidate_sha)
             )
 
         self.assertEqual(oversized_requests, [])
 
     def test_exact_candidate_bounds_directories_across_breadth_frontiers(self):
-        from afk import worktree as checkouts
+        from afk import worktree
 
         directory = self.candidate
         for depth in range(5):
             directory /= f"d{depth}"
             directory.mkdir()
-        real_run_trusted_read_git = checkouts.run_trusted_read_git
+        real_run_trusted_read_git = worktree.run_trusted_read_git
         ignore_requests = []
 
         def record_ignore_request(args, **kwargs):
@@ -2698,15 +2698,15 @@ class CandidateBrokerCliTest(unittest.TestCase):
             return real_run_trusted_read_git(args, **kwargs)
 
         with (
-            mock.patch.object(checkouts, "EXACT_CANDIDATE_UNTRACKED_PATH_LIMIT", 4),
-            mock.patch.object(checkouts, "EXACT_CANDIDATE_UNTRACKED_BYTES_LIMIT", 1024),
+            mock.patch.object(worktree, "EXACT_CANDIDATE_UNTRACKED_PATH_LIMIT", 4),
+            mock.patch.object(worktree, "EXACT_CANDIDATE_UNTRACKED_BYTES_LIMIT", 1024),
             mock.patch(
                 "afk.worktree.run_trusted_read_git",
                 side_effect=record_ignore_request,
             ),
         ):
             self.assertFalse(
-                checkouts.is_exact_clean_commit(self.candidate, self.candidate_sha)
+                worktree.is_exact_clean_commit(self.candidate, self.candidate_sha)
             )
 
         self.assertEqual(len(ignore_requests), 4)
