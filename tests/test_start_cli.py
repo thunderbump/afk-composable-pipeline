@@ -8733,8 +8733,8 @@ class StartCliTest(unittest.TestCase):
 
         self.assert_resume_preflight_rejected("Run identity is invalid: crashed-run")
 
-    def test_resume_accepts_transitional_receipt_aware_run_identity(self):
-        store, run_dir = self.create_resume_preflight_run()
+    def test_resume_rejects_schema_one_receipt_aware_run_identity(self):
+        _, run_dir = self.create_resume_preflight_run()
         identity_path = run_dir / "run.json"
         identity = json.loads(identity_path.read_text(encoding="utf-8"))
         identity["schema_version"] = 1
@@ -8743,10 +8743,7 @@ class StartCliTest(unittest.TestCase):
             encoding="utf-8",
         )
 
-        resumed = self.run_afk("resume")
-
-        self.assertEqual(resumed.returncode, 0, resumed.stderr)
-        self.assertEqual(store.identity("crashed-run"), identity)
+        self.assert_resume_preflight_rejected("Run identity is invalid: crashed-run")
 
     def test_resume_rejects_tampered_sealed_evidence_before_external_commands(self):
         store, _ = self.create_resume_preflight_run()
@@ -9564,13 +9561,6 @@ class StartCliTest(unittest.TestCase):
             base_sha=BASE_SHA,
             start_request={},
             run_id=run_id,
-        )
-        identity_path = store_root / "runs" / run_id / "run.json"
-        identity = json.loads(identity_path.read_text(encoding="utf-8"))
-        identity["schema_version"] = 1
-        identity_path.write_text(
-            json.dumps(identity, sort_keys=True, separators=(",", ":")) + "\n",
-            encoding="utf-8",
         )
         projection = store.record_attention_episode(
             run_id,

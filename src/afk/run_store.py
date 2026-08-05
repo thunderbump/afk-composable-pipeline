@@ -2054,7 +2054,7 @@ class RunStore:
         )
         valid_format = (
             type(schema_version) is int
-            and schema_version in (SCHEMA_VERSION, RUN_IDENTITY_SCHEMA_VERSION)
+            and schema_version == RUN_IDENTITY_SCHEMA_VERSION
             and set(identity) == identity_keys
             and type(identity.get("evidence_receipt_version")) is int
             and identity["evidence_receipt_version"] == EVIDENCE_RECEIPT_VERSION
