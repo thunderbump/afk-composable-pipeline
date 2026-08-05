@@ -13,6 +13,14 @@ sys.path.insert(0, str(ROOT / "src"))
 from afk import candidate_gate as candidate_gate_module  # noqa: E402
 from afk.bead_spec import persist_bead_spec  # noqa: E402
 from afk.candidate import CandidateError  # noqa: E402
+from afk.candidate_pr_publication import (  # noqa: E402
+    event as candidate_pr_publication_event,
+    marker as candidate_pr_marker,
+)
+from afk.candidate_publication import (  # noqa: E402
+    event as candidate_publication_event,
+    publication as candidate_publication,
+)
 from afk.candidate_gate import (  # noqa: E402
     GateError,
     build_repair_brief,
@@ -128,6 +136,63 @@ class CandidateGateTest(unittest.TestCase):
             run_id,
             bead or {"id": "central-test.1"},
         )
+        store.append_event(
+            run_id,
+            "worktree.ready",
+            state="worktree_ready",
+            data={
+                "checkpoint": "worktree_ready",
+                "worktree_path": str(checkout),
+                "branch": branch,
+            },
+        )
+        store.append_event(
+            run_id,
+            "candidate.change_committed",
+            state="change_committed",
+            data={"checkpoint": "change_committed", "candidate_sha": candidate_sha},
+        )
+        publication = candidate_publication("owner/project", branch, candidate_sha)
+        publication_event = candidate_publication_event("change_committed", publication)
+        store.append_event(
+            run_id,
+            publication_event["event"],
+            state=publication_event["state"],
+            data=publication_event["data"],
+        )
+        marker = candidate_pr_marker(run_id, candidate_sha)
+        pr_publication = {
+            "repository": "owner/project",
+            "number": 7,
+            "url": "https://example.test/pr/7",
+            "head_sha": candidate_sha,
+            "head": branch,
+            "base": "main",
+            "state": "OPEN",
+            "draft": True,
+            "marker": marker,
+        }
+        publication_event = candidate_pr_publication_event(
+            "change_committed", pr_publication
+        )
+        store.append_event(
+            run_id,
+            publication_event["event"],
+            state=publication_event["state"],
+            data=publication_event["data"],
+        )
+        store.append_event(
+            run_id,
+            "candidate.ready",
+            state="candidate_ready",
+            data={
+                "checkpoint": "candidate_ready",
+                "candidate_sha": candidate_sha,
+                "pr_number": 7,
+                "pr_url": "https://example.test/pr/7",
+                "pr_head_sha": candidate_sha,
+            },
+        )
         store.write_evidence_text(run_id, "gates/validation/result.json", "{}\n")
         validation_manifest_sha256 = sha256_json(
             store.seal_evidence(run_id, "gates/validation")
@@ -160,6 +225,7 @@ class CandidateGateTest(unittest.TestCase):
             "headRefOid": candidate_sha,
             "headRefName": branch,
             "baseRefName": "main",
+            "body": marker,
         }
         return store, run_id, checkout, candidate_sha, pr
 
@@ -454,9 +520,9 @@ class CandidateGateTest(unittest.TestCase):
             "closed",
             "ready",
         )
+        self._use_real_publication_check()
         for case in cases:
             with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
-                self._use_real_publication_check()
                 root = Path(temporary)
                 store, run_id, checkout, candidate_sha, pr = (
                     self._published_validated_candidate(root)
@@ -525,10 +591,6 @@ class CandidateGateTest(unittest.TestCase):
                 )
                 self.assertEqual(raised.exception.kind, expected)
                 reviews.assert_not_called()
-                self.publication_check = mock.patch(
-                    "afk.candidate_gate._require_candidate_publication"
-                )
-                self.publication_check.start()
 
     def test_publication_drift_during_review_blocks_attempt_reuse(self):
         self._use_real_publication_check()
@@ -665,6 +727,7 @@ class CandidateGateTest(unittest.TestCase):
                 mock.patch(
                     "afk.start._advance_validation", side_effect=pass_validation
                 ),
+                mock.patch("afk.start.verify_candidate_publication"),
                 mock.patch("afk.start._advance_gate", side_effect=enter_gate) as gate,
             ):
                 exit_code = _advance_candidate(store, run_id)
@@ -744,6 +807,7 @@ class CandidateGateTest(unittest.TestCase):
                     mock.patch(
                         "afk.start._advance_validation", return_value=0
                     ) as validation,
+                    mock.patch("afk.start.verify_candidate_publication"),
                     mock.patch("afk.start._advance_gate", return_value=0) as gate,
                 ):
                     resumed = resume_run()
