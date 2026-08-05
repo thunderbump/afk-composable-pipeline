@@ -2038,7 +2038,7 @@ class RunStore:
         return self._validate_identity(identity, run_id)
 
     def _validate_identity(self, identity: Any, run_id: str) -> dict[str, Any]:
-        legacy_keys = {
+        identity_keys = {
             "schema_version",
             "run_id",
             "bead_id",
@@ -2047,19 +2047,17 @@ class RunStore:
             "base_sha",
             "created_at",
             "start_request",
+            "evidence_receipt_version",
         }
-        receipt_keys = legacy_keys | {"evidence_receipt_version"}
         schema_version = (
             identity.get("schema_version") if isinstance(identity, dict) else None
         )
-        valid_format = type(schema_version) is int and (
-            (schema_version == SCHEMA_VERSION and set(identity) == legacy_keys)
-            or (
-                schema_version in (SCHEMA_VERSION, RUN_IDENTITY_SCHEMA_VERSION)
-                and set(identity) == receipt_keys
-                and type(identity.get("evidence_receipt_version")) is int
-                and identity["evidence_receipt_version"] == EVIDENCE_RECEIPT_VERSION
-            )
+        valid_format = (
+            type(schema_version) is int
+            and schema_version in (SCHEMA_VERSION, RUN_IDENTITY_SCHEMA_VERSION)
+            and set(identity) == identity_keys
+            and type(identity.get("evidence_receipt_version")) is int
+            and identity["evidence_receipt_version"] == EVIDENCE_RECEIPT_VERSION
         )
         if (
             not valid_format
