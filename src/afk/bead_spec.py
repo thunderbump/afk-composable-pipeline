@@ -81,8 +81,6 @@ def reconcile_bead_spec(
 def load_bead_spec(
     store: RunStore,
     run_id: str,
-    *,
-    fallback: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     projection = store.status(run_id)
     record = projection.get("bead_spec")
@@ -102,8 +100,6 @@ def load_bead_spec(
                     "canonical Bead/spec evidence is malformed"
                 ) from exc
             record = _bead_spec_record(recovered_manifest)
-        elif fallback is not None:
-            return redact_artifact_value(fallback)
     if not isinstance(record, dict) or set(record) != {
         "schema_version",
         "evidence",

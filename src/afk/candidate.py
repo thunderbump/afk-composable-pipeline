@@ -132,11 +132,9 @@ def github_repo_from_repo_url(repo_url: str) -> str | None:
 def produce_candidate(
     store: RunStore,
     run_id: str,
-    *,
-    bead: dict[str, Any],
 ) -> dict[str, Any]:
     """Produce and reconcile the Run's one implementation Candidate."""
-    bead = load_bead_spec(store, run_id, fallback=bead)
+    bead = load_bead_spec(store, run_id)
     identity = store.identity(run_id)
     projection = store.status(run_id)
     worktree = Path(_field(projection, "worktree_path"))
@@ -755,11 +753,10 @@ def produce_repair_candidate(
     store: RunStore,
     run_id: str,
     *,
-    bead: dict[str, Any],
     repair_brief: dict[str, Any],
 ) -> dict[str, Any]:
     """Run one budgeted repair and advance the existing Candidate branch/PR."""
-    bead = load_bead_spec(store, run_id, fallback=bead)
+    bead = load_bead_spec(store, run_id)
     identity = store.identity(run_id)
     projection = store.status(run_id)
     worktree = Path(_field(projection, "worktree_path"))

@@ -1888,18 +1888,18 @@ else:
         self.store.write_evidence_value("run-001", BEAD_SPEC_ARTIFACT, bead)
         self.store.seal_evidence("run-001", BEAD_SPEC_EVIDENCE)
 
-        recovered = load_bead_spec(
-            self.store,
-            "run-001",
-            fallback={
-                **bead,
-                "description": "mutated live description",
-                "status": "closed",
-                "comments": [{"text": "mutated live comment"}],
-            },
-        )
+        recovered = load_bead_spec(self.store, "run-001")
 
         self.assertEqual(recovered, bead)
+
+    def test_load_bead_spec_rejects_missing_canonical_evidence(self):
+        self.create_run()
+
+        with self.assertRaisesRegex(
+            RunStoreError,
+            "Run lacks canonical Bead/spec identity",
+        ):
+            load_bead_spec(self.store, "run-001")
 
     def test_status_cli_reports_named_and_active_run(self):
         self.create_run()

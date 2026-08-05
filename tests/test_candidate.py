@@ -214,6 +214,17 @@ class CandidateTest(unittest.TestCase):
         ).stdout.strip()
 
     def produce(self, **env):
+        if "bead_spec" not in self.store.status("run-1"):
+            persist_bead_spec(
+                self.store,
+                "run-1",
+                {
+                    "id": "central-test.1",
+                    "title": "Implement the thing",
+                    "description": "Change one file.",
+                    "acceptance_criteria": "The file exists.",
+                },
+            )
         (self.codex_home / "fake-outcome").write_text(
             env.pop("CODEX_FAKE_OUTCOME", "completed"), encoding="utf-8"
         )
@@ -231,16 +242,14 @@ class CandidateTest(unittest.TestCase):
         )
         environment.update(env)
         with mock.patch.dict(os.environ, environment, clear=True):
-            return produce_candidate(
-                self.store,
-                "run-1",
-                bead={
-                    "id": "central-test.1",
-                    "title": "Implement the thing",
-                    "description": "Change one file.",
-                    "acceptance_criteria": "The file exists.",
-                },
-            )
+            return produce_candidate(self.store, "run-1")
+
+    def test_candidate_requires_frozen_bead_spec_evidence(self):
+        with self.assertRaisesRegex(
+            RunStoreError,
+            "Run lacks canonical Bead/spec identity",
+        ):
+            produce_candidate(self.store, "run-1")
 
     def test_produces_exact_committed_head_as_one_stable_draft_pr(self):
         result = self.produce()
@@ -543,14 +552,6 @@ class CandidateTest(unittest.TestCase):
             result = produce_repair_candidate(
                 self.store,
                 "run-1",
-                bead={
-                    "id": "central-test.1",
-                    "title": "Implement the thing",
-                    "description": "mutated live description",
-                    "acceptance_criteria": "The file exists.",
-                    "status": "closed",
-                    "comments": [{"text": "mutated live comment"}],
-                },
                 repair_brief=brief,
             )
 
@@ -624,12 +625,6 @@ class CandidateTest(unittest.TestCase):
                 produce_repair_candidate(
                     self.store,
                     "run-1",
-                    bead={
-                        "id": "central-test.1",
-                        "title": "Implement the thing",
-                        "description": "Change one file.",
-                        "acceptance_criteria": "The file exists.",
-                    },
                     repair_brief=brief,
                 )
 
@@ -676,7 +671,6 @@ class CandidateTest(unittest.TestCase):
             produce_repair_candidate(
                 self.store,
                 "run-1",
-                bead=bead,
                 repair_brief=brief,
             )
 
@@ -763,7 +757,6 @@ class CandidateTest(unittest.TestCase):
             produce_repair_candidate(
                 self.store,
                 "run-1",
-                bead=bead,
                 repair_brief=brief,
             )
 
@@ -915,7 +908,6 @@ class CandidateTest(unittest.TestCase):
             produce_repair_candidate(
                 self.store,
                 "run-1",
-                bead=bead,
                 repair_brief=brief,
             )
 
@@ -979,12 +971,6 @@ class CandidateTest(unittest.TestCase):
             produce_repair_candidate(
                 self.store,
                 "run-1",
-                bead={
-                    "id": "central-test.1",
-                    "title": "Implement the thing",
-                    "description": "Change one file.",
-                    "acceptance_criteria": "The file exists.",
-                },
                 repair_brief=brief,
             )
 
@@ -1040,7 +1026,6 @@ class CandidateTest(unittest.TestCase):
             produce_repair_candidate(
                 self.store,
                 "run-1",
-                bead=bead,
                 repair_brief=brief,
             )
 
@@ -1108,7 +1093,6 @@ class CandidateTest(unittest.TestCase):
             produce_repair_candidate(
                 self.store,
                 "run-1",
-                bead=bead,
                 repair_brief=second_brief,
             )
 
@@ -1173,7 +1157,6 @@ class CandidateTest(unittest.TestCase):
             produce_repair_candidate(
                 self.store,
                 "run-1",
-                bead=bead,
                 repair_brief=third_brief,
             )
 
@@ -1235,7 +1218,6 @@ class CandidateTest(unittest.TestCase):
             produce_repair_candidate(
                 self.store,
                 "run-1",
-                bead=bead,
                 repair_brief=fourth_brief,
             )
 
@@ -1314,21 +1296,13 @@ class CandidateTest(unittest.TestCase):
                 },
             )
 
-        bead = {
-            "id": "central-test.1",
-            "title": "Implement the thing",
-            "description": "Change one file.",
-            "acceptance_criteria": "The file exists.",
-        }
         first_brief = brief(1)
         start_attempt(1, first_brief)
         self.store.write_evidence_text(
             "run-1", "attempts/repair-1/prompt.md", "started\n"
         )
         with self.assertRaisesRegex(CandidateError, "incomplete"):
-            produce_repair_candidate(
-                self.store, "run-1", bead=bead, repair_brief=first_brief
-            )
+            produce_repair_candidate(self.store, "run-1", repair_brief=first_brief)
 
         valid_report = {
             "status": "completed",
@@ -1354,9 +1328,7 @@ class CandidateTest(unittest.TestCase):
         tampered.write_text("{}", encoding="utf-8")
         tampered.chmod(0o400)
         with self.assertRaises(EvidenceTampered):
-            produce_repair_candidate(
-                self.store, "run-1", bead=bead, repair_brief=second_brief
-            )
+            produce_repair_candidate(self.store, "run-1", repair_brief=second_brief)
 
         third_brief = brief(3)
         start_attempt(3, third_brief)
@@ -1373,9 +1345,7 @@ class CandidateTest(unittest.TestCase):
         )
         self.store.seal_evidence("run-1", "attempts/repair-3")
         with self.assertRaisesRegex(CandidateError, "dispositions"):
-            produce_repair_candidate(
-                self.store, "run-1", bead=bead, repair_brief=third_brief
-            )
+            produce_repair_candidate(self.store, "run-1", repair_brief=third_brief)
 
     def test_allows_only_codex_package_when_installed_beneath_home(self):
         package = self.home / ".local/lib/node_modules/@openai/codex"

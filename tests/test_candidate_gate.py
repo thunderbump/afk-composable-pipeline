@@ -45,7 +45,7 @@ class CandidateGateTest(unittest.TestCase):
         self.publication_check.stop()
         self.publication_check = None
 
-    def _published_validated_candidate(self, root):
+    def _published_validated_candidate(self, root, *, bead=None):
         remote = root / "remote.git"
         checkout = root / "checkout"
         subprocess.run(
@@ -123,6 +123,11 @@ class CandidateGateTest(unittest.TestCase):
             start_request={},
             run_id="run-1",
         )["run_id"]
+        persist_bead_spec(
+            store,
+            run_id,
+            bead or {"id": "central-test.1"},
+        )
         store.write_evidence_text(run_id, "gates/validation/result.json", "{}\n")
         validation_manifest_sha256 = sha256_json(
             store.seal_evidence(run_id, "gates/validation")
@@ -157,6 +162,24 @@ class CandidateGateTest(unittest.TestCase):
             "baseRefName": "main",
         }
         return store, run_id, checkout, candidate_sha, pr
+
+    def test_gate_requires_frozen_bead_spec_evidence(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store = RunStore(Path(temporary) / "state")
+            run_id = store.create_run(
+                bead_id="central-test.1",
+                repository="owner/project",
+                base_branch="main",
+                base_sha="a" * 40,
+                start_request={},
+                run_id="run-1",
+            )["run_id"]
+
+            with self.assertRaisesRegex(
+                RunStoreError,
+                "Run lacks canonical Bead/spec identity",
+            ):
+                complete_gate_cycle(store, run_id)
 
     def test_review_permission_profile_keeps_inputs_read_only(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -315,12 +338,8 @@ class CandidateGateTest(unittest.TestCase):
                 ) as run_reviews,
                 mock.patch("afk.candidate_gate.reconcile_gate_comment") as comment,
             ):
-                outcome = complete_gate_cycle(
-                    store, run_id, bead={"id": "central-test.1"}
-                )
-                recovered = complete_gate_cycle(
-                    store, run_id, bead={"id": "central-test.1"}
-                )
+                outcome = complete_gate_cycle(store, run_id)
+                recovered = complete_gate_cycle(store, run_id)
 
             self.assertEqual(recovered, outcome)
             self.assertEqual(run_reviews.call_count, 1)
@@ -344,16 +363,16 @@ class CandidateGateTest(unittest.TestCase):
     def test_redacted_review_bundle_recovers_with_exact_bead_and_instructions(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            store, run_id, _, candidate_sha, _ = self._published_validated_candidate(
-                root
-            )
             bead = {
                 "id": "central-test.1",
                 "title": "password=bead-secret",
                 "description": "Review it.",
                 "acceptance_criteria": "Both axes pass.",
             }
-            persist_bead_spec(store, run_id, bead)
+            store, run_id, _, candidate_sha, _ = self._published_validated_candidate(
+                root,
+                bead=bead,
+            )
 
             def reviewer(axis, bundle_path, attempt_path, worktree):
                 return (
@@ -373,17 +392,11 @@ class CandidateGateTest(unittest.TestCase):
             with mock.patch(
                 "afk.candidate_gate._execute_reviewer", side_effect=reviewer
             ) as execute:
-                first = run_candidate_reviews(store, run_id, cycle=1, bead=bead)
+                first = run_candidate_reviews(store, run_id, cycle=1)
                 second = run_candidate_reviews(
                     store,
                     run_id,
                     cycle=1,
-                    bead={
-                        **bead,
-                        "description": "mutated live description",
-                        "status": "closed",
-                        "comments": [{"text": "mutated live comment"}],
-                    },
                 )
 
             self.assertEqual(first, second)
@@ -423,7 +436,7 @@ class CandidateGateTest(unittest.TestCase):
                 mock.patch("afk.candidate_gate.reconcile_gate_comment"),
                 self.assertRaises(GateError) as raised,
             ):
-                complete_gate_cycle(store, run_id, bead={"id": "central-test.1"})
+                complete_gate_cycle(store, run_id)
 
             self.assertEqual(raised.exception.kind, "head_mismatch")
             reviews.assert_not_called()
@@ -503,7 +516,7 @@ class CandidateGateTest(unittest.TestCase):
                     mock.patch("afk.candidate_gate.run_candidate_reviews") as reviews,
                     self.assertRaises(GateError) as raised,
                 ):
-                    complete_gate_cycle(store, run_id, bead={"id": "central-test.1"})
+                    complete_gate_cycle(store, run_id)
 
                 expected = (
                     "head_mismatch"
@@ -546,7 +559,7 @@ class CandidateGateTest(unittest.TestCase):
                 ),
                 self.assertRaises(GateError) as raised,
             ):
-                complete_gate_cycle(store, run_id, bead={"id": "central-test.1"})
+                complete_gate_cycle(store, run_id)
 
             self.assertEqual(raised.exception.kind, "head_mismatch")
             gate = (
@@ -563,7 +576,7 @@ class CandidateGateTest(unittest.TestCase):
                 mock.patch("afk.candidate_gate.run_candidate_reviews") as rerun,
                 self.assertRaises(GateError),
             ):
-                complete_gate_cycle(store, run_id, bead={"id": "central-test.1"})
+                complete_gate_cycle(store, run_id)
             rerun.assert_not_called()
 
     def test_repaired_bootstrap_candidate_pauses_for_explicit_reapproval(self):
@@ -610,7 +623,6 @@ class CandidateGateTest(unittest.TestCase):
                     store,
                     run_id,
                     outcome=outcome,
-                    bead={"id": "central-test.1"},
                 )
 
             self.assertEqual(exit_code, 2)
@@ -950,7 +962,6 @@ class CandidateGateTest(unittest.TestCase):
                 root
             )
             validation_projection = store.status(run_id)
-            persist_bead_spec(store, run_id, {"id": "central-test.1"})
             store.append_event(
                 run_id,
                 "validation.passed",
@@ -1544,6 +1555,7 @@ class CandidateGateTest(unittest.TestCase):
                 start_request={},
                 run_id="run-1",
             )["run_id"]
+            persist_bead_spec(store, run_id, {"id": "central-test.1"})
             store.write_evidence_text(run_id, "gates/validation-b/result.json", "{}\n")
             store.seal_evidence(run_id, "gates/validation-b")
             store.append_event(
@@ -1581,9 +1593,7 @@ class CandidateGateTest(unittest.TestCase):
                 ) as run_reviews,
                 mock.patch("afk.candidate_gate.reconcile_gate_comment"),
             ):
-                outcome = complete_gate_cycle(
-                    store, run_id, bead={"id": "central-test.1"}
-                )
+                outcome = complete_gate_cycle(store, run_id)
 
             self.assertEqual(outcome["next_action"], "complete")
             self.assertEqual(store.status(run_id)["checkpoint"], "reviewed")
@@ -1603,6 +1613,7 @@ class CandidateGateTest(unittest.TestCase):
                 start_request={},
                 run_id="run-1",
             )["run_id"]
+            persist_bead_spec(store, run_id, {"id": "central-test.1"})
             store.write_evidence_text(run_id, "gates/validation-b/result.json", "{}\n")
             store.seal_evidence(run_id, "gates/validation-b")
             store.append_event(
@@ -1646,9 +1657,7 @@ class CandidateGateTest(unittest.TestCase):
                 ),
                 mock.patch("afk.candidate_gate.reconcile_gate_comment"),
             ):
-                outcome = complete_gate_cycle(
-                    store, run_id, bead={"id": "central-test.1"}
-                )
+                outcome = complete_gate_cycle(store, run_id)
 
             self.assertEqual(outcome["next_action"], "attention")
             self.assertEqual(store.status(run_id)["checkpoint"], "validated")
@@ -1659,7 +1668,6 @@ class CandidateGateTest(unittest.TestCase):
             store, run_id, _, candidate_sha, _ = self._published_validated_candidate(
                 root
             )
-            persist_bead_spec(store, run_id, {"id": "central-test.1"})
             original_evidence = f"gates/gate-cycle-1-{candidate_sha[:12]}"
             original = {
                 "schema_version": 1,
@@ -1711,7 +1719,6 @@ class CandidateGateTest(unittest.TestCase):
                 outcome = complete_gate_cycle(
                     store,
                     run_id,
-                    bead={"id": "central-test.1"},
                     retry=1,
                 )
 
@@ -1768,6 +1775,7 @@ class CandidateGateTest(unittest.TestCase):
                 start_request={},
                 run_id="run-1",
             )["run_id"]
+            persist_bead_spec(store, run_id, {"id": "central-test.1"})
             store.write_evidence_text(run_id, "gates/validation-b/result.json", "{}\n")
             store.seal_evidence(run_id, "gates/validation-b")
             store.append_event(
@@ -1797,9 +1805,7 @@ class CandidateGateTest(unittest.TestCase):
             )
 
             with mock.patch("afk.candidate_gate.reconcile_gate_comment"):
-                outcome = complete_gate_cycle(
-                    store, run_id, bead={"id": "central-test.1"}
-                )
+                outcome = complete_gate_cycle(store, run_id)
 
             self.assertEqual(outcome["next_action"], "attention")
             self.assertIn("four", outcome["stop_reason"])
@@ -1820,6 +1826,7 @@ class CandidateGateTest(unittest.TestCase):
                 start_request={},
                 run_id="run-1",
             )["run_id"]
+            persist_bead_spec(store, run_id, {"id": "central-test.1"})
             store.write_evidence_text(run_id, "gates/validation-b/result.json", "{}\n")
             store.seal_evidence(run_id, "gates/validation-b")
             store.append_event(
@@ -1874,9 +1881,7 @@ class CandidateGateTest(unittest.TestCase):
                 ),
                 mock.patch("afk.candidate_gate.reconcile_gate_comment"),
             ):
-                outcome = complete_gate_cycle(
-                    store, run_id, bead={"id": "central-test.1"}
-                )
+                outcome = complete_gate_cycle(store, run_id)
 
             self.assertEqual(outcome["next_action"], "attention")
             self.assertIn("four", outcome["stop_reason"])
@@ -1896,6 +1901,7 @@ class CandidateGateTest(unittest.TestCase):
                 start_request={},
                 run_id="run-1",
             )["run_id"]
+            persist_bead_spec(store, run_id, {"id": "central-test.1"})
             store.write_evidence_text(run_id, "gates/validation-b/result.json", "{}\n")
             store.seal_evidence(run_id, "gates/validation-b")
             store.append_event(
@@ -1927,7 +1933,6 @@ class CandidateGateTest(unittest.TestCase):
                 outcome = complete_gate_cycle(
                     store,
                     run_id,
-                    bead={"id": "central-test.1"},
                 )
 
             self.assertEqual(outcome["next_action"], "repair")
@@ -2424,6 +2429,7 @@ class CandidateGateTest(unittest.TestCase):
                 "description": "Test the gate.",
                 "acceptance_criteria": "Both axes pass.",
             }
+            persist_bead_spec(store, run_id, full_bead)
 
             def seal_bundle_before_crash(cycle, bead):
                 bundle = f"gates/gate-cycle-{cycle}-{candidate_sha[:12]}/review-bundle"
@@ -2446,7 +2452,6 @@ class CandidateGateTest(unittest.TestCase):
                         store,
                         run_id,
                         cycle=cycle,
-                        bead=bead,
                     )
                 reviewer.assert_not_called()
 
@@ -2478,7 +2483,6 @@ class CandidateGateTest(unittest.TestCase):
                 outcome = complete_gate_cycle(
                     store,
                     run_id,
-                    bead=full_bead,
                 )
             reviews = outcome["reviews"]
 
@@ -2533,7 +2537,6 @@ class CandidateGateTest(unittest.TestCase):
                     store,
                     run_id,
                     cycle=2,
-                    bead={"id": "central-test.1"},
                 )
 
             self.assertEqual(resumed_calls, ["spec"])
@@ -2560,7 +2563,7 @@ class CandidateGateTest(unittest.TestCase):
                 mock.patch("afk.candidate_gate.reconcile_gate_comment"),
                 self.assertRaisesRegex(RuntimeError, "crash before Gate seal"),
             ):
-                complete_gate_cycle(store, run_id, bead={"id": "central-test.1"})
+                complete_gate_cycle(store, run_id)
 
             with (
                 mock.patch("afk.candidate_gate._execute_reviewer") as rerun,
@@ -2570,16 +2573,14 @@ class CandidateGateTest(unittest.TestCase):
                 ),
                 self.assertRaisesRegex(RuntimeError, "crash after Gate seal"),
             ):
-                complete_gate_cycle(store, run_id, bead={"id": "central-test.1"})
+                complete_gate_cycle(store, run_id)
 
             rerun.assert_not_called()
             with (
                 mock.patch("afk.candidate_gate._execute_reviewer") as sealed_rerun,
                 mock.patch("afk.candidate_gate.reconcile_gate_comment"),
             ):
-                resumed_outcome = complete_gate_cycle(
-                    store, run_id, bead={"id": "central-test.1"}
-                )
+                resumed_outcome = complete_gate_cycle(store, run_id)
             sealed_rerun.assert_not_called()
             self.assertEqual(resumed_outcome["next_action"], "complete")
             self.assertTrue(
@@ -2632,7 +2633,6 @@ class CandidateGateTest(unittest.TestCase):
                     store,
                     run_id,
                     cycle=3,
-                    bead={"id": "central-test.1"},
                 )
             recovered.assert_called_once()
             self.assertEqual(recovered.call_args.args[0], "spec")
@@ -2676,7 +2676,7 @@ class CandidateGateTest(unittest.TestCase):
                 mock.patch("afk.candidate_gate._execute_reviewer") as tampered_rerun,
                 self.assertRaises(EvidenceTampered),
             ):
-                complete_gate_cycle(store, run_id, bead={"id": "central-test.1"})
+                complete_gate_cycle(store, run_id)
             tampered_rerun.assert_not_called()
 
             store.append_event(
@@ -2692,7 +2692,7 @@ class CandidateGateTest(unittest.TestCase):
                 mock.patch("afk.candidate_gate._execute_reviewer") as unsafe_retry,
                 self.assertRaisesRegex(GateError, "ambiguous"),
             ):
-                complete_gate_cycle(store, run_id, bead={"id": "central-test.1"})
+                complete_gate_cycle(store, run_id)
             unsafe_retry.assert_not_called()
 
             invalid_bundle = f"gates/gate-cycle-6-{candidate_sha[:12]}/review-bundle"
@@ -2706,7 +2706,6 @@ class CandidateGateTest(unittest.TestCase):
                     store,
                     run_id,
                     cycle=6,
-                    bead={"id": "central-test.1"},
                 )
             unsafe_review.assert_not_called()
 
@@ -2772,7 +2771,6 @@ class CandidateGateTest(unittest.TestCase):
                             store,
                             run_id,
                             cycle=cycle,
-                            bead=exact_bead,
                         )
                     contradicted_review.assert_not_called()
 
@@ -2864,6 +2862,7 @@ class CandidateGateTest(unittest.TestCase):
                 start_request={"repository_root": str(checkout)},
                 run_id="run-1",
             )["run_id"]
+            persist_bead_spec(store, run_id, {"id": "central-test.1"})
             store.write_evidence_text(run_id, "gates/validation-b/result.json", "{}\n")
             store.seal_evidence(run_id, "gates/validation-b")
             store.append_event(
@@ -2907,7 +2906,6 @@ class CandidateGateTest(unittest.TestCase):
                     store,
                     run_id,
                     cycle=1,
-                    bead={"id": "central-test.1"},
                 )
 
             self.assertEqual(
@@ -2979,7 +2977,6 @@ class CandidateGateTest(unittest.TestCase):
                             store,
                             run_id,
                             cycle=cycle,
-                            bead={"id": "central-test.1"},
                         )
 
                     self.assertEqual(
@@ -3011,9 +3008,7 @@ class CandidateGateTest(unittest.TestCase):
                 ),
                 mock.patch("afk.candidate_gate.reconcile_gate_comment"),
             ):
-                outcome = complete_gate_cycle(
-                    store, run_id, bead={"id": "central-test.1"}
-                )
+                outcome = complete_gate_cycle(store, run_id)
 
             self.assertEqual(outcome["next_action"], "attention")
 

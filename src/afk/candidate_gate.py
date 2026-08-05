@@ -94,12 +94,11 @@ def complete_gate_cycle(
     store: RunStore,
     run_id: str,
     *,
-    bead: dict[str, Any],
     retry: int = 0,
 ) -> dict[str, Any]:
     if type(retry) is not int or retry < 0:
         raise GateError("Gate retry number is invalid")
-    bead = load_bead_spec(store, run_id, fallback=bead)
+    load_bead_spec(store, run_id)
     projection = store.status(run_id)
     cycles = projection.get("gate_cycles", [])
     if not isinstance(cycles, list):
@@ -152,7 +151,7 @@ def complete_gate_cycle(
                     "unsealed Gate Cycle evidence is ambiguous", kind="inconclusive"
                 )
         reviews = (
-            run_candidate_reviews(store, run_id, cycle=cycle, retry=retry, bead=bead)
+            run_candidate_reviews(store, run_id, cycle=cycle, retry=retry)
             if validation["status"] == "passed"
             else []
         )
@@ -449,11 +448,10 @@ def run_candidate_reviews(
     *,
     cycle: int,
     retry: int = 0,
-    bead: dict[str, Any],
 ) -> list[dict[str, Any]]:
     if type(retry) is not int or retry < 0:
         raise GateError("Gate retry number is invalid")
-    bead = load_bead_spec(store, run_id, fallback=bead)
+    bead = load_bead_spec(store, run_id)
     projection = store.status(run_id)
     identity = store.identity(run_id)
     candidate_sha = _required_text(projection, "candidate_sha")
