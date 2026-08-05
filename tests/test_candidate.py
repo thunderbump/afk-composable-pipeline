@@ -27,6 +27,40 @@ from afk.run_store import EvidenceTampered, RunStore, RunStoreError  # noqa: E40
 from afk.start import resume_run  # noqa: E402
 
 
+class GithubRepoFromRepoUrlTest(unittest.TestCase):
+    def test_accepts_supported_github_repository_urls(self):
+        cases = {
+            "https://github.com/owner/project.git": "owner/project",
+            "ssh://git@github.com/owner/project.git": "owner/project",
+            "git@github.com:owner/project.git": "owner/project",
+            "github.com/owner/project": "owner/project",
+        }
+
+        for repo_url, expected in cases.items():
+            with self.subTest(repo_url=repo_url):
+                self.assertEqual(
+                    candidate_module.github_repo_from_repo_url(repo_url),
+                    expected,
+                )
+
+    def test_rejects_non_github_and_invalid_repository_urls(self):
+        repo_urls = (
+            "https://gitlab.com/owner/project.git",
+            "git@gitlab.com:owner/project.git",
+            "https://notgithub.com/owner/project.git",
+            "https://github.com/owner",
+            "https://github.com/owner/project/extra",
+            "not a repository URL",
+            "",
+        )
+
+        for repo_url in repo_urls:
+            with self.subTest(repo_url=repo_url):
+                self.assertIsNone(
+                    candidate_module.github_repo_from_repo_url(repo_url)
+                )
+
+
 class CandidateTest(unittest.TestCase):
     def setUp(self):
         self.temporary_directory = tempfile.TemporaryDirectory()
