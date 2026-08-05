@@ -2112,9 +2112,7 @@ class RunStore:
         episode = self._validated_completion_episode(run_id, projection)
         finalization = self._read_completion_finalization(run_id, missing_ok=True)
         if episode is None:
-            if finalization is not None:
-                raise EventHistoryCorrupt("completion finalization is invalid")
-            return True
+            raise EventHistoryCorrupt("completion episode marker is invalid")
         if finalization is None:
             return False
         outcome = self.sealed_evidence_result(run_id, episode["evidence"])
@@ -2199,7 +2197,7 @@ class RunStore:
         run_id: str,
         projection: dict[str, Any],
     ) -> dict[str, Any] | None:
-        return self._validated_episode(
+        episode = self._validated_episode(
             run_id,
             projection,
             name="completion",
@@ -2208,6 +2206,9 @@ class RunStore:
             event_state="completed",
             projection_state="completed",
         )
+        if episode is None and projection.get("state") == "completed":
+            raise EventHistoryCorrupt("completion episode marker is invalid")
+        return episode
 
     def _validated_attention_episode(
         self,
@@ -2223,6 +2224,8 @@ class RunStore:
             event_state="attention_required",
         )
         if episode is None:
+            if projection.get("state") == "attention_required":
+                raise EventHistoryCorrupt("attention episode marker is invalid")
             return None
         events, _ = self._read_events(run_id)
         latest = next(

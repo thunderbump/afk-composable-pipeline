@@ -6002,16 +6002,16 @@ class StartCliTest(unittest.TestCase):
         ):
             store.active_run_id()
 
-    def test_named_resume_of_legacy_completion_does_not_start_retrospective(self):
+    def test_named_resume_rejects_markerless_completion_before_retrospective(self):
         store = RunStore(self.state_home / "afk")
         store.create_run(
             bead_id="central-bnkl.1.1",
             repository="thunderbump/beads-webui",
             base_branch="main",
             base_sha="a" * 40,
-            run_id="legacy-completed",
+            run_id="markerless-completed",
         )
-        legacy_completion = {
+        completion = {
             "schema_version": 1,
             "repository": "thunderbump/beads-webui",
             "bead_id": "central-bnkl.1.1",
@@ -6026,24 +6026,29 @@ class StartCliTest(unittest.TestCase):
             "cleanup_warnings": [],
             "evidence": "gates/completion-dddddddddddd",
         }
-        store.append_event(
-            "legacy-completed",
-            "run.completed",
-            state="completed",
-            data={
-                "checkpoint": "completed",
-                "attention": {},
-                "completion": legacy_completion,
-            },
-        )
+        with self.assertRaisesRegex(
+            EventHistoryCorrupt, "completion episode marker is invalid"
+        ):
+            store.append_event(
+                "markerless-completed",
+                "run.completed",
+                state="completed",
+                data={
+                    "checkpoint": "completed",
+                    "attention": {},
+                    "completion": completion,
+                },
+            )
 
         with (
             patch.dict(os.environ, self.afk_environment()),
             patch("afk.start.run_retrospective_attempt") as retrospective,
+            self.assertRaisesRegex(
+                EventHistoryCorrupt, "completion episode marker is invalid"
+            ),
         ):
-            resumed = resume_run("legacy-completed")
+            resume_run("markerless-completed")
 
-        self.assertEqual(resumed, ("legacy-completed", 0))
         retrospective.assert_not_called()
 
     def test_named_resume_rejects_a_later_forged_completion_episode_before_analysis(
@@ -6055,26 +6060,24 @@ class StartCliTest(unittest.TestCase):
             repository="thunderbump/beads-webui",
             base_branch="main",
             base_sha="a" * 40,
-            run_id="legacy-completed",
+            run_id="completed-run",
         )
         completion = {"schema_version": 1}
-        store.append_event(
-            "legacy-completed",
-            "run.completed",
-            state="completed",
-            data={"checkpoint": "completed", "completion": completion},
+        store.record_completion_episode(
+            "completed-run",
+            completion=completion,
         )
         marker = {
             "schema_version": 1,
-            "episode_sequence": 2,
-            "evidence": "retrospective/completed-2",
-            "effect_id": "retrospective-analysis-2",
+            "episode_sequence": 3,
+            "evidence": "retrospective/completed-3",
+            "effect_id": "retrospective-analysis-3",
         }
         with self.assertRaisesRegex(
             EventHistoryCorrupt, "completion episode marker is invalid"
         ):
             store.append_event(
-                "legacy-completed",
+                "completed-run",
                 "worker.terminal",
                 data={
                     "checkpoint": "completed",
@@ -6083,14 +6086,14 @@ class StartCliTest(unittest.TestCase):
                     "worker_result": "completed",
                 },
             )
-        run_dir = self.state_home / "afk" / "runs" / "legacy-completed"
+        run_dir = self.state_home / "afk" / "runs" / "completed-run"
         effects_before = tuple((run_dir / "effects").iterdir())
         evidence_before = tuple((run_dir / "retrospective").iterdir())
         with self.assertRaisesRegex(
             EventHistoryCorrupt, "completion episode marker is invalid"
         ):
             store.record_completion_episode(
-                "legacy-completed",
+                "completed-run",
                 completion=completion,
             )
 
@@ -6101,7 +6104,7 @@ class StartCliTest(unittest.TestCase):
                 EventHistoryCorrupt, "completion episode marker is invalid"
             ),
         ):
-            resume_run("legacy-completed")
+            resume_run("completed-run")
 
         retrospective.assert_not_called()
         self.assertEqual(tuple((run_dir / "effects").iterdir()), effects_before)
@@ -8262,7 +8265,7 @@ class StartCliTest(unittest.TestCase):
         outcome = store.sealed_evidence_result("crashed-run", latest["evidence"])
         self.assertEqual(outcome["episode_sequence"], latest["episode_sequence"])
 
-    def test_resume_preserves_legacy_attention_without_an_episode_marker(self):
+    def test_resume_rejects_attention_without_an_episode_marker(self):
         store, _ = self.create_resume_preflight_run()
         store.append_event(
             "crashed-run",
@@ -8273,7 +8276,7 @@ class StartCliTest(unittest.TestCase):
                 "attention": {
                     "scope": "worker_launch",
                     "kind": "unavailable",
-                    "summary": "legacy worker launch failure",
+                    "summary": "markerless worker launch failure",
                 },
             },
         )
@@ -8281,11 +8284,13 @@ class StartCliTest(unittest.TestCase):
 
         resumed = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="active")
 
-        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        self.assertEqual(resumed.returncode, 2)
+        self.assertIn("attention episode marker is invalid", resumed.stderr)
         self.assertEqual(
             store.effect("crashed-run", "worker-launch-1")["status"],
-            "confirmed",
+            "prepared",
         )
+        self.assertFalse(self.command_log.exists())
 
     def test_resume_rejects_misbound_open_validation_attempt_before_commands(self):
         store, _ = self.create_resume_preflight_run()
