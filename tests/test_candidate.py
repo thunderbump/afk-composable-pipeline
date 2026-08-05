@@ -56,9 +56,7 @@ class GithubRepoFromRepoUrlTest(unittest.TestCase):
 
         for repo_url in repo_urls:
             with self.subTest(repo_url=repo_url):
-                self.assertIsNone(
-                    candidate_module.github_repo_from_repo_url(repo_url)
-                )
+                self.assertIsNone(candidate_module.github_repo_from_repo_url(repo_url))
 
 
 class CandidateTest(unittest.TestCase):

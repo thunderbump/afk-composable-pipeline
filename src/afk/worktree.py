@@ -213,10 +213,7 @@ def _require_git_path(item_path: bytes) -> None:
 
 
 def _tracked_git_output_limit() -> int:
-    return (
-        EXACT_CANDIDATE_TRACKED_BYTES_LIMIT
-        + EXACT_CANDIDATE_TRACKED_PATH_LIMIT * 64
-    )
+    return EXACT_CANDIDATE_TRACKED_BYTES_LIMIT + EXACT_CANDIDATE_TRACKED_PATH_LIMIT * 64
 
 
 def _require_tracked_path_budget(
@@ -270,9 +267,7 @@ def _pinned_repository(path: Path) -> Iterator[tuple[Path, Path]]:
 def _open_git_directory(root_descriptor: int) -> int:
     flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
     try:
-        return os.open(
-            b".git", flags | os.O_DIRECTORY, dir_fd=root_descriptor
-        )
+        return os.open(b".git", flags | os.O_DIRECTORY, dir_fd=root_descriptor)
     except NotADirectoryError:
         git_file = os.open(b".git", flags, dir_fd=root_descriptor)
         try:
@@ -290,9 +285,7 @@ def _open_git_directory(root_descriptor: int) -> int:
         if not git_directory.is_absolute():
             root = Path(os.readlink(f"/proc/self/fd/{root_descriptor}"))
             git_directory = root / git_directory
-        return os.open(
-            git_directory, flags | os.O_DIRECTORY
-        )
+        return os.open(git_directory, flags | os.O_DIRECTORY)
 
 
 def _run_repository_git(
@@ -464,8 +457,10 @@ def _check_ignored(evaluation: Path, item_paths: set[bytes]) -> set[bytes]:
 
 def _git_blob_id(content: bytes) -> bytes:
     header = f"blob {len(content)}\0".encode("ascii")
-    return hashlib.sha1(header + content, usedforsecurity=False).hexdigest().encode(
-        "ascii"
+    return (
+        hashlib.sha1(header + content, usedforsecurity=False)
+        .hexdigest()
+        .encode("ascii")
     )
 
 
@@ -609,9 +604,7 @@ def run_trusted_read_git(
             if text
             else b"trusted Git command timed out"
         )
-        return subprocess.CompletedProcess(
-            command, 124, stdout=empty, stderr=message
-        )
+        return subprocess.CompletedProcess(command, 124, stdout=empty, stderr=message)
 
 
 def _run_bounded_trusted_git(
@@ -713,4 +706,3 @@ def _cleanup_bounded_git_process(
                 stream.close()
             except BaseException:
                 pass
-
