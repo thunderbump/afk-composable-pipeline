@@ -1,8 +1,0 @@
-{
-  "project": "central-lve",
-  "step": "noop",
-  "payload": {
-    "message": "fixture data survives the no-op step",
-    "count": 1
-  }
-}
