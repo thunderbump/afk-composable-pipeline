@@ -1157,17 +1157,13 @@ class CandidateGateTest(unittest.TestCase):
                         )
                         outcome_path.chmod(0o600)
                         outcome_path.write_text("{}\n", encoding="utf-8")
-                store.append_event(
+                store.record_attention_episode(
                     run_id,
-                    "run.attention_required",
-                    state="attention_required",
-                    data={
-                        "checkpoint": "candidate_ready",
-                        "attention": {
-                            "scope": "gate",
-                            "kind": "inconclusive",
-                            "summary": "GitHub comment command failed",
-                        },
+                    checkpoint="candidate_ready",
+                    attention={
+                        "scope": "gate",
+                        "kind": "inconclusive",
+                        "summary": "GitHub comment command failed",
                     },
                 )
                 last_sequence = store.status(run_id)["last_sequence"]
@@ -1178,6 +1174,7 @@ class CandidateGateTest(unittest.TestCase):
                         "afk.candidate_gate._run_gh",
                         side_effect=AssertionError("Gate retry must not start"),
                     ),
+                    mock.patch("afk.start.run_retrospective_attempt"),
                 ):
                     if case == "tampered":
                         with self.assertRaises(EvidenceTampered):
@@ -1262,11 +1259,10 @@ class CandidateGateTest(unittest.TestCase):
                     "kind": "exhausted" if stop_reason else "inconclusive",
                     "summary": stop_reason or "review was inconclusive",
                 }
-                store.append_event(
+                store.record_attention_episode(
                     run_id,
-                    "run.attention_required",
-                    state="attention_required",
-                    data={"checkpoint": "validated", "attention": attention},
+                    checkpoint="validated",
+                    attention=attention,
                 )
                 last_sequence = store.status(run_id)["last_sequence"]
 
@@ -1276,6 +1272,7 @@ class CandidateGateTest(unittest.TestCase):
                         "afk.start._advance_gate",
                         side_effect=AssertionError("Gate must not be retried"),
                     ),
+                    mock.patch("afk.start.run_retrospective_attempt"),
                 ):
                     resumed = resume_run()
 
@@ -1287,6 +1284,7 @@ class CandidateGateTest(unittest.TestCase):
                 with (
                     mock.patch("afk.start.RunStore", return_value=store),
                     mock.patch("afk.start._advance_gate", return_value=0) as advance,
+                    mock.patch("afk.start.run_retrospective_attempt"),
                 ):
                     authorized = resume_run(note="review runtime fixed")
 
@@ -1496,17 +1494,13 @@ class CandidateGateTest(unittest.TestCase):
                         "interrupted_repair": interruption,
                     },
                 )
-                store.append_event(
+                store.record_attention_episode(
                     run_id,
-                    "run.attention_required",
-                    state="attention_required",
-                    data={
-                        "checkpoint": checkpoint,
-                        "attention": {
-                            "scope": "repair",
-                            "kind": "unavailable",
-                            "summary": "transient failure",
-                        },
+                    checkpoint=checkpoint,
+                    attention={
+                        "scope": "repair",
+                        "kind": "unavailable",
+                        "summary": "transient failure",
                     },
                 )
 
@@ -1519,6 +1513,7 @@ class CandidateGateTest(unittest.TestCase):
                         "afk.start.reconcile_interrupted_repair_worktree"
                     ) as reconcile,
                     mock.patch("afk.start._advance_gate") as gate,
+                    mock.patch("afk.start.run_retrospective_attempt"),
                 ):
                     resumed = resume_run()
 
