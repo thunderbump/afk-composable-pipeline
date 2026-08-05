@@ -22,7 +22,6 @@ from afk.start import (
     run_worker,
     run_worker_unit,
     start_run,
-    worker_unit,
 )
 
 
@@ -115,9 +114,12 @@ def main(
                 output["recommended_resume"] = ["afk", "resume"]
                 exit_code = 2
             if projection["state"] != "superseded" and "worker_exit_code" in projection:
+                unit = projection.get("unit")
+                if not isinstance(unit, str) or not unit:
+                    raise RunStoreError("terminal worker observation unit is invalid")
                 output["unit_observation"] = {
                     "status": "terminal",
-                    "unit": projection.get("unit", worker_unit(projection["run_id"])),
+                    "unit": unit,
                     "worker_exit_code": projection["worker_exit_code"],
                     "worker_result": projection["worker_result"],
                 }

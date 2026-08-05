@@ -8908,17 +8908,17 @@ class StartCliTest(unittest.TestCase):
         )
         self.assertFalse(self.command_log.exists())
 
-    def test_status_derives_unit_for_legacy_terminal_observation(self):
+    def test_status_rejects_terminal_observation_without_unit(self):
         store = RunStore(self.state_home / "afk")
         store.create_run(
             bead_id="central-bnkl.1.1",
             repository="thunderbump/beads-webui",
             base_branch="main",
             base_sha=BASE_SHA,
-            run_id="legacy-terminal-run",
+            run_id="terminal-run",
         )
         store.append_event(
-            "legacy-terminal-run",
+            "terminal-run",
             "worker.terminal",
             data={
                 "checkpoint": "created",
@@ -8927,18 +8927,13 @@ class StartCliTest(unittest.TestCase):
             },
         )
 
-        completed = self.run_afk("status", "legacy-terminal-run", "--json")
+        completed = self.run_afk("status", "terminal-run", "--json")
 
-        self.assertEqual(completed.returncode, 0, completed.stderr)
-        status = json.loads(completed.stdout)
-        self.assertEqual(
-            status["unit_observation"],
-            {
-                "status": "terminal",
-                "unit": "afk-legacy-terminal-run-worker-1",
-                "worker_exit_code": 2,
-                "worker_result": "attention_required",
-            },
+        self.assertEqual(completed.returncode, 1)
+        self.assertEqual(completed.stdout, "")
+        self.assertIn(
+            "terminal worker observation unit is invalid",
+            completed.stderr,
         )
 
     def test_unnamed_status_prefers_completion_recorded_during_unit_observation(self):
@@ -9902,7 +9897,10 @@ class StartCliTest(unittest.TestCase):
             base_sha=BASE_SHA,
             run_id="completed-run",
         )
-        store.append_event("completed-run", "run.completed", state="completed")
+        store.record_completion_episode(
+            "completed-run",
+            completion={"schema_version": 1},
+        )
         active_path = self.state_home / "afk" / "active.json"
         active_path.write_text('{"run_id":"completed-run"}\n', encoding="utf-8")
         store_root = self.state_home / "afk"
