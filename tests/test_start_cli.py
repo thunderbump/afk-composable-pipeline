@@ -13,7 +13,7 @@ import unittest
 from io import StringIO
 from pathlib import Path
 from typing import NamedTuple
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from tests.afk_cli_fixture import AfkCliFixture, BASE_SHA
 
@@ -149,6 +149,40 @@ class StartCliTest(unittest.TestCase):
 
     def tearDown(self):
         self.cli_fixture.close()
+
+    def test_validation_rejects_candidate_without_durable_pr_publication(self):
+        store = Mock()
+        projection = {"checkpoint": "candidate_ready"}
+        store.status.return_value = projection
+        identity = {"repository": "owner/project"}
+        store.identity.return_value = identity
+
+        with (
+            patch(
+                "afk.start.verify_candidate_publication",
+                side_effect=start_module.CandidateError(
+                    "durable Candidate PR publication is missing",
+                    kind="conflict",
+                ),
+            ) as verify,
+            patch("afk.start._attention") as attention,
+            patch("afk.start._advance_validation") as validation,
+            patch("afk.start._advance_gate") as gate,
+        ):
+            exit_code = start_module._advance_validation_then_gate(store, "run-1")
+
+        self.assertEqual(exit_code, 2)
+        verify.assert_called_once_with(identity, projection)
+        validation.assert_not_called()
+        gate.assert_not_called()
+        attention.assert_called_once_with(
+            store,
+            "run-1",
+            checkpoint="candidate_ready",
+            scope="candidate",
+            kind="conflict",
+            summary="durable Candidate PR publication is missing",
+        )
 
     def install_retrospective_analyzer(self):
         analyzer = self.fake_bin / "codex"

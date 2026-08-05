@@ -59,6 +59,26 @@ class GithubRepoFromRepoUrlTest(unittest.TestCase):
                 self.assertIsNone(candidate_module.github_repo_from_repo_url(repo_url))
 
 
+class CandidatePublicationTest(unittest.TestCase):
+    def test_verification_rejects_candidate_without_durable_pr_publication(self):
+        projection = {
+            "worktree_path": "/tmp/candidate",
+            "branch": "afk/run/candidate",
+            "candidate_sha": "b" * 40,
+            "pr_number": 7,
+            "pr_url": "https://example.test/pr/7",
+        }
+
+        with self.assertRaisesRegex(
+            CandidateError,
+            "durable Candidate PR publication is missing",
+        ):
+            candidate_module.verify_candidate_publication(
+                {"repository": "owner/project", "base_branch": "main"},
+                projection,
+            )
+
+
 class CandidateTest(unittest.TestCase):
     def setUp(self):
         self.temporary_directory = tempfile.TemporaryDirectory()

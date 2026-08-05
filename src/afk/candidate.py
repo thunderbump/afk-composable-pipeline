@@ -1647,10 +1647,12 @@ def _verify_published(
         raise CandidateError("PR Candidate facts disagree", kind="conflict")
 
 
-def _projected_candidate_pr_marker(projection: dict[str, Any]) -> str | None:
+def _projected_candidate_pr_marker(projection: dict[str, Any]) -> str:
     publication = projection.get("candidate_pr")
     if publication is None:
-        return None
+        raise CandidateError(
+            "durable Candidate PR publication is missing", kind="conflict"
+        )
     marker = publication.get("marker") if isinstance(publication, dict) else None
     if not isinstance(marker, str) or not marker:
         raise CandidateError("durable Candidate PR marker is invalid", kind="conflict")
@@ -1670,6 +1672,7 @@ def verify_candidate_publication(
         raise CandidateError("stable Candidate PR URL is invalid", kind="conflict")
     if type(pr_number) is not int or pr_number <= 0:
         raise CandidateError("stable Candidate PR number is invalid", kind="conflict")
+    expected_marker = _projected_candidate_pr_marker(projection)
     prs = _list_prs(worktree, identity["repository"], branch)
     if len(prs) != 1:
         raise CandidateError(
@@ -1683,7 +1686,7 @@ def verify_candidate_publication(
         prs[0],
         expected_pr_number=pr_number,
         expected_pr_url=pr_url,
-        expected_marker=_projected_candidate_pr_marker(projection),
+        expected_marker=expected_marker,
     )
     return prs[0]
 
