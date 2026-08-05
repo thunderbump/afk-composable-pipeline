@@ -16,7 +16,6 @@ BINDING_FIELDS = {
     "worktree_path",
 }
 SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
-LEGACY_BLOCKED_SUMMARY = "implementation reported blocked"
 
 
 def started_attempt(
@@ -52,9 +51,7 @@ def interrupted_attempt(
 def next_attempt_id(attempt: dict[str, Any]) -> str | None:
     if (
         attempt.get("status") == "interrupted"
-        and (
-            attempt.get("retryable") is True or legacy_blocked_retry_available(attempt)
-        )
+        and attempt.get("retryable") is True
         and interruption_is_retryable(attempt)
     ):
         return SECOND_ATTEMPT_ID
@@ -63,16 +60,6 @@ def next_attempt_id(attempt: dict[str, Any]) -> str | None:
 
 def interruption_is_retryable(attempt: dict[str, Any]) -> bool:
     return attempt.get("attempt_id") == FIRST_ATTEMPT_ID
-
-
-def legacy_blocked_retry_available(attempt: dict[str, Any]) -> bool:
-    """Recognize blocked evidence sealed before clean blocks became retryable."""
-    return (
-        attempt.get("attempt_id") == FIRST_ATTEMPT_ID
-        and attempt.get("status") == "interrupted"
-        and attempt.get("summary") == LEGACY_BLOCKED_SUMMARY
-        and attempt.get("retryable") is False
-    )
 
 
 def valid_attempt(value: Any, statuses: set[str]) -> bool:

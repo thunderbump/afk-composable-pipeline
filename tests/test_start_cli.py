@@ -25,7 +25,6 @@ import afk.run_store as run_store_module  # noqa: E402
 import afk.start as start_module  # noqa: E402
 from afk.bead_spec import bead_spec_identity, persist_bead_spec  # noqa: E402
 from afk.lifecycle_signals import record_lifecycle_interruption  # noqa: E402
-from afk.implementation_attempt import interrupted_attempt  # noqa: E402
 from afk.retrospective_attempt import (  # noqa: E402
     RETROSPECTIVE_OUTPUT_BYTE_LIMIT,
 )
@@ -244,16 +243,20 @@ class StartCliTest(unittest.TestCase):
                     "  part in relative for part in target.split('|')\n"
                     " )\n"
                     "def injected_evidence_writer(original):\n"
-                    " def injected(store, run_id, relative, value):\n"
-                    "  result = original(store, run_id, relative, value)\n"
+                    " def injected(store, run_id, relative, value, **kwargs):\n"
+                    "  result = original(\n"
+                    "   store, run_id, relative, value, **kwargs\n"
+                    "  )\n"
                     "  target = injections.get('AFK_TEST_KILL_AFTER_EVIDENCE')\n"
                     "  if evidence_targeted(target, relative):\n"
                     "   os.kill(os.getpid(), signal.SIGKILL)\n"
                     "  return result\n"
                     " return injected\n"
-                    "def injected_ingest_evidence(store, run_id, relative, source):\n"
+                    "def injected_ingest_evidence(\n"
+                    " store, run_id, relative, source, **kwargs\n"
+                    "):\n"
                     " result = original_ingest_evidence(\n"
-                    "  store, run_id, relative, source\n"
+                    "  store, run_id, relative, source, **kwargs\n"
                     " )\n"
                     " target = injections.get('AFK_TEST_KILL_AFTER_EVIDENCE')\n"
                     " if evidence_targeted(target, relative):\n"
@@ -2659,73 +2662,6 @@ class StartCliTest(unittest.TestCase):
         self.assertEqual(
             len(self.launch_events(run_id, "implementation.attempt_finished")), 1
         )
-
-    def test_resume_retries_a_legacy_clean_blocked_implementation_attempt(self):
-        run_id = self.start_open_implementation_attempt()
-        store = RunStore(self.state_home / "afk")
-        started = store.status(run_id)["implementation_attempt"]
-        report = {
-            "status": "blocked",
-            "starting_sha": BASE_SHA,
-            "ending_sha": BASE_SHA,
-            "summary": "nested collaboration is unavailable",
-            "checks": [],
-            "changed_areas": [],
-        }
-        store.write_evidence_value(
-            run_id, "attempts/implementation-1/report.json", report
-        )
-        store.write_evidence_value(
-            run_id,
-            "attempts/implementation-1/recovery.json",
-            {
-                "status": "interrupted",
-                "summary": "implementation reported blocked",
-                "retryable": False,
-            },
-        )
-        store.seal_evidence(run_id, "attempts/implementation-1")
-        interrupted = interrupted_attempt(
-            started,
-            summary="implementation reported blocked",
-            retryable=False,
-        )
-        store.append_event(
-            run_id,
-            "implementation.attempt_interrupted",
-            data={
-                "checkpoint": "worktree_ready",
-                "implementation_attempt": interrupted,
-            },
-        )
-        store.record_attention_episode(
-            run_id,
-            checkpoint="worktree_ready",
-            attention={
-                "scope": "candidate",
-                "kind": "invalid",
-                "summary": "implementation reported blocked",
-            },
-        )
-
-        resumed = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="absent")
-
-        projection = json.loads(self.run_afk("status", run_id, "--json").stdout)
-        self.assertEqual(resumed.returncode, 2, (resumed.stderr, projection))
-        self.assertEqual(projection["checkpoint"], "candidate_ready")
-        self.assertEqual(projection["attention"]["scope"], "validation")
-        self.assertEqual(
-            projection["implementation_attempt"]["attempt_id"], "implementation-2"
-        )
-        self.assertEqual(projection["implementation_attempt"]["status"], "completed")
-        first_recovery = (
-            self.state_home
-            / "afk"
-            / "runs"
-            / run_id
-            / "attempts/implementation-1/recovery.json"
-        )
-        self.assertFalse(json.loads(first_recovery.read_text())["retryable"])
 
     def test_resume_refuses_to_recover_an_attempt_from_a_different_origin(self):
         run_id = self.start_open_implementation_attempt()
@@ -12672,6 +12608,7 @@ class StartCliTest(unittest.TestCase):
             textwrap.dedent(
                 """
                 #!/usr/bin/env python3
+                import hashlib
                 import json
                 import os
                 import subprocess
@@ -12772,7 +12709,62 @@ class StartCliTest(unittest.TestCase):
                         raise SystemExit(137)
 
                 if command == "git":
-                    if args[:2] == ["rev-parse", "--show-toplevel"]:
+                    trusted_work_tree = None
+                    if args and args[0].startswith("--git-dir="):
+                        trusted_work_tree = Path(
+                            args[1].removeprefix("--work-tree=")
+                        ).resolve()
+                        args = args[2:]
+                    trusted_files = {}
+                    trusted_blobs = {}
+                    if trusted_work_tree is not None:
+                        for path in trusted_work_tree.rglob("*"):
+                            relative = path.relative_to(trusted_work_tree)
+                            if relative.parts[0] == ".git" or not path.is_file():
+                                continue
+                            content = path.read_bytes()
+                            blob = hashlib.sha1(
+                                f"blob {len(content)}\\0".encode() + content
+                            ).hexdigest()
+                            mode = "100755" if os.access(path, os.X_OK) else "100644"
+                            trusted_files[relative.as_posix()] = (mode, blob)
+                            trusted_blobs[blob] = content
+                    if (
+                        trusted_work_tree is not None
+                        and args[:3] == ["ls-tree", "-rz", "--full-tree"]
+                    ):
+                        for path, (mode, blob) in sorted(trusted_files.items()):
+                            sys.stdout.buffer.write(
+                                f"{mode} blob {blob}\\t{path}\\0".encode()
+                            )
+                    elif (
+                        trusted_work_tree is not None
+                        and args == ["ls-files", "--stage", "-z"]
+                    ):
+                        for path, (mode, blob) in sorted(trusted_files.items()):
+                            sys.stdout.buffer.write(
+                                f"{mode} {blob} 0\\t{path}\\0".encode()
+                            )
+                    elif (
+                        trusted_work_tree is not None
+                        and args[:1] == ["cat-file"]
+                        and args[1].startswith("--batch-check=")
+                    ):
+                        for blob in sys.stdin.buffer.read().splitlines():
+                            content = trusted_blobs[blob.decode()]
+                            sys.stdout.buffer.write(
+                                blob + f" blob {len(content)}\\n".encode()
+                            )
+                    elif (
+                        trusted_work_tree is not None
+                        and args[:2] == ["cat-file", "blob"]
+                    ):
+                        sys.stdout.buffer.write(trusted_blobs[args[2]])
+                    elif args[:1] == ["init"]:
+                        (Path.cwd() / ".git").mkdir(exist_ok=True)
+                    elif args[:1] == ["check-ignore"]:
+                        raise SystemExit(1)
+                    elif args[:2] == ["rev-parse", "--show-toplevel"]:
                         status_checks = (
                             Path(os.environ["XDG_STATE_HOME"])
                             / "fake-status-checks"
@@ -12963,8 +12955,13 @@ class StartCliTest(unittest.TestCase):
                         before_mutation("worktree-create")
                         checkout = Path(args[-2])
                         checkout.mkdir(parents=True)
+                        fake_git_dir = checkout.parent / (checkout.name + ".git")
+                        fake_git_dir.mkdir()
                         git_file = checkout / ".git"
-                        git_file.write_text("gitdir: fake\\n", encoding="utf-8")
+                        git_file.write_text(
+                            "gitdir: " + str(fake_git_dir) + "\\n",
+                            encoding="utf-8",
+                        )
                         scripts = checkout / "scripts"
                         scripts.mkdir()
                         validation_worker = scripts / "validation-worker.sh"

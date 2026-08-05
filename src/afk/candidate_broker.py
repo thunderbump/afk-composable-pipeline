@@ -12,7 +12,7 @@ import uuid
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from afk.checkouts import is_exact_clean_commit, run_trusted_read_git
+from afk.worktree import is_exact_clean_commit, run_trusted_read_git
 from afk.jsonutil import canonical_json
 from afk.process_supervision import (
     SupervisedCommandError,

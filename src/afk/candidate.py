@@ -9,7 +9,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 from afk.bead_spec import load_bead_spec
 from afk.candidate_validation import (
@@ -35,12 +35,10 @@ from afk.implementation_attempt import (
     completed_attempt,
     interruption_is_retryable,
     interrupted_attempt,
-    legacy_blocked_retry_available,
     next_attempt_id,
     started_attempt,
 )
 from afk.redaction import redact_artifact_value
-from afk.run_next import github_repo_from_repo_url
 from afk.run_store import RunStore, RunStoreError
 
 
@@ -116,6 +114,21 @@ class CandidateError(RuntimeError):
         self.stderr = stderr
 
 
+def github_repo_from_repo_url(repo_url: str) -> str | None:
+    parsed = urlsplit(repo_url)
+    path = ""
+    if parsed.scheme in {"http", "https", "ssh"}:
+        if parsed.hostname != "github.com":
+            return None
+        path = parsed.path
+    elif repo_url.startswith("git@github.com:"):
+        path = repo_url.removeprefix("git@github.com:")
+    elif repo_url.startswith("github.com/"):
+        path = repo_url.removeprefix("github.com/")
+    cleaned = path.strip("/").removesuffix(".git")
+    return cleaned if cleaned.count("/") == 1 else None
+
+
 def produce_candidate(
     store: RunStore,
     run_id: str,
@@ -175,13 +188,6 @@ def produce_candidate(
             worktree=worktree,
             branch=branch,
         )
-        if legacy_blocked_retry_available(attempt_state):
-            _require_legacy_blocked_retry(
-                store,
-                run_id,
-                attempt_state=attempt_state,
-                base_sha=base_sha,
-            )
         report, attempt_state = _run_implementation_attempt(
             store,
             run_id,
@@ -659,33 +665,6 @@ def _accept_implementation_report(
         store, run_id, attempt_state=attempt_state, candidate_sha=candidate_sha
     )
     return report, finished
-
-
-def _require_legacy_blocked_retry(
-    store: RunStore,
-    run_id: str,
-    *,
-    attempt_state: dict[str, Any],
-    base_sha: str,
-) -> None:
-    attempt = attempt_state["evidence"]
-    attempt_path = store.root / "runs" / run_id / attempt
-    if not store.verify_evidence(run_id, attempt):
-        raise CandidateError("implementation evidence could not be verified")
-    report = _read_report(attempt_path / "report.json")
-    recovery = _implementation_interruption(attempt_path / "recovery.json")
-    if (
-        report["status"] != "blocked"
-        or report["starting_sha"] != base_sha
-        or report["ending_sha"] != base_sha
-        or recovery
-        != {
-            "status": "interrupted",
-            "summary": attempt_state["summary"],
-            "retryable": False,
-        }
-    ):
-        raise CandidateError("legacy blocked implementation evidence is invalid")
 
 
 def _implementation_checkout(worktree: Path) -> tuple[str, str, str]:

@@ -39,12 +39,15 @@ long-lived shell session.
 This repo already documents the AFK pipeline surfaces. Refer to those sources
 instead of copying long instructions into agent responses:
 
-- [README.md](README.md): validation worker usage, final review step, and
-  workstream publisher examples
-- [src/afk/validation.py](src/afk/validation.py): validation step behavior
-- [src/afk/review.py](src/afk/review.py): final review step behavior
-- [tests/test_validate_cli.py](tests/test_validate_cli.py) and
-  [tests/test_review_cli.py](tests/test_review_cli.py): CLI-level expectations
+- [README.md](README.md): Run lifecycle, repository-owned validation, and
+  operator usage
+- [src/afk/candidate_validation.py](src/afk/candidate_validation.py): exact
+  Candidate Validation Contract behavior
+- [src/afk/candidate_gate.py](src/afk/candidate_gate.py): independent Standards
+  and Spec review behavior
+- [tests/test_candidate_validation_cli.py](tests/test_candidate_validation_cli.py)
+  and [tests/test_candidate_gate.py](tests/test_candidate_gate.py): Gate-level
+  expectations
 
 ### Sub-agents
 
