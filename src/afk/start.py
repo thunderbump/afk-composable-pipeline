@@ -1367,8 +1367,7 @@ def _run_worker_with_lock(store: RunStore, run_id: str) -> int:
 
 def _advance_candidate(store: RunStore, run_id: str) -> int:
     try:
-        bead = _bead_for_run(store, run_id)
-        produce_candidate(store, run_id, bead=bead)
+        produce_candidate(store, run_id)
     except CandidateError as exc:
         checkpoint = store.status(run_id)["checkpoint"]
         _attention(
@@ -1399,8 +1398,7 @@ def _advance_candidate(store: RunStore, run_id: str) -> int:
 
 def _advance_gate(store: RunStore, run_id: str, *, retry: int = 0) -> int:
     try:
-        bead = _bead_for_run(store, run_id)
-        outcome = complete_gate_cycle(store, run_id, bead=bead, retry=retry)
+        outcome = complete_gate_cycle(store, run_id, retry=retry)
     except GateError as exc:
         _attention(
             store,
@@ -1424,7 +1422,7 @@ def _advance_gate(store: RunStore, run_id: str, *, retry: int = 0) -> int:
             ),
         )
         return 2
-    return _advance_completed_gate(store, run_id, outcome=outcome, bead=bead)
+    return _advance_completed_gate(store, run_id, outcome=outcome)
 
 
 def _advance_repaired_candidate(store: RunStore, run_id: str) -> int:
@@ -1450,8 +1448,7 @@ def _advance_repaired_candidate(store: RunStore, run_id: str) -> int:
 def _advance_validation_then_gate(store: RunStore, run_id: str) -> int:
     try:
         projection = store.status(run_id)
-        if projection.get("candidate_pr") is not None:
-            verify_candidate_publication(store.identity(run_id), projection)
+        verify_candidate_publication(store.identity(run_id), projection)
     except CandidateError as exc:
         _attention(
             store,
@@ -1476,15 +1473,6 @@ def _advance_validation_then_gate(store: RunStore, run_id: str) -> int:
     if exit_code != 0:
         return exit_code
     return _advance_gate(store, run_id)
-
-
-def _bead_for_run(store: RunStore, run_id: str) -> dict[str, Any]:
-    evidence = store.root / "runs" / run_id / BEAD_SPEC_EVIDENCE
-    if "bead_spec" in store.status(run_id) or evidence.exists():
-        return load_bead_spec(store, run_id)
-    identity = store.identity(run_id)
-    request = identity.get("start_request", {})
-    return _show_bead(identity["bead_id"], Path(request["beads_workspace"]))
 
 
 def _advance_pr_ready(store: RunStore, run_id: str) -> int:
@@ -2275,7 +2263,6 @@ def _advance_completed_gate(
     run_id: str,
     *,
     outcome: dict[str, Any] | None = None,
-    bead: dict[str, Any] | None = None,
 ) -> int:
     projection = store.status(run_id)
     resuming_completed_gate = outcome is None
@@ -2340,12 +2327,9 @@ def _advance_completed_gate(
         )
         return 2
     try:
-        if bead is None:
-            bead = _bead_for_run(store, run_id)
         produce_repair_candidate(
             store,
             run_id,
-            bead=bead,
             repair_brief=outcome["repair_brief"],
         )
     except CandidateError as exc:

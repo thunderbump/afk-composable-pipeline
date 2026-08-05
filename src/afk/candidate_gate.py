@@ -94,12 +94,11 @@ def complete_gate_cycle(
     store: RunStore,
     run_id: str,
     *,
-    bead: dict[str, Any],
     retry: int = 0,
 ) -> dict[str, Any]:
     if type(retry) is not int or retry < 0:
         raise GateError("Gate retry number is invalid")
-    bead = load_bead_spec(store, run_id, fallback=bead)
+    load_bead_spec(store, run_id)
     projection = store.status(run_id)
     cycles = projection.get("gate_cycles", [])
     if not isinstance(cycles, list):
@@ -152,7 +151,7 @@ def complete_gate_cycle(
                     "unsealed Gate Cycle evidence is ambiguous", kind="inconclusive"
                 )
         reviews = (
-            run_candidate_reviews(store, run_id, cycle=cycle, retry=retry, bead=bead)
+            run_candidate_reviews(store, run_id, cycle=cycle, retry=retry)
             if validation["status"] == "passed"
             else []
         )
@@ -307,28 +306,19 @@ def reconcile_gate_comment(
     marker = intended["marker"]
     body = _gate_comment_body(gate, marker)
     effect_id = gate_comment_effect_id(cycle, retry)
-    existing = store.effect_if_present(run_id, effect_id)
-    legacy_intended = {key: value for key, value in intended.items() if key != "marker"}
-    legacy_effect = (
-        projected is None
-        and existing is not None
-        and existing.get("intended") == legacy_intended
-    )
-    effect_intended = legacy_intended if legacy_effect else intended
     effect = store.prepare_effect(
         run_id,
         effect_id,
         kind="gate-comment",
-        intended=effect_intended,
+        intended=intended,
     )
-    observed_identity = {"marker": marker} if legacy_effect else intended
     observed = _observe_gate_comment(
         identity["repository"],
         pr_number,
         worktree,
         marker=marker,
         body=body,
-        observed_identity=observed_identity,
+        observed_identity=intended,
     )
     if observed is None:
         if effect["status"] == "confirmed":
@@ -345,7 +335,7 @@ def reconcile_gate_comment(
             worktree,
             marker=marker,
             body=body,
-            observed_identity=observed_identity,
+            observed_identity=intended,
         )
         if observed is None:
             raise GateError(
@@ -458,11 +448,10 @@ def run_candidate_reviews(
     *,
     cycle: int,
     retry: int = 0,
-    bead: dict[str, Any],
 ) -> list[dict[str, Any]]:
     if type(retry) is not int or retry < 0:
         raise GateError("Gate retry number is invalid")
-    bead = load_bead_spec(store, run_id, fallback=bead)
+    bead = load_bead_spec(store, run_id)
     projection = store.status(run_id)
     identity = store.identity(run_id)
     candidate_sha = _required_text(projection, "candidate_sha")

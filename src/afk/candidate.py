@@ -9,7 +9,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 from afk.bead_spec import load_bead_spec
 from afk.candidate_validation import (
@@ -35,12 +35,10 @@ from afk.implementation_attempt import (
     completed_attempt,
     interruption_is_retryable,
     interrupted_attempt,
-    legacy_blocked_retry_available,
     next_attempt_id,
     started_attempt,
 )
 from afk.redaction import redact_artifact_value
-from afk.run_next import github_repo_from_repo_url
 from afk.run_store import RunStore, RunStoreError
 
 
@@ -116,14 +114,27 @@ class CandidateError(RuntimeError):
         self.stderr = stderr
 
 
+def github_repo_from_repo_url(repo_url: str) -> str | None:
+    parsed = urlsplit(repo_url)
+    path = ""
+    if parsed.scheme in {"http", "https", "ssh"}:
+        if parsed.hostname != "github.com":
+            return None
+        path = parsed.path
+    elif repo_url.startswith("git@github.com:"):
+        path = repo_url.removeprefix("git@github.com:")
+    elif repo_url.startswith("github.com/"):
+        path = repo_url.removeprefix("github.com/")
+    cleaned = path.strip("/").removesuffix(".git")
+    return cleaned if cleaned.count("/") == 1 else None
+
+
 def produce_candidate(
     store: RunStore,
     run_id: str,
-    *,
-    bead: dict[str, Any],
 ) -> dict[str, Any]:
     """Produce and reconcile the Run's one implementation Candidate."""
-    bead = load_bead_spec(store, run_id, fallback=bead)
+    bead = load_bead_spec(store, run_id)
     identity = store.identity(run_id)
     projection = store.status(run_id)
     worktree = Path(_field(projection, "worktree_path"))
@@ -175,13 +186,6 @@ def produce_candidate(
             worktree=worktree,
             branch=branch,
         )
-        if legacy_blocked_retry_available(attempt_state):
-            _require_legacy_blocked_retry(
-                store,
-                run_id,
-                attempt_state=attempt_state,
-                base_sha=base_sha,
-            )
         report, attempt_state = _run_implementation_attempt(
             store,
             run_id,
@@ -661,33 +665,6 @@ def _accept_implementation_report(
     return report, finished
 
 
-def _require_legacy_blocked_retry(
-    store: RunStore,
-    run_id: str,
-    *,
-    attempt_state: dict[str, Any],
-    base_sha: str,
-) -> None:
-    attempt = attempt_state["evidence"]
-    attempt_path = store.root / "runs" / run_id / attempt
-    if not store.verify_evidence(run_id, attempt):
-        raise CandidateError("implementation evidence could not be verified")
-    report = _read_report(attempt_path / "report.json")
-    recovery = _implementation_interruption(attempt_path / "recovery.json")
-    if (
-        report["status"] != "blocked"
-        or report["starting_sha"] != base_sha
-        or report["ending_sha"] != base_sha
-        or recovery
-        != {
-            "status": "interrupted",
-            "summary": attempt_state["summary"],
-            "retryable": False,
-        }
-    ):
-        raise CandidateError("legacy blocked implementation evidence is invalid")
-
-
 def _implementation_checkout(worktree: Path) -> tuple[str, str, str]:
     return (
         _git(worktree, "rev-parse", "HEAD"),
@@ -776,11 +753,10 @@ def produce_repair_candidate(
     store: RunStore,
     run_id: str,
     *,
-    bead: dict[str, Any],
     repair_brief: dict[str, Any],
 ) -> dict[str, Any]:
     """Run one budgeted repair and advance the existing Candidate branch/PR."""
-    bead = load_bead_spec(store, run_id, fallback=bead)
+    bead = load_bead_spec(store, run_id)
     identity = store.identity(run_id)
     projection = store.status(run_id)
     worktree = Path(_field(projection, "worktree_path"))
@@ -1668,10 +1644,12 @@ def _verify_published(
         raise CandidateError("PR Candidate facts disagree", kind="conflict")
 
 
-def _projected_candidate_pr_marker(projection: dict[str, Any]) -> str | None:
+def _projected_candidate_pr_marker(projection: dict[str, Any]) -> str:
     publication = projection.get("candidate_pr")
     if publication is None:
-        return None
+        raise CandidateError(
+            "durable Candidate PR publication is missing", kind="conflict"
+        )
     marker = publication.get("marker") if isinstance(publication, dict) else None
     if not isinstance(marker, str) or not marker:
         raise CandidateError("durable Candidate PR marker is invalid", kind="conflict")
@@ -1691,6 +1669,7 @@ def verify_candidate_publication(
         raise CandidateError("stable Candidate PR URL is invalid", kind="conflict")
     if type(pr_number) is not int or pr_number <= 0:
         raise CandidateError("stable Candidate PR number is invalid", kind="conflict")
+    expected_marker = _projected_candidate_pr_marker(projection)
     prs = _list_prs(worktree, identity["repository"], branch)
     if len(prs) != 1:
         raise CandidateError(
@@ -1704,7 +1683,7 @@ def verify_candidate_publication(
         prs[0],
         expected_pr_number=pr_number,
         expected_pr_url=pr_url,
-        expected_marker=_projected_candidate_pr_marker(projection),
+        expected_marker=expected_marker,
     )
     return prs[0]
 

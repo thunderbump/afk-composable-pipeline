@@ -535,25 +535,18 @@ class RunStore:
             return projection
 
     def resume_completed_status(self, run_id: str) -> dict[str, Any]:
-        """Validate a named Completed Run and reconcile a stale legacy pointer."""
+        """Validate a named Completed Run and its pending retrospective."""
         with self.lock(validate_root_permissions=True):
             projection, active_run_id = self._validated_resume_context(run_id)
             if projection["state"] != "completed":
                 raise RunStoreError(
                     "named resume is only available for a completed Run"
                 )
-            episode = self._validated_completion_episode(run_id, projection)
             finalized = self._completion_episode_finalized(run_id, projection)
-            if (
-                episode is not None
-                and not finalized
-                and active_run_id not in {None, run_id}
-            ):
+            if not finalized and active_run_id not in {None, run_id}:
                 raise EventHistoryCorrupt(
                     "Active Run pointer does not match pending completion"
                 )
-            if projection.get("completion_episode") is None and active_run_id == run_id:
-                self._clear_active_pointer(run_id)
             return projection
 
     def finalize_completion_episode(self, run_id: str) -> dict[str, Any]:
@@ -2038,7 +2031,7 @@ class RunStore:
         return self._validate_identity(identity, run_id)
 
     def _validate_identity(self, identity: Any, run_id: str) -> dict[str, Any]:
-        legacy_keys = {
+        identity_keys = {
             "schema_version",
             "run_id",
             "bead_id",
@@ -2047,19 +2040,17 @@ class RunStore:
             "base_sha",
             "created_at",
             "start_request",
+            "evidence_receipt_version",
         }
-        receipt_keys = legacy_keys | {"evidence_receipt_version"}
         schema_version = (
             identity.get("schema_version") if isinstance(identity, dict) else None
         )
-        valid_format = type(schema_version) is int and (
-            (schema_version == SCHEMA_VERSION and set(identity) == legacy_keys)
-            or (
-                schema_version in (SCHEMA_VERSION, RUN_IDENTITY_SCHEMA_VERSION)
-                and set(identity) == receipt_keys
-                and type(identity.get("evidence_receipt_version")) is int
-                and identity["evidence_receipt_version"] == EVIDENCE_RECEIPT_VERSION
-            )
+        valid_format = (
+            type(schema_version) is int
+            and schema_version == RUN_IDENTITY_SCHEMA_VERSION
+            and set(identity) == identity_keys
+            and type(identity.get("evidence_receipt_version")) is int
+            and identity["evidence_receipt_version"] == EVIDENCE_RECEIPT_VERSION
         )
         if (
             not valid_format
@@ -2113,10 +2104,6 @@ class RunStore:
     ) -> bool:
         episode = self._validated_completion_episode(run_id, projection)
         finalization = self._read_completion_finalization(run_id, missing_ok=True)
-        if episode is None:
-            if finalization is not None:
-                raise EventHistoryCorrupt("completion finalization is invalid")
-            return True
         if finalization is None:
             return False
         outcome = self.sealed_evidence_result(run_id, episode["evidence"])
@@ -2201,7 +2188,7 @@ class RunStore:
         run_id: str,
         projection: dict[str, Any],
     ) -> dict[str, Any] | None:
-        return self._validated_episode(
+        episode = self._validated_episode(
             run_id,
             projection,
             name="completion",
@@ -2210,6 +2197,9 @@ class RunStore:
             event_state="completed",
             projection_state="completed",
         )
+        if episode is None and projection.get("state") == "completed":
+            raise EventHistoryCorrupt("completion episode marker is invalid")
+        return episode
 
     def _validated_attention_episode(
         self,
@@ -2225,6 +2215,8 @@ class RunStore:
             event_state="attention_required",
         )
         if episode is None:
+            if projection.get("state") == "attention_required":
+                raise EventHistoryCorrupt("attention episode marker is invalid")
             return None
         events, _ = self._read_events(run_id)
         latest = next(

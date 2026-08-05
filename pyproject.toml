@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "afk-composable-pipeline"
 version = "0.1.0"
-description = "Composable AFK pipeline scaffold with ledgered step execution."
+description = "Durable single-Bead implementation, validation, review, and merge orchestration."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = []

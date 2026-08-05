@@ -30,14 +30,12 @@ from afk.run_store import (  # noqa: E402
     EvidenceTampered,
     EvidenceTooLarge,
     EventHistoryCorrupt,
-    RunNotFound,
     RunStore,
     RunStoreBusy,
     RunStoreError,
 )
 from afk.retrospective_contract import INVENTORY_KEY  # noqa: E402
 from afk.retrospective_status import build_retrospective_status  # noqa: E402
-from afk.start import resume_run  # noqa: E402
 
 
 BASE_SHA = "a" * 40
@@ -126,6 +124,22 @@ class RunStoreTest(unittest.TestCase):
                 ):
                     self.store.identity("run-001")
 
+    def test_run_identity_rejects_legacy_schema_with_receipt_protocol_version(self):
+        self.create_run()
+        identity_path = self.root / "runs" / "run-001" / "run.json"
+        identity = json.loads(identity_path.read_text(encoding="utf-8"))
+        identity["schema_version"] = 1
+        identity_path.write_text(
+            json.dumps(identity, sort_keys=True, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(
+            EventHistoryCorrupt,
+            "Run identity is invalid: run-001",
+        ):
+            self.store.identity("run-001")
+
     def test_run_identity_schema_version_requires_an_exact_integer(self):
         self.create_run()
         identity_path = self.root / "runs" / "run-001" / "run.json"
@@ -161,36 +175,31 @@ class RunStoreTest(unittest.TestCase):
                 ):
                     self.store.identity("run-001")
 
-    def test_receipt_aware_identity_version_requires_an_exact_integer(self):
+    def test_evidence_receipt_version_requires_an_exact_integer(self):
         self.create_run()
         identity_path = self.root / "runs" / "run-001" / "run.json"
         current = json.loads(identity_path.read_text(encoding="utf-8"))
 
-        for schema_version in (1, 2):
-            for receipt_version in (True, 1.0):
-                with self.subTest(
-                    schema_version=schema_version,
-                    evidence_receipt_version=receipt_version,
-                ):
-                    identity_path.write_text(
-                        json.dumps(
-                            {
-                                **current,
-                                "schema_version": schema_version,
-                                "evidence_receipt_version": receipt_version,
-                            },
-                            sort_keys=True,
-                            separators=(",", ":"),
-                        )
-                        + "\n",
-                        encoding="utf-8",
+        for receipt_version in (True, 1.0):
+            with self.subTest(evidence_receipt_version=receipt_version):
+                identity_path.write_text(
+                    json.dumps(
+                        {
+                            **current,
+                            "evidence_receipt_version": receipt_version,
+                        },
+                        sort_keys=True,
+                        separators=(",", ":"),
                     )
+                    + "\n",
+                    encoding="utf-8",
+                )
 
-                    with self.assertRaisesRegex(
-                        EventHistoryCorrupt,
-                        "Run identity is invalid: run-001",
-                    ):
-                        self.store.identity("run-001")
+                with self.assertRaisesRegex(
+                    EventHistoryCorrupt,
+                    "Run identity is invalid: run-001",
+                ):
+                    self.store.identity("run-001")
 
     def test_status_replays_stale_projection_and_ignores_torn_event_tail(self):
         self.create_run()
@@ -247,21 +256,6 @@ class RunStoreTest(unittest.TestCase):
         self.assertEqual(self.store.status()["run_id"], "run-001")
         with self.assertRaises(ActiveRunExists):
             self.create_run("run-002")
-
-    def test_completing_a_run_clears_active_pointer_and_allows_the_next_run(self):
-        self.create_run()
-
-        completed = self.store.append_event(
-            "run-001", "run.completed", state="completed"
-        )
-
-        self.assertFalse((self.root / "active.json").exists())
-        with self.assertRaises(RunNotFound):
-            self.store.status()
-        self.assertEqual(self.store.status("run-001"), completed)
-
-        next_run = self.create_run("run-002")
-        self.assertEqual(next_run["run_id"], "run-002")
 
     def test_record_completion_episode_persists_its_exact_retrospective_identity(self):
         self.create_run()
@@ -438,47 +432,6 @@ class RunStoreTest(unittest.TestCase):
         self.assertEqual(corrected_event["data"]["checkpoint"], "candidate_ready")
         self.assertEqual(corrected_event["data"]["attention"], attention)
         self.assertEqual(corrected_event["data"]["continuation"], continuation)
-
-    def test_resume_recovers_completion_after_active_pointer_unlink_fails(self):
-        self.create_run()
-        active_path = self.root / "active.json"
-        real_unlink = Path.unlink
-
-        def fail_active_unlink(path, *args, **kwargs):
-            if path == active_path:
-                raise OSError("injected active pointer unlink failure")
-            return real_unlink(path, *args, **kwargs)
-
-        with patch.object(
-            Path, "unlink", autospec=True, side_effect=fail_active_unlink
-        ):
-            with self.assertRaises(OSError):
-                self.store.append_event("run-001", "run.completed", state="completed")
-
-        with patch.dict(os.environ, {"XDG_STATE_HOME": str(self.state_home)}):
-            run_id, exit_code = resume_run()
-
-        self.assertEqual((run_id, exit_code), ("run-001", 0))
-        self.assertFalse(active_path.exists())
-        events = (self.root / "runs" / "run-001" / "events.jsonl").read_text(
-            encoding="utf-8"
-        )
-        self.assertEqual(events.count('"event":"run.completed"'), 1)
-
-    def test_completing_one_run_does_not_clear_another_runs_pointer(self):
-        self.create_run()
-        self.store.append_event("run-001", "run.completed", state="completed")
-        self.create_run("run-002")
-        self.store.append_event("run-002", "run.completed", state="completed")
-        active_path = self.root / "active.json"
-        active_path.write_text('{"run_id":"run-002"}\n', encoding="utf-8")
-
-        self.store.append_event("run-001", "run.observed", state="completed")
-
-        self.assertEqual(
-            json.loads(active_path.read_text(encoding="utf-8")),
-            {"run_id": "run-002"},
-        )
 
     def test_attention_required_run_remains_active(self):
         self.create_run()
@@ -1935,18 +1888,18 @@ else:
         self.store.write_evidence_value("run-001", BEAD_SPEC_ARTIFACT, bead)
         self.store.seal_evidence("run-001", BEAD_SPEC_EVIDENCE)
 
-        recovered = load_bead_spec(
-            self.store,
-            "run-001",
-            fallback={
-                **bead,
-                "description": "mutated live description",
-                "status": "closed",
-                "comments": [{"text": "mutated live comment"}],
-            },
-        )
+        recovered = load_bead_spec(self.store, "run-001")
 
         self.assertEqual(recovered, bead)
+
+    def test_load_bead_spec_rejects_missing_canonical_evidence(self):
+        self.create_run()
+
+        with self.assertRaisesRegex(
+            RunStoreError,
+            "Run lacks canonical Bead/spec identity",
+        ):
+            load_bead_spec(self.store, "run-001")
 
     def test_status_cli_reports_named_and_active_run(self):
         self.create_run()

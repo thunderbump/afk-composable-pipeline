@@ -15,7 +15,7 @@ from afk.candidate_capability import (
     CandidateBrokerCapability,
     CandidateCapabilityError,
 )
-from afk.checkouts import is_exact_clean_commit
+from afk.worktree import is_exact_clean_commit
 from afk.jsonutil import canonical_json
 from afk.process_supervision import (
     SupervisedCommandError,

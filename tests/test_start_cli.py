@@ -13,7 +13,7 @@ import unittest
 from io import StringIO
 from pathlib import Path
 from typing import NamedTuple
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from tests.afk_cli_fixture import AfkCliFixture, BASE_SHA
 
@@ -25,7 +25,6 @@ import afk.run_store as run_store_module  # noqa: E402
 import afk.start as start_module  # noqa: E402
 from afk.bead_spec import bead_spec_identity, persist_bead_spec  # noqa: E402
 from afk.lifecycle_signals import record_lifecycle_interruption  # noqa: E402
-from afk.implementation_attempt import interrupted_attempt  # noqa: E402
 from afk.retrospective_attempt import (  # noqa: E402
     RETROSPECTIVE_OUTPUT_BYTE_LIMIT,
 )
@@ -151,6 +150,40 @@ class StartCliTest(unittest.TestCase):
     def tearDown(self):
         self.cli_fixture.close()
 
+    def test_validation_rejects_candidate_without_durable_pr_publication(self):
+        store = Mock()
+        projection = {"checkpoint": "candidate_ready"}
+        store.status.return_value = projection
+        identity = {"repository": "owner/project"}
+        store.identity.return_value = identity
+
+        with (
+            patch(
+                "afk.start.verify_candidate_publication",
+                side_effect=start_module.CandidateError(
+                    "durable Candidate PR publication is missing",
+                    kind="conflict",
+                ),
+            ) as verify,
+            patch("afk.start._attention") as attention,
+            patch("afk.start._advance_validation") as validation,
+            patch("afk.start._advance_gate") as gate,
+        ):
+            exit_code = start_module._advance_validation_then_gate(store, "run-1")
+
+        self.assertEqual(exit_code, 2)
+        verify.assert_called_once_with(identity, projection)
+        validation.assert_not_called()
+        gate.assert_not_called()
+        attention.assert_called_once_with(
+            store,
+            "run-1",
+            checkpoint="candidate_ready",
+            scope="candidate",
+            kind="conflict",
+            summary="durable Candidate PR publication is missing",
+        )
+
     def install_retrospective_analyzer(self):
         analyzer = self.fake_bin / "codex"
         analyzer.replace(self.fake_bin / "codex-candidate-review")
@@ -244,16 +277,20 @@ class StartCliTest(unittest.TestCase):
                     "  part in relative for part in target.split('|')\n"
                     " )\n"
                     "def injected_evidence_writer(original):\n"
-                    " def injected(store, run_id, relative, value):\n"
-                    "  result = original(store, run_id, relative, value)\n"
+                    " def injected(store, run_id, relative, value, **kwargs):\n"
+                    "  result = original(\n"
+                    "   store, run_id, relative, value, **kwargs\n"
+                    "  )\n"
                     "  target = injections.get('AFK_TEST_KILL_AFTER_EVIDENCE')\n"
                     "  if evidence_targeted(target, relative):\n"
                     "   os.kill(os.getpid(), signal.SIGKILL)\n"
                     "  return result\n"
                     " return injected\n"
-                    "def injected_ingest_evidence(store, run_id, relative, source):\n"
+                    "def injected_ingest_evidence(\n"
+                    " store, run_id, relative, source, **kwargs\n"
+                    "):\n"
                     " result = original_ingest_evidence(\n"
-                    "  store, run_id, relative, source\n"
+                    "  store, run_id, relative, source, **kwargs\n"
                     " )\n"
                     " target = injections.get('AFK_TEST_KILL_AFTER_EVIDENCE')\n"
                     " if evidence_targeted(target, relative):\n"
@@ -2659,73 +2696,6 @@ class StartCliTest(unittest.TestCase):
         self.assertEqual(
             len(self.launch_events(run_id, "implementation.attempt_finished")), 1
         )
-
-    def test_resume_retries_a_legacy_clean_blocked_implementation_attempt(self):
-        run_id = self.start_open_implementation_attempt()
-        store = RunStore(self.state_home / "afk")
-        started = store.status(run_id)["implementation_attempt"]
-        report = {
-            "status": "blocked",
-            "starting_sha": BASE_SHA,
-            "ending_sha": BASE_SHA,
-            "summary": "nested collaboration is unavailable",
-            "checks": [],
-            "changed_areas": [],
-        }
-        store.write_evidence_value(
-            run_id, "attempts/implementation-1/report.json", report
-        )
-        store.write_evidence_value(
-            run_id,
-            "attempts/implementation-1/recovery.json",
-            {
-                "status": "interrupted",
-                "summary": "implementation reported blocked",
-                "retryable": False,
-            },
-        )
-        store.seal_evidence(run_id, "attempts/implementation-1")
-        interrupted = interrupted_attempt(
-            started,
-            summary="implementation reported blocked",
-            retryable=False,
-        )
-        store.append_event(
-            run_id,
-            "implementation.attempt_interrupted",
-            data={
-                "checkpoint": "worktree_ready",
-                "implementation_attempt": interrupted,
-            },
-        )
-        store.record_attention_episode(
-            run_id,
-            checkpoint="worktree_ready",
-            attention={
-                "scope": "candidate",
-                "kind": "invalid",
-                "summary": "implementation reported blocked",
-            },
-        )
-
-        resumed = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="absent")
-
-        projection = json.loads(self.run_afk("status", run_id, "--json").stdout)
-        self.assertEqual(resumed.returncode, 2, (resumed.stderr, projection))
-        self.assertEqual(projection["checkpoint"], "candidate_ready")
-        self.assertEqual(projection["attention"]["scope"], "validation")
-        self.assertEqual(
-            projection["implementation_attempt"]["attempt_id"], "implementation-2"
-        )
-        self.assertEqual(projection["implementation_attempt"]["status"], "completed")
-        first_recovery = (
-            self.state_home
-            / "afk"
-            / "runs"
-            / run_id
-            / "attempts/implementation-1/recovery.json"
-        )
-        self.assertFalse(json.loads(first_recovery.read_text())["retryable"])
 
     def test_resume_refuses_to_recover_an_attempt_from_a_different_origin(self):
         run_id = self.start_open_implementation_attempt()
@@ -6066,16 +6036,16 @@ class StartCliTest(unittest.TestCase):
         ):
             store.active_run_id()
 
-    def test_named_resume_of_legacy_completion_does_not_start_retrospective(self):
+    def test_named_resume_rejects_markerless_completion_before_retrospective(self):
         store = RunStore(self.state_home / "afk")
         store.create_run(
             bead_id="central-bnkl.1.1",
             repository="thunderbump/beads-webui",
             base_branch="main",
             base_sha="a" * 40,
-            run_id="legacy-completed",
+            run_id="markerless-completed",
         )
-        legacy_completion = {
+        completion = {
             "schema_version": 1,
             "repository": "thunderbump/beads-webui",
             "bead_id": "central-bnkl.1.1",
@@ -6090,24 +6060,29 @@ class StartCliTest(unittest.TestCase):
             "cleanup_warnings": [],
             "evidence": "gates/completion-dddddddddddd",
         }
-        store.append_event(
-            "legacy-completed",
-            "run.completed",
-            state="completed",
-            data={
-                "checkpoint": "completed",
-                "attention": {},
-                "completion": legacy_completion,
-            },
-        )
+        with self.assertRaisesRegex(
+            EventHistoryCorrupt, "completion episode marker is invalid"
+        ):
+            store.append_event(
+                "markerless-completed",
+                "run.completed",
+                state="completed",
+                data={
+                    "checkpoint": "completed",
+                    "attention": {},
+                    "completion": completion,
+                },
+            )
 
         with (
             patch.dict(os.environ, self.afk_environment()),
             patch("afk.start.run_retrospective_attempt") as retrospective,
+            self.assertRaisesRegex(
+                EventHistoryCorrupt, "completion episode marker is invalid"
+            ),
         ):
-            resumed = resume_run("legacy-completed")
+            resume_run("markerless-completed")
 
-        self.assertEqual(resumed, ("legacy-completed", 0))
         retrospective.assert_not_called()
 
     def test_named_resume_rejects_a_later_forged_completion_episode_before_analysis(
@@ -6119,26 +6094,24 @@ class StartCliTest(unittest.TestCase):
             repository="thunderbump/beads-webui",
             base_branch="main",
             base_sha="a" * 40,
-            run_id="legacy-completed",
+            run_id="completed-run",
         )
         completion = {"schema_version": 1}
-        store.append_event(
-            "legacy-completed",
-            "run.completed",
-            state="completed",
-            data={"checkpoint": "completed", "completion": completion},
+        store.record_completion_episode(
+            "completed-run",
+            completion=completion,
         )
         marker = {
             "schema_version": 1,
-            "episode_sequence": 2,
-            "evidence": "retrospective/completed-2",
-            "effect_id": "retrospective-analysis-2",
+            "episode_sequence": 3,
+            "evidence": "retrospective/completed-3",
+            "effect_id": "retrospective-analysis-3",
         }
         with self.assertRaisesRegex(
             EventHistoryCorrupt, "completion episode marker is invalid"
         ):
             store.append_event(
-                "legacy-completed",
+                "completed-run",
                 "worker.terminal",
                 data={
                     "checkpoint": "completed",
@@ -6147,14 +6120,14 @@ class StartCliTest(unittest.TestCase):
                     "worker_result": "completed",
                 },
             )
-        run_dir = self.state_home / "afk" / "runs" / "legacy-completed"
+        run_dir = self.state_home / "afk" / "runs" / "completed-run"
         effects_before = tuple((run_dir / "effects").iterdir())
         evidence_before = tuple((run_dir / "retrospective").iterdir())
         with self.assertRaisesRegex(
             EventHistoryCorrupt, "completion episode marker is invalid"
         ):
             store.record_completion_episode(
-                "legacy-completed",
+                "completed-run",
                 completion=completion,
             )
 
@@ -6165,7 +6138,7 @@ class StartCliTest(unittest.TestCase):
                 EventHistoryCorrupt, "completion episode marker is invalid"
             ),
         ):
-            resume_run("legacy-completed")
+            resume_run("completed-run")
 
         retrospective.assert_not_called()
         self.assertEqual(tuple((run_dir / "effects").iterdir()), effects_before)
@@ -8326,7 +8299,7 @@ class StartCliTest(unittest.TestCase):
         outcome = store.sealed_evidence_result("crashed-run", latest["evidence"])
         self.assertEqual(outcome["episode_sequence"], latest["episode_sequence"])
 
-    def test_resume_preserves_legacy_attention_without_an_episode_marker(self):
+    def test_resume_rejects_attention_without_an_episode_marker(self):
         store, _ = self.create_resume_preflight_run()
         store.append_event(
             "crashed-run",
@@ -8337,7 +8310,7 @@ class StartCliTest(unittest.TestCase):
                 "attention": {
                     "scope": "worker_launch",
                     "kind": "unavailable",
-                    "summary": "legacy worker launch failure",
+                    "summary": "markerless worker launch failure",
                 },
             },
         )
@@ -8345,11 +8318,13 @@ class StartCliTest(unittest.TestCase):
 
         resumed = self.run_afk("resume", AFK_FAKE_SYSTEMD_STATE="active")
 
-        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        self.assertEqual(resumed.returncode, 2)
+        self.assertIn("attention episode marker is invalid", resumed.stderr)
         self.assertEqual(
             store.effect("crashed-run", "worker-launch-1")["status"],
-            "confirmed",
+            "prepared",
         )
+        self.assertFalse(self.command_log.exists())
 
     def test_resume_rejects_misbound_open_validation_attempt_before_commands(self):
         store, _ = self.create_resume_preflight_run()
@@ -8797,8 +8772,8 @@ class StartCliTest(unittest.TestCase):
 
         self.assert_resume_preflight_rejected("Run identity is invalid: crashed-run")
 
-    def test_resume_accepts_transitional_receipt_aware_run_identity(self):
-        store, run_dir = self.create_resume_preflight_run()
+    def test_resume_rejects_schema_one_receipt_aware_run_identity(self):
+        _, run_dir = self.create_resume_preflight_run()
         identity_path = run_dir / "run.json"
         identity = json.loads(identity_path.read_text(encoding="utf-8"))
         identity["schema_version"] = 1
@@ -8807,10 +8782,7 @@ class StartCliTest(unittest.TestCase):
             encoding="utf-8",
         )
 
-        resumed = self.run_afk("resume")
-
-        self.assertEqual(resumed.returncode, 0, resumed.stderr)
-        self.assertEqual(store.identity("crashed-run"), identity)
+        self.assert_resume_preflight_rejected("Run identity is invalid: crashed-run")
 
     def test_resume_rejects_tampered_sealed_evidence_before_external_commands(self):
         store, _ = self.create_resume_preflight_run()
@@ -8970,17 +8942,17 @@ class StartCliTest(unittest.TestCase):
         )
         self.assertFalse(self.command_log.exists())
 
-    def test_status_derives_unit_for_legacy_terminal_observation(self):
+    def test_status_rejects_terminal_observation_without_unit(self):
         store = RunStore(self.state_home / "afk")
         store.create_run(
             bead_id="central-bnkl.1.1",
             repository="thunderbump/beads-webui",
             base_branch="main",
             base_sha=BASE_SHA,
-            run_id="legacy-terminal-run",
+            run_id="terminal-run",
         )
         store.append_event(
-            "legacy-terminal-run",
+            "terminal-run",
             "worker.terminal",
             data={
                 "checkpoint": "created",
@@ -8989,18 +8961,13 @@ class StartCliTest(unittest.TestCase):
             },
         )
 
-        completed = self.run_afk("status", "legacy-terminal-run", "--json")
+        completed = self.run_afk("status", "terminal-run", "--json")
 
-        self.assertEqual(completed.returncode, 0, completed.stderr)
-        status = json.loads(completed.stdout)
-        self.assertEqual(
-            status["unit_observation"],
-            {
-                "status": "terminal",
-                "unit": "afk-legacy-terminal-run-worker-1",
-                "worker_exit_code": 2,
-                "worker_result": "attention_required",
-            },
+        self.assertEqual(completed.returncode, 1)
+        self.assertEqual(completed.stdout, "")
+        self.assertIn(
+            "terminal worker observation unit is invalid",
+            completed.stderr,
         )
 
     def test_unnamed_status_prefers_completion_recorded_during_unit_observation(self):
@@ -9629,13 +9596,6 @@ class StartCliTest(unittest.TestCase):
             start_request={},
             run_id=run_id,
         )
-        identity_path = store_root / "runs" / run_id / "run.json"
-        identity = json.loads(identity_path.read_text(encoding="utf-8"))
-        identity["schema_version"] = 1
-        identity_path.write_text(
-            json.dumps(identity, sort_keys=True, separators=(",", ":")) + "\n",
-            encoding="utf-8",
-        )
         projection = store.record_attention_episode(
             run_id,
             checkpoint="created",
@@ -9971,7 +9931,10 @@ class StartCliTest(unittest.TestCase):
             base_sha=BASE_SHA,
             run_id="completed-run",
         )
-        store.append_event("completed-run", "run.completed", state="completed")
+        store.record_completion_episode(
+            "completed-run",
+            completion={"schema_version": 1},
+        )
         active_path = self.state_home / "afk" / "active.json"
         active_path.write_text('{"run_id":"completed-run"}\n', encoding="utf-8")
         store_root = self.state_home / "afk"
@@ -12672,6 +12635,7 @@ class StartCliTest(unittest.TestCase):
             textwrap.dedent(
                 """
                 #!/usr/bin/env python3
+                import hashlib
                 import json
                 import os
                 import subprocess
@@ -12772,7 +12736,62 @@ class StartCliTest(unittest.TestCase):
                         raise SystemExit(137)
 
                 if command == "git":
-                    if args[:2] == ["rev-parse", "--show-toplevel"]:
+                    trusted_work_tree = None
+                    if args and args[0].startswith("--git-dir="):
+                        trusted_work_tree = Path(
+                            args[1].removeprefix("--work-tree=")
+                        ).resolve()
+                        args = args[2:]
+                    trusted_files = {}
+                    trusted_blobs = {}
+                    if trusted_work_tree is not None:
+                        for path in trusted_work_tree.rglob("*"):
+                            relative = path.relative_to(trusted_work_tree)
+                            if relative.parts[0] == ".git" or not path.is_file():
+                                continue
+                            content = path.read_bytes()
+                            blob = hashlib.sha1(
+                                f"blob {len(content)}\\0".encode() + content
+                            ).hexdigest()
+                            mode = "100755" if os.access(path, os.X_OK) else "100644"
+                            trusted_files[relative.as_posix()] = (mode, blob)
+                            trusted_blobs[blob] = content
+                    if (
+                        trusted_work_tree is not None
+                        and args[:3] == ["ls-tree", "-rz", "--full-tree"]
+                    ):
+                        for path, (mode, blob) in sorted(trusted_files.items()):
+                            sys.stdout.buffer.write(
+                                f"{mode} blob {blob}\\t{path}\\0".encode()
+                            )
+                    elif (
+                        trusted_work_tree is not None
+                        and args == ["ls-files", "--stage", "-z"]
+                    ):
+                        for path, (mode, blob) in sorted(trusted_files.items()):
+                            sys.stdout.buffer.write(
+                                f"{mode} {blob} 0\\t{path}\\0".encode()
+                            )
+                    elif (
+                        trusted_work_tree is not None
+                        and args[:1] == ["cat-file"]
+                        and args[1].startswith("--batch-check=")
+                    ):
+                        for blob in sys.stdin.buffer.read().splitlines():
+                            content = trusted_blobs[blob.decode()]
+                            sys.stdout.buffer.write(
+                                blob + f" blob {len(content)}\\n".encode()
+                            )
+                    elif (
+                        trusted_work_tree is not None
+                        and args[:2] == ["cat-file", "blob"]
+                    ):
+                        sys.stdout.buffer.write(trusted_blobs[args[2]])
+                    elif args[:1] == ["init"]:
+                        (Path.cwd() / ".git").mkdir(exist_ok=True)
+                    elif args[:1] == ["check-ignore"]:
+                        raise SystemExit(1)
+                    elif args[:2] == ["rev-parse", "--show-toplevel"]:
                         status_checks = (
                             Path(os.environ["XDG_STATE_HOME"])
                             / "fake-status-checks"
@@ -12963,8 +12982,13 @@ class StartCliTest(unittest.TestCase):
                         before_mutation("worktree-create")
                         checkout = Path(args[-2])
                         checkout.mkdir(parents=True)
+                        fake_git_dir = checkout.parent / (checkout.name + ".git")
+                        fake_git_dir.mkdir()
                         git_file = checkout / ".git"
-                        git_file.write_text("gitdir: fake\\n", encoding="utf-8")
+                        git_file.write_text(
+                            "gitdir: " + str(fake_git_dir) + "\\n",
+                            encoding="utf-8",
+                        )
                         scripts = checkout / "scripts"
                         scripts.mkdir()
                         validation_worker = scripts / "validation-worker.sh"
